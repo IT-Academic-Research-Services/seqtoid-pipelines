@@ -17,5 +17,8 @@ pub struct Arguments {
     #[arg(short = 'I', long = "file2")]
     pub file2: Option<String>,
 
+    #[arg(long, default_value_t = 50000000)]
+    pub max_reads: usize,
+
 }
 
