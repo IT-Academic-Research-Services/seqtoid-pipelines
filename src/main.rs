@@ -8,7 +8,8 @@ use utils::Arguments;
 
 use pipelines::consensus_genome;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let run_start = Instant::now();
     eprintln!("\n-------------\n SeqToID\n-------------\n");
 
@@ -18,13 +19,13 @@ fn main() {
     let args = Arguments::parse();
 
     match args.module.as_str() {
-        "consensus_genome" => consensus_genome_run(&args),
+        "consensus_genome" => consensus_genome_run(&args).await,
         _ => panic!("Invalid option!"),
     }
 
     eprintln!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
 }
 
-fn consensus_genome_run(args: &Arguments) {
-    consensus_genome::run(args);
+async fn consensus_genome_run(args: &Arguments) {
+    consensus_genome::run(args).await.unwrap();
 }
