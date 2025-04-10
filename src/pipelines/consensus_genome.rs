@@ -26,8 +26,8 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
             Err(e) => println!("Error getting ID: {}", e),
         }
 
-        println!("Sequence: {}", String::from_utf8_lossy(record.seq()));
-        println!("Quality: {}", String::from_utf8_lossy(record.qual()));
+        // println!("Sequence: {}", String::from_utf8_lossy(record.seq()));
+        // println!("Quality: {}", String::from_utf8_lossy(record.qual()));
         println!("---"); // Separator between records
     }
 

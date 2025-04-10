@@ -95,39 +95,40 @@ fn compare_read_ids(
 ) -> bool {
     match (id1_result, id2_result) {
         (Ok(id1), Ok(id2)) => {
-            // Split each ID into the pre-space (read identifier) and post-space (attributes) parts
+            // Try Casava 1.8+ format first (space-separated)
             let id1_parts: Vec<&str> = id1.splitn(2, ' ').collect();
             let id2_parts: Vec<&str> = id2.splitn(2, ' ').collect();
 
-            // Check if both IDs have two parts (identifier and attributes)
-            if id1_parts.len() != 2 || id2_parts.len() != 2 {
-                eprintln!("Invalid header format in R1 or R2");
-                return false;
+            if id1_parts.len() == 2 && id2_parts.len() == 2 {
+                let read_id1 = id1_parts[0];
+                let read_id2 = id2_parts[0];
+                if read_id1 != read_id2 {
+                    return false;
+                }
+                let attr1_parts: Vec<&str> = id1_parts[1].split(':').collect();
+                let attr2_parts: Vec<&str> = id2_parts[1].split(':').collect();
+                if attr1_parts.is_empty() || attr2_parts.is_empty() {
+                    eprintln!("Invalid attributes format in R1 or R2");
+                    return false;
+                }
+                let read_num1 = attr1_parts[0];
+                let read_num2 = attr2_parts[0];
+                return (read_num1 == "1" && read_num2 == "2") || (read_num1 == "2" && read_num2 == "1");
             }
 
-            // The read identifier (pre-space) must match exactly
-            let read_id1 = id1_parts[0];
-            let read_id2 = id2_parts[0];
-            if read_id1 != read_id2 {
-                return false;
+            // Fallback to /1 and /2 format
+            if id1.ends_with("/1") && id2.ends_with("/2") {
+                let base_id1 = id1.trim_end_matches("/1");
+                let base_id2 = id2.trim_end_matches("/2");
+                return base_id1 == base_id2;
+            } else if id1.ends_with("/2") && id2.ends_with("/1") {
+                let base_id1 = id1.trim_end_matches("/2");
+                let base_id2 = id2.trim_end_matches("/1");
+                return base_id1 == base_id2;
             }
 
-            // The attributes (post-space) must have a read number of "1" for R1 and "2" for R2
-            let attr1_parts: Vec<&str> = id1_parts[1].split(':').collect();
-            let attr2_parts: Vec<&str> = id2_parts[1].split(':').collect();
-
-            // Ensure there are enough fields (at least the read number)
-            if attr1_parts.is_empty() || attr2_parts.is_empty() {
-                eprintln!("Invalid attributes format in R1 or R2");
-                return false;
-            }
-
-            // Read number is the first field after the space
-            let read_num1 = attr1_parts[0];
-            let read_num2 = attr2_parts[0];
-
-            // Check that one is "1" and the other is "2" (in either order)
-            (read_num1 == "1" && read_num2 == "2") || (read_num1 == "2" && read_num2 == "1")
+            eprintln!("Unsupported read ID format or mismatched pairs");
+            false
         }
         (Err(e1), _) => {
             eprintln!("Error getting R1 ID: {}", e1);
