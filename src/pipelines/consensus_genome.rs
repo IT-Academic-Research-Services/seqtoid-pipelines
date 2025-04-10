@@ -16,6 +16,6 @@ pub fn run(args: &Arguments) {
         None => println!("File2 not given"),
     }
 
-    let done = read_and_interleave_fastq(&args.file1, args.file2.as_deref(), args.max_reads);
+    let done = read_and_interleave_fastq(&args.file1, args.file2.as_deref());
 
 }
