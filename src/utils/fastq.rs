@@ -4,6 +4,7 @@ use std::io::{self, BufReader, Read};
 use flate2::read::GzDecoder;
 use tokio::sync::mpsc;
 use crate::utils::file::is_gzipped;
+use crate::utils::Technology;
 
 pub enum FastqReader {
     Uncompressed(BufReader<File>),
@@ -32,6 +33,7 @@ pub fn fastq_reader(path: &str) -> io::Result<Reader<FastqReader>> {
 pub fn read_and_interleave_fastq(
     fastq1_path: &str,
     fastq2_path: Option<&str>,
+    technology: Technology,
 ) -> anyhow::Result<mpsc::Receiver<OwnedRecord>> {
     let fastq1_path = fastq1_path.to_string();
     let fastq2_path = fastq2_path.map(String::from);
@@ -48,6 +50,15 @@ pub fn read_and_interleave_fastq(
             while let (Some(Ok(r1)), Some(Ok(r2))) = (records1.next(), records2.next()) {
                 let r1_owned = r1.to_owned();
                 let r2_owned = r2.to_owned();
+
+
+                if technology == Technology::illumina {
+                    if !compare_read_ids(r1_owned.id(), r2_owned.id()) {
+                        eprintln!("Mismatch!");
+                    }
+                    
+                }
+                
                 if tx.send(r1_owned).await.is_err() {
                     eprintln!("Failed to send R1 record");
                     break;
@@ -56,6 +67,7 @@ pub fn read_and_interleave_fastq(
                     eprintln!("Failed to send R2 record");
                     break;
                 }
+
             }
         });
     } else { // single-ended
@@ -75,4 +87,55 @@ pub fn read_and_interleave_fastq(
     }
 
     Ok(rx)
+}
+
+fn compare_read_ids(
+    id1_result: Result<&str, impl std::error::Error>,
+    id2_result: Result<&str, impl std::error::Error>,
+) -> bool {
+    match (id1_result, id2_result) {
+        (Ok(id1), Ok(id2)) => {
+            // Split each ID into the pre-space (read identifier) and post-space (attributes) parts
+            let id1_parts: Vec<&str> = id1.splitn(2, ' ').collect();
+            let id2_parts: Vec<&str> = id2.splitn(2, ' ').collect();
+
+            // Check if both IDs have two parts (identifier and attributes)
+            if id1_parts.len() != 2 || id2_parts.len() != 2 {
+                eprintln!("Invalid header format in R1 or R2");
+                return false;
+            }
+
+            // The read identifier (pre-space) must match exactly
+            let read_id1 = id1_parts[0];
+            let read_id2 = id2_parts[0];
+            if read_id1 != read_id2 {
+                return false;
+            }
+
+            // The attributes (post-space) must have a read number of "1" for R1 and "2" for R2
+            let attr1_parts: Vec<&str> = id1_parts[1].split(':').collect();
+            let attr2_parts: Vec<&str> = id2_parts[1].split(':').collect();
+
+            // Ensure there are enough fields (at least the read number)
+            if attr1_parts.is_empty() || attr2_parts.is_empty() {
+                eprintln!("Invalid attributes format in R1 or R2");
+                return false;
+            }
+
+            // Read number is the first field after the space
+            let read_num1 = attr1_parts[0];
+            let read_num2 = attr2_parts[0];
+
+            // Check that one is "1" and the other is "2" (in either order)
+            (read_num1 == "1" && read_num2 == "2") || (read_num1 == "2" && read_num2 == "1")
+        }
+        (Err(e1), _) => {
+            eprintln!("Error getting R1 ID: {}", e1);
+            false
+        }
+        (_, Err(e2)) => {
+            eprintln!("Error getting R2 ID: {}", e2);
+            false
+        }
+    }
 }

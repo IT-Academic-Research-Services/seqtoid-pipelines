@@ -15,8 +15,8 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
         Some(file) => println!("File 2: {}", file),
         None => println!("File2 not given"),
     }
-
-    let mut rx = read_and_interleave_fastq(&args.file1, args.file2.as_deref())?;
+    let technology = args.technology.clone();
+    let mut rx = read_and_interleave_fastq(&args.file1, args.file2.as_deref(), technology)?;
 
 
     while let Some(record) = rx.recv().await {
