@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
 use flate2::read::GzDecoder;
-use crate::utils::fastq::{read_and_interleave_fastq, record_counter};
+use crate::utils::fastq::{record_counter};
 use std::time::Instant;
 
 pub async fn run(args: &Arguments) -> anyhow::Result<()> {
@@ -18,10 +18,10 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
     }
     let technology = args.technology.clone();
 
-    // let start = Instant::now();
-    // let fq1count = record_counter(&args.file1);
-    // let duration = start.elapsed();
-    // println!("Num records: {:?} Time in ms: {}", fq1count,  duration.as_millis());
+    let start = Instant::now();
+    let fq1count = record_counter(&args.file1);
+    let duration = start.elapsed();
+    println!("Num records: {:?} Time in ms: {}", fq1count,  duration.as_millis());
     
     // let mut rx = read_and_interleave_fastq(&args.file1, args.file2.as_deref(), technology)?;
     // 
