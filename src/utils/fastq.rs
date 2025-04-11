@@ -30,6 +30,39 @@ pub fn fastq_reader(path: &str) -> io::Result<Reader<FastqReader>> {
     Ok(reader)
 }
 
+
+/// Counts the number of records in a FASTQ.
+///
+///
+/// # Arguments
+///
+/// * `fastq_path` - Valid path to a fastq file.
+///
+/// # Returns
+/// u64: Number of records in the FASTQ.
+///
+pub fn record_counter(fastq_path: &str) -> io::Result<u64> {
+    let fastq_path = fastq_path.to_string();
+    let mut counter = 0;
+    if let Ok(reader) = fastq_reader(&fastq_path) {
+        for result in reader.into_records() {
+            counter += 1;
+        }
+    }
+    return Ok(counter);
+}
+
+
+/// Asynchronously outputs a stream from one or two FASTQ files.
+/// If two FASTQ, the stream is interleaved and a header check is performed 
+/// to ensure each pair of reads is really an R1/R2 pair.
+/// # Arguments
+///
+/// * `fastq_path` - Valid path to a fastq file.
+///
+/// # Returns
+/// Receiver<Owned Record> stream on an async stream.
+///
 pub fn read_and_interleave_fastq(
     fastq1_path: &str,
     fastq2_path: Option<&str>,
@@ -89,6 +122,18 @@ pub fn read_and_interleave_fastq(
     Ok(rx)
 }
 
+
+/// Compares the headers ot two FASTQ reads.
+/// If two FASTQ, the stream is interleaved and a header check is performed 
+/// to ensure each pair of reads is really an R1/R2 pair.
+/// # Arguments
+///
+/// * `id1_result`: &str - ID string for read 1
+/// * `id2_result`: &str - ID string for read 2
+///
+/// # Returns
+/// bool: true if reads are a matched pair.
+///
 fn compare_read_ids(
     id1_result: Result<&str, impl std::error::Error>,
     id2_result: Result<&str, impl std::error::Error>,
