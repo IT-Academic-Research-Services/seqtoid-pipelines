@@ -1,6 +1,9 @@
 // src/utils/stream.rs
+use std::fs::File;
+use std::io::{self, Write};
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 
@@ -42,4 +45,31 @@ where
     });
 
     streams
+}
+
+
+/// Takes a stream 
+/// The streams are all asynchronous.
+///
+/// # Arguments
+///
+/// * `input_rx' - Receiver stream: tokio::mpsc
+/// * 'num_streams' - Number of output streams to generate.
+///
+/// # Returns
+/// Vector of output streams.
+///
+pub async fn tee_file<T> (input_rx: mpsc::Receiver<T>, out_filename: String) -> BroadcastStream<T>
+where
+    T: Clone + Send + 'static,
+{
+    
+    let out_streams = t_junction(input_rx, 2).await;
+
+    let mut streams = out_streams.into_iter(); 
+    let return_stream = streams.next().unwrap(); 
+    let file_stream = streams.next().unwrap();
+
+    
+    return_stream 
 }
