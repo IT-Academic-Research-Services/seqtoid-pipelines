@@ -1,4 +1,4 @@
-pub mod fastq;
+pub mod fastx;
 mod file;
 mod streams;
 

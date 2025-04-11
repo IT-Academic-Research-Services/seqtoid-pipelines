@@ -1,11 +1,11 @@
 
-use crate::utils::{Arguments, fastq};
+use crate::utils::{Arguments, fastx};
 use seq_io::fastq::{Reader, Record};
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::Path;
 use flate2::read::GzDecoder;
-use crate::utils::fastq::{record_counter};
+use crate::utils::fastx::{record_counter};
 use std::time::Instant;
 
 pub async fn run(args: &Arguments) -> anyhow::Result<()> {
