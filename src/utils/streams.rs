@@ -5,6 +5,9 @@ use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use crate::utils::fastx::SequenceRecord;
+use crate::utils::file::{write_fastq_record, write_fasta_record};
 
 
 /// Generates any number of output streams from a single input stream.
@@ -59,17 +62,53 @@ where
 /// # Returns
 /// Vector of output streams.
 ///
-pub async fn tee_file<T> (input_rx: mpsc::Receiver<T>, out_filename: String) -> BroadcastStream<T>
-where
-    T: Clone + Send + 'static,
+pub async fn tee_file(
+    input_rx: mpsc::Receiver<SequenceRecord>,
+    out_filename: String,
+) -> BroadcastStream<SequenceRecord>
 {
-    
     let out_streams = t_junction(input_rx, 2).await;
 
-    let mut streams = out_streams.into_iter(); 
-    let return_stream = streams.next().unwrap(); 
+    let mut streams = out_streams.into_iter();
+    let return_stream = streams.next().unwrap();
     let file_stream = streams.next().unwrap();
 
-    
-    return_stream 
+    tokio::spawn(async move {
+        let mut file = match File::create(&out_filename) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Failed to create file {}: {}", out_filename, e);
+                return;
+            }
+        };
+
+        let mut stream = file_stream;
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(record) => {
+                    match record {
+                        SequenceRecord::Fastq { id, desc, seq, qual } => {
+                            if let Err(e) = write_fastq_record(&mut file, &id, desc.as_deref(), &seq, &qual) {
+                                eprintln!("Failed to write FASTQ record: {}", e);
+                                break;
+                            }
+                        }
+                        SequenceRecord::Fasta { id, desc, seq } => {
+                            if let Err(e) = write_fasta_record(&mut file, &id, desc.as_deref(), &seq) {
+                                eprintln!("Failed to write FASTA record: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => match err {
+                    BroadcastStreamRecvError::Lagged(skipped) => {
+                        eprintln!("File stream lagged, skipped {} items", skipped);
+                    }
+                },
+            }
+        }
+    });
+
+    return_stream
 }
