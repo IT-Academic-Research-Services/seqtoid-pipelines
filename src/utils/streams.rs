@@ -1,6 +1,6 @@
 // src/utils/stream.rs
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::Write;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -51,8 +51,10 @@ where
 }
 
 
-/// Takes a stream 
-/// The streams are all asynchronous.
+
+
+/// Takes a generic stream from tokio_stream and asynchronously writes to a file.
+///
 ///
 /// # Arguments
 ///
@@ -60,9 +62,66 @@ where
 /// * 'num_streams' - Number of output streams to generate.
 ///
 /// # Returns
-/// Vector of output streams.
+/// Output stream.
+pub async fn tee_file <T>(
+    input_rx: mpsc::Receiver<T>,
+    out_filename: String,
+) -> BroadcastStream<T>
+where
+    T: Clone + Send + 'static + AsRef<[u8]>,
+{
+    let out_streams = t_junction(input_rx, 2).await;
+
+    let mut streams = out_streams.into_iter();
+    let return_stream = streams.next().unwrap();
+    let mut file_stream = streams.next().unwrap();
+
+    tokio::spawn(async move {
+        let mut file = match File::create(&out_filename) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("Failed to create file {}: {}", out_filename, e);
+                return;
+            }
+        };
+
+        // let mut stream = file_stream;
+        while let Some(result) = file_stream.next().await {
+            match result {
+                Ok(data) => {
+                    if let Err(e) = file.write_all(data.as_ref()) {
+                        eprintln!("Failed to write data: {}", e);
+                        break;
+                    }
+                    if let Err(e) = file.write_all(b"\n") {
+                        eprintln!("Failed to write newline: {}", e);
+                        break;
+                    }
+                }
+                Err(err) => match err {
+                    BroadcastStreamRecvError::Lagged(skipped) => {
+                        eprintln!("File stream lagged, skipped {} items", skipped);
+                    }
+                },
+            }
+            
+        }
+    });
+
+    return_stream
+}
+
+/// Takes a stream of FASTX records from seq_io and asynchronously writes to a file.
 ///
-pub async fn tee_file(
+///
+/// # Arguments
+///
+/// * `input_rx' - Receiver stream: tokio::mpsc
+/// * 'num_streams' - Number of output streams to generate.
+///
+/// # Returns
+/// Output stream.
+pub async fn tee_fastx(
     input_rx: mpsc::Receiver<SequenceRecord>,
     out_filename: String,
 ) -> BroadcastStream<SequenceRecord>
@@ -112,3 +171,5 @@ pub async fn tee_file(
 
     return_stream
 }
+
+
