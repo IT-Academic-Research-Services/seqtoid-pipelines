@@ -192,3 +192,136 @@ where
 
     Ok(child)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::NamedTempFile;
+    use tokio::time::{timeout, Duration};
+    
+    #[tokio::test]
+    async fn test_t_junction_splits_stream() {
+        let (tx, rx) = mpsc::channel(10);
+        let items = vec![b"item1".to_vec(), b"item2".to_vec()];
+        
+        let items_clone = items.clone();
+        tokio::spawn(async move {
+            for item in items_clone {
+                tx.send(item).await.unwrap();
+            }
+        });
+        
+        let mut streams = t_junction(rx, 2).await;
+        let mut stream1 = streams.pop().unwrap();
+        let mut stream2 = streams.pop().unwrap();
+        
+        let mut results1 = Vec::new();
+        let mut results2 = Vec::new();
+
+        while let Some(result) = timeout(Duration::from_millis(100), stream1.next()).await.unwrap() {
+            if let Ok(item) = result {
+                results1.push(item);
+            }
+        }
+        while let Some(result) = timeout(Duration::from_millis(100), stream2.next()).await.unwrap() {
+            if let Ok(item) = result {
+                results2.push(item);
+            }
+        }
+        
+        assert_eq!(results1, items);
+        assert_eq!(results2, items);
+    }
+    
+    #[tokio::test]
+    async fn test_tee_writes_bytes_to_file() {
+        let (tx, rx) = mpsc::channel(10);
+        let items = vec![b"hello".to_vec(), b"world".to_vec()];
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        
+        let items_clone = items.clone();
+        tokio::spawn(async move {
+            for item in items_clone {
+                tx.send(item).await.unwrap();
+            }
+        });
+        
+        let mut stream = tee(rx, path.clone()).await;
+        
+        let mut results = Vec::new();
+        while let Some(result) = timeout(Duration::from_millis(100), stream.next()).await.unwrap() {
+            if let Ok(item) = result {
+                results.push(item);
+            }
+        }
+        
+        assert_eq!(results, items);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "hello\nworld\n");
+    }
+    
+    #[tokio::test]
+    async fn test_tee_writes_fastq_to_file() {
+        let (tx, rx) = mpsc::channel(10);
+        let record = SequenceRecord::Fastq {
+            id: "seq1".to_string(),
+            desc: Some("test".to_string()),
+            seq: b"ATCG".to_vec(),
+            qual: b"IIII".to_vec(),
+        };
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        
+        let record_clone = record.clone();
+        tokio::spawn(async move {
+            tx.send(record_clone).await.unwrap();
+        });
+        
+        let mut stream = tee(rx, path.clone()).await;
+        
+        let mut results = Vec::new();
+        while let Some(result) = timeout(Duration::from_millis(100), stream.next()).await.unwrap() {
+            if let Ok(item) = result {
+                results.push(item);
+            }
+        }
+        
+        assert_eq!(results.len(), 1);
+        if let SequenceRecord::Fastq { id, desc, seq, qual } = &results[0] {
+            assert_eq!(id, "seq1");
+            assert_eq!(desc, &Some("test".to_string()));
+            assert_eq!(seq, &b"ATCG".to_vec());
+            assert_eq!(qual, &b"IIII".to_vec());
+        } else {
+            panic!("Expected Fastq record");
+        }
+        
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "@seq1 test\nATCG\n+\nIIII\n");
+    }
+    
+    #[tokio::test]
+    async fn test_stream_to_cmd_feeds_stdin() {
+        let (tx, rx) = mpsc::channel(10);
+        let items = vec![b"hello".to_vec(), b"world".to_vec()];
+        let stream = t_junction(rx, 1).await.pop().unwrap();
+        
+        let items_clone = items.clone();
+        tokio::spawn(async move {
+            for item in items_clone {
+                tx.send(item).await.unwrap();
+            }
+        });
+        
+        let child = stream_to_cmd(stream, "cat", &[]).await.unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout, "hello\nworld\n");
+    }
+}
