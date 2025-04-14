@@ -13,6 +13,37 @@ use crate::utils::fastx::SequenceRecord;
 use crate::utils::file::{write_fastq_record, write_fasta_record};
 
 
+/// Trait to abstract writing items to a file
+pub trait WriteToFile {
+    fn write_to_file(&self, file: &mut File) -> io::Result<()>;
+}
+
+/// Implementation for generic byte-like types
+impl<T> WriteToFile for T
+where
+    T: AsRef<[u8]>,
+{
+    fn write_to_file(&self, file: &mut File) -> io::Result<()> {
+        file.write_all(self.as_ref())?;
+        file.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+/// Implementation for SequenceRecord
+impl WriteToFile for SequenceRecord {
+    fn write_to_file(&self, file: &mut File) -> io::Result<()> {
+        match self {
+            SequenceRecord::Fastq { id, desc, seq, qual } => {
+                write_fastq_record(file, id, desc.as_deref(), seq, qual)
+            }
+            SequenceRecord::Fasta { id, desc, seq } => {
+                write_fasta_record(file, id, desc.as_deref(), seq)
+            }
+        }
+    }
+}
+
 /// Generates any number of output streams from a single input stream.
 /// The streams are all asynchronous.
 ///
@@ -62,16 +93,16 @@ where
 /// # Arguments
 ///
 /// * `input_rx' - Receiver stream: tokio::mpsc
-/// * 'num_streams' - Number of output streams to generate.
+/// * 'out_filename' - output file.
 ///
 /// # Returns
-/// Output stream.
-pub async fn tee_file <T>(
+/// One child stream for continuation of pipeline.
+pub async fn tee<T>(
     input_rx: mpsc::Receiver<T>,
     out_filename: String,
 ) -> BroadcastStream<T>
 where
-    T: Clone + Send + 'static + AsRef<[u8]>,
+    T: WriteToFile + Clone + Send + 'static,
 {
     let out_streams = t_junction(input_rx, 2).await;
 
@@ -88,79 +119,12 @@ where
             }
         };
 
-        // let mut stream = file_stream;
         while let Some(result) = file_stream.next().await {
             match result {
                 Ok(data) => {
-                    if let Err(e) = file.write_all(data.as_ref()) {
+                    if let Err(e) = data.write_to_file(&mut file) {
                         eprintln!("Failed to write data: {}", e);
                         break;
-                    }
-                    if let Err(e) = file.write_all(b"\n") {
-                        eprintln!("Failed to write newline: {}", e);
-                        break;
-                    }
-                }
-                Err(err) => match err {
-                    BroadcastStreamRecvError::Lagged(skipped) => {
-                        eprintln!("File stream lagged, skipped {} items", skipped);
-                    }
-                },
-            }
-            
-        }
-    });
-
-    return_stream
-}
-
-/// Takes a stream of FASTX records from seq_io and asynchronously writes to a file.
-///
-///
-/// # Arguments
-///
-/// * `input_rx' - Receiver stream: tokio::mpsc
-/// * 'num_streams' - Number of output streams to generate.
-///
-/// # Returns
-/// Output stream.
-pub async fn tee_fastx(
-    input_rx: mpsc::Receiver<SequenceRecord>,
-    out_filename: String,
-) -> BroadcastStream<SequenceRecord>
-{
-    let out_streams = t_junction(input_rx, 2).await;
-
-    let mut streams = out_streams.into_iter();
-    let return_stream = streams.next().unwrap();
-    let file_stream = streams.next().unwrap();
-
-    tokio::spawn(async move {
-        let mut file = match File::create(&out_filename) {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("Failed to create file {}: {}", out_filename, e);
-                return;
-            }
-        };
-
-        let mut stream = file_stream;
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(record) => {
-                    match record {
-                        SequenceRecord::Fastq { id, desc, seq, qual } => {
-                            if let Err(e) = write_fastq_record(&mut file, &id, desc.as_deref(), &seq, &qual) {
-                                eprintln!("Failed to write FASTQ record: {}", e);
-                                break;
-                            }
-                        }
-                        SequenceRecord::Fasta { id, desc, seq } => {
-                            if let Err(e) = write_fasta_record(&mut file, &id, desc.as_deref(), &seq) {
-                                eprintln!("Failed to write FASTA record: {}", e);
-                                break;
-                            }
-                        }
                     }
                 }
                 Err(err) => match err {
