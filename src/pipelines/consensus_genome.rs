@@ -1,5 +1,5 @@
 
-use crate::utils::{Arguments, fastx};
+use crate::utils::Arguments;
 use crate::utils::fastx::read_and_interleave_sequences;
 
 
