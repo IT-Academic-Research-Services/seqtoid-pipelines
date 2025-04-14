@@ -18,7 +18,7 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
     // let duration = start.elapsed();
     // println!("Num records: {:?} Time in ms: {}", fq1count,  duration.as_millis());
     
-    let mut rx = read_and_interleave_sequences(&args.file1, args.file2.as_deref(), technology)?;
+    let mut rx = read_and_interleave_sequences(&args.file1, args.file2.as_deref(), technology, args.max_reads)?;
     // 
     // 
     while let Some(record) = rx.recv().await {

@@ -1,3 +1,4 @@
+use std::cmp::max;
 use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
@@ -165,11 +166,12 @@ pub fn read_and_interleave_sequences(
     path1: &str,
     path2: Option<&str>,
     technology: Option<Technology>,
+    max_reads: usize,
 ) -> anyhow::Result<tokio::sync::mpsc::Receiver<SequenceRecord>> {
     let path1 = path1.to_string();
     let path2 = path2.map(String::from);
     let (tx, rx) = tokio::sync::mpsc::channel(100);
-
+    let mut read_counter = 0;
     match (path2, sequence_reader(&path1)?) {
         (Some(path2), SequenceReader::Fastq(_)) => {
             tokio::spawn(async move {
@@ -198,6 +200,10 @@ pub fn read_and_interleave_sequences(
                     }
                     if tx.send(r2_owned).await.is_err() {
                         eprintln!("Failed to send R2 record");
+                        break;
+                    }
+                    read_counter += 1;
+                    if read_counter >= max_reads {
                         break;
                     }
                 }
