@@ -297,11 +297,13 @@ mod tests {
 
     #[test]
     fn test_sequence_reader_fasta() -> io::Result<()> {
-        let mut tmp = NamedTempFile::new()?;
-        writeln!(tmp, ">seq1\ndescr\nATCG")?;
-        let path = tmp.path().to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?;
-
-        let reader = sequence_reader(path)?;
+        let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
+        let path = tmp.path().with_extension("fasta");
+        std::fs::rename(tmp.path(), &path)?;
+        writeln!(tmp, ">seq1 testFASTA\nATCG")?;
+        tmp.flush()?;
+        
+        let reader = sequence_reader(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?)?;
         match reader {
             SequenceReader::Fasta(_) => Ok(()),
             _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
@@ -309,12 +311,15 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn test_sequence_reader_fastq() -> io::Result<()> {
-        let mut tmp = NamedTempFile::new()?;
+        let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
+        let path = tmp.path().with_extension("fastq");
+        std::fs::rename(tmp.path(), &path)?;
         writeln!(tmp, "@seq1\nATCG\n+\nIIII")?;
-        let path = tmp.path().to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?;
+        tmp.flush()?;
 
-        let reader = sequence_reader(path)?;
+        let reader = sequence_reader(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?)?;
         match reader {
             SequenceReader::Fastq(_) => Ok(()),
             _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
