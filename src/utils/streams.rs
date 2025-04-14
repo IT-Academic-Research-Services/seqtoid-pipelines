@@ -44,6 +44,55 @@ impl WriteToFile for SequenceRecord {
     }
 }
 
+
+/// Trait to convert items to bytes for writing to a process's stdin
+pub trait ToBytes {
+    fn to_bytes(&self) -> io::Result<Vec<u8>>;
+}
+
+// Implementation for generic byte-like types
+impl<T> ToBytes for T
+where
+    T: AsRef<[u8]>,
+{
+    fn to_bytes(&self) -> io::Result<Vec<u8>> {
+        let mut bytes = self.as_ref().to_vec();
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+/// Implementation for SequenceRecord
+impl ToBytes for SequenceRecord {
+    fn to_bytes(&self) -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        match self {
+            SequenceRecord::Fastq { id, desc, seq, qual } => {
+                if let Some(desc) = desc {
+                    writeln!(buffer, "@{} {}", id, desc)?;
+                } else {
+                    writeln!(buffer, "@{}", id)?;
+                }
+                buffer.extend_from_slice(seq);
+                buffer.extend_from_slice(b"\n+\n");
+                buffer.extend_from_slice(qual);
+                buffer.push(b'\n');
+            }
+            SequenceRecord::Fasta { id, desc, seq } => {
+                if let Some(desc) = desc {
+                    writeln!(buffer, ">{} {}", id, desc)?;
+                } else {
+                    writeln!(buffer, ">{}", id)?;
+                }
+                buffer.extend_from_slice(seq);
+                buffer.push(b'\n');
+            }
+        }
+        Ok(buffer)
+    }
+}
+
+
 /// Generates any number of output streams from a single input stream.
 /// The streams are all asynchronous.
 ///
@@ -157,7 +206,7 @@ pub async fn stream_to_cmd<T>(
     args: &[&str],
 ) -> io::Result<Child>
 where
-    T: Clone + AsRef<[u8]> + Send + 'static,
+    T: ToBytes + Clone + Send + 'static,
 {
     let mut child = Command::new(command)
         .args(args)
@@ -174,13 +223,17 @@ where
         while let Some(result) = stream.next().await {
             match result {
                 Ok(data) => {
-                    if let Err(e) = stdin.write_all(data.as_ref()).await {
-                        eprintln!("Failed to write to stdin: {}", e);
-                        break;
-                    }
-                    if let Err(e) = stdin.write_all(b"\n").await {
-                        eprintln!("Failed to write newline: {}", e);
-                        break;
+                    match data.to_bytes() {
+                        Ok(bytes) => {
+                            if let Err(e) = stdin.write_all(&bytes).await {
+                                eprintln!("Failed to write to stdin: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to convert data to bytes: {}", e);
+                            break;
+                        }
                     }
                 }
                 Err(BroadcastStreamRecvError::Lagged(skipped)) => {
@@ -306,7 +359,7 @@ mod tests {
     }
     
     #[tokio::test]
-    async fn test_stream_to_cmd_feeds_stdin() {
+    async fn test_stream_to_cmd_feeds_stdin_bytes() {
         let (tx, rx) = mpsc::channel(10);
         let items = vec![b"hello".to_vec(), b"world".to_vec()];
         let stream = t_junction(rx, 1).await.pop().unwrap();
@@ -323,5 +376,28 @@ mod tests {
         
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(stdout, "hello\nworld\n");
+    }
+    
+    #[tokio::test]
+    async fn test_stream_to_cmd_feeds_stdin_fastq() {
+        let (tx, rx) = mpsc::channel(10);
+        let record = SequenceRecord::Fastq {
+            id: "seq1".to_string(),
+            desc: Some("test".to_string()),
+            seq: b"ATCG".to_vec(),
+            qual: b"IIII".to_vec(),
+        };
+        let stream = t_junction(rx, 1).await.pop().unwrap();
+        
+        let record_clone = record.clone();
+        tokio::spawn(async move {
+            tx.send(record_clone).await.unwrap();
+        });
+        
+        let child = stream_to_cmd(stream, "cat", &[]).await.unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout, "@seq1 test\nATCG\n+\nIIII\n");
     }
 }
