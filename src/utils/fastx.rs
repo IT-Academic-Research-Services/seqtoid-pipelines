@@ -173,6 +173,11 @@ pub fn read_and_interleave_sequences(
     let mut read_counter = 0;
     match (path2, sequence_reader(&path1)?) {
         (Some(path2), SequenceReader::Fastq(_)) => {
+            
+            if let Some(Technology::ONT) = technology {
+                return Err(anyhow::anyhow!("Paired-end mode not supported for ONT technology!"));
+            }
+            
             tokio::spawn(async move {
                 let reader1 = sequence_reader(&path1).unwrap();
                 let reader2 = sequence_reader(&path2).unwrap();
