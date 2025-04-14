@@ -6,6 +6,8 @@ use flate2::read::GzDecoder;
 use crate::utils::file::is_gzipped;
 use crate::utils::Technology;
 
+
+/// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone)]
 pub enum SequenceRecord {
     Fasta {
@@ -21,6 +23,7 @@ pub enum SequenceRecord {
     },
 }
 
+/// Maps id and seq to the correct file type.
 impl SequenceRecord {
     pub fn id(&self) -> &str {
         match self {
@@ -60,6 +63,17 @@ impl From<FastqOwnedRecord> for SequenceRecord {
     }
 }
 
+/// Parses a FASTX header.
+///
+///
+/// # Arguments
+///
+/// * `head` - Header line of a FASTX record.
+/// * 'prefix' - Leading, defining character of the header. > for FASTA, @ for FASTQ.
+///
+/// # Returns
+/// Tuple: (id, desc) split of header on whitespace.
+///
 fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     let head_str = String::from_utf8_lossy(head).into_owned();
     let parts: Vec<&str> = head_str.splitn(2, |c: char| c.is_whitespace()).collect();
@@ -68,12 +82,13 @@ fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     (id, desc)
 }
 
-// Custom reader enum for handling compressed/uncompressed files
+/// Custom reader enum for handling compressed/uncompressed files
 pub enum FileReader {
     Uncompressed(BufReader<File>),
     Gzipped(GzDecoder<File>),
 }
 
+/// Trait implementation of reading from either a compressed or uncompressed file.
 impl Read for FileReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -118,8 +133,6 @@ pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
 /// # Returns
 /// u64: Number of records in the FASTQ.
 ///
-
-
 pub fn record_counter(path: &str) -> io::Result<u64> {
     let mut counter = 0;
     match sequence_reader(path)? {
