@@ -1,5 +1,5 @@
 pub mod fastx;
-mod file;
+pub mod file;
 mod streams;
 
 use std::io::Read;

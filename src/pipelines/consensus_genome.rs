@@ -1,5 +1,6 @@
 
 use crate::utils::Arguments;
+use crate::utils::file::file_name_manipulator;
 use crate::utils::fastx::read_and_interleave_sequences;
 
 

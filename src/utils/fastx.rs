@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use flate2::read::GzDecoder;
 use crate::utils::file::is_gzipped;
+use crate::utils::file::file_name_manipulator;
 use crate::utils::Technology;
 
 
@@ -242,7 +243,7 @@ pub fn read_and_interleave_sequences(
                             }
                         }
                         if let Some(max_len) = max_read_len {
-                            if r1_owned.seq().len() > max_len{
+                            if r1_owned.seq().len() > max_len {
                                 eprintln!("Read length above maximum: {}", max_len);
                                 return; // Drop tx to close channel
                             }
@@ -269,7 +270,7 @@ pub fn read_and_interleave_sequences(
                             }
                         }
                         if let Some(max_len) = max_read_len {
-                            if r1_owned.seq().len() > max_len{
+                            if r1_owned.seq().len() > max_len {
                                 eprintln!("Read length above maximum: {}", max_len);
                                 return; // Drop tx to close channel
                             }
