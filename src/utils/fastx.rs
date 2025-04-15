@@ -166,6 +166,8 @@ pub fn read_and_interleave_sequences(
     path2: Option<&str>,
     technology: Option<Technology>,
     max_reads: usize,
+    min_read_len: Option<usize>,
+    max_read_len: Option<usize>,
 ) -> anyhow::Result<tokio::sync::mpsc::Receiver<SequenceRecord>> {
     let path1 = path1.to_string();
     let path2 = path2.map(String::from);
@@ -173,11 +175,11 @@ pub fn read_and_interleave_sequences(
     let mut read_counter = 0;
     match (path2, sequence_reader(&path1)?) {
         (Some(path2), SequenceReader::Fastq(_)) => {
-            
+
             if let Some(Technology::ONT) = technology {
                 return Err(anyhow::anyhow!("Paired-end mode not supported for ONT technology!"));
             }
-            
+
             tokio::spawn(async move {
                 let reader1 = sequence_reader(&path1).unwrap();
                 let reader2 = sequence_reader(&path2).unwrap();
@@ -193,6 +195,20 @@ pub fn read_and_interleave_sequences(
                 while let (Some(Ok(r1)), Some(Ok(r2))) = (records1.next(), records2.next()) {
                     let r1_owned: SequenceRecord = r1.to_owned().into();
                     let r2_owned: SequenceRecord = r2.to_owned().into();
+
+                    if let Some(min_len) = min_read_len {
+                        if r1_owned.seq().len() < min_len || r2_owned.seq().len() < min_len {
+                            eprintln!("Read length below minimum: {}", min_len);
+                            return; // Drop tx to close channel
+                        }
+                    }
+                    if let Some(max_len) = max_read_len {
+                        if r1_owned.seq().len() > max_len || r2_owned.seq().len() > max_len {
+                            eprintln!("Read length above maximum: {}", max_len);
+                            return; // Drop tx to close channel
+                        }
+                    }
+                    
                     if let Some(Technology::illumina) = technology {
                         if !compare_read_ids(r1_owned.id(), r2_owned.id()) {
                             eprintln!("Read ID mismatch in paired-end FASTQ");
@@ -217,7 +233,22 @@ pub fn read_and_interleave_sequences(
             tokio::spawn(async move {
                 for result in reader.into_records() {
                     if let Ok(record) = result {
-                        if tx.send(record.to_owned().into()).await.is_err() {
+                        let r1_owned: SequenceRecord = record.to_owned().into();
+
+                        if let Some(min_len) = min_read_len {
+                            if r1_owned.seq().len() < min_len {
+                                eprintln!("Read length below minimum: {}", min_len);
+                                return; // Drop tx to close channel
+                            }
+                        }
+                        if let Some(max_len) = max_read_len {
+                            if r1_owned.seq().len() > max_len{
+                                eprintln!("Read length above maximum: {}", max_len);
+                                return; // Drop tx to close channel
+                            }
+                        }
+                        
+                        if tx.send(r1_owned.into()).await.is_err() {
                             eprintln!("Failed to send FASTQ record");
                             break;
                         }
@@ -229,7 +260,21 @@ pub fn read_and_interleave_sequences(
             tokio::spawn(async move {
                 for result in reader.into_records() {
                     if let Ok(record) = result {
-                        if tx.send(record.to_owned().into()).await.is_err() {
+                        let r1_owned: SequenceRecord = record.to_owned().into();
+
+                        if let Some(min_len) = min_read_len {
+                            if r1_owned.seq().len() < min_len {
+                                eprintln!("Read length below minimum: {}", min_len);
+                                return; // Drop tx to close channel
+                            }
+                        }
+                        if let Some(max_len) = max_read_len {
+                            if r1_owned.seq().len() > max_len{
+                                eprintln!("Read length above maximum: {}", max_len);
+                                return; // Drop tx to close channel
+                            }
+                        }
+                        if tx.send(r1_owned.to_owned().into()).await.is_err() {
                             eprintln!("Failed to send FASTA record");
                             break;
                         }

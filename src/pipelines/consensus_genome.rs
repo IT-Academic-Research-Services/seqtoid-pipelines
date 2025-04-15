@@ -18,12 +18,19 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
     // let duration = start.elapsed();
     // println!("Num records: {:?} Time in ms: {}", fq1count,  duration.as_millis());
     
-    let mut rx = read_and_interleave_sequences(&args.file1, args.file2.as_deref(), technology, args.max_reads)?;
+    let mut rx = read_and_interleave_sequences(&args.file1, args.file2.as_deref(), technology, args.max_reads, args.min_read_len, args.max_read_len)?;
     // 
     // 
     while let Some(record) = rx.recv().await {
 
         println!("ID: {}", record.id());
+        // println!("Seq: {:?}", record.seq());
+        
+        let seq_len = record.seq().len();
+        println!("Sequence length: {}", seq_len);
+
+        let seq_str = String::from_utf8_lossy(&record.seq()).to_string();
+        println!("Seq: {}", seq_str);
 
         println!("---"); // Separator between records
     }
