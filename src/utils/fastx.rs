@@ -2,11 +2,17 @@ use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
+use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
 use crate::utils::file::is_gzipped;
-use crate::utils::file::file_name_manipulator;
 use crate::utils::Technology;
+use crate::GZIP_EXT;
 
+
+const FASTA_TAG : &str = "fasta";
+const FASTQ_TAG : &str = "fastq";
+const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
+const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone)]
@@ -64,6 +70,48 @@ impl From<FastqOwnedRecord> for SequenceRecord {
     }
 }
 
+
+/// Determines if a file path is a FASTA, FASTQ, or neither.
+/// Checks extensions, not the body.
+///
+/// # Arguments
+///
+/// * `path` - Header line of a FASTX record.
+///
+/// # Returns
+/// Result<String>. Ok fastq or fasta, or err.
+///
+fn fastx_filetype(path: &PathBuf) -> io::Result<String> {
+
+    let last_ext = path.extension().and_then(|e| e.to_str());
+
+    let ext = if last_ext.map(|e| e.eq_ignore_ascii_case(GZIP_EXT)).unwrap_or(false) {
+        path.file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+    } else {
+        last_ext.unwrap_or("")
+    };
+
+    if FASTA_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Ok(FASTA_TAG.to_string());
+    }
+
+    if FASTQ_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+        return Ok(FASTQ_TAG.to_string());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "File '{}' has invalid extension '{}'. Expected FASTA ({:?}) or FASTQ ({:?}).",
+            path.display(), ext, FASTA_EXTS, FASTQ_EXTS
+        ),
+    ))
+
+}
+
 /// Parses a FASTX header.
 ///
 ///
@@ -99,14 +147,23 @@ impl Read for FileReader {
     }
 }
 
-// Enum to hold either FASTA or FASTQ reader
+/// Enum to hold either FASTA or FASTQ reader
 pub enum SequenceReader {
     Fasta(FastaReader<FileReader>),
     Fastq(FastqReader<FileReader>),
 }
 
-// Function to create a SequenceReader based on file type
-pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
+/// Creates a SequenceReader for either FASTA or FASTQ files.
+///
+///
+/// # Arguments
+///
+/// * `path`: &PATHBuf - Valid path to a fastx file.
+///
+/// # Returns
+/// io::Result<SequenceReader>: Result bearing the correct SequenceReader.
+///
+pub fn sequence_reader(path: &PathBuf) -> io::Result<SequenceReader> {
     let file = File::open(path)?;
     let is_gz = is_gzipped(path)?;
     let reader = if is_gz {
@@ -114,14 +171,17 @@ pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
     } else {
         FileReader::Uncompressed(BufReader::new(file))
     };
-
-    // Determine format by extension (or add explicit format detection if needed)
-    let is_fasta = path.to_lowercase().ends_with(".fasta") || path.to_lowercase().ends_with(".fa");
-    Ok(if is_fasta {
-        SequenceReader::Fasta(FastaReader::new(reader))
-    } else {
-        SequenceReader::Fastq(FastqReader::new(reader))
-    })
+    
+    let is_fasta = fastx_filetype(path)?;
+    match is_fasta.as_str() {
+        FASTA_TAG => Ok(SequenceReader::Fasta(FastaReader::new(reader))),
+        FASTQ_TAG => Ok(SequenceReader::Fastq(FastqReader::new(reader))),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported file type for path: {:?}", path),
+        )),
+    }
+    
 }
 
 /// Counts the number of records in a FASTQ.
@@ -134,7 +194,7 @@ pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
 /// # Returns
 /// u64: Number of records in the FASTQ.
 ///
-pub fn record_counter(path: &str) -> io::Result<u64> {
+pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
     let mut counter = 0;
     match sequence_reader(path)? {
         SequenceReader::Fasta(reader) => {
@@ -163,15 +223,15 @@ pub fn record_counter(path: &str) -> io::Result<u64> {
 /// Receiver<Owned Record> stream on an async stream.
 ///
 pub fn read_and_interleave_sequences(
-    path1: &str,
-    path2: Option<&str>,
+    path1: PathBuf,
+    path2: Option<PathBuf>,
     technology: Option<Technology>,
     max_reads: usize,
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
 ) -> anyhow::Result<tokio::sync::mpsc::Receiver<SequenceRecord>> {
-    let path1 = path1.to_string();
-    let path2 = path2.map(String::from);
+
+    
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let mut read_counter = 0;
     match (path2, sequence_reader(&path1)?) {
@@ -359,11 +419,17 @@ mod tests {
         writeln!(tmp, ">seq1 testFASTA\nATCG")?;
         tmp.flush()?;
         
-        let reader = sequence_reader(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?)?;
-        match reader {
-            SequenceReader::Fasta(_) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
+        let reader_result = sequence_reader(&path);
+        match reader_result {
+            Ok(reader) => {
+                match reader {
+                    SequenceReader::Fasta(reader) => { Ok(()) },
+                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
+                }
+            }
+            Err(e) => Err(e),
         }
+        
     }
 
     #[test]
@@ -375,10 +441,15 @@ mod tests {
         writeln!(tmp, "@seq1\nATCG\n+\nIIII")?;
         tmp.flush()?;
 
-        let reader = sequence_reader(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?)?;
-        match reader {
-            SequenceReader::Fastq(_) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
+        let reader_result = sequence_reader(&path);
+        match reader_result {
+            Ok(reader) => {
+                match reader {
+                    SequenceReader::Fastq(reader) => { Ok(()) },
+                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 }

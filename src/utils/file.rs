@@ -2,16 +2,14 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use crate::GZIP_EXT;
+use std::path::{Path, PathBuf};
 
-pub fn is_gzipped(path: &str) -> io::Result<bool> {
+pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; 2];
     file.read_exact(&mut buffer)?;
     Ok(buffer == [0x1F, 0x8B]) // Gzip magic bytes
 }
-
 
 pub fn write_fastq_record(
     file: &mut File,
@@ -55,28 +53,36 @@ pub fn write_fasta_record(
 /// Then returns absolute path.
 /// # Arguments
 ///
-/// * `path`: &str - File path
+/// * `path`: PAthBuf - File path
 /// * 'prefix': Option<&str> = added ahead of base
 /// * 'postfix': Option<&str> = added after of base
 ///
 /// # Returns
 /// Option<PathBuf>: modified, absolute path
 ///
-pub fn file_name_manipulator(path: &str, prefix: Option<&str>, postfix: Option<&str>) -> Option<PathBuf> {
+pub fn file_path_manipulator(path: PathBuf, prefix: Option<&str>, postfix: Option<&str>) -> Option<PathBuf> {
     
     let absolute_path = match fs::canonicalize(path) {
         Ok(path) => path,
-        Err(_) => return None, // Return None if path doesn't exist or canonicalization fails
+        Err(_) => return None,
     };
 
-    let base_file_name = match absolute_path.file_name().and_then(|name| name.to_str()) {
+    let file_name = match absolute_path.file_name().and_then(|name| name.to_str()) {
         Some(name) => name,
-        None => return None, // Return None if no file name or non-UTF-8
+        None => return None, 
     };
 
-    let (base_parts, extensions) = extension_remover(base_file_name);
-    let base = base_parts.into_iter().collect::<Vec<_>>().join(".");
+    let path = Path::new(file_name);
+    let mut extensions = Vec::new();
+    let mut current = path;
+
+    while let Some(ext) = current.extension().and_then(|e| e.to_str()) {
+        extensions.push(ext);
+        current = Path::new(current.file_stem().unwrap_or_default());
+    }
+    extensions.reverse();
     
+    let base = current.to_str().unwrap_or("");
     let new_base = format!(
         "{}{}{}",
         prefix.unwrap_or(""),
@@ -92,59 +98,12 @@ pub fn file_name_manipulator(path: &str, prefix: Option<&str>, postfix: Option<&
 
     let parent = absolute_path
         .parent()
-        .unwrap_or_else(|| std::path::Path::new(""));
+        .unwrap_or_else(|| Path::new(""));
     let new_path = parent.join(new_file_name);
 
     match fs::canonicalize(&new_path) {
         Ok(canonical_path) => Some(canonical_path),
-        Err(_) => Some(new_path), 
+        Err(_) => None,
     }
 }
 
-
-/// Separates a file name, removing its extension and returning as a vec.
-/// If the last ext is .gz, will include the part before it (e.g. fastq.gz)
-/// # Arguments
-///
-/// * `path`: &str - File path
-///
-/// # Returns
-/// (Vec<String>, Vec<String>): base, extension(s)
-///
-fn extension_remover(path: &str) -> (Vec<String>, Vec<String>) {
-
-
-    let path_parts: Vec<&str> = path.split('.').collect();
-    let mut extensions: Vec<String> = Vec::new();
-    let mut base: Vec<String> = Vec::new();
-    let mut count = 0;
-    let mut gzip_present = false;
-
-    for part in path_parts.iter().rev() {
-
-        if count == 0 {
-            if *part == GZIP_EXT {
-                extensions.push(part.to_string());
-                gzip_present = true;
-            } else {
-                extensions.push(part.to_string());
-            }
-        } else if count == 1  {
-            if gzip_present {
-                extensions.push(part.to_string());
-            }
-            else {
-                base.push(part.to_string());
-            }
-
-        }
-        else {
-            base.push(part.to_string());
-        }
-        count += 1; // Increment count to process next part
-    }
-    
-    let revbase : Vec<String> = base.iter().rev().cloned().collect();
-    let revext : Vec<String> = extensions.iter().rev().cloned().collect();
-    (revbase, revext)
-}
