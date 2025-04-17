@@ -1,4 +1,3 @@
-use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
@@ -49,35 +48,54 @@ pub fn write_fasta_record(
 }
 
 
-/// Calls extension_remover to retrieve base and extensions.
-/// Then prepends prefix and appends postfix, if any.
+/// Calls file_name_manipulator to make alterations to the file name.
 /// Then returns absolute path.
 /// # Arguments
 ///
 /// * `path`: PAthBuf - File path
 /// * 'prefix': Option<&str> = added ahead of base
 /// * 'postfix': Option<&str> = added after of base
+/// /// * 'postfix': Option<&str> = added after of base
+// /// * 'delimiter': &str = added between prefix, postfix and base.
 ///
 /// # Returns
-/// Option<PathBuf>: modified, absolute path
-///
-pub fn file_path_manipulator(path: PathBuf, prefix: Option<&str>, postfix: Option<&str>) -> Option<PathBuf> {
+/// PathBuf: modified, absolute path
+pub fn file_path_manipulator(path: &PathBuf, parent_dir: &PathBuf, prefix: Option<&str>, postfix: Option<&str>, delimiter: &str) -> PathBuf {
     
-    let absolute_path = match fs::canonicalize(path) {
-        Ok(path) => path,
-        Err(_) => return None,
-    };
+    
+    
+    let absolute_path = parent_dir.canonicalize().ok().expect("Parent directory not found. {parent_dir:?}");
+    
+    let new_file_name = file_name_manipulator(path, prefix, postfix, delimiter);
+    let new_file_path = PathBuf::from(new_file_name);
+    let absolute_file_path = absolute_path.join(&new_file_path);
+    
+    absolute_file_path
+}
 
-    
-    let (stem, extensions) = extension_remover(&absolute_path);
-    
+
+/// Calls extension_remover to retrieve base and extensions.
+/// Then prepends prefix and appends postfix, if any.
+
+/// # Arguments
+///
+/// * `path`: PAthBuf - File path
+/// * 'prefix': Option<&str> = added ahead of base
+/// * 'postfix': Option<&str> = added after of base
+/// * 'delimiter': &str = added between prefix, postfix and base.
+///
+/// # Returns
+/// String: new file name
+pub fn file_name_manipulator(path: &PathBuf, prefix: Option<&str>, postfix:Option<&str>, delimiter: &str) -> String {
+
+    let (stem, extensions) = extension_remover(&path);
     let base = stem.to_str().unwrap_or("");
-    let new_base = format!(
-        "{}{}{}",
-        prefix.unwrap_or(""),
-        base,
-        postfix.unwrap_or("")
-    );
+    let new_base = match (prefix, postfix) {
+        (Some(p), Some(q)) => format!("{}{}{}{}{}", p, delimiter, base, delimiter, q),
+        (Some(p), None) => format!("{}{}{}", p, delimiter, base),
+        (None, Some(q)) => format!("{}{}{}", base, delimiter, q),
+        (None, None) => base.to_string(),
+    };
 
     let new_file_name = if extensions.is_empty() {
         new_base
@@ -85,17 +103,8 @@ pub fn file_path_manipulator(path: PathBuf, prefix: Option<&str>, postfix: Optio
         format!("{}.{}", new_base, extensions.join("."))
     };
     
-    let parent = absolute_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""));
-    let new_path = parent.join(new_file_name);
-
-    match fs::canonicalize(&new_path) {
-        Ok(canonical_path) => Some(canonical_path),
-        Err(_) => None,
-    }
+    new_file_name
 }
-
 
 pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
     let path = Path::new(&path);
