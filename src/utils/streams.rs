@@ -2,6 +2,7 @@
 use std::fs::File;
 use std::io;
 use std::io::Write;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tokio::process::{Command, Child};
@@ -148,7 +149,7 @@ where
 /// One child stream for continuation of pipeline.
 pub async fn tee<T>(
     input_rx: mpsc::Receiver<T>,
-    out_filename: String,
+    out_path: PathBuf,
 ) -> BroadcastStream<T>
 where
     T: WriteToFile + Clone + Send + 'static,
@@ -160,10 +161,10 @@ where
     let mut file_stream = streams.next().unwrap();
 
     tokio::spawn(async move {
-        let mut file = match File::create(&out_filename) {
+        let mut file = match File::create(&out_path) {
             Ok(file) => file,
             Err(e) => {
-                eprintln!("Failed to create file {}: {}", out_filename, e);
+                eprintln!("Failed to create file {}: {}", out_path.display(), e);
                 return;
             }
         };
@@ -172,17 +173,16 @@ where
             match result {
                 Ok(data) => {
                     if let Err(e) = data.write_to_file(&mut file) {
-                        eprintln!("Failed to write data: {}", e);
+                        eprintln!("Failed to write data to {}: {}", out_path.display(), e);
                         break;
                     }
                 }
-                Err(err) => match err {
-                    BroadcastStreamRecvError::Lagged(skipped) => {
-                        eprintln!("File stream lagged, skipped {} items", skipped);
-                    }
-                },
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    eprintln!("File stream lagged, skipped {} items", skipped);
+                }
             }
         }
+        eprintln!("File stream for {} completed", out_path.display());
     });
 
     return_stream
