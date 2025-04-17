@@ -2,7 +2,7 @@ use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use flate2::read::GzDecoder;
 use crate::utils::file::{extension_remover, is_gzipped};
 use crate::utils::Technology;
@@ -130,8 +130,9 @@ fn fastx_filetype(path: &PathBuf) -> io::Result<String> {
 pub struct R1R2Result {
     pub delimiter: Option<char>,
     pub r1_tag: Option<String>,
-    pub prefix: Option<String>,
+    pub file_name: Option<String>,
     pub index: Option<usize>,
+    
 }
 
 /// Tries to locate
@@ -164,10 +165,13 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                                 } else {
                                     prefix_parts.join(&delimiter.to_string())
                                 };
+
+                                let new_file = format!("{}.{}", prefix, extensions.join("."));
+                                
                                 return R1R2Result {
                                     delimiter: Some(delimiter),
                                     r1_tag: Some(r1_tag),
-                                    prefix: Some(prefix),
+                                    file_name: Some(new_file),
                                     index: Some(index),
                                 };
                             }
@@ -178,7 +182,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                     return R1R2Result {
                         delimiter: None,
                         r1_tag: None,
-                        prefix: None,
+                        file_name: None,
                         index: None,
                     };
                 }
@@ -188,7 +192,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
             return R1R2Result {
                 delimiter: None,
                 r1_tag: None,
-                prefix: None,
+                file_name: None,
                 index: None,
             };
         }
@@ -197,7 +201,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
     return R1R2Result {
         delimiter: None,
         r1_tag: None,
-        prefix: None,
+        file_name: None,
         index: None,
     };
     

@@ -62,14 +62,11 @@ pub fn write_fasta_record(
 /// PathBuf: modified, absolute path
 pub fn file_path_manipulator(path: &PathBuf, parent_dir: &PathBuf, prefix: Option<&str>, postfix: Option<&str>, delimiter: &str) -> PathBuf {
     
-    
-    
     let absolute_path = parent_dir.canonicalize().ok().expect("Parent directory not found. {parent_dir:?}");
-    
     let new_file_name = file_name_manipulator(path, prefix, postfix, delimiter);
     let new_file_path = PathBuf::from(new_file_name);
     let absolute_file_path = absolute_path.join(&new_file_path);
-    
+
     absolute_file_path
 }
 
@@ -79,7 +76,7 @@ pub fn file_path_manipulator(path: &PathBuf, parent_dir: &PathBuf, prefix: Optio
 
 /// # Arguments
 ///
-/// * `path`: PAthBuf - File path
+/// * `path`: PathBuf - File path
 /// * 'prefix': Option<&str> = added ahead of base
 /// * 'postfix': Option<&str> = added after of base
 /// * 'delimiter': &str = added between prefix, postfix and base.
