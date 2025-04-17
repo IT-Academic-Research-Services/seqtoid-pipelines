@@ -4,15 +4,34 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
-use crate::utils::file::is_gzipped;
+use crate::utils::file::{extension_remover, is_gzipped};
 use crate::utils::Technology;
-use crate::GZIP_EXT;
-
+use std::collections::HashMap;
+use lazy_static::lazy_static;
+use tokio::io::AsyncBufReadExt;
 
 const FASTA_TAG : &str = "fasta";
 const FASTQ_TAG : &str = "fastq";
 const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
+
+lazy_static! {
+    static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
+        let mut m = HashMap::new();
+        m.insert("R1", "R2");
+        m.insert("r1", "r2");
+        m.insert("1", "2");
+        m.insert("F", "R");
+        m.insert("f", "r");
+        m.insert("FWD", "REV");
+        m.insert("fwd", "rev");
+        m.insert("PE1", "PE2");
+        m.insert("pe1", "pe2");
+        m.insert("READ1", "READ2");
+        m.insert("read1", "read2");
+        m
+    };
+}
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone)]
@@ -82,34 +101,106 @@ impl From<FastqOwnedRecord> for SequenceRecord {
 /// Result<String>. Ok fastq or fasta, or err.
 ///
 fn fastx_filetype(path: &PathBuf) -> io::Result<String> {
+    let (_, extensions) = extension_remover(path);
 
-    let last_ext = path.extension().and_then(|e| e.to_str());
+    for ext in &extensions {
+        if FASTA_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+            return Ok(FASTA_TAG.to_string());
+        }
 
-    let ext = if last_ext.map(|e| e.eq_ignore_ascii_case(GZIP_EXT)).unwrap_or(false) {
-        path.file_stem()
-            .and_then(|stem| Path::new(stem).extension())
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-    } else {
-        last_ext.unwrap_or("")
-    };
-
-    if FASTA_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
-        return Ok(FASTA_TAG.to_string());
-    }
-
-    if FASTQ_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
-        return Ok(FASTQ_TAG.to_string());
+        if FASTQ_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+            return Ok(FASTQ_TAG.to_string());
+        }
     }
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "File '{}' has invalid extension '{}'. Expected FASTA ({:?}) or FASTQ ({:?}).",
-            path.display(), ext, FASTA_EXTS, FASTQ_EXTS
+            "File '{}' has invalid extension(s) '{:?}'. Expected FASTA ({:?}) or FASTQ ({:?}).",
+            path.display(),
+            extensions,
+            FASTA_EXTS,
+            FASTQ_EXTS
         ),
     ))
+}
 
+
+#[derive(Debug, PartialEq)]
+pub struct R1R2Result {
+    pub delimiter: Option<char>,
+    pub r1_tag: Option<String>,
+    pub prefix: Option<String>,
+    pub index: Option<usize>,
+}
+
+/// Tries to locate
+/// Checks extensions, not the body.
+///
+/// # Arguments
+///
+/// * `path` - Header line of a FASTX record.
+///
+/// # Returns
+/// Result<String>. Ok fastq or fasta, or err.
+///
+pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
+
+    let delimiters = ['_', '.', '-'];
+    let (stem, extensions) = extension_remover(&path);
+    
+    match stem.file_name() {
+        Some(name) => {
+            match name.to_str() {
+                Some(filename) => {
+                    for &delimiter in delimiters.iter() {
+                        let parts: Vec<&str> = filename.split(delimiter).collect();
+                        for (index, part) in parts.iter().enumerate() {
+                            if R1_R2_TAGS.contains_key(part) {
+                                let r1_tag = part.to_string();
+                                let prefix_parts = &parts[..index];
+                                let prefix = if prefix_parts.is_empty() {
+                                    String::new()
+                                } else {
+                                    prefix_parts.join(&delimiter.to_string())
+                                };
+                                return R1R2Result {
+                                    delimiter: Some(delimiter),
+                                    r1_tag: Some(r1_tag),
+                                    prefix: Some(prefix),
+                                    index: Some(index),
+                                };
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return R1R2Result {
+                        delimiter: None,
+                        r1_tag: None,
+                        prefix: None,
+                        index: None,
+                    };
+                }
+            }
+        },
+        None => {
+            return R1R2Result {
+                delimiter: None,
+                r1_tag: None,
+                prefix: None,
+                index: None,
+            };
+        }
+    }
+    
+    return R1R2Result {
+        delimiter: None,
+        r1_tag: None,
+        prefix: None,
+        index: None,
+    };
+    
 }
 
 /// Parses a FASTX header.
