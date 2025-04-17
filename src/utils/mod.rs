@@ -1,6 +1,6 @@
 pub mod fastx;
 pub mod file;
-mod streams;
+pub mod streams;
 
 use std::io::Read;
 use clap::{Parser, ValueEnum};
