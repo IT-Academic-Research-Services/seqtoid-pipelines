@@ -292,7 +292,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(10);
         let items = vec![b"hello".to_vec(), b"world".to_vec()];
         let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path().to_string_lossy().to_string();
+        let path = PathBuf::from(temp_file.path());
+        
         
         let items_clone = items.clone();
         tokio::spawn(async move {
@@ -326,7 +327,7 @@ mod tests {
             qual: b"IIII".to_vec(),
         };
         let temp_file = NamedTempFile::new().unwrap();
-        let path = temp_file.path().to_string_lossy().to_string();
+        let path = PathBuf::from(temp_file.path());
         
         let record_clone = record.clone();
         tokio::spawn(async move {
