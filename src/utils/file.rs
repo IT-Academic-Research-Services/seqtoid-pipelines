@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use crate::GZIP_EXT;
 
 pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
     let mut file = File::open(path)?;
@@ -67,22 +68,10 @@ pub fn file_path_manipulator(path: PathBuf, prefix: Option<&str>, postfix: Optio
         Err(_) => return None,
     };
 
-    let file_name = match absolute_path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => name,
-        None => return None, 
-    };
-
-    let path = Path::new(file_name);
-    let mut extensions = Vec::new();
-    let mut current = path;
-
-    while let Some(ext) = current.extension().and_then(|e| e.to_str()) {
-        extensions.push(ext);
-        current = Path::new(current.file_stem().unwrap_or_default());
-    }
-    extensions.reverse();
     
-    let base = current.to_str().unwrap_or("");
+    let (stem, extensions) = extension_remover(&absolute_path);
+    
+    let base = stem.to_str().unwrap_or("");
     let new_base = format!(
         "{}{}{}",
         prefix.unwrap_or(""),
@@ -95,7 +84,7 @@ pub fn file_path_manipulator(path: PathBuf, prefix: Option<&str>, postfix: Optio
     } else {
         format!("{}.{}", new_base, extensions.join("."))
     };
-
+    
     let parent = absolute_path
         .parent()
         .unwrap_or_else(|| Path::new(""));
@@ -107,3 +96,34 @@ pub fn file_path_manipulator(path: PathBuf, prefix: Option<&str>, postfix: Optio
     }
 }
 
+
+pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
+    let path = Path::new(&path);
+    let mut current = path;
+    let mut extensions = Vec::new();
+
+    while let Some(ext) = current.extension().and_then(|e| e.to_str()) {
+
+        match extensions.len() {
+            1 => {
+                if extensions[0] == GZIP_EXT {
+                    extensions.push(ext.to_string());
+                } else {
+                    break;
+                }
+            }
+            0 => {
+                extensions.push(ext.to_string());
+            }
+            _ => {
+                break;
+            }
+        }
+
+        current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
+    }
+    
+    let mut out_path_buf = PathBuf::from(current.to_string_lossy().into_owned());
+    extensions.reverse();
+    (out_path_buf, extensions)
+}
