@@ -34,6 +34,6 @@ pub struct Arguments {
 #[derive(Debug, Clone, ValueEnum, Default, PartialEq)]
 pub enum Technology {
     #[default]
-    illumina,
+    Illumina,
     ONT
 }

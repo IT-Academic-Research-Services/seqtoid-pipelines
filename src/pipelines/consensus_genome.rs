@@ -8,14 +8,14 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 
 pub async fn run(args: &Arguments) -> anyhow::Result<()> {
-    eprintln!("\n-------------\n Consensus Genome\n-------------\n");
+    println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", args.module);
     
     let cwd = std::env::current_dir()?;
 
     let file1_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
     eprintln!("{}", file1_path.display());
-    let mut sample_base: String;
+    let sample_base: String;
     let file1_r1r2 = r1r2_base(&file1_path);
     match file1_r1r2.file_name {
         Some(prefix) => {sample_base = prefix;}

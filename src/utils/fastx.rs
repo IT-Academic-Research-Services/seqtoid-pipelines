@@ -8,7 +8,6 @@ use crate::utils::file::{extension_remover, is_gzipped};
 use crate::utils::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use tokio::io::AsyncBufReadExt;
 
 const FASTA_TAG : &str = "fasta";
 const FASTQ_TAG : &str = "fastq";
@@ -361,26 +360,27 @@ pub fn read_and_interleave_sequences(
                     if let Some(max_len) = max_read_len {
                         if r1_owned.seq().len() > max_len || r2_owned.seq().len() > max_len {
                             eprintln!("Read length above maximum: {}", max_len);
-                            return; // Drop tx to close channel
+                            return;
                         }
                     }
                     
-                    if let Some(Technology::illumina) = technology {
+                    if let Some(Technology::Illumina) = technology {
                         if !compare_read_ids(r1_owned.id(), r2_owned.id()) {
                             eprintln!("Read ID mismatch in paired-end FASTQ");
+                            return;
                         }
                     }
                     if tx.send(r1_owned).await.is_err() {
                         eprintln!("Failed to send R1 record");
-                        break;
+                        return;
                     }
                     if tx.send(r2_owned).await.is_err() {
                         eprintln!("Failed to send R2 record");
-                        break;
+                        return;
                     }
                     read_counter += 1;
                     if read_counter >= max_reads {
-                        break;
+                        return;
                     }
                 }
             });
@@ -394,13 +394,13 @@ pub fn read_and_interleave_sequences(
                         if let Some(min_len) = min_read_len {
                             if r1_owned.seq().len() < min_len {
                                 eprintln!("Read length below minimum: {}", min_len);
-                                return; // Drop tx to close channel
+                                return;
                             }
                         }
                         if let Some(max_len) = max_read_len {
                             if r1_owned.seq().len() > max_len {
                                 eprintln!("Read length above maximum: {}", max_len);
-                                return; // Drop tx to close channel
+                                return; 
                             }
                         }
                         
@@ -421,13 +421,13 @@ pub fn read_and_interleave_sequences(
                         if let Some(min_len) = min_read_len {
                             if r1_owned.seq().len() < min_len {
                                 eprintln!("Read length below minimum: {}", min_len);
-                                return; // Drop tx to close channel
+                                return;
                             }
                         }
                         if let Some(max_len) = max_read_len {
                             if r1_owned.seq().len() > max_len {
                                 eprintln!("Read length above maximum: {}", max_len);
-                                return; // Drop tx to close channel
+                                return;
                             }
                         }
                         if tx.send(r1_owned.to_owned().into()).await.is_err() {
@@ -526,8 +526,7 @@ mod tests {
         }
         
     }
-
-    #[test]
+    
     #[test]
     fn test_sequence_reader_fastq() -> io::Result<()> {
         let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
