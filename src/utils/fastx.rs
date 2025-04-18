@@ -2,10 +2,35 @@ use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
+use std::path::PathBuf;
 use flate2::read::GzDecoder;
-use crate::utils::file::is_gzipped;
+use crate::utils::file::{extension_remover, is_gzipped};
 use crate::utils::Technology;
+use std::collections::HashMap;
+use lazy_static::lazy_static;
 
+const FASTA_TAG : &str = "fasta";
+const FASTQ_TAG : &str = "fastq";
+const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
+const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
+
+lazy_static! {
+    static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
+        let mut m = HashMap::new();
+        m.insert("R1", "R2");
+        m.insert("r1", "r2");
+        m.insert("1", "2");
+        m.insert("F", "R");
+        m.insert("f", "r");
+        m.insert("FWD", "REV");
+        m.insert("fwd", "rev");
+        m.insert("PE1", "PE2");
+        m.insert("pe1", "pe2");
+        m.insert("READ1", "READ2");
+        m.insert("read1", "read2");
+        m
+    };
+}
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone)]
@@ -63,6 +88,124 @@ impl From<FastqOwnedRecord> for SequenceRecord {
     }
 }
 
+
+/// Determines if a file path is a FASTA, FASTQ, or neither.
+/// Checks extensions, not the body.
+///
+/// # Arguments
+///
+/// * `path` - Header line of a FASTX record.
+///
+/// # Returns
+/// Result<String>. Ok fastq or fasta, or err.
+///
+fn fastx_filetype(path: &PathBuf) -> io::Result<String> {
+    let (_, extensions) = extension_remover(path);
+
+    for ext in &extensions {
+        if FASTA_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+            return Ok(FASTA_TAG.to_string());
+        }
+
+        if FASTQ_EXTS.iter().any(|&e| e.eq_ignore_ascii_case(ext)) {
+            return Ok(FASTQ_TAG.to_string());
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "File '{}' has invalid extension(s) '{:?}'. Expected FASTA ({:?}) or FASTQ ({:?}).",
+            path.display(),
+            extensions,
+            FASTA_EXTS,
+            FASTQ_EXTS
+        ),
+    ))
+}
+
+
+#[derive(Debug, PartialEq)]
+pub struct R1R2Result {
+    pub delimiter: Option<char>,
+    pub r1_tag: Option<String>,
+    pub file_name: Option<String>,
+    pub index: Option<usize>,
+    
+}
+
+/// Tries to locate
+/// Checks extensions, not the body.
+///
+/// # Arguments
+///
+/// * `path` - Header line of a FASTX record.
+///
+/// # Returns
+/// Result<String>. Ok fastq or fasta, or err.
+///
+pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
+
+    let delimiters = ['_', '.', '-'];
+    let (stem, extensions) = extension_remover(&path);
+    
+    match stem.file_name() {
+        Some(name) => {
+            match name.to_str() {
+                Some(filename) => {
+                    for &delimiter in delimiters.iter() {
+                        let parts: Vec<&str> = filename.split(delimiter).collect();
+                        for (index, part) in parts.iter().enumerate() {
+                            if R1_R2_TAGS.contains_key(part) {
+                                let r1_tag = part.to_string();
+                                let prefix_parts = &parts[..index];
+                                let prefix = if prefix_parts.is_empty() {
+                                    String::new()
+                                } else {
+                                    prefix_parts.join(&delimiter.to_string())
+                                };
+
+                                let new_file = format!("{}.{}", prefix, extensions.join("."));
+                                
+                                return R1R2Result {
+                                    delimiter: Some(delimiter),
+                                    r1_tag: Some(r1_tag),
+                                    file_name: Some(new_file),
+                                    index: Some(index),
+                                };
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return R1R2Result {
+                        delimiter: None,
+                        r1_tag: None,
+                        file_name: None,
+                        index: None,
+                    };
+                }
+            }
+        },
+        None => {
+            return R1R2Result {
+                delimiter: None,
+                r1_tag: None,
+                file_name: None,
+                index: None,
+            };
+        }
+    }
+    
+    return R1R2Result {
+        delimiter: None,
+        r1_tag: None,
+        file_name: None,
+        index: None,
+    };
+    
+}
+
 /// Parses a FASTX header.
 ///
 ///
@@ -98,14 +241,23 @@ impl Read for FileReader {
     }
 }
 
-// Enum to hold either FASTA or FASTQ reader
+/// Enum to hold either FASTA or FASTQ reader
 pub enum SequenceReader {
     Fasta(FastaReader<FileReader>),
     Fastq(FastqReader<FileReader>),
 }
 
-// Function to create a SequenceReader based on file type
-pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
+/// Creates a SequenceReader for either FASTA or FASTQ files.
+///
+///
+/// # Arguments
+///
+/// * `path`: &PATHBuf - Valid path to a fastx file.
+///
+/// # Returns
+/// io::Result<SequenceReader>: Result bearing the correct SequenceReader.
+///
+pub fn sequence_reader(path: &PathBuf) -> io::Result<SequenceReader> {
     let file = File::open(path)?;
     let is_gz = is_gzipped(path)?;
     let reader = if is_gz {
@@ -113,14 +265,17 @@ pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
     } else {
         FileReader::Uncompressed(BufReader::new(file))
     };
-
-    // Determine format by extension (or add explicit format detection if needed)
-    let is_fasta = path.to_lowercase().ends_with(".fasta") || path.to_lowercase().ends_with(".fa");
-    Ok(if is_fasta {
-        SequenceReader::Fasta(FastaReader::new(reader))
-    } else {
-        SequenceReader::Fastq(FastqReader::new(reader))
-    })
+    
+    let is_fasta = fastx_filetype(path)?;
+    match is_fasta.as_str() {
+        FASTA_TAG => Ok(SequenceReader::Fasta(FastaReader::new(reader))),
+        FASTQ_TAG => Ok(SequenceReader::Fastq(FastqReader::new(reader))),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported file type for path: {:?}", path),
+        )),
+    }
+    
 }
 
 /// Counts the number of records in a FASTQ.
@@ -133,7 +288,7 @@ pub fn sequence_reader(path: &str) -> io::Result<SequenceReader> {
 /// # Returns
 /// u64: Number of records in the FASTQ.
 ///
-pub fn record_counter(path: &str) -> io::Result<u64> {
+pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
     let mut counter = 0;
     match sequence_reader(path)? {
         SequenceReader::Fasta(reader) => {
@@ -162,16 +317,24 @@ pub fn record_counter(path: &str) -> io::Result<u64> {
 /// Receiver<Owned Record> stream on an async stream.
 ///
 pub fn read_and_interleave_sequences(
-    path1: &str,
-    path2: Option<&str>,
+    path1: PathBuf,
+    path2: Option<PathBuf>,
     technology: Option<Technology>,
+    max_reads: usize,
+    min_read_len: Option<usize>,
+    max_read_len: Option<usize>,
 ) -> anyhow::Result<tokio::sync::mpsc::Receiver<SequenceRecord>> {
-    let path1 = path1.to_string();
-    let path2 = path2.map(String::from);
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
 
+    
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    let mut read_counter = 0;
     match (path2, sequence_reader(&path1)?) {
         (Some(path2), SequenceReader::Fastq(_)) => {
+
+            if let Some(Technology::ONT) = technology {
+                return Err(anyhow::anyhow!("Paired-end mode not supported for ONT technology!"));
+            }
+
             tokio::spawn(async move {
                 let reader1 = sequence_reader(&path1).unwrap();
                 let reader2 = sequence_reader(&path2).unwrap();
@@ -187,18 +350,37 @@ pub fn read_and_interleave_sequences(
                 while let (Some(Ok(r1)), Some(Ok(r2))) = (records1.next(), records2.next()) {
                     let r1_owned: SequenceRecord = r1.to_owned().into();
                     let r2_owned: SequenceRecord = r2.to_owned().into();
-                    if let Some(Technology::illumina) = technology {
+
+                    if let Some(min_len) = min_read_len {
+                        if r1_owned.seq().len() < min_len || r2_owned.seq().len() < min_len {
+                            eprintln!("Read length below minimum: {}", min_len);
+                            return; // Drop tx to close channel
+                        }
+                    }
+                    if let Some(max_len) = max_read_len {
+                        if r1_owned.seq().len() > max_len || r2_owned.seq().len() > max_len {
+                            eprintln!("Read length above maximum: {}", max_len);
+                            return;
+                        }
+                    }
+                    
+                    if let Some(Technology::Illumina) = technology {
                         if !compare_read_ids(r1_owned.id(), r2_owned.id()) {
                             eprintln!("Read ID mismatch in paired-end FASTQ");
+                            return;
                         }
                     }
                     if tx.send(r1_owned).await.is_err() {
                         eprintln!("Failed to send R1 record");
-                        break;
+                        return;
                     }
                     if tx.send(r2_owned).await.is_err() {
                         eprintln!("Failed to send R2 record");
-                        break;
+                        return;
+                    }
+                    read_counter += 1;
+                    if read_counter >= max_reads {
+                        return;
                     }
                 }
             });
@@ -207,7 +389,22 @@ pub fn read_and_interleave_sequences(
             tokio::spawn(async move {
                 for result in reader.into_records() {
                     if let Ok(record) = result {
-                        if tx.send(record.to_owned().into()).await.is_err() {
+                        let r1_owned: SequenceRecord = record.to_owned().into();
+
+                        if let Some(min_len) = min_read_len {
+                            if r1_owned.seq().len() < min_len {
+                                eprintln!("Read length below minimum: {}", min_len);
+                                return;
+                            }
+                        }
+                        if let Some(max_len) = max_read_len {
+                            if r1_owned.seq().len() > max_len {
+                                eprintln!("Read length above maximum: {}", max_len);
+                                return; 
+                            }
+                        }
+                        
+                        if tx.send(r1_owned.into()).await.is_err() {
                             eprintln!("Failed to send FASTQ record");
                             break;
                         }
@@ -219,7 +416,21 @@ pub fn read_and_interleave_sequences(
             tokio::spawn(async move {
                 for result in reader.into_records() {
                     if let Ok(record) = result {
-                        if tx.send(record.to_owned().into()).await.is_err() {
+                        let r1_owned: SequenceRecord = record.to_owned().into();
+
+                        if let Some(min_len) = min_read_len {
+                            if r1_owned.seq().len() < min_len {
+                                eprintln!("Read length below minimum: {}", min_len);
+                                return;
+                            }
+                        }
+                        if let Some(max_len) = max_read_len {
+                            if r1_owned.seq().len() > max_len {
+                                eprintln!("Read length above maximum: {}", max_len);
+                                return;
+                            }
+                        }
+                        if tx.send(r1_owned.to_owned().into()).await.is_err() {
                             eprintln!("Failed to send FASTA record");
                             break;
                         }
@@ -303,14 +514,19 @@ mod tests {
         writeln!(tmp, ">seq1 testFASTA\nATCG")?;
         tmp.flush()?;
         
-        let reader = sequence_reader(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?)?;
-        match reader {
-            SequenceReader::Fasta(_) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
+        let reader_result = sequence_reader(&path);
+        match reader_result {
+            Ok(reader) => {
+                match reader {
+                    SequenceReader::Fasta(reader) => { Ok(()) },
+                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
+                }
+            }
+            Err(e) => Err(e),
         }
+        
     }
-
-    #[test]
+    
     #[test]
     fn test_sequence_reader_fastq() -> io::Result<()> {
         let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
@@ -319,10 +535,15 @@ mod tests {
         writeln!(tmp, "@seq1\nATCG\n+\nIIII")?;
         tmp.flush()?;
 
-        let reader = sequence_reader(path.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid path"))?)?;
-        match reader {
-            SequenceReader::Fastq(_) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
+        let reader_result = sequence_reader(&path);
+        match reader_result {
+            Ok(reader) => {
+                match reader {
+                    SequenceReader::Fastq(reader) => { Ok(()) },
+                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
+                }
+            }
+            Err(e) => Err(e),
         }
     }
 }

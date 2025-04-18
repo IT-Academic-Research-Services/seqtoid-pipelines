@@ -8,6 +8,8 @@ use utils::Arguments;
 
 use pipelines::consensus_genome;
 
+pub const GZIP_EXT: &str = "gz";
+
 #[tokio::main]
 async fn main() {
     let run_start = Instant::now();

@@ -1,8 +1,8 @@
 pub mod fastx;
-mod file;
-mod streams;
+pub mod file;
+pub mod streams;
 
-use std::io::{self, Read};
+use std::io::Read;
 use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Default, Debug)]
@@ -22,12 +22,18 @@ pub struct Arguments {
     
     #[arg(short = 't', long = "technology", default_value = "illumina", value_enum)]
     pub technology: Technology,
+    
+    #[arg(long)]
+    pub min_read_len: Option<usize>,
+    
+    #[arg(long)]
+    pub max_read_len: Option<usize>,
 
 }
 
 #[derive(Debug, Clone, ValueEnum, Default, PartialEq)]
 pub enum Technology {
     #[default]
-    illumina,
+    Illumina,
     ONT
 }
