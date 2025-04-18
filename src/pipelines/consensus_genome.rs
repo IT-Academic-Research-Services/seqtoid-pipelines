@@ -50,7 +50,7 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
 
     let rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
 
-    let mut rrx = tee(rx, validated_interleaved_file_path).await;
+    let mut rrx = tee(rx, validated_interleaved_file_path, true).await;
     while let Some(result) = rrx.next().await {
         match result {
             Ok(record) => {

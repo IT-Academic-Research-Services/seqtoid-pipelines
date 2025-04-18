@@ -1,7 +1,8 @@
 // src/utils/stream.rs
 use std::fs::File;
-use std::io;
-use std::io::Write;
+use std::io::{self, BufWriter, Write};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
@@ -10,40 +11,9 @@ use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use crate::utils::fastx::SequenceRecord;
-use crate::utils::file::{write_fastq_record, write_fasta_record};
+use crate::utils::file::WriteToFile;
+use crate::utils::fastx::{SequenceRecord, FileWriter};
 
-
-/// Trait to abstract writing items to a file
-pub trait WriteToFile {
-    fn write_to_file(&self, file: &mut File) -> io::Result<()>;
-}
-
-/// Implementation for generic byte-like types
-impl<T> WriteToFile for T
-where
-    T: AsRef<[u8]>,
-{
-    fn write_to_file(&self, file: &mut File) -> io::Result<()> {
-        file.write_all(self.as_ref())?;
-        file.write_all(b"\n")?;
-        Ok(())
-    }
-}
-
-/// Implementation for SequenceRecord
-impl WriteToFile for SequenceRecord {
-    fn write_to_file(&self, file: &mut File) -> io::Result<()> {
-        match self {
-            SequenceRecord::Fastq { id, desc, seq, qual } => {
-                write_fastq_record(file, id, desc.as_deref(), seq, qual)
-            }
-            SequenceRecord::Fasta { id, desc, seq } => {
-                write_fasta_record(file, id, desc.as_deref(), seq)
-            }
-        }
-    }
-}
 
 
 /// Trait to convert items to bytes for writing to a process's stdin
@@ -150,6 +120,7 @@ where
 pub async fn tee<T>(
     input_rx: mpsc::Receiver<T>,
     out_path: PathBuf,
+    gz_out: bool,
 ) -> BroadcastStream<T>
 where
     T: WriteToFile + Clone + Send + 'static,
@@ -169,10 +140,16 @@ where
             }
         };
 
+        let mut writer = if gz_out {
+            FileWriter::Gzipped(GzEncoder::new(BufWriter::new(file), Compression::default()))
+        } else {
+            FileWriter::Uncompressed(BufWriter::new(file))
+        };
+
         while let Some(result) = file_stream.next().await {
             match result {
                 Ok(data) => {
-                    if let Err(e) = data.write_to_file(&mut file) {
+                    if let Err(e) = data.write_to_file(&mut writer) {
                         eprintln!("Failed to write data to {}: {}", out_path.display(), e);
                         break;
                     }
@@ -182,7 +159,12 @@ where
                 }
             }
         }
-        eprintln!("File stream for {} completed", out_path.display());
+
+        if let Err(e) = writer.flush() {
+            eprintln!("Failed to flush writer for {}: {}", out_path.display(), e);
+        }
+        
+        println!("File stream for {} completed", out_path.display());
     });
 
     return_stream

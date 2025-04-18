@@ -1,50 +1,71 @@
 use std::fs::File;
 use std::io;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use crate::GZIP_EXT;
+
+
+/// Custom reader enum for handling compressed/uncompressed files
+pub enum FileReader {
+    Uncompressed(BufReader<File>),
+    Gzipped(GzDecoder<File>),
+}
+
+/// Trait implementation of reading from either a compressed or uncompressed file.
+impl Read for FileReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            FileReader::Uncompressed(r) => r.read(buf),
+            FileReader::Gzipped(r) => r.read(buf),
+        }
+    }
+}
+
+pub enum FileWriter {
+    Uncompressed(BufWriter<File>),
+    Gzipped(GzEncoder<BufWriter<File>>),
+}
+
+/// Trait to abstract writing items to a file
+pub trait WriteToFile {
+    fn write_to_file<W: Write>(&self, writer: &mut W) -> io::Result<()>;
+}
+
+impl Write for FileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            FileWriter::Uncompressed(w) => w.write(buf),
+            FileWriter::Gzipped(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            FileWriter::Uncompressed(w) => w.flush(),
+            FileWriter::Gzipped(w) => w.flush(),
+        }
+    }
+}
+
+/// Implementation for generic byte-like types
+impl<T> WriteToFile for T
+where
+    T: AsRef<[u8]>,
+{
+    fn write_to_file<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(self.as_ref())?;
+        writer.write_all(b"\n")?;
+        Ok(())
+    }
+}
 
 pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; 2];
     file.read_exact(&mut buffer)?;
     Ok(buffer == [0x1F, 0x8B]) // Gzip magic bytes
-}
-
-pub fn write_fastq_record(
-    file: &mut File,
-    id: &str,
-    desc: Option<&str>,
-    seq: &[u8],
-    qual: &[u8],
-) -> io::Result<()> {
-    if let Some(desc) = desc {
-        writeln!(file, "@{} {}", id, desc)?;
-    } else {
-        writeln!(file, "@{}", id)?;
-    }
-    file.write_all(seq)?;
-    writeln!(file)?;
-    writeln!(file, "+")?;
-    file.write_all(qual)?;
-    writeln!(file)?;
-    Ok(())
-}
-
-pub fn write_fasta_record(
-    file: &mut File,
-    id: &str,
-    desc: Option<&str>,
-    seq: &[u8],
-) -> io::Result<()> {
-    if let Some(desc) = desc {
-        writeln!(file, ">{} {}", id, desc)?;
-    } else {
-        writeln!(file, ">{}", id)?;
-    }
-    file.write_all(seq)?;
-    writeln!(file)?;
-    Ok(())
 }
 
 
