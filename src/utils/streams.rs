@@ -284,7 +284,7 @@ mod tests {
             }
         });
         
-        let mut stream = tee(rx, path.clone()).await;
+        let mut stream = tee(rx, path.clone(), false).await;
         
         let mut results = Vec::new();
         while let Some(result) = timeout(Duration::from_millis(100), stream.next()).await.unwrap() {
@@ -316,7 +316,7 @@ mod tests {
             tx.send(record_clone).await.unwrap();
         });
         
-        let mut stream = tee(rx, path.clone()).await;
+        let mut stream = tee(rx, path.clone(), false).await;
         
         let mut results = Vec::new();
         while let Some(result) = timeout(Duration::from_millis(100), stream.next()).await.unwrap() {
