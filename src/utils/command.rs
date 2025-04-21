@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use crate::FASTP_TAG;
-use std::collections::{HashMap, HashSet};
 use crate::utils::Arguments;
 
 
