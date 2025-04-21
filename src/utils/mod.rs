@@ -1,6 +1,7 @@
 pub mod fastx;
 pub mod file;
 pub mod streams;
+pub mod command;
 
 use std::io::Read;
 use clap::{Parser, ValueEnum};
@@ -28,6 +29,14 @@ pub struct Arguments {
     
     #[arg(long)]
     pub max_read_len: Option<usize>,
+    
+    #[arg(long, default_value_t = 4)]
+    pub threads: usize,
+    
+    #[arg(short = 'q', long = "quality", default_value_t = 30)]
+    pub quality: u8,
+
+}
 
 }
 
