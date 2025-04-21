@@ -1,15 +1,17 @@
+use std::io;
 use std::path::PathBuf;
+use anyhow::Result;
 use tokio_stream::StreamExt;
 use crate::utils::Arguments;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
-use crate::utils::streams::tee;
+use crate::utils::streams::{stream_to_cmd, tee};
 use crate::utils::command::generate_cli;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use crate::FASTP_TAG;
 
 
-pub async fn run(args: &Arguments) -> anyhow::Result<()> {
+pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", args.module);
     
@@ -47,31 +49,29 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
 
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(sample_base), &cwd, None, Option::from("validated"), "_");
 
-    
+    eprintln!("{}", args.quality);
 
 
     let rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
     
-    match generate_cli(FASTP_TAG, args) {
-        Ok(output) => {eprintln!("{}", output);},
-        Err(err) => {}
-    }
     
     let mut rrx = tee(rx, validated_interleaved_file_path, true).await;
+
+    // let fastp_cmd = generate_cli(FASTP_TAG, &args)?;
     
-    
-    
-    while let Some(result) = rrx.next().await {
-        match result {
-            Ok(record) => {
-                eprintln!("id: {}", record.id());
-                eprintln!("seq: {}", String::from_utf8_lossy(&record.seq()));
-            }
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                eprintln!("Broadcast stream lagged, skipped {} items", skipped);
-            }
-        }
-    }
+    // let rx_child = stream_to_cmd(rrx, fastp_cmd);
+    // 
+    // while let Some(result) = rrx.next().await {
+    //     match result {
+    //         Ok(record) => {
+    //             eprintln!("id: {}", record.id());
+    //             eprintln!("seq: {}", String::from_utf8_lossy(&record.seq()));
+    //         }
+    //         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+    //             eprintln!("Broadcast stream lagged, skipped {} items", skipped);
+    //         }
+    //     }
+    // }
     
     
 
