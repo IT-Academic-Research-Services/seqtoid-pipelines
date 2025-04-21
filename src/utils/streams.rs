@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tokio::process::{Command, Child};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -226,6 +226,46 @@ where
     });
 
     Ok(child)
+}
+
+
+/// Mostly for testing.
+/// Reads child stdout to screen
+///
+/// # Arguments
+///
+/// * `child' - Child process from stream_to_cmd.
+///
+/// # Returns
+/// io::Result<()>
+pub async fn read_child_stdout(mut child: Child) -> io::Result<()> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to open stdout"))?;
+
+    let mut buffer = [0; 1024]; // Adjust buffer size as needed
+    loop {
+        match stdout.read(&mut buffer).await {
+            Ok(0) => { 
+                println!("Child process stdout closed");
+                break;
+            }
+            Ok(n) => {
+                let output = String::from_utf8_lossy(&buffer[..n]);
+                print!("Child stdout: {}", output);
+            }
+            Err(e) => {
+                eprintln!("Failed to read from stdout: {}", e);
+                break;
+            }
+        }
+    }
+
+    let status = child.wait().await?;
+    println!("Child exited with: {}", status);
+
+    Ok(())
 }
 
 #[cfg(test)]
