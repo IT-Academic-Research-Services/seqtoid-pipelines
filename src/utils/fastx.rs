@@ -519,7 +519,7 @@ pub fn read_and_interleave_sequences(
             return Err(anyhow::anyhow!("Paired-end mode not supported for FASTA"));
         }
     }
-
+    eprintln!("read count reached {}", read_counter);
     Ok(rx)
 }
 

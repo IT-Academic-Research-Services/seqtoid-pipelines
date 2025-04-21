@@ -9,6 +9,7 @@ use utils::Arguments;
 use pipelines::consensus_genome;
 
 pub const GZIP_EXT: &str = "gz";
+pub const FASTP_TAG: &str = "fastp";
 
 #[tokio::main]
 async fn main() {

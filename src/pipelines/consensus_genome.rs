@@ -4,7 +4,9 @@ use crate::utils::Arguments;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::tee;
+use crate::utils::command::generate_cli;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use crate::FASTP_TAG;
 
 
 pub async fn run(args: &Arguments) -> anyhow::Result<()> {
@@ -49,8 +51,16 @@ pub async fn run(args: &Arguments) -> anyhow::Result<()> {
 
 
     let rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
-
+    
+    match generate_cli(FASTP_TAG, args) {
+        Ok(output) => {eprintln!("{}", output);},
+        Err(err) => {}
+    }
+    
     let mut rrx = tee(rx, validated_interleaved_file_path, true).await;
+    
+    
+    
     while let Some(result) = rrx.next().await {
         match result {
             Ok(record) => {
