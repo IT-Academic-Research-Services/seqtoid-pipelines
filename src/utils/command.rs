@@ -1,6 +1,6 @@
 /// Functions and structs for working with creating command-line arguments
 
-
+use anyhow::Result;
 use crate::FASTP_TAG;
 use std::collections::{HashMap, HashSet};
 use crate::utils::Arguments;
@@ -17,30 +17,30 @@ use crate::utils::Arguments;
 //     
 // }
 
-fn fastp_arg_generator(args: &Arguments) -> Vec<String> {
-    
-    
-    let mut args = Vec::new();
-    args.push("--stdin");
-    args.push("--stdout");
-    args.push("--interleaved_in");
-    args.push("-q");
-    args.push(args.quality.to_string().as_str());
-    args.push("-w");
-    args.push(args.threads.to_string().as_str());
+mod fastp {
+    use crate::utils::Arguments;
 
-    
-    args 
+    pub fn arg_generator(args: &Arguments) -> Vec<String> {
+        let mut args_vec: Vec<String> = Vec::new();
+        args_vec.push("--stdin".to_string());
+        args_vec.push("--stdout".to_string());
+        args_vec.push("--interleaved_in".to_string());
+        args_vec.push("-q".to_string());
+        args_vec.push(args.quality.to_string());
+        args_vec.push("-w".to_string());
+        args_vec.push(args.threads.to_string());
+        args_vec
+}
 }
 
 
 
-pub fn generate_cli(tool: &str, args: &Arguments) -> Result<String, String> {
+pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
     
 
     let cmd = match tool {
-        FASTP_TAG => fastp_arg_generator(&args),
-        _ => return Err(format!("Unknown tool: {}", tool)),
+        FASTP_TAG => fastp::arg_generator(&args),
+        _ => return Err(anyhow::anyhow!("Unknown tool: {}", tool)),
     };
     
     eprintln!("cmd = {:?}", cmd);
