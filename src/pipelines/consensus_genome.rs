@@ -1,14 +1,10 @@
-use std::io;
 use std::path::PathBuf;
 use anyhow::Result;
-use tokio_stream::StreamExt;
 use crate::utils::Arguments;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
-use crate::utils::streams::{stream_to_cmd, tee};
-use crate::utils::command::generate_cli;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use crate::FASTP_TAG;
+use crate::utils::streams::{stream_to_cmd, t_junction};
+
 
 
 pub async fn run(args: &Arguments) -> Result<()> {
@@ -56,28 +52,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(sample_base), &cwd, None, Option::from("validated"), "_");
     let mut rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
-    let (mut rrx, file_handle) = tee(rx, validated_interleaved_file_path, true).await;
 
-    let start = Instant::now();
-    let mut out_counter = 0;
-    while let Some(result) = rrx.next().await {
-        match result {
-            Ok(_) => {
-                out_counter += 1;
-                if out_counter % 1000 == 0 {
-                    eprintln!("Consumed {} records", out_counter);
-                }
-            }
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                eprintln!("Broadcast stream lagged, skipped {} items after {} records", skipped, out_counter);
-            }
-        }
-    }
-    eprintln!("out count {}, took {} ms", out_counter, start.elapsed().as_millis());
+    let mut streams = t_junction(rx, 2).await;
+    let mut file_stream = streams.pop().unwrap();
+    let mut rrx = streams.pop().unwrap();
 
-    // Await the file writer task
-    file_handle.await.unwrap();
-    eprintln!("File writing completed");
+   
 
     // let fastp_cmd = generate_cli(FASTP_TAG, &args)?;
 

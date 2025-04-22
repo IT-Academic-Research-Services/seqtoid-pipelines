@@ -32,6 +32,18 @@ mod fastp {
 }
 }
 
+mod pigz {
+    use crate::utils::Arguments;
+    
+    pub fn arg_generator(args: &Arguments) -> Vec<String> {
+        let mut args_vec: Vec<String> = Vec::new();
+
+        args_vec.push("-p".to_string());
+        args_vec.push(args.threads.to_string());
+        
+        args_vec
+    }
+}
 
 
 pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
