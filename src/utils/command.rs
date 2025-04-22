@@ -1,7 +1,7 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::Result;
-use crate::FASTP_TAG;
+use crate::{FASTP_TAG, PIGZ_TAG};
 use crate::utils::Arguments;
 
 
@@ -51,6 +51,7 @@ pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
 
     let cmd = match tool {
         FASTP_TAG => fastp::arg_generator(&args),
+        PIGZ_TAG => pigz::arg_generator(&args),
         _ => return Err(anyhow::anyhow!("Unknown tool: {}", tool)),
     };
     

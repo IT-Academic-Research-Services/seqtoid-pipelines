@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use anyhow::Result;
 use crate::utils::Arguments;
+use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::{stream_to_cmd, t_junction};
-
+use crate::{PIGZ_TAG, FASTP_TAG};
 
 
 pub async fn run(args: &Arguments) -> Result<()> {
@@ -47,9 +48,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
 
-    use tokio_stream::StreamExt;
-    use tokio::time::Instant;
-
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(sample_base), &cwd, None, Option::from("validated"), "_");
     let mut rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
 
@@ -57,9 +55,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let mut file_stream = streams.pop().unwrap();
     let mut rrx = streams.pop().unwrap();
 
-   
-
+    // let pigz_cmd = generate_cli(PIGZ_TAG, &args);
+    // eprintln!("{:?}", pigz_cmd);
+    // 
     // let fastp_cmd = generate_cli(FASTP_TAG, &args)?;
+    
+
 
     // let rx_child = stream_to_cmd(rrx, fastp_cmd);
     // 
