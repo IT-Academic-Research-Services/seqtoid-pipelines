@@ -425,8 +425,14 @@ pub fn read_and_interleave_sequences(
 
                 let mut r1_count = 0;
                 let mut r2_count = 0;
+                let mut last_progress = tokio::time::Instant::now();
 
                 while let (Some(r1_result), Some(r2_result)) = (records1.next(), records2.next()) {
+                    if last_progress.elapsed() > tokio::time::Duration::from_secs(15) {
+                        eprintln!("Stall detected at {} read pairs", read_counter);
+                        last_progress = tokio::time::Instant::now();
+                    }
+
                     match (r1_result, r2_result) {
                         (Ok(r1), Ok(r2)) => {
                             let r1_owned: SequenceRecord = r1.to_owned().into();
@@ -434,13 +440,13 @@ pub fn read_and_interleave_sequences(
 
                             if let Some(min_len) = min_read_len {
                                 if r1_owned.seq().len() < min_len || r2_owned.seq().len() < min_len {
-                                    eprintln!("Read length below minimum: {}", min_len);
+                                    eprintln!("Read length below minimum: {} at pair {}", min_len, read_counter + 1);
                                     return;
                                 }
                             }
                             if let Some(max_len) = max_read_len {
                                 if r1_owned.seq().len() > max_len || r2_owned.seq().len() > max_len {
-                                    eprintln!("Read length above maximum: {}", max_len);
+                                    eprintln!("Read length above maximum: {} at pair {}", max_len, read_counter + 1);
                                     return;
                                 }
                             }
@@ -464,10 +470,7 @@ pub fn read_and_interleave_sequences(
                             }
                             r2_count += 1;
 
-                            read_counter += 1; // Increment per pair
-                            if read_counter % 1000 == 0 {
-                                eprintln!("Processed {} read pairs", read_counter);
-                            }
+                            read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
                                 return;
@@ -484,20 +487,46 @@ pub fn read_and_interleave_sequences(
                     }
                 }
 
-                eprintln!(
-                    "Finished reading: {} read pairs, R1 records = {}, R2 records = {}",
-                    read_counter, r1_count, r2_count
-                );
+                eprintln!("Finished reading: {} read pairs", read_counter);
             });
         }
-        // Single-end and FASTA cases unchanged, but update channel capacity
         (None, SequenceReader::Fastq(reader)) => {
             tokio::spawn(async move {
+                let mut last_progress = tokio::time::Instant::now();
                 for result in reader.into_records() {
-                    // ... (unchanged, but use tx.send(...).await)
-                    read_counter += 1;
-                    if read_counter % 1000 == 0 {
-                        eprintln!("Processed {} FASTQ records", read_counter);
+                    if last_progress.elapsed() > tokio::time::Duration::from_secs(15) {
+                        eprintln!("Stall detected at {} FASTQ records", read_counter);
+                        last_progress = tokio::time::Instant::now();
+                    }
+                    match result {
+                        Ok(record) => {
+                            let r1_owned: SequenceRecord = record.to_owned().into();
+                            if let Some(min_len) = min_read_len {
+                                if r1_owned.seq().len() < min_len {
+                                    eprintln!("Read length below minimum: {}", min_len);
+                                    return;
+                                }
+                            }
+                            if let Some(max_len) = max_read_len {
+                                if r1_owned.seq().len() > max_len {
+                                    eprintln!("Read length above maximum: {}", max_len);
+                                    return;
+                                }
+                            }
+                            if tx.send(r1_owned).await.is_err() {
+                                eprintln!("Failed to send FASTQ record at count {}", read_counter + 1);
+                                return;
+                            }
+                            read_counter += 1;
+                            if read_counter >= max_reads {
+                                eprintln!("Reached max reads: {}", max_reads);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading FASTQ record at count {}: {}", read_counter + 1, e);
+                            return;
+                        }
                     }
                 }
                 eprintln!("Finished reading single-end: {} records", read_counter);
@@ -505,11 +534,41 @@ pub fn read_and_interleave_sequences(
         }
         (None, SequenceReader::Fasta(reader)) => {
             tokio::spawn(async move {
+                let mut last_progress = tokio::time::Instant::now();
                 for result in reader.into_records() {
-                    // ... (unchanged, but use tx.send(...).await)
-                    read_counter += 1;
-                    if read_counter % 1000 == 0 {
-                        eprintln!("Processed {} FASTA records", read_counter);
+                    if last_progress.elapsed() > tokio::time::Duration::from_secs(15) {
+                        eprintln!("Stall detected at {} FASTA records", read_counter);
+                        last_progress = tokio::time::Instant::now();
+                    }
+                    match result {
+                        Ok(record) => {
+                            let r1_owned: SequenceRecord = record.to_owned().into();
+                            if let Some(min_len) = min_read_len {
+                                if r1_owned.seq().len() < min_len {
+                                    eprintln!("Read length below minimum: {}", min_len);
+                                    return;
+                                }
+                            }
+                            if let Some(max_len) = max_read_len {
+                                if r1_owned.seq().len() > max_len {
+                                    eprintln!("Read length above maximum: {}", max_len);
+                                    return;
+                                }
+                            }
+                            if tx.send(r1_owned).await.is_err() {
+                                eprintln!("Failed to send FASTA record at count {}", read_counter + 1);
+                                return;
+                            }
+                            read_counter += 1;
+                            if read_counter >= max_reads {
+                                eprintln!("Reached max reads: {}", max_reads);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading FASTA record at count {}: {}", read_counter + 1, e);
+                            return;
+                        }
                     }
                 }
                 eprintln!("Finished reading FASTA: {} records", read_counter);
