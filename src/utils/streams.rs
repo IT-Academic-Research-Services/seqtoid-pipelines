@@ -11,8 +11,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio::task::JoinHandle;
+use tokio::sync::mpsc::{Sender, channel};
 use crate::utils::file::WriteToFile;
 use crate::utils::fastx::{SequenceRecord, FileWriter};
+use std::sync::{Arc, Mutex};
+use tokio::time::{sleep, Duration};
+
+
 
 
 
@@ -82,23 +88,28 @@ pub async fn t_junction<T>(
 where
     T: Clone + Send + 'static,
 {
-    let (tx, _rx) = broadcast::channel(100);
+    let (tx, _rx) = broadcast::channel(50000);
 
-    // Create N broadcast receivers first
     let mut streams = Vec::new();
     for _ in 0..num_streams {
         let rx = tx.subscribe();
         streams.push(BroadcastStream::new(rx));
     }
 
-    // Spawn the task after creating receivers
     tokio::spawn(async move {
         let mut rx = input_rx;
+        let mut count = 0;
         while let Some(item) = rx.recv().await {
+            count += 1;
             if tx.send(item).is_err() {
-                break; // No active receivers
+                eprintln!("Broadcast: No active receivers after {} records", count);
+            }
+            if count % 1000 == 0 {
+                eprintln!("Broadcast sent {} records", count);
+                sleep(Duration::from_millis(2)).await; // Increased throttling
             }
         }
+        eprintln!("Broadcast task completed, sent {} records", count);
     });
 
     streams
@@ -121,7 +132,7 @@ pub async fn tee<T>(
     input_rx: mpsc::Receiver<T>,
     out_path: PathBuf,
     gz_out: bool,
-) -> BroadcastStream<T>
+) -> (BroadcastStream<T>, JoinHandle<()>)
 where
     T: WriteToFile + Clone + Send + 'static,
 {
@@ -131,8 +142,8 @@ where
     let return_stream = streams.next().unwrap();
     let mut file_stream = streams.next().unwrap();
 
-    tokio::spawn(async move {
-        let mut file = match File::create(&out_path) {
+    let handle = tokio::spawn(async move {
+        let file = match File::create(&out_path) {
             Ok(file) => file,
             Err(e) => {
                 eprintln!("Failed to create file {}: {}", out_path.display(), e);
@@ -140,34 +151,61 @@ where
             }
         };
 
-        let mut writer = if gz_out {
-            FileWriter::Gzipped(GzEncoder::new(BufWriter::new(file), Compression::default()))
+        // Wrap writer in Arc<Mutex> to share across spawn_blocking
+        let writer = Arc::new(Mutex::new(if gz_out {
+            FileWriter::Gzipped(GzEncoder::new(BufWriter::with_capacity(4 * 1024 * 1024, file), Compression::default()))
         } else {
-            FileWriter::Uncompressed(BufWriter::new(file))
-        };
+            FileWriter::Uncompressed(BufWriter::with_capacity(4 * 1024 * 1024, file))
+        }));
 
+        let mut file_count = 0;
+        let start = tokio::time::Instant::now();
         while let Some(result) = file_stream.next().await {
             match result {
                 Ok(data) => {
-                    if let Err(e) = data.write_to_file(&mut writer) {
+                    let writer = Arc::clone(&writer);
+                    let write_result = if gz_out {
+
+                        let data = data.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut writer = writer.lock().unwrap();
+                            data.write_to_file(&mut *writer)
+                        }).await.unwrap()
+                    } else {
+                        // Direct write for uncompressed
+                        let mut writer = writer.lock().unwrap();
+                        data.write_to_file(&mut *writer)
+                    };
+
+                    if let Err(e) = write_result {
                         eprintln!("Failed to write data to {}: {}", out_path.display(), e);
                         break;
                     }
+                    file_count += 1;
+                    if file_count % 1000 == 0 {
+                        eprintln!("Wrote {} records to file", file_count);
+                    }
                 }
                 Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    eprintln!("File stream lagged, skipped {} items", skipped);
+                    eprintln!("File stream lagged, skipped {} items after {} records", skipped, file_count);
                 }
             }
         }
 
-        if let Err(e) = writer.flush() {
+        // Flush writer
+        if let Err(e) = writer.lock().unwrap().flush() {
             eprintln!("Failed to flush writer for {}: {}", out_path.display(), e);
         }
-        
-        println!("File stream for {} completed", out_path.display());
+
+        eprintln!(
+            "File stream for {} completed, wrote {} records in {} ms",
+            out_path.display(),
+            file_count,
+            start.elapsed().as_millis()
+        );
     });
 
-    return_stream
+    (return_stream, handle)
 }
 
 
