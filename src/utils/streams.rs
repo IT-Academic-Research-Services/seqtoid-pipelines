@@ -10,7 +10,6 @@ use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::utils::fastx::SequenceRecord;
-use tokio::sync::broadcast::error::RecvError;
 
 
 
