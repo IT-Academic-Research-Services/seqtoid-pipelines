@@ -55,7 +55,5 @@ pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
         _ => return Err(anyhow::anyhow!("Unknown tool: {}", tool)),
     };
     
-    eprintln!("cmd = {:?}", cmd);
-    
     Ok(cmd)
 }
