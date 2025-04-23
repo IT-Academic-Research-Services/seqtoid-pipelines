@@ -2,11 +2,13 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use anyhow::anyhow;
+use anyhow::Result;
 use tokio::sync::broadcast;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration, Instant};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
@@ -14,7 +16,6 @@ use crate::utils::file::WriteToFile;
 use crate::utils::fastx::SequenceRecord;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::process::ChildStdout;
-
 
 
 
@@ -75,20 +76,27 @@ impl ToBytes for SequenceRecord {
 ///
 /// # Arguments
 ///
-/// * `input_rx' - Receiver stream: tokio::mpsc
-/// * 'num_streams' - Number of output streams to generate.
-/// 
-/// # Returns
-/// Vector of output streams.
+/// * `input_stream`: An asynchronous stream yielding items of type `T`.
+/// * `num_streams`: Number of output streams to generate.
+/// * `stall_threshold_secs`: Seconds before logging a stall.
+/// * `sleep_duration_ms`: Optional milliseconds to sleep per item (None for no sleep).
 ///
-pub async fn t_junction<T>(
-    input_rx: mpsc::Receiver<T>,
+/// # Returns
+/// A `Result` containing a tuple of:
+/// - A vector of `BroadcastStream<T>` for downstream processing.
+/// - A `oneshot::Receiver<()>` to await task completion.
+pub async fn t_junction<T, S>(
+    mut input_stream: S,
     num_streams: usize,
-) -> Vec<BroadcastStream<T>>
+    stall_threshold_secs: u64,
+    sleep_duration_ms: Option<u64>,
+) -> anyhow::Result<(Vec<BroadcastStream<T>>, oneshot::Receiver<()>)>
 where
     T: Clone + Send + 'static,
+    S: Stream<Item = T> + Send + 'static + std::marker::Unpin,
 {
-    let (tx, _rx) = broadcast::channel(100000);
+    let (tx, _rx) = broadcast::channel(100_000);
+    let (done_tx, done_rx) = oneshot::channel();
 
     let mut streams = Vec::new();
     for _ in 0..num_streams {
@@ -97,26 +105,33 @@ where
     }
 
     tokio::spawn(async move {
-        let mut rx = input_rx;
         let mut count = 0;
-        let mut last_progress = tokio::time::Instant::now();
+        let mut last_progress = Instant::now();
+        let stall_threshold = Duration::from_secs(stall_threshold_secs);
 
-        while let Some(item) = rx.recv().await {
+        while let Some(item) = input_stream.next().await {
             count += 1;
-            if last_progress.elapsed() > tokio::time::Duration::from_secs(15) {
+            if last_progress.elapsed() > stall_threshold {
                 eprintln!("Broadcast stall detected at {} records", count);
-                last_progress = tokio::time::Instant::now();
+                last_progress = Instant::now();
             }
 
             if tx.send(item).is_err() {
                 eprintln!("Broadcast: No active receivers after {} records", count);
+                let _ = done_tx.send(());
+                return;
             }
-            sleep(Duration::from_millis(1)).await;
+
+            if let Some(duration) = sleep_duration_ms {
+                sleep(Duration::from_millis(duration)).await;
+            }
         }
+
         eprintln!("Broadcast task completed, sent {} records", count);
+        let _ = done_tx.send(());
     });
 
-    streams
+    Ok((streams, done_rx))
 }
 
 

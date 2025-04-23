@@ -51,9 +51,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(sample_base), &cwd, None, Option::from("validated"), "_");
     let mut rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
 
-    let mut streams = t_junction(rx, 2).await;
-    let mut file_stream = streams.pop().unwrap();
-    let mut rrx = streams.pop().unwrap();
+    // let mut streams = t_junction(rx, 2).await;
+    // let mut file_stream = streams.pop().unwrap();
+    // let mut rrx = streams.pop().unwrap();
 
     // let pigz_cmd = generate_cli(PIGZ_TAG, &args);
     // eprintln!("{:?}", pigz_cmd);
