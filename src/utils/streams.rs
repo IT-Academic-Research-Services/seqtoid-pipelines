@@ -1,5 +1,5 @@
 // src/utils/stream.rs
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tokio::sync::{broadcast, oneshot};
