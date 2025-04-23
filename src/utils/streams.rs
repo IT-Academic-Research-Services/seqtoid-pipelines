@@ -342,47 +342,40 @@ pub async fn parse_child_stdout_to_bytes(
 ///
 /// # Arguments
 ///
-/// * `input_stream' - tokio ChldStdout
+/// * `input_stream' - BroadcastStream<T>
 /// * 'output_opatj' - PathBuf for output file
 
 ///
 /// # Returns
-/// Result
-pub async fn stream_to_file(
-    mut input_stream: ChildStdout,
+/// Result<()>
+pub async fn stream_to_file<T>(
+    mut input_stream: BroadcastStream<T>,
     output_path: PathBuf,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    T: ToBytes + Clone + Send + 'static,
+{
     let file = File::create(&output_path)
-        .await // Add await
+        .await
         .map_err(|e| anyhow!("Failed to create file {}: {}", output_path.display(), e))?;
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, &mut input_stream);
 
-    let mut buffer = vec![0; 1024 * 1024]; // 1 MB read buffer
     let mut total_bytes = 0;
     let mut last_progress = Instant::now();
 
-    loop {
+    while let Some(result) = input_stream.next().await {
         if last_progress.elapsed() > Duration::from_secs(15) {
             eprintln!("File writer stall detected at {} bytes", total_bytes);
             last_progress = Instant::now();
         }
 
-        let bytes_read = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|e| anyhow!("Failed to read from stream: {}", e))?;
-
-        if bytes_read == 0 {
-            break;
-        }
-
+        let item = result.map_err(|e| anyhow!("Broadcast stream error: {}", e))?;
+        let bytes = item.to_bytes().map_err(|e| anyhow!("Failed to convert to bytes: {}", e))?;
         writer
-            .write_all(&buffer[..bytes_read])
+            .write_all(&bytes)
             .await
             .map_err(|e| anyhow!("Failed to write to file {}: {}", output_path.display(), e))?;
-
-        total_bytes += bytes_read;
+        total_bytes += bytes.len();
     }
 
     writer
