@@ -144,7 +144,7 @@ pub async fn stream_to_cmd<T>(
 ) -> anyhow::Result<Child>
 where
     T: ToBytes + Clone + Send + 'static,
-    BroadcastStream<T>: Stream<Item = Result<T, RecvError>>,
+    BroadcastStream<T>: Stream<Item = Result<T, tokio_stream::wrappers::errors::BroadcastStreamRecvError>>,
 {
     let cmd = cmd.to_string(); // Clone to owned String
     let mut command = Command::new(&cmd);
@@ -245,7 +245,7 @@ where
 /// * `sydout' - Child process stdout.
 ///
 /// # Returns
-/// Result<BroadcastStream<SequenceRecord>> 
+/// Result<BroadcastStream<SequenceRecord>>
 pub async fn parse_child_stdout_to_fastq(
     stdout: ChildStdout,
 ) -> Result<BroadcastStream<SequenceRecord>> {
@@ -315,7 +315,7 @@ pub async fn parse_child_stdout_to_bytes(
     let mut reader = BufReader::with_capacity(1024 * 1024, stdout);
 
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; 256 * 1024]; 
+        let mut buffer = vec![0u8; 256 * 1024];
         loop {
             match reader.read(&mut buffer).await {
                 Ok(0) => break, // EOF
@@ -401,7 +401,7 @@ pub async fn stream_to_file(
 }
 
 /// A sink for testing output streams.
-/// Reads child stdout to screen. 
+/// Reads child stdout to screen.
 ///
 /// # Arguments
 ///
