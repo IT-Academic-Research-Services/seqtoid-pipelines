@@ -1,4 +1,3 @@
-// src/utils/stream.rs
 use std::io::{self, Write};
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
@@ -12,13 +11,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::utils::fastx::SequenceRecord;
 
 
-
-// ToBytes and implementations (defined locally)
 pub trait ToBytes {
     fn to_bytes(&self) -> std::io::Result<Vec<u8>>;
 }
 
-/// Trait to convert items to bytes for writing to a process's stdin
 impl<T> ToBytes for T
 where
     T: AsRef<[u8]>,
@@ -30,7 +26,6 @@ where
     }
 }
 
-/// Implementation for SequenceRecord
 impl ToBytes for SequenceRecord {
     fn to_bytes(&self) -> io::Result<Vec<u8>> {
         let mut buffer = Vec::new();
@@ -60,21 +55,6 @@ impl ToBytes for SequenceRecord {
     }
 }
 
-
-/// Generates any number of output streams from a single input stream.
-/// The streams are all asynchronous.
-///
-/// # Arguments
-///
-/// * `input_stream`: An asynchronous stream yielding items of type `T`.
-/// * `num_streams`: Number of output streams to generate.
-/// * `stall_threshold_secs`: Seconds before logging a stall.
-/// * `sleep_duration_ms`: Optional milliseconds to sleep per item (None for no sleep).
-///
-/// # Returns
-/// A `Result` containing a tuple of:
-/// - A vector of `BroadcastStream<T>` for downstream processing.
-/// - A `oneshot::Receiver<()>` to await task completion.
 pub async fn t_junction<T, S>(
     mut input_stream: S,
     num_streams: usize,
@@ -98,12 +78,18 @@ where
         let mut count = 0;
         let mut last_progress = Instant::now();
         let stall_threshold = Duration::from_secs(stall_threshold_secs);
+        let max_buffer = 90_000;
 
         while let Some(item) = input_stream.next().await {
             count += 1;
             if last_progress.elapsed() > stall_threshold {
                 eprintln!("Broadcast stall detected at {} records", count);
                 last_progress = Instant::now();
+            }
+
+            while tx.len() > max_buffer {
+                eprintln!("Broadcast buffer high ({} items), pausing at {} records", tx.len(), count);
+                sleep(Duration::from_millis(10)).await;
             }
 
             if tx.send(item).is_err() {
@@ -124,18 +110,6 @@ where
     Ok((streams, done_rx))
 }
 
-
-/// Asynchronously spawn an external process and feed it a stream as stdin.
-/// Capture stdout and return from function.
-///
-/// # Arguments
-///
-/// * `stream' - Receiver stream: tokio::mpsc
-/// * 'command' - command to shell out
-/// * 'args' = args for shelled out command
-///
-/// # Returns
-/// tokio::process::Command containing stdout and stderr
 pub async fn stream_to_cmd<T>(
     mut input_stream: BroadcastStream<T>,
     cmd: &str,
@@ -145,7 +119,7 @@ where
     T: ToBytes + Clone + Send + 'static,
     BroadcastStream<T>: Stream<Item = Result<T, tokio_stream::wrappers::errors::BroadcastStreamRecvError>>,
 {
-    let cmd = cmd.to_string(); // Clone to owned String
+    let cmd = cmd.to_string();
     let mut command = Command::new(&cmd);
     command
         .args(args.as_slice())
@@ -169,7 +143,7 @@ where
 
     {
         let cmd = cmd.clone();
-        let args = args.clone(); // Clone for stderr task
+        let args = args.clone();
         tokio::spawn(async move {
             let mut stderr_reader = tokio::io::BufReader::new(stderr);
             let mut line = String::new();
@@ -185,7 +159,7 @@ where
 
     {
         let cmd = cmd.clone();
-        let args = args.clone(); // Clone for stdin task
+        let args = args.clone();
         tokio::spawn(async move {
             let mut stdin_writer = BufWriter::with_capacity(4 * 1024 * 1024, &mut stdin);
             let mut count = 0;
@@ -222,6 +196,7 @@ where
                     }
                     Err(e) => {
                         eprintln!("{} {} stream error after {} records: {:?}", cmd, args.join(" "), count, e);
+                        break; // Stop on stream errors like lag
                     }
                 }
             }
@@ -299,14 +274,6 @@ pub async fn parse_child_stdout_to_fastq(
 }
 
 
-/// Takes output from stream_to_cmd and outputs it as a byte stream.
-///
-/// # Arguments
-///
-/// * `sydout' - Child process stdout.
-///
-/// # Returns
-/// Result<BroadcastStream<Vec<u8>>>
 pub async fn parse_child_stdout_to_bytes(
     stdout: ChildStdout,
 ) -> Result<BroadcastStream<Vec<u8>>> {
@@ -331,7 +298,6 @@ pub async fn parse_child_stdout_to_bytes(
                 }
             }
         }
-        // Reader dropped, channel remains open
     });
 
     Ok(BroadcastStream::new(rx))
@@ -392,25 +358,16 @@ where
     Ok(())
 }
 
-/// A sink for testing output streams.
-/// Reads child stdout to screen.
-///
-/// # Arguments
-///
-/// * `child' - Child process from stream_to_cmd.
-///
-/// # Returns
-/// io::Result<()>
 pub async fn read_child_stdout(mut child: Child) -> io::Result<()> {
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to open stdout"))?;
 
-    let mut buffer = [0; 1024]; // Adjust buffer size as needed
+    let mut buffer = [0; 1024];
     loop {
         match stdout.read(&mut buffer).await {
-            Ok(0) => { 
+            Ok(0) => {
                 println!("Child process stdout closed");
                 break;
             }
@@ -430,7 +387,6 @@ pub async fn read_child_stdout(mut child: Child) -> io::Result<()> {
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -456,6 +412,7 @@ mod tests {
         assert_eq!(records[1].seq(), b"GCTA");
         Ok(())
     }
+
     #[tokio::test]
     async fn test_parse_child_stdout_to_bytes() -> Result<()> {
         let mut cmd = Command::new("echo");
