@@ -64,6 +64,19 @@ impl SequenceRecord {
             SequenceRecord::Fastq { seq, .. } => seq,
         }
     }
+    pub fn qual(&self) -> &[u8] {
+        match self {
+            SequenceRecord::Fasta { .. } => &[],
+            SequenceRecord::Fastq { qual, .. } => qual,
+        }
+    }
+
+    pub fn desc(&self) -> Option<&str> {
+        match self {
+            SequenceRecord::Fasta { desc, .. } => desc.as_deref(),
+            SequenceRecord::Fastq { desc, .. } => desc.as_deref(),
+        }
+    }
 }
 
 impl From<FastaOwnedRecord> for SequenceRecord {
