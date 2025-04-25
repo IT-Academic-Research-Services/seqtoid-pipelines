@@ -3,7 +3,6 @@ pub mod file;
 pub mod streams;
 pub mod command;
 
-use std::io::Read;
 use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Default, Debug)]
