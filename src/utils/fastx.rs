@@ -34,7 +34,7 @@ lazy_static! {
 }
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum SequenceRecord {
     Fasta {
         id: String,
