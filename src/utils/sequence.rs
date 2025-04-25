@@ -1,6 +1,7 @@
 use rand::rngs::ThreadRng;
 use rand::seq::IndexedRandom;
 use rand::rng;
+use rand_distr::{Normal, Distribution};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DNA {
@@ -53,6 +54,29 @@ impl DNA {
 
 fn phred33(score: u8) -> u8 {
     score + 33
+}
+
+fn normal_phred_qual(mean: f32, stdev: f32) -> u8 {
+    let mut raw_phred = -1.0;
+
+    let normal = Normal::new(mean, stdev).unwrap();
+    
+    while raw_phred < 0.0 || raw_phred > 40.0 {
+        raw_phred = normal.sample(&mut rand::rng());
+    }
+    
+    phred33(raw_phred as u8)
+}
+
+pub fn normal_phred_qual_string(length: usize, mean: f32, stdev: f32) -> String {
+
+    let mut quals = String::new();
+    
+    for _i in 0..length {
+        quals.push(normal_phred_qual(mean, stdev) as char);
+    }
+    
+    quals
 }
 
 #[cfg(test)]

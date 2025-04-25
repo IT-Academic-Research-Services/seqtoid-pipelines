@@ -8,8 +8,9 @@ use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::utils::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use crate::utils::sequence::DNA;
+use crate::utils::sequence::{DNA, normal_phred_qual_string};
 use futures::Stream;
+use tokio_stream::iter;
 
 const FASTA_TAG : &str = "fasta";
 const FASTQ_TAG : &str = "fastq";
@@ -310,8 +311,30 @@ pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
 }
 
 
-pub fn fastx_generator(num_records: usize, seq_len: usize) -> impl Stream<Item = SequenceRecord> {
-
+/// Generates FASTQ (not yet FASTA) records
+/// # Arguments
+///
+/// * `num_records` - Number of SequenceRecords to make.
+/// * 'seq_len' = Length of each seq.
+/// * 'mean' = Mean quality of bases
+/// * 'stdev' = St Dev of quality of bases. 
+///
+/// # Returns
+/// Stream<Item = SequenceRecord>
+pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32) -> impl Stream<Item = SequenceRecord> {
+    let records: Vec<SequenceRecord> = (0..num_records)
+        .map(|i| {
+            let seq = DNA::random_sequence(seq_len);
+            let qual = normal_phred_qual_string(seq_len, mean, stdev);
+            SequenceRecord::Fastq {
+                id: format!("read{}", i + 1),
+                desc: None,
+                seq: seq.into_bytes(),
+                qual: qual.into_bytes(),
+            }
+        })
+        .collect();
+    iter(records)
 
 }
 

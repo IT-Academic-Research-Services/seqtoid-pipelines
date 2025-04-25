@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::time::Duration;
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
-use crate::utils::fastx::SequenceRecord;
+use crate::utils::fastx::{SequenceRecord, fastx_generator};
 
 pub trait ToBytes {
     fn to_bytes(&self) -> Result<Vec<u8>>;
@@ -341,6 +341,31 @@ mod tests {
         assert_eq!(records1[0].id(), "read1");
         assert_eq!(records2[0].id(), "read1");
         done_rx.await?;
+        
+        // test longer stream of good quality
+        let stream = fastx_generator(10000, 143, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+        let mut output1 = outputs.pop().unwrap();
+        let mut output2 = outputs.pop().unwrap();
+        let mut records1 = Vec::new();
+        let mut records2 = Vec::new();
+        while let Some(Ok(record)) = output1.next().await {
+            records1.push(record);
+        }
+        while let Some(Ok(record)) = output2.next().await {
+            records2.push(record);
+        }
+        assert_eq!(records1.len(), 10000);
+        assert_eq!(records2.len(), 10000);
+
+        done_rx.await?;
+
+
+        // let stream = fastx_generator(10000, 143, 35.0, 3.0);
+        // let (mut outputs, done_rx) = t_junction(stream, 10, 1000, None).await?;
+        // 
+        // 
+        
         Ok(())
     }
 
