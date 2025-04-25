@@ -55,20 +55,19 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     // Pigz stream
     let pigz_args = generate_cli(PIGZ_TAG, &args)?;
-    eprintln!("pigz_args: {:?}", pigz_args);
+    // eprintln!("pigz_args: {:?}", pigz_args);
     let pigz_args: Vec<&str> = pigz_args.iter().map(|s| s.as_str()).collect();
     let mut pigz_child = stream_to_cmd(pigz_stream, PIGZ_TAG, pigz_args).await?;
     let pigz_stdout = pigz_child.stdout.take().ok_or_else(|| anyhow!("Failed to get stdout from pigz"))?;
     let pigz_stream = parse_child_stdout_to_bytes(pigz_stdout).await?;
     let mut pigz_task = tokio::spawn(async move {
         let result = stream_bytes_to_file(pigz_stream, validated_interleaved_file_path.clone()).await;
-        eprintln!("pigz_task completed: {:?}", result);
         result
     });
 
     // Fastp stream
     let fastp_args = generate_cli(FASTP_TAG, &args)?;
-    eprintln!("fastp_args: {:?}", fastp_args);
+    // eprintln!("fastp_args: {:?}", fastp_args);
     let fastp_args: Vec<&str> = fastp_args.iter().map(|s| s.as_str()).collect();
     let mut fastp_child = stream_to_cmd(fastp_stream, FASTP_TAG, fastp_args).await?;
     let fastp_stdout = fastp_child.stdout.take().ok_or_else(|| anyhow!("Failed to get stdout from fastp"))?;
@@ -76,12 +75,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let (fastp_tx, fastp_rx) = tokio::sync::mpsc::channel(20000); // Use mpsc channel
     let mut fastp_parse_task = tokio::spawn(async move {
         let result = parse_child_stdout_to_fastq(fastp_stdout, fastp_tx).await;
-        eprintln!("fastp_parse_task completed: {:?}", result);
+
         result
     });
     let mut fastp_write_task = tokio::spawn(async move {
         let result = stream_to_file(fastp_rx, PathBuf::from("test_fastp.fq")).await;
-        eprintln!("fastp_write_task completed: {:?}", result);
         result
     });
     let mut fastp_stderr_task = tokio::spawn(async move {
@@ -90,13 +88,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let mut buffer = String::new();
             while let Ok(bytes) = stderr.read_line(&mut buffer).await {
                 if bytes == 0 { break; }
-                eprintln!("fastp stderr: {}", buffer.trim());
+                // eprintln!("fastp stderr: {}", buffer.trim());  // turnt his back on once you set up verbosity
                 buffer.clear();
             }
         } else {
-            eprintln!("Warning: fastp stderr not available");
         }
-        eprintln!("fastp_stderr_task completed");
         Ok::<(), anyhow::Error>(())
     });
 
@@ -113,22 +109,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
         tokio::select! {
             result = &mut fastp_parse_task, if !fastp_parse_done => {
                 let result = result.map_err(|e| anyhow!("Fastp parse task failed: {}", e))?;
-                eprintln!("fastp_parse_task completed: {:?}", result);
                 fastp_parse_done = true;
             }
             result = &mut fastp_write_task, if !fastp_write_done => {
                 let result = result.map_err(|e| anyhow!("Fastp write task failed: {}", e))?;
-                eprintln!("fastp_write_task completed: {:?}", result);
                 fastp_write_done = true;
             }
             result = &mut fastp_stderr_task, if !fastp_stderr_done => {
                 let result = result.map_err(|e| anyhow!("Fastp stderr task failed: {}", e))?;
-                eprintln!("fastp_stderr_task completed: {:?}", result);
                 fastp_stderr_done = true;
             }
             status = fastp_child.wait(), if !fastp_done && fastp_parse_done && fastp_write_done && fastp_stderr_done => {
                 let status = status.map_err(|e| anyhow!("Failed to wait for fastp: {}", e))?;
-                eprintln!("fastp_child completed with status: {}", status);
                 if !status.success() {
                     return Err(anyhow!("Fastp exited with non-zero status: {}", status));
                 }
@@ -136,7 +128,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
             status = pigz_child.wait(), if !pigz_done => {
                 let status = status.map_err(|e| anyhow!("Failed to wait for pigz: {}", e))?;
-                eprintln!("pigz_child completed with status: {}", status);
                 if !status.success() {
                     return Err(anyhow!("Pigz exited with non-zero status: {}", status));
                 }
@@ -144,11 +135,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
             result = &mut pigz_task, if !pigz_task_done => {
                 let result = result.map_err(|e| anyhow!("Pigz task failed: {}", e))?;
-                eprintln!("pigz_task completed: {:?}", result);
+
                 pigz_task_done = true;
             }
             result = &mut done_rx, if !t_junction_done => {
-                eprintln!("t_junction completed: {:?}", result);
+
                 match result {
                     Ok(()) => t_junction_done = true,
                     Err(e) => return Err(anyhow!("t_junction failed: {}", e)),

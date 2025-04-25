@@ -24,10 +24,10 @@ mod fastp {
         args_vec.push("--stdin".to_string());
         args_vec.push("--stdout".to_string());
         args_vec.push("--interleaved_in".to_string());
-        args_vec.push("-Q".to_string());
+        // args_vec.push("-Q".to_string());
 
-        // args_vec.push("-q".to_string());
-        // args_vec.push(args.quality.to_string());
+        args_vec.push("-q".to_string());
+        args_vec.push(args.quality.to_string());
         args_vec.push("-w".to_string());
         args_vec.push(args.threads.to_string());
         args_vec

@@ -499,8 +499,7 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-
-                eprintln!("Finished reading: {} read pairs", read_counter);
+                
             });
         }
         (None, SequenceReader::Fastq(reader)) => {

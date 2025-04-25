@@ -3,15 +3,12 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tokio::sync::{broadcast, oneshot};
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, Duration};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::utils::fastx::SequenceRecord;
-use tokio::sync::broadcast::{Receiver, Sender};
-use std::pin::Pin;
-
 
 
 
@@ -76,7 +73,6 @@ where
         .collect();
     let (done_tx, done_rx) = oneshot::channel();
 
-    // Pin the input stream to ensure it is Unpin and Send
     let mut input = Box::pin(input);
 
     tokio::spawn(async move {
@@ -88,15 +84,12 @@ where
             }
             count += 1;
 
-            // Log stalls
             if count % stall_threshold == 0 {
-                eprintln!("Broadcast stall detected at {} records", count);
                 if let Some(sleep_ms) = stream_sleep_ms {
                     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                 }
             }
         }
-        eprintln!("Finished broadcasting {} records", count);
         let _ = done_tx.send(());
     });
 
@@ -108,7 +101,7 @@ pub async fn stream_to_cmd(
     cmd_tag: &str,
     cmd_args: Vec<&str>,
 ) -> Result<Child> {
-    eprintln!("Spawning {} with args: {:?}", cmd_tag, cmd_args);
+    // eprintln!("Spawning {} with args: {:?}", cmd_tag, cmd_args);
     let mut cmd = Command::new(cmd_tag);
     cmd.args(&cmd_args)
         .stdin(std::process::Stdio::piped())
@@ -116,12 +109,6 @@ pub async fn stream_to_cmd(
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag, e))?;
 
-    eprintln!("Spawned {}: stdin={:?}, stdout={:?}, stderr={:?}",
-              cmd_tag,
-              child.stdin.is_some(),
-              child.stdout.is_some(),
-              child.stderr.is_some()
-    );
 
     let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag))?;
     let cmd_tag_owned = cmd_tag.to_string(); // Clone to String for 'static lifetime
@@ -175,7 +162,7 @@ pub async fn stream_to_cmd(
             eprintln!("Error flushing {} stdin: {}", cmd_tag_owned, e);
             return Err(anyhow!("Error flushing {} stdin: {}", cmd_tag_owned, e));
         }
-        eprintln!("Finished writing {} records to {} stdin", count, cmd_tag_owned);
+
         Ok::<(), anyhow::Error>(())
     });
 
@@ -261,7 +248,6 @@ pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
             }
         };
         if bytes_read == 0 {
-            println!("Reached EOF at record {}", count);
             break; // EOF
         }
         let id_line = buffer.trim_end();
@@ -314,7 +300,6 @@ pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
 
         // Validate sequence and quality lengths
         if seq.len() != qual.len() {
-            eprintln!("Sequence length ({}) != quality length ({}) at record {}", seq.len(), qual.len(), count);
             return Err(anyhow!("Sequence length ({}) != quality length ({}) for record {}", seq.len(), qual.len(), count));
         }
 
@@ -326,21 +311,8 @@ pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
             qual,
         };
 
-        // Log first 16 records
-        if count < 16 {
-            println!(
-                "Parsed record {}: id={}, seq_len={}, qual_len={}, desc={:?}",
-                count,
-                record.id(),
-                record.seq().len(),
-                record.qual().len(),
-                record.desc()
-            );
-        }
-
         // Send record
         if let Err(e) = sender.send(record).await {
-            eprintln!("Failed to send record {}: {}", count, e);
             return Err(anyhow!("Failed to send record: {}", e));
         }
         count += 1;
@@ -350,8 +322,7 @@ pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
             sleep(Duration::from_millis(1)).await;
         }
     }
-
-    println!("Total records parsed: {}", count);
+    
     Ok(())
 }
 
@@ -446,9 +417,7 @@ pub async fn stream_to_file(
     let mut file = File::create(&path).await?;
     let mut count = 0;
     while let Some(record) = rx.recv().await {
-        if count < 16 {
-            println!("Writing record {}: id={}, seq_len={}", count, record.id(), record.seq().len());
-        }
+
         if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
             file.write_all(b"@").await?;
             file.write_all(id.as_bytes()).await?;
@@ -464,10 +433,7 @@ pub async fn stream_to_file(
             count += 1;
         }
     }
-    if count < 47108 {
-        eprintln!("stream_to_file stopped early at {} sequences, expected ~47108", count);
-    }
-    println!("Wrote {} sequences to {}", count, path.display());
+    
     Ok(())
 }
 
@@ -508,7 +474,6 @@ pub async fn stream_bytes_to_file(mut rx: tokio_stream::wrappers::BroadcastStrea
         file.write_all(&bytes).await?;
         total_bytes += bytes.len();
     }
-    println!("Wrote {} bytes to {}", total_bytes, path.display());
     Ok(())
 }
 
