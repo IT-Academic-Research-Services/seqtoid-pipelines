@@ -359,12 +359,27 @@ mod tests {
         assert_eq!(records2.len(), 10000);
 
         done_rx.await?;
+        
+        let stream = fastx_generator(10000, 143, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 10, 1000, None).await?;
 
+        let mut records = Vec::new();
+        for _output in &outputs {
+           let record :Vec<SequenceRecord> = Vec::new();
+            records.push(record);
+        }
+        
+        for i in 0..records.len() {
+            while let Some(Ok(record)) = outputs[i].next().await {
+                records[i].push(record);
+            }
+        }
 
-        // let stream = fastx_generator(10000, 143, 35.0, 3.0);
-        // let (mut outputs, done_rx) = t_junction(stream, 10, 1000, None).await?;
-        // 
-        // 
+        for i in 0..records.len() {
+            assert_eq!(records[i].len(), 10000)
+        }
+        done_rx.await?;
+        
         
         Ok(())
     }
