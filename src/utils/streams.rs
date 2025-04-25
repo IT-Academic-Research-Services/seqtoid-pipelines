@@ -248,8 +248,8 @@ pub async fn parse_child_stdout_to_bytes(stdout: ChildStdout) -> Result<Broadcas
 ///
 /// # Arguments
 ///
-/// * `input_stream' - BroadcastStream<T>
-/// * 'output_opatj' - PathBuf for output file
+/// * `rx' - BroadcastStream<T>
+/// * 'path' - PathBuf for output file
 
 ///
 /// # Returns
@@ -282,6 +282,7 @@ pub async fn stream_bytes_to_file(mut rx: BroadcastStream<Vec<u8>>, path: PathBu
 ///
 /// # Returns
 /// io::Result<()>
+#[allow(dead_code)]
 pub async fn read_child_stdout(mut child: Child) -> Result<()> {
     let mut stdout = child
         .stdout

@@ -1,9 +1,8 @@
 use std::fs::File;
 use std::io;
-use std::io::{BufReader, Read, BufWriter, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use crate::GZIP_EXT;
 
 
@@ -20,44 +19,6 @@ impl Read for FileReader {
             FileReader::Uncompressed(r) => r.read(buf),
             FileReader::Gzipped(r) => r.read(buf),
         }
-    }
-}
-
-pub enum FileWriter {
-    Uncompressed(BufWriter<File>),
-    Gzipped(GzEncoder<BufWriter<File>>),
-}
-
-/// Trait to abstract writing items to a file
-pub trait WriteToFile {
-    fn write_to_file<W: Write>(&self, writer: &mut W) -> io::Result<()>;
-}
-
-impl Write for FileWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            FileWriter::Uncompressed(w) => w.write(buf),
-            FileWriter::Gzipped(w) => w.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            FileWriter::Uncompressed(w) => w.flush(),
-            FileWriter::Gzipped(w) => w.flush(),
-        }
-    }
-}
-
-/// Implementation for generic byte-like types
-impl<T> WriteToFile for T
-where
-    T: AsRef<[u8]>,
-{
-    fn write_to_file<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(self.as_ref())?;
-        writer.write_all(b"\n")?;
-        Ok(())
     }
 }
 
@@ -150,7 +111,7 @@ pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
         current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
     }
     
-    let mut out_path_buf = PathBuf::from(current.to_string_lossy().into_owned());
+    let out_path_buf = PathBuf::from(current.to_string_lossy().into_owned());
     extensions.reverse();
     (out_path_buf, extensions)
 }

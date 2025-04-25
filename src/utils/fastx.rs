@@ -1,11 +1,10 @@
 use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader};
 use std::path::PathBuf;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use crate::utils::file::{extension_remover, is_gzipped, FileReader, WriteToFile};
+use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::utils::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
@@ -64,6 +63,7 @@ impl SequenceRecord {
             SequenceRecord::Fastq { seq, .. } => seq,
         }
     }
+    #[allow(dead_code)]
     pub fn qual(&self) -> &[u8] {
         match self {
             SequenceRecord::Fasta { .. } => &[],
@@ -71,6 +71,7 @@ impl SequenceRecord {
         }
     }
 
+    #[allow(dead_code)]
     pub fn desc(&self) -> Option<&str> {
         match self {
             SequenceRecord::Fasta { desc, .. } => desc.as_deref(),
@@ -137,74 +138,6 @@ pub fn sequence_reader(path: &PathBuf) -> io::Result<SequenceReader> {
             format!("Unsupported file type for path: {:?}", path),
         )),
     }
-}
-
-
-/// Implementation for SequenceRecord
-impl WriteToFile for SequenceRecord {
-    fn write_to_file<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            SequenceRecord::Fastq { id, desc, seq, qual } => {
-                write_fastq_record(writer, id, desc.as_deref(), seq, qual)
-            }
-            SequenceRecord::Fasta { id, desc, seq } => {
-                write_fasta_record(writer, id, desc.as_deref(), seq)
-            }
-        }
-    }
-}
-
-pub fn write_fasta_record<W: Write>(
-    writer: &mut W,
-    id: &str,
-    desc: Option<&str>,
-    seq: &[u8],
-) -> io::Result<()> {
-    // Write header
-    writer.write_all(b">")?;
-    writer.write_all(id.as_bytes())?;
-    if let Some(desc) = desc {
-        writer.write_all(b" ")?;
-        writer.write_all(desc.as_bytes())?;
-    }
-    writer.write_all(b"\n")?;
-
-    // Write sequence (with line wrapping, e.g., 80 chars per line)
-    for chunk in seq.chunks(80) {
-        writer.write_all(chunk)?;
-        writer.write_all(b"\n")?;
-    }
-    Ok(())
-}
-
-pub fn write_fastq_record<W: Write>(
-    writer: &mut W,
-    id: &str,
-    desc: Option<&str>,
-    seq: &[u8],
-    qual: &[u8],
-) -> io::Result<()> {
-    // Write header
-    writer.write_all(b"@")?;
-    writer.write_all(id.as_bytes())?;
-    if let Some(desc) = desc {
-        writer.write_all(b" ")?;
-        writer.write_all(desc.as_bytes())?;
-    }
-    writer.write_all(b"\n")?;
-
-    // Write sequence
-    writer.write_all(seq)?;
-    writer.write_all(b"\n")?;
-
-    // Write separator
-    writer.write_all(b"+")?;
-    writer.write_all(b"\n")?;
-
-    // Write quality scores
-    writer.write_all(qual)?;
-    writer.write_all(b"\n")?;
-    Ok(())
 }
 
 
@@ -356,6 +289,7 @@ fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 /// # Returns
 /// u64: Number of records in the FASTQ.
 ///
+#[allow(dead_code)]
 pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
     let mut counter = 0;
     match sequence_reader(path)? {
@@ -371,28 +305,6 @@ pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
         }
     }
     Ok(counter)
-}
-
-/// Enum to hold either an uncompressed or gzipped file writer
-pub enum FileWriter {
-    Uncompressed(BufWriter<File>),
-    Gzipped(GzEncoder<BufWriter<File>>),
-}
-
-impl Write for FileWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            FileWriter::Uncompressed(w) => w.write(buf),
-            FileWriter::Gzipped(w) => w.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            FileWriter::Uncompressed(w) => w.flush(),
-            FileWriter::Gzipped(w) => w.flush(),
-        }
-    }
 }
 
 
@@ -666,7 +578,7 @@ mod tests {
         match reader_result {
             Ok(reader) => {
                 match reader {
-                    SequenceReader::Fasta(reader) => { Ok(()) },
+                    SequenceReader::Fasta(_reader) => { Ok(()) },
                     _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
                 }
             }
@@ -687,7 +599,7 @@ mod tests {
         match reader_result {
             Ok(reader) => {
                 match reader {
-                    SequenceReader::Fastq(reader) => { Ok(()) },
+                    SequenceReader::Fastq(_reader) => { Ok(()) },
                     _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
                 }
             }

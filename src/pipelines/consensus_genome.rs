@@ -130,44 +130,44 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     loop {
         tokio::select! {
-            result = &mut fastp_parse_task, if !fastp_parse_done => {
-                result.map_err(|e| anyhow!("Fastp parse task failed: {}", e))?;
-                fastp_parse_done = true;
-            }
-            result = &mut fastp_write_task, if !fastp_write_done => {
-                result.map_err(|e| anyhow!("Fastp write task failed: {}", e))?;
-                fastp_write_done = true;
-            }
-            result = &mut fastp_stderr_task, if !fastp_stderr_done => {
-                result.map_err(|e| anyhow!("Fastp stderr task failed: {}", e))?;
-                fastp_stderr_done = true;
-            }
-            status = fastp_child.wait(), if !fastp_done && fastp_parse_done && fastp_write_done && fastp_stderr_done => {
-                let status = status.map_err(|e| anyhow!("Failed to wait for fastp: {}", e))?;
-                if !status.success() {
-                    return Err(anyhow!("Fastp exited with non-zero status: {}", status));
-                }
-                fastp_done = true;
-            }
-            status = pigz_child.wait(), if !pigz_done => {
-                let status = status.map_err(|e| anyhow!("Failed to wait for pigz: {}", e))?;
-                if !status.success() {
-                    return Err(anyhow!("Pigz exited with non-zero status: {}", status));
-                }
-                pigz_done = true;
-            }
-            result = &mut pigz_task, if !pigz_task_done => {
-                result.map_err(|e| anyhow!("Pigz task failed: {}", e))?;
-                pigz_task_done = true;
-            }
-            result = &mut done_rx, if !t_junction_done => {
-                match result {
-                    Ok(()) => t_junction_done = true,
-                    Err(e) => return Err(anyhow!("t_junction failed: {}", e)),
-                }
-            }
-            else => break,
+        result = &mut fastp_parse_task, if !fastp_parse_done => {
+            let _ = result.map_err(|e| anyhow!("Fastp parse task failed: {}", e))?;
+            fastp_parse_done = true;
         }
+        result = &mut fastp_write_task, if !fastp_write_done => {
+            let _ = result.map_err(|e| anyhow!("Fastp write task failed: {}", e))?;
+            fastp_write_done = true;
+        }
+        result = &mut fastp_stderr_task, if !fastp_stderr_done => {
+            let _ = result.map_err(|e| anyhow!("Fastp stderr task failed: {}", e))?;
+            fastp_stderr_done = true;
+        }
+        status = fastp_child.wait(), if !fastp_done && fastp_parse_done && fastp_write_done && fastp_stderr_done => {
+            let status = status.map_err(|e| anyhow!("Failed to wait for fastp: {}", e))?;
+            if !status.success() {
+                return Err(anyhow!("Fastp exited with non-zero status: {}", status));
+            }
+            fastp_done = true;
+        }
+        status = pigz_child.wait(), if !pigz_done => {
+            let status = status.map_err(|e| anyhow!("Failed to wait for pigz: {}", e))?;
+            if !status.success() {
+                return Err(anyhow!("Pigz exited with non-zero status: {}", status));
+            }
+            pigz_done = true;
+        }
+        result = &mut pigz_task, if !pigz_task_done => {
+            let _ = result.map_err(|e| anyhow!("Pigz task failed: {}", e))?;
+            pigz_task_done = true;
+        }
+        result = &mut done_rx, if !t_junction_done => {
+            match result {
+                Ok(()) => t_junction_done = true,
+                Err(e) => return Err(anyhow!("t_junction failed: {}", e)),
+            }
+        }
+        else => break,
+    }
         if fastp_done && pigz_done && pigz_task_done && fastp_parse_done && fastp_write_done && fastp_stderr_done && t_junction_done {
             break;
         }
