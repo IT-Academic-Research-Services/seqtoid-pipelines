@@ -1,8 +1,9 @@
 pub mod fastx;
 pub mod file;
 pub mod streams;
+pub mod command;
+pub mod sequence;
 
-use std::io::Read;
 use clap::{Parser, ValueEnum};
 
 #[derive(Parser, Default, Debug)]
@@ -28,8 +29,21 @@ pub struct Arguments {
     
     #[arg(long)]
     pub max_read_len: Option<usize>,
+    
+    #[arg(long, default_value_t = 4)]
+    pub threads: usize,
+    
+    #[arg(short = 'q', long = "quality", default_value_t = 30)]
+    pub quality: u8,
 
+    #[arg(long, default_value_t = 15)]
+    pub stall_threshold: u64,
+
+    #[arg(long, default_value_t = 0)]
+    pub stream_sleep_ms: u64,
 }
+
+
 
 #[derive(Debug, Clone, ValueEnum, Default, PartialEq)]
 pub enum Technology {

@@ -1,50 +1,32 @@
 use std::fs::File;
 use std::io;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use flate2::read::GzDecoder;
 use crate::GZIP_EXT;
+
+
+/// Custom reader enum for handling compressed/uncompressed files
+pub enum FileReader {
+    Uncompressed(BufReader<File>),
+    Gzipped(GzDecoder<File>),
+}
+
+/// Trait implementation of reading from either a compressed or uncompressed file.
+impl Read for FileReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            FileReader::Uncompressed(r) => r.read(buf),
+            FileReader::Gzipped(r) => r.read(buf),
+        }
+    }
+}
 
 pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
     let mut file = File::open(path)?;
     let mut buffer = [0u8; 2];
     file.read_exact(&mut buffer)?;
     Ok(buffer == [0x1F, 0x8B]) // Gzip magic bytes
-}
-
-pub fn write_fastq_record(
-    file: &mut File,
-    id: &str,
-    desc: Option<&str>,
-    seq: &[u8],
-    qual: &[u8],
-) -> io::Result<()> {
-    if let Some(desc) = desc {
-        writeln!(file, "@{} {}", id, desc)?;
-    } else {
-        writeln!(file, "@{}", id)?;
-    }
-    file.write_all(seq)?;
-    writeln!(file)?;
-    writeln!(file, "+")?;
-    file.write_all(qual)?;
-    writeln!(file)?;
-    Ok(())
-}
-
-pub fn write_fasta_record(
-    file: &mut File,
-    id: &str,
-    desc: Option<&str>,
-    seq: &[u8],
-) -> io::Result<()> {
-    if let Some(desc) = desc {
-        writeln!(file, ">{} {}", id, desc)?;
-    } else {
-        writeln!(file, ">{}", id)?;
-    }
-    file.write_all(seq)?;
-    writeln!(file)?;
-    Ok(())
 }
 
 
@@ -129,7 +111,7 @@ pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
         current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
     }
     
-    let mut out_path_buf = PathBuf::from(current.to_string_lossy().into_owned());
+    let out_path_buf = PathBuf::from(current.to_string_lossy().into_owned());
     extensions.reverse();
     (out_path_buf, extensions)
 }

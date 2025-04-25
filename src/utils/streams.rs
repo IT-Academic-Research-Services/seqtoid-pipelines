@@ -1,78 +1,33 @@
-// src/utils/stream.rs
-use std::fs::File;
-use std::io;
-use std::io::Write;
+use anyhow::Result;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
-use tokio::sync::broadcast;
-use tokio::process::{Command, Child};
-use tokio::io::AsyncWriteExt;
-use tokio_stream::StreamExt;
+use tokio::fs::File;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::sync::{broadcast, oneshot};
+use tokio::time::Duration;
+use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use crate::utils::fastx::SequenceRecord;
-use crate::utils::file::{write_fastq_record, write_fasta_record};
+use crate::utils::fastx::{SequenceRecord, fastx_generator};
 
-
-/// Trait to abstract writing items to a file
-pub trait WriteToFile {
-    fn write_to_file(&self, file: &mut File) -> io::Result<()>;
-}
-
-/// Implementation for generic byte-like types
-impl<T> WriteToFile for T
-where
-    T: AsRef<[u8]>,
-{
-    fn write_to_file(&self, file: &mut File) -> io::Result<()> {
-        file.write_all(self.as_ref())?;
-        file.write_all(b"\n")?;
-        Ok(())
-    }
-}
-
-/// Implementation for SequenceRecord
-impl WriteToFile for SequenceRecord {
-    fn write_to_file(&self, file: &mut File) -> io::Result<()> {
-        match self {
-            SequenceRecord::Fastq { id, desc, seq, qual } => {
-                write_fastq_record(file, id, desc.as_deref(), seq, qual)
-            }
-            SequenceRecord::Fasta { id, desc, seq } => {
-                write_fasta_record(file, id, desc.as_deref(), seq)
-            }
-        }
-    }
-}
-
-
-/// Trait to convert items to bytes for writing to a process's stdin
 pub trait ToBytes {
-    fn to_bytes(&self) -> io::Result<Vec<u8>>;
+    fn to_bytes(&self) -> Result<Vec<u8>>;
 }
 
-// Implementation for generic byte-like types
-impl<T> ToBytes for T
-where
-    T: AsRef<[u8]>,
-{
-    fn to_bytes(&self) -> io::Result<Vec<u8>> {
-        let mut bytes = self.as_ref().to_vec();
-        bytes.push(b'\n');
-        Ok(bytes)
+impl ToBytes for Vec<u8> {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(self.clone())
     }
 }
 
-/// Implementation for SequenceRecord
 impl ToBytes for SequenceRecord {
-    fn to_bytes(&self) -> io::Result<Vec<u8>> {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
         match self {
             SequenceRecord::Fastq { id, desc, seq, qual } => {
                 if let Some(desc) = desc {
-                    writeln!(buffer, "@{} {}", id, desc)?;
+                    buffer.extend_from_slice(format!("@{} {}\n", id, desc).as_bytes());
                 } else {
-                    writeln!(buffer, "@{}", id)?;
+                    buffer.extend_from_slice(format!("@{}\n", id).as_bytes());
                 }
                 buffer.extend_from_slice(seq);
                 buffer.extend_from_slice(b"\n+\n");
@@ -81,9 +36,9 @@ impl ToBytes for SequenceRecord {
             }
             SequenceRecord::Fasta { id, desc, seq } => {
                 if let Some(desc) = desc {
-                    writeln!(buffer, ">{} {}", id, desc)?;
+                    buffer.extend_from_slice(format!(">{} {}\n", id, desc).as_bytes());
                 } else {
-                    writeln!(buffer, ">{}", id)?;
+                    buffer.extend_from_slice(format!(">{}\n", id).as_bytes());
                 }
                 buffer.extend_from_slice(seq);
                 buffer.push(b'\n');
@@ -93,101 +48,54 @@ impl ToBytes for SequenceRecord {
     }
 }
 
-
 /// Generates any number of output streams from a single input stream.
 /// The streams are all asynchronous.
 ///
 /// # Arguments
 ///
-/// * `input_rx' - Receiver stream: tokio::mpsc
-/// * 'num_streams' - Number of output streams to generate.
-/// 
-/// # Returns
-/// Vector of output streams.
-///
-pub async fn t_junction<T>(
-    input_rx: mpsc::Receiver<T>,
-    num_streams: usize,
-) -> Vec<BroadcastStream<T>>
-where
-    T: Clone + Send + 'static,
-{
-    let (tx, _rx) = broadcast::channel(100);
-
-    // Create N broadcast receivers first
-    let mut streams = Vec::new();
-    for _ in 0..num_streams {
-        let rx = tx.subscribe();
-        streams.push(BroadcastStream::new(rx));
-    }
-
-    // Spawn the task after creating receivers
-    tokio::spawn(async move {
-        let mut rx = input_rx;
-        while let Some(item) = rx.recv().await {
-            if tx.send(item).is_err() {
-                break; // No active receivers
-            }
-        }
-    });
-
-    streams
-}
-
-
-
-
-/// Takes a generic stream from tokio_stream and asynchronously writes to a file.
-///
-///
-/// # Arguments
-///
-/// * `input_rx' - Receiver stream: tokio::mpsc
-/// * 'out_filename' - output file.
+/// * `input_stream`: An asynchronous stream yielding items of type `T`.
+/// * `num_streams`: Number of output streams to generate.
+/// * `stall_threshold_secs`: Seconds before logging a stall.
+/// * `sleep_duration_ms`: Optional milliseconds to sleep per item (None for no sleep).
 ///
 /// # Returns
-/// One child stream for continuation of pipeline.
-pub async fn tee<T>(
-    input_rx: mpsc::Receiver<T>,
-    out_path: PathBuf,
-) -> BroadcastStream<T>
+/// A `Result` containing a tuple of:
+/// - A vector of `BroadcastStream<T>` for downstream processing.
+/// - A `oneshot::Receiver<()>` to await task completion.
+pub async fn t_junction<S, T>(
+    input: S,
+    n_outputs: usize,
+    stall_threshold: u64,
+    stream_sleep_ms: Option<u64>,
+) -> Result<(Vec<BroadcastStream<T>>, oneshot::Receiver<()>)>
 where
-    T: WriteToFile + Clone + Send + 'static,
+    S: Stream<Item = T> + Unpin + Send + 'static,
+    T: ToBytes + Clone + Send + Sync + 'static,
 {
-    let out_streams = t_junction(input_rx, 2).await;
+    let (tx, _) = broadcast::channel(10000);
+    let output_rxs: Vec<_> = (0..n_outputs)
+        .map(|_| BroadcastStream::new(tx.subscribe()))
+        .collect();
+    let (done_tx, done_rx) = oneshot::channel();
 
-    let mut streams = out_streams.into_iter();
-    let return_stream = streams.next().unwrap();
-    let mut file_stream = streams.next().unwrap();
+    let mut input = Box::pin(input);
 
     tokio::spawn(async move {
-        let mut file = match File::create(&out_path) {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("Failed to create file {}: {}", out_path.display(), e);
-                return;
-            }
-        };
-
-        while let Some(result) = file_stream.next().await {
-            match result {
-                Ok(data) => {
-                    if let Err(e) = data.write_to_file(&mut file) {
-                        eprintln!("Failed to write data to {}: {}", out_path.display(), e);
-                        break;
-                    }
-                }
-                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    eprintln!("File stream lagged, skipped {} items", skipped);
+        let mut count = 0;
+        while let Some(item) = input.next().await {
+            let _ = tx.send(item);
+            count += 1;
+            if count % stall_threshold == 0 {
+                if let Some(sleep_ms) = stream_sleep_ms {
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 }
             }
         }
-        eprintln!("File stream for {} completed", out_path.display());
+        let _ = done_tx.send(());
     });
 
-    return_stream
+    Ok((output_rxs, done_rx))
 }
-
 
 /// Asynchronously spawn an external process and feed it a stream as stdin.
 /// Capture stdout and return from function.
@@ -200,205 +108,319 @@ where
 ///
 /// # Returns
 /// tokio::process::Command containing stdout and stderr
-pub async fn stream_to_cmd<T>(
-    mut stream: BroadcastStream<T>,
-    command: &str,
-    args: &[&str],
-) -> io::Result<Child>
-where
-    T: ToBytes + Clone + Send + 'static,
-{
-    let mut child = Command::new(command)
-        .args(args)
+pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
+    mut rx: BroadcastStream<T>,
+    cmd_tag: &str,
+    args: Vec<&str>,
+) -> Result<Child> {
+    let cmd_tag_owned = cmd_tag.to_string();
+    let mut child = Command::new(&cmd_tag_owned)
+        .args(&args)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped()) // Optional
-        .stderr(std::process::Stdio::piped()) // Optional
-        .spawn()?;
-    
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "Failed to open stdin")
-    })?;
-    
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
     tokio::spawn(async move {
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(data) => {
-                    match data.to_bytes() {
-                        Ok(bytes) => {
-                            if let Err(e) = stdin.write_all(&bytes).await {
-                                eprintln!("Failed to write to stdin: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to convert data to bytes: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    eprintln!("Stream lagged, skipped {} items", skipped);
-                }
-            }
+        let mut writer = tokio::io::BufWriter::new(stdin);
+        while let Some(Ok(item)) = rx.next().await {
+            let bytes = item.to_bytes()?;
+            writer.write_all(&bytes).await?;
         }
+        writer.flush().await?;
+        Ok::<(), anyhow::Error>(())
     });
 
     Ok(child)
 }
 
+/// Takes output from stream_to_cmd and outputs it as seq_io records.
+///
+/// # Arguments
+///
+/// * `sydout' - Child process stdout.
+///
+/// # Returns
+/// Result<BroadcastStream<SequenceRecord>>
+pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
+    reader: R,
+    sender: tokio::sync::mpsc::Sender<SequenceRecord>,
+) -> Result<()> {
+    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+    let mut buffer = String::new();
+    let mut count = 0;
+
+    loop {
+        buffer.clear();
+        let bytes_read = reader.read_line(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        let id_line = buffer.trim_end();
+        if !id_line.starts_with('@') {
+            return Err(anyhow::anyhow!("Invalid FASTQ format: expected '@', got '{}'", id_line));
+        }
+
+        let (id, desc) = match id_line[1..].split_once(' ') {
+            Some((id, desc)) => (id.to_string(), Some(desc.to_string())),
+            None => (id_line[1..].to_string(), None),
+        };
+
+        buffer.clear();
+        reader.read_line(&mut buffer).await?;
+        let seq = buffer.trim_end().as_bytes().to_vec();
+        if seq.is_empty() {
+            return Err(anyhow::anyhow!("Missing sequence"));
+        }
+
+        buffer.clear();
+        reader.read_line(&mut buffer).await?;
+        let plus = buffer.trim_end();
+        if plus != "+" {
+            return Err(anyhow::anyhow!("Invalid FASTQ format: expected '+', got '{}'", plus));
+        }
+
+        buffer.clear();
+        reader.read_line(&mut buffer).await?;
+        let qual = buffer.trim_end().as_bytes().to_vec();
+        if qual.is_empty() {
+            return Err(anyhow::anyhow!("Missing quality"));
+        }
+
+        if seq.len() != qual.len() {
+            return Err(anyhow::anyhow!("Sequence length ({}) != quality length ({})", seq.len(), qual.len()));
+        }
+
+        let record = SequenceRecord::Fastq {
+            id,
+            desc,
+            seq,
+            qual,
+        };
+
+        sender.send(record).await?;
+        count += 1;
+
+        if count % 1000 == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Takes output from stream_to_cmd and outputs it as a byte stream.
+///
+/// # Arguments
+///
+/// * `stdout' - Child process stdout.
+///
+/// # Returns
+/// Result<BroadcastStream<Vec<u8>>>
+pub async fn parse_child_stdout_to_bytes(stdout: ChildStdout) -> Result<BroadcastStream<Vec<u8>>> {
+    let (tx, rx) = broadcast::channel(100);
+    let mut reader = BufReader::with_capacity(1024 * 1024, stdout);
+
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 256 * 1024];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = buffer[..n].to_vec();
+                    let _ = tx.send(chunk);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(BroadcastStream::new(rx))
+}
+
+/// Writes a stream to a file.
+/// Capture stdout and return from function.
+///
+/// # Arguments
+///
+/// * `rx' - BroadcastStream<T>
+/// * 'path' - PathBuf for output file
+
+///
+/// # Returns
+/// Result<()>
+pub async fn stream_to_file(mut rx: tokio::sync::mpsc::Receiver<SequenceRecord>, path: PathBuf) -> Result<()> {
+    let mut file = File::create(&path).await?;
+    while let Some(record) = rx.recv().await {
+        let bytes = record.to_bytes()?;
+        file.write_all(&bytes).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+pub async fn stream_bytes_to_file(mut rx: BroadcastStream<Vec<u8>>, path: PathBuf) -> Result<()> {
+    let mut file = File::create(&path).await?;
+    while let Some(Ok(bytes)) = rx.next().await {
+        file.write_all(&bytes).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+/// A sink for testing output streams.
+/// Reads child stdout to screen.
+///
+/// # Arguments
+///
+/// * `child' - Child process from stream_to_cmd.
+///
+/// # Returns
+/// io::Result<()>
+#[allow(dead_code)]
+pub async fn read_child_stdout(mut child: Child) -> Result<()> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+
+    let mut buffer = [0; 1024];
+    loop {
+        match stdout.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(_) => {},
+            Err(_) => break,
+        }
+    }
+
+    child.wait().await?;
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::NamedTempFile;
-    use tokio::time::{timeout, Duration};
-    
-    #[tokio::test]
-    async fn test_t_junction_splits_stream() {
-        let (tx, rx) = mpsc::channel(10);
-        let items = vec![b"item1".to_vec(), b"item2".to_vec()];
-        
-        let items_clone = items.clone();
-        tokio::spawn(async move {
-            for item in items_clone {
-                tx.send(item).await.unwrap();
-            }
-        });
-        
-        let mut streams = t_junction(rx, 2).await;
-        let mut stream1 = streams.pop().unwrap();
-        let mut stream2 = streams.pop().unwrap();
-        
-        let mut results1 = Vec::new();
-        let mut results2 = Vec::new();
+    use tokio::process::Command;
 
-        while let Some(result) = timeout(Duration::from_millis(100), stream1.next()).await.unwrap() {
-            if let Ok(item) = result {
-                results1.push(item);
-            }
-        }
-        while let Some(result) = timeout(Duration::from_millis(100), stream2.next()).await.unwrap() {
-            if let Ok(item) = result {
-                results2.push(item);
-            }
-        }
-        
-        assert_eq!(results1, items);
-        assert_eq!(results2, items);
-    }
-    
     #[tokio::test]
-    async fn test_tee_writes_bytes_to_file() {
-        let (tx, rx) = mpsc::channel(10);
-        let items = vec![b"hello".to_vec(), b"world".to_vec()];
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = PathBuf::from(temp_file.path());
-        
-        
-        let items_clone = items.clone();
-        tokio::spawn(async move {
-            for item in items_clone {
-                tx.send(item).await.unwrap();
-            }
-        });
-        
-        let mut stream = tee(rx, path.clone()).await;
-        
-        let mut results = Vec::new();
-        while let Some(result) = timeout(Duration::from_millis(100), stream.next()).await.unwrap() {
-            if let Ok(item) = result {
-                results.push(item);
-            }
+    async fn test_t_junction() -> Result<()> {
+        let records = vec![
+            SequenceRecord::Fastq {
+                id: "read1".to_string(),
+                desc: None,
+                seq: b"ATCG".to_vec(),
+                qual: b"IIII".to_vec(),
+            },
+            SequenceRecord::Fastq {
+                id: "read2".to_string(),
+                desc: None,
+                seq: b"GCTA".to_vec(),
+                qual: b"HHHH".to_vec(),
+            },
+        ];
+        let stream = tokio_stream::iter(records);
+        let (mut outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+        let mut output1 = outputs.pop().unwrap();
+        let mut output2 = outputs.pop().unwrap();
+        let mut records1 = Vec::new();
+        let mut records2 = Vec::new();
+        while let Some(Ok(record)) = output1.next().await {
+            records1.push(record);
         }
-        
-        assert_eq!(results, items);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let contents = fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, "hello\nworld\n");
-    }
-    
-    #[tokio::test]
-    async fn test_tee_writes_fastq_to_file() {
-        let (tx, rx) = mpsc::channel(10);
-        let record = SequenceRecord::Fastq {
-            id: "seq1".to_string(),
-            desc: Some("test".to_string()),
-            seq: b"ATCG".to_vec(),
-            qual: b"IIII".to_vec(),
-        };
-        let temp_file = NamedTempFile::new().unwrap();
-        let path = PathBuf::from(temp_file.path());
-        
-        let record_clone = record.clone();
-        tokio::spawn(async move {
-            tx.send(record_clone).await.unwrap();
-        });
-        
-        let mut stream = tee(rx, path.clone()).await;
-        
-        let mut results = Vec::new();
-        while let Some(result) = timeout(Duration::from_millis(100), stream.next()).await.unwrap() {
-            if let Ok(item) = result {
-                results.push(item);
-            }
+        while let Some(Ok(record)) = output2.next().await {
+            records2.push(record);
         }
+        assert_eq!(records1.len(), 2);
+        assert_eq!(records2.len(), 2);
+        assert_eq!(records1[0].id(), "read1");
+        assert_eq!(records2[0].id(), "read1");
+        done_rx.await?;
         
-        assert_eq!(results.len(), 1);
-        if let SequenceRecord::Fastq { id, desc, seq, qual } = &results[0] {
-            assert_eq!(id, "seq1");
-            assert_eq!(desc, &Some("test".to_string()));
-            assert_eq!(seq, &b"ATCG".to_vec());
-            assert_eq!(qual, &b"IIII".to_vec());
-        } else {
-            panic!("Expected Fastq record");
+        // test longer stream of good quality
+        let stream = fastx_generator(10000, 143, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+        let mut output1 = outputs.pop().unwrap();
+        let mut output2 = outputs.pop().unwrap();
+        let mut records1 = Vec::new();
+        let mut records2 = Vec::new();
+        while let Some(Ok(record)) = output1.next().await {
+            records1.push(record);
         }
+        while let Some(Ok(record)) = output2.next().await {
+            records2.push(record);
+        }
+        assert_eq!(records1.len(), 10000);
+        assert_eq!(records2.len(), 10000);
+
+        done_rx.await?;
+
+
+        // let stream = fastx_generator(10000, 143, 35.0, 3.0);
+        // let (mut outputs, done_rx) = t_junction(stream, 10, 1000, None).await?;
+        // 
+        // 
         
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        let contents = fs::read_to_string(&path).unwrap();
-        assert_eq!(contents, "@seq1 test\nATCG\n+\nIIII\n");
+        Ok(())
     }
-    
+
     #[tokio::test]
-    async fn test_stream_to_cmd_feeds_stdin_bytes() {
-        let (tx, rx) = mpsc::channel(10);
-        let items = vec![b"hello".to_vec(), b"world".to_vec()];
-        let stream = t_junction(rx, 1).await.pop().unwrap();
-        
-        let items_clone = items.clone();
-        tokio::spawn(async move {
-            for item in items_clone {
-                tx.send(item).await.unwrap();
-            }
-        });
-        
-        let child = stream_to_cmd(stream, "cat", &[]).await.unwrap();
-        let output = child.wait_with_output().await.unwrap();
-        
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(stdout, "hello\nworld\n");
+    async fn test_stream_to_cmd() -> Result<()> {
+        let data = vec![b"test data\n".to_vec()];
+        let (tx, rx) = broadcast::channel(100);
+        for chunk in data {
+            tx.send(chunk)?;
+        }
+        drop(tx); // Close the sender to terminate the BroadcastStream
+        let stream = BroadcastStream::new(rx);
+        let mut child = stream_to_cmd(stream, "cat", vec!["-"]).await?;
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await?;
+        assert!(String::from_utf8_lossy(&output).contains("test data"));
+        child.wait().await?; 
+        Ok(())
     }
-    
+
     #[tokio::test]
-    async fn test_stream_to_cmd_feeds_stdin_fastq() {
-        let (tx, rx) = mpsc::channel(10);
-        let record = SequenceRecord::Fastq {
-            id: "seq1".to_string(),
-            desc: Some("test".to_string()),
-            seq: b"ATCG".to_vec(),
-            qual: b"IIII".to_vec(),
-        };
-        let stream = t_junction(rx, 1).await.pop().unwrap();
-        
-        let record_clone = record.clone();
-        tokio::spawn(async move {
-            tx.send(record_clone).await.unwrap();
-        });
-        
-        let child = stream_to_cmd(stream, "cat", &[]).await.unwrap();
-        let output = child.wait_with_output().await.unwrap();
-        
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(stdout, "@seq1 test\nATCG\n+\nIIII\n");
+    async fn test_parse_child_stdout_to_fastq() -> Result<()> {
+        let mut cmd = Command::new("echo");
+        cmd.arg("@read1\nATCG\n+\nIIII\n@read2\nGCTA\n+\nHHHH\n");
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        tokio::spawn(parse_child_stdout_to_fastq(stdout, tx));
+        let mut records = Vec::new();
+        while let Some(record) = rx.recv().await {
+            records.push(record);
+        }
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id(), "read1");
+        assert_eq!(records[0].seq(), b"ATCG");
+        assert_eq!(records[1].id(), "read2");
+        assert_eq!(records[1].seq(), b"GCTA");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_child_stdout_to_bytes() -> Result<()> {
+        let mut cmd = Command::new("echo");
+        cmd.arg("test data");
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        let stream = parse_child_stdout_to_bytes(stdout).await?;
+        let mut stream = stream;
+        while let Some(Ok(chunk)) = stream.next().await {
+            let data = chunk;
+            assert!(String::from_utf8_lossy(&data).contains("test data"));
+            break;
+        }
+        Ok(())
     }
 }
