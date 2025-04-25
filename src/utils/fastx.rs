@@ -8,6 +8,8 @@ use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::utils::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
+use crate::utils::sequence::DNA;
+use futures::Stream;
 
 const FASTA_TAG : &str = "fasta";
 const FASTQ_TAG : &str = "fastq";
@@ -307,6 +309,11 @@ pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
     Ok(counter)
 }
 
+
+pub fn fastx_generator(num_records: usize, seq_len: usize) -> impl Stream<Item = SequenceRecord> {
+
+
+}
 
 /// Asynchronously outputs a stream from one or two FASTQ files.
 /// If two FASTQ, the stream is interleaved and a header check is performed 
