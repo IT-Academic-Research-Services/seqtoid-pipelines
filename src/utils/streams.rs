@@ -351,6 +351,7 @@ mod tests {
         for chunk in data {
             tx.send(chunk)?;
         }
+        drop(tx); // Close the sender to terminate the BroadcastStream
         let stream = BroadcastStream::new(rx);
         let mut child = stream_to_cmd(stream, "cat", vec!["-"]).await?;
         let stdout = child.stdout.take().unwrap();
@@ -358,6 +359,7 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).await?;
         assert!(String::from_utf8_lossy(&output).contains("test data"));
+        child.wait().await?; 
         Ok(())
     }
 
