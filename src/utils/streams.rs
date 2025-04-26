@@ -400,6 +400,23 @@ mod tests {
         reader.read_to_end(&mut output).await?;
         assert!(String::from_utf8_lossy(&output).contains("test data"));
         child.wait().await?; 
+
+        
+        //empty stream
+        let data = vec![b"".to_vec()];
+        let (tx, rx) = broadcast::channel(100);
+        for chunk in data {
+            tx.send(chunk)?;
+        }
+        drop(tx); // Close the sender to terminate the BroadcastStream
+        let stream = BroadcastStream::new(rx);
+        let mut child = stream_to_cmd(stream, "cat", vec!["-"]).await?;
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await?;
+        assert_eq!(String::from_utf8_lossy(&output).len(), 0);
+        child.wait().await?;
         Ok(())
     }
 
