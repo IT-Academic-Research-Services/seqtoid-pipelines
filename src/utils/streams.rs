@@ -381,6 +381,22 @@ mod tests {
         done_rx.await?;
         
         
+        //empty stream
+        let stream = fastx_generator(0, 143, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+        let mut output1 = outputs.pop().unwrap();
+        let mut output2 = outputs.pop().unwrap();
+        let mut records1 = Vec::new();
+        let mut records2 = Vec::new();
+        while let Some(Ok(record)) = output1.next().await {
+            records1.push(record);
+        }
+        while let Some(Ok(record)) = output2.next().await {
+            records2.push(record);
+        }
+        assert_eq!(records1.len(), 0);
+
+        done_rx.await?;
         Ok(())
     }
 
