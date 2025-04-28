@@ -8,7 +8,7 @@ use tokio_stream::StreamExt;
 use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
-use crate::utils::streams::{t_junction, stream_to_file, stream_bytes_to_file, stream_to_cmd, parse_child_stdout_to_bytes, parse_child_stdout_to_fastq, ToBytes};
+use crate::utils::streams::{t_junction, stream_sequence_records_to_file, stream_bytes_to_file, stream_to_cmd, parse_child_stdout_to_bytes, parse_child_stdout_to_fastq, ToBytes};
 use crate::{PIGZ_TAG, FASTP_TAG};
 
 pub async fn run(args: &Arguments) -> Result<()> {
@@ -102,7 +102,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         parse_child_stdout_to_fastq(fastp_stdout, fastp_tx).await
     });
     let mut fastp_write_task = tokio::spawn(async move {
-        stream_to_file(fastp_rx, PathBuf::from("test_fastpppp.fq")).await
+        stream_sequence_records_to_file(fastp_rx, PathBuf::from("test_fastp.fq")).await
     });
     let mut fastp_stderr_task = tokio::spawn(async move {
         if let Some(fastp_stderr) = fastp_stderr {
