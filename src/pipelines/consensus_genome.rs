@@ -102,7 +102,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         parse_child_stdout_to_fastq(fastp_stdout, fastp_tx).await
     });
     let mut fastp_write_task = tokio::spawn(async move {
-        stream_to_file(fastp_rx, PathBuf::from("test_fastp.fq")).await
+        stream_to_file(fastp_rx, PathBuf::from("test_fastpppp.fq")).await
     });
     let mut fastp_stderr_task = tokio::spawn(async move {
         if let Some(fastp_stderr) = fastp_stderr {
@@ -110,7 +110,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let mut buffer = String::new();
             while let Ok(bytes) = stderr.read_line(&mut buffer).await {
                 if bytes == 0 { break; }
-                // eprintln!("fastp stderr: {}", buffer.trim());
                 buffer.clear();
             }
         }

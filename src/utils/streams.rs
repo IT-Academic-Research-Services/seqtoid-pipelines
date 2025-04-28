@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -9,8 +11,10 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::time::{self, Duration};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::mpsc;
 use crate::utils::fastx::{SequenceRecord, fastx_generator};
 use tokio::task::JoinHandle;
+
 
 pub trait ToBytes {
     fn to_bytes(&self) -> Result<Vec<u8>>;
@@ -762,6 +766,40 @@ mod tests {
             assert!(String::from_utf8_lossy(&data).contains("test data"));
             break;
         }
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_stream_to_file() -> Result<()> {
+        let _ = fs::remove_file("stream_to_file_test.fq");
+        let (tx, rx) = mpsc::channel(100);
+        let records = fastx_generator(2, 10, 35.0, 3.0);
+        let mut records_stream = Box::pin(records);
+        
+        let send_task = tokio::spawn(async move {
+            while let Some(record) = records_stream.next().await {
+                if tx.send(record).await.is_err() {
+                    return Err(anyhow::anyhow!("Failed to send record"));
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        
+        let write_task = tokio::spawn(async move {
+            stream_to_file(rx, Path::new("stream_to_file_test.fq").to_path_buf()).await
+        });
+        
+        send_task.await??;
+        write_task.await??;
+        
+        assert!(Path::new("stream_to_file_test.fq").exists(), "Output file was not created");
+        
+        let content = fs::read_to_string("stream_to_file_test.fq")?;
+        let num_records = content.lines().filter(|line| line.starts_with('@')).count();
+        assert_eq!(num_records, 2, "Expected 2 FASTQ records, found {}", num_records);
+        
+        fs::remove_file("stream_to_file_test.fq")?;
+
         Ok(())
     }
 }
