@@ -543,7 +543,6 @@ mod tests {
             .await??;
 
         for (i, records) in all_records.iter().enumerate() {
-            eprintln!("records {}: {:?}", i, records.len());
             assert_eq!(
                 records.len(),
                 num_records,
@@ -596,6 +595,140 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_stream_to_cmd_valid_cat() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(!output.is_empty(), "Output should contain FASTQ data");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("@read1"), "Output should contain first read ID");
+        assert!(output_str.contains("@read2"), "Output should contain second read ID");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_invalid_command() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, _done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let result = stream_to_cmd(outputs.pop().unwrap(), "nonexistent_cmd", vec![]).await;
+        assert!(result.is_err(), "Should fail for invalid command");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Failed to spawn nonexistent_cmd"), "Error should mention command name");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_empty_stream() -> Result<()> {
+        let stream = fastx_generator(0, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(output.is_empty(), "Output should be empty for empty stream");
+        Ok(())
+    }
+
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_large_stream() -> Result<()> {
+        let num_records = 10000;
+        let stream = fastx_generator(num_records, 50, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+
+        // Parse output as FASTQ records
+        let output_str = String::from_utf8_lossy(&output);
+        let mut lines = output_str.lines().peekable();
+        let mut record_count = 0;
+
+        while let Some(line) = lines.next() {
+            if line.starts_with('@') {
+                // Expect sequence, +, and quality lines
+                let seq_line = lines.next();
+                let plus_line = lines.next();
+                let qual_line = lines.next();
+                if seq_line.is_none() || plus_line != Some("+") || qual_line.is_none() {
+                    return Err(anyhow!("Invalid FASTQ format at record {}", record_count + 1));
+                }
+                record_count += 1;
+            } else {
+                return Err(anyhow!("Unexpected line in FASTQ output: {}", line));
+            }
+        }
+
+        assert_eq!(
+            record_count, num_records,
+            "Output should contain {} records, found {}",
+            num_records, record_count
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_no_output() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "true", vec![]).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        let stdout = child.stdout.take();
+        assert!(stdout.is_none() || tokio::io::copy(&mut stdout.unwrap(), &mut Vec::new()).await? == 0, "No output expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_premature_exit() -> Result<()> {
+        let stream = fastx_generator(10, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n", "1"]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        let task_result = task.await?;
+        let status = child.wait().await?;
+        done_rx.await??;
+        assert!(status.success(), "Child process should exit successfully");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("@read1"), "Output should contain first read ID");
+        assert!(!output_str.contains("@read2"), "Output should not contain second read ID");
+        assert!(task_result.is_ok() || task_result.is_err(), "Task may error due to broken pipe");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_resource_cleanup() -> Result<()> {
+        let stream = fastx_generator(5, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(child.stdin.is_none(), "Stdin should be closed");
+        Ok(())
+    }
     #[tokio::test]
     async fn test_parse_child_stdout_to_fastq() -> Result<()> {
         let mut cmd = Command::new("echo");
