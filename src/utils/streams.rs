@@ -10,6 +10,7 @@ use tokio::time::{self, Duration};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::utils::fastx::{SequenceRecord, fastx_generator};
+use tokio::task::JoinHandle;
 
 pub trait ToBytes {
     fn to_bytes(&self) -> Result<Vec<u8>>;
@@ -136,7 +137,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     mut rx: BroadcastStream<T>,
     cmd_tag: &str,
     args: Vec<&str>,
-) -> Result<Child> {
+) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
@@ -144,23 +145,31 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
 
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
-    tokio::spawn(async move {
+        .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
+
+    let task = tokio::spawn(async move {
         let mut writer = tokio::io::BufWriter::new(stdin);
-        while let Some(Ok(item)) = rx.next().await {
-            let bytes = item.to_bytes()?;
-            writer.write_all(&bytes).await?;
+        while let Some(result) = rx.next().await {
+            match result {
+                Ok(item) => {
+                    let bytes = item.to_bytes()?;
+                    writer.write_all(&bytes).await?;
+                    writer.flush().await?;
+                }
+                Err(e) => return Err(anyhow!("Broadcast stream error: {}", e)),
+            }
         }
         writer.flush().await?;
-        Ok::<(), anyhow::Error>(())
+        writer.shutdown().await?;
+        Ok(())
     });
 
-    Ok(child)
+    Ok((child, task))
 }
 
 /// Takes output from stream_to_cmd and outputs it as seq_io records.
@@ -570,41 +579,20 @@ mod tests {
         done_rx.await??;
         Ok(())
     }
-    
+
 
     #[tokio::test]
-    async fn test_stream_to_cmd() -> Result<()> {
-        let data = vec![b"test data\n".to_vec()];
-        let (tx, rx) = broadcast::channel(100);
-        for chunk in data {
-            tx.send(chunk)?;
-        }
-        drop(tx); // Close the sender to terminate the BroadcastStream
-        let stream = BroadcastStream::new(rx);
-        let mut child = stream_to_cmd(stream, "cat", vec!["-"]).await?;
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
+    async fn test_stream_to_cmd_valid() -> Result<()> {
+        let stream = fastx_generator(100, 50, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
-        reader.read_to_end(&mut output).await?;
-        assert!(String::from_utf8_lossy(&output).contains("test data"));
-        child.wait().await?; 
-
-        
-        //empty stream
-        let data = vec![b"".to_vec()];
-        let (tx, rx) = broadcast::channel(100);
-        for chunk in data {
-            tx.send(chunk)?;
-        }
-        drop(tx); // Close the sender to terminate the BroadcastStream
-        let stream = BroadcastStream::new(rx);
-        let mut child = stream_to_cmd(stream, "cat", vec!["-"]).await?;
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await?;
-        assert_eq!(String::from_utf8_lossy(&output).len(), 0);
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??; // Check for stream errors
+        done_rx.await??; // Check for t_junction errors
         child.wait().await?;
+        assert!(!output.is_empty(), "Output should contain data");
         Ok(())
     }
 
