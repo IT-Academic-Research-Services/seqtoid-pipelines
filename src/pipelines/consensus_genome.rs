@@ -162,8 +162,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
         result = &mut done_rx, if !t_junction_done => {
             match result {
-                Ok(()) => t_junction_done = true,
-                Err(e) => return Err(anyhow!("t_junction failed: {}", e)),
+                Ok(inner_result) => match inner_result {
+                    Ok(()) => t_junction_done = true,
+                    Err(e) => return Err(anyhow!("t_junction failed: {}", e)),
+                },
+                Err(e) => return Err(anyhow!("t_junction channel closed: {}", e)),
             }
         }
         else => break,
