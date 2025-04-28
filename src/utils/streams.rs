@@ -1,13 +1,20 @@
+use std::fs;
+use std::path::Path;
+use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
 use tokio::fs::File;
+use tokio::task;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{broadcast, oneshot};
-use tokio::time::Duration;
+use tokio::time::{self, Duration};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::mpsc;
 use crate::utils::fastx::{SequenceRecord, fastx_generator};
+use tokio::task::JoinHandle;
+
 
 pub trait ToBytes {
     fn to_bytes(&self) -> Result<Vec<u8>>;
@@ -67,23 +74,40 @@ pub async fn t_junction<S, T>(
     n_outputs: usize,
     stall_threshold: u64,
     stream_sleep_ms: Option<u64>,
-) -> Result<(Vec<BroadcastStream<T>>, oneshot::Receiver<()>)>
+) -> Result<(Vec<BroadcastStream<T>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
 where
     S: Stream<Item = T> + Unpin + Send + 'static,
     T: ToBytes + Clone + Send + Sync + 'static,
 {
+    let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
+
     let (tx, _) = broadcast::channel(10000);
     let output_rxs: Vec<_> = (0..n_outputs)
         .map(|_| BroadcastStream::new(tx.subscribe()))
         .collect();
-    let (done_tx, done_rx) = oneshot::channel();
 
     let mut input = Box::pin(input);
 
     tokio::spawn(async move {
+        // Check for zero subscribers
+        if n_outputs == 0 {
+            let _ = done_tx.send(Err(anyhow!("No subscribers: cannot process stream")));
+            return;
+        }
+
         let mut count = 0;
         while let Some(item) = input.next().await {
-            let _ = tx.send(item);
+            // Check for lagging subscribers
+            if tx.receiver_count() == 0 {
+                panic!("All subscribers dropped before stream completion");
+            }
+            // Send item and handle errors
+            match tx.send(item) {
+                Ok(_) => (),
+                Err(broadcast::error::SendError(_)) => {
+                    panic!("Broadcast channel lagged: failed to send item {}", count + 1);
+                }
+            }
             count += 1;
             if count % stall_threshold == 0 {
                 if let Some(sleep_ms) = stream_sleep_ms {
@@ -91,7 +115,12 @@ where
                 }
             }
         }
-        let _ = done_tx.send(());
+        // Verify all items were sent to active subscribers
+        if tx.receiver_count() > 0 {
+            let _ = done_tx.send(Ok(()));
+        } else {
+            panic!("No active subscribers at stream completion");
+        }
     });
 
     Ok((output_rxs, done_rx))
@@ -112,7 +141,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     mut rx: BroadcastStream<T>,
     cmd_tag: &str,
     args: Vec<&str>,
-) -> Result<Child> {
+) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
@@ -120,23 +149,31 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
 
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
-    tokio::spawn(async move {
+        .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
+
+    let task = tokio::spawn(async move {
         let mut writer = tokio::io::BufWriter::new(stdin);
-        while let Some(Ok(item)) = rx.next().await {
-            let bytes = item.to_bytes()?;
-            writer.write_all(&bytes).await?;
+        while let Some(result) = rx.next().await {
+            match result {
+                Ok(item) => {
+                    let bytes = item.to_bytes()?;
+                    writer.write_all(&bytes).await?;
+                    writer.flush().await?;
+                }
+                Err(e) => return Err(anyhow!("Broadcast stream error: {}", e)),
+            }
         }
         writer.flush().await?;
-        Ok::<(), anyhow::Error>(())
+        writer.shutdown().await?;
+        Ok(())
     });
 
-    Ok(child)
+    Ok((child, task))
 }
 
 /// Takes output from stream_to_cmd and outputs it as seq_io records.
@@ -243,18 +280,18 @@ pub async fn parse_child_stdout_to_bytes(stdout: ChildStdout) -> Result<Broadcas
     Ok(BroadcastStream::new(rx))
 }
 
-/// Writes a stream to a file.
+/// Writes a stream of SequenceRecords to a file.
 /// Capture stdout and return from function.
 ///
 /// # Arguments
 ///
-/// * `rx' - BroadcastStream<T>
+/// * `rx' - tokio::sync::mpsc::Receiver<SequenceRecord>
 /// * 'path' - PathBuf for output file
 
 ///
 /// # Returns
 /// Result<()>
-pub async fn stream_to_file(mut rx: tokio::sync::mpsc::Receiver<SequenceRecord>, path: PathBuf) -> Result<()> {
+pub async fn stream_sequence_records_to_file(mut rx: tokio::sync::mpsc::Receiver<SequenceRecord>, path: PathBuf) -> Result<()> {
     let mut file = File::create(&path).await?;
     while let Some(record) = rx.recv().await {
         let bytes = record.to_bytes()?;
@@ -264,6 +301,17 @@ pub async fn stream_to_file(mut rx: tokio::sync::mpsc::Receiver<SequenceRecord>,
     Ok(())
 }
 
+/// Writes a stream of bytes to a file.
+/// Capture stdout and return from function.
+///
+/// # Arguments
+///
+/// * `rx' - BBroadcastStream<Vec<u8>>
+/// * 'path' - PathBuf for output file
+
+///
+/// # Returns
+/// Result<()>
 pub async fn stream_bytes_to_file(mut rx: BroadcastStream<Vec<u8>>, path: PathBuf) -> Result<()> {
     let mut file = File::create(&path).await?;
     while let Some(Ok(bytes)) = rx.next().await {
@@ -293,7 +341,9 @@ pub async fn read_child_stdout(mut child: Child) -> Result<()> {
     loop {
         match stdout.read(&mut buffer).await {
             Ok(0) => break,
-            Ok(_) => {},
+            Ok(_) => {
+                print!("{}", String::from_utf8_lossy(&buffer));
+            },
             Err(_) => break,
         }
     }
@@ -309,7 +359,21 @@ mod tests {
     use tokio::process::Command;
 
     #[tokio::test]
-    async fn test_t_junction() -> Result<()> {
+    async fn test_t_junction_zero_streams() -> Result<()> {
+        let stream = fastx_generator(10, 143, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(stream, 0, 1000, None).await?;
+        assert_eq!(outputs.len(), 0);
+        let result = done_rx.await?;
+        assert!(result.is_err(), "Expected error for zero subscribers");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "No subscribers: cannot process stream"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_t_junction_two_records() -> Result<()> {
         let records = vec![
             SequenceRecord::Fastq {
                 id: "read1".to_string(),
@@ -340,9 +404,12 @@ mod tests {
         assert_eq!(records2.len(), 2);
         assert_eq!(records1[0].id(), "read1");
         assert_eq!(records2[0].id(), "read1");
-        done_rx.await?;
-        
-        // test longer stream of good quality
+        done_rx.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_t_junction_long_stream() -> Result<()> {
         let stream = fastx_generator(10000, 143, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
         let mut output1 = outputs.pop().unwrap();
@@ -358,36 +425,327 @@ mod tests {
         assert_eq!(records1.len(), 10000);
         assert_eq!(records2.len(), 10000);
 
-        done_rx.await?;
-
-
-        // let stream = fastx_generator(10000, 143, 35.0, 3.0);
-        // let (mut outputs, done_rx) = t_junction(stream, 10, 1000, None).await?;
-        // 
-        // 
-        
+        done_rx.await??;
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_stream_to_cmd() -> Result<()> {
-        let data = vec![b"test data\n".to_vec()];
-        let (tx, rx) = broadcast::channel(100);
-        for chunk in data {
-            tx.send(chunk)?;
+    async fn test_t_junction_ten_thousand_records_ten_streams() -> Result<()> {
+        let stream = fastx_generator(10000, 143, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 100, 1000, None).await?;
+        let mut records = Vec::new();
+        for _output in &outputs {
+            let record :Vec<SequenceRecord> = Vec::new();
+            records.push(record);
         }
-        drop(tx); // Close the sender to terminate the BroadcastStream
-        let stream = BroadcastStream::new(rx);
-        let mut child = stream_to_cmd(stream, "cat", vec!["-"]).await?;
-        let stdout = child.stdout.take().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await?;
-        assert!(String::from_utf8_lossy(&output).contains("test data"));
-        child.wait().await?; 
+
+        for i in 0..records.len() {
+            while let Some(Ok(record)) = outputs[i].next().await {
+                records[i].push(record);
+            }
+        }
+
+        for i in 0..records.len() {
+            assert_eq!(records[i].len(), 10000)
+        }
+        done_rx.await??;
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_t_junction_empty_stream() -> Result<()> {
+        let stream = fastx_generator(0, 50, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+        for mut output in outputs {
+            assert!(output.next().await.is_none(), "Empty stream should yield no items");
+        }
+        done_rx.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_t_junction_single_record() -> Result<()> {
+        let stream = fastx_generator(1, 50, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+        let mut handles = Vec::new();
+        for output in outputs {
+            handles.push(task::spawn(async move {
+                let mut records = Vec::new();
+                let mut stream = output;
+                while let Some(Ok(record)) = stream.next().await {
+                    records.push(record);
+                }
+                Ok::<_, anyhow::Error>(records)
+            }));
+        }
+        let all_records = time::timeout(Duration::from_secs(10), async {
+            let mut all_records = Vec::new();
+            for handle in handles {
+                let records = handle.await??;
+                all_records.push(records);
+            }
+            Ok::<_, anyhow::Error>(all_records)
+        })
+            .await??;
+        for records in &all_records {
+            assert_eq!(records.len(), 1, "Should have one record");
+        }
+        done_rx.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_t_junction_slow_consumer() -> Result<()> {
+        let stream = fastx_generator(1000, 50, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(stream, 2, 100, Some(10)).await?;
+        let mut handles = Vec::new();
+        for (i, output) in outputs.into_iter().enumerate() {
+            let handle = task::spawn(async move {
+                let mut records = Vec::new();
+                let mut stream = output;
+                while let Some(Ok(record)) = stream.next().await {
+                    records.push(record);
+                    if i == 1 {
+                        time::sleep(Duration::from_millis(5)).await; // Simulate slow consumer
+                    }
+                }
+                Ok::<_, anyhow::Error>(records)
+            });
+            handles.push(handle);
+        }
+        let all_records = time::timeout(Duration::from_secs(30), async {
+            let mut all_records = Vec::new();
+            for handle in handles {
+                let records = handle.await??;
+                all_records.push(records);
+            }
+            Ok::<_, anyhow::Error>(all_records)
+        })
+            .await??;
+        for records in &all_records {
+            assert_eq!(records.len(), 1000, "Should have all records");
+        }
+        done_rx.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_t_million_records_ten_streams() -> Result<()> {
+        let num_records = 1000000;
+        // 1M records, 2 streams, stall 1000, No sleep
+        let stream = fastx_generator(num_records, 143, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(stream, 2, 1000, None).await?;
+
+
+        let mut handles = Vec::new();
+        for output in outputs {
+            let handle = task::spawn(async move {
+                let mut records = Vec::new();
+                let mut stream = output;
+                while let Some(Ok(record)) = stream.next().await {
+                    records.push(record);
+                }
+                Ok::<_, anyhow::Error>(records)
+            });
+            handles.push(handle);
+        }
+        let all_records = time::timeout(Duration::from_secs(60), async {
+            let mut all_records = Vec::new();
+            for handle in handles {
+                let records = handle.await??;
+                all_records.push(records);
+            }
+            Ok::<_, anyhow::Error>(all_records)
+        })
+            .await??;
+
+        for (i, records) in all_records.iter().enumerate() {
+            assert_eq!(
+                records.len(),
+                num_records,
+                "Output {} should have {} records",
+                i,
+                num_records
+            );
+        }
+
+        // Verify records match across outputs
+        for i in 0..num_records {
+            assert_eq!(
+                all_records[0][i].id(),
+                all_records[1][i].id(),
+                "Record {} IDs should match",
+                i
+            );
+            assert_eq!(
+                all_records[0][i].seq(),
+                all_records[1][i].seq(),
+                "Record {} sequences should match",
+                i
+            );
+            assert_eq!(
+                all_records[0][i].qual(),
+                all_records[1][i].qual(),
+                "Record {} quality scores should match",
+                i
+            );
+        }
+
+
+        done_rx.await??;
+        Ok(())
+    }
+
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_valid() -> Result<()> {
+        let stream = fastx_generator(100, 50, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??; // Check for stream errors
+        done_rx.await??; // Check for t_junction errors
+        child.wait().await?;
+        assert!(!output.is_empty(), "Output should contain data");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_valid_cat() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(!output.is_empty(), "Output should contain FASTQ data");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("@read1"), "Output should contain first read ID");
+        assert!(output_str.contains("@read2"), "Output should contain second read ID");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_invalid_command() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, _done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let result = stream_to_cmd(outputs.pop().unwrap(), "nonexistent_cmd", vec![]).await;
+        assert!(result.is_err(), "Should fail for invalid command");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Failed to spawn nonexistent_cmd"), "Error should mention command name");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_empty_stream() -> Result<()> {
+        let stream = fastx_generator(0, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(output.is_empty(), "Output should be empty for empty stream");
+        Ok(())
+    }
+
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_large_stream() -> Result<()> {
+        let num_records = 10000;
+        let stream = fastx_generator(num_records, 50, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+
+        // Parse output as FASTQ records
+        let output_str = String::from_utf8_lossy(&output);
+        let mut lines = output_str.lines().peekable();
+        let mut record_count = 0;
+
+        while let Some(line) = lines.next() {
+            if line.starts_with('@') {
+                // Expect sequence, +, and quality lines
+                let seq_line = lines.next();
+                let plus_line = lines.next();
+                let qual_line = lines.next();
+                if seq_line.is_none() || plus_line != Some("+") || qual_line.is_none() {
+                    return Err(anyhow!("Invalid FASTQ format at record {}", record_count + 1));
+                }
+                record_count += 1;
+            } else {
+                return Err(anyhow!("Unexpected line in FASTQ output: {}", line));
+            }
+        }
+
+        assert_eq!(
+            record_count, num_records,
+            "Output should contain {} records, found {}",
+            num_records, record_count
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_no_output() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "true", vec![]).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        let stdout = child.stdout.take();
+        assert!(stdout.is_none() || tokio::io::copy(&mut stdout.unwrap(), &mut Vec::new()).await? == 0, "No output expected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_premature_exit() -> Result<()> {
+        let stream = fastx_generator(10, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n", "1"]).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        let task_result = task.await?;
+        let status = child.wait().await?;
+        done_rx.await??;
+        assert!(status.success(), "Child process should exit successfully");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("@read1"), "Output should contain first read ID");
+        assert!(!output_str.contains("@read2"), "Output should not contain second read ID");
+        assert!(task_result.is_ok() || task_result.is_err(), "Task may error due to broken pipe");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_resource_cleanup() -> Result<()> {
+        let stream = fastx_generator(5, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(child.stdin.is_none(), "Stdin should be closed");
+        Ok(())
+    }
     #[tokio::test]
     async fn test_parse_child_stdout_to_fastq() -> Result<()> {
         let mut cmd = Command::new("echo");
@@ -423,4 +781,73 @@ mod tests {
         }
         Ok(())
     }
+    
+    #[tokio::test]
+    async fn test_stream_sequence_records_to_file() -> Result<()> {
+        let _ = fs::remove_file("stream_to_file_test.fq");
+        let (tx, rx) = mpsc::channel(100);
+        let records = fastx_generator(2, 10, 35.0, 3.0);
+        let mut records_stream = Box::pin(records);
+        
+        let send_task = tokio::spawn(async move {
+            while let Some(record) = records_stream.next().await {
+                if tx.send(record).await.is_err() {
+                    return Err(anyhow::anyhow!("Failed to send record"));
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        
+        let write_task = tokio::spawn(async move {
+            stream_sequence_records_to_file(rx, Path::new("stream_to_file_test.fq").to_path_buf()).await
+        });
+        
+        send_task.await??;
+        write_task.await??;
+        
+        assert!(Path::new("stream_to_file_test.fq").exists(), "Output file was not created");
+        
+        let content = fs::read_to_string("stream_to_file_test.fq")?;
+        let num_records = content.lines().filter(|line| line.starts_with('@')).count();
+        assert_eq!(num_records, 2, "Expected 2 FASTQ records, found {}", num_records);
+        
+        fs::remove_file("stream_to_file_test.fq")?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_sequence_records_to_file_no_records() -> Result<()> {
+        let _ = fs::remove_file("stream_to_file_norecord_test.fq");
+        let (tx, rx) = mpsc::channel(100);
+        let records = fastx_generator(0, 10, 35.0, 3.0);
+        let mut records_stream = Box::pin(records);
+
+        let send_task = tokio::spawn(async move {
+            while let Some(record) = records_stream.next().await {
+                if tx.send(record).await.is_err() {
+                    return Err(anyhow::anyhow!("Failed to send record"));
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let write_task = tokio::spawn(async move {
+            stream_sequence_records_to_file(rx, Path::new("stream_to_file_norecord_test.fq").to_path_buf()).await
+        });
+
+        send_task.await??;
+        write_task.await??;
+
+        assert!(Path::new("stream_to_file_norecord_test.fq").exists(), "Output file was not created");
+
+        let content = fs::read_to_string("stream_to_file_norecord_test.fq")?;
+        let num_records = content.lines().filter(|line| line.starts_with('@')).count();
+        assert_eq!(num_records, 0, "Expected 2 FASTQ records, found {}", num_records);
+
+        fs::remove_file("stream_to_file_norecord_test.fq")?;
+
+        Ok(())
+    }
+    
 }
