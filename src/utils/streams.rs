@@ -330,7 +330,7 @@ pub async fn stream_bytes_to_file(mut rx: BroadcastStream<Vec<u8>>, path: PathBu
 ///
 /// # Returns
 /// io::Result<()>
-#[allow(dead_code)]
+
 pub async fn read_child_stdout(mut child: Child) -> Result<()> {
     let mut stdout = child
         .stdout
@@ -849,5 +849,37 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_read_child_to_stdout() -> Result<()> {
+
+        let records = vec![
+            SequenceRecord::Fastq {
+                id: "read1".to_string(),
+                desc: None,
+                seq: b"ATCG".to_vec(),
+                qual: b"IIII".to_vec(),
+            },
+            SequenceRecord::Fastq {
+                id: "read2".to_string(),
+                desc: None,
+                seq: b"GCTA".to_vec(),
+                qual: b"HHHH".to_vec(),
+            },
+        ];
+        let stream = tokio_stream::iter(records);
+        
+ 
+        let (mut outputs, done_rx) = t_junction(stream, 1, 1000, None).await?;
+        let (child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![]).await?;
+
+        task.await??;
+        if let Err(e) = read_child_stdout(child).await {
+            return Err(e);
+        }
+        
+        Ok(())
+    }
+    
     
 }
