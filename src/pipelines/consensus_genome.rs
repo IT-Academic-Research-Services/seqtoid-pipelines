@@ -48,7 +48,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let (streams, mut done_rx) = t_junction(
         rx_stream,
         2,
-        args.stall_threshold * 2,
+        args.buffer_size,
+        args.stall_threshold,
         Some(args.stream_sleep_ms),
     ).await?;
 
