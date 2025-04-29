@@ -925,3 +925,66 @@ mod tests {
     
     
 }
+
+
+#[cfg(stress_test)]
+mod stress_tests {
+    use super::*;
+    use tokio::time::Duration;
+    use crate::utils::fastx::fastx_generator;
+
+    #[tokio::test]
+    async fn test_t_junction_stress() -> Result<()> {
+        let buffer_sizes = vec![10_000, 50_000, 100_000, 1_000_000];
+        let stall_thresholds = vec![100, 1_000, 10_000, 50_000];
+        let sleep_ms = vec![0, 1, 2, 5, 10];
+        let stream_nums = vec![2, 5, 10];
+        let num_reads = vec![10000, 100000, 1000000];
+        let read_sizes  = vec![100, 1000, 10000];
+
+        let mut log = std::fs::File::create("stress_test.log")?;
+        writeln!("Buffer size\tStall\tSleep\tStreams\tReads\tSize\tTime\tMemory", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed, memory_used);
+        let sys = System::new_all();
+
+        for buffer_size in &buffer_sizes {
+            for stall in &stall_thresholds {
+                for sleep in &sleep_ms {
+                    for stream_num in &stream_nums {
+                        for num_read in &num_reads {
+                            for read_size in &read_sizes {
+                                let start = Instant::now();
+                                let memory_before = sys.used_memory();
+                                eprintln!("Buffer size: {}  Stall: {}  Sleep: {}  Streams: {} Reads: {}  Size: {}", buffer_size, stall, sleep, stream_num, num_read, read_size);
+                                let stream = fastx_generator(num_read, read_size, 35.0, 3.0); 
+                                let (mut outputs, done_rx) = t_junction(
+                                    stream,
+                                    stream_num, 
+                                    *stall,
+                                    if *sleep == 0 { None } else { Some(*sleep) },
+                                ).await?;
+
+                                let mut records = vec![Vec::new(), Vec::new()];
+                                for i in 0..*stream_num {
+                                    while let Some(Ok(record)) = outputs[i].next().await {
+                                        records[i].push(record);
+                                    }
+                                }
+                                let elapsed = start.elapsed();
+                                let memory_after = sys.used_memory();
+                                let memory_used = (memory_after - memory_before) / 1024 / 1024; // MB
+
+                                for i in 0..*stream_num {
+                                    assert_eq!(num_read, records[i].len());
+                                }
+                                done_rx.await??;
+
+                                writeln!("{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed, memory_used);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
