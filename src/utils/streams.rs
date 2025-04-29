@@ -330,7 +330,6 @@ pub async fn stream_bytes_to_file(mut rx: BroadcastStream<Vec<u8>>, path: PathBu
 ///
 /// # Returns
 /// io::Result<()>
-
 pub async fn read_child_stdout(mut child: Child) -> Result<()> {
     let mut stdout = child
         .stdout
@@ -352,6 +351,48 @@ pub async fn read_child_stdout(mut child: Child) -> Result<()> {
     Ok(())
 }
 
+
+/// Reads child stdout to a Vec<String>.
+///
+/// # Arguments
+///
+/// * `child' - Child process from stream_to_cmd.
+///
+/// # Returns
+/// Result<Vec<String>>
+pub async fn read_child_stdout_to_vec(mut child: Child) -> Result<Vec<String>> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+
+    let mut reader = BufReader::new(&mut stdout);
+    let mut lines = Vec::new();
+    let mut buffer = String::new();
+
+    loop {
+        buffer.clear();
+        match reader.read_line(&mut buffer).await {
+            Ok(0) => break, // EOF reached
+            Ok(_) => {
+                // Remove trailing newline and store the line
+                let line = buffer.trim_end().to_string();
+                if !line.is_empty() {
+                    lines.push(line);
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!("Failed to read stdout: {}", e)),
+        }
+    }
+
+    // Wait for the child process to finish
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("Child process exited with non-zero status: {}", status));
+    }
+
+    Ok(lines)
+}
 
 #[cfg(test)]
 mod tests {
