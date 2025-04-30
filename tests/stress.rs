@@ -1,10 +1,12 @@
 use seqtoid_pipelines::utils::fastx::fastx_generator;
 use anyhow::Result;
 use std::io::{stderr, Write};
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use futures::StreamExt;
 use sysinfo::{System, Pid};
-use seqtoid_pipelines::utils::streams::t_junction;
+use seqtoid_pipelines::utils::streams::{stream_to_cmd, t_junction};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -215,6 +217,218 @@ async fn test_t_junction_stress() -> Result<()> {
                             
                             writeln!(& mut log, "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed_secs, memory_used, record_counts, run_success)?;
                             log.flush()?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn test_stream_to_cmd_stress() -> Result<()> {
+    let num_reads = vec![10_000]; // Smaller for debugging
+    let read_sizes = vec![100, 1000];
+    let stream_nums = vec![1]; // Single stream to reduce contention
+    let buffer_sizes = vec![10_000, 100_000];
+    let sleep_ms = vec![0, 1];
+    let commands = vec![
+        ("cat", vec!["-"]), // Fast I/O
+        ("gzip", vec!["-c"]), // CPU-bound
+    ];
+    let timeout_secs = 60; // Timeout per iteration
+
+    let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
+    writeln!(
+        &mut log,
+        "Command\tBuffer_Size\tSleep\tStreams\tReads\tSize\tTime\tMemory\tRecords\tSuccess?"
+    )?;
+    log.flush()?;
+
+    let mut sys = System::new();
+    let pid = Pid::from(std::process::id() as usize);
+
+    for (cmd_tag, args) in &commands {
+        for buffer_size in &buffer_sizes {
+            for sleep in &sleep_ms {
+                for stream_num in &stream_nums {
+                    for num_read in &num_reads {
+                        for read_size in &read_sizes {
+                            let mut run_success = true;
+                            let start = Instant::now();
+                            sys.refresh_process(pid);
+                            let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+
+                            eprintln!(
+                                "Starting: Command: {}, Buffer: {}, Sleep: {}, Streams: {}, Reads: {}, Size: {}",
+                                cmd_tag, buffer_size, sleep, stream_num, num_read, read_size
+                            );
+                            stderr().flush()?;
+
+                            // Generate stream and split with t_junction
+                            let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
+                            let (outputs, done_rx) = match t_junction(
+                                stream,
+                                *stream_num,
+                                *buffer_size,
+                                100,
+                                if *sleep == 0 { None } else { Some(*sleep) },
+                            )
+                                .await {
+                                Ok(result) => result,
+                                Err(e) => {
+                                    eprintln!("t_junction failed to start: {}", e);
+                                    run_success = false;
+                                    writeln!(
+                                        &mut log,
+                                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                        cmd_tag,
+                                        buffer_size,
+                                        sleep,
+                                        stream_num,
+                                        num_read,
+                                        read_size,
+                                        0.0,
+                                        0,
+                                        "",
+                                        false
+                                    )?;
+                                    log.flush()?;
+                                    continue;
+                                }
+                            };
+
+                            // Spawn stream_to_cmd for each stream
+                            let mut children: Vec<tokio::process::Child> = Vec::new();
+                            let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+                            let mut record_counts = vec![0usize; *stream_num];
+
+                            for (i, rx) in outputs.into_iter().enumerate() {
+                                match stream_to_cmd(rx, cmd_tag, args.iter().map(|&s| s).collect()).await {
+                                    Ok((child, task)) => {
+                                        children.push(child);
+                                        tasks.push(task);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Stream {} failed to spawn {}: {}", i, cmd_tag, e);
+                                        run_success = false;
+                                    }
+                                }
+                            }
+
+                            // Wait for tasks with timeout
+                            for (i, task) in tasks.into_iter().enumerate() {
+                                match timeout(Duration::from_secs(timeout_secs), task).await {
+                                    Ok(Ok(Ok(()))) => {}
+                                    Ok(Ok(Err(e))) => {
+                                        eprintln!("Stream {} task failed: {}", i, e);
+                                        run_success = false;
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("Stream {} task join failed: {}", i, e);
+                                        run_success = false;
+                                    }
+                                    Err(_) => {
+                                        eprintln!("Stream {} task timed out after {}s", i, timeout_secs);
+                                        run_success = false;
+                                    }
+                                }
+                            }
+
+                            // Verify process completion
+                            for (i, mut child) in children.into_iter().enumerate() {
+                                match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+                                    Ok(Ok(output)) => {
+                                        if !output.status.success() {
+                                            eprintln!(
+                                                "Stream {} process {} failed with status: {}",
+                                                i, cmd_tag, output.status
+                                            );
+                                            run_success = false;
+                                        }
+                                        // Count records in stdout (FASTA/FASTQ for cat, skip for gzip)
+                                        if cmd_tag == &"cat" {
+                                            let stdout = String::from_utf8_lossy(&output.stdout);
+                                            let count = stdout.lines().filter(|l| l.starts_with('>') || l.starts_with('@')).count();
+                                            record_counts[i] = count;
+                                            if count != *num_read {
+                                                eprintln!(
+                                                    "Stream {} received {} records, expected {}",
+                                                    i, count, num_read
+                                                );
+                                                run_success = false;
+                                            }
+                                        } else {
+                                            // For gzip, assume success if process completes
+                                            record_counts[i] = *num_read;
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("Stream {} process failed: {}", i, e);
+                                        run_success = false;
+                                    }
+                                    Err(_) => {
+                                        eprintln!("Stream {} process timed out after {}s", i, timeout_secs);
+                                        run_success = false;
+                                    }
+                                }
+                            }
+
+                            // Check t_junction completion
+                            match timeout(Duration::from_secs(timeout_secs), done_rx).await {
+                                Ok(Ok(Ok(()))) => {}
+                                Ok(Ok(Err(e))) => {
+                                    eprintln!("t_junction failed: {}", e);
+                                    run_success = false;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("t_junction task failed to send: {}", e);
+                                    run_success = false;
+                                }
+                                Err(_) => {
+                                    eprintln!("t_junction timed out after {}s", timeout_secs);
+                                    run_success = false;
+                                }
+                            }
+
+                            let elapsed = start.elapsed();
+                            let elapsed_secs = elapsed.as_secs_f64();
+                            sys.refresh_process(pid);
+                            let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+                            let memory_used = if memory_after >= memory_before {
+                                memory_after - memory_before
+                            } else {
+                                0
+                            };
+
+                            let record_counts_str = record_counts
+                                .iter()
+                                .map(|c| c.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            writeln!(
+                                &mut log,
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                cmd_tag,
+                                buffer_size,
+                                sleep,
+                                stream_num,
+                                num_read,
+                                read_size,
+                                elapsed_secs,
+                                memory_used,
+                                record_counts_str,
+                                run_success
+                            )?;
+                            log.flush()?;
+
+                            eprintln!(
+                                "Completed: Command: {}, Buffer: {}, Sleep: {}, Streams: {}, Reads: {}, Size: {}, Success: {}",
+                                cmd_tag, buffer_size, sleep, stream_num, num_read, read_size, run_success
+                            );
+                            stderr().flush()?;
                         }
                     }
                 }
