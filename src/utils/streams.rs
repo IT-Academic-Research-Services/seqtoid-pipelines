@@ -91,23 +91,30 @@ where
     let mut input = Box::pin(input);
 
     tokio::spawn(async move {
-        // Check for zero subscribers
         if n_outputs == 0 {
             let _ = done_tx.send(Err(anyhow!("No subscribers: cannot process stream")));
             return;
         }
 
         let mut count = 0;
+        let mut lag_count = 0;
         while let Some(item) = input.next().await {
-            // Check for lagging subscribers
             if tx.receiver_count() == 0 {
-                eprintln!("All subscribers dropped before stream completion");
+                eprintln!("All subscribers dropped at item {}", count + 1);
+                let _ = done_tx.send(Err(anyhow!("All subscribers dropped")));
+                return;
             }
-            // Send item and handle errors
+
             match tx.send(item) {
                 Ok(_) => (),
                 Err(broadcast::error::SendError(_)) => {
                     eprintln!("Warning: Broadcast channel lagged at item {}", count + 1);
+                    lag_count += 1;
+                    if lag_count > stall_threshold {
+                        eprintln!("Excessive lag detected after {} items", lag_count);
+                        let _ = done_tx.send(Err(anyhow!("Excessive buffer lag")));
+                        return;
+                    }
                     continue;
                 }
             }
@@ -118,7 +125,7 @@ where
                 }
             }
         }
-        // Verify all items were sent to active subscribers
+
         if tx.receiver_count() > 0 {
             eprintln!("Sending Ok(()) with {} subscribers", tx.receiver_count());
             let _ = done_tx.send(Ok(()));
