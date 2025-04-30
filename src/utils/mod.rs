@@ -3,6 +3,7 @@ pub mod file;
 pub mod streams;
 pub mod command;
 pub mod sequence;
+pub mod defs;
 
 use clap::{Parser, ValueEnum};
 

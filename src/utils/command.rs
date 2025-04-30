@@ -1,7 +1,7 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
-use crate::{FASTP_TAG, PIGZ_TAG};
+use crate::utils::defs::{FASTP_TAG, PIGZ_TAG};
 use crate::utils::Arguments;
 
 
@@ -10,7 +10,7 @@ mod fastp {
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
     use crate::utils::Arguments;
-    use crate::FASTP_TAG;
+    use crate::utils::defs::FASTP_TAG;
     use crate::utils::streams::read_child_stdout_to_vec;
 
     pub async fn fastp_presence_check() -> Result<String> {

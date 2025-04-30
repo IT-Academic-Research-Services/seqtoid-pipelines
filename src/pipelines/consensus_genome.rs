@@ -9,7 +9,7 @@ use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::{t_junction, stream_sequence_records_to_file, stream_bytes_to_file, stream_to_cmd, parse_child_stdout_to_bytes, parse_child_stdout_to_fastq, ToBytes};
-use crate::{PIGZ_TAG, FASTP_TAG};
+use crate::utils::defs::{PIGZ_TAG, FASTP_TAG};
 
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
