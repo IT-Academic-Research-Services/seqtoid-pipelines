@@ -102,6 +102,26 @@ async fn test_fastx_generator_stress() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_fastx_generator_edge_cases() -> Result<()> {
+    // Test zero reads
+    let stream = fastx_generator(0, 100, 35.0, 3.0);
+    let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
+    assert_eq!(count, 0, "Zero reads should produce no records");
+
+    // Test single read
+    let stream = fastx_generator(1, 100, 35.0, 3.0);
+    let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
+    assert_eq!(count, 1, "Single read should produce one record");
+
+    // Test zero read size (if fastx_generator allows it)
+    let stream = fastx_generator(1000, 0, 35.0, 3.0);
+    let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
+    assert_eq!(count, 0, "Zero read size should produce no records");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_t_junction_stress() -> Result<()> {
     let buffer_sizes = vec![10_000, 50_000, 100_000, 1_000_000];
     let stall_thresholds = vec![100, 1_000, 10_000, 50_000];
