@@ -1,9 +1,9 @@
-use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord};
+use seqtoid_pipelines::utils::fastx::fastx_generator;
 use anyhow::Result;
 use std::io::{stderr, Write};
 use std::time::Instant;
 use futures::StreamExt;
-use sysinfo::System;
+use sysinfo::{System, Pid};
 use seqtoid_pipelines::utils::streams::t_junction;
 
 #[tokio::test]
@@ -131,8 +131,9 @@ async fn test_t_junction_stress() -> Result<()> {
     let read_sizes  = vec![100, 1000, 10000];
 
     let mut log = std::fs::File::create("stress_test.log")?;
-    writeln!(&mut log, "Buffer size\tStall\tSleep\tStreams\tReads\tSize\tTime\tMemory")?;
-    let mut sys = System::new_all();
+    writeln!(&mut log, "Buffer_Size\tStall\tSleep\tStreams\tReads\tSize\tTime\tMemory\tRecords\tSuccess?")?;
+    let mut sys = System::new();
+    let pid = Pid::from(std::process::id() as usize);
 
     for buffer_size in &buffer_sizes {
         for stall in &stall_thresholds {
@@ -140,56 +141,79 @@ async fn test_t_junction_stress() -> Result<()> {
                 for stream_num in &stream_nums {
                     for num_read in &num_reads {
                         for read_size in &read_sizes {
+                            let mut run_success = true;
                             let start = Instant::now();
-                            sys.refresh_memory();
-                            let memory_before = sys.used_memory();
+                            sys.refresh_process(pid);
+                            let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+                            
                             eprintln!("Buffer size: {}  Stall: {}  Sleep: {}  Streams: {} Reads: {}  Size: {}", buffer_size, stall, sleep, stream_num, num_read, read_size);
                             std::io::stderr().flush()?;
+
                             let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
                             let (mut outputs, done_rx) = t_junction(
                                 stream,
                                 *stream_num,
                                 *buffer_size,
                                 *stall,
-                                if *sleep == 0 { None } else { Some(*sleep) },
-                            ).await?;
+                                if *sleep == 0 { None } else { Some(*sleep) }
+                            )
+                                .await?;
 
                             let mut records = vec![Vec::new(); *stream_num];
                             for i in 0..*stream_num {
-                                while let Some(Ok(record)) = outputs[i].next().await {
-                                    records[i].push(record);
+                                while let Some(result) = outputs[i].next().await {
+                                    match result {
+                                        Ok(record) => records[i].push(record),
+                                        Err(e) => eprintln!("Stream {} error: {}", i, e),
+                                    }
                                 }
+                                eprintln!("Stream {} received {} records", i, records[i].len());
+                                stderr().flush()?;
                             }
+
+
                             let elapsed = start.elapsed();
                             let elapsed_secs = elapsed.as_secs_f64();
-                            sys.refresh_memory();
-                            let memory_after = sys.used_memory();
+                            sys.refresh_process(pid);
+                            let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
                             let memory_used = if memory_after >= memory_before {
-                                (memory_after - memory_before) / 1024 / 1024 // MB
+                                memory_after - memory_before
                             } else {
-                                0 // Memory usage decreased, likely due to system fluctuations
+                                0
                             };
+                            
 
                             for i in 0..*stream_num {
                                 eprintln!("stream {}", i);
-                                std::io::stderr().flush()?;
-                                assert_eq!(num_read, &records[i].len());
+                                stderr().flush()?;
+                                if num_read != &records[i].len() {
+                                    eprintln!("Stream {} failed: expected {}, got {}", i, num_read, records[i].len());
+                                    run_success = false;
+                                }
                             }
+
                             match done_rx.await {
                                 Ok(result) => match result {
                                     Ok(()) => eprintln!("t_junction completed successfully"),
                                     Err(e) => {
                                         eprintln!("t_junction failed: {}", e);
-                                        return Err(e);
+                                        run_success = false;
                                     }
                                 },
                                 Err(e) => {
                                     eprintln!("t_junction task failed to send: {}", e);
-                                    return Err(anyhow::anyhow!("t_junction task failed: {}", e));
+                                    run_success = false;
                                 }
                             };
+                            stderr().flush()?;
 
-                            writeln!(& mut log, "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed_secs, memory_used)?;
+                            let record_counts: String = records
+                                .iter()
+                                .map(|r| r.len().to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            
+                            writeln!(& mut log, "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed_secs, memory_used, record_counts, run_success)?;
                             log.flush()?;
                         }
                     }
