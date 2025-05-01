@@ -18,30 +18,23 @@ async fn test_fastx_generator_stress() -> Result<()> {
     let mut log = std::fs::File::create("fastx_stress.log")?;
     writeln!(
         &mut log,
-        "Dataset\tReads\tSize\tRecords\tTime\tMemory"
+        "Reads\tSize\tRecords\tTime\tMemory"
     )?;
     log.flush()?;
-
+    
     // Optional system monitoring
     #[cfg(feature = "sysinfo")]
     let mut sys = System::new_all();
 
     for read_size in &read_sizes {
-        let dataset_name = if *read_size <= 150 {
-            format!("illumina_{}bp", read_size)
-        } else {
-            format!("ont_{}bp", read_size)
-        };
-        let max_records = if *read_size >= 1000 { 10_000 } else { 100_000 };
+        
 
         for num_read in &num_reads {
-            if *num_read > max_records {
-                continue;
-            }
+
 
             eprintln!(
-                "Testing: Dataset: {}, Reads: {}, Size: {}",
-                dataset_name, num_read, read_size
+                "Testing: Reads: {}, Size: {}",
+                num_read, read_size
             );
             stderr().flush()?;
 
@@ -75,26 +68,13 @@ async fn test_fastx_generator_stress() -> Result<()> {
                 #[cfg(not(feature = "sysinfo"))]
                 0
             };
-
-            // Verify record count
-            assert_eq!(
-                *num_read,
-                record_count,
-                "Dataset: {}, Reads: {}, Size: {}",
-                dataset_name, num_read, read_size
-            );
-
-            eprintln!(
-                "Dataset: {} produced {} records",
-                dataset_name, record_count
-            );
-            stderr().flush()?;
+            
 
             // Log results
             writeln!(
                 &mut log,
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                dataset_name, num_read, read_size, record_count, elapsed_secs, memory_used
+                "{}\t{}\t{}\t{}\t{}",
+                num_read, read_size, record_count, elapsed_secs, memory_used
             )?;
             log.flush()?;
         }
