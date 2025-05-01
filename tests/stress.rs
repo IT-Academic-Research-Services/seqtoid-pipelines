@@ -124,6 +124,28 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_fastx_generator_count() -> Result<()> {
+    let num_reads = vec![10_000];
+    let read_sizes = vec![50, 100, 1000];
+
+    for num_read in num_reads {
+        for read_size in &read_sizes {
+            eprintln!("Testing fastx_generator: Reads: {}, Size: {}", num_read, read_size);
+            stderr().flush()?;
+            let stream = fastx_generator(num_read, *read_size, 35.0, 3.0);
+            let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
+            if count != num_read {
+                eprintln!("fastx_generator failed: expected {}, got {}", num_read, count);
+                return Err(anyhow::anyhow!("fastx_generator produced {} records, expected {}", count, num_read));
+            }
+            eprintln!("fastx_generator produced {} records", count);
+            stderr().flush()?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_t_junction_stress() -> Result<()> {
     let buffer_sizes = vec![10_000, 50_000, 100_000, 1_000_000];
     let stall_thresholds = vec![100, 1_000, 10_000, 50_000];
@@ -147,7 +169,7 @@ async fn test_t_junction_stress() -> Result<()> {
                             let start = Instant::now();
                             sys.refresh_process(pid);
                             let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
-                            
+
                             eprintln!("Buffer size: {}  Stall: {}  Sleep: {}  Streams: {} Reads: {}  Size: {}", buffer_size, stall, sleep, stream_num, num_read, read_size);
                             std::io::stderr().flush()?;
 
@@ -183,7 +205,7 @@ async fn test_t_junction_stress() -> Result<()> {
                             } else {
                                 0
                             };
-                            
+
 
                             for i in 0..*stream_num {
                                 eprintln!("stream {}", i);
@@ -214,7 +236,7 @@ async fn test_t_junction_stress() -> Result<()> {
                                 .map(|r| r.len().to_string())
                                 .collect::<Vec<_>>()
                                 .join(",");
-                            
+
                             writeln!(& mut log, "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed_secs, memory_used, record_counts, run_success)?;
                             log.flush()?;
                         }
