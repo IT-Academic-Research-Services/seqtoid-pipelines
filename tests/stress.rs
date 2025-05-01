@@ -5,11 +5,10 @@ use std::io::{stderr, Write};
 use std::time::{Instant, Duration};
 use futures::StreamExt;
 use sysinfo::{System, Pid};
-use seqtoid_pipelines::utils::streams::{stream_to_cmd, t_junction, ToBytes};
+use seqtoid_pipelines::utils::streams::{stream_to_cmd, t_junction};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
