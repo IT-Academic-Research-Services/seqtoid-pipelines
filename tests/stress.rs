@@ -232,6 +232,50 @@ async fn test_t_junction_stress() -> Result<()> {
 
 
 #[tokio::test]
+async fn test_t_junction_count() -> Result<()> {
+    let num_read = 10_000;
+    let read_size = 50;
+    let buffer_size = 100_000;
+    let sleep_ms = Some(1);
+    eprintln!("Testing t_junction: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}", num_read, read_size, buffer_size, sleep_ms);
+    stderr().flush()?;
+    let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
+    let (mut outputs, done_rx) = t_junction(stream, 2, buffer_size, 100, sleep_ms).await?;
+    let mut counts = vec![0usize; 2];
+    for (i, mut rx) in outputs.into_iter().enumerate() {
+        while let Some(result) = rx.next().await {
+            match result {
+                Ok(_) => {
+                    counts[i] += 1;
+                    if counts[i] % 1000 == 0 {
+                        eprintln!("t_junction stream {} counted {} records", i, counts[i]);
+                        stderr().flush()?;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("t_junction stream {} error: {}", i, e);
+                    stderr().flush()?;
+                }
+            }
+        }
+        eprintln!("t_junction stream {} finished: {} records", i, counts[i]);
+        stderr().flush()?;
+    }
+    match done_rx.await {
+        Ok(Ok(())) => eprintln!("t_junction completed successfully"),
+        Ok(Err(e)) => eprintln!("t_junction failed: {}", e),
+        Err(e) => eprintln!("t_junction send error: {}", e),
+    }
+    stderr().flush()?;
+    eprintln!("t_junction counts: {:?}", counts);
+    stderr().flush()?;
+    if counts != vec![num_read, num_read] {
+        return Err(anyhow!("t_junction produced {:?}, expected [{}, {}]", counts, num_read, num_read));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_stream_to_cmd_stress() -> Result<()> {
     let num_reads = vec![10_000];
     let read_sizes = vec![50, 100, 1000];
