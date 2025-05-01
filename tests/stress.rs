@@ -86,6 +86,28 @@ async fn test_fastx_generator_stress() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_fastx_generator_count() -> Result<()> {
+    let num_reads = vec![10_000];
+    let read_sizes = vec![50, 100, 1000];
+
+    for num_read in num_reads {
+        for read_size in &read_sizes {
+            eprintln!("Testing fastx_generator: Reads: {}, Size: {}", num_read, read_size);
+            stderr().flush()?;
+            let stream = fastx_generator(num_read, *read_size, 35.0, 3.0);
+            let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
+            if count != num_read {
+                eprintln!("fastx_generator failed: expected {}, got {}", num_read, count);
+                return Err(anyhow::anyhow!("fastx_generator produced {} records, expected {}", count, num_read));
+            }
+            eprintln!("fastx_generator produced {} records", count);
+            stderr().flush()?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_fastx_generator_edge_cases() -> Result<()> {
     // Test zero reads
     let stream = fastx_generator(0, 100, 35.0, 3.0);
