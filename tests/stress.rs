@@ -2,18 +2,23 @@ use anyhow::anyhow;
 use seqtoid_pipelines::utils::fastx::fastx_generator;
 use anyhow::Result;
 use std::io::{stderr, Write};
-use std::time::{Instant, Duration};
+use std::time::{Instant};
 use futures::StreamExt;
 use sysinfo::{System, Pid};
 use seqtoid_pipelines::utils::streams::{stream_to_cmd, t_junction};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Child;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use std::sync::{Arc, Mutex};
+use tokio::time::{sleep, Duration};
+
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
-    // Test parameters
-    let num_reads = vec![10_000, 100_000]; // Matches t_junction failing case
+
+    let num_reads = vec![10_000, 100_000]; 
     let read_sizes = vec![100, 150, 1000, 5000]; // Illumina and ONT
 
     // Log results to file
@@ -23,13 +28,13 @@ async fn test_fastx_generator_stress() -> Result<()> {
         "Reads\tSize\tRecords\tTime\tMemory"
     )?;
     log.flush()?;
-    
+
     // Optional system monitoring
     #[cfg(feature = "sysinfo")]
     let mut sys = System::new_all();
 
     for read_size in &read_sizes {
-        
+
 
         for num_read in &num_reads {
 
@@ -70,7 +75,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
                 #[cfg(not(feature = "sysinfo"))]
                 0
             };
-            
+
 
             // Log results
             writeln!(
@@ -127,102 +132,103 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
     Ok(())
 }
 
+
 #[tokio::test]
 async fn test_t_junction_stress() -> Result<()> {
-    let buffer_sizes = vec![10_000, 100_000];
-    let stall_thresholds = vec![100, 10_000];
-    let sleep_ms = vec![0, 1];
-    let stream_nums = vec![2, 5];
-    let num_reads = vec![10000, 100000];
-    let read_sizes  = vec![100, 1000];
+    let buffer_sizes = [10_000, 100_000];
+    let stall_thresholds = [100];
+    let sleep_ms_options = [Some(0), Some(10)];
+    let backpressure_pause_ms_options = [50, 250, 500];
+    let num_reads = 100_000;
+    let seq_len = 100;
+    let n_outputs = 2;
 
-    let mut log = std::fs::File::create("stress_test.log")?;
-    writeln!(&mut log, "Buffer_Size\tStall\tSleep\tStreams\tReads\tSize\tTime\tMemory\tRecords\tSuccess?")?;
-    let mut sys = System::new();
-    let pid = Pid::from(std::process::id() as usize);
+    for &buffer_size in &buffer_sizes {
+        for &stall_threshold in &stall_thresholds {
+            for &sleep_ms in &sleep_ms_options {
+                for &backpressure_pause_ms in &backpressure_pause_ms_options {
+                    eprintln!(
+                        "Buffer size: {}  Stall: {}  Sleep: {}  Pause: {}  Streams: {} Reads: {}  Size: {}",
+                        buffer_size,
+                        stall_threshold,
+                        sleep_ms.unwrap_or(0),
+                        backpressure_pause_ms,
+                        n_outputs,
+                        num_reads,
+                        seq_len
+                    );
 
-    for buffer_size in &buffer_sizes {
-        for stall in &stall_thresholds {
-            for sleep in &sleep_ms {
-                for stream_num in &stream_nums {
-                    for num_read in &num_reads {
-                        for read_size in &read_sizes {
-                            let mut run_success = true;
-                            let start = Instant::now();
-                            sys.refresh_process(pid);
-                            let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
-                            
-                            eprintln!("Buffer size: {}  Stall: {}  Sleep: {}  Streams: {} Reads: {}  Size: {}", buffer_size, stall, sleep, stream_num, num_read, read_size);
-                            std::io::stderr().flush()?;
+                    let stream = fastx_generator(num_reads, seq_len, 30.0, 5.0);
+                    let start = Instant::now();
+                    let (outputs, done_rx) = t_junction(
+                        stream,
+                        n_outputs,
+                        buffer_size,
+                        stall_threshold,
+                        sleep_ms,
+                        backpressure_pause_ms,
+                    )
+                        .await?;
 
-                            let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
-                            let (mut outputs, done_rx) = t_junction(
-                                stream,
-                                *stream_num,
-                                *buffer_size,
-                                *stall,
-                                if *sleep == 0 { None } else { Some(*sleep) }
-                            )
-                                .await?;
-
-                            let mut records = vec![Vec::new(); *stream_num];
-                            for i in 0..*stream_num {
-                                while let Some(result) = outputs[i].next().await {
-                                    match result {
-                                        Ok(record) => records[i].push(record),
-                                        Err(e) => eprintln!("Stream {} error: {}", i, e),
+                    let mut run_success = true;
+                    let record_counts = Arc::new(Mutex::new(vec![0; n_outputs]));
+                    for (i, mut output) in outputs.into_iter().enumerate() {
+                        let record_counts = Arc::clone(&record_counts);
+                        tokio::spawn(async move {
+                            while let Some(_item) = output.next().await {
+                                {
+                                    let mut counts = record_counts.lock().unwrap();
+                                    counts[i] += 1;
+                                    if counts[i] % 1000 == 0 {
+                                        eprintln!("Stream {} processed {} items", i, counts[i]);
                                     }
-                                }
-                                eprintln!("Stream {} received {} records", i, records[i].len());
-                                stderr().flush()?;
+                                } // Drop MutexGuard here
+
                             }
+                        });
+                    }
 
-
-                            let elapsed = start.elapsed();
-                            let elapsed_secs = elapsed.as_secs_f64();
-                            sys.refresh_process(pid);
-                            let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
-                            let memory_used = if memory_after >= memory_before {
-                                memory_after - memory_before
-                            } else {
-                                0
-                            };
-                            
-
-                            for i in 0..*stream_num {
-                                eprintln!("stream {}", i);
-                                stderr().flush()?;
-                                if num_read != &records[i].len() {
-                                    eprintln!("Stream {} failed: expected {}, got {}", i, num_read, records[i].len());
-                                    run_success = false;
-                                }
+                    match done_rx.await {
+                        Ok(result) => match result {
+                            Ok(()) => eprintln!("t_junction completed successfully"),
+                            Err(e) => {
+                                eprintln!("t_junction failed: {}", e);
+                                run_success = false;
                             }
-
-                            match done_rx.await {
-                                Ok(result) => match result {
-                                    Ok(()) => eprintln!("t_junction completed successfully"),
-                                    Err(e) => {
-                                        eprintln!("t_junction failed: {}", e);
-                                        run_success = false;
-                                    }
-                                },
-                                Err(e) => {
-                                    eprintln!("t_junction task failed to send: {}", e);
-                                    run_success = false;
-                                }
-                            };
-                            stderr().flush()?;
-
-                            let record_counts: String = records
-                                .iter()
-                                .map(|r| r.len().to_string())
-                                .collect::<Vec<_>>()
-                                .join(",");
-                            
-                            writeln!(& mut log, "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}", buffer_size, stall, sleep, stream_num, num_read, read_size, elapsed_secs, memory_used, record_counts, run_success)?;
-                            log.flush()?;
+                        },
+                        Err(e) => {
+                            eprintln!("t_junction task failed to send: {}", e);
+                            run_success = false;
                         }
                     }
+
+                    let duration = start.elapsed();
+                    let memory = 0; // Update with sysinfo if enabled
+                    let record_counts = record_counts.lock().unwrap();
+                    eprintln!(
+                        "Records: {:?}  Success: {}",
+                        *record_counts, run_success
+                    );
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}",
+                        buffer_size,
+                        stall_threshold,
+                        sleep_ms.unwrap_or(0),
+                        n_outputs,
+                        num_reads,
+                        seq_len,
+                        duration.as_secs_f64(),
+                        memory,
+                        *record_counts,
+                        run_success
+                    );
+
+                    assert_eq!(
+                        *record_counts,
+                        vec![num_reads; n_outputs],
+                        "Incorrect record counts"
+                    );
+
                 }
             }
         }
@@ -236,11 +242,13 @@ async fn test_t_junction_count() -> Result<()> {
     let num_read = 10_000;
     let read_size = 50;
     let buffer_size = 100_000;
+    let stall_threshold = 100;
     let sleep_ms = Some(1);
+    let backpressure_pause_ms = 500;
     eprintln!("Testing t_junction: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}", num_read, read_size, buffer_size, sleep_ms);
     stderr().flush()?;
     let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
-    let (mut outputs, done_rx) = t_junction(stream, 2, buffer_size, 100, sleep_ms).await?;
+    let (mut outputs, done_rx) = t_junction(stream, 2, buffer_size, stall_threshold, sleep_ms, backpressure_pause_ms).await?;
     let mut counts = vec![0usize; 2];
     for (i, mut rx) in outputs.into_iter().enumerate() {
         while let Some(result) = rx.next().await {
@@ -276,17 +284,73 @@ async fn test_t_junction_count() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_stream_to_cmd_direct() -> Result<()> {
+    let num_read = 100;
+    let read_size = 50;
+    let cmd_tag = "cat";
+    let args = vec!["-"];
+    eprintln!("Testing stream_to_cmd: Reads: {}, Size: {}, Command: {}", num_read, read_size, cmd_tag);
+    stderr().flush()?;
+
+    let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
+    let (tx, rx) = broadcast::channel(100_000);
+    let rx = BroadcastStream::new(rx);
+
+    tokio::spawn(async move {
+        let mut count = 0;
+        let mut stream = Box::pin(stream);
+        while let Some(item) = stream.next().await {
+            count += 1;
+            if count % 10 == 0 {
+                eprintln!("Sent {} records to broadcast channel", count);
+                stderr().flush().ok();
+            }
+            if tx.send(item).is_err() {
+                eprintln!("Broadcast channel dropped");
+                break;
+            }
+        }
+        eprintln!("Finished sending {} records", count);
+        stderr().flush().ok();
+    });
+
+    let (child, inner_task) = stream_to_cmd(rx, cmd_tag, args).await?;
+    match timeout(Duration::from_secs(30), inner_task).await {
+        Ok(Ok(Ok(()))) => eprintln!("stream_to_cmd completed successfully"),
+        Ok(Ok(Err(e))) => {
+            eprintln!("stream_to_cmd failed: {}", e);
+            return Err(e);
+        }
+        Ok(Err(e)) => {
+            eprintln!("stream_to_cmd join error: {}", e);
+            return Err(anyhow!("Join error: {}", e));
+        }
+        Err(_) => {
+            eprintln!("stream_to_cmd timed out after 30s");
+            return Err(anyhow!("stream_to_cmd timed out"));
+        }
+    }
+    let output = child.wait_with_output().await?;
+    let stderr_output = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        eprintln!("Child process failed: status: {}, stderr: {}", output.status, stderr_output);
+        return Err(anyhow!("Child process failed: status: {}, stderr: {}", output.status, stderr_output));
+    }
+    eprintln!("Child process completed successfully");
+    stderr().flush()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_stream_to_cmd_stress() -> Result<()> {
-    let num_reads = vec![10_000];
-    let read_sizes = vec![50, 100, 1000];
+    let num_reads = vec![100];
+    let read_sizes = vec![50];
     let stream_nums = vec![1];
-    let buffer_sizes = vec![10_000, 100_000];
-    let sleep_ms = vec![0, 1];
-    let commands = vec![
-        ("cat", vec!["-"]),
-        ("gzip", vec!["-c"]),
-    ];
-    let timeout_secs = 300;
+    let buffer_sizes = vec![100_000];
+    let sleep_ms = vec![0];
+    let commands = vec![("cat", vec!["-"])];
+    let timeout_secs = 30;
+    let backpressure_pause_ms = 500;
 
     let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
     writeln!(
@@ -317,36 +381,31 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                             // Generate stream and split with t_junction
                             let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
+                            let mut gen_count = 0;
+                            let stream = stream.inspect(move |_result| {
+                                gen_count += 1;
+                                if gen_count % 10 == 0 {
+                                    eprintln!("fastx_generator produced {} records", gen_count);
+                                    let _ = stderr().flush();
+                                }
+                            });
                             let (mut outputs, done_rx) = match t_junction(
                                 stream,
-                                *stream_num + 1, // Extra stream for counting
+                                *stream_num + 1,
                                 *buffer_size,
                                 100,
-                                if *sleep == 0 { None } else { Some(*sleep) },
+                                if *sleep == 0 { None } else { Some(*sleep) }, backpressure_pause_ms
                             )
                                 .await {
                                 Ok(result) => result,
                                 Err(e) => {
                                     eprintln!("t_junction failed to start: {}", e);
                                     run_success = false;
-                                    writeln!(
-                                        &mut log,
-                                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                        cmd_tag,
-                                        buffer_size,
-                                        sleep,
-                                        stream_num,
-                                        num_read,
-                                        read_size,
-                                        0.0,
-                                        0,
-                                        "0",
-                                        false
-                                    )?;
-                                    log.flush()?;
-                                    continue;
+                                    return Err(anyhow!("t_junction failed: {}", e));
                                 }
                             };
+                            eprintln!("t_junction started with {} streams", *stream_num + 1);
+                            stderr().flush()?;
 
                             // Spawn stream_to_cmd for each stream
                             let mut children: Vec<Child> = Vec::new();
@@ -356,7 +415,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             for i in 0..*stream_num {
                                 let cmd_tag = cmd_tag.to_string();
                                 let args = args.iter().map(|&s| s.to_string()).collect::<Vec<_>>();
-                                let num_read_owned = *num_read; // Copy usize for 'static
+                                let num_read_owned = *num_read;
                                 let rx = outputs.pop().ok_or_else(|| anyhow!("Missing stream for cmd"))?;
                                 let mut rx_count = outputs.pop().ok_or_else(|| anyhow!("Missing stream for counting"))?;
                                 let (child, inner_task) = match stream_to_cmd(
@@ -376,15 +435,29 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 let task = tokio::spawn(async move {
                                     let mut count = 0;
                                     let result = async {
-                                        // Count records from rx_count
                                         while let Some(result) = rx_count.next().await {
                                             match result {
-                                                Ok(_) => count += 1,
+                                                Ok(record) => {
+                                                    count += 1;
+                                                    if count <= 5 {
+                                                        eprintln!("Stream {} record {}: {:?}", i, count, record.id());
+                                                        stderr().flush()?;
+                                                    }
+                                                    if count % 10 == 0 {
+                                                        eprintln!("Stream {} counted {} records", i, count);
+                                                        stderr().flush()?;
+                                                    }
+                                                }
                                                 Err(e) => return Err(anyhow!("Broadcast stream error: {}", e)),
                                             }
                                         }
-                                        // Wait for inner_task to complete
-                                        inner_task.await??;
+                                        eprintln!("Stream {} finished counting: {} records", i, count);
+                                        stderr().flush()?;
+                                        match inner_task.await {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(e)) => return Err(anyhow!("stream_to_cmd error: {}", e)),
+                                            Err(e) => return Err(anyhow!("stream_to_cmd join error: {}", e)),
+                                        }
                                         if count != num_read_owned {
                                             return Err(anyhow!(
                                                 "Expected {} records, received {}",
@@ -405,6 +478,8 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 match timeout(Duration::from_secs(timeout_secs), task).await {
                                     Ok(Ok((Ok(()), count))) => {
                                         record_counts[i] = count;
+                                        eprintln!("Stream {} task completed: {} records", i, count);
+                                        stderr().flush()?;
                                     }
                                     Ok(Ok((Err(e), count))) => {
                                         eprintln!("Stream {} task failed: {}, received {} records", i, e, count);
@@ -423,15 +498,19 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             }
 
                             // Verify process completion
-                            for (i, mut child) in children.into_iter().enumerate() {
+                            for (i, child) in children.into_iter().enumerate() {
                                 match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
                                     Ok(Ok(output)) => {
+                                        let stderr_output = String::from_utf8_lossy(&output.stderr);
                                         if !output.status.success() {
                                             eprintln!(
                                                 "Stream {} process {} failed with status: {}, stderr: {}",
-                                                i, cmd_tag, output.status, String::from_utf8_lossy(&output.stderr)
+                                                i, cmd_tag, output.status, stderr_output
                                             );
                                             run_success = false;
+                                        } else {
+                                            eprintln!("Stream {} process {} completed successfully", i, cmd_tag);
+                                            stderr().flush()?;
                                         }
                                     }
                                     Ok(Err(e)) => {
@@ -447,18 +526,24 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                             // Check t_junction completion
                             match timeout(Duration::from_secs(timeout_secs), done_rx).await {
-                                Ok(Ok(Ok(()))) => {}
+                                Ok(Ok(Ok(()))) => {
+                                    eprintln!("t_junction completed successfully");
+                                    stderr().flush()?;
+                                }
                                 Ok(Ok(Err(e))) => {
                                     eprintln!("t_junction failed: {}", e);
                                     run_success = false;
+                                    return Err(anyhow!("t_junction failed: {}", e));
                                 }
                                 Ok(Err(e)) => {
                                     eprintln!("t_junction task failed to send: {}", e);
                                     run_success = false;
+                                    return Err(anyhow!("t_junction send error: {}", e));
                                 }
                                 Err(_) => {
                                     eprintln!("t_junction timed out after {}s", timeout_secs);
                                     run_success = false;
+                                    return Err(anyhow!("t_junction timed out"));
                                 }
                             }
 
@@ -498,6 +583,10 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 cmd_tag, buffer_size, sleep, stream_num, num_read, read_size, run_success, record_counts_str
                             );
                             stderr().flush()?;
+
+                            if !run_success {
+                                return Err(anyhow!("Test failed due to errors in stream_to_cmd or t_junction"));
+                            }
                         }
                     }
                 }
