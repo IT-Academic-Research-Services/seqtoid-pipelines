@@ -9,7 +9,7 @@ use tokio::task;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{broadcast, oneshot};
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, sleep};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio::sync::mpsc;
@@ -76,56 +76,56 @@ pub async fn t_junction<S, T>(
     buffer_size: usize,
     stall_threshold: u64,
     stream_sleep_ms: Option<u64>,
+    backpressure_pause_ms: u64,
 ) -> Result<(Vec<BroadcastStream<T>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
 where
     S: Stream<Item = T> + Unpin + Send + 'static,
-    T: ToBytes + Clone + Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
+    if n_outputs == 0 {
+        return Err(anyhow!("No subscribers: cannot process stream"));
+    }
+    
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
-
     let (tx, _) = broadcast::channel(buffer_size);
     let output_rxs: Vec<_> = (0..n_outputs)
         .map(|_| BroadcastStream::new(tx.subscribe()))
         .collect();
-
     let mut input = Box::pin(input);
 
     tokio::spawn(async move {
-        if n_outputs == 0 {
-            let _ = done_tx.send(Err(anyhow!("No subscribers: cannot process stream")));
-            return;
-        }
-
+        let buffer_threshold = (buffer_size as f64 * 0.8) as usize; // Pause at 80% capacity
         let mut count = 0;
-        let mut lag_count = 0;
+
         while let Some(item) = input.next().await {
             if tx.receiver_count() == 0 {
                 eprintln!("All subscribers dropped at item {}", count + 1);
                 let _ = done_tx.send(Err(anyhow!("All subscribers dropped")));
                 return;
             }
-
+            
+            if tx.len() > buffer_threshold {
+                eprintln!("Buffer at {} items (> {} threshold), pausing...", tx.len(), buffer_threshold);
+                sleep(Duration::from_millis(backpressure_pause_ms)).await;
+            }
+            
             match tx.send(item) {
                 Ok(_) => (),
                 Err(broadcast::error::SendError(_)) => {
-                    eprintln!("Warning: Broadcast channel lagged at item {}", count + 1);
-                    lag_count += 1;
-                    if lag_count > stall_threshold {
-                        eprintln!("Excessive lag detected after {} items", lag_count);
-                        let _ = done_tx.send(Err(anyhow!("Excessive buffer lag")));
-                        return;
-                    }
-                    continue;
+                    eprintln!("Data loss: Broadcast channel lagged at item {}", count + 1);
+                    let _ = done_tx.send(Err(anyhow!("Data loss due to buffer lag at item {}", count + 1)));
+                    return;
                 }
             }
             count += 1;
+            
             if count % stall_threshold == 0 {
                 if let Some(sleep_ms) = stream_sleep_ms {
-                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    sleep(Duration::from_millis(sleep_ms)).await;
                 }
             }
         }
-
+        
         if tx.receiver_count() > 0 {
             eprintln!("Sending Ok(()) with {} subscribers", tx.receiver_count());
             let _ = done_tx.send(Ok(()));
