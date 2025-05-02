@@ -417,12 +417,13 @@ mod tests {
     #[tokio::test]
     async fn test_t_junction_zero_streams() -> Result<()> {
         let stream = fastx_generator(10, 143, 35.0, 3.0);
-        let (outputs, done_rx) = t_junction(stream, 0, 50000, 10000, Some(1), 500).await?;
-        assert_eq!(outputs.len(), 0);
-        let result = done_rx.await?;
-        assert!(result.is_err(), "Expected error for zero subscribers");
+        
+        let result = t_junction(stream, 0, 50000, 10000, Some(1), 500).await;
+        assert!(result.is_err());
+        
+        let error = result.unwrap_err();
         assert_eq!(
-            result.unwrap_err().to_string(),
+            error.to_string(),
             "No subscribers: cannot process stream"
         );
         Ok(())
