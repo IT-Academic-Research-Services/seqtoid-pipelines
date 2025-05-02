@@ -13,6 +13,7 @@ mod fastp {
     use crate::utils::defs::FASTP_TAG;
     use crate::utils::streams::read_child_stdout_to_vec;
 
+    #[allow(dead_code)]
     pub async fn fastp_presence_check() -> Result<String> {
         let args: Vec<&str> = vec!["-v"];
 
@@ -79,6 +80,7 @@ pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
     Ok(cmd)
 }
 
+#[allow(dead_code)]
 pub async fn check_version(tool: &str) -> Result<String> {
     let version = match tool {
         FASTP_TAG => fastp::fastp_presence_check().await,

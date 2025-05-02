@@ -12,7 +12,7 @@ use tokio::process::Child;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration};
 
 
 #[tokio::test]
@@ -28,17 +28,10 @@ async fn test_fastx_generator_stress() -> Result<()> {
         "Reads\tSize\tRecords\tTime\tMemory"
     )?;
     log.flush()?;
-
-    // Optional system monitoring
-    #[cfg(feature = "sysinfo")]
+    
     let mut sys = System::new_all();
-
     for read_size in &read_sizes {
-
-
         for num_read in &num_reads {
-
-
             eprintln!(
                 "Testing: Reads: {}, Size: {}",
                 num_read, read_size
@@ -46,8 +39,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
             stderr().flush()?;
 
             let start = Instant::now();
-
-            #[cfg(feature = "sysinfo")]
+            
             let memory_before = {
                 sys.refresh_memory();
                 sys.used_memory()
@@ -62,8 +54,6 @@ async fn test_fastx_generator_stress() -> Result<()> {
             let elapsed = start.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
             let memory_used = {
-                #[cfg(feature = "sysinfo")]
-                {
                     sys.refresh_memory();
                     let memory_after = sys.used_memory();
                     if memory_after >= memory_before {
@@ -71,9 +61,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
                     } else {
                         0 // Handle underflow
                     }
-                }
-                #[cfg(not(feature = "sysinfo"))]
-                0
+                
             };
 
 
@@ -135,11 +123,11 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
 
 #[tokio::test]
 async fn test_t_junction_stress() -> Result<()> {
-    let buffer_sizes = [10_000, 100_000];
-    let stall_thresholds = [100];
+    let buffer_sizes = [1000, 10_000, 100_000];
+    let stall_thresholds = [100, 1000];
     let sleep_ms_options = [Some(0), Some(10)];
-    let backpressure_pause_ms_options = [50, 250, 500];
-    let num_reads = 100_000;
+    let backpressure_pause_ms_options = [50, 500];
+    let num_reads = 1_000_000;
     let seq_len = 100;
     let n_outputs = 2;
 

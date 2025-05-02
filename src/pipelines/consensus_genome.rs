@@ -49,8 +49,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
         rx_stream,
         2,
         args.buffer_size,
-        args.stall_threshold,
+        args.stall_threshold.try_into().unwrap(),
         Some(args.stream_sleep_ms),
+        500
     ).await?;
 
     if streams.len() != 2 {
