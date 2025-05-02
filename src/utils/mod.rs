@@ -37,13 +37,13 @@ pub struct Arguments {
     #[arg(short = 'q', long = "quality", default_value_t = 30)]
     pub quality: u8,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 1000)]
     pub stall_threshold: u64,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
 
-    #[arg(long, default_value_t = 100000)]
+    #[arg(long, default_value_t = 10000)]
     pub buffer_size: usize,
 }
 

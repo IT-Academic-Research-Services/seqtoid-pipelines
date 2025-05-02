@@ -130,7 +130,7 @@ async fn test_t_junction_stress() -> Result<()> {
     let num_reads = 100_000;
     let seq_len = 100;
     let n_outputs = 2;
-    println!("BufferSize\tStall\tSleep\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess");
+    println!("BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess");
     
     for &buffer_size in &buffer_sizes {
         for &stall_threshold in &stall_thresholds {
@@ -199,10 +199,11 @@ async fn test_t_junction_stress() -> Result<()> {
                         *record_counts, run_success
                     );
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}",
                         buffer_size,
                         stall_threshold,
                         sleep_ms.unwrap_or(0),
+                        backpressure_pause_ms,
                         n_outputs,
                         num_reads,
                         seq_len,
