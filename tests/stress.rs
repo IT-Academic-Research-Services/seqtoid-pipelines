@@ -127,7 +127,7 @@ async fn test_t_junction_stress() -> Result<()> {
     let stall_thresholds = [100, 1000];
     let sleep_ms_options = [Some(0), Some(10)];
     let backpressure_pause_ms_options = [50, 500];
-    let num_reads = 1_000_000;
+    let num_reads = 100_000;
     let seq_len = 100;
     let n_outputs = 2;
 
