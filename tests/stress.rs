@@ -131,7 +131,7 @@ async fn test_t_junction_stress() -> Result<()> {
     let seq_len = 100;
     let n_outputs = 2;
     println!("BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess");
-    
+
     for &buffer_size in &buffer_sizes {
         for &stall_threshold in &stall_thresholds {
             for &sleep_ms in &sleep_ms_options {
@@ -337,15 +337,15 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     let read_sizes = vec![50];
     let stream_nums = vec![1];
     let buffer_sizes = vec![100_000];
+    let backpressure_pause_ms_options = [50];
     let sleep_ms = vec![0];
     let commands = vec![("cat", vec!["-"])];
     let timeout_secs = 30;
-    let backpressure_pause_ms = 500;
 
     let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
     writeln!(
         &mut log,
-        "Command\tBuffer_Size\tSleep\tStreams\tReads\tSize\tTime\tMemory\tRecords\tSuccess?"
+        "Command\tBuffer_Size\tSleep\tBackpressurePause\tStreams\tReads\tSize\tTime\tMemory\tRecords\tSuccess?"
     )?;
     log.flush()?;
 
@@ -355,6 +355,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     for (cmd_tag, args) in &commands {
         for buffer_size in &buffer_sizes {
             for sleep in &sleep_ms {
+                for &backpressure_pause_ms in &backpressure_pause_ms_options {
                 for stream_num in &stream_nums {
                     for num_read in &num_reads {
                         for read_size in &read_sizes {
@@ -554,10 +555,11 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 .join(",");
                             writeln!(
                                 &mut log,
-                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                 cmd_tag,
                                 buffer_size,
                                 sleep,
+                                backpressure_pause_ms,
                                 stream_num,
                                 num_read,
                                 read_size,
@@ -582,6 +584,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                 }
             }
         }
+    }
     }
     Ok(())
 }
