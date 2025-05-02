@@ -336,9 +336,9 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     let num_reads = vec![100, 1000];
     let read_sizes = vec![50];
     let stream_nums = vec![1];
-    let buffer_sizes = vec![100_000];
-    let backpressure_pause_ms_options = [50];
-    let sleep_ms = vec![0];
+    let buffer_sizes = vec![10_000, 100_000];
+    let backpressure_pause_ms_options = [50, 500];
+    let sleep_ms = vec![0, 1];
     let commands = vec![("cat", vec!["-"])];
     let timeout_secs = 30;
 
