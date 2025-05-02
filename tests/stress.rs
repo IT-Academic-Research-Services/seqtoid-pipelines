@@ -19,7 +19,7 @@ use tokio::time::{Duration};
 async fn test_fastx_generator_stress() -> Result<()> {
 
     let num_reads = vec![10_000, 100_000]; 
-    let read_sizes = vec![100, 150, 1000, 5000]; // Illumina and ONT
+    let read_sizes = vec![100, 150, 1000, 5000];
 
     // Log results to file
     let mut log = std::fs::File::create("fastx_stress.log")?;
@@ -130,7 +130,8 @@ async fn test_t_junction_stress() -> Result<()> {
     let num_reads = 100_000;
     let seq_len = 100;
     let n_outputs = 2;
-
+    println!("BufferSize\tStall\tSleep\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess");
+    
     for &buffer_size in &buffer_sizes {
         for &stall_threshold in &stall_thresholds {
             for &sleep_ms in &sleep_ms_options {
