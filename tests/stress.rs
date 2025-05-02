@@ -333,7 +333,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_stream_to_cmd_stress() -> Result<()> {
-    let num_reads = vec![100];
+    let num_reads = vec![100, 1000];
     let read_sizes = vec![50];
     let stream_nums = vec![1];
     let buffer_sizes = vec![100_000];
