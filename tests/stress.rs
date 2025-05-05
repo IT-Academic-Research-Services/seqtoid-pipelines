@@ -342,7 +342,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     let buffer_sizes = vec![10_000, 100_000];
     let backpressure_pause_ms_options = [50, 500];
     let sleep_ms = vec![0, 1];
-    let commands = vec![("cat", vec!["-"])];
+    let commands = vec![("cat", vec!["-"]), ("gzip", vec!["-"])];
     let timeout_secs = 30;
 
     let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
