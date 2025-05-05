@@ -20,8 +20,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
 
     let num_reads = vec![10_000, 100_000]; 
     let read_sizes = vec![100, 150, 1000, 5000];
-
-    // Log results to file
+    
     let mut log = std::fs::File::create("fastx_stress.log")?;
     writeln!(
         &mut log,
@@ -63,9 +62,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
                     }
                 
             };
-
-
-            // Log results
+            
             writeln!(
                 &mut log,
                 "{}\t{}\t{}\t{}\t{}",
@@ -82,18 +79,21 @@ async fn test_fastx_generator_stress() -> Result<()> {
 async fn test_fastx_generator_count() -> Result<()> {
     let num_reads = vec![10_000];
     let read_sizes = vec![50, 100, 1000];
-
+    let mut log = std::fs::File::create("fastx_count.log")?;
     for num_read in num_reads {
         for read_size in &read_sizes {
-            eprintln!("Testing fastx_generator: Reads: {}, Size: {}", num_read, read_size);
+            writeln!(
+                &mut log,"Testing fastx_generator: Reads: {}, Size: {}", num_read, read_size)?;
             stderr().flush()?;
             let stream = fastx_generator(num_read, *read_size, 35.0, 3.0);
             let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
             if count != num_read {
-                eprintln!("fastx_generator failed: expected {}, got {}", num_read, count);
+                writeln!(
+                    &mut log,"fastx_generator failed: expected {}, got {}", num_read, count)?;
                 return Err(anyhow::anyhow!("fastx_generator produced {} records, expected {}", count, num_read));
             }
-            eprintln!("fastx_generator produced {} records", count);
+            writeln!(
+                &mut log,"fastx_generator produced {} records", count)?;
             stderr().flush()?;
         }
     }
@@ -130,7 +130,9 @@ async fn test_t_junction_stress() -> Result<()> {
     let num_reads = 100_000;
     let seq_len = 100;
     let n_outputs = 2;
-    println!("BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess");
+    let mut log = std::fs::File::create("t_junction_stress.log")?;
+    writeln!(
+        &mut log,"BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess")?;
 
     for &buffer_size in &buffer_sizes {
         for &stall_threshold in &stall_thresholds {
@@ -198,7 +200,8 @@ async fn test_t_junction_stress() -> Result<()> {
                         "Records: {:?}  Success: {}",
                         *record_counts, run_success
                     );
-                    println!(
+                    writeln!(
+                        &mut log,
                         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}",
                         buffer_size,
                         stall_threshold,
@@ -211,7 +214,7 @@ async fn test_t_junction_stress() -> Result<()> {
                         memory,
                         *record_counts,
                         run_success
-                    );
+                    )?;
 
                     assert_eq!(
                         *record_counts,
