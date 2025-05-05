@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::{Duration, sleep};
@@ -258,6 +258,22 @@ pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
     Ok(())
 }
 
+
+pub async fn write_child_stdout_to_file(mut child: Child, path: PathBuf) -> Result<()> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+
+    let file = File::create(&path).await?;
+    let mut writer = BufWriter::new(file);
+    tokio::io::copy(&mut tokio::io::BufReader::new(stdout), &mut writer).await?;
+    writer.flush().await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
 /// Takes output from stream_to_cmd and outputs it as a byte stream.
 ///
 /// # Arguments
@@ -298,10 +314,10 @@ pub async fn parse_child_stdout_to_bytes(stdout: ChildStdout) -> Result<Broadcas
 ///
 /// # Returns
 /// Result<()>
-pub async fn stream_sequence_records_to_file(mut rx: tokio::sync::mpsc::Receiver<SequenceRecord>, path: PathBuf) -> Result<()> {
+pub async fn stream_sequence_records_to_file(mut rx: BroadcastStream<SequenceRecord>, path: PathBuf) -> Result<()> {
     let mut file = File::create(&path).await?;
-    while let Some(record) = rx.recv().await {
-        let bytes = record.to_bytes()?;
+    while let Some(record) = rx.next().await {
+        let bytes = record?.to_bytes()?;
         file.write_all(&bytes).await?;
     }
     file.flush().await?;
