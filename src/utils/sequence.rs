@@ -28,6 +28,7 @@ impl DNA {
     }
 
     /// Generate a random nucleotide using the thread-local RNG. words.choose(&mut rand::rng()).unwrap()
+    #[allow(dead_code)]
     pub fn random() -> DNA {
         let mut rng = rng();
         
