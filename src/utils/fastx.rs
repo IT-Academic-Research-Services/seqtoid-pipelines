@@ -321,7 +321,6 @@ pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
 ///
 /// # Returns
 /// Stream<Item = SequenceRecord>
-#[allow(dead_code)]
 pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32) -> impl Stream<Item = SequenceRecord> {
     let records: Vec<SequenceRecord> = if seq_len == 0 {
         Vec::new() // Empty vector for zero read size

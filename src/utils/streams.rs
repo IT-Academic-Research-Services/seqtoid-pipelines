@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::{Duration, sleep};
@@ -258,22 +258,6 @@ pub async fn parse_child_stdout_to_fastq<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-
-pub async fn write_child_stdout_to_file(mut child: Child, path: PathBuf) -> Result<()> {
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
-
-    let file = File::create(&path).await?;
-    let mut writer = BufWriter::new(file);
-    tokio::io::copy(&mut tokio::io::BufReader::new(stdout), &mut writer).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    Ok(())
-}
-
 /// Takes output from stream_to_cmd and outputs it as a byte stream.
 ///
 /// # Arguments
@@ -310,7 +294,6 @@ pub async fn parse_child_stdout_to_bytes(stdout: ChildStdout) -> Result<Broadcas
 ///
 /// * `rx' - tokio::sync::mpsc::Receiver<SequenceRecord>
 /// * 'path' - PathBuf for output file
-
 ///
 /// # Returns
 /// Result<()>
@@ -331,7 +314,6 @@ pub async fn stream_sequence_records_to_file(mut rx: BroadcastStream<SequenceRec
 ///
 /// * `rx' - BBroadcastStream<Vec<u8>>
 /// * 'path' - PathBuf for output file
-
 ///
 /// # Returns
 /// Result<()>
@@ -353,7 +335,6 @@ pub async fn stream_bytes_to_file(mut rx: BroadcastStream<Vec<u8>>, path: PathBu
 ///
 /// # Returns
 /// io::Result<()>
-#[allow(dead_code)]
 pub async fn read_child_stdout(mut child: Child) -> Result<()> {
     let mut stdout = child
         .stdout
@@ -384,7 +365,6 @@ pub async fn read_child_stdout(mut child: Child) -> Result<()> {
 ///
 /// # Returns
 /// Result<Vec<String>>
-#[allow(dead_code)]
 pub async fn read_child_stdout_to_vec(mut child: Child) -> Result<Vec<String>> {
     let mut stdout = child
         .stdout
@@ -858,24 +838,24 @@ mod tests {
     #[tokio::test]
     async fn test_stream_sequence_records_to_file() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_test.fq");
-        let (tx, rx) = mpsc::channel(100);
-        let records = fastx_generator(2, 10, 35.0, 3.0);
-        let mut records_stream = Box::pin(records);
+
+        let mut records = fastx_generator(2, 10, 35.0, 3.0);
+        let (tx, rx) = broadcast::channel(1024); 
         
-        let send_task = tokio::spawn(async move {
-            while let Some(record) = records_stream.next().await {
-                if tx.send(record).await.is_err() {
-                    return Err(anyhow::anyhow!("Failed to send record"));
+        tokio::spawn(async move {
+            while let Some(record) = records.next().await {
+                if let Err(e) = tx.send(record) {
+                    assert!(false, "Failed to send record: {}", e);
+
                 }
             }
-            Ok::<(), anyhow::Error>(())
         });
-        
+
+        let broadcast_stream = BroadcastStream::new(rx);
         let write_task = tokio::spawn(async move {
-            stream_sequence_records_to_file(rx, Path::new("stream_to_file_test.fq").to_path_buf()).await
+            stream_sequence_records_to_file(broadcast_stream, Path::new("stream_to_file_test.fq").to_path_buf()).await
         });
         
-        send_task.await??;
         write_task.await??;
         
         assert!(Path::new("stream_to_file_test.fq").exists(), "Output file was not created");
@@ -892,34 +872,34 @@ mod tests {
     #[tokio::test]
     async fn test_stream_sequence_records_to_file_no_records() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_norecord_test.fq");
-        let (tx, rx) = mpsc::channel(100);
-        let records = fastx_generator(0, 10, 35.0, 3.0);
-        let mut records_stream = Box::pin(records);
+        let (tx, rx) = broadcast::channel(1024);
+        let mut records = fastx_generator(0, 10, 35.0, 3.0);
+        
+        tokio::spawn(async move {
+            while let Some(record) = records.next().await {
+                if let Err(e) = tx.send(record) {
+                    assert!(false, "Failed to send record: {}", e);
 
-        let send_task = tokio::spawn(async move {
-            while let Some(record) = records_stream.next().await {
-                if tx.send(record).await.is_err() {
-                    return Err(anyhow::anyhow!("Failed to send record"));
                 }
             }
-            Ok::<(), anyhow::Error>(())
         });
 
+        let broadcast_stream = BroadcastStream::new(rx);
+    
         let write_task = tokio::spawn(async move {
-            stream_sequence_records_to_file(rx, Path::new("stream_to_file_norecord_test.fq").to_path_buf()).await
+            stream_sequence_records_to_file(broadcast_stream, Path::new("stream_to_file_norecord_test.fq").to_path_buf()).await
         });
-
-        send_task.await??;
+        
         write_task.await??;
-
+    
         assert!(Path::new("stream_to_file_norecord_test.fq").exists(), "Output file was not created");
-
+    
         let content = fs::read_to_string("stream_to_file_norecord_test.fq")?;
         let num_records = content.lines().filter(|line| line.starts_with('@')).count();
         assert_eq!(num_records, 0, "Expected 2 FASTQ records, found {}", num_records);
-
+    
         fs::remove_file("stream_to_file_norecord_test.fq")?;
-
+    
         Ok(())
     }
 
