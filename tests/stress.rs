@@ -7,11 +7,11 @@ use std::path::Path;
 use std::time::{Instant};
 use futures::StreamExt;
 use sysinfo::{System, Pid};
-use seqtoid_pipelines::utils::streams::{read_child_stdout_to_vec, stream_to_cmd, t_junction, write_child_stdout_to_file};
+use seqtoid_pipelines::utils::streams::{read_child_stdout_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::{Child, Command};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::BroadcastStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration};
@@ -421,7 +421,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 let args = args.iter().map(|&s| s.to_string()).collect::<Vec<_>>();
 
                                 let rx = outputs.pop().ok_or_else(|| anyhow!("Missing stream for cmd"))?;
-                                let (child, stream_task) = match stream_to_cmd(
+                                let (mut child, stream_task) = match stream_to_cmd(
                                     rx,
                                     &cmd_tag,
                                     args.iter().map(|s| s.as_str()).collect(),
@@ -434,7 +434,14 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         continue;
                                     }
                                 };
-                                write_child_stdout_to_file(child, Path::new(&stream_outfile).to_path_buf()).await?;
+
+                                let out_stream = parse_child_output(child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
+                                let write_task = tokio::spawn(stream_to_file(
+                                    out_stream,
+                                    Path::new(&stream_outfile).to_path_buf(),
+                                ));
+                                
+                                tasks.push(write_task);
                                 tasks.push(stream_task);
                             }
 
@@ -455,15 +462,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         
                                     }
                                     
-                                    // "gzip" => {
-                                    //     cmd = "zcat".to_string();
-                                    //     let mut zcat = Command::new("zcat")
-                                    //         .arg("-")
-                                    //         .stdout(Stdio::piped()) // Pipe zcat's output
-                                    //         .spawn()?;
-                                    // 
-                                    // }
-                                    
+
                                     _ => {
                                         return Err(anyhow!("Cannot use this command {}", cmd_tag));
                                     }
