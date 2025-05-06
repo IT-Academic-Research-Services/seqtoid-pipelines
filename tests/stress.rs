@@ -344,9 +344,9 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
 /// Read each file, and work out if it has the correct number of records
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_stream_to_cmd_stress() -> Result<()> {
-    let num_reads = vec![100, 1000];
-    let read_sizes = vec![50];
-    let stream_nums = vec![1, 2, 5];
+    let num_reads = vec![100, 1000, 10_000];
+    let read_sizes = vec![50, 500, 5000];
+    let stream_nums = vec![1, 2, 5, 10];
     let buffer_sizes = vec![10_000, 100_000];
     let backpressure_pause_ms_options = [50, 500];
     let sleep_ms = vec![0, 1];
