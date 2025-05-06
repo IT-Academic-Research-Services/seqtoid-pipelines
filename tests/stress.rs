@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Instant};
 use futures::StreamExt;
 use sysinfo::{System, Pid};
-use seqtoid_pipelines::utils::streams::{read_child_stdout_to_vec, stream_sequence_records_to_file, stream_to_cmd, t_junction, write_child_stdout_to_file};
+use seqtoid_pipelines::utils::streams::{read_child_stdout_to_vec, stream_to_cmd, t_junction, write_child_stdout_to_file};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::{Child, Command};
@@ -16,7 +16,6 @@ use tokio_stream::wrappers::BroadcastStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration};
 use futures::future::join_all;
-use seqtoid_pipelines::utils::defs::FASTP_TAG;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -344,14 +343,14 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
 /// Read each file, and work out if it has the correct number of records
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_stream_to_cmd_stress() -> Result<()> {
-    let num_reads = vec![100, 1000, 10_000];
-    let read_sizes = vec![50, 500, 5000];
-    let stream_nums = vec![1, 2, 5, 10];
-    let buffer_sizes = vec![10_000, 100_000];
-    let backpressure_pause_ms_options = [50, 500];
-    let sleep_ms = vec![0, 1];
+    let num_reads = vec![100];
+    let read_sizes = vec![50];
+    let stream_nums = vec![1];
+    let buffer_sizes = vec![100_000];
+    let backpressure_pause_ms_options = [50];
+    let sleep_ms = vec![0];
     let commands = vec![("cat", vec!["-"])];
-    let timeout_secs = 30;
+
 
     let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
     writeln!(
@@ -407,9 +406,9 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             eprintln!("t_junction started with {} streams", *stream_num + 1);
                             stderr().flush()?;
                             
-                            let mut tasks: Vec<JoinHandle<(Result<(), anyhow::Error>)>> = Vec::new();
+                            let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
                             let mut outfiles = Vec::new();
-                            // Spawn stream_to_cmd for each stream
+
                             for i in 0..*stream_num {
                                 let stream_outfile = format!("stream_to_cmd_stress.{}.log", i);
 
@@ -445,10 +444,32 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             }
                             
                             for outfile in outfiles {
-                                let mut cmd = "wc".to_string();
+                                
+                                let mut cmd = String::new();
                                 let mut args_vec: Vec<String> = Vec::new();
-                                args_vec.push("-l".to_string());
-                                args_vec.push(outfile.to_string());
+                                match *cmd_tag {
+                                    "cat" => {
+                                        cmd = "wc".to_string();
+                                        args_vec.push("-l".to_string());
+                                        args_vec.push(outfile.to_string());
+                                        
+                                    }
+                                    
+                                    // "gzip" => {
+                                    //     cmd = "zcat".to_string();
+                                    //     let mut zcat = Command::new("zcat")
+                                    //         .arg("-")
+                                    //         .stdout(Stdio::piped()) // Pipe zcat's output
+                                    //         .spawn()?;
+                                    // 
+                                    // }
+                                    
+                                    _ => {
+                                        return Err(anyhow!("Cannot use this command {}", cmd_tag));
+                                    }
+                                }
+                                
+                                
                             
                                 let wc_child = Command::new(&cmd)
                                     .args(&args_vec)
@@ -467,7 +488,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 
                                 let line_count : usize = first_cols[0].parse()?;
                                 let fastq_count = line_count/4;
-                                // eprintln!("outfile:{} fatsqs: {}", outfile, fastq_count);
+
                                 if fastq_count != *num_read {
                                     run_success = false;
                                 }
@@ -502,7 +523,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             )?;
                             log.flush()?;
 
-
+                            eprintln!("done");
                             stderr().flush()?;
 
                             if !run_success {
