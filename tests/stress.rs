@@ -435,12 +435,12 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     }
                                 };
 
-                                let out_stream = parse_child_output(& mut child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
+                                let out_stream = parse_child_output(& mut child, ChildStream::Stdout, ParseMode::Fastq, *buffer_size).await?;
                                 let write_task = tokio::spawn(stream_to_file(
                                     out_stream,
                                     Path::new(&stream_outfile).to_path_buf(),
                                 ));
-                                
+
                                 tasks.push(write_task);
                                 tasks.push(stream_task);
                             }
@@ -449,9 +449,9 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             for result in results {
                                 result??; // Unwrap JoinHandle and inner Result, propagating errors
                             }
-                            
+
                             done_rx.await??; // Propagates any t_junction errors
-                            
+
                             for outfile in outfiles {
                                 
                                 let mut cmd = String::new();
@@ -463,13 +463,13 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         args_vec.push(outfile.to_string());
                                         
                                     }
-                                    
+
 
                                     _ => {
                                         return Err(anyhow!("Cannot use this command {}", cmd_tag));
                                     }
                                 }
-                                
+
                                 let mut wc_child = Command::new(&cmd)
                                     .args(&args_vec)
                                     .stdin(std::process::Stdio::piped())
