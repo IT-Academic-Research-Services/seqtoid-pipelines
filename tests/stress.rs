@@ -7,11 +7,11 @@ use std::path::Path;
 use std::time::{Instant};
 use futures::StreamExt;
 use sysinfo::{System, Pid};
-use seqtoid_pipelines::utils::streams::{read_child_stdout_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, mpsc};
+use tokio::process::Command;
+use tokio::sync::{broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration};
@@ -435,7 +435,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     }
                                 };
 
-                                let out_stream = parse_child_output(child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
+                                let out_stream = parse_child_output(& mut child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
                                 let write_task = tokio::spawn(stream_to_file(
                                     out_stream,
                                     Path::new(&stream_outfile).to_path_buf(),
@@ -449,6 +449,8 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             for result in results {
                                 result??; // Unwrap JoinHandle and inner Result, propagating errors
                             }
+                            
+                            done_rx.await??; // Propagates any t_junction errors
                             
                             for outfile in outfiles {
                                 
@@ -468,16 +470,14 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     }
                                 }
                                 
-                                
-                            
-                                let wc_child = Command::new(&cmd)
+                                let mut wc_child = Command::new(&cmd)
                                     .args(&args_vec)
                                     .stdin(std::process::Stdio::piped())
                                     .stdout(std::process::Stdio::piped())
                                     .stderr(std::process::Stdio::piped())
                                     .spawn()
                                     .map_err(|e| anyhow!("Failed to spawn {}: {}.", cmd, e))?;
-                                let lines = read_child_stdout_to_vec(wc_child).await?;
+                                let lines = read_child_output_to_vec(&mut wc_child, ChildStream::Stdout).await?;
                                 let first_line = lines
                                     .first()
                                     .ok_or_else(|| anyhow!("No output from fastp -v"))?;
@@ -504,7 +504,6 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             } else {
                                 0
                             };
-                            
                             
                             writeln!(
                                 &mut log,

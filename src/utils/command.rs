@@ -11,14 +11,14 @@ mod fastp {
     use tokio::process::Command;
     use crate::utils::Arguments;
     use crate::utils::defs::FASTP_TAG;
-    use crate::utils::streams::read_child_stdout_to_vec;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[allow(dead_code)]
     pub async fn fastp_presence_check() -> Result<String> {
         let args: Vec<&str> = vec!["-v"];
 
         let cmd_tag_owned = FASTP_TAG.to_string();
-        let child = Command::new(FASTP_TAG)
+        let mut child = Command::new(FASTP_TAG)
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -26,7 +26,7 @@ mod fastp {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn {}: {}. Is fastp installed?", cmd_tag_owned, e))?;
 
-        let lines = read_child_stdout_to_vec(child).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
         let first_line = lines
             .first()
             .ok_or_else(|| anyhow!("No output from fastp -v"))?;

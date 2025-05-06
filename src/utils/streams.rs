@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdout, ChildStderr, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::{Duration, sleep};
 use tokio_stream::{Stream, StreamExt};
@@ -215,7 +215,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 /// # Returns
 /// Result<BroadcastStream<ParseOutput>>
 pub async fn parse_child_output(
-    mut child: Child,
+    child: &mut Child,
     stream: ChildStream,
     mode: ParseMode,
     buffer_size: usize,
@@ -430,46 +430,44 @@ pub async fn stream_to_file(mut rx: BroadcastStream<ParseOutput>, path: PathBuf)
     Ok(())
 }
 
-
-
-
-/// Reads child stdout to a Vec<String>.
+/// Reads a child process's stdout or stderr into a Vec<String>.
 ///
 /// # Arguments
 ///
-/// * `child' - Child process from stream_to_cmd.
+/// * `child` - Child process with stdout/stderr.
+/// * `stream` - Selects stdout or stderr (default: stdout).
 ///
 /// # Returns
-/// Result<Vec<String>>
-pub async fn read_child_stdout_to_vec(mut child: Child) -> Result<Vec<String>> {
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to open stdout"))?;
+/// Result<Vec<String>> containing the lines from the selected stream.
+pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) -> Result<Vec<String>> {
+    // Get a BroadcastStream<ParseOutput> using parse_child_output
+    let mut rx = parse_child_output(child, stream, ParseMode::Bytes, 1000).await?;
 
-    let mut reader = BufReader::new(&mut stdout);
     let mut lines = Vec::new();
-    let mut buffer = String::new();
 
-    loop {
-        buffer.clear();
-        match reader.read_line(&mut buffer).await {
-            Ok(0) => break, // EOF reached
-            Ok(_) => {
-                // Remove trailing newline and store the line
-                let line = buffer.trim_end().to_string();
-                if !line.is_empty() {
-                    lines.push(line);
+    // Process the stream
+    while let Some(result) = rx.next().await {
+        match result? {
+            ParseOutput::Bytes(chunk) => {
+                // Convert bytes to String, handling invalid UTF-8 lossily
+                let text = String::from_utf8_lossy(&chunk);
+                // Split into lines and collect non-empty ones
+                for line in text.lines() {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        lines.push(trimmed.to_string());
+                    }
                 }
             }
-            Err(e) => return Err(anyhow::anyhow!("Failed to read stdout: {}", e)),
+            ParseOutput::Fastq(_) => {
+                return Err(anyhow!("Unexpected Fastq record when parsing bytes"));
+            }
         }
     }
-
-    // Wait for the child process to finish
+    
     let status = child.wait().await?;
     if !status.success() {
-        return Err(anyhow::anyhow!("Child process exited with non-zero status: {}", status));
+        return Err(anyhow!("Child process exited with non-zero status: {}", status));
     }
 
     Ok(lines)
@@ -879,8 +877,8 @@ mod tests {
     async fn test_parse_child_output_fastq() -> Result<()> {
         let mut cmd = Command::new("echo");
         cmd.arg("@read1\nATCG\n+\nIIII\n@read2\nGCTA\n+\nHHHH\n");
-        let child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let mut stream = parse_child_output(child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let mut stream = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
         let mut records = Vec::new();
         while let Some(Ok(ParseOutput::Fastq(record))) = stream.next().await {
             records.push(record);
@@ -897,8 +895,8 @@ mod tests {
     async fn test_parse_child_output_bytes() -> Result<()> {
         let mut cmd = Command::new("echo");
         cmd.arg("test data");
-        let child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let mut stream = parse_child_output(child, ChildStream::Stdout, ParseMode::Bytes, 100).await?;
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let mut stream = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, 100).await?;
         while let Some(Ok(ParseOutput::Bytes(chunk))) = stream.next().await {
             assert!(String::from_utf8_lossy(&chunk).contains("test data"));
             break;
@@ -969,6 +967,31 @@ mod tests {
         fs::remove_file("stream_to_file_norecord_test.fq")?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_read_child_output_to_vec() -> Result<()> {
+        let mut cmd = Command::new("echo");
+        cmd.arg("line1\nline2\n\nline3");
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line1");
+        assert_eq!(lines[1], "line2");
+        assert_eq!(lines[2], "line3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_child_output_to_vec_stderr() -> Result<()> {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo error >&2");
+        let mut child = cmd.stderr(std::process::Stdio::piped()).spawn()?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "error");
+        Ok(())
+    }
+    
 }
 
 
