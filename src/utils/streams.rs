@@ -99,7 +99,7 @@ where
     if n_outputs == 0 {
         return Err(anyhow!("No subscribers: cannot process stream"));
     }
-    
+
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let (tx, _) = broadcast::channel(buffer_size);
     let output_rxs: Vec<_> = (0..n_outputs)
@@ -110,6 +110,8 @@ where
     tokio::spawn(async move {
         let buffer_threshold = (buffer_size as f64 * 0.8) as usize; // Pause at 80% capacity
         let mut count = 0;
+        let mut current_pause_ms = backpressure_pause_ms; // Start with base pause
+        let max_pause_ms = 5000; // Cap pause to prevent excessive delays
 
         while let Some(item) = input.next().await {
             if tx.receiver_count() == 0 {
@@ -117,12 +119,15 @@ where
                 let _ = done_tx.send(Err(anyhow!("All subscribers dropped")));
                 return;
             }
-            
+
             if tx.len() > buffer_threshold {
-                eprintln!("Buffer at {} items (> {} threshold), pausing...", tx.len(), buffer_threshold);
-                sleep(Duration::from_millis(backpressure_pause_ms)).await;
+                eprintln!("Buffer at {} items (> {} threshold), pausing for {}ms...", tx.len(), buffer_threshold, current_pause_ms);
+                sleep(Duration::from_millis(current_pause_ms)).await;
+                current_pause_ms = (current_pause_ms * 2).min(max_pause_ms);
+            } else {
+                current_pause_ms = backpressure_pause_ms;
             }
-            
+
             match tx.send(item) {
                 Ok(_) => (),
                 Err(broadcast::error::SendError(_)) => {
@@ -132,14 +137,14 @@ where
                 }
             }
             count += 1;
-            
+
             if count % stall_threshold == 0 {
                 if let Some(sleep_ms) = stream_sleep_ms {
                     sleep(Duration::from_millis(sleep_ms)).await;
                 }
             }
         }
-        
+
         if tx.receiver_count() > 0 {
             eprintln!("Sending Ok(()) with {} subscribers", tx.receiver_count());
             let _ = done_tx.send(Ok(()));
