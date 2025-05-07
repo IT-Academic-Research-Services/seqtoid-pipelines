@@ -10,6 +10,7 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::utils::fastx::SequenceRecord;
 use tokio::task::JoinHandle;
+use sysinfo::{System};
 
 
 pub trait ToBytes {
@@ -84,10 +85,11 @@ pub enum ParseOutput {
 /// A `Result` containing a tuple of:
 /// - A vector of `BroadcastStream<T>` for downstream processing.
 /// - A `oneshot::Receiver<()>` to await task completion.
+
 pub async fn t_junction<S, T>(
     input: S,
     n_outputs: usize,
-    buffer_size: usize,
+    base_buffer_size: usize,
     stall_threshold: u64,
     stream_sleep_ms: Option<u64>,
     backpressure_pause_ms: u64,
@@ -99,6 +101,26 @@ where
     if n_outputs == 0 {
         return Err(anyhow!("No subscribers: cannot process stream"));
     }
+    
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let available_ram = system.available_memory(); // In bytes
+    const MAX_PROCESSES: usize = 4; // Max concurrent t_junction/stream_to_cmd processes
+    const RAM_FRACTION: f64 = 0.25; // Use 25% of available RAM per process
+    // Estimate memory per SequenceRecord (approx 1KB for size=500, conservative). Memory for raw bytes should be smaller than this.
+    const RECORD_SIZE: usize = 1024;
+    // Max buffer size as number of records: 25% of available RAM / max processes / record size
+    let max_buffer_size = ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / RECORD_SIZE as f64) as usize;
+
+    // Calculate buffer size: scale with streams, cap at RAM limit, ensure minimum
+    let buffer_size = (base_buffer_size * n_outputs.max(1))
+        .min(max_buffer_size)
+        .max(10_000); // Minimum buffer size
+
+    eprintln!(
+        "t_junction: available RAM={}KB, max_buffer_size={} records, using buffer_size={}",
+        available_ram / 1024, max_buffer_size, buffer_size
+    );
 
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let (tx, _) = broadcast::channel(buffer_size);
@@ -121,7 +143,12 @@ where
             }
 
             if tx.len() > buffer_threshold {
-                eprintln!("Buffer at {} items (> {} threshold), pausing for {}ms...", tx.len(), buffer_threshold, current_pause_ms);
+                eprintln!(
+                    "Buffer at {} items (> {} threshold), pausing for {}ms...",
+                    tx.len(),
+                    buffer_threshold,
+                    current_pause_ms
+                );
                 sleep(Duration::from_millis(current_pause_ms)).await;
                 current_pause_ms = (current_pause_ms * 2).min(max_pause_ms);
             } else {
@@ -132,7 +159,10 @@ where
                 Ok(_) => (),
                 Err(broadcast::error::SendError(_)) => {
                     eprintln!("Data loss: Broadcast channel lagged at item {}", count + 1);
-                    let _ = done_tx.send(Err(anyhow!("Data loss due to buffer lag at item {}", count + 1)));
+                    let _ = done_tx.send(Err(anyhow!(
+                        "Data loss due to buffer lag at item {}",
+                        count + 1
+                    )));
                     return;
                 }
             }
