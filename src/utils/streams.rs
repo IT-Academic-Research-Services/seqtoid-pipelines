@@ -85,7 +85,6 @@ pub enum ParseOutput {
 /// A `Result` containing a tuple of:
 /// - A vector of `BroadcastStream<T>` for downstream processing.
 /// - A `oneshot::Receiver<()>` to await task completion.
-
 pub async fn t_junction<S, T>(
     input: S,
     n_outputs: usize,
@@ -107,19 +106,25 @@ where
     let available_ram = system.available_memory(); // In bytes
     const MAX_PROCESSES: usize = 4; // Max concurrent t_junction/stream_to_cmd processes
     const RAM_FRACTION: f64 = 0.25; // Use 25% of available RAM per process
-    // Estimate memory per SequenceRecord (approx 1KB for size=500, conservative). Memory for raw bytes should be smaller than this.
-    const RECORD_SIZE: usize = 1024;
-    // Max buffer size as number of records: 25% of available RAM / max processes / record size
-    let max_buffer_size = ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / RECORD_SIZE as f64) as usize;
+    const RECORD_SIZE: usize = 1024; // Approx memory per SequenceRecord (~1KB)
+    const MIN_BUFFER_PER_STREAM: usize = 5_000; // Minimum records per stream
 
-    // Calculate buffer size: scale with streams, cap at RAM limit, ensure minimum
-    let buffer_size = (base_buffer_size * n_outputs.max(1))
-        .min(max_buffer_size)
-        .max(10_000); // Minimum buffer size
+    // Calculate max buffer size based on RAM
+    let max_buffer_size = if available_ram > 0 {
+        ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / RECORD_SIZE as f64) as usize
+    } else {
+        eprintln!("Warning: Failed to detect available RAM, using fallback buffer size");
+        base_buffer_size * n_outputs.max(1) * 2 // Double the stream-scaled size as fallback
+    };
+    
+    let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
+
+    // Calculate buffer size: clamp between min_buffer_size and max_buffer_size
+    let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size);
 
     eprintln!(
-        "t_junction: available RAM={}KB, max_buffer_size={} records, using buffer_size={}",
-        available_ram / 1024, max_buffer_size, buffer_size
+        "t_junction: available RAM={}KB, max_buffer_size={} records, min_buffer_size={} records, using buffer_size={}",
+        available_ram / 1024, max_buffer_size, min_buffer_size, buffer_size
     );
 
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
