@@ -4,32 +4,30 @@ use seqtoid_pipelines::utils::fastx::fastx_generator;
 use anyhow::Result;
 use std::io::{stderr, Write};
 use std::path::Path;
-use std::time::{Instant};
+use std::time::Instant;
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
 use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, StreamDataType};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Command;
-use tokio::sync::{broadcast};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::ReceiverStream;
 use std::sync::{Arc, Mutex};
-use tokio::time::{Duration};
+use tokio::time::Duration;
 use futures::future::join_all;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
-
-    let num_reads = vec![10_000, 100_000]; 
+    let num_reads = vec![10_000, 100_000];
     let read_sizes = vec![100, 150, 1000, 5000];
-    
+
     let mut log = std::fs::File::create("fastx_stress.log")?;
     writeln!(
         &mut log,
         "Reads\tSize\tRecords\tTime\tMemory"
     )?;
     log.flush()?;
-    
+
     let mut sys = System::new_all();
     for read_size in &read_sizes {
         for num_read in &num_reads {
@@ -40,7 +38,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
             stderr().flush()?;
 
             let start = Instant::now();
-            
+
             let memory_before = {
                 sys.refresh_memory();
                 sys.used_memory()
@@ -55,16 +53,15 @@ async fn test_fastx_generator_stress() -> Result<()> {
             let elapsed = start.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
             let memory_used = {
-                    sys.refresh_memory();
-                    let memory_after = sys.used_memory();
-                    if memory_after >= memory_before {
-                        (memory_after - memory_before) / 1024 / 1024 // MB
-                    } else {
-                        0 // Handle underflow
-                    }
-                
+                sys.refresh_memory();
+                let memory_after = sys.used_memory();
+                if memory_after >= memory_before {
+                    (memory_after - memory_before) / 1024 / 1024 // MB
+                } else {
+                    0 // Handle underflow
+                }
             };
-            
+
             writeln!(
                 &mut log,
                 "{}\t{}\t{}\t{}\t{}",
@@ -85,17 +82,29 @@ async fn test_fastx_generator_count() -> Result<()> {
     for num_read in num_reads {
         for read_size in &read_sizes {
             writeln!(
-                &mut log,"Testing fastx_generator: Reads: {}, Size: {}", num_read, read_size)?;
+                &mut log,
+                "Testing fastx_generator: Reads: {}, Size: {}",
+                num_read, read_size
+            )?;
             stderr().flush()?;
             let stream = fastx_generator(num_read, *read_size, 35.0, 3.0);
             let count = stream.fold(0usize, |acc, _| async move { acc + 1 }).await;
             if count != num_read {
                 writeln!(
-                    &mut log,"fastx_generator failed: expected {}, got {}", num_read, count)?;
-                return Err(anyhow::anyhow!("fastx_generator produced {} records, expected {}", count, num_read));
+                    &mut log,
+                    "fastx_generator failed: expected {}, got {}",
+                    num_read, count
+                )?;
+                return Err(anyhow::anyhow!(
+                    "fastx_generator produced {} records, expected {}", 
+                    count, num_read
+                ));
             }
             writeln!(
-                &mut log,"fastx_generator produced {} records", count)?;
+                &mut log,
+                "fastx_generator produced {} records",
+                count
+            )?;
             stderr().flush()?;
         }
     }
@@ -122,7 +131,6 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn test_t_junction_stress() -> Result<()> {
     let buffer_sizes = [1000, 10_000, 100_000];
@@ -134,7 +142,9 @@ async fn test_t_junction_stress() -> Result<()> {
     let n_outputs = 2;
     let mut log = std::fs::File::create("t_junction_stress.log")?;
     writeln!(
-        &mut log,"BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess")?;
+        &mut log,
+        "BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess"
+    )?;
 
     for &buffer_size in &buffer_sizes {
         for &stall_threshold in &stall_thresholds {
@@ -165,21 +175,24 @@ async fn test_t_junction_stress() -> Result<()> {
 
                     let mut run_success = true;
                     let record_counts = Arc::new(Mutex::new(vec![0; n_outputs]));
-                    for (i, mut output) in outputs.into_iter().enumerate() {
-                        let record_counts = Arc::clone(&record_counts);
-                        tokio::spawn(async move {
-                            while let Some(_item) = output.next().await {
-                                {
-                                    let mut counts = record_counts.lock().unwrap();
-                                    counts[i] += 1;
-                                    if counts[i] % 1000 == 0 {
-                                        eprintln!("Stream {} processed {} items", i, counts[i]);
-                                    }
-                                } // Drop MutexGuard here
+                    let mut handles = Vec::new();
 
+                    for (i, rx) in outputs.into_iter().enumerate() {
+                        let record_counts = Arc::clone(&record_counts);
+                        let handle = tokio::spawn(async move {
+                            let mut stream = ReceiverStream::new(rx);
+                            while let Some(_item) = stream.next().await {
+                                let mut counts = record_counts.lock().unwrap();
+                                counts[i] += 1;
+                                if counts[i] % 1000 == 0 {
+                                    eprintln!("Stream {} processed {} items", i, counts[i]);
+                                }
                             }
                         });
+                        handles.push(handle);
                     }
+
+                    join_all(handles).await;
 
                     match done_rx.await {
                         Ok(result) => match result {
@@ -223,14 +236,12 @@ async fn test_t_junction_stress() -> Result<()> {
                         vec![num_reads; n_outputs],
                         "Incorrect record counts"
                     );
-
                 }
             }
         }
     }
     Ok(())
 }
-
 
 #[tokio::test]
 async fn test_t_junction_count() -> Result<()> {
@@ -240,30 +251,44 @@ async fn test_t_junction_count() -> Result<()> {
     let stall_threshold = 100;
     let sleep_ms = Some(1);
     let backpressure_pause_ms = 500;
-    eprintln!("Testing t_junction: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}", num_read, read_size, buffer_size, sleep_ms);
+    eprintln!(
+        "Testing t_junction: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}",
+        num_read, read_size, buffer_size, sleep_ms
+    );
     stderr().flush()?;
     let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
-    let (mut outputs, done_rx) = t_junction(stream, 2, buffer_size, stall_threshold, sleep_ms, backpressure_pause_ms).await?;
+    let (outputs, done_rx) = t_junction(
+        stream,
+        2,
+        buffer_size,
+        stall_threshold,
+        sleep_ms,
+        backpressure_pause_ms
+    ).await?;
     let mut counts = vec![0usize; 2];
-    for (i, mut rx) in outputs.into_iter().enumerate() {
-        while let Some(result) = rx.next().await {
-            match result {
-                Ok(_) => {
-                    counts[i] += 1;
-                    if counts[i] % 1000 == 0 {
-                        eprintln!("t_junction stream {} counted {} records", i, counts[i]);
-                        stderr().flush()?;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("t_junction stream {} error: {}", i, e);
-                    stderr().flush()?;
+    let mut handles = Vec::new();
+
+    for (i, rx) in outputs.into_iter().enumerate() {
+        let handle = tokio::spawn(async move {
+            let mut stream = ReceiverStream::new(rx);
+            let mut count = 0;
+            while let Some(_) = stream.next().await {
+                count += 1;
+                if count % 1000 == 0 {
+                    eprintln!("t_junction stream {} counted {} records", i, count);
+                    stderr().flush().ok();
                 }
             }
-        }
-        eprintln!("t_junction stream {} finished: {} records", i, counts[i]);
-        stderr().flush()?;
+            eprintln!("t_junction stream {} finished: {} records", i, count);
+            Ok::<_, anyhow::Error>(count)
+        });
+        handles.push((i, handle));
     }
+
+    for (i, handle) in handles {
+        counts[i] = handle.await??;
+    }
+
     match done_rx.await {
         Ok(Ok(())) => eprintln!("t_junction completed successfully"),
         Ok(Err(e)) => eprintln!("t_junction failed: {}", e),
@@ -273,7 +298,10 @@ async fn test_t_junction_count() -> Result<()> {
     eprintln!("t_junction counts: {:?}", counts);
     stderr().flush()?;
     if counts != vec![num_read, num_read] {
-        return Err(anyhow!("t_junction produced {:?}, expected [{}, {}]", counts, num_read, num_read));
+        return Err(anyhow!(
+            "t_junction produced {:?}, expected [{}, {}]", 
+            counts, num_read, num_read
+        ));
     }
     Ok(())
 }
@@ -284,32 +312,30 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     let read_size = 50;
     let cmd_tag = "cat";
     let args = vec!["-"];
-    eprintln!("Testing stream_to_cmd: Reads: {}, Size: {}, Command: {}", num_read, read_size, cmd_tag);
+    eprintln!(
+        "Testing stream_to_cmd: Reads: {}, Size: {}, Command: {}",
+        num_read, read_size, cmd_tag
+    );
     stderr().flush()?;
 
     let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
-    let (tx, rx) = broadcast::channel(100_000);
-    let rx = BroadcastStream::new(rx);
+    let (mut outputs, done_rx) = t_junction(
+        stream,
+        1,
+        100_000,
+        100,
+        Some(1),
+        500
+    ).await?;
 
-    tokio::spawn(async move {
-        let mut count = 0;
-        let mut stream = Box::pin(stream);
-        while let Some(item) = stream.next().await {
-            count += 1;
-            if count % 10 == 0 {
-                eprintln!("Sent {} records to broadcast channel", count);
-                stderr().flush().ok();
-            }
-            if tx.send(item).is_err() {
-                eprintln!("Broadcast channel dropped");
-                break;
-            }
-        }
-        eprintln!("Finished sending {} records", count);
-        stderr().flush().ok();
-    });
+    let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
+    let (child, inner_task) = stream_to_cmd(
+        rx,
+        cmd_tag,
+        args,
+        StreamDataType::IlluminaFastq
+    ).await?;
 
-    let (child, inner_task) = stream_to_cmd(rx, cmd_tag, args, StreamDataType::IlluminaFastq).await?;
     match timeout(Duration::from_secs(30), inner_task).await {
         Ok(Ok(Ok(()))) => eprintln!("stream_to_cmd completed successfully"),
         Ok(Ok(Err(e))) => {
@@ -325,22 +351,26 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
             return Err(anyhow!("stream_to_cmd timed out"));
         }
     }
+
+    done_rx.await??;
+
     let output = child.wait_with_output().await?;
     let stderr_output = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        eprintln!("Child process failed: status: {}, stderr: {}", output.status, stderr_output);
-        return Err(anyhow!("Child process failed: status: {}, stderr: {}", output.status, stderr_output));
+        eprintln!(
+            "Child process failed: status: {}, stderr: {}",
+            output.status, stderr_output
+        );
+        return Err(anyhow!(
+            "Child process failed: status: {}, stderr: {}", 
+            output.status, stderr_output
+        ));
     }
     eprintln!("Child process completed successfully");
     stderr().flush()?;
     Ok(())
 }
 
-
-/// Create multiple streams of fastq data with fatsx_generator
-/// The number of records is thus known
-/// Spawn N streams and cat the data into files
-/// Read each file, and work out if it has the correct number of records
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_stream_to_cmd_stress() -> Result<()> {
     let num_reads = vec![100, 10_000, 100_000];
@@ -350,7 +380,6 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     let backpressure_pause_ms_options = [50, 500];
     let sleep_ms = vec![0, 1];
     let commands = vec![("cat", vec!["-"])];
-
 
     let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
     writeln!(
@@ -365,175 +394,175 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     for (cmd_tag, args) in &commands {
         for buffer_size in &buffer_sizes {
             for sleep in &sleep_ms {
-                for &backpressure_pause_ms in &backpressure_pause_ms_options { 
+                for &backpressure_pause_ms in &backpressure_pause_ms_options {
+                    for stream_num in &stream_nums {
+                        for num_read in &num_reads {
+                            for read_size in &read_sizes {
+                                let mut run_success = true;
+                                let start = Instant::now();
+                                sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+                                let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
 
-                for stream_num in &stream_nums {
+                                eprintln!(
+                                    "Starting: Command: {}, Buffer: {}, Sleep: {}, Streams: {}, Reads: {}, Size: {}",
+                                    cmd_tag, buffer_size, sleep, stream_num, num_read, read_size
+                                );
+                                stderr().flush()?;
 
-                    for num_read in &num_reads {
-                        for read_size in &read_sizes {
-                            let mut run_success = true;
-                            let start = Instant::now();
-                            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                            let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
-
-                            eprintln!(
-                                "Starting: Command: {}, Buffer: {}, Sleep: {}, Streams: {}, Reads: {}, Size: {}",
-                                cmd_tag, buffer_size, sleep, stream_num, num_read, read_size
-                            );
-                            stderr().flush()?;
-
-                            // Generate stream and split with t_junction
-                            let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
-                            let mut gen_count = 0;
-                            let stream = stream.inspect(move |_result| {
-                                gen_count += 1;
-                            });
-                            let (mut outputs, done_rx) = match t_junction(
-                                stream,
-                                *stream_num,
-                                *buffer_size,
-                                10000,
-                                if *sleep == 0 { None } else { Some(*sleep) }, backpressure_pause_ms
-                            )
-                                .await {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    eprintln!("t_junction failed to start: {}", e);
-                                    run_success = false;
-                                    return Err(anyhow!("t_junction failed: {}", e));
-                                }
-                            };
-                            eprintln!("t_junction started with {} streams", *stream_num);
-                            stderr().flush()?;
-                            
-                            let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-                            let mut outfiles = Vec::new();
-
-                            for i in 0..*stream_num {
-                                let stream_outfile = format!("stream_to_cmd_stress.{}.log", i);
-
-                                if fs::metadata(&stream_outfile).is_ok() {
-                                    fs::remove_file(&stream_outfile)?;
-                                }
-                                
-                                outfiles.push(stream_outfile.clone());
-                                let cmd_tag = cmd_tag.to_string();
-                                let args = args.iter().map(|&s| s.to_string()).collect::<Vec<_>>();
-
-                                let rx = outputs.pop().ok_or_else(|| anyhow!("Missing stream for cmd"))?;
-                                let (mut child, stream_task) = match stream_to_cmd(
-                                    rx,
-                                    &cmd_tag,
-                                    args.iter().map(|s| s.as_str()).collect(),
-                                    StreamDataType::IlluminaFastq
+                                // Generate stream and split with t_junction
+                                let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
+                                let mut gen_count = 0;
+                                let stream = stream.inspect(move |_result| {
+                                    gen_count += 1;
+                                });
+                                let (outputs, done_rx) = match t_junction(
+                                    stream,
+                                    *stream_num,
+                                    *buffer_size,
+                                    10000,
+                                    if *sleep == 0 { None } else { Some(*sleep) },
+                                    backpressure_pause_ms
                                 )
                                     .await {
                                     Ok(result) => result,
                                     Err(e) => {
-                                        eprintln!("Stream {} failed to spawn {}: {}", i, cmd_tag, e);
+                                        eprintln!("t_junction failed to start: {}", e);
                                         run_success = false;
-                                        continue;
+                                        return Err(anyhow!("t_junction failed: {}", e));
                                     }
                                 };
+                                eprintln!("t_junction started with {} streams", *stream_num);
+                                stderr().flush()?;
 
-                                let out_stream = parse_child_output(& mut child, ChildStream::Stdout, ParseMode::Fastq, *buffer_size).await?;
-                                let write_task = tokio::spawn(stream_to_file(
-                                    out_stream,
-                                    Path::new(&stream_outfile).to_path_buf(),
-                                ));
+                                let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+                                let mut outfiles = Vec::new();
 
-                                tasks.push(write_task);
-                                tasks.push(stream_task);
-                            }
+                                for (i, rx) in outputs.into_iter().enumerate() {
+                                    let stream_outfile = format!("stream_to_cmd_stress.{}.log", i);
 
-                            let results = join_all(tasks).await;
-                            for result in results {
-                                result??; // Unwrap JoinHandle and inner Result, propagating errors
-                            }
-
-                            done_rx.await??; // Propagates any t_junction errors
-
-                            for outfile in outfiles {
-                                
-                                let mut cmd = String::new();
-                                let mut args_vec: Vec<String> = Vec::new();
-                                match *cmd_tag {
-                                    "cat" => {
-                                        cmd = "wc".to_string();
-                                        args_vec.push("-l".to_string());
-                                        args_vec.push(outfile.to_string());
-                                        
+                                    if fs::metadata(&stream_outfile).is_ok() {
+                                        fs::remove_file(&stream_outfile)?;
                                     }
 
+                                    outfiles.push(stream_outfile.clone());
+                                    let cmd_tag = cmd_tag.to_string();
+                                    let args = args.iter().map(|&s| s.to_string()).collect::<Vec<_>>();
 
-                                    _ => {
-                                        return Err(anyhow!("Cannot use this command {}", cmd_tag));
+                                    let (mut child, stream_task) = match stream_to_cmd(
+                                        rx,
+                                        &cmd_tag,
+                                        args.iter().map(|s| s.as_str()).collect(),
+                                        StreamDataType::IlluminaFastq
+                                    )
+                                        .await {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            eprintln!("Stream {} failed to spawn {}: {}", i, cmd_tag, e);
+                                            run_success = false;
+                                            continue;
+                                        }
+                                    };
+
+                                    let out_stream = parse_child_output(
+                                        &mut child,
+                                        ChildStream::Stdout,
+                                        ParseMode::Fastq,
+                                        *buffer_size
+                                    ).await?;
+                                    let write_task = tokio::spawn(stream_to_file(
+                                        out_stream,
+                                        Path::new(&stream_outfile).to_path_buf(),
+                                    ));
+
+                                    tasks.push(write_task);
+                                    tasks.push(stream_task);
+                                }
+
+                                let results = join_all(tasks).await;
+                                for result in results {
+                                    result??; // Unwrap JoinHandle and inner Result, propagating errors
+                                }
+
+                                done_rx.await??; // Propagates any t_junction errors
+
+                                for outfile in outfiles {
+                                    let mut cmd = String::new();
+                                    let mut args_vec: Vec<String> = Vec::new();
+                                    match *cmd_tag {
+                                        "cat" => {
+                                            cmd = "wc".to_string();
+                                            args_vec.push("-l".to_string());
+                                            args_vec.push(outfile.to_string());
+                                        }
+                                        _ => {
+                                            return Err(anyhow!("Cannot use this command {}", cmd_tag));
+                                        }
                                     }
+
+                                    let mut wc_child = Command::new(&cmd)
+                                        .args(&args_vec)
+                                        .stdin(std::process::Stdio::piped())
+                                        .stdout(std::process::Stdio::piped())
+                                        .stderr(std::process::Stdio::piped())
+                                        .spawn()
+                                        .map_err(|e| anyhow!("Failed to spawn {}: {}.", cmd, e))?;
+                                    let lines = read_child_output_to_vec(&mut wc_child, ChildStream::Stdout).await?;
+                                    let first_line = lines
+                                        .first()
+                                        .ok_or_else(|| anyhow!("No output from wc"))?;
+
+                                    let first_cols = first_line.split_whitespace().collect::<Vec<_>>();
+
+                                    let line_count: usize = first_cols[0].parse()?;
+                                    let fastq_count = line_count / 4;
+
+                                    if fastq_count != *num_read {
+                                        run_success = false;
+                                    }
+
+                                    assert_eq!(fastq_count, *num_read);
                                 }
 
-                                let mut wc_child = Command::new(&cmd)
-                                    .args(&args_vec)
-                                    .stdin(std::process::Stdio::piped())
-                                    .stdout(std::process::Stdio::piped())
-                                    .stderr(std::process::Stdio::piped())
-                                    .spawn()
-                                    .map_err(|e| anyhow!("Failed to spawn {}: {}.", cmd, e))?;
-                                let lines = read_child_output_to_vec(&mut wc_child, ChildStream::Stdout).await?;
-                                let first_line = lines
-                                    .first()
-                                    .ok_or_else(|| anyhow!("No output from fastp -v"))?;
+                                let elapsed = start.elapsed();
+                                let elapsed_secs = elapsed.as_secs_f64();
+                                sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+                                let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+                                let memory_used = if memory_after >= memory_before {
+                                    memory_after - memory_before
+                                } else {
+                                    0
+                                };
 
-                                let first_cols = first_line.split_whitespace().collect::<Vec<_>>();
+                                writeln!(
+                                    &mut log,
+                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                    cmd_tag,
+                                    buffer_size,
+                                    sleep,
+                                    backpressure_pause_ms,
+                                    stream_num,
+                                    num_read,
+                                    read_size,
+                                    elapsed_secs,
+                                    memory_used,
+                                    run_success
+                                )?;
+                                log.flush()?;
 
-                                
-                                let line_count : usize = first_cols[0].parse()?;
-                                let fastq_count = line_count/4;
+                                eprintln!("done");
+                                stderr().flush()?;
 
-                                if fastq_count != *num_read {
-                                    run_success = false;
+                                if !run_success {
+                                    return Err(anyhow!(
+                                        "Test failed due to errors in stream_to_cmd or t_junction"
+                                    ));
                                 }
-                                
-                                assert_eq!(fastq_count, *num_read);
-                            }
-                            
-                            let elapsed = start.elapsed();
-                            let elapsed_secs = elapsed.as_secs_f64();
-                            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                            let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
-                            let memory_used = if memory_after >= memory_before {
-                                memory_after - memory_before
-                            } else {
-                                0
-                            };
-                            
-                            writeln!(
-                                &mut log,
-                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                                cmd_tag,
-                                buffer_size,
-                                sleep,
-                                backpressure_pause_ms,
-                                stream_num,
-                                num_read,
-                                read_size,
-                                elapsed_secs,
-                                memory_used,
-                                run_success
-                            )?;
-                            log.flush()?;
-
-                            eprintln!("done");
-                            stderr().flush()?;
-
-                            if !run_success {
-                                return Err(anyhow!("Test failed due to errors in stream_to_cmd or t_junction"));
                             }
                         }
                     }
                 }
             }
         }
-    }
     }
     Ok(())
 }
