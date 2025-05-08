@@ -1,3 +1,4 @@
+use sysinfo::System;
 use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -10,10 +11,10 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::BroadcastStream;
 use crate::utils::fastx::SequenceRecord;
 use tokio::task::JoinHandle;
-use sysinfo::{System};
 
 
 pub trait ToBytes {
+    #[allow(dead_code)]
     fn to_bytes(&self) -> Result<Vec<u8>>;
 }
 
@@ -56,17 +57,20 @@ impl ToBytes for SequenceRecord {
 #[derive(Clone, Copy, Debug)]
 pub enum ChildStream {
     Stdout,
+    #[allow(dead_code)]
     Stderr,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum ParseMode {
+    #[allow(dead_code)]
     Fastq,
     Bytes,
 }
 
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
+    #[allow(dead_code)]
     Fastq(SequenceRecord),
     Bytes(Vec<u8>),
 }
@@ -100,7 +104,7 @@ where
     if n_outputs == 0 {
         return Err(anyhow!("No subscribers: cannot process stream"));
     }
-    
+
     let mut system = System::new_all();
     system.refresh_memory();
     let available_ram = system.available_memory(); // In bytes
@@ -116,7 +120,7 @@ where
         eprintln!("Warning: Failed to detect available RAM, using fallback buffer size");
         base_buffer_size * n_outputs.max(1) * 2 // Double the stream-scaled size as fallback
     };
-    
+
     let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
 
     // Calculate buffer size: clamp between min_buffer_size and max_buffer_size
@@ -208,6 +212,9 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     cmd_tag: &str,
     args: Vec<&str>,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
+    const BATCH_SIZE_BYTES: usize = 65_536; // 64KB batch size
+    const WRITER_CAPACITY: usize = 65_536; // BufWriter capacity matches batch size
+
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
@@ -223,19 +230,43 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
 
     let task = tokio::spawn(async move {
-        let mut writer = tokio::io::BufWriter::new(stdin);
+        let mut writer = BufWriter::with_capacity(WRITER_CAPACITY, stdin);
+        let mut batch = Vec::with_capacity(BATCH_SIZE_BYTES);
+        let mut total_written = 0;
+
         while let Some(result) = rx.next().await {
             match result {
                 Ok(item) => {
                     let bytes = item.to_bytes()?;
-                    writer.write_all(&bytes).await?;
-                    writer.flush().await?;
+                    batch.extend_from_slice(&bytes);
+                    
+                    if batch.len() >= BATCH_SIZE_BYTES {
+                        writer.write_all(&batch).await?;
+                        writer.flush().await?;
+                        total_written += batch.len();
+
+                        batch.clear();
+                    }
                 }
                 Err(e) => return Err(anyhow!("Broadcast stream error: {}", e)),
             }
         }
+        
+        if !batch.is_empty() {
+            writer.write_all(&batch).await?;
+            writer.flush().await?;
+            total_written += batch.len();
+            eprintln!(
+                "Wrote final batch of {} bytes to {} (total: {} bytes)",
+                batch.len(),
+                cmd_tag_owned,
+                total_written
+            );
+        }
+
         writer.flush().await?;
         writer.shutdown().await?;
+        eprintln!("Completed writing to {} (total: {} bytes)", cmd_tag_owned, total_written);
         Ok(())
     });
 
@@ -946,8 +977,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_file_fastq() -> Result<()> {
-        let _ = fs::remove_file("stream_to_file_test.fq");
-        let mut records = fastx_generator(2, 10, 35.0, 3.0);
+        let _ = fs::remove_file("stream_to_file_test_illumina.fq");
+        let mut records = fastx_generator(10, 150, 30.0, 8.0);
         let (tx, rx) = broadcast::channel(1024);
 
         tokio::spawn(async move {
@@ -972,7 +1003,7 @@ mod tests {
         let num_records = content.lines().filter(|line| line.starts_with('@')).count();
         assert_eq!(num_records, 2, "Expected 2 FASTQ records, found {}", num_records);
 
-        fs::remove_file("stream_to_file_test.fq")?;
+        // fs::remove_file("stream_to_file_test.fq")?;
         Ok(())
     }
 

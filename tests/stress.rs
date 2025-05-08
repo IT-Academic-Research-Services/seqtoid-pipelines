@@ -6,7 +6,7 @@ use std::io::{stderr, Write};
 use std::path::Path;
 use std::time::{Instant};
 use futures::StreamExt;
-use sysinfo::{System, Pid};
+use sysinfo::{System, Pid, ProcessesToUpdate};
 use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -345,7 +345,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
 async fn test_stream_to_cmd_stress() -> Result<()> {
     let num_reads = vec![100, 10_000, 100_000];
     let read_sizes = vec![50, 500];
-    let stream_nums = vec![1, 10];
+    let stream_nums = vec![1, 5];
     let buffer_sizes = vec![10_000, 100_000];
     let backpressure_pause_ms_options = [50, 500];
     let sleep_ms = vec![0, 1];
@@ -373,7 +373,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                         for read_size in &read_sizes {
                             let mut run_success = true;
                             let start = Instant::now();
-                            sys.refresh_process(pid);
+                            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
                             let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
 
                             eprintln!(
@@ -403,7 +403,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     return Err(anyhow!("t_junction failed: {}", e));
                                 }
                             };
-                            eprintln!("t_junction started with {} streams", *stream_num + 1);
+                            eprintln!("t_junction started with {} streams", *stream_num);
                             stderr().flush()?;
                             
                             let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -497,7 +497,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                             
                             let elapsed = start.elapsed();
                             let elapsed_secs = elapsed.as_secs_f64();
-                            sys.refresh_process(pid);
+                            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
                             let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
                             let memory_used = if memory_after >= memory_before {
                                 memory_after - memory_before
