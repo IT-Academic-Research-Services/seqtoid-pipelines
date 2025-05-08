@@ -642,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn test_t_junction_ten_thousand_records_ten_streams() -> Result<()> {
         let stream = fastx_generator(10000, 143, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 100, 50000, 10000, Some(1), 500).await?;
+        let (mut outputs, done_rx) = t_junction(stream, 10, 50000, 10000, Some(0), 500).await?;
         let mut records = Vec::new();
         for _output in &outputs {
             let record: Vec<SequenceRecord> = Vec::new();
