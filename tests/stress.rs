@@ -299,8 +299,9 @@ async fn test_t_junction_count() -> Result<()> {
     stderr().flush()?;
     if counts != vec![num_read, num_read] {
         return Err(anyhow!(
-            "t_junction produced {:?}, expected [{}, {}]", 
-            counts, num_read, num_read
+            "t_junction produced [{:}], expected [{}, {}]", 
+            counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "), 
+            num_read, num_read
         ));
     }
     Ok(())
@@ -384,7 +385,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
     let mut log = std::fs::File::create("stream_to_cmd_stress.log")?;
     writeln!(
         &mut log,
-        "Command\tBuffer_Size\tSleep\tBackpressurePause\tStreams\tReads\tSize\tTime\tMemory\tSuccess?"
+        "Command\tBuffer_Size\tSleep\tBackpressurePause\tStreams\tReads\tSize\tTime\tMemory_Bytes\tSuccess?"
     )?;
     log.flush()?;
 
@@ -401,7 +402,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 let mut run_success = true;
                                 let start = Instant::now();
                                 sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                                let memory_before = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+                                let memory_before = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
 
                                 eprintln!(
                                     "Starting: Command: {}, Buffer: {}, Sleep: {}, Streams: {}, Reads: {}, Size: {}",
@@ -526,7 +527,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 let elapsed = start.elapsed();
                                 let elapsed_secs = elapsed.as_secs_f64();
                                 sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                                let memory_after = sys.process(pid).map(|p| p.memory() / 1024 / 1024).unwrap_or(0);
+                                let memory_after = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
                                 let memory_used = if memory_after >= memory_before {
                                     memory_after - memory_before
                                 } else {

@@ -198,9 +198,9 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     data_type: StreamDataType,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let (batch_size_bytes, writer_capacity) = match data_type {
-        StreamDataType::JustBytes => (32_768, 32_768),
-        StreamDataType::IlluminaFastq => (65_536, 65_536),
-        StreamDataType::OntFastq => (262_144, 262_144),
+        StreamDataType::JustBytes => (65_536, 65_536),
+        StreamDataType::IlluminaFastq => (131_072, 131_072),
+        StreamDataType::OntFastq => (524_288, 524_288),
     };
 
     let cmd_tag_owned = cmd_tag.to_string();
@@ -457,7 +457,7 @@ async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
 /// Result<()>
 pub async fn stream_to_file(rx: mpsc::Receiver<ParseOutput>, path: PathBuf) -> Result<()> {
     let file = File::create(&path).await?;
-    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
     let mut stream = ReceiverStream::new(rx);
 
     while let Some(item) = stream.next().await {
