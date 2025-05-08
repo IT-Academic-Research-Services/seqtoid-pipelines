@@ -978,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_file_fastq() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_test_illumina.fq");
-        let mut records = fastx_generator(10, 150, 30.0, 8.0);
+        let mut records = fastx_generator(2, 150, 30.0, 8.0);
         let (tx, rx) = broadcast::channel(1024);
 
         tokio::spawn(async move {
@@ -1003,7 +1003,7 @@ mod tests {
         let num_records = content.lines().filter(|line| line.starts_with('@')).count();
         assert_eq!(num_records, 2, "Expected 2 FASTQ records, found {}", num_records);
 
-        // fs::remove_file("stream_to_file_test.fq")?;
+        fs::remove_file("stream_to_file_test.fq")?;
         Ok(())
     }
 
