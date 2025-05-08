@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{Instant};
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
-use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, StreamDataType};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Command;
@@ -309,7 +309,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         stderr().flush().ok();
     });
 
-    let (child, inner_task) = stream_to_cmd(rx, cmd_tag, args).await?;
+    let (child, inner_task) = stream_to_cmd(rx, cmd_tag, args, StreamDataType::IlluminaFastq).await?;
     match timeout(Duration::from_secs(30), inner_task).await {
         Ok(Ok(Ok(()))) => eprintln!("stream_to_cmd completed successfully"),
         Ok(Ok(Err(e))) => {
@@ -425,6 +425,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     rx,
                                     &cmd_tag,
                                     args.iter().map(|s| s.as_str()).collect(),
+                                    StreamDataType::IlluminaFastq
                                 )
                                     .await {
                                     Ok(result) => result,
