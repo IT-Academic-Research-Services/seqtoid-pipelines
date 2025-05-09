@@ -54,11 +54,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
     if val_streams.len() != 2 {
         return Err(anyhow!("Expected exactly 2 streams, got {}", val_streams.len()));
     }
-    
+
     let mut streams_iter = val_streams.into_iter();
     let mut fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
     let mut pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-    
+
     //Pigz stream to intermediate file output
     let pigz_args = generate_cli(PIGZ_TAG, &args)?;
     let pigz_args: Vec<&str> = pigz_args.iter().map(|s| s.as_str()).collect();
@@ -74,8 +74,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
         pigz_out_stream,
         validated_interleaved_file_path,
     ));
-    
-    
+
+
     // Fastp stream
     let fastp_args = generate_cli(FASTP_TAG, &args)?;
     let fastp_args: Vec<&str> = fastp_args.iter().map(|s| s.as_str()).collect();
@@ -86,14 +86,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Fastq,
         args.buffer_size,
     ).await?;
-    
+
     // just for now write out
     let mut fastp_write_task = tokio::spawn(stream_to_file(
         fastp_out_stream,
         PathBuf::from("fastp_out_test.fq"),
     ));
 
-
+    // NB: the await calls below cause run to pause
+    // Await write tasks concurrently
+    // let (pigz_write_result, fastp_write_result) = join!(pigz_write_task, fastp_write_task);
+    // pigz_write_result??;
+    // fastp_write_result??;
     pigz_write_task.await??;
     fastp_write_task.await??;
 
@@ -110,7 +114,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Check t_junction completion
     val_done_rx.await??;
 
-    
+
 
     Ok(())
 }
