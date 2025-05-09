@@ -416,7 +416,7 @@ async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
-async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
+pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
     buffer_size: usize,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
