@@ -16,6 +16,7 @@ rand = "0.9.1"
 rand_distr = "0.5.1"
 futures = "0.3.31"
 sysinfo = "0.35.0"
+hdf5-metno = { version = "0.10.1", features = ["blosc"] }
 
 [dev-dependencies]
 sysinfo = "0.35.0"
