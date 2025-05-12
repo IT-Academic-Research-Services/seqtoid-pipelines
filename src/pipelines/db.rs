@@ -5,7 +5,7 @@ use crate::utils::Arguments;
 use crate::utils::fastx::{read_and_interleave_sequences, SequenceRecord};
 use crate::utils::file::file_path_manipulator;
 use hdf5_metno::filters::{blosc_set_nthreads, Blosc, BloscShuffle};
-use hdf5_metno::{File, Result};
+use hdf5_metno::{File, Result, Extent};
 use hdf5_metno::types::{VarLenArray, VarLenUnicode};
 use tokio::task;
 
@@ -52,7 +52,7 @@ async fn write_sequences_to_hdf5(
     // Create extensible dataset for sequences (VarLenArray<u8>)
     let seq_dataset = hdf5_group
         .new_dataset::<VarLenArray<u8>>()
-        .shape([0])
+        .shape([Extent::resizable(0)])
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
@@ -60,7 +60,7 @@ async fn write_sequences_to_hdf5(
     // Create extensible dataset for IDs (VarLenUnicode)
     let id_dataset = hdf5_group
         .new_dataset::<VarLenUnicode>()
-        .shape([0])
+        .shape([Extent::resizable(0)])
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
@@ -69,6 +69,7 @@ async fn write_sequences_to_hdf5(
     let mut id_buffer: Vec<VarLenUnicode> = Vec::new();
 
     while let Some(record) = rx_stream.next().await {
+
         seq_buffer.push(record.seq().into()); // Convert &[u8] to VarLenArray<u8>
         id_buffer.push(unsafe { VarLenUnicode::from_str_unchecked(record.id()) });
 
