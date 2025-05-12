@@ -65,20 +65,21 @@ async fn write_sequences_to_hdf5(
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
 
-    let mut seq_buffer: Vec<u8> = Vec::new();
-    let mut id_buffer: Vec<String> = Vec::new();
+    let mut seq_buffer: Vec<VarLenArray<u8>> = Vec::new();
+    let mut id_buffer: Vec<VarLenUnicode> = Vec::new();
 
     while let Some(record) = rx_stream.next().await {
-        seq_buffer.extend_from_slice(record.seq());
-        id_buffer.push(record.id().to_string());
+        seq_buffer.push(record.seq().into()); // Convert &[u8] to VarLenArray<u8>
+        id_buffer.push(unsafe { VarLenUnicode::from_str_unchecked(record.id()) });
 
         if seq_buffer.len() >= chunk_size {
+            let count = seq_buffer.len();
             write_chunk_async(
                 seq_dataset.clone(),
                 id_dataset.clone(),
-                seq_buffer.clone(),
+                seq_buffer,
                 id_buffer,
-                seq_buffer.len(),
+                count,
             )
                 .await?;
             seq_buffer = Vec::new();
@@ -87,7 +88,8 @@ async fn write_sequences_to_hdf5(
     }
 
     if !seq_buffer.is_empty() {
-        write_chunk_async(seq_dataset, id_dataset, seq_buffer.clone(), id_buffer, seq_buffer.len()).await?;
+        let count = seq_buffer.len();
+        write_chunk_async(seq_dataset, id_dataset, seq_buffer, id_buffer, count).await?;
     }
 
     Ok(())
@@ -96,8 +98,8 @@ async fn write_sequences_to_hdf5(
 async fn write_chunk_async(
     seq_dataset: hdf5_metno::Dataset,
     id_dataset: hdf5_metno::Dataset,
-    seq_buffer: Vec<u8>,
-    id_buffer: Vec<String>,
+    seq_buffer: Vec<VarLenArray<u8>>,
+    id_buffer: Vec<VarLenUnicode>,
     count: usize,
 ) -> anyhow::Result<()> {
     task::spawn_blocking(move || write_chunk(&seq_dataset, &id_dataset, &seq_buffer, &id_buffer, count))
@@ -108,8 +110,8 @@ async fn write_chunk_async(
 fn write_chunk(
     seq_dataset: &hdf5_metno::Dataset,
     id_dataset: &hdf5_metno::Dataset,
-    seq_buffer: &[u8],
-    id_buffer: &[String],
+    seq_buffer: &[VarLenArray<u8>],
+    id_buffer: &[VarLenUnicode],
     count: usize,
 ) -> Result<()> {
     let current_size = seq_dataset.shape()[0];
@@ -117,6 +119,6 @@ fn write_chunk(
     id_dataset.resize([current_size + count])?;
 
     seq_dataset.write_slice(seq_buffer, current_size..current_size + count)?;
-    id_dataset.write_slice(&id_buffer, current_size..current_size + count)?;
+    id_dataset.write_slice(id_buffer, current_size..current_size + count)?;
     Ok(())
 }
