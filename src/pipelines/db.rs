@@ -35,6 +35,8 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
         .unwrap_or_else(|| "hdf5_out.h5".to_string());
 
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
+    
+    check_db(String::as_str(&hdf5_file_name));
     Ok(())
 }
 
@@ -121,5 +123,22 @@ fn write_chunk(
 
     seq_dataset.write_slice(seq_buffer, current_size..current_size + count)?;
     id_dataset.write_slice(id_buffer, current_size..current_size + count)?;
+    Ok(())
+}
+
+async fn check_db(h5_file_name: &str) -> anyhow::Result<()> {
+    eprintln!("Checking HDF5 file: {}", h5_file_name);
+    let file = File::open(h5_file_name)?; // Open for reading
+    let group = file.group("db")?;
+    let id_dataset = group.dataset("id")?;
+    let seq_dataset = group.dataset("sequences")?;
+    
+    let id_len = id_dataset.shape()[0];
+    let seq_len = seq_dataset.shape()[0];
+    if id_len != seq_len {
+        return Err(anyhow::anyhow!("Mismatched dataset lengths: id={} seq={}", id_len, seq_len));
+    }
+    eprintln!("Dataset sizes: {} records", id_len);
+
     Ok(())
 }
