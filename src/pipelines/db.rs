@@ -1,21 +1,46 @@
 use std::path::PathBuf;
+use std::time::Instant;
 use futures::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::Arguments;
 use crate::utils::fastx::{read_and_interleave_sequences, SequenceRecord};
-use crate::utils::file::file_path_manipulator;
+use crate::utils::file::{file_path_manipulator, extension_remover};
 use hdf5_metno::filters::{blosc_set_nthreads, Blosc, BloscShuffle};
-use hdf5_metno::{File, Result, Extent};
-use hdf5_metno::types::{VarLenArray, VarLenUnicode};
+use hdf5_metno::{File, Result, Extent, H5Type};
+use hdf5_metno::types::{VarLenArray, FixedAscii};
 use tokio::task;
+use fxhash::FxHashMap as HashMap;
 
+
+const CHUNK_SIZE: usize = 1000;
+#[derive(H5Type, Clone, PartialEq)]
+#[repr(C)]
+struct IndexEntry {
+    id: FixedAscii<24>,
+    index: u64,
+}
+
+/// Creates a new, HDF5-backed database of id's and
+/// sequences.
+///
+/// # Arguments
+///
+/// * `args` - Parsed CLI arguments.
+///
+/// # Returns
+/// anyhow::Result<()>
+///
 pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     println!("\n-------------\n Create DB\n-------------\n");
     println!("Generating HDF5 DB");
+    let start = Instant::now();
 
     let cwd = std::env::current_dir()?;
     let fasta_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
     eprintln!("{}", fasta_path.display());
+    
+    let (stem, extensions) = extension_remover(&fasta_path);
+    let base = stem.to_str().unwrap_or("");
 
     let technology = Some(args.technology.clone());
     let rx = read_and_interleave_sequences(
@@ -36,10 +61,29 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
     
-    check_db(String::as_str(&hdf5_file_name));
+    // check_db(String::as_str(&hdf5_file_name));
+
+
+    let index_file_name = format!("{}.index.bin", base);
+    let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str());
+    
+    let elapsed = start.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+    println!("Created DB File: {} seconds", elapsed_secs);
     Ok(())
 }
 
+/// Asynchronous fxn for writing to an hdf5 file.
+///
+/// # Arguments
+///
+/// * `rx_stream` - ReceiverStream<SequenceRecord> from read_and_interleave_sequences or similar.
+/// * `hdf_file_name' - HDF5 file to write to.
+/// * `threads' - Number of Blosc compression threads.
+///
+/// # Returns
+/// anyhow::Result<()> 
+///
 async fn write_sequences_to_hdf5(
     rx_stream: &mut ReceiverStream<SequenceRecord>,
     hdf5_file_name: &str,
@@ -49,96 +93,204 @@ async fn write_sequences_to_hdf5(
     let hdf5_group = hdf5_file.create_group("db")?;
 
     blosc_set_nthreads(threads.min(255) as u8);
-    let chunk_size = 1000;
+    let chunk_size = 10_000;
 
-    // Create extensible dataset for sequences (VarLenArray<u8>)
     let seq_dataset = hdf5_group
         .new_dataset::<VarLenArray<u8>>()
         .shape([Extent::resizable(0)])
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
-
-    // Create extensible dataset for IDs (VarLenUnicode)
+    
     let id_dataset = hdf5_group
-        .new_dataset::<VarLenUnicode>()
+        .new_dataset::<FixedAscii<24>>()
         .shape([Extent::resizable(0)])
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
 
+    let index_dataset = hdf5_group
+        .new_dataset::<IndexEntry>()
+        .shape([Extent::resizable(0)])
+        .chunk([chunk_size])
+        .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
+        .create("index")?;
+
     let mut seq_buffer: Vec<VarLenArray<u8>> = Vec::new();
-    let mut id_buffer: Vec<VarLenUnicode> = Vec::new();
+    let mut id_buffer: Vec<FixedAscii<24>> = Vec::new();
+    let mut index_buffer: Vec<IndexEntry> = Vec::new();
+    let mut global_index: u64 = 0;
 
     while let Some(record) = rx_stream.next().await {
-
-        seq_buffer.push(record.seq().into()); // Convert &[u8] to VarLenArray<u8>
-        id_buffer.push(unsafe { VarLenUnicode::from_str_unchecked(record.id()) });
+        let accession = record
+            .id()
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Invalid header: {}", record.id()))?;
+        if accession.len() > 23 {
+            eprintln!(
+                "ERROR: Skipping ID '{}' ({} bytes), exceeds 23-byte limit",
+                accession,
+                accession.len()
+            );
+            continue;
+        }
+        let mut accession_bytes = accession.as_bytes().to_vec();
+        accession_bytes.push(0); // Add null terminator
+        let id = FixedAscii::from_ascii(&accession_bytes)
+            .map_err(|e| anyhow::anyhow!("Invalid ASCII in '{}': {}", accession, e))?;
+        seq_buffer.push(record.seq().into());
+        id_buffer.push(id.clone());
+        index_buffer.push(IndexEntry { id, index: global_index });
 
         if seq_buffer.len() >= chunk_size {
             let count = seq_buffer.len();
+            index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
             write_chunk_async(
                 seq_dataset.clone(),
                 id_dataset.clone(),
+                index_dataset.clone(),
                 seq_buffer,
                 id_buffer,
+                index_buffer,
                 count,
             )
                 .await?;
             seq_buffer = Vec::new();
             id_buffer = Vec::new();
+            index_buffer = Vec::new();
+            global_index += count as u64;
         }
     }
 
     if !seq_buffer.is_empty() {
         let count = seq_buffer.len();
-        write_chunk_async(seq_dataset, id_dataset, seq_buffer, id_buffer, count).await?;
+        index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        write_chunk_async(
+            seq_dataset,
+            id_dataset,
+            index_dataset,
+            seq_buffer,
+            id_buffer,
+            index_buffer,
+            count,
+        )
+            .await?;
     }
 
     Ok(())
 }
 
+/// Asynchronous caller of write_chunk. 
+///
+/// # Arguments
+///
+/// * `seq_dataset` - Dataset of sequence data.
+/// * `id_dataset' - Dataset of id data.
+/// * `index_dataset' - "dataset of id:sequence associations.
+/// * `seq_buffer` - Buffer of data to be written to the sequence dataset.
+/// * `id_buffer` - Buffer of data to be written to the id dataset.
+/// * `index_buffer` - Buffer of data to be written to the index dataset.
+/// * 'count' - Passed to use for resizing.
+///
+/// # Returns
+/// anyhow::Result<()> 
+///
 async fn write_chunk_async(
     seq_dataset: hdf5_metno::Dataset,
     id_dataset: hdf5_metno::Dataset,
+    index_dataset: hdf5_metno::Dataset,
     seq_buffer: Vec<VarLenArray<u8>>,
-    id_buffer: Vec<VarLenUnicode>,
+    id_buffer: Vec<FixedAscii<24>>,
+    index_buffer: Vec<IndexEntry>,
     count: usize,
 ) -> anyhow::Result<()> {
-    task::spawn_blocking(move || write_chunk(&seq_dataset, &id_dataset, &seq_buffer, &id_buffer, count))
+    task::spawn_blocking(move || {
+        write_chunk(
+            &seq_dataset,
+            &id_dataset,
+            &index_dataset,
+            &seq_buffer,
+            &id_buffer,
+            &index_buffer,
+            count,
+        )
+    })
         .await??;
     Ok(())
 }
 
+/// Writes new data to the HDF5 datasets.
+///
+/// # Arguments
+///
+/// * `seq_dataset` - Dataset of sequence data.
+/// * `id_dataset' - Dataset of id data.
+/// * `index_dataset' - "dataset of id:sequence associations.
+/// * `seq_buffer` - Buffer of data to be written to the sequence dataset.
+/// * `id_buffer` - Buffer of data to be written to the id dataset.
+/// * `index_buffer` - Buffer of data to be written to the index dataset.
+/// * 'count' - Passed to use for resizing.
+///
+/// # Returns
+/// anyhow::Result<()> 
+///
 fn write_chunk(
     seq_dataset: &hdf5_metno::Dataset,
     id_dataset: &hdf5_metno::Dataset,
+    index_dataset: &hdf5_metno::Dataset,
     seq_buffer: &[VarLenArray<u8>],
-    id_buffer: &[VarLenUnicode],
+    id_buffer: &[FixedAscii<24>],
+    index_buffer: &[IndexEntry],
     count: usize,
 ) -> Result<()> {
     let current_size = seq_dataset.shape()[0];
     seq_dataset.resize([current_size + count])?;
     id_dataset.resize([current_size + count])?;
+    index_dataset.resize([current_size + count])?;
 
     seq_dataset.write_slice(seq_buffer, current_size..current_size + count)?;
     id_dataset.write_slice(id_buffer, current_size..current_size + count)?;
+    index_dataset.write_slice(index_buffer, current_size..current_size + count)?;
     Ok(())
 }
 
-async fn check_db(h5_file_name: &str) -> anyhow::Result<()> {
-    eprintln!("Checking HDF5 file: {}", h5_file_name);
-    let file = File::open(h5_file_name)?; // Open for reading
+/// Determines if a file path is a FASTA, FASTQ, or neither.
+/// Checks extensions, not the body.
+///
+/// # Arguments
+///
+/// * `path` - Header line of a FASTX record.
+///
+/// # Returns
+/// Result<String>. Ok fastq or fasta, or err.
+///
+async fn build_new_in_memory_index(h5_file_name: &str, cache_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u64>> {
+    println!("Building in-memory index for: {}", h5_file_name);
+    let file = File::open(h5_file_name)?;
     let group = file.group("db")?;
-    let id_dataset = group.dataset("id")?;
-    let seq_dataset = group.dataset("sequences")?;
-    
-    let id_len = id_dataset.shape()[0];
-    let seq_len = seq_dataset.shape()[0];
-    if id_len != seq_len {
-        return Err(anyhow::anyhow!("Mismatched dataset lengths: id={} seq={}", id_len, seq_len));
-    }
-    eprintln!("Dataset sizes: {} records", id_len);
+    let index_dataset = group.dataset("index")?;
 
-    Ok(())
+    let index_len = index_dataset.shape()[0];
+
+    let mut index_map: HashMap<[u8; 24], u64> = HashMap::default();
+    index_map.reserve(index_len);
+
+    for start in (0..index_len).step_by(CHUNK_SIZE) {
+        let end = (start + CHUNK_SIZE).min(index_len);
+        let entries: Vec<IndexEntry> = index_dataset.read_slice(start..end)?.to_vec();
+        for entry in entries {
+            let id_bytes = entry.id.as_str().as_bytes();
+            let id_len = id_bytes.len() - 1; // Exclude null terminator
+            let mut id_bytes_array = [0u8; 24];
+            id_bytes_array[..id_len].copy_from_slice(&id_bytes[..id_len]);
+            index_map.insert(id_bytes_array, entry.index);
+        }
+    }
+
+    eprintln!("Saving index to cache: {}", cache_file_name);
+    let config = bincode::config::standard();
+    std::fs::write(&cache_file_name, bincode::serde::encode_to_vec(&index_map, config)?)?;
+    eprintln!("In-memory index built: {} entries", index_map.len());
+    Ok(index_map)
 }
