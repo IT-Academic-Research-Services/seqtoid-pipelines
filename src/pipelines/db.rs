@@ -96,13 +96,14 @@ async fn write_sequences_to_hdf5(
     let hdf5_group = hdf5_file.create_group("db")?;
 
     blosc_set_nthreads(threads.min(255) as u8);
-    let chunk_size = 10_000;
+
     eprintln!("Setting Blosc threads: {}", threads.min(255));
 
     let seq_dataset = hdf5_group
         .new_dataset::<VarLenArray<u8>>()
         .shape([Extent::resizable(0)])
-        .chunk([chunk_size])
+        .chunk([CHUNK_SIZE])
+        .deflate(6)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
 
@@ -111,14 +112,16 @@ async fn write_sequences_to_hdf5(
     let id_dataset = hdf5_group
         .new_dataset::<FixedAscii<24>>()
         .shape([Extent::resizable(0)])
-        .chunk([chunk_size])
+        .chunk([CHUNK_SIZE])
+        .deflate(6)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
 
     let index_dataset = hdf5_group
         .new_dataset::<IndexEntry>()
         .shape([Extent::resizable(0)])
-        .chunk([chunk_size])
+        .chunk([CHUNK_SIZE])
+        .deflate(6)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("index")?;
 
@@ -151,7 +154,7 @@ async fn write_sequences_to_hdf5(
         id_buffer.push(id.clone());
         index_buffer.push(IndexEntry { id, index: global_index });
 
-        if seq_buffer.len() >= chunk_size {
+        if seq_buffer.len() >= CHUNK_SIZE {
             let count = seq_buffer.len();
             index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
             write_chunk_async(
