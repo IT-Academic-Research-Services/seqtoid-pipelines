@@ -63,11 +63,13 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 
     eprintln!("Checking DB");
     check_db(hdf5_file_name.as_str(), None).await?;
+    eprintln!("Checking DB complete");
 
     let index_file_name = format!("{}.index.bin", base);
     let _ = fs::remove_file(&index_file_name);
+    eprintln!("building index map");
     let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
-
+    eprintln!("building index map complete");
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     println!("Created DB File: {} seconds", elapsed_secs);
@@ -104,7 +106,7 @@ async fn write_sequences_to_hdf5(
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
 
-    eprintln!("Sequences dataset created");
+
 
     let id_dataset = hdf5_group
         .new_dataset::<FixedAscii<24>>()
@@ -119,6 +121,8 @@ async fn write_sequences_to_hdf5(
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("index")?;
+
+    eprintln!(" datasets created");
 
     let mut seq_buffer: Vec<VarLenArray<u8>> = Vec::new();
     let mut id_buffer: Vec<FixedAscii<24>> = Vec::new();
