@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 use futures::StreamExt;
@@ -59,13 +60,14 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| "hdf5_out.h5".to_string());
 
+    let _ = fs::remove_file(&hdf5_file_name);
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
+
+    check_db(hdf5_file_name.as_str(), None).await?;
     
-    // check_db(String::as_str(&hdf5_file_name));
-
-
     let index_file_name = format!("{}.index.bin", base);
-    let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str());
+    let _ = fs::remove_file(&index_file_name);
+    let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
     
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
@@ -294,3 +296,86 @@ async fn build_new_in_memory_index(h5_file_name: &str, cache_file_name: &str) ->
     eprintln!("In-memory index built: {} entries", index_map.len());
     Ok(index_map)
 }
+
+
+// async fn load_indexes(h5_file_name: &str, index_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u64>> {
+// 
+//     let config = bincode::config::standard();
+//     if std::path::Path::new(&index_file_name).exists() {
+//         let hdf5_mtime = std::fs::metadata(h5_file_name)?.modified()?;
+//         let cache_mtime = std::fs::metadata(&index_file_name)?.modified()?;
+//         if cache_mtime >= hdf5_mtime {
+//             eprintln!("Loading index from cache: {}", index_file_name);
+//             let index_map: HashMap<[u8; 24], u64> = config.deserialize(&std::fs::read(&cache_file)?)?;
+//             eprintln!("In-memory index loaded: {} entries", index_map.len());
+//             return Ok(index_map);
+//         }
+//     }
+// }
+async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result<()> {
+    println!("Checking HDF5 file: {}", h5_file_name);
+    let file = File::open(h5_file_name)?;
+    let group = file.group("db")?;
+    let id_dataset = group.dataset("id")?;
+    let seq_dataset = group.dataset("sequences")?;
+    let index_dataset = group.dataset("index")?;
+
+    let id_len = id_dataset.shape()[0];
+    let seq_len = seq_dataset.shape()[0];
+    let index_len = index_dataset.shape()[0];
+    if id_len != seq_len || id_len != index_len {
+        return Err(anyhow::anyhow!(
+            "Mismatched dataset lengths: id={} seq={} index={}",
+            id_len,
+            seq_len,
+            index_len
+        ));
+    }
+    eprintln!("Dataset sizes: {} records", id_len);
+
+    // if let Some(id) = target_id {
+    //     if id.len() > 23 {
+    //         return Err(anyhow::anyhow!(
+    //             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
+    //             id,
+    //             id.len()
+    //         ));
+    //     }
+    //     let index_map = build_in_memory_index(h5_file_name).await?;
+    //     let seq = lookup_sequence(h5_file_name, id, &index_map).await?;
+    //     eprintln!("Found sequence for ID '{}': {:?}", id, seq);
+    // }
+
+    Ok(())
+}
+// 
+// async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &HashMap<[u8; 15], u64>) -> anyhow::Result<Vec<u8>> {
+//     eprintln!("Looking up ID: {} in file: {}", target_id, h5_file_name);
+//     if target_id.len() > 23 {
+//         return Err(anyhow::anyhow!(
+//             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
+//             target_id,
+//             target_id.len()
+//         ));
+//     }
+//     let file = File::open(h5_file_name)?;
+//     let group = file.group("db")?;
+//     let seq_dataset = group.dataset("sequences")?;
+// 
+//     if target_id.len() > 15 {
+//         return Err(anyhow::anyhow!(
+//             "Target ID '{}' ({} bytes) exceeds 15-byte HashMap limit",
+//             target_id,
+//             target_id.len()
+//         ));
+//     }
+//     let mut id_bytes = [0u8; 15];
+//     id_bytes[..target_id.len()].copy_from_slice(target_id.as_bytes());
+// 
+//     let index = index_map
+//         .get(&id_bytes)
+//         .ok_or_else(|| anyhow::anyhow!("ID '{}' not found in dataset", target_id))?;
+// 
+//     let seq: VarLenArray<u8> = seq_dataset.read_slice(*index as usize..*index as usize + 1)?[0].clone();
+//     Ok(seq.into_vec())
+// }
