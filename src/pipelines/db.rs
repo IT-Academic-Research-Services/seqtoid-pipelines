@@ -54,12 +54,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     )?;
     let mut rx_stream = ReceiverStream::new(rx);
 
-    let hdf5_file_name = args
-        .out_file
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| "hdf5_out.h5".to_string());
-
+    let hdf5_file_name = format!("{}.h5", base);
     let _ = fs::remove_file(&hdf5_file_name);
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
 
