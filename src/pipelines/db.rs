@@ -103,6 +103,8 @@ async fn write_sequences_to_hdf5(
         .new_dataset::<VarLenArray<u8>>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
+        // .shuffle().lzf()
+        // .deflate(6)
         .shuffle().deflate(6)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
@@ -113,6 +115,8 @@ async fn write_sequences_to_hdf5(
         .new_dataset::<FixedAscii<24>>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
+        // .shuffle().lzf()
+        // .deflate(6)
         .shuffle().deflate(6)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
@@ -121,6 +125,8 @@ async fn write_sequences_to_hdf5(
         .new_dataset::<IndexEntry>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
+        // .shuffle().lzf()
+        // .deflate(6)
         .shuffle().deflate(6)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("index")?;
