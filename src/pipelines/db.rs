@@ -44,6 +44,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let base = stem.to_str().unwrap_or("");
 
     let technology = Some(args.technology.clone());
+    eprintln!("Starting read_and_interleave_sequences");
     let rx = read_and_interleave_sequences(
         fasta_path,
         None,
@@ -56,8 +57,11 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 
     let hdf5_file_name = format!("{}.h5", base);
     let _ = fs::remove_file(&hdf5_file_name);
+    eprintln!("Writing to HDF5: {}", hdf5_file_name);
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
+    eprintln!("Finished writing HDF5");
 
+    eprintln!("Checking DB");
     check_db(hdf5_file_name.as_str(), None).await?;
 
     let index_file_name = format!("{}.index.bin", base);
@@ -91,6 +95,7 @@ async fn write_sequences_to_hdf5(
 
     blosc_set_nthreads(threads.min(255) as u8);
     let chunk_size = 10_000;
+    eprintln!("Setting Blosc threads: {}", threads.min(255));
 
     let seq_dataset = hdf5_group
         .new_dataset::<VarLenArray<u8>>()
@@ -98,6 +103,8 @@ async fn write_sequences_to_hdf5(
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
+
+    eprintln!("Sequences dataset created");
 
     let id_dataset = hdf5_group
         .new_dataset::<FixedAscii<24>>()
