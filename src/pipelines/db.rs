@@ -39,7 +39,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let fasta_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
     eprintln!("{}", fasta_path.display());
-    
+
     let (stem, extensions) = extension_remover(&fasta_path);
     let base = stem.to_str().unwrap_or("");
 
@@ -64,11 +64,11 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
 
     check_db(hdf5_file_name.as_str(), None).await?;
-    
+
     let index_file_name = format!("{}.index.bin", base);
     let _ = fs::remove_file(&index_file_name);
     let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
-    
+
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     println!("Created DB File: {} seconds", elapsed_secs);
@@ -84,7 +84,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 /// * `threads' - Number of Blosc compression threads.
 ///
 /// # Returns
-/// anyhow::Result<()> 
+/// anyhow::Result<()>
 ///
 async fn write_sequences_to_hdf5(
     rx_stream: &mut ReceiverStream<SequenceRecord>,
@@ -103,7 +103,7 @@ async fn write_sequences_to_hdf5(
         .chunk([chunk_size])
         .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
-    
+
     let id_dataset = hdf5_group
         .new_dataset::<FixedAscii<24>>()
         .shape([Extent::resizable(0)])
@@ -183,7 +183,7 @@ async fn write_sequences_to_hdf5(
     Ok(())
 }
 
-/// Asynchronous caller of write_chunk. 
+/// Asynchronous caller of write_chunk.
 ///
 /// # Arguments
 ///
@@ -196,7 +196,7 @@ async fn write_sequences_to_hdf5(
 /// * 'count' - Passed to use for resizing.
 ///
 /// # Returns
-/// anyhow::Result<()> 
+/// anyhow::Result<()>
 ///
 async fn write_chunk_async(
     seq_dataset: hdf5_metno::Dataset,
@@ -235,7 +235,7 @@ async fn write_chunk_async(
 /// * 'count' - Passed to use for resizing.
 ///
 /// # Returns
-/// anyhow::Result<()> 
+/// anyhow::Result<()>
 ///
 fn write_chunk(
     seq_dataset: &hdf5_metno::Dataset,
@@ -258,7 +258,6 @@ fn write_chunk(
 }
 
 /// Determines if a file path is a FASTA, FASTQ, or neither.
-/// Checks extensions, not the body.
 ///
 /// # Arguments
 ///
@@ -298,20 +297,23 @@ async fn build_new_in_memory_index(h5_file_name: &str, cache_file_name: &str) ->
 }
 
 
-// async fn load_indexes(h5_file_name: &str, index_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u64>> {
-// 
-//     let config = bincode::config::standard();
-//     if std::path::Path::new(&index_file_name).exists() {
-//         let hdf5_mtime = std::fs::metadata(h5_file_name)?.modified()?;
-//         let cache_mtime = std::fs::metadata(&index_file_name)?.modified()?;
-//         if cache_mtime >= hdf5_mtime {
-//             eprintln!("Loading index from cache: {}", index_file_name);
-//             let index_map: HashMap<[u8; 24], u64> = config.deserialize(&std::fs::read(&cache_file)?)?;
-//             eprintln!("In-memory index loaded: {} entries", index_map.len());
-//             return Ok(index_map);
-//         }
-//     }
-// }
+/// Loads an index file associated with an HDF5 file.
+///
+/// # Arguments
+///
+/// * `index_file_name` - Name of index file.
+///
+/// # Returns
+/// anyhow::Result<HashMap<[u8; 24], u64>> the index
+///
+async fn load_index(index_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u64>> {
+    let config = bincode::config::standard();
+    let data = tokio::fs::read(index_file_name).await?;
+    let (index_map, _): (HashMap<[u8; 24], u64>, usize) = bincode::serde::decode_from_slice(&data, config)?;
+    eprintln!("Loaded index from {}: {} entries", index_file_name, index_map.len());
+    Ok(index_map)
+}
+
 async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result<()> {
     println!("Checking HDF5 file: {}", h5_file_name);
     let file = File::open(h5_file_name)?;
@@ -348,7 +350,7 @@ async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result
 
     Ok(())
 }
-// 
+//
 // async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &HashMap<[u8; 15], u64>) -> anyhow::Result<Vec<u8>> {
 //     eprintln!("Looking up ID: {} in file: {}", target_id, h5_file_name);
 //     if target_id.len() > 23 {
@@ -361,7 +363,7 @@ async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result
 //     let file = File::open(h5_file_name)?;
 //     let group = file.group("db")?;
 //     let seq_dataset = group.dataset("sequences")?;
-// 
+//
 //     if target_id.len() > 15 {
 //         return Err(anyhow::anyhow!(
 //             "Target ID '{}' ({} bytes) exceeds 15-byte HashMap limit",
@@ -371,11 +373,11 @@ async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result
 //     }
 //     let mut id_bytes = [0u8; 15];
 //     id_bytes[..target_id.len()].copy_from_slice(target_id.as_bytes());
-// 
+//
 //     let index = index_map
 //         .get(&id_bytes)
 //         .ok_or_else(|| anyhow::anyhow!("ID '{}' not found in dataset", target_id))?;
-// 
+//
 //     let seq: VarLenArray<u8> = seq_dataset.read_slice(*index as usize..*index as usize + 1)?[0].clone();
 //     Ok(seq.into_vec())
 // }
