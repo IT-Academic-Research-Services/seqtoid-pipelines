@@ -11,8 +11,8 @@ use hdf5_metno::{File, Result, Extent, H5Type};
 use hdf5_metno::types::{VarLenArray, FixedAscii};
 use tokio::task;
 use fxhash::FxHashMap as HashMap;
-
-
+use crate::utils::command::check_version;
+use crate::utils::defs::H5DUMP_TAG;
 const CHUNK_SIZE: usize = 1000;
 #[derive(H5Type, Clone, PartialEq)]
 #[repr(C)]
@@ -35,6 +35,9 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     println!("\n-------------\n Create DB\n-------------\n");
     println!("Generating HDF5 DB");
     let start = Instant::now();
+    
+    let h5v = check_version(H5DUMP_TAG).await?;
+    println!("H5 version: {}", h5v);
 
     let cwd = std::env::current_dir()?;
     let fasta_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
@@ -105,7 +108,7 @@ async fn write_sequences_to_hdf5(
         .chunk([CHUNK_SIZE])
         // .shuffle().lzf()
         // .deflate(6)
-        .shuffle().deflate(6)
+        .shuffle().deflate(9)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
 
@@ -117,7 +120,7 @@ async fn write_sequences_to_hdf5(
         .chunk([CHUNK_SIZE])
         // .shuffle().lzf()
         // .deflate(6)
-        .shuffle().deflate(6)
+        .shuffle().deflate(9)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
 
@@ -127,7 +130,7 @@ async fn write_sequences_to_hdf5(
         .chunk([CHUNK_SIZE])
         // .shuffle().lzf()
         // .deflate(6)
-        .shuffle().deflate(6)
+        .shuffle().deflate(9)
         // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("index")?;
 

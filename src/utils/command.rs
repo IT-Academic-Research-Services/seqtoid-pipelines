@@ -89,10 +89,10 @@ mod h5dump {
         let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
         let first_line = lines
             .first()
-            .ok_or_else(|| anyhow!("No output from fastp -v"))?;
+            .ok_or_else(|| anyhow!("No output from h5dump -V"))?;
         let version = first_line
             .split_whitespace()
-            .nth(1)
+            .nth(2)
             .ok_or_else(|| anyhow!("Invalid fastp -v output: {}", first_line))?
             .to_string();
         if version.is_empty() {
@@ -114,10 +114,11 @@ pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
     Ok(cmd)
 }
 
-#[allow(dead_code)]
+
 pub async fn check_version(tool: &str) -> Result<String> {
     let version = match tool {
         FASTP_TAG => fastp::fastp_presence_check().await,
+        H5DUMP_TAG => h5dump::h5dump_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
