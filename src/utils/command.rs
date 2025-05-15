@@ -1,7 +1,7 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
-use crate::utils::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG};
 use crate::cli::Arguments;
 
 
@@ -10,7 +10,7 @@ mod fastp {
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::utils::defs::FASTP_TAG;
+    use crate::config::defs::FASTP_TAG;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[allow(dead_code)]
@@ -70,7 +70,7 @@ mod pigz {
 mod h5dump {
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::utils::defs::{H5DUMP_TAG};
+    use crate::config::defs::{H5DUMP_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[allow(dead_code)]

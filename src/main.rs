@@ -1,5 +1,6 @@
 mod pipelines;
 mod utils;
+mod config;
 
 use std::time::Instant;
 use std::env;
