@@ -13,6 +13,8 @@ use tokio::task;
 use fxhash::FxHashMap as HashMap;
 use crate::utils::command::check_version;
 use crate::utils::defs::H5DUMP_TAG;
+use ndarray::Ix1;
+
 const CHUNK_SIZE: usize = 1000;
 #[derive(H5Type, Clone, PartialEq)]
 #[repr(C)]
@@ -64,15 +66,18 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
     eprintln!("Finished writing HDF5");
 
-    eprintln!("Checking DB");
-    check_db(hdf5_file_name.as_str(), None).await?;
-    eprintln!("Checking DB complete");
 
     let index_file_name = format!("{}.index.bin", base);
     let _ = fs::remove_file(&index_file_name);
     eprintln!("building index map");
     let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
     eprintln!("building index map complete");
+
+    eprintln!("Checking DB");
+    check_db(hdf5_file_name.as_str(), &index_file_name, None).await?;
+    eprintln!("Checking DB complete");
+
+
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     println!("Created DB File: {} seconds", elapsed_secs);
@@ -332,7 +337,18 @@ async fn load_index(index_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u
     Ok(index_map)
 }
 
-async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result<()> {
+/// Database integrity check function
+///
+/// # Arguments
+///
+/// * `h5_file_name` - Name of index file.
+/// * `index_file_name` - Name of index file.
+/// * 'target_id` - Accession ID to test.
+///
+/// # Returns
+/// anyhow::Result<HashMap<[u8; 24], u64>> the index
+///
+async fn check_db(h5_file_name: &str, index_file_name: &str, target_id: Option<&str>) -> anyhow::Result<()> {
     println!("Checking HDF5 file: {}", h5_file_name);
     let file = File::open(h5_file_name)?;
     let group = file.group("db")?;
@@ -353,49 +369,61 @@ async fn check_db(h5_file_name: &str, target_id: Option<&str>) -> anyhow::Result
     }
     eprintln!("Dataset sizes: {} records", id_len);
 
-    // if let Some(id) = target_id {
-    //     if id.len() > 23 {
-    //         return Err(anyhow::anyhow!(
-    //             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
-    //             id,
-    //             id.len()
-    //         ));
-    //     }
-    //     let index_map = build_in_memory_index(h5_file_name).await?;
-    //     let seq = lookup_sequence(h5_file_name, id, &index_map).await?;
-    //     eprintln!("Found sequence for ID '{}': {:?}", id, seq);
-    // }
+    if let Some(id) = target_id {
+        if id.len() > 23 {
+            return Err(anyhow::anyhow!(
+                "Target ID '{}' ({} bytes) exceeds 23-byte limit",
+                id,
+                id.len()
+            ));
+        }
+        
+        let index_map = load_index(index_file_name).await?;
+        let seq = lookup_sequence(h5_file_name, id, &index_map).await?;
+        eprintln!("Found sequence for ID '{}': {:?}", id, seq);
+    }
 
     Ok(())
 }
-//
-// async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &HashMap<[u8; 15], u64>) -> anyhow::Result<Vec<u8>> {
-//     eprintln!("Looking up ID: {} in file: {}", target_id, h5_file_name);
-//     if target_id.len() > 23 {
-//         return Err(anyhow::anyhow!(
-//             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
-//             target_id,
-//             target_id.len()
-//         ));
-//     }
-//     let file = File::open(h5_file_name)?;
-//     let group = file.group("db")?;
-//     let seq_dataset = group.dataset("sequences")?;
-//
-//     if target_id.len() > 15 {
-//         return Err(anyhow::anyhow!(
-//             "Target ID '{}' ({} bytes) exceeds 15-byte HashMap limit",
-//             target_id,
-//             target_id.len()
-//         ));
-//     }
-//     let mut id_bytes = [0u8; 15];
-//     id_bytes[..target_id.len()].copy_from_slice(target_id.as_bytes());
-//
-//     let index = index_map
-//         .get(&id_bytes)
-//         .ok_or_else(|| anyhow::anyhow!("ID '{}' not found in dataset", target_id))?;
-//
-//     let seq: VarLenArray<u8> = seq_dataset.read_slice(*index as usize..*index as usize + 1)?[0].clone();
-//     Ok(seq.into_vec())
-// }
+
+
+/// Retrieve a sequence from an H5 file.
+///
+/// # Arguments
+///
+/// * `h5_file_name` - Name of index file.
+/// * 'target_id` - Accession ID to test.
+/// * `index_map' - Index associated with H5 file.
+///
+/// # Returns
+/// anyhow::Result<HashMap<[u8; 24], u64>> the index
+///
+async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &HashMap<[u8; 24], u64>) -> anyhow::Result<Vec<u8>> {
+    eprintln!("Looking up ID: {} in file: {}", target_id, h5_file_name);
+    if target_id.len() > 23 {
+        return Err(anyhow::anyhow!(
+            "Target ID '{}' ({} bytes) exceeds 23-byte limit",
+            target_id,
+            target_id.len()
+        ));
+    }
+    let file = File::open(h5_file_name)?;
+    let group = file.group("db")?;
+    let seq_dataset = group.dataset("sequences")?;
+
+    let mut id_bytes = [0u8; 24];
+    if target_id.len() > 23 {
+        return Err(anyhow::anyhow!(
+        "Target ID '{}' ({} bytes) exceeds 23-byte limit",
+        target_id,
+        target_id.len()
+    ));
+    }
+    id_bytes[..target_id.len()].copy_from_slice(target_id.as_bytes());
+    let index = index_map
+        .get(&id_bytes)
+        .ok_or_else(|| anyhow::anyhow!("ID '{}' not found in dataset", target_id))?;
+
+    let seq: VarLenArray<u8> = seq_dataset.read_slice::<VarLenArray<u8>, std::ops::Range<usize>, ndarray::Ix1>(*index as usize..*index as usize + 1)?[0].clone();
+    Ok(seq.to_vec())
+}
