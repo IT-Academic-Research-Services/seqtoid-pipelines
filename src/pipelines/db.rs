@@ -6,14 +6,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::Arguments;
 use crate::utils::fastx::{read_and_interleave_sequences, SequenceRecord};
 use crate::utils::file::{file_path_manipulator, extension_remover};
-use hdf5_metno::filters::{blosc_set_nthreads, Blosc, BloscShuffle};
 use hdf5_metno::{File, Result, Extent, H5Type};
 use hdf5_metno::types::{VarLenArray, FixedAscii};
 use tokio::task;
 use fxhash::FxHashMap as HashMap;
 use crate::utils::command::check_version;
 use crate::utils::defs::H5DUMP_TAG;
-use ndarray::Ix1;
 
 const CHUNK_SIZE: usize = 1000;
 #[derive(H5Type, Clone, PartialEq)]
@@ -45,7 +43,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let fasta_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
     eprintln!("{}", fasta_path.display());
 
-    let (stem, extensions) = extension_remover(&fasta_path);
+    let (stem, _extensions) = extension_remover(&fasta_path);
     let base = stem.to_str().unwrap_or("");
 
     let technology = Some(args.technology.clone());
@@ -63,14 +61,14 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let hdf5_file_name = format!("{}.h5", base);
     let _ = fs::remove_file(&hdf5_file_name);
     eprintln!("Writing to HDF5: {}", hdf5_file_name);
-    write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name, args.threads).await?;
+    write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name).await?;
     eprintln!("Finished writing HDF5");
 
 
     let index_file_name = format!("{}.index.bin", base);
     let _ = fs::remove_file(&index_file_name);
     eprintln!("building index map");
-    let index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
+    let _index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
     eprintln!("building index map complete");
 
     eprintln!("Checking DB");
@@ -98,49 +96,31 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 async fn write_sequences_to_hdf5(
     rx_stream: &mut ReceiverStream<SequenceRecord>,
     hdf5_file_name: &str,
-    threads: usize,
 ) -> anyhow::Result<()> {
     let hdf5_file = File::create(hdf5_file_name)?;
     let hdf5_group = hdf5_file.create_group("db")?;
-
-    blosc_set_nthreads(threads.min(255) as u8);
-
-    eprintln!("Setting Blosc threads: {}", threads.min(255));
-
+    
     let seq_dataset = hdf5_group
         .new_dataset::<VarLenArray<u8>>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
-        // .shuffle().lzf()
-        // .deflate(6)
         .shuffle().deflate(9)
-        // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("sequences")?;
-
-
-
+    
     let id_dataset = hdf5_group
         .new_dataset::<FixedAscii<24>>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
-        // .shuffle().lzf()
-        // .deflate(6)
         .shuffle().deflate(9)
-        // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("id")?;
 
     let index_dataset = hdf5_group
         .new_dataset::<IndexEntry>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
-        // .shuffle().lzf()
-        // .deflate(6)
         .shuffle().deflate(9)
-        // .blosc(Blosc::BloscLZ, 9, BloscShuffle::Byte)
         .create("index")?;
-
-    eprintln!(" datasets created");
-
+    
     let mut seq_buffer: Vec<VarLenArray<u8>> = Vec::new();
     let mut id_buffer: Vec<FixedAscii<24>> = Vec::new();
     let mut index_buffer: Vec<IndexEntry> = Vec::new();
@@ -290,7 +270,7 @@ fn write_chunk(
 /// Result<String>. Ok fastq or fasta, or err.
 ///
 async fn build_new_in_memory_index(h5_file_name: &str, cache_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u64>> {
-    println!("Building in-memory index for: {}", h5_file_name);
+    eprintln!("Building in-memory index for: {}", h5_file_name);
     let file = File::open(h5_file_name)?;
     let group = file.group("db")?;
     let index_dataset = group.dataset("index")?;
@@ -349,7 +329,7 @@ async fn load_index(index_file_name: &str) -> anyhow::Result<HashMap<[u8; 24], u
 /// anyhow::Result<HashMap<[u8; 24], u64>> the index
 ///
 async fn check_db(h5_file_name: &str, index_file_name: &str, target_id: Option<&str>) -> anyhow::Result<()> {
-    println!("Checking HDF5 file: {}", h5_file_name);
+    eprintln!("Checking HDF5 file: {}", h5_file_name);
     let file = File::open(h5_file_name)?;
     let group = file.group("db")?;
     let id_dataset = group.dataset("id")?;
