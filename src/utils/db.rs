@@ -36,21 +36,21 @@ pub async fn write_sequences_to_hdf5(
         .new_dataset::<VarLenArray<u8>>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
-        .shuffle().deflate(9)
+        .shuffle().deflate(6)
         .create("sequences")?;
 
     let id_dataset = hdf5_group
         .new_dataset::<FixedAscii<24>>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
-        .shuffle().deflate(9)
+        .shuffle().deflate(6)
         .create("id")?;
 
     let index_dataset = hdf5_group
         .new_dataset::<IndexEntry>()
         .shape([Extent::resizable(0)])
         .chunk([CHUNK_SIZE])
-        .shuffle().deflate(9)
+        .shuffle().deflate(6)
         .create("index")?;
 
     let mut seq_buffer: Vec<VarLenArray<u8>> = Vec::new();
