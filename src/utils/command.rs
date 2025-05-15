@@ -1,7 +1,7 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
-use crate::utils::defs::{FASTP_TAG, PIGZ_TAG};
+use crate::utils::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG};
 use crate::utils::Arguments;
 
 
@@ -67,6 +67,40 @@ mod pigz {
     }
 }
 
+mod h5dump {
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::utils::defs::{H5DUMP_TAG};
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    #[allow(dead_code)]
+    pub async fn h5dump_presence_check() -> anyhow::Result<String> {
+        let args: Vec<&str> = vec!["-V"];
+
+
+        let mut child = Command::new(H5DUMP_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is fastp installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from h5dump -V"))?;
+        let version = first_line
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| anyhow!("Invalid fastp -v output: {}", first_line))?
+            .to_string();
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in fastp -v output: {}", first_line));
+        }
+        Ok(version)
+    }
+}
 
 pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
     
@@ -80,10 +114,11 @@ pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
     Ok(cmd)
 }
 
-#[allow(dead_code)]
+
 pub async fn check_version(tool: &str) -> Result<String> {
     let version = match tool {
         FASTP_TAG => fastp::fastp_presence_check().await,
+        H5DUMP_TAG => h5dump::h5dump_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
