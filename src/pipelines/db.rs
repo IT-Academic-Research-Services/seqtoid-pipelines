@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::Arguments;
+use crate::cli::Arguments;
 use crate::utils::fastx::{read_and_interleave_sequences};
 use crate::utils::file::{file_path_manipulator, extension_remover};
 use crate::utils::command::check_version;

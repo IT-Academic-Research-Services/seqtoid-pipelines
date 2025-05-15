@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
-use crate::utils::Arguments;
+use crate::cli::Arguments;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;

@@ -2,14 +2,14 @@
 
 use anyhow::{anyhow, Result};
 use crate::utils::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG};
-use crate::utils::Arguments;
+use crate::cli::Arguments;
 
 
 
 mod fastp {
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
-    use crate::utils::Arguments;
+    use crate::cli::Arguments;
     use crate::utils::defs::FASTP_TAG;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -55,7 +55,7 @@ mod fastp {
 }
 
 mod pigz {
-    use crate::utils::Arguments;
+    use crate::cli::Arguments;
     
     pub fn arg_generator(args: &Arguments) -> Vec<String> {
         let mut args_vec: Vec<String> = Vec::new();
