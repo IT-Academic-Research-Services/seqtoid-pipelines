@@ -1,15 +1,18 @@
 mod pipelines;
 mod utils;
+mod config;
 
 use std::time::Instant;
 use std::env;
 use clap::Parser;
 use anyhow::Result;
-use utils::Arguments;
 
+
+use crate::cli::{parse, Arguments};
 use pipelines::consensus_genome;
 use pipelines::db;
 
+mod cli;
 
 
 #[tokio::main]
@@ -20,7 +23,7 @@ async fn main() -> Result<()> {
     let dir = env::current_dir()?;
     println!("The current directory is {:?}\n", dir);
 
-    let args = Arguments::parse();
+    let args = parse();
 
     if let Err(e) = match args.module.as_str() {
         "consensus_genome" => consensus_genome_run(&args).await,

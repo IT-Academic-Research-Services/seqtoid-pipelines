@@ -5,7 +5,7 @@ use std::io::{self, BufReader};
 use std::path::PathBuf;
 use flate2::read::GzDecoder;
 use crate::utils::file::{extension_remover, is_gzipped, FileReader};
-use crate::utils::Technology;
+use crate::cli::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
 use crate::utils::sequence::{DNA, normal_phred_qual_string};
@@ -211,7 +211,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                     for &delimiter in delimiters.iter() {
                         let parts: Vec<&str> = filename.split(delimiter).collect();
                         for (index, part) in parts.iter().enumerate() {
-                            if R1_R2_TAGS.contains_key(part) {
+                            if (*R1_R2_TAGS).contains_key(part) {
                                 let r1_tag = part.to_string();
                                 let prefix_parts = &parts[..index];
                                 let prefix = if prefix_parts.is_empty() {

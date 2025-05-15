@@ -2,11 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::Arguments;
+use crate::cli::Arguments;
 use crate::utils::fastx::{read_and_interleave_sequences};
 use crate::utils::file::{file_path_manipulator, extension_remover};
 use crate::utils::command::check_version;
-use crate::utils::defs::H5DUMP_TAG;
+use crate::config::defs::H5DUMP_TAG;
 use crate::utils::db::{write_sequences_to_hdf5, build_new_in_memory_index, check_db};
 
 

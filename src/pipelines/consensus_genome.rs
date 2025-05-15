@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
-use crate::utils::Arguments;
+use crate::cli::Arguments;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
-use crate::utils::defs::{PIGZ_TAG, FASTP_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG};
 
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");

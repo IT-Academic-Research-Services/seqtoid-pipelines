@@ -3,7 +3,7 @@ use std::io;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use flate2::read::GzDecoder;
-use crate::utils::defs::GZIP_EXT;
+use crate::config::defs::GZIP_EXT;
 
 
 
