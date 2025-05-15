@@ -52,8 +52,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     eprintln!("Writing to HDF5: {}", hdf5_file_name);
     write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name).await?;
     eprintln!("Finished writing HDF5");
-
-
+    
     let index_file_name = format!("{}.index.bin", base);
     let _ = fs::remove_file(&index_file_name);
     eprintln!("building index map");
@@ -64,9 +63,10 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     check_db(hdf5_file_name.as_str(), &index_file_name, None).await?;
     eprintln!("Checking DB complete");
 
-
+    println!("Created DB File: {}", hdf5_file_name);
+    println!("Created DB Index: {}", index_file_name);
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
-    println!("Created DB File: {} seconds", elapsed_secs);
+    println!("Time elapsed: {} seconds", elapsed_secs);
     Ok(())
 }
