@@ -8,7 +8,8 @@ use futures::StreamExt;
 use crate::cli::Technology;
 
 const CHUNK_SIZE: usize = 1000;
-const TEST_FASTA_PATH: &str = "tests/data/test_4_nt.fa";
+const TEST_FASTA_PATH: &str = "tests/data/test_7_nt.fa";
+const TEST_FASTA_TOOLONG_PATH: &str = "tests/data/test_7_nt_long_id.fa";
 const TEST_FASTA_ID: &str = "test7";
 const TEST_FASTA_SEQ: &str = "ACGT";
 
@@ -549,6 +550,46 @@ mod tests {
             }
         }
         
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_too_long_to_db() -> anyhow::Result<()> {
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let hdf5_path = temp_file.path().to_str().unwrap();
+
+        let rx = read_and_interleave_sequences(
+            PathBuf::from(TEST_FASTA_TOOLONG_PATH),
+            None,
+            Some(Technology::Illumina),
+            500000000,
+            None,
+            None,
+        )?;
+
+        let mut rx_stream = ReceiverStream::new(rx);
+        let result = write_sequences_to_hdf5(&mut rx_stream, hdf5_path).await;
+        assert!(result.is_ok());
+
+        let file = File::open(hdf5_path).unwrap();
+        let group = file.group("db").unwrap();
+        let seq_dataset = group.dataset("sequences").unwrap();
+        let id_dataset = group.dataset("id").unwrap();
+        let index_dataset = group.dataset("index").unwrap();
+
+        assert_eq!(seq_dataset.shape()[0], 6);
+        assert_eq!(id_dataset.shape()[0], 6);
+        assert_eq!(index_dataset.shape()[0], 6);
+
+        let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..6).unwrap().to_vec();
+        let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..6).unwrap().to_vec();
+
+        assert_eq!(ids[0].as_str(), "NC_039199.1"); // NB: This is actually the second entry, 
+        // so this assertion implies the first entry was skipped for excessive length
+        assert_eq!(ids[5].as_str(), "test7");
+        assert_eq!(seqs[5].to_vec(), b"ACGT");
+
         Ok(())
     }
 

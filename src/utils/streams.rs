@@ -129,10 +129,10 @@ where
     let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
     let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size);
 
-    eprintln!(
-        "t_junction: available RAM={}KB, max_buffer_size={} records, min_buffer_size={} records, using buffer_size={}",
-        available_ram / 1024, max_buffer_size, min_buffer_size, buffer_size
-    );
+    // eprintln!(
+    //     "t_junction: available RAM={}KB, max_buffer_size={} records, min_buffer_size={} records, using buffer_size={}",
+    //     available_ram / 1024, max_buffer_size, min_buffer_size, buffer_size
+    // );
 
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let mut output_txs = Vec::with_capacity(n_outputs);
