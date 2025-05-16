@@ -507,4 +507,49 @@ mod tests {
         
     }
 
+    #[tokio::test]
+    async fn test_load_index() -> anyhow::Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let hdf5_path = temp_file.path().to_str().unwrap();
+        let stream = fastx_generator(100, 150, 35.0, 3.0);
+
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            100_000,
+            100,
+            Some(0),
+            50
+        ).await?;
+
+        let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
+        let mut rx_stream = ReceiverStream::new(rx);
+        let result = write_sequences_to_hdf5(&mut rx_stream, hdf5_path).await;
+        assert!(result.is_ok());
+
+        let (stem, _extensions) = extension_remover(&PathBuf::from(hdf5_path));
+        let base = stem.to_str().unwrap_or("");
+
+        let index_file_name = format!("{}.index.bin", base);
+
+
+        let index_map_from_build = build_new_in_memory_index(&hdf5_path, index_file_name.as_str()).await?;
+
+        let index_map_from_file = load_index(index_file_name.as_str()).await?;
+        
+        assert_eq!(index_map_from_build.len(), index_map_from_file.len());
+
+        for (key, value) in index_map_from_build.iter() {
+            match index_map_from_file.get(key) {
+                Some(&map2_value) => {
+                    assert_eq!(map2_value, *value);
+
+                }
+                None => assert!(false), // Key missing
+            }
+        }
+        
+        Ok(())
+    }
+
 }
