@@ -26,6 +26,11 @@ jobs:
     - name: Set HDF5_DIR environment variable
       run: echo "HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial" >> $GITHUB_ENV
 
+    - name: Verify test files
+      run: |
+          ls -l tests/data/test_7_nt.fa
+          ls -l tests/data/test_7_nt_long_id.fa
+
     - name: Build
       run: cargo build --verbose
     - name: Run tests

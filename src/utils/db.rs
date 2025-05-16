@@ -8,8 +8,8 @@ use futures::StreamExt;
 use crate::cli::Technology;
 
 const CHUNK_SIZE: usize = 1000;
-const TEST_FASTA_PATH: &str = "tests/data/test_7_nt.fa";
-const TEST_FASTA_TOOLONG_PATH: &str = "tests/data/test_7_nt_long_id.fa";
+const TEST_FASTA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt.fa");
+const TEST_FASTA_TOOLONG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt_long_id.fa");
 const TEST_FASTA_ID: &str = "test7";
 const TEST_FASTA_SEQ: &str = "ACGT";
 
