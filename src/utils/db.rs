@@ -5,8 +5,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::fastx::SequenceRecord;
 use fxhash::FxHashMap as HashMap;
 use futures::StreamExt;
+use crate::cli::Technology;
 
 const CHUNK_SIZE: usize = 1000;
+const TEST_FASTA_PATH: &str = "tests/data/test_4_nt.fa";
 #[derive(H5Type, Clone, PartialEq)]
 #[repr(C)]
 struct IndexEntry {
@@ -342,10 +344,11 @@ pub async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &Ha
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use super::*;
     use anyhow::anyhow;
     use tempfile::NamedTempFile;
-    use crate::utils::fastx::fastx_generator;
+    use crate::utils::fastx::{fastx_generator, read_and_interleave_sequences};
     use crate::utils::streams::t_junction;
 
     #[tokio::test]
@@ -381,6 +384,81 @@ mod tests {
         let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..100).unwrap().to_vec();
         assert_eq!(ids[0].as_str(), "read1");
         
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_db_ont_small() -> anyhow::Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let hdf5_path = temp_file.path().to_str().unwrap();
+        let stream = fastx_generator(100, 5000, 35.0, 3.0);
+
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            100_000,
+            100,
+            Some(0),
+            50
+        ).await?;
+
+        let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
+        let mut rx_stream = ReceiverStream::new(rx);
+        let result = write_sequences_to_hdf5(&mut rx_stream, hdf5_path).await;
+        assert!(result.is_ok());
+
+        let file = File::open(hdf5_path).unwrap();
+        let group = file.group("db").unwrap();
+        let seq_dataset = group.dataset("sequences").unwrap();
+        let id_dataset = group.dataset("id").unwrap();
+        let index_dataset = group.dataset("index").unwrap();
+
+        assert_eq!(seq_dataset.shape()[0], 100);
+        assert_eq!(id_dataset.shape()[0], 100);
+        assert_eq!(index_dataset.shape()[0], 100);
+
+        let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..100).unwrap().to_vec();
+        assert_eq!(ids[0].as_str(), "read1");
+
+        Ok(())
+    }
+    
+    #[tokio::test]
+    async fn test_read_known_file_to_db() -> anyhow::Result<()> {
+        let cwd = std::env::current_dir()?;
+        println!("{}", cwd.display());
+        let temp_file = NamedTempFile::new().unwrap();
+        let hdf5_path = temp_file.path().to_str().unwrap();
+
+        let rx = read_and_interleave_sequences(
+            PathBuf::from(TEST_FASTA_PATH),
+            None,
+            Some(Technology::Illumina),
+            500000000,
+            None,
+            None,
+        )?;
+
+        let mut rx_stream = ReceiverStream::new(rx);
+        let result = write_sequences_to_hdf5(&mut rx_stream, hdf5_path).await;
+        assert!(result.is_ok());
+
+        let file = File::open(hdf5_path).unwrap();
+        let group = file.group("db").unwrap();
+        let seq_dataset = group.dataset("sequences").unwrap();
+        let id_dataset = group.dataset("id").unwrap();
+        let index_dataset = group.dataset("index").unwrap();
+
+        assert_eq!(seq_dataset.shape()[0], 7);
+        assert_eq!(id_dataset.shape()[0], 7);
+        assert_eq!(index_dataset.shape()[0], 7);
+
+        let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..7).unwrap().to_vec();
+        let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..7).unwrap().to_vec();
+        assert_eq!(ids[0].as_str(), "NC_049488.1");
+        assert_eq!(ids[6].as_str(), "test7");
+        assert_eq!(seqs[6].to_vec(), b"ACGT");
+
         Ok(())
     }
     
