@@ -16,6 +16,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install HDF5
+      run: |
+          sudo apt-get update
+          sudo apt-get install -y libhdf5-dev
+          # Installs HDF5 development headers and libraries
+
+    - name: Set HDF5_DIR environment variable
+      run: echo "HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial" >> $GITHUB_ENV
+
     - name: Build
       run: cargo build --verbose
     - name: Run tests
