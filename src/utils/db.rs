@@ -9,6 +9,9 @@ use crate::cli::Technology;
 
 const CHUNK_SIZE: usize = 1000;
 const TEST_FASTA_PATH: &str = "tests/data/test_4_nt.fa";
+const TEST_FASTA_ID: &str = "test7";
+const TEST_FASTA_SEQ: &str = "ACGT";
+
 #[derive(H5Type, Clone, PartialEq)]
 #[repr(C)]
 struct IndexEntry {
@@ -81,6 +84,7 @@ pub async fn write_sequences_to_hdf5(
         seq_buffer.push(record.seq().into());
         id_buffer.push(id.clone());
         index_buffer.push(IndexEntry { id, index: global_index });
+        global_index += 1;
 
         if seq_buffer.len() >= CHUNK_SIZE {
             let count = seq_buffer.len();
@@ -98,7 +102,6 @@ pub async fn write_sequences_to_hdf5(
             seq_buffer = Vec::new();
             id_buffer = Vec::new();
             index_buffer = Vec::new();
-            global_index += count as u64;
         }
     }
 
@@ -219,14 +222,12 @@ pub async fn build_new_in_memory_index(h5_file_name: &str, cache_file_name: &str
         let entries: Vec<IndexEntry> = index_dataset.read_slice(start..end)?.to_vec();
         for entry in entries {
             let id_bytes = entry.id.as_str().as_bytes();
-            let id_len = id_bytes.len() - 1; // Exclude null terminator
             let mut id_bytes_array = [0u8; 24];
-            id_bytes_array[..id_len].copy_from_slice(&id_bytes[..id_len]);
+            id_bytes_array[..id_bytes.len()].copy_from_slice(&id_bytes[..id_bytes.len()]);
             index_map.insert(id_bytes_array, entry.index);
         }
     }
-
-    eprintln!("Saving index to cache: {}", cache_file_name);
+    
     let config = bincode::config::standard();
     std::fs::write(&cache_file_name, bincode::serde::encode_to_vec(&index_map, config)?)?;
     eprintln!("In-memory index built: {} entries", index_map.len());
@@ -263,7 +264,7 @@ pub async fn load_index(index_file_name: &str) -> anyhow::Result<HashMap<[u8; 24
 /// anyhow::Result<HashMap<[u8; 24], u64>> the index
 ///
 pub async fn check_db(h5_file_name: &str, index_file_name: &str, target_id: Option<&str>) -> anyhow::Result<()> {
-    eprintln!("Checking HDF5 file: {}", h5_file_name);
+    println!("Checking HDF5 file: {}", h5_file_name);
     let file = File::open(h5_file_name)?;
     let group = file.group("db")?;
     let id_dataset = group.dataset("id")?;
@@ -281,7 +282,7 @@ pub async fn check_db(h5_file_name: &str, index_file_name: &str, target_id: Opti
             index_len
         ));
     }
-    eprintln!("Dataset sizes: {} records", id_len);
+    println!("Dataset sizes: {} records", id_len);
 
     if let Some(id) = target_id {
         if id.len() > 23 {
@@ -294,7 +295,7 @@ pub async fn check_db(h5_file_name: &str, index_file_name: &str, target_id: Opti
 
         let index_map = load_index(index_file_name).await?;
         let seq = lookup_sequence(h5_file_name, id, &index_map).await?;
-        eprintln!("Found sequence for ID '{}': {:?}", id, seq);
+        println!("Found sequence for ID '{}': {:?}", id, seq);
     }
 
     Ok(())
@@ -313,7 +314,6 @@ pub async fn check_db(h5_file_name: &str, index_file_name: &str, target_id: Opti
 /// anyhow::Result<HashMap<[u8; 24], u64>> the index
 ///
 pub async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &HashMap<[u8; 24], u64>) -> anyhow::Result<Vec<u8>> {
-    eprintln!("Looking up ID: {} in file: {}", target_id, h5_file_name);
     if target_id.len() > 23 {
         return Err(anyhow::anyhow!(
             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
@@ -344,11 +344,13 @@ pub async fn lookup_sequence(h5_file_name: &str, target_id: &str, index_map: &Ha
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use super::*;
     use anyhow::anyhow;
     use tempfile::NamedTempFile;
     use crate::utils::fastx::{fastx_generator, read_and_interleave_sequences};
+    use crate::utils::file::extension_remover;
     use crate::utils::streams::t_junction;
 
     #[tokio::test]
@@ -357,7 +359,7 @@ mod tests {
         let hdf5_path = temp_file.path().to_str().unwrap();
         let stream = fastx_generator(100, 150, 35.0, 3.0);
 
-        let (mut outputs, done_rx) = t_junction( 
+        let (mut outputs, done_rx) = t_junction(
             stream,
             1,
             100_000,
@@ -383,7 +385,7 @@ mod tests {
 
         let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..100).unwrap().to_vec();
         assert_eq!(ids[0].as_str(), "read1");
-        
+
         Ok(())
     }
 
@@ -422,11 +424,10 @@ mod tests {
 
         Ok(())
     }
-    
+
     #[tokio::test]
     async fn test_read_known_file_to_db() -> anyhow::Result<()> {
-        let cwd = std::env::current_dir()?;
-        println!("{}", cwd.display());
+
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = temp_file.path().to_str().unwrap();
 
@@ -462,4 +463,48 @@ mod tests {
         Ok(())
     }
     
+    #[tokio::test]
+    async fn test_seq_lookup() -> anyhow::Result<()> {
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let hdf5_path = temp_file.path().to_str().unwrap();
+
+        let rx = read_and_interleave_sequences(
+            PathBuf::from(TEST_FASTA_PATH),
+            None,
+            Some(Technology::Illumina),
+            500000000,
+            None,
+            None,
+        )?;
+
+        let mut rx_stream = ReceiverStream::new(rx);
+        let result = write_sequences_to_hdf5(&mut rx_stream, hdf5_path).await;
+        assert!(result.is_ok());
+
+        let file = File::open(hdf5_path).unwrap();
+        let group = file.group("db").unwrap();
+        let seq_dataset = group.dataset("sequences").unwrap();
+        let id_dataset = group.dataset("id").unwrap();
+        let index_dataset = group.dataset("index").unwrap();
+        let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..7).unwrap().to_vec();
+        let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..7).unwrap().to_vec();
+        assert_eq!(ids[6].as_str(), "test7");
+        
+        let (stem, _extensions) = extension_remover(&PathBuf::from(hdf5_path));
+        let base = stem.to_str().unwrap_or("");
+        
+        let index_file_name = format!("{}.index.bin", base);
+        let _ = fs::remove_file(&index_file_name);
+        
+        let index_map = build_new_in_memory_index(&hdf5_path, index_file_name.as_str()).await?;
+        
+        let seq = lookup_sequence(hdf5_path, TEST_FASTA_ID, &index_map).await?;
+        let seq_str = std::str::from_utf8(&seq).unwrap();
+        assert_eq!(seq_str, TEST_FASTA_SEQ);
+        
+        Ok(())
+        
+    }
+
 }

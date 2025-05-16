@@ -486,7 +486,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-                eprintln!("Finished reading single-end: {} records", read_counter);
             });
         }
         (None, SequenceReader::Fasta(reader)) => {
@@ -528,7 +527,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-                eprintln!("Finished reading FASTA: {} records", read_counter);
             });
         }
         (Some(_), SequenceReader::Fasta(_)) => {
