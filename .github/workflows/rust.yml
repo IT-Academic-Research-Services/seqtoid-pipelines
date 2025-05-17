@@ -2,36 +2,41 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" , "dev"]
+    branches: [ "main", "dev" ]
   pull_request:
-    branches: [ "main" , "dev"]
+    branches: [ "main", "dev" ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install HDF5
-      run: |
+      - name: Install HDF5
+        run: |
           sudo apt-get update
           sudo apt-get install -y libhdf5-dev
-          # Installs HDF5 development headers and libraries
 
-    - name: Set HDF5_DIR environment variable
-      run: echo "HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial" >> $GITHUB_ENV
-#
-#    - name: Verify test files
-#      run: |
-#          ls -l tests/data/test_7_nt.fa
-#          ls -l tests/data/test_7_nt_long_id.fa
+      - name: Set HDF5_DIR environment variable
+        run: echo "HDF5_DIR=/usr/lib/x86_64-linux-gnu/hdf5/serial" >> $GITHUB_ENV
 
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - name: Verify test files
+        run: |
+          ls -l tests/data/test_7_nt.fa || { echo "Error: test_7_nt.fa missing"; exit 1; }
+          ls -l tests/data/test_7_nt_long_id.fa || { echo "Error: test_7_nt_long_id.fa missing"; exit 1; }
+
+      - name: Increase pipe buffer size
+        run: sudo sysctl -w fs.pipe-max-size=1048576
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: |
+          RUST_BACKTRACE=full cargo test --verbose -- --test-threads=1
+        env:
+          RUST_LOG: debug
