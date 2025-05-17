@@ -882,13 +882,21 @@ mod tests {
     async fn test_stream_to_cmd_no_output() -> Result<()> {
         let stream = fastx_generator(2, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "true", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task) = stream_to_cmd(
+            outputs.pop().unwrap(),
+            "cat",
+            vec!["/dev/null"], // Redirect stdin to /dev/null
+            StreamDataType::IlluminaFastq,
+        ).await?;
         task.await??;
         done_rx.await??;
         let status = child.wait().await?;
         assert!(status.success(), "Child process should exit successfully");
         let stdout = child.stdout.take();
-        assert!(stdout.is_none() || tokio::io::copy(&mut stdout.unwrap(), &mut Vec::new()).await? == 0, "No output expected");
+        assert!(
+            stdout.is_none() || tokio::io::copy(&mut stdout.unwrap(), &mut Vec::new()).await? == 0,
+            "No output expected"
+        );
         Ok(())
     }
 
