@@ -5,12 +5,12 @@ use std::io::{self, BufReader};
 use std::path::PathBuf;
 use flate2::read::GzDecoder;
 use crate::utils::file::{extension_remover, is_gzipped, FileReader};
-use crate::utils::Technology;
+use crate::cli::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
 use crate::utils::sequence::{DNA, normal_phred_qual_string};
 use futures::Stream;
-use tokio_stream::iter;
+use tokio_stream::{self as stream};
 
 const FASTA_TAG : &str = "fasta";
 const FASTQ_TAG : &str = "fastq";
@@ -211,7 +211,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                     for &delimiter in delimiters.iter() {
                         let parts: Vec<&str> = filename.split(delimiter).collect();
                         for (index, part) in parts.iter().enumerate() {
-                            if R1_R2_TAGS.contains_key(part) {
+                            if (*R1_R2_TAGS).contains_key(part) {
                                 let r1_tag = part.to_string();
                                 let prefix_parts = &parts[..index];
                                 let prefix = if prefix_parts.is_empty() {
@@ -322,20 +322,23 @@ pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
 /// # Returns
 /// Stream<Item = SequenceRecord>
 pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32) -> impl Stream<Item = SequenceRecord> {
-    let records: Vec<SequenceRecord> = (0..num_records)
-        .map(|i| {
-            let seq = DNA::random_sequence(seq_len);
-            let qual = normal_phred_qual_string(seq_len, mean, stdev);
-            SequenceRecord::Fastq {
-                id: format!("read{}", i + 1),
-                desc: None,
-                seq: seq.into_bytes(),
-                qual: qual.into_bytes(),
-            }
-        })
-        .collect();
-    iter(records)
-
+    let records: Vec<SequenceRecord> = if seq_len == 0 {
+        Vec::new() // Empty vector for zero read size
+    } else {
+        (0..num_records)
+            .map(|i| {
+                let seq = DNA::random_sequence(seq_len);
+                let qual = normal_phred_qual_string(seq_len, mean, stdev);
+                SequenceRecord::Fastq {
+                    id: format!("read{}", i + 1),
+                    desc: None,
+                    seq: seq.into_bytes(),
+                    qual: qual.into_bytes(),
+                }
+            })
+            .collect()
+    };
+    stream::iter(records)
 }
 
 /// Asynchronously outputs a stream from one or two FASTQ files.
@@ -483,7 +486,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-                eprintln!("Finished reading single-end: {} records", read_counter);
             });
         }
         (None, SequenceReader::Fasta(reader)) => {
@@ -525,7 +527,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-                eprintln!("Finished reading FASTA: {} records", read_counter);
             });
         }
         (Some(_), SequenceReader::Fasta(_)) => {

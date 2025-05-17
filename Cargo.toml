@@ -1,10 +1,10 @@
 [package]
 name = "seqtoid-pipelines"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.5.35", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 seq_io = "0.3.4"
 flate2 = "1.1.1"
 tokio = { version = "1.44.2", features = ["full", "io-util"] }
@@ -13,6 +13,25 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 tempfile = "3.19.1"
 lazy_static = "1.4.0"
 rand = "0.9.1"
-futures = "0.3.31"
 rand_distr = "0.5.1"
+futures = "0.3.31"
+sysinfo = "0.35.0"
+hdf5-metno = { version = "0.10.1", features = ["blosc", "lzf"] }
+fxhash = "0.2.1"
+bincode = { version = "2.0.1", features = ["serde"] }
+ndarray = "0.16.1"
 
+[dev-dependencies]
+sysinfo = "0.35.0"
+futures = "0.3.31"
+tokio = { version = "1.44.2", features = ["full", "test-util"] }
+anyhow = "1.0.98"
+
+
+[[bin]]
+name = "seqtoid-pipelines"
+path = "src/main.rs"
+
+[lib]
+name = "seqtoid_pipelines"
+path = "src/lib.rs"
