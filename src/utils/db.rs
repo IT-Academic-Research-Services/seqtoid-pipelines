@@ -1,3 +1,4 @@
+use std::path::Path;
 use hdf5_metno::{Extent, File, H5Type};
 use hdf5_metno::types::{FixedAscii, VarLenArray};
 use tokio::task;
@@ -429,6 +430,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_known_file_to_db() -> anyhow::Result<()> {
 
+        let path = Path::new(TEST_FASTA_PATH);
+        assert!(path.exists(), "Test file {} does not exist", TEST_FASTA_PATH);
+
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = temp_file.path().to_str().unwrap();
 
@@ -466,6 +470,9 @@ mod tests {
     
     #[tokio::test]
     async fn test_seq_lookup() -> anyhow::Result<()> {
+
+        let path = Path::new(TEST_FASTA_PATH);
+        assert!(path.exists(), "Test file {} does not exist", TEST_FASTA_PATH);
 
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = temp_file.path().to_str().unwrap();
@@ -555,6 +562,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_too_long_to_db() -> anyhow::Result<()> {
+
+        let path = Path::new(TEST_FASTA_TOOLONG_PATH);
+        assert!(path.exists(), "Test file {} does not exist", TEST_FASTA_TOOLONG_PATH);
 
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = temp_file.path().to_str().unwrap();
