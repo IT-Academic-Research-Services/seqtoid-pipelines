@@ -881,7 +881,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_no_output() -> Result<()> {
         let stream = fastx_generator(2, 10, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
+        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(0), 50).await?;
         let (mut child, task) = stream_to_cmd(
             outputs.pop().unwrap(),
             "cat",
