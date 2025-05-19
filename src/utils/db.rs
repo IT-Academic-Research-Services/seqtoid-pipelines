@@ -339,6 +339,14 @@ pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u
     let index = index_map
         .get(&id_bytes)
         .ok_or_else(|| anyhow::anyhow!("ID '{}' not found in dataset", target_id))?;
+    
+    if *index as usize >= seq_dataset.shape()[0] {
+        return Err(anyhow::anyhow!(
+            "Index {} out of bounds for dataset size {}",
+            *index,
+            seq_dataset.shape()[0]
+        ));
+    }
 
     let seq: VarLenArray<u8> = seq_dataset.read_slice::<VarLenArray<u8>, std::ops::Range<usize>, ndarray::Ix1>(*index as usize..*index as usize + 1)?[0].clone();
     Ok(seq.to_vec())

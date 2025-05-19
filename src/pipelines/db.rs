@@ -55,8 +55,8 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let index_path = stem.with_extension("index.bin");
     let _ = fs::remove_file(&index_path);
 
-    let _index_map = build_new_in_memory_index(&h5_path, &index_path).await?;
-    // check_db(hdf5_file_name.as_str(), &index_file_name, None).await?;
+    let index_map = build_new_in_memory_index(&h5_path, &index_path).await?;
+    check_db(&h5_path, &index_path, Some("NP_852780.1")).await?;
     
     println!("Created DB File: {}", h5_path.display());
     println!("Created DB Index: {}", index_path.display());
