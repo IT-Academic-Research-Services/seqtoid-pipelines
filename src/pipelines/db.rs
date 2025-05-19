@@ -32,7 +32,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let fasta_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
 
     let (stem, _extensions) = extension_remover(&fasta_path);
-    let base = stem.to_str().unwrap_or("");
+    // let base = stem.to_str().unwrap_or("");
 
     let technology = Some(args.technology.clone());
 
@@ -45,19 +45,21 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
         args.max_read_len,
     )?;
     let mut rx_stream = ReceiverStream::new(rx);
-
-    let hdf5_file_name = format!("{}.h5", base);
-    let _ = fs::remove_file(&hdf5_file_name);
-    write_sequences_to_hdf5(&mut rx_stream, &hdf5_file_name).await?;
     
-    let index_file_name = format!("{}.index.bin", base);
-    let _ = fs::remove_file(&index_file_name);
+    let h5_path = stem.with_extension("h5");
+    eprintln!("{}", h5_path.display());
+    let _ = fs::remove_file(&h5_path);
+    write_sequences_to_hdf5(&mut rx_stream, &h5_path).await?;
 
-    let _index_map = build_new_in_memory_index(&hdf5_file_name, index_file_name.as_str()).await?;
-    check_db(hdf5_file_name.as_str(), &index_file_name, None).await?;
+
+    let index_path = stem.with_extension("index.bin");
+    let _ = fs::remove_file(&index_path);
+
+    let _index_map = build_new_in_memory_index(&h5_path, &index_path).await?;
+    // check_db(hdf5_file_name.as_str(), &index_file_name, None).await?;
     
-    println!("Created DB File: {}", hdf5_file_name);
-    println!("Created DB Index: {}", index_file_name);
+    println!("Created DB File: {}", h5_path.display());
+    println!("Created DB Index: {}", index_path.display());
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();
     println!("Time elapsed: {} seconds", elapsed_secs);
