@@ -2,8 +2,6 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use crate::cli::Arguments;
 use tokio_stream::wrappers::ReceiverStream;
-use fxhash::FxHashMap as HashMap;
-use ndarray::logspace;
 use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
@@ -64,11 +62,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             })?
         }
         Technology::ONT => {
-            // Provide a default or handle differently
             String::new() // or return an error if ref_accession is required
-        }
-        _ => {
-            return Err(anyhow::anyhow!("Technology must be Illumina or ONT but is {:?}.", technology));
         }
     };
 
@@ -171,21 +165,15 @@ pub async fn run(args: &Arguments) -> Result<()> {
         eprintln!("No index file provided, creating new index: {}", index_full_path.display());
         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
     };
-    
 
     
-    eprintln!("accession {}", ref_accession);
     if technology == Technology::Illumina {
-        let seq = lookup_sequence(&ref_db_path,  &h5_index, &ref_accession).await?;
-        // let ref_seq = std::str::from_utf8(&seq).unwrap();
-        // eprintln!("{}", ref_seq);
+        let seq = lookup_sequence(&ref_db_path, &h5_index, &ref_accession).await?;
+        let ref_seq = std::str::from_utf8(&seq).unwrap();
+        eprintln!("{}", ref_seq);
     }
-
-
+    
     eprintln!("Finished generating consensus genome");
     
-    
-
-
     Ok(())
 }
