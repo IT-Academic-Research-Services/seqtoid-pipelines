@@ -45,7 +45,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
         args.max_read_len,
     )?;
     let mut rx_stream = ReceiverStream::new(rx);
-    
+
     let h5_path = stem.with_extension("h5");
     eprintln!("{}", h5_path.display());
     let _ = fs::remove_file(&h5_path);

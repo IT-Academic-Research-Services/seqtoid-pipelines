@@ -2,13 +2,15 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use crate::cli::Arguments;
 use tokio_stream::wrappers::ReceiverStream;
+use fxhash::FxHashMap as HashMap;
+use ndarray::logspace;
 use crate::utils::command::generate_cli;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG};
 use crate::cli::Technology;
-use crate::utils::db::lookup_sequence;
+use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
 
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
@@ -49,32 +51,35 @@ pub async fn run(args: &Arguments) -> Result<()> {
     };
 
     let technology = args.technology.clone();
-    let ref_accession = args.ref_accession.clone();
+    
     let ref_db = args.ref_db.clone().ok_or_else(|| {
         anyhow!("HDF5 database file must be given (-d).")
     })?;
-    
-    match technology {
-        Technology::Illumina => {
+    let ref_db_path = PathBuf::from(&ref_db);
 
-            let _ref_accession_chk = ref_accession.ok_or_else(|| {
-                anyhow!("Technology is Illumina so an accession must be given (-a).")
-            })?;
-            
+    let ref_accession = match technology {
+        Technology::Illumina => {
+            args.ref_accession.clone().ok_or_else(|| {
+                anyhow::anyhow!("HDF5 database file must be given (-d).")
+            })?
         }
         Technology::ONT => {
-            
+            // Provide a default or handle differently
+            String::new() // or return an error if ref_accession is required
         }
         _ => {
-            return Err(anyhow!("Technology must be Illumina or ONT but is {:?}.", technology));
+            return Err(anyhow::anyhow!("Technology must be Illumina or ONT but is {:?}.", technology));
         }
-    }
+    };
+
+    // ref_accession is accessible here
 
 
-    
+    //*****************
     // Input Validation
+    
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("validated"), "_");
-    let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology), args.max_reads, args.min_read_len, args.max_read_len)?;
+    let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology.clone()), args.max_reads, args.min_read_len, args.max_read_len)?;
     let rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
         rx_stream,
@@ -149,8 +154,37 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Check t_junction completion
     val_done_rx.await??;
     
+    //*****************
     //Fetch Reference from accession
+    
+    let h5_index = if let Some(index_file) = &args.ref_index {
+        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd, None, None, "");
+        if index_full_path.exists() {
+            load_index(&index_full_path).await?
+        } else {
+            eprintln!("Index path does not exist: {}", index_full_path.display());
 
+            build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+        }
+    } else {
+        let index_full_path = ref_db_path.with_extension("index.bin");
+        eprintln!("No index file provided, creating new index: {}", index_full_path.display());
+        build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+    };
+    
+
+    
+    eprintln!("accession {}", ref_accession);
+    if technology == Technology::Illumina {
+        let seq = lookup_sequence(&ref_db_path,  &h5_index, &ref_accession).await?;
+        // let ref_seq = std::str::from_utf8(&seq).unwrap();
+        // eprintln!("{}", ref_seq);
+    }
+
+
+    eprintln!("Finished generating consensus genome");
+    
+    
 
 
     Ok(())

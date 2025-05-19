@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use hdf5_metno::{Extent, File, H5Type};
 use hdf5_metno::types::{FixedAscii, VarLenArray};
 use tokio::task;
@@ -296,7 +296,7 @@ pub async fn check_db(h5_path: &PathBuf, index_path: &PathBuf, target_id: Option
         }
 
         let index_map = load_index(index_path).await?;
-        let seq = lookup_sequence(h5_path, id, &index_map).await?;
+        let seq = lookup_sequence(h5_path, &index_map, &id.to_string()).await?;
         println!("Found sequence for ID '{}': {:?}", id, seq);
     }
 
@@ -315,7 +315,7 @@ pub async fn check_db(h5_path: &PathBuf, index_path: &PathBuf, target_id: Option
 /// # Returns
 /// anyhow::Result<HashMap<[u8; 24], u64>> the index
 ///
-pub async fn lookup_sequence(h5_path: &PathBuf, target_id: &str, index_map: &HashMap<[u8; 24], u64>) -> anyhow::Result<Vec<u8>> {
+pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u64>, target_id: &String) -> anyhow::Result<Vec<u8>> {
     if target_id.len() > 23 {
         return Err(anyhow::anyhow!(
             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
@@ -503,7 +503,7 @@ mod tests {
         
         let index_map = build_new_in_memory_index(&hdf5_path, &index_path).await?;
         
-        let seq = lookup_sequence(&hdf5_path, TEST_FASTA_ID, &index_map).await?;
+        let seq = lookup_sequence(&hdf5_path,  &index_map, &TEST_FASTA_ID.to_string()).await?;
         let seq_str = std::str::from_utf8(&seq).unwrap();
         assert_eq!(seq_str, TEST_FASTA_SEQ);
         
