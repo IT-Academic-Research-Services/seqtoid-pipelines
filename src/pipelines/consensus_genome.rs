@@ -7,13 +7,17 @@ use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG};
+use crate::cli::Technology;
+use crate::utils::db::lookup_sequence;
 
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", args.module);
 
     let cwd = std::env::current_dir()?;
-
+    
+    
+    // Arguments and files check
     let file1_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
     eprintln!("{}", file1_path.display());
     let sample_base: String;
@@ -24,6 +28,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
             eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
             sample_base = file1_path.to_string_lossy().into_owned();
         },
+    }
+    if !file1_path.exists() {
+        return Err(anyhow!("Specficied file1 {:?} does not exist.", file1_path));
     }
 
     let file2_path: Option<PathBuf> = match &args.file2 {
@@ -36,10 +43,33 @@ pub async fn run(args: &Arguments) -> Result<()> {
         },
     };
 
-    let technology = Some(args.technology.clone());
+    let technology = args.technology.clone();
+    let ref_accession = args.ref_accession.clone();
+    let ref_db = args.ref_db.clone().ok_or_else(|| {
+        anyhow!("HDF5 database file must be given (-d).")
+    })?;
+    
+    match technology {
+        Technology::Illumina => {
 
+            let _ref_accession_chk = ref_accession.ok_or_else(|| {
+                anyhow!("Technology is Illumina so an accession must be given (-a).")
+            })?;
+            
+        }
+        Technology::ONT => {
+            
+        }
+        _ => {
+            return Err(anyhow!("Technology must be Illumina or ONT but is {:?}.", technology));
+        }
+    }
+
+
+    
+    // Input Validation
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("validated"), "_");
-    let rx = read_and_interleave_sequences(file1_path, file2_path, technology, args.max_reads, args.min_read_len, args.max_read_len)?;
+    let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology), args.max_reads, args.min_read_len, args.max_read_len)?;
     let rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
         rx_stream,
@@ -113,6 +143,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     // Check t_junction completion
     val_done_rx.await??;
+    
+    //Fetch Reference from accession
 
 
 
