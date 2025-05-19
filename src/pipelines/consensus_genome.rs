@@ -35,12 +35,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     let file2_path: Option<PathBuf> = match &args.file2 {
         Some(file) => {
-            Some(file_path_manipulator(&PathBuf::from(file), &cwd, None, None, ""))
-        },
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            if file2_full_path.exists() {
+                Some(file2_full_path)
+            } else {
+                eprintln!("File2 path does not exist: {}", file2_full_path.display());
+                None
+            }
+        }
         None => {
-            eprintln!("File2 not given");
             None
-        },
+        }
     };
 
     let technology = args.technology.clone();
