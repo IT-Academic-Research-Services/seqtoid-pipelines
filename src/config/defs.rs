@@ -2,3 +2,8 @@ pub const GZIP_EXT: &str = "gz";
 pub const FASTP_TAG: &str = "fastp";
 pub const PIGZ_TAG: &str = "pigz";
 pub const H5DUMP_TAG: &str = "h5dump";
+
+pub const FASTA_TAG : &str = "fasta";
+pub const FASTQ_TAG : &str = "fastq";
+pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
+pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
