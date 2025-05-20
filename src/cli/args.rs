@@ -13,8 +13,8 @@ pub struct Arguments {
     #[arg(short, long)]
     pub module: String,
 
-    #[arg(short = 'i', long = "file1", required = true)]
-    pub file1: String,
+    #[arg(short = 'i', long = "file1")]
+    pub file1: Option<String>,
 
     #[arg(short = 'I', long = "file2")]
     pub file2: Option<String>,
