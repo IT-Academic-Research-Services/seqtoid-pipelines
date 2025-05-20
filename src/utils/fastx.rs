@@ -11,11 +11,8 @@ use lazy_static::lazy_static;
 use crate::utils::sequence::{DNA, normal_phred_qual_string};
 use futures::Stream;
 use tokio_stream::{self as stream};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
 
-const FASTA_TAG : &str = "fasta";
-const FASTQ_TAG : &str = "fastq";
-const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
-const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {

@@ -20,10 +20,25 @@ pub async fn run(args: &Arguments) -> Result<()> {
     println!("Running consensus genome with module: {}", args.module);
 
     let cwd = std::env::current_dir()?;
-    
+
     
     // Arguments and files check
-    let file1_path = file_path_manipulator(&PathBuf::from(&args.file1), &cwd, None, None, "");
+
+    let file1_path: PathBuf = match &args.file1 {
+        Some(file) => {
+            let file1_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            if file1_full_path.exists() {
+                file1_full_path
+            } else {
+                return Err(anyhow!("File1 path does not exist: {}", file1_full_path.display()));
+            }
+        }
+        None => {
+            return Err(anyhow!("File1 path required"));
+        }
+    };
+    
+    
     eprintln!("{}", file1_path.display());
     let sample_base: String;
     let file1_r1r2 = r1r2_base(&file1_path);
