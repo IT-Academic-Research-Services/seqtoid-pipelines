@@ -1,7 +1,7 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG};
 use crate::cli::Arguments;
 
 
@@ -84,7 +84,7 @@ mod h5dump {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is fastp installed?",  e))?;
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is hddump installed?",  e))?;
 
         let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
         let first_line = lines
@@ -93,13 +93,48 @@ mod h5dump {
         let version = first_line
             .split_whitespace()
             .nth(2)
-            .ok_or_else(|| anyhow!("Invalid fastp -v output: {}", first_line))?
+            .ok_or_else(|| anyhow!("Invalid h5dump -V output: {}", first_line))?
             .to_string();
         if version.is_empty() {
-            return Err(anyhow!("Empty version number in fastp -v output: {}", first_line));
+            return Err(anyhow!("Empty version number in h5dump -V output: {}", first_line));
         }
         Ok(version)
     }
+}
+
+mod minimap2 {
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::config::defs::MINIMAP2_TAG;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub async fn minimap2_presence_check() -> anyhow::Result<String> {
+        let args: Vec<&str> = vec!["-V"];
+
+        let mut child = Command::new(MINIMAP2_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is minimap2 installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from minimap2 -V"))?;
+        let version = first_line
+            .split_whitespace()
+            .nth(0)
+            .ok_or_else(|| anyhow!("Invalid minimap2 -V output: {}", first_line))?
+            .to_string();
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in minimap2 -V output: {}", first_line));
+        }
+        Ok(version)
+        
+    }
+    
 }
 
 pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
@@ -119,6 +154,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
     let version = match tool {
         FASTP_TAG => fastp::fastp_presence_check().await,
         H5DUMP_TAG => h5dump::h5dump_presence_check().await,
+        MINIMAP2_TAG => {minimap2::minimap2_presence_check().await},
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)

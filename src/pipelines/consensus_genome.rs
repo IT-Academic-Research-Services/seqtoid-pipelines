@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use crate::cli::Arguments;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::command::generate_cli;
+use crate::utils::command::{generate_cli, check_version};
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
 use crate::cli::Technology;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
 
@@ -148,6 +148,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Check t_junction completion
     val_done_rx.await??;
     
+    
     //*****************
     //Fetch Reference from accession
     
@@ -172,7 +173,24 @@ pub async fn run(args: &Arguments) -> Result<()> {
         let ref_seq = std::str::from_utf8(&seq).unwrap();
         eprintln!("{}", ref_seq);
     }
+
     
+    //*****************
+    //Host Removal
+
+    let minimap2_version = match check_version(MINIMAP2_TAG).await {
+        Ok(version) => {
+            eprintln!("{}", version);
+            version
+        }
+        Err(err) => {
+            return Err(anyhow!("Error checking minimap2 version: {}", err));
+        }
+    };
+    eprintln!("Minimap2 version: {}", minimap2_version);
+    
+    
+    //*****************
     eprintln!("Finished generating consensus genome");
     
     Ok(())
