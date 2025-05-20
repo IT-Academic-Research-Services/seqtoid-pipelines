@@ -48,4 +48,14 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 10000)]
     pub buffer_size: usize,
+
+    #[arg(short = 'a', long = "accession")]
+    pub ref_accession : Option<String>,
+
+    #[arg(short = 'd', long = "db")]
+    pub ref_db : Option<String>,
+
+    #[arg(long = "index")]
+    pub ref_index : Option<String>,
+    
 }
