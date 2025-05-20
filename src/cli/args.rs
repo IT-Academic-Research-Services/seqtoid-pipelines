@@ -49,7 +49,10 @@ pub struct Arguments {
     #[arg(long, default_value_t = 10000)]
     pub buffer_size: usize,
 
-    #[arg(short = 'a', long = "accession")]
+    #[arg(short = 'a', long = "host_accession")]
+    pub host_accession : Option<String>,
+
+    #[arg(short = 'r', long = "ref_accession")]
     pub ref_accession : Option<String>,
 
     #[arg(short = 'd', long = "db")]
@@ -57,5 +60,8 @@ pub struct Arguments {
 
     #[arg(long = "index")]
     pub ref_index : Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    pub limit_align_threads: bool,
     
 }

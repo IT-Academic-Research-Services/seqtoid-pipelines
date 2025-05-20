@@ -1,8 +1,11 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
+use num_cpus;
 use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG};
 use crate::cli::Arguments;
+use crate::cli::Technology;
+
 
 
 
@@ -103,9 +106,13 @@ mod h5dump {
 }
 
 mod minimap2 {
+    use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
+    use crate::cli::{Arguments, Technology};
     use crate::config::defs::MINIMAP2_TAG;
+    use crate::utils::command::check_version;
+    use crate::utils::file::file_path_manipulator;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub async fn minimap2_presence_check() -> anyhow::Result<String> {
@@ -133,6 +140,52 @@ mod minimap2 {
         }
         Ok(version)
         
+    }
+
+    pub fn arg_generator(args: &Arguments) -> Vec<String> {
+        let mut args_vec: Vec<String> = Vec::new();
+
+        let num_cores : usize = match &args.limit_align_threads {
+            true => {
+                args.threads
+            }
+            false => {
+                num_cpus::get()
+            }
+        };
+
+        args_vec.push("-t".to_string());
+        args_vec.push(num_cores.to_string());
+
+        let technology = args.technology.clone();
+        match technology {
+            Technology::Illumina => {
+                args_vec.push("-ax sr".to_string());
+            }
+            Technology::ONT => {
+                args_vec.push("-ax map-ont".to_string());
+            }
+            
+        }
+
+        
+        let paired : bool = match &args.file2 {
+            Some(file) => {
+                true
+            }
+            None => {
+                false
+            }
+        };
+
+
+        
+
+        
+        
+
+
+        args_vec
     }
     
 }

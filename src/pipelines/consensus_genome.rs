@@ -1,7 +1,12 @@
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
+use tempfile::NamedTempFile;
 use crate::cli::Arguments;
+use std::process::Command;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio::process::Command as TokioCommand;
 use crate::utils::command::{generate_cli, check_version};
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
@@ -55,18 +60,22 @@ pub async fn run(args: &Arguments) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    let ref_accession = match technology {
-        Technology::Illumina => {
-            args.ref_accession.clone().ok_or_else(|| {
-                anyhow::anyhow!("HDF5 database file must be given (-d).")
-            })?
-        }
-        Technology::ONT => {
-            String::new() // or return an error if ref_accession is required
-        }
-    };
+    let host_accession = args.host_accession.clone().ok_or_else(|| {
+        anyhow!("Host accession must be given (-a).")
+    })?;
+    
+    // let ref_accession = match technology {
+    //     Technology::Illumina => {
+    //         args.ref_accession.clone().ok_or_else(|| {
+    //             anyhow::anyhow!("HDF5 database file must be given (-d).")
+    //         })?
+    //     }
+    //     Technology::ONT => {
+    //         String::new() // or return an error if ref_accession is required
+    //     }
+    // };
 
-    // ref_accession is accessible here
+
 
 
     //*****************
@@ -167,13 +176,55 @@ pub async fn run(args: &Arguments) -> Result<()> {
         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
     };
 
-    
-    if technology == Technology::Illumina {
-        let seq = lookup_sequence(&ref_db_path, &h5_index, &ref_accession).await?;
-        let ref_seq = std::str::from_utf8(&seq).unwrap();
-        eprintln!("{}", ref_seq);
-    }
 
+    let ref_temp = NamedTempFile::new()?;
+    let ref_pipe_path = ref_temp.path().to_path_buf();
+    let query_temp = NamedTempFile::new()?;
+    let query_pipe_path = query_temp.path().to_path_buf();
+
+    #[cfg(unix)]
+    {
+        Command::new("mkfifo")
+            .arg(&ref_pipe_path)
+            .status()?;
+        Command::new("mkfifo")
+            .arg(&query_pipe_path)
+            .status()?;
+    }
+    #[cfg(not(unix))]
+    return Err(anyhow!("Named pipes are not supported on non-Unix systems. Only Unix-like systems supported."));
+    
+    
+    let seq = lookup_sequence(&ref_db_path, &h5_index, &host_accession).await?;
+    let ref_seq = String::from_utf8(seq)?;
+    eprintln!("{}", ref_seq);
+
+
+    let ref_write_task = tokio::spawn({
+        let ref_pipe_path = ref_pipe_path.clone();
+        async move {
+            let mut ref_file = File::create(&ref_pipe_path).await?;
+            ref_file.write_all(format!(">{}\n{}\n", host_accession, ref_seq).as_bytes()).await?;
+            ref_file.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+
+    // let query_write_task = tokio::spawn({
+    //     let query_pipe_path = query_pipe_path.clone();
+    //     async move {
+    //         let mut query_file = File::create(&query_pipe_path).await?;
+    //         while let Some(record) = fastp_out_stream.next().await {
+    //             query_file.write_all(format!("@{}\n", record.id()).as_bytes()).await?;
+    //             query_file.write_all(record.seq()).await?;
+    //             query_file.write_all(b"\n+\n").await?;
+    //             query_file.write_all(record.qual().unwrap_or(b"").as_bytes()).await?;
+    //             query_file.write_all(b"\n").await?;
+    //         }
+    //         query_file.flush().await?;
+    //         Ok::<(), anyhow::Error>(())
+    //     }
+    // });
     
     //*****************
     //Host Removal
