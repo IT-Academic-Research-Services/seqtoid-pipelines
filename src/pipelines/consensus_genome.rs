@@ -148,33 +148,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         args.buffer_size,
     ).await?;
 
-
-    // just for now write out
-    // let mut fastp_write_task = tokio::spawn(stream_to_file(
-    //     fastp_out_stream,
-    //     PathBuf::from("fastp_out_test.fq"),
-    // ));
-
-    // NB: the await calls below cause run to pause
-    // Await write tasks concurrently
-    // let (pigz_write_result, fastp_write_result) = join!(pigz_write_task, fastp_write_task);
-    // pigz_write_result??;
-    // fastp_write_result??;
-    pigz_write_task.await??;
-    // fastp_write_task.await??;
-
-    // Check child exit statuses
-    let pigz_status = pigz_child.wait().await?;
-    if !pigz_status.success() {
-        return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
-    }
-    let fastp_status = fastp_child.wait().await?;
-    if !fastp_status.success() {
-        return Err(anyhow!("fastp exited with non-zero status: {}", fastp_status));
-    }
+    
+    
 
     // Check t_junction completion
-    val_done_rx.await??;
+
     
     
     //*****************
@@ -281,6 +259,19 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     
     //*****************
+    // Cleanup, hanging tasks
+    
+    pigz_write_task.await??;
+    let pigz_status = pigz_child.wait().await?;
+    if !pigz_status.success() {
+        return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
+    }
+    
+    let fastp_status = fastp_child.wait().await?;
+    if !fastp_status.success() {
+        return Err(anyhow!("fastp exited with non-zero status: {}", fastp_status));
+    }
+    val_done_rx.await??;
     
     
     
