@@ -231,9 +231,16 @@ pub async fn build_new_in_memory_index(h5_path: &PathBuf, cache_file_name: &Path
             index_map.insert(id_bytes_array, entry.index);
         }
     }
-    
+
     let config = bincode::config::standard();
-    std::fs::write(&cache_file_name, bincode::serde::encode_to_vec(&index_map, config)?)?;
+    let (serialized_data, index_map) = tokio::task::spawn_blocking({
+        move || {
+            let serialized = bincode::serde::encode_to_vec(&index_map, config)?;
+            Ok::<_, bincode::error::EncodeError>((serialized, index_map))
+        }
+    }).await??;
+    tokio::fs::write(&cache_file_name, serialized_data).await?;
+
     eprintln!("In-memory index built: {} entries", index_map.len());
     Ok(index_map)
 }
