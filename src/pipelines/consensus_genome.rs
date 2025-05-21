@@ -1,3 +1,5 @@
+use tokio_stream::StreamExt;
+use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
@@ -146,11 +148,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
         args.buffer_size,
     ).await?;
 
+
     // just for now write out
-    let mut fastp_write_task = tokio::spawn(stream_to_file(
-        fastp_out_stream,
-        PathBuf::from("fastp_out_test.fq"),
-    ));
+    // let mut fastp_write_task = tokio::spawn(stream_to_file(
+    //     fastp_out_stream,
+    //     PathBuf::from("fastp_out_test.fq"),
+    // ));
 
     // NB: the await calls below cause run to pause
     // Await write tasks concurrently
@@ -158,7 +161,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // pigz_write_result??;
     // fastp_write_result??;
     pigz_write_task.await??;
-    fastp_write_task.await??;
+    // fastp_write_task.await??;
 
     // Check child exit statuses
     let pigz_status = pigz_child.wait().await?;
@@ -211,40 +214,56 @@ pub async fn run(args: &Arguments) -> Result<()> {
     return Err(anyhow!("Named pipes are not supported on non-Unix systems. Only Unix-like systems supported."));
 
 
-    // let ref_write_task = tokio::spawn({
-    //     let ref_pipe_path = ref_pipe_path.clone();
-    //     let host_accession = host_accession.clone();
-    //     async move {
-    //         match &args.host_sequence {
-    //             Some(host_sequence_file) => {
-    //                 let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
-    //                 tokio::task::spawn_blocking(move || {
-    //                     write_fasta_to_fifo(&host_sequence_path, &ref_pipe_path)
-    //                 }).await?
-    //             }
-    //             _ => {
-    //                 let seq = lookup_sequence(&ref_db_path, &h5_index, &host_accession).await?;
-    //                 write_hdf5_seq_to_fifo(seq, &host_accession, &ref_pipe_path).await
-    //             }
-    //         }
-    //     }
-    // });
+    let ref_write_task = tokio::spawn({
+        let ref_pipe_path = ref_pipe_path.clone();
+        let host_accession = host_accession.clone();
+        let host_sequence = args.host_sequence.clone(); // Clone to own the data
+        let ref_db_path = ref_db_path.clone();
+        let h5_index = h5_index.clone(); // Assuming h5_index is Clone
+        let cwd = cwd.clone();
+        async move {
+            match &host_sequence {
+                Some(host_sequence_file) => {
+                    let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
+                    tokio::task::spawn_blocking(move || {
+                        write_fasta_to_fifo(&host_sequence_path, &ref_pipe_path)
+                    }).await?
+                }
+                _ => {
+                    let seq = lookup_sequence(&ref_db_path, &h5_index, &host_accession).await?;
+                    write_hdf5_seq_to_fifo(seq, &host_accession, &ref_pipe_path).await
+                }
+            }
+        }
+    });
 
-    // let query_write_task = tokio::spawn({
-    //     let query_pipe_path = query_pipe_path.clone();
-    //     async move {
-    //         let mut query_file = File::create(&query_pipe_path).await?;
-    //         while let Some(record) = fastp_out_stream.next().await {
-    //             query_file.write_all(format!("@{}\n", record.id()).as_bytes()).await?;
-    //             query_file.write_all(record.seq()).await?;
-    //             query_file.write_all(b"\n+\n").await?;
-    //             query_file.write_all(record.qual().unwrap_or(b"").as_bytes()).await?;
-    //             query_file.write_all(b"\n").await?;
-    //         }
-    //         query_file.flush().await?;
-    //         Ok::<(), anyhow::Error>(())
-    //     }
-    // });
+    let mut fastp_out_stream = ReceiverStream::new(fastp_out_stream);
+    let query_write_task = tokio::spawn({
+        let query_pipe_path = query_pipe_path.clone();
+        async move {
+            let mut query_file = File::create(&query_pipe_path).await?;
+            while let Some(item) = fastp_out_stream.next().await {
+                match item {
+                    ParseOutput::Fastq(record) => {
+                        let qual = record.qual();
+                        if qual.is_empty() {
+                            return Err(anyhow!("FASTQ record '{}' has empty quality scores", record.id()));
+                        }
+                        query_file.write_all(format!("@{}\n", record.id()).as_bytes()).await?;
+                        query_file.write_all(record.seq()).await?;
+                        query_file.write_all(b"\n+\n").await?;
+                        query_file.write_all(qual).await?;
+                        query_file.write_all(b"\n").await?;
+                    }
+                    ParseOutput::Bytes(_) => {
+                        return Err(anyhow!("Expected Fastq record, got Bytes"));
+                    }
+                }
+            }
+            query_file.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
     
     //*****************
     //Host Removal
@@ -262,6 +281,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     
     //*****************
+    
+    
+    
     eprintln!("Finished generating consensus genome");
     
     Ok(())
