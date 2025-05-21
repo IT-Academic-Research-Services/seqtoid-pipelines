@@ -9,6 +9,8 @@ use crate::utils::fastx::SequenceRecord;
 use fxhash::FxHashMap as HashMap;
 use futures::StreamExt;
 use crate::cli::Technology;
+use tokio::fs::File as TokioFile;
+use tokio::io::AsyncWriteExt;
 
 const CHUNK_SIZE: usize = 1000;
 const TEST_FASTA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt.fa");
@@ -373,7 +375,7 @@ pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u
 /// Result
 ///
 pub async fn write_hdf5_seq_to_fifo(seq: Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
-    let mut fifo_file = File::create(fifo_path).await?;
+    let mut fifo_file = TokioFile::create(fifo_path).await?;
     fifo_file.write_all(format!(">{}\n", accession).as_bytes()).await?;
     let seq_str = String::from_utf8(seq)?;
     const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
