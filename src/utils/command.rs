@@ -142,7 +142,7 @@ mod minimap2 {
         
     }
 
-    pub fn arg_generator(args: &Arguments) -> Vec<String> {
+    pub fn arg_generator(args: &Arguments, ref_pipe_path: &PathBuf, query_pipe_path: &PathBuf) -> Vec<String> {
         let mut args_vec: Vec<String> = Vec::new();
 
         let num_cores : usize = match &args.limit_align_threads {
@@ -179,11 +179,10 @@ mod minimap2 {
         };
 
 
-        
 
         
-        
-
+        args_vec.push(ref_pipe_path.to_string_lossy().to_string());
+        args_vec.push(query_pipe_path.to_string_lossy().to_string());
 
         args_vec
     }

@@ -52,6 +52,9 @@ pub struct Arguments {
     #[arg(short = 'a', long = "host_accession")]
     pub host_accession : Option<String>,
 
+    #[arg(long)]
+    pub host_sequence : Option<String>,
+
     #[arg(short = 'r', long = "ref_accession")]
     pub ref_accession : Option<String>,
 

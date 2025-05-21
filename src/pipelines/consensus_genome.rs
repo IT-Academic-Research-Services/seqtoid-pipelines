@@ -8,8 +8,9 @@ use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::process::Command as TokioCommand;
 use crate::utils::command::{generate_cli, check_version};
-use crate::utils::file::file_path_manipulator;
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
+use crate::utils::file::{file_name_manipulator, file_path_manipulator};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
+use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
 use crate::cli::Technology;
@@ -208,22 +209,26 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
     #[cfg(not(unix))]
     return Err(anyhow!("Named pipes are not supported on non-Unix systems. Only Unix-like systems supported."));
-    
-    
-    let seq = lookup_sequence(&ref_db_path, &h5_index, &host_accession).await?;
-    let ref_seq = String::from_utf8(seq)?;
-    eprintln!("{}", ref_seq);
 
 
-    let ref_write_task = tokio::spawn({
-        let ref_pipe_path = ref_pipe_path.clone();
-        async move {
-            let mut ref_file = File::create(&ref_pipe_path).await?;
-            ref_file.write_all(format!(">{}\n{}\n", host_accession, ref_seq).as_bytes()).await?;
-            ref_file.flush().await?;
-            Ok::<(), anyhow::Error>(())
-        }
-    });
+    // let ref_write_task = tokio::spawn({
+    //     let ref_pipe_path = ref_pipe_path.clone();
+    //     let host_accession = host_accession.clone();
+    //     async move {
+    //         match &args.host_sequence {
+    //             Some(host_sequence_file) => {
+    //                 let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
+    //                 tokio::task::spawn_blocking(move || {
+    //                     write_fasta_to_fifo(&host_sequence_path, &ref_pipe_path)
+    //                 }).await?
+    //             }
+    //             _ => {
+    //                 let seq = lookup_sequence(&ref_db_path, &h5_index, &host_accession).await?;
+    //                 write_hdf5_seq_to_fifo(seq, &host_accession, &ref_pipe_path).await
+    //             }
+    //         }
+    //     }
+    // });
 
     // let query_write_task = tokio::spawn({
     //     let query_pipe_path = query_pipe_path.clone();
