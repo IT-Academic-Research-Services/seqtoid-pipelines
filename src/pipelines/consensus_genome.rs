@@ -12,7 +12,7 @@ use crate::utils::command::{generate_cli, check_version};
 use crate::utils::file::{file_path_manipulator};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
 
@@ -76,23 +76,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    // let host_accession = args.host_accession.clone().ok_or_else(|| {
-    //     anyhow!("Host accession must be given (-a).")
-    // })?;
     
-    // let ref_accession = match technology {
-    //     Technology::Illumina => {
-    //         args.ref_accession.clone().ok_or_else(|| {
-    //             anyhow::anyhow!("HDF5 database file must be given (-d).")
-    //         })?
-    //     }
-    //     Technology::ONT => {
-    //         String::new() // or return an error if ref_accession is required
-    //     }
-    // };
-
-
-
 
     //*****************
     // Input Validation
@@ -138,13 +122,28 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Fastp stream
     let fastp_args = generate_cli(FASTP_TAG, &args, None)?;
     let fastp_args: Vec<&str> = fastp_args.iter().map(|s| s.as_str()).collect();
-    let (mut fastp_child, _fastp_stream_task) = stream_to_cmd(fastp_stream, FASTP_TAG, fastp_args, StreamDataType::IlluminaFastq).await?;
+    let (mut fastp_child, fastp_stream_task) = stream_to_cmd(fastp_stream, FASTP_TAG, fastp_args, StreamDataType::IlluminaFastq).await?;
     let fastp_out_stream = parse_child_output(
         &mut fastp_child,
         ChildStream::Stdout,
-        ParseMode::Fastq,
+        ParseMode::Bytes, // Use Bytes to avoid parsing issues
+        args.buffer_size / 4, // Reduce buffer size
+    ).await?;
+    let mut fastp_out_stream = ReceiverStream::new(fastp_out_stream);
+    
+    let fastp_err_stream = parse_child_output(
+        &mut fastp_child,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
         args.buffer_size,
     ).await?;
+    let fastp_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(fastp_err_stream);
+        while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+            eprintln!("fastp stderr: {}", String::from_utf8_lossy(&chunk));
+        }
+        Ok::<(), anyhow::Error>(())
+    });
 
 
     
@@ -174,23 +173,20 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let query_temp = NamedTempFile::new()?;
     let query_pipe_path = query_temp.path().to_path_buf();
 
-    #[cfg(unix)]
-    {
-        if ref_pipe_path.exists() {
-            std::fs::remove_file(&ref_pipe_path)?;
-        }
-        Command::new("mkfifo")
-            .arg(&ref_pipe_path)
-            .status()?;
-        if query_pipe_path.exists() {
-            std::fs::remove_file(&query_pipe_path)?;
-        }
-        Command::new("mkfifo")
-            .arg(&query_pipe_path)
-            .status()?;
+
+    if ref_pipe_path.exists() {
+        std::fs::remove_file(&ref_pipe_path)?;
     }
-    #[cfg(not(unix))]
-    return Err(anyhow!("Named pipes are not supported on non-Unix systems. Only Unix-like systems supported."));
+    Command::new("mkfifo")
+        .arg(&ref_pipe_path)
+        .status()?;
+    if query_pipe_path.exists() {
+        std::fs::remove_file(&query_pipe_path)?;
+    }
+    Command::new("mkfifo")
+        .arg(&query_pipe_path)
+        .status()?;
+    
     
     let host_accession = args.host_accession.clone();
     let host_sequence = args.host_sequence.clone();
@@ -211,6 +207,30 @@ pub async fn run(args: &Arguments) -> Result<()> {
         },
         
     };
+
+
+    // Create FIFO pipe for the fastp output to stream to minimap2
+    let query_write_task = tokio::spawn({
+        let query_pipe_path = query_pipe_path.clone();
+        async move {
+            let mut query_file = File::create(&query_pipe_path).await?;
+            let mut byte_count = 0;
+            while let Some(item) = fastp_out_stream.next().await {
+                match item {
+                    ParseOutput::Bytes(data) => {
+                        query_file.write_all(&data).await?;
+                        byte_count += data.len();
+                    }
+                    _ => return Err(anyhow!("Expected Bytes, got unexpected data")),
+                }
+            }
+            query_file.flush().await?;
+            if byte_count == 0 {
+                return Err(anyhow!("No data produced by fastp"));
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
 
     // Create FIFO pipe from either the host_sequence of host_accession
     let ref_write_task = tokio::spawn({
@@ -241,44 +261,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
                         }
                     }
                     
-
+    
                 }
             }
         }
     });
 
-    let mut fastp_out_stream = ReceiverStream::new(fastp_out_stream);
-    let query_write_task = tokio::spawn({
-        let query_pipe_path = query_pipe_path.clone();
-        async move {
-            let mut query_file = File::create(&query_pipe_path).await?;
-            while let Some(item) = fastp_out_stream.next().await {
-                match item {
-                    ParseOutput::Fastq(record) => {
-                        let qual = record.qual();
-                        if qual.is_empty() {
-                            return Err(anyhow!("FASTQ record '{}' has empty quality scores", record.id()));
-                        }
-                        query_file.write_all(format!("@{}\n", record.id()).as_bytes()).await?;
-                        query_file.write_all(record.seq()).await?;
-                        query_file.write_all(b"\n+\n").await?;
-                        query_file.write_all(qual).await?;
-                        query_file.write_all(b"\n").await?;
-                    }
-                    ParseOutput::Bytes(_) => {
-                        return Err(anyhow!("Expected Fastq record, got Bytes"));
-                    }
-                }
-            }
-            query_file.flush().await?;
-            Ok::<(), anyhow::Error>(())
-        }
-    });
+    
     
     //*****************
     //Host Removal
 
-    let _minimap2_version = match check_version(MINIMAP2_TAG).await {
+    let minimap2_version = match check_version(MINIMAP2_TAG).await {
         Ok(version) => {
             eprintln!("{}", version);
             version
@@ -289,25 +283,86 @@ pub async fn run(args: &Arguments) -> Result<()> {
     };
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ref_pipe_path.clone(), query_pipe_path.clone())))?;
-    eprintln!("Minimap2 args: {:?}", minimap2_args);
-    
+
+    let minimap2_args: Vec<&str> = minimap2_args.iter().map(|s| s.as_str()).collect();
+    let (mut minimap2_child, minimap2_task) = spawn_cmd(MINIMAP2_TAG, minimap2_args).await?;
+    let minimap2_out_stream = parse_child_output(
+        &mut minimap2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    let minimap2_write_task = tokio::spawn(stream_to_file(
+        minimap2_out_stream,
+        PathBuf::from("test_minimap.sam"),
+    ));
+
+    let minimap2_err_stream = parse_child_output(
+        &mut minimap2_child,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    let minimap2_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(minimap2_err_stream);
+        while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+            eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
     //*****************
     // Cleanup, hanging tasks
     
+
+
+    fastp_stream_task.await??;
+    fastp_err_task.await??;
+    let fastp_status = fastp_child.wait().await?;
+    if fastp_status.success() {
+        eprintln!("Fastp exited successfully");
+    }
+    else {
+        return Err(anyhow!("Fastp exited with non-zero status: {}", fastp_status));
+    }
+    
+    //T_junction completion
+    val_done_rx.await??;
+    eprintln!("Validation t_junction done");
+
+    // Ensure Minimap2 FIFO write tasks complete
+    ref_write_task.await??;
+    query_write_task.await??;
+    eprintln!("Minimap2 fifo tasks done");
+
+
+    minimap2_err_task.await??;
+    minimap2_write_task.await??;
+    minimap2_task.await??;
+    let minimap2_status = minimap2_child.wait().await?;
+    if minimap2_status.success() {
+        eprintln!("Minimap2 exited successfully");
+    }
+    else {
+        return Err(anyhow!("Minimap2 exited with non-zero status: {}", minimap2_status));
+    }
+    
+    
+    if ref_pipe_path.exists() {
+        std::fs::remove_file(&ref_pipe_path)?;
+    }
+    if query_pipe_path.exists() {
+        std::fs::remove_file(&query_pipe_path)?;
+    }
+
     pigz_write_task.await??;
     let pigz_status = pigz_child.wait().await?;
-    if !pigz_status.success() {
+    if pigz_status.success() {
+        eprintln!("Pigz exited successfully");
+    }
+    else {
         return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
     }
-    eprintln!("pigz exited successfully");
-    
-    let fastp_status = fastp_child.wait().await?;
-    if !fastp_status.success() {
-        return Err(anyhow!("fastp exited with non-zero status: {}", fastp_status));
-    }
-    val_done_rx.await??;
-    
-    
     
     eprintln!("Finished generating consensus genome");
     
