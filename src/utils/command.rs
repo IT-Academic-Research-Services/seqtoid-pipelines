@@ -4,10 +4,11 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG};
 use crate::cli::Arguments;
-use crate::cli::Technology;
 
 
-
+pub trait ArgGenerator {
+    fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>>; 
+}
 
 mod fastp {
     use anyhow::{anyhow, Result};
@@ -15,8 +16,10 @@ mod fastp {
     use crate::cli::Arguments;
     use crate::config::defs::FASTP_TAG;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::command::ArgGenerator;
 
-    #[allow(dead_code)]
+    pub struct FastpArgGenerator;
+    
     pub async fn fastp_presence_check() -> Result<String> {
         let args: Vec<&str> = vec!["-v"];
 
@@ -43,30 +46,36 @@ mod fastp {
         }
         Ok(version)
     }
-
-    pub fn arg_generator(args: &Arguments) -> Vec<String> {
-        let mut args_vec: Vec<String> = Vec::new();
-        args_vec.push("--stdin".to_string());
-        args_vec.push("--stdout".to_string());
-        args_vec.push("--interleaved_in".to_string());
-        args_vec.push("-q".to_string());
-        args_vec.push(args.quality.to_string());
-        args_vec.push("-w".to_string());
-        args_vec.push(args.threads.to_string());
-        args_vec
+    
+    impl ArgGenerator for FastpArgGenerator {
+        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let mut args_vec: Vec<String> = Vec::new();
+            args_vec.push("--stdin".to_string());
+            args_vec.push("--stdout".to_string());
+            args_vec.push("--interleaved_in".to_string());
+            args_vec.push("-q".to_string());
+            args_vec.push(args.quality.to_string());
+            args_vec.push("-w".to_string());
+            args_vec.push(args.threads.to_string());
+            Ok(args_vec)
+        }
     }
+    
 }
 
 mod pigz {
     use crate::cli::Arguments;
-    
-    pub fn arg_generator(args: &Arguments) -> Vec<String> {
-        let mut args_vec: Vec<String> = Vec::new();
-        args_vec.push("-c".to_string());
-        args_vec.push("-p".to_string());
-        args_vec.push(args.threads.to_string());
-        
-        args_vec
+    use crate::utils::command::ArgGenerator;
+    pub struct PigzArgGenerator;
+
+    impl ArgGenerator for PigzArgGenerator {
+        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let mut args_vec: Vec<String> = Vec::new();
+            args_vec.push("-c".to_string());
+            args_vec.push("-p".to_string());
+            args_vec.push(args.threads.to_string());
+            Ok(args_vec)
+        }
     }
 }
 
@@ -75,8 +84,7 @@ mod h5dump {
     use tokio::process::Command;
     use crate::config::defs::{H5DUMP_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-
-    #[allow(dead_code)]
+    
     pub async fn h5dump_presence_check() -> anyhow::Result<String> {
         let args: Vec<&str> = vec!["-V"];
 
@@ -111,10 +119,10 @@ mod minimap2 {
     use tokio::process::Command;
     use crate::cli::{Arguments, Technology};
     use crate::config::defs::MINIMAP2_TAG;
-    use crate::utils::command::check_version;
-    use crate::utils::file::file_path_manipulator;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::command::ArgGenerator;
 
+    pub struct Minimap2ArgGenerator;
     pub async fn minimap2_presence_check() -> anyhow::Result<String> {
         let args: Vec<&str> = vec!["-V"];
 
@@ -140,6 +148,42 @@ mod minimap2 {
         }
         Ok(version)
         
+    }
+
+    impl ArgGenerator for Minimap2ArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let paths = extra
+                .and_then(|e| e.downcast_ref::<(PathBuf, PathBuf)>())
+                .ok_or_else(|| anyhow!("Minimap2 requires (ref_pipe_path, query_pipe_path) as extra arguments"))?;
+
+            let (ref_pipe_path, query_pipe_path) = paths;
+            
+            let mut args_vec: Vec<String> = Vec::new();
+
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push("-t".to_string());
+            args_vec.push(num_cores.to_string());
+
+            let technology = args.technology.clone();
+            match technology {
+                Technology::Illumina => {
+                    args_vec.push("-ax sr".to_string());
+                }
+                Technology::ONT => {
+                    args_vec.push("-ax map-ont".to_string());
+                }
+
+            }
+
+            args_vec.push(ref_pipe_path.to_string_lossy().to_string());
+            args_vec.push(query_pipe_path.to_string_lossy().to_string());
+
+            Ok(args_vec)
+            
+        }
     }
 
     pub fn arg_generator(args: &Arguments, ref_pipe_path: &PathBuf, query_pipe_path: &PathBuf) -> Vec<String> {
@@ -168,19 +212,6 @@ mod minimap2 {
             
         }
 
-        
-        let paired : bool = match &args.file2 {
-            Some(file) => {
-                true
-            }
-            None => {
-                false
-            }
-        };
-
-
-
-        
         args_vec.push(ref_pipe_path.to_string_lossy().to_string());
         args_vec.push(query_pipe_path.to_string_lossy().to_string());
 
@@ -189,16 +220,16 @@ mod minimap2 {
     
 }
 
-pub fn generate_cli(tool: &str, args: &Arguments) -> Result<Vec<String>> {
-    
-
-    let cmd = match tool {
-        FASTP_TAG => fastp::arg_generator(&args),
-        PIGZ_TAG => pigz::arg_generator(&args),
-        _ => return Err(anyhow::anyhow!("Unknown tool: {}", tool)),
+pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
+    let generator: Box<dyn ArgGenerator> = match tool {
+        FASTP_TAG => Box::new(fastp::FastpArgGenerator),
+        PIGZ_TAG => Box::new(pigz::PigzArgGenerator),
+        MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
+        H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
+        _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
-    
-    Ok(cmd)
+
+    generator.generate_args(args, extra)
 }
 
 

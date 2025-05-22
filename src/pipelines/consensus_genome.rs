@@ -119,7 +119,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let mut pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
 
     //Pigz stream to intermediate file output
-    let pigz_args = generate_cli(PIGZ_TAG, &args)?;
+    let pigz_args = generate_cli(PIGZ_TAG, &args, None)?;
     let pigz_args: Vec<&str> = pigz_args.iter().map(|s| s.as_str()).collect();
     let (mut pigz_child, _pigz_stream_task) = stream_to_cmd(pigz_stream, PIGZ_TAG, pigz_args, StreamDataType::IlluminaFastq).await?;
 
@@ -136,7 +136,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
     // Fastp stream
-    let fastp_args = generate_cli(FASTP_TAG, &args)?;
+    let fastp_args = generate_cli(FASTP_TAG, &args, None)?;
     let fastp_args: Vec<&str> = fastp_args.iter().map(|s| s.as_str()).collect();
     let (mut fastp_child, _fastp_stream_task) = stream_to_cmd(fastp_stream, FASTP_TAG, fastp_args, StreamDataType::IlluminaFastq).await?;
     let fastp_out_stream = parse_child_output(
@@ -278,7 +278,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     //*****************
     //Host Removal
 
-    let minimap2_version = match check_version(MINIMAP2_TAG).await {
+    let _minimap2_version = match check_version(MINIMAP2_TAG).await {
         Ok(version) => {
             eprintln!("{}", version);
             version
@@ -287,8 +287,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
             return Err(anyhow!("Error checking minimap2 version: {}", err));
         }
     };
-    eprintln!("Minimap2 version: {}", minimap2_version);
-    
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ref_pipe_path.clone(), query_pipe_path.clone())))?;
+    eprintln!("Minimap2 args: {:?}", minimap2_args);
     
     //*****************
     // Cleanup, hanging tasks
@@ -298,6 +299,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     if !pigz_status.success() {
         return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
     }
+    eprintln!("pigz exited successfully");
     
     let fastp_status = fastp_child.wait().await?;
     if !fastp_status.success() {
