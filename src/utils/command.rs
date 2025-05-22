@@ -167,13 +167,14 @@ mod minimap2 {
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
+            args_vec.push("-ax".to_string());
             let technology = args.technology.clone();
             match technology {
                 Technology::Illumina => {
-                    args_vec.push("-ax sr".to_string());
+                    args_vec.push("sr".to_string());
                 }
                 Technology::ONT => {
-                    args_vec.push("-ax map-ont".to_string());
+                    args_vec.push("map-ont".to_string());
                 }
 
             }
