@@ -256,6 +256,26 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     Ok((child, task))
 }
 
+
+pub async fn spawn_cmd(
+    cmd_tag: &str,
+    args: Vec<&str>,
+) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
+    eprintln!("spawning {}", cmd_tag);
+    let cmd_tag_owned = cmd_tag.to_string();
+    let mut child = Command::new(&cmd_tag_owned)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+
+    let task = tokio::spawn(async move { Ok(()) });
+
+    Ok((child, task))
+}
+
 /// Parse the output of a stream, either Fastq or simple bytes.
 ///
 /// # Arguments
