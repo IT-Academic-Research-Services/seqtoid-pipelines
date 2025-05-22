@@ -8,14 +8,12 @@ use std::process::Command;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::process::Command as TokioCommand;
 use crate::utils::command::{generate_cli, check_version};
-use crate::utils::file::{file_name_manipulator, file_path_manipulator};
+use crate::utils::file::{file_path_manipulator};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
-use crate::cli::Technology;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
 
 pub async fn run(args: &Arguments) -> Result<()> {
@@ -78,9 +76,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    let host_accession = args.host_accession.clone().ok_or_else(|| {
-        anyhow!("Host accession must be given (-a).")
-    })?;
+    // let host_accession = args.host_accession.clone().ok_or_else(|| {
+    //     anyhow!("Host accession must be given (-a).")
+    // })?;
     
     // let ref_accession = match technology {
     //     Technology::Illumina => {
@@ -148,16 +146,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
         args.buffer_size,
     ).await?;
 
-    
-    
 
-    // Check t_junction completion
-
-    
     
     //*****************
     //Fetch Reference from accession
     
+    // Retrieve index or create it for host sequence and filter sequence
     let h5_index = if let Some(index_file) = &args.ref_index {
         let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd, None, None, "");
         if index_full_path.exists() {
@@ -173,7 +167,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
     };
 
-
+    
+    // Create FIFO pipes
     let ref_temp = NamedTempFile::new()?;
     let ref_pipe_path = ref_temp.path().to_path_buf();
     let query_temp = NamedTempFile::new()?;
@@ -181,35 +176,72 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     #[cfg(unix)]
     {
+        if ref_pipe_path.exists() {
+            std::fs::remove_file(&ref_pipe_path)?;
+        }
         Command::new("mkfifo")
             .arg(&ref_pipe_path)
             .status()?;
+        if query_pipe_path.exists() {
+            std::fs::remove_file(&query_pipe_path)?;
+        }
         Command::new("mkfifo")
             .arg(&query_pipe_path)
             .status()?;
     }
     #[cfg(not(unix))]
     return Err(anyhow!("Named pipes are not supported on non-Unix systems. Only Unix-like systems supported."));
+    
+    let host_accession = args.host_accession.clone();
+    let host_sequence = args.host_sequence.clone();
 
+    // If the host sequence file is given, load it, if not retrieve it by accession from ref_db
+    let seq = match &host_sequence {
+        Some(_host_sequence_file) => None,
+        None => {
+            match &host_accession {
+                Some(accession) => {
+                    Some(lookup_sequence(&ref_db_path, &h5_index, &accession).await?)
+                }
+                None => {
+                    return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+                }
+            }
+            
+        },
+        
+    };
 
+    // Create FIFO pipe from either the host_sequence of host_accession
     let ref_write_task = tokio::spawn({
         let ref_pipe_path = ref_pipe_path.clone();
-        let host_accession = host_accession.clone();
-        let host_sequence = args.host_sequence.clone(); // Clone to own the data
-        let ref_db_path = ref_db_path.clone();
-        let h5_index = h5_index.clone(); // Assuming h5_index is Clone
-        let cwd = cwd.clone();
         async move {
-            match &host_sequence {
-                Some(host_sequence_file) => {
-                    let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
-                    tokio::task::spawn_blocking(move || {
-                        write_fasta_to_fifo(&host_sequence_path, &ref_pipe_path)
-                    }).await?
+            
+            match seq {
+                Some(seq) => {
+                    match &host_accession {
+                        Some(accession) => {
+                            write_hdf5_seq_to_fifo(seq, &accession, &ref_pipe_path).await
+                        }
+                        None => {
+                            return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+                        }
+                    }
                 }
-                _ => {
-                    let seq = lookup_sequence(&ref_db_path, &h5_index, &host_accession).await?;
-                    write_hdf5_seq_to_fifo(seq, &host_accession, &ref_pipe_path).await
+                None => {
+                    match &host_sequence {
+                        Some(host_sequence_file) => {
+                            let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
+                            tokio::task::spawn_blocking(move || {
+                                write_fasta_to_fifo(&host_sequence_path, &ref_pipe_path)
+                            }).await?
+                        }
+                        None => {
+                            return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+                        }
+                    }
+                    
+
                 }
             }
         }
