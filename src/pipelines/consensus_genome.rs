@@ -13,8 +13,10 @@ use crate::utils::file::{file_path_manipulator};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
+use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
+
 
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
@@ -333,6 +335,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
             return Err(anyhow!("Error checking samtools version: {}", err));
         }
     };
+
+    let samtools_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        filter_flag: Some(("-f".to_string(), 4)), // Require mapped reads (SAM flag 4)
+    };
+    let samtools_args = generate_cli(
+        SAMTOOLS_TAG,
+        &args,
+        Some(&samtools_config),
+    )?;
+    
+    eprintln!("SAMTOOLS args {:?}", samtools_args);
 
     //*****************
     // Cleanup, hanging tasks

@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
 use crate::cli::Arguments;
 
 
@@ -222,14 +222,25 @@ mod minimap2 {
 }
 
 
-mod samtools {
+pub mod samtools {
     use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::{Arguments, Technology};
-    use crate::config::defs::{SAMTOOLS_TAG};
+    use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
+    
+    #[derive(Debug)]
+    pub struct SamtoolsConfig {
+        pub subcommand: SamtoolsSubcommand,
+        pub filter_flag: Option<(String, u32)>, // (flag, value), e.g., ("-f", 4) or ("-F", 256)
+    }
+    
+    pub struct SamtoolsArgGenerator;
+
+
+
 
     pub async fn samtools_presence_check() -> anyhow::Result<String> {
         let args: Vec<&str> = vec!["--version"];
@@ -256,13 +267,43 @@ mod samtools {
         }
         Ok(version)
     }
-    
-}
+
+    impl ArgGenerator for SamtoolsArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<SamtoolsConfig>())
+                .ok_or_else(|| anyhow!("Samtools requires a SamtoolsConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                SamtoolsSubcommand::View => {
+                    args_vec.push("view".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(args.threads.to_string());
+                    args_vec.push("--no-PG".to_string());
+                    args_vec.push("-u".to_string());
+
+                    if let Some((flag, value)) = &config.filter_flag {
+                        if flag != "-f" && flag != "-F" {
+                            return Err(anyhow!("Invalid filter flag: {}. Must be '-f' or '-F'", flag));
+                        }
+                        args_vec.push(flag.clone());
+                        args_vec.push(value.to_string());
+                    }
+                
+                    }
+                }
+            Ok(args_vec)
+            }
+        }
+    }
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
         PIGZ_TAG => Box::new(pigz::PigzArgGenerator),
         MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
+        SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
