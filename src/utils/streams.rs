@@ -194,7 +194,7 @@ where
 pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     rx: mpsc::Receiver<T>,
     cmd_tag: &str,
-    args: Vec<&str>,
+    args: Vec<String>,
     data_type: StreamDataType,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let (batch_size_bytes, writer_capacity) = match data_type {
@@ -259,7 +259,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
 pub async fn spawn_cmd(
     cmd_tag: &str,
-    args: Vec<&str>,
+    args: Vec<String>,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     eprintln!("spawning {}", cmd_tag);
     let cmd_tag_owned = cmd_tag.to_string();
@@ -902,7 +902,7 @@ mod tests {
     async fn test_stream_to_cmd_premature_exit() -> Result<()> {
         let stream = fastx_generator(10, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n", "1"], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n".to_string(), "1".to_string()], StreamDataType::IlluminaFastq).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
