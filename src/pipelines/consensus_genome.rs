@@ -13,7 +13,7 @@ use crate::utils::file::{file_path_manipulator};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG};
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
 
 pub async fn run(args: &Arguments) -> Result<()> {
@@ -279,7 +279,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     //*****************
     //Host Removal
 
-    let minimap2_version = match check_version(MINIMAP2_TAG).await {
+    let _minimap2_version = match check_version(MINIMAP2_TAG).await {
         Ok(version) => {
             eprintln!("{}", version);
             version
@@ -322,6 +322,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     });
+
+
+    let _samtools_version = match check_version(SAMTOOLS_TAG).await {
+        Ok(version) => {
+            eprintln!("{}", version);
+            version
+        }
+        Err(err) => {
+            return Err(anyhow!("Error checking samtools version: {}", err));
+        }
+    };
 
     //*****************
     // Cleanup, hanging tasks
