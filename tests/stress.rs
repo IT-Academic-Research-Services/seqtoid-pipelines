@@ -312,7 +312,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     let num_read = 100;
     let read_size = 50;
     let cmd_tag = "cat";
-    let args = vec!["-"];
+    let args = vec!["-".to_string()];
     eprintln!(
         "Testing stream_to_cmd: Reads: {}, Size: {}, Command: {}",
         num_read, read_size, cmd_tag
@@ -452,7 +452,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     let (mut child, stream_task) = match stream_to_cmd(
                                         rx,
                                         &cmd_tag,
-                                        args.iter().map(|s| s.as_str()).collect(),
+                                        args,
                                         StreamDataType::IlluminaFastq
                                     )
                                         .await {
