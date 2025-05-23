@@ -10,8 +10,12 @@ pub enum Technology {
 #[derive(Parser, Debug)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
+    
     #[arg(short, long)]
     pub module: String,
+
+    #[arg(short = 'v', long = "verbose", action)]
+    pub verbose: bool,
 
     #[arg(short = 'i', long = "file1")]
     pub file1: Option<String>,

@@ -21,6 +21,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     println!("Running consensus genome with module: {}", args.module);
 
     let cwd = std::env::current_dir()?;
+    let verbose = args.verbose.clone();
 
     
     // Arguments and files check
@@ -139,9 +140,15 @@ pub async fn run(args: &Arguments) -> Result<()> {
     ).await?;
     let fastp_err_task = tokio::spawn(async move {
         let mut err_stream = ReceiverStream::new(fastp_err_stream);
-        while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-            eprintln!("fastp stderr: {}", String::from_utf8_lossy(&chunk));
+        if verbose {
+            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                eprintln!("fastp stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+        } else {
+            // Consume the stream without processing
+            while err_stream.next().await.is_some() {}
         }
+        
         Ok::<(), anyhow::Error>(())
     });
 
@@ -305,8 +312,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
     ).await?;
     let minimap2_err_task = tokio::spawn(async move {
         let mut err_stream = ReceiverStream::new(minimap2_err_stream);
-        while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-            eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
+        if verbose {
+            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+        } else {
+            // Consume the stream without processing
+            while err_stream.next().await.is_some() {}
         }
         Ok::<(), anyhow::Error>(())
     });
