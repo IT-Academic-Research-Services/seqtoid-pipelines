@@ -275,7 +275,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
     });
 
     
-    
     //*****************
     //Host Removal
 
@@ -298,10 +297,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    let minimap2_write_task = tokio::spawn(stream_to_file(
-        minimap2_out_stream,
-        PathBuf::from("test_minimap.sam"),
-    ));
+    
 
     let minimap2_err_stream = parse_child_output(
         &mut minimap2_child,
@@ -343,13 +339,24 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Some(&samtools_config),
     )?;
     
-    eprintln!("SAMTOOLS args {:?}", samtools_args);
+    let (mut samtools_child, samtools_task) = stream_to_cmd(minimap2_out_stream, SAMTOOLS_TAG, samtools_args, StreamDataType::JustBytes).await?;
+    let samtools_out_stream = parse_child_output(
+        &mut samtools_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    
+    
+    let samtools_write_task = tokio::spawn(stream_to_file(
+        samtools_out_stream,
+        PathBuf::from("test_samtools_mapped.sam"),
+    ));
 
+    
     //*****************
     // Cleanup, hanging tasks
     
-
-
     fastp_stream_task.await??;
     fastp_err_task.await??;
     let fastp_status = fastp_child.wait().await?;
@@ -371,7 +378,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
     minimap2_err_task.await??;
-    minimap2_write_task.await??;
+
     minimap2_task.await??;
     let minimap2_status = minimap2_child.wait().await?;
     if minimap2_status.success() {
@@ -380,7 +387,16 @@ pub async fn run(args: &Arguments) -> Result<()> {
     else {
         return Err(anyhow!("Minimap2 exited with non-zero status: {}", minimap2_status));
     }
-    
+
+    samtools_write_task.await??;
+    samtools_task.await??;
+    let samtools_status = samtools_child.wait().await?;
+    if samtools_status.success() {
+        eprintln!("Samtools exited successfully");
+    }
+    else {
+        return Err(anyhow!("Samtools exited with non-zero status: {}", samtools_status));
+    }
     
     if ref_pipe_path.exists() {
         std::fs::remove_file(&ref_pipe_path)?;

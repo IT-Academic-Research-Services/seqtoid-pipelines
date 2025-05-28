@@ -21,7 +21,6 @@ pub enum StreamDataType {
 }
 
 pub trait ToBytes {
-    #[allow(dead_code)]
     fn to_bytes(&self) -> Result<Vec<u8>>;
 }
 
@@ -60,23 +59,29 @@ impl ToBytes for SequenceRecord {
     }
 }
 
+impl ToBytes for ParseOutput {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            ParseOutput::Fastq(record) => record.to_bytes(),
+            ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ChildStream {
     Stdout,
-    #[allow(dead_code)]
     Stderr,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum ParseMode {
-    #[allow(dead_code)]
     Fastq,
     Bytes,
 }
 
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
-    #[allow(dead_code)]
     Fastq(SequenceRecord),
     Bytes(Vec<u8>),
 }
@@ -830,6 +835,37 @@ mod tests {
         assert!(output_str.contains("@read2"), "Output should contain second read ID");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_stream_to_cmd_valid_parseoutput() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
+        let rx = outputs.pop().unwrap();
+        let (tx, rx_parse) = mpsc::channel(100);
+        tokio::spawn(async move {
+            let mut stream = ReceiverStream::new(rx);
+            while let Some(record) = stream.next().await {
+                if tx.send(ParseOutput::Fastq(record)).await.is_err() {
+                    eprintln!("Failed to send ParseOutput");
+                    break;
+                }
+            }
+        });
+        let (mut child, task) = stream_to_cmd(rx_parse, "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(!output.is_empty(), "Output should contain FASTQ data");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("@read1"), "Output should contain first read ID");
+        assert!(output_str.contains("@read2"), "Output should contain second read ID");
+        Ok(())
+    }
+
 
     #[tokio::test]
     async fn test_stream_to_cmd_invalid_command() -> Result<()> {
