@@ -8,7 +8,7 @@ use std::process::Command;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::command::{generate_cli, check_version};
+use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{file_path_manipulator};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
@@ -24,7 +24,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let verbose = args.verbose.clone();
-
+    
+    //External tools check
+    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG]).await?;
     
     // Arguments and files check
 
@@ -279,16 +281,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     });
 
     
-    let _minimap2_version = match check_version(MINIMAP2_TAG).await {
-        Ok(version) => {
-            eprintln!("{}", version);
-            version
-        }
-        Err(err) => {
-            return Err(anyhow!("Error checking minimap2 version: {}", err));
-        }
-    };
-
+    
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     
     let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args).await?;
@@ -320,16 +313,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     });
 
 
-    let _samtools_version = match check_version(SAMTOOLS_TAG).await {
-        Ok(version) => {
-            eprintln!("{}", version);
-            version
-        }
-        Err(err) => {
-            return Err(anyhow!("Error checking samtools version: {}", err));
-        }
-    };
-
+    
     let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         filter_flag: Some(("-f".to_string(), 4)), // Require mapped reads (SAM flag 4)

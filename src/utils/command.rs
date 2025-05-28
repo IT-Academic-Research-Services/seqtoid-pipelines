@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
@@ -32,10 +33,12 @@ mod fastp {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn {}: {}. Is fastp installed?", cmd_tag_owned, e))?;
 
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
+        eprintln!("num lines {}", lines.len());
         let first_line = lines
             .first()
             .ok_or_else(|| anyhow!("No output from fastp -v"))?;
+        eprintln!("First line: {}", first_line);
         let version = first_line
             .split_whitespace()
             .nth(1)
@@ -321,4 +324,20 @@ pub async fn check_version(tool: &str) -> Result<String> {
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
+}
+
+
+pub async fn check_versions(tools: Vec<&str>) -> Result<HashMap<String, String>>{
+    let mut versions: HashMap<String, String> = HashMap::new();
+    for tool in tools {
+        let _tool_version = match check_version(tool).await {
+            Ok(version) => {
+                versions.insert(tool.to_string(), version);
+            }
+            Err(err) => {
+                return Err(anyhow!("Cannot find external tool in path: {}", tool));
+            }
+        };
+    }
+    Ok(versions)
 }
