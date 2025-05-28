@@ -8,6 +8,7 @@ pub const SAMTOOLS_TAG: &str = "samtools";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
     View,
+    Fastq
 }
 pub const BCFTOOLS_TAG: &str = "bcftools";
 

@@ -226,6 +226,7 @@ mod minimap2 {
 
 
 pub mod samtools {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
@@ -237,7 +238,7 @@ pub mod samtools {
     #[derive(Debug)]
     pub struct SamtoolsConfig {
         pub subcommand: SamtoolsSubcommand,
-        pub filter_flag: Option<(String, u32)>, // (flag, value), e.g., ("-f", 4) or ("-F", 256)
+        pub subcommand_fields: HashMap<String, Option<String>>,
     }
     
     pub struct SamtoolsArgGenerator;
@@ -286,17 +287,26 @@ pub mod samtools {
                     args_vec.push(args.threads.to_string());
                     args_vec.push("--no-PG".to_string());
                     args_vec.push("-u".to_string());
-
-                    if let Some((flag, value)) = &config.filter_flag {
-                        if flag != "-f" && flag != "-F" {
-                            return Err(anyhow!("Invalid filter flag: {}. Must be '-f' or '-F'", flag));
-                        }
-                        args_vec.push(flag.clone());
-                        args_vec.push(value.to_string());
-                    }
                 
                     }
+                SamtoolsSubcommand::Fastq => {
+                    args_vec.push("view".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(args.threads.to_string());
+                    args_vec.push("-c".to_string());
+                    args_vec.push("6".to_string());
+                    args_vec.push("-n".to_string());
+                    
+                    }
                 }
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
+            
             Ok(args_vec)
             }
         }

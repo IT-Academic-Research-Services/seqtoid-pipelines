@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
@@ -24,10 +25,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let verbose = args.verbose.clone();
-    
+
     //External tools check
     let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG]).await?;
-    
+
     // Arguments and files check
 
     let file1_path: PathBuf = match &args.file1 {
@@ -280,8 +281,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     });
 
-    
-    
+
+
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     
     let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args).await?;
@@ -313,17 +314,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
     });
 
 
-    
+
     let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        filter_flag: Some(("-f".to_string(), 4)), // Require mapped reads (SAM flag 4)
+        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require mapped reads (SAM flag 4)
     };
     let host_samtools_args_view = generate_cli(
         SAMTOOLS_TAG,
         &args,
         Some(&host_samtools_config_view),
     )?;
-
+    eprintln!("WATWAT {:?}", host_samtools_args_view);
     let (mut host_samtools_child_view, samtools_task) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes).await?;
     let host_samtools_out_stream_view = parse_child_output(
         &mut host_samtools_child_view,
@@ -331,8 +332,38 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    
-    
+
+
+
+    // let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("no_host"), "_");
+    // let (host_streams, host_done_rx) = t_junction(
+    //     host_samtools_out_stream_view,
+    //     2,
+    //     args.buffer_size,
+    //     args.stall_threshold.try_into().unwrap(),
+    //     Some(args.stream_sleep_ms),
+    //     50,
+    // )
+    //     .await?;
+    // 
+    // if host_streams.len() != 2 {
+    //     return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
+    // }
+    // 
+    // let mut streams_iter = host_streams.into_iter();
+    // let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+    // let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    // 
+    // 
+    // //Output to FASTQ through samtools
+    // let host_samtools_config_fastq = SamtoolsConfig {
+    //     subcommand: SamtoolsSubcommand::Fastq,
+    //     filter_flag: Some(("-0".to_string(), no_host_file_path)), // Require mapped reads (SAM flag 4)
+    // };
+
+
+
+
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         host_samtools_out_stream_view,
         PathBuf::from("test_samtools_mapped.sam"),
