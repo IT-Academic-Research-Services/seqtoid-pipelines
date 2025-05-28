@@ -155,7 +155,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     
     //*****************
-    //Fetch Reference from accession
+    //Fetch reference
     
     // Retrieve index or create it for host sequence and filter sequence
     let h5_index = if let Some(index_file) = &args.ref_index {
@@ -173,25 +173,29 @@ pub async fn run(args: &Arguments) -> Result<()> {
         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
     };
 
+
+
+    //*****************
+    //Host Removal
     
     // Create FIFO pipes
-    let ref_temp = NamedTempFile::new()?;
-    let ref_pipe_path = ref_temp.path().to_path_buf();
-    let query_temp = NamedTempFile::new()?;
-    let query_pipe_path = query_temp.path().to_path_buf();
+    let host_ref_temp = NamedTempFile::new()?;
+    let host_ref_pipe_path = host_ref_temp.path().to_path_buf();
+    let host_query_temp = NamedTempFile::new()?;
+    let host_query_pipe_path = host_query_temp.path().to_path_buf();
 
 
-    if ref_pipe_path.exists() {
-        std::fs::remove_file(&ref_pipe_path)?;
+    if host_ref_pipe_path.exists() {
+        std::fs::remove_file(&host_ref_pipe_path)?;
     }
     Command::new("mkfifo")
-        .arg(&ref_pipe_path)
+        .arg(&host_ref_pipe_path)
         .status()?;
-    if query_pipe_path.exists() {
-        std::fs::remove_file(&query_pipe_path)?;
+    if host_query_pipe_path.exists() {
+        std::fs::remove_file(&host_query_pipe_path)?;
     }
     Command::new("mkfifo")
-        .arg(&query_pipe_path)
+        .arg(&host_query_pipe_path)
         .status()?;
     
     
@@ -199,7 +203,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let host_sequence = args.host_sequence.clone();
 
     // If the host sequence file is given, load it, if not retrieve it by accession from ref_db
-    let seq = match &host_sequence {
+    let host_seq = match &host_sequence {
         Some(_host_sequence_file) => None,
         None => {
             match &host_accession {
@@ -217,10 +221,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
     // Create FIFO pipe for the fastp output to stream to minimap2
-    let query_write_task = tokio::spawn({
-        let query_pipe_path = query_pipe_path.clone();
+    let host_query_write_task = tokio::spawn({
+        let host_query_pipe_path = host_query_pipe_path.clone();
         async move {
-            let mut query_file = File::create(&query_pipe_path).await?;
+            let mut query_file = File::create(&host_query_pipe_path).await?;
             let mut byte_count = 0;
             while let Some(item) = val_fastp_out_stream.next().await {
                 match item {
@@ -239,16 +243,16 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     });
 
-    // Create FIFO pipe from either the host_sequence of host_accession
-    let ref_write_task = tokio::spawn({
-        let ref_pipe_path = ref_pipe_path.clone();
+    // Create FIFO pipe from either the host_sequence or host_accession
+    let host_ref_write_task = tokio::spawn({
+        let host_ref_pipe_path = host_ref_pipe_path.clone();
         async move {
             
-            match seq {
+            match host_seq {
                 Some(seq) => {
                     match &host_accession {
                         Some(accession) => {
-                            write_hdf5_seq_to_fifo(seq, &accession, &ref_pipe_path).await
+                            write_hdf5_seq_to_fifo(seq, &accession, &host_ref_pipe_path).await
                         }
                         None => {
                             return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
@@ -260,7 +264,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                         Some(host_sequence_file) => {
                             let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
                             tokio::task::spawn_blocking(move || {
-                                write_fasta_to_fifo(&host_sequence_path, &ref_pipe_path)
+                                write_fasta_to_fifo(&host_sequence_path, &host_ref_pipe_path)
                             }).await?
                         }
                         None => {
@@ -274,10 +278,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     });
 
-
-    //*****************
-    //Host Removal
-
+    
     let _minimap2_version = match check_version(MINIMAP2_TAG).await {
         Ok(version) => {
             eprintln!("{}", version);
@@ -288,25 +289,25 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     };
 
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ref_pipe_path.clone(), query_pipe_path.clone())))?;
+    let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     
-    let (mut minimap2_child, minimap2_task) = spawn_cmd(MINIMAP2_TAG, minimap2_args).await?;
-    let minimap2_out_stream = parse_child_output(
-        &mut minimap2_child,
+    let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args).await?;
+    let host_minimap2_out_stream = parse_child_output(
+        &mut host_minimap2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
 
 
-    let minimap2_err_stream = parse_child_output(
-        &mut minimap2_child,
+    let host_minimap2_err_stream = parse_child_output(
+        &mut host_minimap2_child,
         ChildStream::Stderr,
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    let minimap2_err_task = tokio::spawn(async move {
-        let mut err_stream = ReceiverStream::new(minimap2_err_stream);
+    let host_minimap2_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
         if verbose {
             while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
                 eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
@@ -329,27 +330,27 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     };
 
-    let samtools_config = SamtoolsConfig {
+    let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         filter_flag: Some(("-f".to_string(), 4)), // Require mapped reads (SAM flag 4)
     };
-    let samtools_args = generate_cli(
+    let host_samtools_args_view = generate_cli(
         SAMTOOLS_TAG,
         &args,
-        Some(&samtools_config),
+        Some(&host_samtools_config_view),
     )?;
 
-    let (mut samtools_child, samtools_task) = stream_to_cmd(minimap2_out_stream, SAMTOOLS_TAG, samtools_args, StreamDataType::JustBytes).await?;
-    let samtools_out_stream = parse_child_output(
-        &mut samtools_child,
+    let (mut host_samtools_child_view, samtools_task) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes).await?;
+    let host_samtools_out_stream_view = parse_child_output(
+        &mut host_samtools_child_view,
         ChildStream::Stdout,
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
     
     
-    let samtools_write_task = tokio::spawn(stream_to_file(
-        samtools_out_stream,
+    let host_samtools_write_task = tokio::spawn(stream_to_file(
+        host_samtools_out_stream_view,
         PathBuf::from("test_samtools_mapped.sam"),
     ));
 
@@ -372,15 +373,15 @@ pub async fn run(args: &Arguments) -> Result<()> {
     eprintln!("Validation t_junction done");
 
     // Ensure Minimap2 FIFO write tasks complete
-    ref_write_task.await??;
-    query_write_task.await??;
+    host_ref_write_task.await??;
+    host_query_write_task.await??;
     eprintln!("Minimap2 fifo tasks done");
 
 
-    minimap2_err_task.await??;
+    host_minimap2_err_task.await??;
 
-    minimap2_task.await??;
-    let minimap2_status = minimap2_child.wait().await?;
+    host_minimap2_task.await??;
+    let minimap2_status = host_minimap2_child.wait().await?;
     if minimap2_status.success() {
         eprintln!("Minimap2 exited successfully");
     }
@@ -388,9 +389,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
         return Err(anyhow!("Minimap2 exited with non-zero status: {}", minimap2_status));
     }
 
-    samtools_write_task.await??;
+    host_samtools_write_task.await??;
     samtools_task.await??;
-    let samtools_status = samtools_child.wait().await?;
+    let samtools_status = host_samtools_child_view.wait().await?;
     if samtools_status.success() {
         eprintln!("Samtools exited successfully");
     }
@@ -398,11 +399,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         return Err(anyhow!("Samtools exited with non-zero status: {}", samtools_status));
     }
 
-    if ref_pipe_path.exists() {
-        std::fs::remove_file(&ref_pipe_path)?;
+    if host_ref_pipe_path.exists() {
+        std::fs::remove_file(&host_ref_pipe_path)?;
     }
-    if query_pipe_path.exists() {
-        std::fs::remove_file(&query_pipe_path)?;
+    if host_query_pipe_path.exists() {
+        std::fs::remove_file(&host_query_pipe_path)?;
     }
 
     val_pigz_write_task.await??;
