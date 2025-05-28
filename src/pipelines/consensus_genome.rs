@@ -86,9 +86,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("validated"), "_");
     let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology.clone()), args.max_reads, args.min_read_len, args.max_read_len)?;
-    let rx_stream = ReceiverStream::new(rx);
+    let val_rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
-        rx_stream,
+        val_rx_stream,
         2,
         args.buffer_size,
         args.stall_threshold.try_into().unwrap(),
@@ -102,44 +102,44 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
 
     let mut streams_iter = val_streams.into_iter();
-    let mut fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
-    let mut pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    let val_fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
+    let val_pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
 
     //Pigz stream to intermediate file output
-    let pigz_args = generate_cli(PIGZ_TAG, &args, None)?;
-    let (mut pigz_child, _pigz_stream_task) = stream_to_cmd(pigz_stream, PIGZ_TAG, pigz_args, StreamDataType::IlluminaFastq).await?;
+    let val_pigz_args = generate_cli(PIGZ_TAG, &args, None)?;
+    let (mut val_pigz_child, _val_pigz_stream_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq).await?;
 
-    let pigz_out_stream = parse_child_output(
-        &mut pigz_child,
+    let val_pigz_out_stream = parse_child_output(
+        &mut val_pigz_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
         args.buffer_size,
     ).await?;
-    let pigz_write_task = tokio::spawn(stream_to_file(
-        pigz_out_stream,
+    let val_pigz_write_task = tokio::spawn(stream_to_file(
+        val_pigz_out_stream,
         validated_interleaved_file_path,
     ));
 
 
     // Fastp stream
-    let fastp_args = generate_cli(FASTP_TAG, &args, None)?;
-    let (mut fastp_child, fastp_stream_task) = stream_to_cmd(fastp_stream, FASTP_TAG, fastp_args, StreamDataType::IlluminaFastq).await?;
-    let fastp_out_stream = parse_child_output(
-        &mut fastp_child,
+    let val_fastp_args = generate_cli(FASTP_TAG, &args, None)?;
+    let (mut val_fastp_child, val_fastp_stream_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq).await?;
+    let val_fastp_out_stream = parse_child_output(
+        &mut val_fastp_child,
         ChildStream::Stdout,
         ParseMode::Bytes, // Use Bytes to avoid parsing issues
         args.buffer_size / 4, // Reduce buffer size
     ).await?;
-    let mut fastp_out_stream = ReceiverStream::new(fastp_out_stream);
+    let mut val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
     
-    let fastp_err_stream = parse_child_output(
-        &mut fastp_child,
+    let val_fastp_err_stream = parse_child_output(
+        &mut val_fastp_child,
         ChildStream::Stderr,
         ParseMode::Bytes,
         args.buffer_size,
     ).await?;
-    let fastp_err_task = tokio::spawn(async move {
-        let mut err_stream = ReceiverStream::new(fastp_err_stream);
+    let val_fastp_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(val_fastp_err_stream);
         if verbose {
             while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
                 eprintln!("fastp stderr: {}", String::from_utf8_lossy(&chunk));
@@ -222,7 +222,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         async move {
             let mut query_file = File::create(&query_pipe_path).await?;
             let mut byte_count = 0;
-            while let Some(item) = fastp_out_stream.next().await {
+            while let Some(item) = val_fastp_out_stream.next().await {
                 match item {
                     ParseOutput::Bytes(data) => {
                         query_file.write_all(&data).await?;
@@ -274,7 +274,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     });
 
-    
+
     //*****************
     //Host Removal
 
@@ -297,7 +297,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    
+
 
     let minimap2_err_stream = parse_child_output(
         &mut minimap2_child,
@@ -338,7 +338,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         &args,
         Some(&samtools_config),
     )?;
-    
+
     let (mut samtools_child, samtools_task) = stream_to_cmd(minimap2_out_stream, SAMTOOLS_TAG, samtools_args, StreamDataType::JustBytes).await?;
     let samtools_out_stream = parse_child_output(
         &mut samtools_child,
@@ -353,18 +353,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
         PathBuf::from("test_samtools_mapped.sam"),
     ));
 
-    
+
     //*****************
     // Cleanup, hanging tasks
-    
-    fastp_stream_task.await??;
-    fastp_err_task.await??;
-    let fastp_status = fastp_child.wait().await?;
-    if fastp_status.success() {
+
+    val_fastp_stream_task.await??;
+    val_fastp_err_task.await??;
+    let val_fastp_status = val_fastp_child.wait().await?;
+    if val_fastp_status.success() {
         eprintln!("Fastp exited successfully");
     }
     else {
-        return Err(anyhow!("Fastp exited with non-zero status: {}", fastp_status));
+        return Err(anyhow!("Fastp exited with non-zero status: {}", val_fastp_status));
     }
     
     //T_junction completion
@@ -397,7 +397,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     else {
         return Err(anyhow!("Samtools exited with non-zero status: {}", samtools_status));
     }
-    
+
     if ref_pipe_path.exists() {
         std::fs::remove_file(&ref_pipe_path)?;
     }
@@ -405,8 +405,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
         std::fs::remove_file(&query_pipe_path)?;
     }
 
-    pigz_write_task.await??;
-    let pigz_status = pigz_child.wait().await?;
+    val_pigz_write_task.await??;
+    let pigz_status = val_pigz_child.wait().await?;
     if pigz_status.success() {
         eprintln!("Pigz exited successfully");
     }
