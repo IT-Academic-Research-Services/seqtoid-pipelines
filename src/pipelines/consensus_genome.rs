@@ -62,7 +62,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     let file2_path: Option<PathBuf> = match &args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd.clone(), None, None, "");
             if file2_full_path.exists() {
                 Some(file2_full_path)
             } else {
@@ -87,7 +87,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     //*****************
     // Input Validation
     
-    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("validated"), "_");
+    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("validated"), "_");
     let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology.clone()), args.max_reads, args.min_read_len, args.max_read_len)?;
     let val_rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
@@ -162,7 +162,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     // Retrieve index or create it for host sequence and filter sequence
     let h5_index = if let Some(index_file) = &args.ref_index {
-        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd, None, None, "");
+        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd.clone(), None, None, "");
         if index_full_path.exists() {
             load_index(&index_full_path).await?
         } else {
@@ -248,6 +248,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     // Create FIFO pipe from either the host_sequence or host_accession
     let host_ref_write_task = tokio::spawn({
+        let cwd = cwd.clone();
         let host_ref_pipe_path = host_ref_pipe_path.clone();
         async move {
             
@@ -265,7 +266,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 None => {
                     match &host_sequence {
                         Some(host_sequence_file) => {
-                            let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd, None, None, "");
+                            let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd.clone(), None, None, "");
                             tokio::task::spawn_blocking(move || {
                                 write_fasta_to_fifo(&host_sequence_path, &host_ref_pipe_path)
                             }).await?
@@ -280,9 +281,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
         }
     });
-
-
-
+    
+    
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     
     let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args).await?;
@@ -313,60 +313,80 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-
-
+    
     let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require mapped reads (SAM flag 4)
+        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
     };
     let host_samtools_args_view = generate_cli(
         SAMTOOLS_TAG,
         &args,
         Some(&host_samtools_config_view),
     )?;
-    eprintln!("WATWAT {:?}", host_samtools_args_view);
-    let (mut host_samtools_child_view, samtools_task) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes).await?;
+
+    let (mut host_samtools_child_view, host_samtools_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes).await?;
     let host_samtools_out_stream_view = parse_child_output(
         &mut host_samtools_child_view,
         ChildStream::Stdout,
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
+    let host_samtools_out_stream_view = ReceiverStream::new(host_samtools_out_stream_view);
 
 
-
-    // let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("no_host"), "_");
-    // let (host_streams, host_done_rx) = t_junction(
-    //     host_samtools_out_stream_view,
-    //     2,
-    //     args.buffer_size,
-    //     args.stall_threshold.try_into().unwrap(),
-    //     Some(args.stream_sleep_ms),
-    //     50,
-    // )
-    //     .await?;
-    // 
-    // if host_streams.len() != 2 {
-    //     return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
-    // }
-    // 
-    // let mut streams_iter = host_streams.into_iter();
-    // let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-    // let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-    // 
-    // 
-    // //Output to FASTQ through samtools
-    // let host_samtools_config_fastq = SamtoolsConfig {
-    //     subcommand: SamtoolsSubcommand::Fastq,
-    //     filter_flag: Some(("-0".to_string(), no_host_file_path)), // Require mapped reads (SAM flag 4)
-    // };
-
-
-
-
-    let host_samtools_write_task = tokio::spawn(stream_to_file(
+    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
+    let no_host_file = no_host_file_path.to_string_lossy().into_owned();
+    
+    let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_view,
-        PathBuf::from("test_samtools_mapped.sam"),
+        2,
+        args.buffer_size,
+        args.stall_threshold.try_into().unwrap(),
+        Some(args.stream_sleep_ms),
+        50,
+    )
+        .await?;
+
+    if host_streams.len() != 2 {
+        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
+    }
+
+    let mut streams_iter = host_streams.into_iter();
+    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+
+
+    // //Output to FASTQ through samtools
+    let host_samtools_config_fastq = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([("-o".to_string(), Some(no_host_file)), ("-".to_string(), None)]),
+    };
+    let host_samtools_args_fastq = generate_cli(
+        SAMTOOLS_TAG,
+        &args,
+        Some(&host_samtools_config_fastq),
+    )?;
+
+    let (mut host_samtools_child_fastq, host_samtools_task_fastq) = stream_to_cmd(no_host_file_stream, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes).await?;
+
+    let host_samtools_child_fastq_err_stream = parse_child_output(
+        &mut host_samtools_child_fastq,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
+        args.buffer_size,
+    ).await?;
+    let host_samtools_child_fastq_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(host_samtools_child_fastq_err_stream);
+        while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+            eprintln!("samtools fastq stderr: {}", String::from_utf8_lossy(&chunk));
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+    
+    let host_samtools_write_task = tokio::spawn(stream_to_file(
+        no_host_output_stream,
+        PathBuf::from("test_samtools_nohost.sam"),
     ));
 
 
@@ -405,7 +425,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
 
     host_samtools_write_task.await??;
-    samtools_task.await??;
+    host_samtools_task_view.await??;
     let samtools_status = host_samtools_child_view.wait().await?;
     if samtools_status.success() {
         eprintln!("Samtools exited successfully");
@@ -429,6 +449,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
     else {
         return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
     }
+
+    host_samtools_task_fastq.await??;
+    let host_samtools_task_fastq_status = host_samtools_child_fastq.wait().await?;
+    if  host_samtools_task_fastq_status.success() {
+        eprintln!("Samtools fastq exited successfully");
+    }
+    else {
+        return Err(anyhow!("Samtools fastq exited with non-zero status: {}", host_samtools_task_fastq_status));
+    }
+
+    host_done_rx.await??;
+    eprintln!("Host t_junction done");
     
     eprintln!("Finished generating consensus genome");
     

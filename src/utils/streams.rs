@@ -207,7 +207,8 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         StreamDataType::IlluminaFastq => (131_072, 131_072),
         StreamDataType::OntFastq => (524_288, 524_288),
     };
-
+    eprintln!("{}", cmd_tag);
+    eprintln!("{:?}", args);
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)

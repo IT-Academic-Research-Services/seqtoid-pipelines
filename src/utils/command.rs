@@ -290,7 +290,7 @@ pub mod samtools {
                 
                     }
                 SamtoolsSubcommand::Fastq => {
-                    args_vec.push("view".to_string());
+                    args_vec.push("fastq".to_string());
                     args_vec.push("-@".to_string());
                     args_vec.push(args.threads.to_string());
                     args_vec.push("-c".to_string());
