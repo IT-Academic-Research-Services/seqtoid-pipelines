@@ -377,10 +377,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
     ).await?;
     let host_samtools_child_fastq_err_task = tokio::spawn(async move {
         let mut err_stream = ReceiverStream::new(host_samtools_child_fastq_err_stream);
-        while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-            eprintln!("samtools fastq stderr: {}", String::from_utf8_lossy(&chunk));
+        if verbose {
+            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                eprintln!("samtools fastq stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+        } else {
+            while err_stream.next().await.is_some() {}
         }
-
+        
         Ok::<(), anyhow::Error>(())
     });
     
@@ -459,6 +463,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         return Err(anyhow!("Samtools fastq exited with non-zero status: {}", host_samtools_task_fastq_status));
     }
 
+    host_samtools_child_fastq_err_task.await??;
     host_done_rx.await??;
     eprintln!("Host t_junction done");
     

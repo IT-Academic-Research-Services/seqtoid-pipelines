@@ -34,11 +34,9 @@ mod fastp {
             .map_err(|e| anyhow!("Failed to spawn {}: {}. Is fastp installed?", cmd_tag_owned, e))?;
 
         let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
-        eprintln!("num lines {}", lines.len());
         let first_line = lines
             .first()
             .ok_or_else(|| anyhow!("No output from fastp -v"))?;
-        eprintln!("First line: {}", first_line);
         let version = first_line
             .split_whitespace()
             .nth(1)
