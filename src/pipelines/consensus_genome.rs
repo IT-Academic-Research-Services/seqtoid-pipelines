@@ -1,22 +1,34 @@
+use std::collections::HashMap;
+use tokio_stream::StreamExt;
+use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
+use tempfile::NamedTempFile;
 use crate::cli::Arguments;
+use std::process::Command;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::command::generate_cli;
-use crate::utils::file::file_path_manipulator;
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base};
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG};
-use crate::cli::Technology;
+use crate::utils::command::{generate_cli, check_versions};
+use crate::utils::file::{file_path_manipulator};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
+use crate::utils::db::write_hdf5_seq_to_fifo;
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
+use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
+
 
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", args.module);
 
     let cwd = std::env::current_dir()?;
+    let verbose = args.verbose.clone();
 
-    
+    //External tools check
+    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG]).await?;
+
     // Arguments and files check
 
     let file1_path: PathBuf = match &args.file1 {
@@ -50,7 +62,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     let file2_path: Option<PathBuf> = match &args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd.clone(), None, None, "");
             if file2_full_path.exists() {
                 Some(file2_full_path)
             } else {
@@ -70,28 +82,16 @@ pub async fn run(args: &Arguments) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    let ref_accession = match technology {
-        Technology::Illumina => {
-            args.ref_accession.clone().ok_or_else(|| {
-                anyhow::anyhow!("HDF5 database file must be given (-d).")
-            })?
-        }
-        Technology::ONT => {
-            String::new() // or return an error if ref_accession is required
-        }
-    };
-
-    // ref_accession is accessible here
-
+    
 
     //*****************
     // Input Validation
     
-    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd, None, Some("validated"), "_");
+    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("validated"), "_");
     let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology.clone()), args.max_reads, args.min_read_len, args.max_read_len)?;
-    let rx_stream = ReceiverStream::new(rx);
+    let val_rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
-        rx_stream,
+        val_rx_stream,
         2,
         args.buffer_size,
         args.stall_threshold.try_into().unwrap(),
@@ -105,69 +105,64 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
 
     let mut streams_iter = val_streams.into_iter();
-    let mut fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
-    let mut pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    let val_fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
+    let val_pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
 
     //Pigz stream to intermediate file output
-    let pigz_args = generate_cli(PIGZ_TAG, &args)?;
-    let pigz_args: Vec<&str> = pigz_args.iter().map(|s| s.as_str()).collect();
-    let (mut pigz_child, _pigz_stream_task) = stream_to_cmd(pigz_stream, PIGZ_TAG, pigz_args, StreamDataType::IlluminaFastq).await?;
+    let val_pigz_args = generate_cli(PIGZ_TAG, &args, None)?;
+    let (mut val_pigz_child, _val_pigz_stream_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq).await?;
 
-    let pigz_out_stream = parse_child_output(
-        &mut pigz_child,
+    let val_pigz_out_stream = parse_child_output(
+        &mut val_pigz_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
         args.buffer_size,
     ).await?;
-    let pigz_write_task = tokio::spawn(stream_to_file(
-        pigz_out_stream,
+    let val_pigz_write_task = tokio::spawn(stream_to_file(
+        val_pigz_out_stream,
         validated_interleaved_file_path,
     ));
 
 
     // Fastp stream
-    let fastp_args = generate_cli(FASTP_TAG, &args)?;
-    let fastp_args: Vec<&str> = fastp_args.iter().map(|s| s.as_str()).collect();
-    let (mut fastp_child, _fastp_stream_task) = stream_to_cmd(fastp_stream, FASTP_TAG, fastp_args, StreamDataType::IlluminaFastq).await?;
-    let fastp_out_stream = parse_child_output(
-        &mut fastp_child,
+    let val_fastp_args = generate_cli(FASTP_TAG, &args, None)?;
+    let (mut val_fastp_child, val_fastp_stream_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq).await?;
+    let val_fastp_out_stream = parse_child_output(
+        &mut val_fastp_child,
         ChildStream::Stdout,
-        ParseMode::Fastq,
+        ParseMode::Bytes, // Use Bytes to avoid parsing issues
+        args.buffer_size / 4, // Reduce buffer size
+    ).await?;
+    let mut val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
+    
+    let val_fastp_err_stream = parse_child_output(
+        &mut val_fastp_child,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
         args.buffer_size,
     ).await?;
+    let val_fastp_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(val_fastp_err_stream);
+        if verbose {
+            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                eprintln!("fastp stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+        } else {
+            // Consume the stream without processing
+            while err_stream.next().await.is_some() {}
+        }
+        
+        Ok::<(), anyhow::Error>(())
+    });
 
-    // just for now write out
-    let mut fastp_write_task = tokio::spawn(stream_to_file(
-        fastp_out_stream,
-        PathBuf::from("fastp_out_test.fq"),
-    ));
 
-    // NB: the await calls below cause run to pause
-    // Await write tasks concurrently
-    // let (pigz_write_result, fastp_write_result) = join!(pigz_write_task, fastp_write_task);
-    // pigz_write_result??;
-    // fastp_write_result??;
-    pigz_write_task.await??;
-    fastp_write_task.await??;
-
-    // Check child exit statuses
-    let pigz_status = pigz_child.wait().await?;
-    if !pigz_status.success() {
-        return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
-    }
-    let fastp_status = fastp_child.wait().await?;
-    if !fastp_status.success() {
-        return Err(anyhow!("fastp exited with non-zero status: {}", fastp_status));
-    }
-
-    // Check t_junction completion
-    val_done_rx.await??;
     
     //*****************
-    //Fetch Reference from accession
+    //Fetch reference
     
+    // Retrieve index or create it for host sequence and filter sequence
     let h5_index = if let Some(index_file) = &args.ref_index {
-        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd, None, None, "");
+        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd.clone(), None, None, "");
         if index_full_path.exists() {
             load_index(&index_full_path).await?
         } else {
@@ -181,12 +176,296 @@ pub async fn run(args: &Arguments) -> Result<()> {
         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
     };
 
+
+
+    //*****************
+    //Host Removal
     
-    if technology == Technology::Illumina {
-        let seq = lookup_sequence(&ref_db_path, &h5_index, &ref_accession).await?;
-        let ref_seq = std::str::from_utf8(&seq).unwrap();
-        eprintln!("{}", ref_seq);
+    // Create FIFO pipes
+    let host_ref_temp = NamedTempFile::new()?;
+    let host_ref_pipe_path = host_ref_temp.path().to_path_buf();
+    let host_query_temp = NamedTempFile::new()?;
+    let host_query_pipe_path = host_query_temp.path().to_path_buf();
+
+
+    if host_ref_pipe_path.exists() {
+        std::fs::remove_file(&host_ref_pipe_path)?;
     }
+    Command::new("mkfifo")
+        .arg(&host_ref_pipe_path)
+        .status()?;
+    if host_query_pipe_path.exists() {
+        std::fs::remove_file(&host_query_pipe_path)?;
+    }
+    Command::new("mkfifo")
+        .arg(&host_query_pipe_path)
+        .status()?;
+    
+    
+    let host_accession = args.host_accession.clone();
+    let host_sequence = args.host_sequence.clone();
+
+    // If the host sequence file is given, load it, if not retrieve it by accession from ref_db
+    let host_seq = match &host_sequence {
+        Some(_host_sequence_file) => None,
+        None => {
+            match &host_accession {
+                Some(accession) => {
+                    Some(lookup_sequence(&ref_db_path, &h5_index, &accession).await?)
+                }
+                None => {
+                    return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+                }
+            }
+            
+        },
+        
+    };
+
+
+    // Create FIFO pipe for the fastp output to stream to minimap2
+    let host_query_write_task = tokio::spawn({
+        let host_query_pipe_path = host_query_pipe_path.clone();
+        async move {
+            let mut query_file = File::create(&host_query_pipe_path).await?;
+            let mut byte_count = 0;
+            while let Some(item) = val_fastp_out_stream.next().await {
+                match item {
+                    ParseOutput::Bytes(data) => {
+                        query_file.write_all(&data).await?;
+                        byte_count += data.len();
+                    }
+                    _ => return Err(anyhow!("Expected Bytes, got unexpected data")),
+                }
+            }
+            query_file.flush().await?;
+            if byte_count == 0 {
+                return Err(anyhow!("No data produced by fastp"));
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+
+    // Create FIFO pipe from either the host_sequence or host_accession
+    let host_ref_write_task = tokio::spawn({
+        let cwd = cwd.clone();
+        let host_ref_pipe_path = host_ref_pipe_path.clone();
+        async move {
+            
+            match host_seq {
+                Some(seq) => {
+                    match &host_accession {
+                        Some(accession) => {
+                            write_hdf5_seq_to_fifo(seq, &accession, &host_ref_pipe_path).await
+                        }
+                        None => {
+                            return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+                        }
+                    }
+                }
+                None => {
+                    match &host_sequence {
+                        Some(host_sequence_file) => {
+                            let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd.clone(), None, None, "");
+                            tokio::task::spawn_blocking(move || {
+                                write_fasta_to_fifo(&host_sequence_path, &host_ref_pipe_path)
+                            }).await?
+                        }
+                        None => {
+                            return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+                        }
+                    }
+                    
+    
+                }
+            }
+        }
+    });
+    
+    
+    let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
+    
+    let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args).await?;
+    let host_minimap2_out_stream = parse_child_output(
+        &mut host_minimap2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+
+
+    let host_minimap2_err_stream = parse_child_output(
+        &mut host_minimap2_child,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    let host_minimap2_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
+        if verbose {
+            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+        } else {
+            // Consume the stream without processing
+            while err_stream.next().await.is_some() {}
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    
+    let host_samtools_config_view = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
+    };
+    let host_samtools_args_view = generate_cli(
+        SAMTOOLS_TAG,
+        &args,
+        Some(&host_samtools_config_view),
+    )?;
+
+    let (mut host_samtools_child_view, host_samtools_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes).await?;
+    let host_samtools_out_stream_view = parse_child_output(
+        &mut host_samtools_child_view,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    let host_samtools_out_stream_view = ReceiverStream::new(host_samtools_out_stream_view);
+
+
+    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
+    let no_host_file = no_host_file_path.to_string_lossy().into_owned();
+    
+    let (host_streams, host_done_rx) = t_junction(
+        host_samtools_out_stream_view,
+        2,
+        args.buffer_size,
+        args.stall_threshold.try_into().unwrap(),
+        Some(args.stream_sleep_ms),
+        50,
+    )
+        .await?;
+
+    if host_streams.len() != 2 {
+        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
+    }
+
+    let mut streams_iter = host_streams.into_iter();
+    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+
+
+    // //Output to FASTQ through samtools
+    let host_samtools_config_fastq = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([("-o".to_string(), Some(no_host_file)), ("-".to_string(), None)]),
+    };
+    let host_samtools_args_fastq = generate_cli(
+        SAMTOOLS_TAG,
+        &args,
+        Some(&host_samtools_config_fastq),
+    )?;
+
+    let (mut host_samtools_child_fastq, host_samtools_task_fastq) = stream_to_cmd(no_host_file_stream, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes).await?;
+
+    let host_samtools_child_fastq_err_stream = parse_child_output(
+        &mut host_samtools_child_fastq,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
+        args.buffer_size,
+    ).await?;
+    let host_samtools_child_fastq_err_task = tokio::spawn(async move {
+        let mut err_stream = ReceiverStream::new(host_samtools_child_fastq_err_stream);
+        if verbose {
+            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                eprintln!("samtools fastq stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+        } else {
+            while err_stream.next().await.is_some() {}
+        }
+        
+        Ok::<(), anyhow::Error>(())
+    });
+    
+    let host_samtools_write_task = tokio::spawn(stream_to_file(
+        no_host_output_stream,
+        PathBuf::from("test_samtools_nohost.sam"),
+    ));
+
+
+    //*****************
+    // Cleanup, hanging tasks
+
+    val_fastp_stream_task.await??;
+    val_fastp_err_task.await??;
+    let val_fastp_status = val_fastp_child.wait().await?;
+    if val_fastp_status.success() {
+        eprintln!("Fastp exited successfully");
+    }
+    else {
+        return Err(anyhow!("Fastp exited with non-zero status: {}", val_fastp_status));
+    }
+    
+    //T_junction completion
+    val_done_rx.await??;
+    eprintln!("Validation t_junction done");
+
+    // Ensure Minimap2 FIFO write tasks complete
+    host_ref_write_task.await??;
+    host_query_write_task.await??;
+    eprintln!("Minimap2 fifo tasks done");
+
+
+    host_minimap2_err_task.await??;
+
+    host_minimap2_task.await??;
+    let minimap2_status = host_minimap2_child.wait().await?;
+    if minimap2_status.success() {
+        eprintln!("Minimap2 exited successfully");
+    }
+    else {
+        return Err(anyhow!("Minimap2 exited with non-zero status: {}", minimap2_status));
+    }
+
+    host_samtools_write_task.await??;
+    host_samtools_task_view.await??;
+    let samtools_status = host_samtools_child_view.wait().await?;
+    if samtools_status.success() {
+        eprintln!("Samtools exited successfully");
+    }
+    else {
+        return Err(anyhow!("Samtools exited with non-zero status: {}", samtools_status));
+    }
+
+    if host_ref_pipe_path.exists() {
+        std::fs::remove_file(&host_ref_pipe_path)?;
+    }
+    if host_query_pipe_path.exists() {
+        std::fs::remove_file(&host_query_pipe_path)?;
+    }
+
+    val_pigz_write_task.await??;
+    let pigz_status = val_pigz_child.wait().await?;
+    if pigz_status.success() {
+        eprintln!("Pigz exited successfully");
+    }
+    else {
+        return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
+    }
+
+    host_samtools_task_fastq.await??;
+    let host_samtools_task_fastq_status = host_samtools_child_fastq.wait().await?;
+    if  host_samtools_task_fastq_status.success() {
+        eprintln!("Samtools fastq exited successfully");
+    }
+    else {
+        return Err(anyhow!("Samtools fastq exited with non-zero status: {}", host_samtools_task_fastq_status));
+    }
+
+    host_samtools_child_fastq_err_task.await??;
+    host_done_rx.await??;
+    eprintln!("Host t_junction done");
     
     eprintln!("Finished generating consensus genome");
     

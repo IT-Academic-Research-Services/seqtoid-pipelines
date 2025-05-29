@@ -1,8 +1,8 @@
-use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
-use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
+use std::io::Write;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
+use anyhow::{Result, anyhow};
 use flate2::read::GzDecoder;
 use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::cli::Technology;
@@ -12,6 +12,8 @@ use crate::utils::sequence::{DNA, normal_phred_qual_string};
 use futures::Stream;
 use tokio_stream::{self as stream};
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
+use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
+use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 
 
 lazy_static! {
@@ -587,6 +589,34 @@ fn compare_read_ids(
     false
     
 }
+
+/// Writes out a FASTA file to a FIFO pipe.
+///
+/// # Arguments
+///
+/// * `fasta_path` - Valid path to a FASTA file.
+/// * 'fifo_path` - APath used by named FIFO pipe.
+///
+/// # Returns
+/// Result()
+///
+pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<()> {
+    let mut reader = match sequence_reader(fasta_path)? {
+        SequenceReader::Fasta(reader) => reader,
+        _ => return Err(anyhow!("Input file {} is not a FASTA file", fasta_path.display())),
+    };
+
+    let mut fifo_file = std::fs::File::create(fifo_path)?;
+    for record_result in reader.into_records() {
+        let record = record_result.map_err(|e| anyhow!("Error reading FASTA: {}", e))?;
+        let seq_record: SequenceRecord = record.to_owned().into();
+        let fasta_line = format!(">{}\n{}\n", seq_record.id(), String::from_utf8_lossy(seq_record.seq()));
+        fifo_file.write_all(fasta_line.as_bytes())?;
+    }
+    fifo_file.flush()?;
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {

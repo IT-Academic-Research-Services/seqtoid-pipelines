@@ -10,8 +10,12 @@ pub enum Technology {
 #[derive(Parser, Debug)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
+    
     #[arg(short, long)]
     pub module: String,
+
+    #[arg(short = 'v', long = "verbose", action)]
+    pub verbose: bool,
 
     #[arg(short = 'i', long = "file1")]
     pub file1: Option<String>,
@@ -49,7 +53,13 @@ pub struct Arguments {
     #[arg(long, default_value_t = 10000)]
     pub buffer_size: usize,
 
-    #[arg(short = 'a', long = "accession")]
+    #[arg(short = 'a', long = "host_accession")]
+    pub host_accession : Option<String>,
+
+    #[arg(long)]
+    pub host_sequence : Option<String>,
+
+    #[arg(short = 'r', long = "ref_accession")]
     pub ref_accession : Option<String>,
 
     #[arg(short = 'd', long = "db")]
@@ -57,5 +67,8 @@ pub struct Arguments {
 
     #[arg(long = "index")]
     pub ref_index : Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    pub limit_align_threads: bool,
     
 }

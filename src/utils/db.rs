@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::io::Write;
+use anyhow::{Result, anyhow};
 use hdf5_metno::{Extent, File, H5Type};
 use hdf5_metno::types::{FixedAscii, VarLenArray};
 use tokio::task;
@@ -7,6 +9,8 @@ use crate::utils::fastx::SequenceRecord;
 use fxhash::FxHashMap as HashMap;
 use futures::StreamExt;
 use crate::cli::Technology;
+use tokio::fs::File as TokioFile;
+use tokio::io::AsyncWriteExt;
 
 const CHUNK_SIZE: usize = 1000;
 const TEST_FASTA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt.fa");
@@ -357,6 +361,30 @@ pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u
 
     let seq: VarLenArray<u8> = seq_dataset.read_slice::<VarLenArray<u8>, std::ops::Range<usize>, ndarray::Ix1>(*index as usize..*index as usize + 1)?[0].clone();
     Ok(seq.to_vec())
+}
+
+/// Converts the retrieved sequence from an HDF5 file to a FIFO pipe.
+///
+/// # Arguments
+///
+/// * `seq` - The retrieved sequence.
+/// * 'accession` - Accession ID for naming in the FIFO pipe.
+/// * `fifo_path' - Will be used as named pipe for passing.
+///
+/// # Returns
+/// Result
+///
+pub async fn write_hdf5_seq_to_fifo(seq: Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
+    let mut fifo_file = TokioFile::create(fifo_path).await?;
+    fifo_file.write_all(format!(">{}\n", accession).as_bytes()).await?;
+    let seq_str = String::from_utf8(seq)?;
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
+    for chunk in seq_str.as_bytes().chunks(CHUNK_SIZE) {
+        fifo_file.write_all(chunk).await?;
+    }
+    fifo_file.write_all(b"\n").await?;
+    fifo_file.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]
