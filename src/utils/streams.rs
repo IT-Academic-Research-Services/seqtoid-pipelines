@@ -21,7 +21,6 @@ pub enum StreamDataType {
 }
 
 pub trait ToBytes {
-    #[allow(dead_code)]
     fn to_bytes(&self) -> Result<Vec<u8>>;
 }
 
@@ -60,23 +59,29 @@ impl ToBytes for SequenceRecord {
     }
 }
 
+impl ToBytes for ParseOutput {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            ParseOutput::Fastq(record) => record.to_bytes(),
+            ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum ChildStream {
     Stdout,
-    #[allow(dead_code)]
     Stderr,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum ParseMode {
-    #[allow(dead_code)]
     Fastq,
     Bytes,
 }
 
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
-    #[allow(dead_code)]
     Fastq(SequenceRecord),
     Bytes(Vec<u8>),
 }
@@ -194,7 +199,7 @@ where
 pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     rx: mpsc::Receiver<T>,
     cmd_tag: &str,
-    args: Vec<&str>,
+    args: Vec<String>,
     data_type: StreamDataType,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let (batch_size_bytes, writer_capacity) = match data_type {
@@ -202,7 +207,6 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         StreamDataType::IlluminaFastq => (131_072, 131_072),
         StreamDataType::OntFastq => (524_288, 524_288),
     };
-
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
@@ -239,12 +243,6 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
             writer.write_all(&batch).await?;
             writer.flush().await?;
             total_written += batch.len();
-            eprintln!(
-                "Wrote final batch of {} bytes to {} (total: {} bytes)",
-                batch.len(),
-                cmd_tag_owned,
-                total_written
-            );
         }
 
         writer.flush().await?;
@@ -252,6 +250,26 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         eprintln!("Completed writing to {} (total: {} bytes)", cmd_tag_owned, total_written);
         Ok(())
     });
+
+    Ok((child, task))
+}
+
+
+pub async fn spawn_cmd(
+    cmd_tag: &str,
+    args: Vec<String>,
+) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
+    eprintln!("spawning {}", cmd_tag);
+    let cmd_tag_owned = cmd_tag.to_string();
+    let mut child = Command::new(&cmd_tag_owned)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+
+    let task = tokio::spawn(async move { Ok(()) });
 
     Ok((child, task))
 }
@@ -812,6 +830,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_stream_to_cmd_valid_parseoutput() -> Result<()> {
+        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
+        let rx = outputs.pop().unwrap();
+        let (tx, rx_parse) = mpsc::channel(100);
+        tokio::spawn(async move {
+            let mut stream = ReceiverStream::new(rx);
+            while let Some(record) = stream.next().await {
+                if tx.send(ParseOutput::Fastq(record)).await.is_err() {
+                    eprintln!("Failed to send ParseOutput");
+                    break;
+                }
+            }
+        });
+        let (mut child, task) = stream_to_cmd(rx_parse, "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let mut stdout = child.stdout.take().unwrap();
+        let mut output = Vec::new();
+        tokio::io::copy(&mut stdout, &mut output).await?;
+        task.await??;
+        done_rx.await??;
+        let status = child.wait().await?;
+        assert!(status.success(), "Child process should exit successfully");
+        assert!(!output.is_empty(), "Output should contain FASTQ data");
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(output_str.contains("@read1"), "Output should contain first read ID");
+        assert!(output_str.contains("@read2"), "Output should contain second read ID");
+        Ok(())
+    }
+
+
+    #[tokio::test]
     async fn test_stream_to_cmd_invalid_command() -> Result<()> {
         let stream = fastx_generator(2, 10, 35.0, 3.0);
         let (mut outputs, _done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
@@ -882,7 +931,7 @@ mod tests {
     async fn test_stream_to_cmd_premature_exit() -> Result<()> {
         let stream = fastx_generator(10, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n", "1"], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n".to_string(), "1".to_string()], StreamDataType::IlluminaFastq).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;

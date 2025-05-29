@@ -20,6 +20,7 @@ hdf5-metno = { version = "0.10.1", features = ["blosc", "lzf"] }
 fxhash = "0.2.1"
 bincode = { version = "2.0.1", features = ["serde"] }
 ndarray = "0.16.1"
+num_cpus = "1.16"
 
 [dev-dependencies]
 sysinfo = "0.35.0"

@@ -20,6 +20,9 @@ async fn main() -> Result<()> {
     let run_start = Instant::now();
     println!("\n-------------\n SeqToID\n-------------\n");
 
+    #[cfg(not(unix))]
+    Err(anyhow!("Named pipes are not supported on non-Unix systems."));
+
     let dir = env::current_dir()?;
     println!("The current directory is {:?}\n", dir);
 
