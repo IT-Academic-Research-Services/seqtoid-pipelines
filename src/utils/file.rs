@@ -121,18 +121,16 @@ pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
 /// Checks if a file has one of a set of extensions
 /// # Arguments
 ///
-/// * `path`: PathBuf - File path
-/// * 'extensions': &[&str] = extensions (from lazy_static)
+/// * `extensions`: from extension_remover
+/// * 'valid_extensions': &[&str] = extensions (from lazy_static)
 ///
 /// # Returns
 /// Bool
-fn has_extension(path: &PathBuf, extensions: &[&str]) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| extensions.iter().any(|&e| e.eq_ignore_ascii_case(ext)))
-        .unwrap_or(false)
+pub fn has_any_extension_from_path(extensions: &[String], valid_extensions: &[&str]) -> bool {
+    extensions
+        .iter()
+        .any(|ext| valid_extensions.iter().any(|&valid| ext.eq_ignore_ascii_case(valid)))
 }
-
 
 /// Scan a directory for files with extensions matching
 /// # Arguments
@@ -142,24 +140,25 @@ fn has_extension(path: &PathBuf, extensions: &[&str]) -> bool {
 ///
 /// # Returns
 /// Result<Vev<PathBuf>>
-pub fn scan_files_with_extensions(dir: &PathBuf, extensions: &[&str]) -> Result<Vec<PathBuf>> {
+pub fn scan_files_with_extensions(dir: &PathBuf, valid_extensions: &[&str]) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
         return Err(anyhow!("Provided path is not a directory: {}", dir.display()));
     }
 
     let mut matching_files = Vec::new();
-
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() && has_extension(&path, extensions) {
-            let full_path = file_path_manipulator(&path, &dir, None, None, "");
+        let (_, extensions) = extension_remover(&path);
+        
+        if path.is_file() && has_any_extension_from_path(&extensions, valid_extensions) {
+            let full_path = file_path_manipulator(&path, dir, None, None, "");
             matching_files.push(full_path);
         }
     }
 
     if matching_files.is_empty() {
-        return Err(anyhow!("No files with extensions {:?} found in directory: {}", extensions, dir.display()));
+        return Err(anyhow!("No files with extensions {:?} found in directory: {}", valid_extensions, dir.display()));
     }
 
     Ok(matching_files)

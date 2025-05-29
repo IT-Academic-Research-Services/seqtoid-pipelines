@@ -63,7 +63,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 
         all_fastas = the_fastas.clone();
     }
-    eprintln!("FASTA files  {:?}", all_fastas);
+    eprintln!("FASTA files for input {:?}", all_fastas);
     
     let h5_path = match &args.ref_db {
         Some(file) => {
