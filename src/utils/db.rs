@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::io::Write;
 use anyhow::{Result, anyhow};
 use hdf5_metno::{Extent, File, H5Type};
@@ -40,34 +40,58 @@ pub async fn write_sequences_to_hdf5(
     rx_stream: &mut ReceiverStream<SequenceRecord>,
     hdf5_file_name: &PathBuf,
 ) -> anyhow::Result<()> {
-    let hdf5_file = File::create(hdf5_file_name)?;
-    let hdf5_group = hdf5_file.create_group("db")?;
+    // Open file in read-write mode, create if it doesn't exist
+    let hdf5_file = if hdf5_file_name.exists() {
+        File::open_rw::<&Path>(hdf5_file_name.as_ref())?
+    } else {
+        File::create::<&Path>(hdf5_file_name.as_ref())?
+    };
+    
+    let hdf5_group = match hdf5_file.group("db") {
+        Ok(group) => group,
+        Err(_) => hdf5_file.create_group("db")?,
+    };
+    
+    let seq_dataset = match hdf5_group.dataset("sequences") {
+        Ok(dataset) => dataset,
+        Err(_) => hdf5_group
+            .new_dataset::<VarLenArray<u8>>()
+            .shape([Extent::resizable(0)])
+            .chunk([CHUNK_SIZE])
+            .shuffle()
+            .deflate(6)
+            .create("sequences")?,
+    };
 
-    let seq_dataset = hdf5_group
-        .new_dataset::<VarLenArray<u8>>()
-        .shape([Extent::resizable(0)])
-        .chunk([CHUNK_SIZE])
-        .shuffle().deflate(6)
-        .create("sequences")?;
+    let id_dataset = match hdf5_group.dataset("id") {
+        Ok(dataset) => dataset,
+        Err(_) => hdf5_group
+            .new_dataset::<FixedAscii<24>>()
+            .shape([Extent::resizable(0)])
+            .chunk([CHUNK_SIZE])
+            .shuffle()
+            .deflate(6)
+            .create("id")?,
+    };
 
-    let id_dataset = hdf5_group
-        .new_dataset::<FixedAscii<24>>()
-        .shape([Extent::resizable(0)])
-        .chunk([CHUNK_SIZE])
-        .shuffle().deflate(6)
-        .create("id")?;
+    let index_dataset = match hdf5_group.dataset("index") {
+        Ok(dataset) => dataset,
+        Err(_) => hdf5_group
+            .new_dataset::<IndexEntry>()
+            .shape([Extent::resizable(0)])
+            .chunk([CHUNK_SIZE])
+            .shuffle()
+            .deflate(6)
+            .create("index")?,
+    };
 
-    let index_dataset = hdf5_group
-        .new_dataset::<IndexEntry>()
-        .shape([Extent::resizable(0)])
-        .chunk([CHUNK_SIZE])
-        .shuffle().deflate(6)
-        .create("index")?;
+    // Get current size for appending
+    let current_size = seq_dataset.shape()[0];
+    let mut global_index: u64 = current_size as u64;
 
     let mut seq_buffer: Vec<VarLenArray<u8>> = Vec::new();
     let mut id_buffer: Vec<FixedAscii<24>> = Vec::new();
     let mut index_buffer: Vec<IndexEntry> = Vec::new();
-    let mut global_index: u64 = 0;
 
     while let Some(record) = rx_stream.next().await {
         let accession = record
@@ -307,8 +331,7 @@ pub async fn check_db(h5_path: &PathBuf, index_path: &PathBuf, target_id: Option
         }
 
         let index_map = load_index(index_path).await?;
-        let seq = lookup_sequence(h5_path, &index_map, &id.to_string()).await?;
-        println!("Found sequence for ID '{}': {:?}", id, seq);
+        let _seq = lookup_sequence(h5_path, &index_map, &id.to_string()).await?;
     }
 
     Ok(())
