@@ -19,6 +19,8 @@ use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
 
 
+const ERCC_FASTA: &str = "ercc_sequences.fasta";
+
 pub async fn run(args: &Arguments) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", args.module);
@@ -82,7 +84,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    
+    let ercc_path = file_path_manipulator(&PathBuf::from(ERCC_FASTA), &cwd, None, None, "");
+    if !ercc_path.exists() {
+        return Err(anyhow!("Specficied ercc {:?} does not exist.", ercc_path));
+    }
 
     //*****************
     // Input Validation
@@ -184,21 +189,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Create FIFO pipes
     let host_ref_temp = NamedTempFile::new()?;
     let host_ref_pipe_path = host_ref_temp.path().to_path_buf();
-    let host_query_temp = NamedTempFile::new()?;
-    let host_query_pipe_path = host_query_temp.path().to_path_buf();
-
-
+    
     if host_ref_pipe_path.exists() {
         std::fs::remove_file(&host_ref_pipe_path)?;
     }
     Command::new("mkfifo")
         .arg(&host_ref_pipe_path)
-        .status()?;
-    if host_query_pipe_path.exists() {
-        std::fs::remove_file(&host_query_pipe_path)?;
-    }
-    Command::new("mkfifo")
-        .arg(&host_query_pipe_path)
         .status()?;
     
     
@@ -385,40 +381,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
             eprintln!("illumina");
             //*****************
             // ERCC
-            
-            // let ercc_query_temp = NamedTempFile::new()?;
-            // let ercc_query_pipe_path = ercc_query_temp.path().to_path_buf();
-            // if ercc_query_pipe_path.exists() {
-            //     std::fs::remove_file(&host_query_pipe_path)?;
-            // }
-            // Command::new("mkfifo")
-            //     .arg(&ercc_query_pipe_path)
-            //     .status()?;
+
+            // let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
             // 
-            // let ercc_query_write_task = tokio::spawn({
-            //     let ercc_query_pipe_path = ercc_query_pipe_path.clone();
-            //     async move {
-            //         let mut query_file = File::create(&ercc_query_pipe_path).await?;
-            //         let mut byte_count = 0;
-            //         while let Some(item) = no_host_output_stream.next().await {
-            //             match item {
-            //                 ParseOutput::Bytes(data) => {
-            //                     query_file.write_all(&data).await?;
-            //                     byte_count += data.len();
-            //                 }
-            //                 _ => return Err(anyhow!("Expected Bytes, got unexpected data")),
-            //             }
-            //         }
-            //         query_file.flush().await?;
-            //         if byte_count == 0 {
-            //             return Err(anyhow!("No data produced"));
-            //         }
-            //         Ok::<(), anyhow::Error>(())
-            //     }
-            // });
-            // 
-            // 
-            // let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&("ercc_sequences.fasta", ercc_query_pipe_path.clone())))?;
+            // let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
             // eprintln!("{:?}", ercc_minimap2_args);
             // 
             // let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args).await?;
@@ -460,7 +426,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
 
-
+        ercc_query_write_task.await??;
 
         } // end tech illumina
         Technology::ONT => {
@@ -515,9 +481,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
     if host_ref_pipe_path.exists() {
         std::fs::remove_file(&host_ref_pipe_path)?;
     }
-    if host_query_pipe_path.exists() {
-        std::fs::remove_file(&host_query_pipe_path)?;
-    }
+
+
+
+    
 
     val_pigz_write_task.await??;
     let pigz_status = val_pigz_child.wait().await?;
