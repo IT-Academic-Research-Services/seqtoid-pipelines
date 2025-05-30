@@ -4,13 +4,13 @@ use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
-use crate::cli::Arguments;
+use crate::cli::{Arguments, Technology};
 use std::process::Command;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{file_path_manipulator};
+use crate::utils::file::{file_path_manipulator, write_parse_output_to_temp};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
@@ -224,27 +224,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
     // Create FIFO pipe for the fastp output to stream to minimap2
-    let host_query_write_task = tokio::spawn({
-        let host_query_pipe_path = host_query_pipe_path.clone();
-        async move {
-            let mut query_file = File::create(&host_query_pipe_path).await?;
-            let mut byte_count = 0;
-            while let Some(item) = val_fastp_out_stream.next().await {
-                match item {
-                    ParseOutput::Bytes(data) => {
-                        query_file.write_all(&data).await?;
-                        byte_count += data.len();
-                    }
-                    _ => return Err(anyhow!("Expected Bytes, got unexpected data")),
-                }
-            }
-            query_file.flush().await?;
-            if byte_count == 0 {
-                return Err(anyhow!("No data produced by fastp"));
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    });
+    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
+  
 
     // Create FIFO pipe from either the host_sequence or host_accession
     let host_ref_write_task = tokio::spawn({
@@ -387,12 +368,106 @@ pub async fn run(args: &Arguments) -> Result<()> {
         
         Ok::<(), anyhow::Error>(())
     });
-    
+
+    // let mut no_host_output_stream = ReceiverStream::new(no_host_output_stream);
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_output_stream,
         PathBuf::from("test_samtools_nohost.sam"),
     ));
 
+    
+    
+    //*****************
+    // Split by Technology
+
+    match technology {
+        Technology::Illumina => {
+            eprintln!("illumina");
+            //*****************
+            // ERCC
+            
+            // let ercc_query_temp = NamedTempFile::new()?;
+            // let ercc_query_pipe_path = ercc_query_temp.path().to_path_buf();
+            // if ercc_query_pipe_path.exists() {
+            //     std::fs::remove_file(&host_query_pipe_path)?;
+            // }
+            // Command::new("mkfifo")
+            //     .arg(&ercc_query_pipe_path)
+            //     .status()?;
+            // 
+            // let ercc_query_write_task = tokio::spawn({
+            //     let ercc_query_pipe_path = ercc_query_pipe_path.clone();
+            //     async move {
+            //         let mut query_file = File::create(&ercc_query_pipe_path).await?;
+            //         let mut byte_count = 0;
+            //         while let Some(item) = no_host_output_stream.next().await {
+            //             match item {
+            //                 ParseOutput::Bytes(data) => {
+            //                     query_file.write_all(&data).await?;
+            //                     byte_count += data.len();
+            //                 }
+            //                 _ => return Err(anyhow!("Expected Bytes, got unexpected data")),
+            //             }
+            //         }
+            //         query_file.flush().await?;
+            //         if byte_count == 0 {
+            //             return Err(anyhow!("No data produced"));
+            //         }
+            //         Ok::<(), anyhow::Error>(())
+            //     }
+            // });
+            // 
+            // 
+            // let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&("ercc_sequences.fasta", ercc_query_pipe_path.clone())))?;
+            // eprintln!("{:?}", ercc_minimap2_args);
+            // 
+            // let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args).await?;
+            // let ercc_minimap2_out_stream = parse_child_output(
+            //     &mut ercc_minimap2_child,
+            //     ChildStream::Stdout,
+            //     ParseMode::Bytes,
+            //     args.buffer_size / 4,
+            // ).await?;
+            // 
+            // 
+            // let host_minimap2_err_stream = parse_child_output(
+            //     &mut ercc_minimap2_child,
+            //     ChildStream::Stderr,
+            //     ParseMode::Bytes,
+            //     args.buffer_size / 4,
+            // ).await?;
+            // let ercc_minimap2_err_task = tokio::spawn(async move {
+            //     let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
+            //     if verbose {
+            //         while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+            //             eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
+            //         }
+            //     } else {
+            //         while err_stream.next().await.is_some() {}
+            //     }
+            //     Ok::<(), anyhow::Error>(())
+            // });
+            // 
+            // 
+
+
+
+
+
+
+
+
+
+
+
+
+
+        } // end tech illumina
+        Technology::ONT => {
+            return Err(anyhow!("Minion not ready"));
+        }
+
+    }
 
     //*****************
     // Cleanup, hanging tasks
@@ -427,8 +502,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     else {
         return Err(anyhow!("Minimap2 exited with non-zero status: {}", minimap2_status));
     }
-
-    host_samtools_write_task.await??;
+    
     host_samtools_task_view.await??;
     let samtools_status = host_samtools_child_view.wait().await?;
     if samtools_status.success() {
