@@ -115,7 +115,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     //Pigz stream to intermediate file output
     let val_pigz_args = generate_cli(PIGZ_TAG, &args, None)?;
-    let (mut val_pigz_child, _val_pigz_stream_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq).await?;
+    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq, args.verbose).await?;
 
     let val_pigz_out_stream = parse_child_output(
         &mut val_pigz_child,
@@ -131,35 +131,15 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     // Fastp stream
     let val_fastp_args = generate_cli(FASTP_TAG, &args, None)?;
-    let (mut val_fastp_child, val_fastp_stream_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq).await?;
+    let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq, args.verbose).await?;
     let val_fastp_out_stream = parse_child_output(
         &mut val_fastp_child,
         ChildStream::Stdout,
-        ParseMode::Bytes, // Use Bytes to avoid parsing issues
-        args.buffer_size / 4, // Reduce buffer size
+        ParseMode::Bytes, 
+        args.buffer_size / 4,
     ).await?;
     let mut val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
     
-    let val_fastp_err_stream = parse_child_output(
-        &mut val_fastp_child,
-        ChildStream::Stderr,
-        ParseMode::Bytes,
-        args.buffer_size,
-    ).await?;
-    let val_fastp_err_task = tokio::spawn(async move {
-        let mut err_stream = ReceiverStream::new(val_fastp_err_stream);
-        if verbose {
-            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-                eprintln!("fastp stderr: {}", String::from_utf8_lossy(&chunk));
-            }
-        } else {
-            // Consume the stream without processing
-            while err_stream.next().await.is_some() {}
-        }
-        
-        Ok::<(), anyhow::Error>(())
-    });
-
 
     
     //*****************
@@ -281,7 +261,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Some(&host_samtools_config_view),
     )?;
 
-    let (mut host_samtools_child_view, host_samtools_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes).await?;
+    let (mut host_samtools_child_view, host_samtools_task_view, host_samtools_err_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
     let host_samtools_out_stream_view = parse_child_output(
         &mut host_samtools_child_view,
         ChildStream::Stdout,
@@ -302,7 +282,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Some(&host_samtools_config_fastq),
     )?;
 
-    let (mut host_samtools_child_fastq, host_samtools_task_fastq) = stream_to_cmd(host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes).await?;
+    let (mut host_samtools_child_fastq, host_samtools_task_fastq, host_samtools_err_task_fastq) = stream_to_cmd(host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
     let host_samtools_out_stream_fastq = parse_child_output(
         &mut host_samtools_child_fastq,
         ChildStream::Stdout,
@@ -311,24 +291,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
     ).await?;
     let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
     
-    let host_samtools_child_fastq_err_stream = parse_child_output(
-        &mut host_samtools_child_fastq,
-        ChildStream::Stderr,
-        ParseMode::Bytes,
-        args.buffer_size,
-    ).await?;
-    let host_samtools_child_fastq_err_task = tokio::spawn(async move {
-        let mut err_stream = ReceiverStream::new(host_samtools_child_fastq_err_stream);
-        if verbose {
-            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-                eprintln!("samtools fastq stderr: {}", String::from_utf8_lossy(&chunk));
-            }
-        } else {
-            while err_stream.next().await.is_some() {}
-        }
-        
-        Ok::<(), anyhow::Error>(())
-    });
 
     // Split for file write and passing on to next stage
     let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
@@ -401,6 +363,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     val_fastp_stream_task.await??;
     val_fastp_err_task.await??;
+
     let val_fastp_status = val_fastp_child.wait().await?;
     if val_fastp_status.success() {
         eprintln!("Fastp exited successfully");
@@ -431,6 +394,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
     
     host_samtools_task_view.await??;
+    host_samtools_err_task_view.await??;
     let samtools_status = host_samtools_child_view.wait().await?;
     if samtools_status.success() {
         eprintln!("Samtools exited successfully");
@@ -445,8 +409,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
 
-    
 
+    val_pigz_stream_task.await??;
+    val_pigz_err_task.await??;
     val_pigz_write_task.await??;
     let pigz_status = val_pigz_child.wait().await?;
     if pigz_status.success() {
@@ -457,6 +422,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
 
     host_samtools_task_fastq.await??;
+    host_samtools_err_task_fastq.await??;
+
     let host_samtools_task_fastq_status = host_samtools_child_fastq.wait().await?;
     if  host_samtools_task_fastq_status.success() {
         eprintln!("Samtools fastq exited successfully");
@@ -466,7 +433,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
 
     host_samtools_write_task.await??;
-    host_samtools_child_fastq_err_task.await??;
+
     host_minimap2_err_task.await??;
     host_done_rx.await??;
     eprintln!("Host t_junction done");
