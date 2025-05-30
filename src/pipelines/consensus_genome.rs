@@ -365,11 +365,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    // let mut no_host_output_stream = ReceiverStream::new(no_host_output_stream);
-    let host_samtools_write_task = tokio::spawn(stream_to_file(
-        no_host_output_stream,
-        PathBuf::from("test_samtools_nohost.sam"),
-    ));
+    let mut no_host_output_stream = ReceiverStream::new(no_host_output_stream);
+    // let host_samtools_write_task = tokio::spawn(stream_to_file(
+    //     no_host_output_stream,
+    //     PathBuf::from("test_samtools_nohost.sam"),
+    // ));
 
     
     
@@ -382,51 +382,50 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //*****************
             // ERCC
 
-            // let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
-            // 
-            // let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
-            // eprintln!("{:?}", ercc_minimap2_args);
-            // 
-            // let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args).await?;
-            // let ercc_minimap2_out_stream = parse_child_output(
-            //     &mut ercc_minimap2_child,
-            //     ChildStream::Stdout,
-            //     ParseMode::Bytes,
-            //     args.buffer_size / 4,
-            // ).await?;
-            // 
-            // 
-            // let host_minimap2_err_stream = parse_child_output(
-            //     &mut ercc_minimap2_child,
-            //     ChildStream::Stderr,
-            //     ParseMode::Bytes,
-            //     args.buffer_size / 4,
-            // ).await?;
-            // let ercc_minimap2_err_task = tokio::spawn(async move {
-            //     let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
-            //     if verbose {
-            //         while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-            //             eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
-            //         }
-            //     } else {
-            //         while err_stream.next().await.is_some() {}
-            //     }
-            //     Ok::<(), anyhow::Error>(())
-            // });
-            // 
-            // 
+            let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
+
+            let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
+            eprintln!("{:?}", ercc_minimap2_args);
+
+            let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args).await?;
+            let ercc_minimap2_out_stream = parse_child_output(
+                &mut ercc_minimap2_child,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+
+            let host_minimap2_err_stream = parse_child_output(
+                &mut ercc_minimap2_child,
+                ChildStream::Stderr,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+            let ercc_minimap2_err_task = tokio::spawn(async move {
+                let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
+                if verbose {
+                    while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
+                        eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
+                    }
+                } else {
+                    while err_stream.next().await.is_some() {}
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+
+            
 
 
-
-
-
-
-
+            let ercc_minimap_write_task = tokio::spawn(stream_to_file(
+                ercc_minimap2_out_stream,
+                PathBuf::from("test_samtools_ercc.sam"),
+            ));
 
 
 
 
         ercc_query_write_task.await??;
+        ercc_minimap_write_task.await??;
 
         } // end tech illumina
         Technology::ONT => {
