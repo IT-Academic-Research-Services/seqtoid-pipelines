@@ -258,6 +258,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 pub async fn spawn_cmd(
     cmd_tag: &str,
     args: Vec<String>,
+    verbose: bool
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     eprintln!("spawning {}", cmd_tag);
     let cmd_tag_owned = cmd_tag.to_string();
@@ -269,9 +270,38 @@ pub async fn spawn_cmd(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
 
-    let task = tokio::spawn(async move { Ok(()) });
+    let stderr_task = {
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+        let cmd_tag_clone = cmd_tag_owned.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
+            let mut buffer = vec![0u8; 8192]; // Buffer for reading stderr chunks
+            if verbose {
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
+                            eprintln!("[{} stderr]: {}", cmd_tag_clone, stderr_chunk);
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading stderr for {}: {}", cmd_tag_clone, e);
+                            return Err(anyhow!("Failed to read stderr: {}", e));
+                        }
+                    }
+                }
+            } else {
+                // Consume stderr without printing to prevent pipe blocking
+                while reader.read(&mut buffer).await? != 0 {}
+            }
+            Ok(())
+        })
+    };
 
-    Ok((child, task))
+    Ok((child, stderr_task))
 }
 
 /// Parse the output of a stream, either Fastq or simple bytes.
@@ -1067,6 +1097,26 @@ mod tests {
         let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cmd_stderr_verbose() -> Result<()> {
+        let args = vec!["-c".to_string(), "echo error >&2".to_string()];
+        let (mut child, stderr_task) = spawn_cmd("sh", args, true).await?;
+        let status = child.wait().await?;
+        stderr_task.await??;
+        assert!(status.success(), "Child process should exit successfully");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cmd_stderr_non_verbose() -> Result<()> {
+        let args = vec!["-c".to_string(), "echo error >&2".to_string()];
+        let (mut child, stderr_task) = spawn_cmd("sh", args, false).await?;
+        let status = child.wait().await?;
+        stderr_task.await??;
+        assert!(status.success(), "Child process should exit successfully");
         Ok(())
     }
 }

@@ -262,7 +262,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     
-    let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args).await?;
+    let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, args.verbose).await?;
     let host_minimap2_out_stream = parse_child_output(
         &mut host_minimap2_child,
         ChildStream::Stdout,
@@ -387,7 +387,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
             eprintln!("{:?}", ercc_minimap2_args);
 
-            let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args).await?;
+            let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
             let ercc_minimap2_out_stream = parse_child_output(
                 &mut ercc_minimap2_child,
                 ChildStream::Stdout,
