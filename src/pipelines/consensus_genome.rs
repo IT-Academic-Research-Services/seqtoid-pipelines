@@ -288,35 +288,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    let host_samtools_out_stream_view = ReceiverStream::new(host_samtools_out_stream_view);
-
-
-    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
-    let no_host_file = no_host_file_path.to_string_lossy().into_owned();
-    
-    let (host_streams, host_done_rx) = t_junction(
-        host_samtools_out_stream_view,
-        2,
-        args.buffer_size,
-        args.stall_threshold.try_into().unwrap(),
-        Some(args.stream_sleep_ms),
-        50,
-    )
-        .await?;
-
-    if host_streams.len() != 2 {
-        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
-    }
-
-    let mut streams_iter = host_streams.into_iter();
-    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    // let host_samtools_out_stream_view = ReceiverStream::new(host_samtools_out_stream_view);
 
 
     // //Output to FASTQ through samtools
     let host_samtools_config_fastq = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([("-o".to_string(), Some(no_host_file)), ("-".to_string(), None)]),
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
     };
     let host_samtools_args_fastq = generate_cli(
         SAMTOOLS_TAG,
@@ -324,8 +302,15 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Some(&host_samtools_config_fastq),
     )?;
 
-    let (mut host_samtools_child_fastq, host_samtools_task_fastq) = stream_to_cmd(no_host_file_stream, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes).await?;
-
+    let (mut host_samtools_child_fastq, host_samtools_task_fastq) = stream_to_cmd(host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes).await?;
+    let host_samtools_out_stream_fastq = parse_child_output(
+        &mut host_samtools_child_fastq,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
+    
     let host_samtools_child_fastq_err_stream = parse_child_output(
         &mut host_samtools_child_fastq,
         ChildStream::Stderr,
@@ -345,11 +330,41 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
+    // split for file and passing on
+    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
+    eprintln!("no_host_path: {}", no_host_file_path.display());
+    // let no_host_file = no_host_file_path.to_string_lossy().into_owned();
+
+    let (host_streams, host_done_rx) = t_junction(
+        host_samtools_out_stream_fastq,
+        2,
+        args.buffer_size,
+        args.stall_threshold.try_into().unwrap(),
+        Some(args.stream_sleep_ms),
+        50,
+    )
+        .await?;
+    
+    if host_streams.len() != 2 {
+        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
+    }
+    
+    let mut streams_iter = host_streams.into_iter();
+    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    
+    
     let mut no_host_output_stream = ReceiverStream::new(no_host_output_stream);
-    // let host_samtools_write_task = tokio::spawn(stream_to_file(
-    //     no_host_output_stream,
-    //     PathBuf::from("test_samtools_nohost.sam"),
-    // ));
+
+    while let Some(ParseOutput::Bytes(chunk)) = no_host_output_stream.next().await {
+        eprintln!("WTFFFFFF: {}", String::from_utf8_lossy(&chunk));
+    }
+    
+    
+    let host_samtools_write_task = tokio::spawn(stream_to_file(
+        no_host_file_stream,
+        PathBuf::from(no_host_file_path),
+    ));
 
     
     
@@ -362,27 +377,27 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //*****************
             // ERCC
 
-            let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
-
-            let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
-            eprintln!("{:?}", ercc_minimap2_args);
-
-            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
-            let ercc_minimap2_out_stream = parse_child_output(
-                &mut ercc_minimap2_child,
-                ChildStream::Stdout,
-                ParseMode::Bytes,
-                args.buffer_size / 4,
-            ).await?;
- 
-            let ercc_minimap_write_task = tokio::spawn(stream_to_file(
-                ercc_minimap2_out_stream,
-                PathBuf::from("test_samtools_ercc.sam"),
-            ));
-
-        ercc_query_write_task.await??;
-        ercc_minimap_write_task.await??;
-        ercc_minimap2_err_task.await??;
+        //     let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
+        // 
+        //     let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
+        //     eprintln!("{:?}", ercc_minimap2_args);
+        // 
+        //     let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
+        //     let ercc_minimap2_out_stream = parse_child_output(
+        //         &mut ercc_minimap2_child,
+        //         ChildStream::Stdout,
+        //         ParseMode::Bytes,
+        //         args.buffer_size / 4,
+        //     ).await?;
+        // 
+        //     let ercc_minimap_write_task = tokio::spawn(stream_to_file(
+        //         ercc_minimap2_out_stream,
+        //         PathBuf::from("test_samtools_ercc.sam"),
+        //     ));
+        // 
+        // ercc_query_write_task.await??;
+        // ercc_minimap_write_task.await??;
+        // ercc_minimap2_err_task.await??;
 
         } // end tech illumina
         Technology::ONT => {
@@ -460,6 +475,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         return Err(anyhow!("Samtools fastq exited with non-zero status: {}", host_samtools_task_fastq_status));
     }
 
+    host_samtools_write_task.await??;
     host_samtools_child_fastq_err_task.await??;
     host_minimap2_err_task.await??;
     host_done_rx.await??;
