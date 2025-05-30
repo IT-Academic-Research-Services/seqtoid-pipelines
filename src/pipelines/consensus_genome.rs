@@ -330,11 +330,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
         Ok::<(), anyhow::Error>(())
     });
 
-    // split for file and passing on
+    // Split for file write and passing on to next stage
     let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
-    eprintln!("no_host_path: {}", no_host_file_path.display());
-    // let no_host_file = no_host_file_path.to_string_lossy().into_owned();
-
+    
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
         2,
@@ -352,20 +350,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
     let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-    
-    
-    let mut no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
-    while let Some(ParseOutput::Bytes(chunk)) = no_host_output_stream.next().await {
-        eprintln!("WTFFFFFF: {}", String::from_utf8_lossy(&chunk));
-    }
-    
-    
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_file_stream,
         PathBuf::from(no_host_file_path),
     ));
-
+    
+    let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
     
     
     //*****************
@@ -377,27 +368,26 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //*****************
             // ERCC
 
-        //     let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
-        // 
-        //     let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
-        //     eprintln!("{:?}", ercc_minimap2_args);
-        // 
-        //     let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
-        //     let ercc_minimap2_out_stream = parse_child_output(
-        //         &mut ercc_minimap2_child,
-        //         ChildStream::Stdout,
-        //         ParseMode::Bytes,
-        //         args.buffer_size / 4,
-        //     ).await?;
-        // 
-        //     let ercc_minimap_write_task = tokio::spawn(stream_to_file(
-        //         ercc_minimap2_out_stream,
-        //         PathBuf::from("test_samtools_ercc.sam"),
-        //     ));
-        // 
-        // ercc_query_write_task.await??;
-        // ercc_minimap_write_task.await??;
-        // ercc_minimap2_err_task.await??;
+            let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
+        
+            let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
+        
+            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
+            let ercc_minimap2_out_stream = parse_child_output(
+                &mut ercc_minimap2_child,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+        
+            let ercc_minimap_write_task = tokio::spawn(stream_to_file(
+                ercc_minimap2_out_stream,
+                PathBuf::from("test_samtools_ercc.sam"),
+            ));
+        
+        ercc_query_write_task.await??;
+        ercc_minimap_write_task.await??;
+        ercc_minimap2_err_task.await??;
 
         } // end tech illumina
         Technology::ONT => {
