@@ -262,33 +262,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     
-    let (mut host_minimap2_child, host_minimap2_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, args.verbose).await?;
+    let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, args.verbose).await?;
     let host_minimap2_out_stream = parse_child_output(
         &mut host_minimap2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-
-
-    let host_minimap2_err_stream = parse_child_output(
-        &mut host_minimap2_child,
-        ChildStream::Stderr,
-        ParseMode::Bytes,
-        args.buffer_size / 4,
-    ).await?;
-    let host_minimap2_err_task = tokio::spawn(async move {
-        let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
-        if verbose {
-            while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-                eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
-            }
-        } else {
-            // Consume the stream without processing
-            while err_stream.next().await.is_some() {}
-        }
-        Ok::<(), anyhow::Error>(())
-    });
 
     
     let host_samtools_config_view = SamtoolsConfig {
@@ -387,35 +367,16 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
             eprintln!("{:?}", ercc_minimap2_args);
 
-            let (mut ercc_minimap2_child, ercc_minimap2_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
+            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
             let ercc_minimap2_out_stream = parse_child_output(
                 &mut ercc_minimap2_child,
                 ChildStream::Stdout,
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-
-            let host_minimap2_err_stream = parse_child_output(
-                &mut ercc_minimap2_child,
-                ChildStream::Stderr,
-                ParseMode::Bytes,
-                args.buffer_size / 4,
-            ).await?;
-            let ercc_minimap2_err_task = tokio::spawn(async move {
-                let mut err_stream = ReceiverStream::new(host_minimap2_err_stream);
-                if verbose {
-                    while let Some(ParseOutput::Bytes(chunk)) = err_stream.next().await {
-                        eprintln!("minimap2 stderr: {}", String::from_utf8_lossy(&chunk));
-                    }
-                } else {
-                    while err_stream.next().await.is_some() {}
-                }
-                Ok::<(), anyhow::Error>(())
-            });
-
             
 
-
+            
             let ercc_minimap_write_task = tokio::spawn(stream_to_file(
                 ercc_minimap2_out_stream,
                 PathBuf::from("test_samtools_ercc.sam"),
@@ -426,6 +387,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
         ercc_query_write_task.await??;
         ercc_minimap_write_task.await??;
+        ercc_minimap2_err_task.await??;
 
         } // end tech illumina
         Technology::ONT => {
@@ -457,9 +419,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     eprintln!("Minimap2 fifo tasks done");
 
 
-    host_minimap2_err_task.await??;
 
-    host_minimap2_task.await??;
+
+
     let minimap2_status = host_minimap2_child.wait().await?;
     if minimap2_status.success() {
         eprintln!("Minimap2 exited successfully");
@@ -504,6 +466,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     }
 
     host_samtools_child_fastq_err_task.await??;
+    host_minimap2_err_task.await??;
     host_done_rx.await??;
     eprintln!("Host t_junction done");
     
