@@ -296,6 +296,9 @@ pub mod samtools {
                     args_vec.push("-n".to_string());
                     
                     }
+                SamtoolsSubcommand::Stats => {
+                    args_vec.push("stats".to_string());
+                }
                 }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(format!("{}", key));

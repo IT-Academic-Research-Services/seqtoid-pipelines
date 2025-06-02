@@ -342,10 +342,46 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 args.buffer_size / 4,
             ).await?;
         
+            // let ercc_minimap_write_task = tokio::spawn(stream_to_file(
+            //     ercc_minimap2_out_stream,
+            //     PathBuf::from("test_samtools_ercc.sam"),
+            // ));
+
+            let ercc_samtools_config_view = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::View,
+                subcommand_fields: HashMap::from([]),
+            };
+            let ercc_samtools_args_view = generate_cli(
+                SAMTOOLS_TAG,
+                &args,
+                Some(&ercc_samtools_config_view),
+            )?;
+
+            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(ercc_minimap2_out_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
+            let ercc_samtools_out_stream_view = parse_child_output(
+                &mut ercc_samtools_child_view,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+
             let ercc_minimap_write_task = tokio::spawn(stream_to_file(
-                ercc_minimap2_out_stream,
+                ercc_samtools_out_stream_view,
                 PathBuf::from("test_samtools_ercc.sam"),
             ));
+
+            // let ercc_samtools_config_stats = SamtoolsConfig {
+            //     subcommand: SamtoolsSubcommand::Stats,
+            //     subcommand_fields: HashMap::from([]),
+            // };
+            // let ercc_samtools_args_view = generate_cli(
+            //     SAMTOOLS_TAG,
+            //     &args,
+            //     Some(&ercc_samtools_config_stats),
+            // )?;
+            // 
+            // let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(ercc_samtools_out_stream_view, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
+            // 
         
         ercc_query_write_task.await??;
         ercc_minimap_write_task.await??;
