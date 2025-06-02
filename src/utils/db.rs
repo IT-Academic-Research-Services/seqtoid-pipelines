@@ -5,7 +5,7 @@ use hdf5_metno::{Extent, File, H5Type};
 use hdf5_metno::types::{FixedAscii, VarLenArray};
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::fastx::SequenceRecord;
+use crate::utils::fastx::{sequence_reader, SequenceReader, SequenceRecord};
 use fxhash::{FxHashMap as HashMap, FxHashMap};
 use futures::StreamExt;
 use crate::cli::{Arguments, Technology};
@@ -437,39 +437,45 @@ pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64
 
     Ok(h5_index)
 }
-// pub fn retrieve_h5_seq(args: &Arguments, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<Vec<u8>> {
-//     
-//     let host_accession = args.host_accession.clone();
-//     let host_sequence = args.host_sequence.clone();
-// 
-//     let host_seq = match &host_sequence {
-//         Some(host_sequence_file) => { 
-//             
-//         },
-//         None => {
-//             match &host_accession {
-//                 Some(accession) => {
-//                     if ref_db_path.is_none() {
-//                         return Err(anyhow!("Reference DB path not set"));
-//                     }
-//                     if h5_index.is_none() {
-//                         return Err(anyhow!("H5 index not set"));
-//                     }
-//                     
-//                     lookup_sequence(&ref_db_path.unwrap(), &h5_index.unwrap(), &accession)
-//                 }
-//                 None => {
-//                     return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
-//                 }
-//             }
-// 
-//         },
-// 
-//     };
-//     
-//     Ok(host_seq)
-// 
-// }
+
+pub async fn retrieve_h5_seq(args: &Arguments, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<(String, Vec<u8>)> {
+    let cwd = std::env::current_dir()?;
+    let host_accession = args.host_accession.clone();
+    let host_sequence = args.host_sequence.clone();
+
+    match (host_sequence, host_accession) {
+        (Some(host_sequence_file), None) => {
+            let host_sequence_path = file_path_manipulator(&PathBuf::from(&host_sequence_file), &cwd, None, None, "");
+            eprintln!("Reading host sequence from FASTA: {}", host_sequence_path.display());
+            let mut reader = match sequence_reader(&host_sequence_path)? {
+                SequenceReader::Fasta(reader) => reader,
+                _ => return Err(anyhow!("Host sequence file must be FASTA: {}", host_sequence_path.display())),
+            };
+            let record = reader
+                .into_records()
+                .next()
+                .ok_or_else(|| anyhow!("No records found in FASTA file: {}", host_sequence_path.display()))?
+                .map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
+            let seq_record: SequenceRecord = record.to_owned().into();
+            let accession = seq_record.id().to_string();
+            let sequence = seq_record.seq().to_vec();
+            Ok((accession, sequence))
+        }
+        (None, Some(accession)) => {
+            let db_path = ref_db_path.ok_or_else(|| anyhow!("Reference DB path not provided"))?;
+            let index = h5_index.ok_or_else(|| anyhow!("H5 index not provided"))?;
+            eprintln!("Looking up host sequence for accession: {}", accession);
+            let seq = lookup_sequence(db_path, index, &accession).await?;
+            Ok((accession, seq))
+        }
+        (Some(_), Some(_)) => {
+            Err(anyhow!("Cannot provide both --host_sequence and --host_accession"))
+        }
+        (None, None) => {
+            Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

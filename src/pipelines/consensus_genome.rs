@@ -17,7 +17,7 @@ use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
-use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index};
+use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -175,7 +175,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let host_sequence = args.host_sequence.clone();
 
     let host_seq_start = Instant::now();
-    // If the host sequence file is given, load it, if not retrieve it by accession from ref_db
+    // let (host_accession, host_seq) = retrieve_h5_seq(&args, Some(&ref_db_path), Some(&h5_index)).await?;
+    // write_hdf5_seq_to_fifo(host_seq, &host_accession, &host_ref_pipe_path).await?;
+    // println!("Host seq retrieve and write time: {} milliseconds.", host_seq_start.elapsed().as_millis());
     let host_seq = match &host_sequence {
         Some(_host_sequence_file) => None,
         None => {
@@ -187,11 +189,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
                 }
             }
-            
+
         },
-        
+
     };
-    println!("Host seq retrieve time: {} milliseconds.", host_seq_start.elapsed().as_millis());
 
 
 
