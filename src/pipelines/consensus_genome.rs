@@ -10,7 +10,7 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{file_path_manipulator, write_parse_output_to_temp};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
@@ -26,8 +26,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     println!("Running consensus genome with module: {}", args.module);
 
     let cwd = std::env::current_dir()?;
-    let verbose = args.verbose.clone();
-
+    
     //External tools check
     let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG]).await?;
 
@@ -61,6 +60,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
     if !file1_path.exists() {
         return Err(anyhow!("Specficied file1 {:?} does not exist.", file1_path));
     }
+
+    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
+    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
+    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+
 
     let file2_path: Option<PathBuf> = match &args.file2 {
         Some(file) => {
@@ -135,7 +139,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let val_fastp_out_stream = parse_child_output(
         &mut val_fastp_child,
         ChildStream::Stdout,
-        ParseMode::Bytes, 
+        ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
     let mut val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
@@ -290,11 +294,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         args.buffer_size / 4,
     ).await?;
     let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
-    
+
 
     // Split for file write and passing on to next stage
     let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
-    
+
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
         2,
@@ -304,11 +308,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         50,
     )
         .await?;
-    
+
     if host_streams.len() != 2 {
         return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
     }
-    
+
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
     let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
@@ -317,9 +321,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
         no_host_file_stream,
         PathBuf::from(no_host_file_path),
     ));
-    
+
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
-    
+
     
     //*****************
     // Split by Technology
@@ -331,9 +335,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
             // ERCC
 
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
-        
+
             let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
-        
+
             let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
             let ercc_minimap2_out_stream = parse_child_output(
                 &mut ercc_minimap2_child,
@@ -341,7 +345,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-        
+
             // let ercc_minimap_write_task = tokio::spawn(stream_to_file(
             //     ercc_minimap2_out_stream,
             //     PathBuf::from("test_samtools_ercc.sam"),
@@ -357,36 +361,75 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 Some(&ercc_samtools_config_view),
             )?;
 
-            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(ercc_minimap2_out_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
+            let (mut ercc_samtools_child_view, ercc_samtools_task_view, _ercc_samtools_err_task_view) = stream_to_cmd(ercc_minimap2_out_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
             let ercc_samtools_out_stream_view = parse_child_output(
                 &mut ercc_samtools_child_view,
                 ChildStream::Stdout,
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-
-            let ercc_minimap_write_task = tokio::spawn(stream_to_file(
+            let mut ercc_samtools_out_stream_view = ReceiverStream::new(ercc_samtools_out_stream_view);
+            
+            let (ercc_streams, ercc_done_rx) = t_junction(
                 ercc_samtools_out_stream_view,
+                2,
+                args.buffer_size,
+                args.stall_threshold.try_into().unwrap(),
+                Some(args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+
+            if ercc_streams.len() != 2 {
+                return Err(anyhow!("Expected exactly 2 streams, got {}", ercc_streams.len()));
+            }
+
+            let mut streams_iter = ercc_streams.into_iter();
+            let ercc_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+            let ercc_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+
+
+
+            let ercc_samtools_config_stats = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::Stats,
+                subcommand_fields: HashMap::from([("-".to_string(), None)]),
+            };
+            let ercc_samtools_args_view = generate_cli(
+                SAMTOOLS_TAG,
+                &args,
+                Some(&ercc_samtools_config_stats),
+            )?;
+            
+            let ercc_stats_file_path = no_ext_sample_base + "_stats.txt";
+            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, _ercc_samtools_err_task_stats) = stream_to_cmd(ercc_file_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
+
+            let ercc_samtools_out_stream_stats = parse_child_output(
+                &mut ercc_samtools_child_stats,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+
+            let ercc_stats_write_task = tokio::spawn(stream_to_file(
+                ercc_samtools_out_stream_stats,
+                PathBuf::from(ercc_stats_file_path),
+            ));
+            
+            
+            let ercc_output_write_task = tokio::spawn(stream_to_file(
+                ercc_output_stream,
                 PathBuf::from("test_samtools_ercc.sam"),
             ));
-
-            // let ercc_samtools_config_stats = SamtoolsConfig {
-            //     subcommand: SamtoolsSubcommand::Stats,
-            //     subcommand_fields: HashMap::from([]),
-            // };
-            // let ercc_samtools_args_view = generate_cli(
-            //     SAMTOOLS_TAG,
-            //     &args,
-            //     Some(&ercc_samtools_config_stats),
-            // )?;
-            // 
-            // let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(ercc_samtools_out_stream_view, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
-            // 
-        
-        ercc_query_write_task.await??;
-        ercc_minimap_write_task.await??;
-        ercc_minimap2_err_task.await??;
-
+            
+            ercc_query_write_task.await??;
+            ercc_output_write_task.await??;
+            ercc_minimap2_err_task.await??;
+            ercc_samtools_task_view.await??;
+            ercc_samtools_task_stats.await??;
+            ercc_stats_write_task.await??;
+            ercc_done_rx.await??;
+            
+            
         } // end tech illumina
         Technology::ONT => {
             return Err(anyhow!("Minion not ready"));
