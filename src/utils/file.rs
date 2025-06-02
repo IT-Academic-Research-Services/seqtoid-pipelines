@@ -2,9 +2,20 @@ use std::fs::File;
 use std::io;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+
 use flate2::read::GzDecoder;
 use crate::config::defs::GZIP_EXT;
 use anyhow::{Result, anyhow};
+use tempfile::NamedTempFile;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio_stream::wrappers::ReceiverStream;
+use crate::utils::streams::ParseOutput;
+use tokio::task::JoinHandle;
+use tokio::fs::File as TokioFile;
+use tokio::process::Command;
+use tokio_stream::StreamExt;
+
+
 
 
 /// Custom reader enum for handling compressed/uncompressed files
@@ -162,4 +173,104 @@ pub fn scan_files_with_extensions(dir: &PathBuf, valid_extensions: &[&str]) -> R
     }
 
     Ok(matching_files)
+}
+
+
+/// Creates a named FIFO pipe and writes data from a ParseOutput stream to it asynchronously.
+///
+/// # Arguments
+///
+/// - `fifo_path`: Path to the FIFO pipe to create.
+/// - `input_stream`: A `ReceiverStream` yielding `ParseOutput` items (expects `Bytes` variant).
+/// - `buffer_size`: Optional buffer size for the writer (defaults to 4MB if not provided).
+///
+/// # Returns
+/// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
+pub async fn write_parse_output_to_fifo(
+    fifo_path: &PathBuf,
+    mut input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: Option<usize>,
+) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
+
+    if fifo_path.exists() {
+        std::fs::remove_file(fifo_path)?;
+    }
+    
+    let status = Command::new("mkfifo")
+        .arg(fifo_path)
+        .status()
+        .await
+        .map_err(|e| anyhow!("Failed to execute mkfifo for {}: {}", fifo_path.display(), e))?;
+    if !status.success() {
+        return Err(anyhow!("mkfifo failed with status: {}", status));
+    }
+    
+    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB
+    
+    let fifo_path = fifo_path.clone();
+    let task = tokio::spawn(async move {
+        let mut writer_file = TokioFile::create(&fifo_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
+        let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
+        let mut byte_count = 0;
+
+        while let Some(item) = input_stream.next().await {
+            match item {
+                ParseOutput::Bytes(data) => {
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| anyhow!("Failed to write to FIFO at {}: {}", fifo_path.display(), e))?;
+                    byte_count += data.len();
+                }
+                _ => {
+                    return Err(anyhow!("Expected Bytes in stream, got unexpected data at {}", fifo_path.display()));
+                }
+            }
+        }
+
+        writer
+            .flush()
+            .await
+            .map_err(|e| anyhow!("Failed to flush FIFO at {}: {}", fifo_path.display(), e))?;
+        writer
+            .shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown FIFO at {}: {}", fifo_path.display(), e))?;
+
+        if byte_count == 0 {
+            return Err(anyhow!("No data written to FIFO at {}", fifo_path.display()));
+        }
+
+        eprintln!("Wrote {} bytes to FIFO at {}", byte_count, fifo_path.display());
+        Ok(())
+    });
+
+    Ok(task)
+}
+
+
+/// Creates a temporary named FIFO pipe and writes data from a ParseOutput stream to it asynchronously.
+///
+/// # Arguments
+///
+/// - `input_stream`: A `ReceiverStream` yielding `ParseOutput` items (expects `Bytes` variant).
+/// - `buffer_size`: Optional buffer size for the writer (defaults to 4MB if not provided).
+///
+/// # Returns
+///
+/// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
+pub async fn write_parse_output_to_temp(
+    input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: Option<usize>,
+) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf)> {
+
+    let temp_name = NamedTempFile::new()?;
+    let temp_path = temp_name.path().to_path_buf();
+    temp_name.close()?;     // Immediately close the regular file to avoid conflicts with mkfifo
+    
+    let task = write_parse_output_to_fifo(&temp_path, input_stream, buffer_size).await?;
+
+    Ok((task, temp_path))
 }

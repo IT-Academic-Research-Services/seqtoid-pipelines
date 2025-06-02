@@ -201,13 +201,17 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
     cmd_tag: &str,
     args: Vec<String>,
     data_type: StreamDataType,
-) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
+    verbose: bool,
+) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
     let (batch_size_bytes, writer_capacity) = match data_type {
         StreamDataType::JustBytes => (65_536, 65_536),
         StreamDataType::IlluminaFastq => (131_072, 131_072),
         StreamDataType::OntFastq => (524_288, 524_288),
     };
+    eprintln!("spawning {}", cmd_tag);
     let cmd_tag_owned = cmd_tag.to_string();
+    let cmd_tag_err_owned = cmd_tag.to_string();
+    
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
         .stdin(std::process::Stdio::piped())
@@ -220,8 +224,12 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         .stdin
         .take()
         .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
 
-    let task = tokio::spawn(async move {
+    let stdin_task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(writer_capacity, stdin);
         let mut batch = Vec::with_capacity(batch_size_bytes);
         let mut total_written = 0;
@@ -251,13 +259,37 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         Ok(())
     });
 
-    Ok((child, task))
+    let stderr_task = tokio::spawn(async move {
+        let mut reader = BufReader::with_capacity(1_048_576, stderr);
+        let mut buffer = vec![0u8; 8192];
+        if verbose {
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
+                        eprintln!("[{} stderr]: {}", cmd_tag_err_owned, stderr_chunk);
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading stderr for {}: {}", cmd_tag_err_owned, e);
+                        return Err(anyhow!("Failed to read stderr: {}", e));
+                    }
+                }
+            }
+        } else {
+            while reader.read(&mut buffer).await? != 0 {}
+        }
+        Ok(())
+    });
+
+    Ok((child, stdin_task, stderr_task))
 }
 
 
 pub async fn spawn_cmd(
     cmd_tag: &str,
     args: Vec<String>,
+    verbose: bool
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     eprintln!("spawning {}", cmd_tag);
     let cmd_tag_owned = cmd_tag.to_string();
@@ -269,9 +301,38 @@ pub async fn spawn_cmd(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
 
-    let task = tokio::spawn(async move { Ok(()) });
+    let stderr_task = {
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+        let cmd_tag_clone = cmd_tag_owned.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
+            let mut buffer = vec![0u8; 8192]; // Buffer for reading stderr chunks
+            if verbose {
+                loop {
+                    match reader.read(&mut buffer).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
+                            eprintln!("[{} stderr]: {}", cmd_tag_clone, stderr_chunk);
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading stderr for {}: {}", cmd_tag_clone, e);
+                            return Err(anyhow!("Failed to read stderr: {}", e));
+                        }
+                    }
+                }
+            } else {
+                // Consume stderr without printing to prevent pipe blocking
+                while reader.read(&mut buffer).await? != 0 {}
+            }
+            Ok(())
+        })
+    };
 
-    Ok((child, task))
+    Ok((child, stderr_task))
 }
 
 /// Parse the output of a stream, either Fastq or simple bytes.
@@ -799,7 +860,7 @@ mod tests {
     async fn test_stream_to_cmd_valid() -> Result<()> {
         let stream = fastx_generator(100, 50, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -814,7 +875,7 @@ mod tests {
     async fn test_stream_to_cmd_valid_cat() -> Result<()> {
         let stream = fastx_generator(2, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -844,7 +905,7 @@ mod tests {
                 }
             }
         });
-        let (mut child, task) = stream_to_cmd(rx_parse, "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task, _err_task) = stream_to_cmd(rx_parse, "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -864,7 +925,7 @@ mod tests {
     async fn test_stream_to_cmd_invalid_command() -> Result<()> {
         let stream = fastx_generator(2, 10, 35.0, 3.0);
         let (mut outputs, _done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let result = stream_to_cmd(outputs.pop().unwrap(), "nonexistent_cmd", vec![], StreamDataType::IlluminaFastq).await;
+        let result = stream_to_cmd(outputs.pop().unwrap(), "nonexistent_cmd", vec![], StreamDataType::IlluminaFastq, false).await;
         assert!(result.is_err(), "Should fail for invalid command");
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Failed to spawn nonexistent_cmd"), "Error should mention command name");
@@ -875,7 +936,7 @@ mod tests {
     async fn test_stream_to_cmd_empty_stream() -> Result<()> {
         let stream = fastx_generator(0, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -892,7 +953,7 @@ mod tests {
         let num_records = 10000;
         let stream = fastx_generator(num_records, 50, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -931,7 +992,7 @@ mod tests {
     async fn test_stream_to_cmd_premature_exit() -> Result<()> {
         let stream = fastx_generator(10, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n".to_string(), "1".to_string()], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task,  _err_task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n".to_string(), "1".to_string()], StreamDataType::IlluminaFastq, false).await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -950,7 +1011,7 @@ mod tests {
     async fn test_stream_to_cmd_resource_cleanup() -> Result<()> {
         let stream = fastx_generator(5, 10, 35.0, 3.0);
         let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 500).await?;
-        let (mut child, task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq).await?;
+        let (mut child, task,  _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
         task.await??;
         done_rx.await??;
         let status = child.wait().await?;
@@ -1067,6 +1128,26 @@ mod tests {
         let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "error");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cmd_stderr_verbose() -> Result<()> {
+        let args = vec!["-c".to_string(), "echo error >&2".to_string()];
+        let (mut child, stderr_task) = spawn_cmd("sh", args, true).await?;
+        let status = child.wait().await?;
+        stderr_task.await??;
+        assert!(status.success(), "Child process should exit successfully");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_cmd_stderr_non_verbose() -> Result<()> {
+        let args = vec!["-c".to_string(), "echo error >&2".to_string()];
+        let (mut child, stderr_task) = spawn_cmd("sh", args, false).await?;
+        let status = child.wait().await?;
+        stderr_task.await??;
+        assert!(status.success(), "Child process should exit successfully");
         Ok(())
     }
 }

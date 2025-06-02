@@ -284,7 +284,7 @@ pub mod samtools {
                     args_vec.push("-@".to_string());
                     args_vec.push(args.threads.to_string());
                     args_vec.push("--no-PG".to_string());
-                    args_vec.push("-u".to_string());
+                    // args_vec.push("-u".to_string());
                 
                     }
                 SamtoolsSubcommand::Fastq => {
@@ -296,6 +296,9 @@ pub mod samtools {
                     args_vec.push("-n".to_string());
                     
                     }
+                SamtoolsSubcommand::Stats => {
+                    args_vec.push("stats".to_string());
+                }
                 }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(format!("{}", key));
