@@ -413,33 +413,30 @@ pub async fn write_hdf5_seq_to_fifo(seq: Vec<u8>, accession: &str, fifo_path: &P
 }
 
 
-// pub fn get_index(args: &Arguments) -> HashMap<[u8; 24], u64> {
-// 
-//     let cwd = std::env::current_dir()?;
-// 
-//     let ref_db = args.ref_db.clone().ok_or_else(|| {
-//         anyhow!("HDF5 database file must be given (-d).")
-//     })?;
-//     let ref_db_path = PathBuf::from(&ref_db);
-// 
-//     
-//     let h5_index = if let Some(index_file) = &args.ref_index {
-//         let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd.clone(), None, None, "");
-//         if index_full_path.exists() {
-//             load_index(&index_full_path)
-//         } else {
-//             eprintln!("Index path does not exist: {}", index_full_path.display());
-// 
-//             build_new_in_memory_index(&ref_db_path, &index_full_path).await?
-//         }
-//     } else {
-//         let index_full_path = ref_db_path.with_extension("index.bin");
-//         eprintln!("No index file provided, creating new index: {}", index_full_path.display());
-//         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
-//     };
-//     
-//     h5_index
-// }
+pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64>> {
+    let cwd = std::env::current_dir()?;
+
+    let ref_db = args.ref_db.clone().ok_or_else(|| {
+        anyhow!("HDF5 database file must be given (-d).")
+    })?;
+    let ref_db_path = PathBuf::from(&ref_db);
+
+    let h5_index = if let Some(index_file) = &args.ref_index {
+        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd, None, None, "");
+        if index_full_path.exists() {
+            load_index(&index_full_path).await?
+        } else {
+            eprintln!("Index path does not exist: {}", index_full_path.display());
+            build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+        }
+    } else {
+        let index_full_path = ref_db_path.with_extension("index.bin");
+        eprintln!("No index file provided, creating new index: {}", index_full_path.display());
+        build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+    };
+
+    Ok(h5_index)
+}
 // pub fn retrieve_h5_seq(args: &Arguments, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<Vec<u8>> {
 //     
 //     let host_accession = args.host_accession.clone();

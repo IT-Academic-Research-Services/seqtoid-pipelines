@@ -17,7 +17,7 @@ use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
-use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index};
+use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index};
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -151,20 +151,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
     //Fetch reference
     let index_start = Instant::now();
     // Retrieve index or create it for host sequence and filter sequence
-    let h5_index = if let Some(index_file) = &args.ref_index {
-        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd.clone(), None, None, "");
-        if index_full_path.exists() {
-            load_index(&index_full_path).await?
-        } else {
-            eprintln!("Index path does not exist: {}", index_full_path.display());
-
-            build_new_in_memory_index(&ref_db_path, &index_full_path).await?
-        }
-    } else {
-        let index_full_path = ref_db_path.with_extension("index.bin");
-        eprintln!("No index file provided, creating new index: {}", index_full_path.display());
-        build_new_in_memory_index(&ref_db_path, &index_full_path).await?
-    };
+    let h5_index = get_index(&args).await?;
+    
     println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
 
 
@@ -430,7 +418,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
             
             else {
-                
+                // ref sequence from above
             }
             
             
