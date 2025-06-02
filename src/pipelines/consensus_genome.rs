@@ -152,7 +152,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let index_start = Instant::now();
     // Retrieve index or create it for host sequence and filter sequence
     let h5_index = get_index(&args).await?;
-    
     println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
 
 
@@ -170,75 +169,19 @@ pub async fn run(args: &Arguments) -> Result<()> {
         .arg(&host_ref_pipe_path)
         .status()?;
     
-    
-    let host_accession = args.host_accession.clone();
-    let host_sequence = args.host_sequence.clone();
-
-    let host_seq_start = Instant::now();
-    // let (host_accession, host_seq) = retrieve_h5_seq(&args, Some(&ref_db_path), Some(&h5_index)).await?;
-    // write_hdf5_seq_to_fifo(host_seq, &host_accession, &host_ref_pipe_path).await?;
-    // println!("Host seq retrieve and write time: {} milliseconds.", host_seq_start.elapsed().as_millis());
-    let host_seq = match &host_sequence {
-        Some(_host_sequence_file) => None,
-        None => {
-            match &host_accession {
-                Some(accession) => {
-                    Some(lookup_sequence(&ref_db_path, &h5_index, &accession).await?)
-                }
-                None => {
-                    return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
-                }
-            }
-
-        },
-
-    };
-
-
-
-    // Create FIFO pipe for the fastp output to stream to minimap2
-    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
-  
-
+    let (host_accession, host_seq) = retrieve_h5_seq(&args, Some(&ref_db_path), Some(&h5_index)).await?;
     // Create FIFO pipe from either the host_sequence or host_accession
     let host_ref_write_task = tokio::spawn({
-        let cwd = cwd.clone();
         let host_ref_pipe_path = host_ref_pipe_path.clone();
         async move {
-            
-            match host_seq {
-                Some(seq) => {
-                    match &host_accession {
-                        Some(accession) => {
-                            write_hdf5_seq_to_fifo(seq, &accession, &host_ref_pipe_path).await
-                        }
-                        None => {
-                            return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
-                        }
-                    }
-                }
-                None => {
-                    match &host_sequence {
-                        Some(host_sequence_file) => {
-                            let host_sequence_path = file_path_manipulator(&PathBuf::from(host_sequence_file), &cwd.clone(), None, None, "");
-                            tokio::task::spawn_blocking(move || {
-                                write_fasta_to_fifo(&host_sequence_path, &host_ref_pipe_path)
-                            }).await?
-                        }
-                        None => {
-                            return Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
-                        }
-                    }
-                    
-    
-                }
-            }
+            write_hdf5_seq_to_fifo(host_seq, &host_accession, &host_ref_pipe_path).await;
         }
     });
     
+    // Create FIFO pipe for the fastp output to stream to minimap2
+    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
-    
     let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, args.verbose).await?;
     let host_minimap2_out_stream = parse_child_output(
         &mut host_minimap2_child,
@@ -246,7 +189,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-
     
     let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
@@ -265,9 +207,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    // let host_samtools_out_stream_view = ReceiverStream::new(host_samtools_out_stream_view);
-
-
+    
     // //Output to FASTQ through samtools
     let host_samtools_config_fastq = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
@@ -460,7 +400,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     eprintln!("Validation t_junction done");
 
     // Ensure Minimap2 FIFO write tasks complete
-    host_ref_write_task.await??;
+    host_ref_write_task.await?;
     host_query_write_task.await??;
     eprintln!("Minimap2 fifo tasks done");
 

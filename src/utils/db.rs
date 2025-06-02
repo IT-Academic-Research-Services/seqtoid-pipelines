@@ -413,6 +413,15 @@ pub async fn write_hdf5_seq_to_fifo(seq: Vec<u8>, accession: &str, fifo_path: &P
 }
 
 
+/// Retrieves an index HashMap from file if provided, otherwise builds one.
+///
+/// # Arguments
+///
+/// * `args` - CLI arguments.
+///
+/// # Returns
+/// anyhow::Result<HashMap<[u8; 24], u64>>
+///
 pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64>> {
     let cwd = std::env::current_dir()?;
 
@@ -438,6 +447,17 @@ pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64
     Ok(h5_index)
 }
 
+/// Converts the retrieved sequence from an HDF5 file to a FIFO pipe.
+///
+/// # Arguments
+///
+/// * `args` - CLI arguments.
+/// * 'ref_db_path` - Optional path to existing DB for retrieval.
+/// * `h5_index' - Optional hdf5 index file.
+///
+/// # Returns
+/// anyhow::Result<(String, Vec<u8>)> <accession, sequence>
+///
 pub async fn retrieve_h5_seq(args: &Arguments, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<(String, Vec<u8>)> {
     let cwd = std::env::current_dir()?;
     let host_accession = args.host_accession.clone();
