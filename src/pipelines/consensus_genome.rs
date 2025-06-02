@@ -15,7 +15,7 @@ use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_o
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
 
@@ -29,7 +29,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let cwd = std::env::current_dir()?;
     
     //External tools check
-    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG]).await?;
+    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG]).await?;
 
     // Arguments and files check
 
