@@ -70,5 +70,8 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = false)]
     pub limit_align_threads: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub dont_filter_reads: bool,
     
 }

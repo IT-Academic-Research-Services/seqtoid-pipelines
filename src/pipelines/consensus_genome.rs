@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
 use crate::cli::{Arguments, Technology};
 use std::process::Command;
+use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -148,7 +149,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
     //*****************
     //Fetch reference
-    
+    let index_start = Instant::now();
     // Retrieve index or create it for host sequence and filter sequence
     let h5_index = if let Some(index_file) = &args.ref_index {
         let index_full_path = file_path_manipulator(&PathBuf::from(index_file), &cwd.clone(), None, None, "");
@@ -164,7 +165,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         eprintln!("No index file provided, creating new index: {}", index_full_path.display());
         build_new_in_memory_index(&ref_db_path, &index_full_path).await?
     };
-
+    println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
 
 
     //*****************
@@ -185,6 +186,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let host_accession = args.host_accession.clone();
     let host_sequence = args.host_sequence.clone();
 
+    let host_seq_start = Instant::now();
     // If the host sequence file is given, load it, if not retrieve it by accession from ref_db
     let host_seq = match &host_sequence {
         Some(_host_sequence_file) => None,
@@ -201,6 +203,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
         },
         
     };
+    println!("Host seq retrieve time: {} milliseconds.", host_seq_start.elapsed().as_millis());
+
 
 
     // Create FIFO pipe for the fastp output to stream to minimap2
@@ -334,8 +338,27 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //*****************
             // ERCC
 
-            let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(no_host_output_stream, None).await?;
+            let (ercc_streams, ercc_done_rx) = t_junction(
+                no_host_output_stream,
+                2,
+                args.buffer_size,
+                args.stall_threshold.try_into().unwrap(),
+                Some(args.stream_sleep_ms),
+                50,
+            )
+                .await?;
 
+            if ercc_streams.len() != 2 {
+                return Err(anyhow!("Expected exactly 2 streams, got {}", ercc_streams.len()));
+            }
+
+            let mut streams_iter = ercc_streams.into_iter();
+            let ercc_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc stream"))?;
+            let ercc_bypass_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc bypass stream"))?;
+            let mut ercc_stream = ReceiverStream::new(ercc_stream);
+
+
+            let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
             let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
 
             let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, args.verbose).await?;
@@ -345,11 +368,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-
-            // let ercc_minimap_write_task = tokio::spawn(stream_to_file(
-            //     ercc_minimap2_out_stream,
-            //     PathBuf::from("test_samtools_ercc.sam"),
-            // ));
+            
 
             let ercc_samtools_config_view = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::View,
@@ -368,28 +387,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-            let mut ercc_samtools_out_stream_view = ReceiverStream::new(ercc_samtools_out_stream_view);
             
-            let (ercc_streams, ercc_done_rx) = t_junction(
-                ercc_samtools_out_stream_view,
-                2,
-                args.buffer_size,
-                args.stall_threshold.try_into().unwrap(),
-                Some(args.stream_sleep_ms),
-                50,
-            )
-                .await?;
-
-            if ercc_streams.len() != 2 {
-                return Err(anyhow!("Expected exactly 2 streams, got {}", ercc_streams.len()));
-            }
-
-            let mut streams_iter = ercc_streams.into_iter();
-            let ercc_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-            let ercc_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-
-
-
+            
             let ercc_samtools_config_stats = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Stats,
                 subcommand_fields: HashMap::from([("-".to_string(), None)]),
@@ -401,7 +400,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             )?;
             
             let ercc_stats_file_path = no_ext_sample_base + "_stats.txt";
-            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, _ercc_samtools_err_task_stats) = stream_to_cmd(ercc_file_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
+            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, _ercc_samtools_err_task_stats) = stream_to_cmd(ercc_samtools_out_stream_view, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
 
             let ercc_samtools_out_stream_stats = parse_child_output(
                 &mut ercc_samtools_child_stats,
@@ -417,9 +416,25 @@ pub async fn run(args: &Arguments) -> Result<()> {
             
             
             let ercc_output_write_task = tokio::spawn(stream_to_file(
-                ercc_output_stream,
+                ercc_bypass_stream,
                 PathBuf::from("test_samtools_ercc.sam"),
             ));
+
+
+
+            //*****************
+            // Filter Reads
+            
+            if args.dont_filter_reads {
+                
+            }
+            
+            else {
+                
+            }
+            
+            
+            
             
             ercc_query_write_task.await??;
             ercc_output_write_task.await??;
