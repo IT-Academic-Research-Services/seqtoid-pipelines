@@ -315,9 +315,21 @@ pub mod samtools {
 
 mod kraken2 {
     use anyhow::anyhow;
+    use std::path::PathBuf;
     use tokio::process::Command;
+    use crate::cli::Arguments;
     use crate::config::defs::{KRAKEN2_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::command::ArgGenerator;
+
+    #[derive(Debug)]
+    pub struct Kraken2Config {
+        pub report_path: PathBuf, 
+        pub classified_path: PathBuf,
+        pub fastq_path: PathBuf,  
+    }
+
+    pub struct Kraken2ArgGenerator;
 
     pub async fn kraken2_presence_check() -> anyhow::Result<String> {
 
@@ -346,6 +358,40 @@ mod kraken2 {
             return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
         }
         Ok(version)
+    }
+    
+    impl ArgGenerator for Kraken2ArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<Kraken2Config>())
+                .ok_or_else(|| anyhow!("Kraken2 requires a Kraken2Config as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+            
+            match &args.kraken_db{
+                Some(db) => {
+                    args_vec.push(format!("--db={}", db));
+                }
+                None => {
+                    return Err(anyhow!("No kraken_db specified"));
+                }
+            }
+            
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push(format!("--threads {}", num_cores));
+            args_vec.push(format!("--report {}", config.report_path.to_string_lossy()));
+            args_vec.push(format!("--classified-out {}", config.classified_path.to_string_lossy()));
+            args_vec.push(format!("--output -")); // "-" will suppress normal output
+            args_vec.push(format!("--memory-mapping"));
+            args_vec.push(format!("--gzip-compressed"));
+
+            args_vec.push(config.fastq_path.to_string_lossy().to_string()); // input, should be a mkfifo
+
+            Ok(args_vec)
+        }
     }
 }
 
