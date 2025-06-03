@@ -33,7 +33,7 @@ mod fastp {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn {}: {}. Is fastp installed?", cmd_tag_owned, e))?;
 
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
         let first_line = lines
             .first()
             .ok_or_else(|| anyhow!("No output from fastp -v"))?;

@@ -73,5 +73,8 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = false)]
     pub dont_filter_reads: bool,
+
+    #[arg(short = 'k', long = "kdb")]
+    pub kraken_db : Option<String>,
     
 }
