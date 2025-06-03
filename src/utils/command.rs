@@ -299,6 +299,11 @@ pub mod samtools {
                 SamtoolsSubcommand::Stats => {
                     args_vec.push("stats".to_string());
                 }
+                SamtoolsSubcommand::Sort => {
+                    args_vec.push("sort".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(args.threads.to_string());
+                }
                 }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(format!("{}", key));
@@ -313,7 +318,7 @@ pub mod samtools {
         }
     }
 
-mod kraken2 {
+pub mod kraken2 {
     use anyhow::anyhow;
     use std::path::PathBuf;
     use tokio::process::Command;
@@ -401,6 +406,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         PIGZ_TAG => Box::new(pigz::PigzArgGenerator),
         MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
         SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
+        KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
