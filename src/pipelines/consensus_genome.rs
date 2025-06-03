@@ -17,6 +17,7 @@ use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG};
 use crate::utils::command::samtools::SamtoolsConfig;
+use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
 
 
@@ -169,7 +170,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         .arg(&host_ref_pipe_path)
         .status()?;
     
-    let (host_accession, host_seq) = retrieve_h5_seq(&args, Some(&ref_db_path), Some(&h5_index)).await?;
+    let (host_accession, host_seq) = retrieve_h5_seq(args.host_accession.clone(), args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
     // Create FIFO pipe from either the host_sequence or host_accession
     let host_ref_write_task = tokio::spawn({
         let host_ref_pipe_path = host_ref_pipe_path.clone();
@@ -232,6 +233,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Split for file write and passing on to next stage
     let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
 
+    // Determine number of needed streams
+    match technology {
+        Technology::Illumina => {
+            
+        }
+        Technology::ONT => {
+            
+        }
+
+    }
+    
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
         2,
@@ -285,6 +297,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let ercc_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc stream"))?;
             let ercc_bypass_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc bypass stream"))?;
             let mut ercc_stream = ReceiverStream::new(ercc_stream);
+            // let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
 
 
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
@@ -355,18 +368,31 @@ pub async fn run(args: &Arguments) -> Result<()> {
             // Filter Reads
             
             if args.dont_filter_reads {
-                
+                // rename ercc_bypass_stream to the output of filter reads
             }
             
             else {
-                // ref sequence from above
+
+                // let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
+                // let kraken2_classified_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified.fq"), "_");
+                // let (kraken2_query_write_task, kraken2_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
+                // 
+                // let filter_reads_kraken2_config = Kraken2Config {
+                //     report_path: kraken2_report_path,
+                //     classified_path: kraken2_classified_path,
+                //     fastq_path: kraken2_query_pipe_path
+                // };
+                // 
+                // 
+                // let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
+                // eprintln!("Filter reads: {:?}", filter_reads_kraken2_args);
             }
             
             
             
             
             ercc_query_write_task.await??;
-            ercc_output_write_task.await??;
+            // ercc_output_write_task.await??;
             ercc_minimap2_err_task.await??;
             ercc_samtools_task_view.await??;
             ercc_samtools_task_stats.await??;

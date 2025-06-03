@@ -458,23 +458,22 @@ pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64
 /// # Returns
 /// anyhow::Result<(String, Vec<u8>)> <accession, sequence>
 ///
-pub async fn retrieve_h5_seq(args: &Arguments, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<(String, Vec<u8>)> {
+pub async fn retrieve_h5_seq(accession: Option<String>, sequence_file: Option<String>, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<(String, Vec<u8>)> {
     let cwd = std::env::current_dir()?;
-    let host_accession = args.host_accession.clone();
-    let host_sequence = args.host_sequence.clone();
 
-    match (host_sequence, host_accession) {
-        (Some(host_sequence_file), None) => {
-            let host_sequence_path = file_path_manipulator(&PathBuf::from(&host_sequence_file), &cwd, None, None, "");
-            eprintln!("Reading host sequence from FASTA: {}", host_sequence_path.display());
-            let mut reader = match sequence_reader(&host_sequence_path)? {
+
+    match (sequence_file, accession) {
+        (Some(sequence_file), None) => {
+            let sequence_path = file_path_manipulator(&PathBuf::from(&sequence_file), &cwd, None, None, "");
+            eprintln!("Reading sequence from FASTA: {}", sequence_path.display());
+            let mut reader = match sequence_reader(&sequence_path)? {
                 SequenceReader::Fasta(reader) => reader,
-                _ => return Err(anyhow!("Host sequence file must be FASTA: {}", host_sequence_path.display())),
+                _ => return Err(anyhow!("Sequence file must be FASTA: {}", sequence_path.display())),
             };
             let record = reader
                 .into_records()
                 .next()
-                .ok_or_else(|| anyhow!("No records found in FASTA file: {}", host_sequence_path.display()))?
+                .ok_or_else(|| anyhow!("No records found in FASTA file: {}", sequence_path.display()))?
                 .map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
             let seq_record: SequenceRecord = record.to_owned().into();
             let accession = seq_record.id().to_string();
@@ -484,7 +483,7 @@ pub async fn retrieve_h5_seq(args: &Arguments, ref_db_path: Option<&PathBuf>, h5
         (None, Some(accession)) => {
             let db_path = ref_db_path.ok_or_else(|| anyhow!("Reference DB path not provided"))?;
             let index = h5_index.ok_or_else(|| anyhow!("H5 index not provided"))?;
-            eprintln!("Looking up host sequence for accession: {}", accession);
+            eprintln!("Looking up sequence for accession: {}", accession);
             let seq = lookup_sequence(db_path, index, &accession).await?;
             Ok((accession, seq))
         }
