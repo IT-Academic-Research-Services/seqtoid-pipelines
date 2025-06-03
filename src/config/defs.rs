@@ -10,7 +10,8 @@ pub const KRAKEN2_TAG: &str = "kraken2";
 pub enum SamtoolsSubcommand {
     View,
     Fastq,
-    Stats
+    Stats,
+    Sort
 }
 pub const BCFTOOLS_TAG: &str = "bcftools";
 
