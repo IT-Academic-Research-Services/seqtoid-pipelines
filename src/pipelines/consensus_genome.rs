@@ -345,22 +345,22 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ercc_samtools_out_stream_stats,
                 PathBuf::from(ercc_stats_file_path),
             ));
-            
-            
 
 
 
+            let (filter_align_accession, filter_align_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
 
             //*****************
             // Filter Reads
             
+            // let mut filter_reads_out_stream = None;
+            
             if args.dont_filter_reads {
-                // rename ercc_bypass_stream to the output of filter reads
+                // filter_reads_out_stream = ercc_bypass_stream;
             }
             
             else {
 
-                eprintln!("filter");
                 let filter_ref_temp = NamedTempFile::new()?;
                 let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
                 
@@ -371,12 +371,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     .arg(&filter_ref_pipe_path)
                     .status()?;
 
-                let (filter_accession, filter_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
 
                 let filter_ref_write_task = tokio::spawn({
                     let filter_ref_pipe_path = filter_ref_pipe_path.clone();
                     async move {
-                        write_hdf5_seq_to_fifo(filter_seq, &filter_accession, &filter_ref_pipe_path).await;
+                        write_hdf5_seq_to_fifo(filter_align_seq, &filter_align_accession, &filter_ref_pipe_path).await;
                     }
                 });
 
@@ -434,18 +433,67 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 //     fastq_path: kraken2_query_pipe_path
                 // };
                 // 
-                // 
                 // let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
-                // eprintln!("Filter reads: {:?}", filter_reads_kraken2_args);
+                // eprintln!("Filter reads kraken2 args: {:?}", filter_reads_kraken2_args);
+                // 
+                // 
+                // let (mut filter_kraken2_child, _filter_kraken2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_reads_kraken2_args, args.verbose).await?;
+                // let filter_kraken2_out_stream = parse_child_output(
+                //     &mut filter_kraken2_child,
+                //     ChildStream::Stdout,
+                //     ParseMode::Bytes,
+                //     args.buffer_size / 4,
+                // ).await?;
+                
 
                 filter_query_write_task.await??;
                 filter_ref_write_task.await?;
                 filter_output_write_task.await?;
+
+                // filter_reads_out_stream = filter_kraken2_out_stream;
             }
-            
-            
-            
-            
+
+
+
+            //*****************
+            // Align Reads to Target
+
+            // let align_ref_temp = NamedTempFile::new()?;
+            // let align_ref_pipe_path = align_ref_temp.path().to_path_buf();
+            // 
+            // if align_ref_pipe_path.exists() {
+            //     std::fs::remove_file(&align_ref_pipe_path)?;
+            // }
+            // Command::new("mkfifo")
+            //     .arg(&align_ref_pipe_path)
+            //     .status()?;
+            // 
+            // let (filter_accession, filter_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            // 
+            // let filter_ref_write_task = tokio::spawn({
+            //     let filter_ref_pipe_path = filter_ref_pipe_path.clone();
+            //     async move {
+            //         write_hdf5_seq_to_fifo(filter_seq, &filter_accession, &filter_ref_pipe_path).await;
+            //     }
+            // });
+            // 
+            // 
+            // let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
+            // 
+            // let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
+            // let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, args.verbose).await?;
+            // let filter_minimap2_out_stream = parse_child_output(
+            //     &mut filter_minimap2_child,
+            //     ChildStream::Stdout,
+            //     ParseMode::Bytes,
+            //     args.buffer_size / 4,
+            // ).await?;
+            // 
+
+
+
+
+
             ercc_query_write_task.await??;
             // ercc_output_write_task.await??;
             ercc_minimap2_err_task.await??;
