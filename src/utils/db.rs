@@ -399,10 +399,10 @@ pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u
 /// # Returns
 /// Result
 ///
-pub async fn write_hdf5_seq_to_fifo(seq: Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
+pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
     let mut fifo_file = TokioFile::create(fifo_path).await?;
     fifo_file.write_all(format!(">{}\n", accession).as_bytes()).await?;
-    let seq_str = String::from_utf8(seq)?;
+    let seq_str = String::from_utf8_lossy(seq);
     const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
     for chunk in seq_str.as_bytes().chunks(CHUNK_SIZE) {
         fifo_file.write_all(chunk).await?;

@@ -175,7 +175,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let host_ref_write_task = tokio::spawn({
         let host_ref_pipe_path = host_ref_pipe_path.clone();
         async move {
-            write_hdf5_seq_to_fifo(host_seq, &host_accession, &host_ref_pipe_path).await;
+            write_hdf5_seq_to_fifo(&host_seq, &host_accession, &host_ref_pipe_path).await;
         }
     });
     
@@ -375,7 +375,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 let filter_ref_write_task = tokio::spawn({
                     let filter_ref_pipe_path = filter_ref_pipe_path.clone();
                     async move {
-                        write_hdf5_seq_to_fifo(filter_align_seq, &filter_align_accession, &filter_ref_pipe_path).await;
+                        write_hdf5_seq_to_fifo(&filter_align_seq, &filter_align_accession, &filter_ref_pipe_path).await;
                     }
                 });
                 let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
@@ -461,16 +461,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
             // Command::new("mkfifo")
             //     .arg(&align_ref_pipe_path)
             //     .status()?;
-            
-
-            // let filter_ref_write_task = tokio::spawn({
-            //     let filter_ref_pipe_path = filter_ref_pipe_path.clone();
+            // 
+            // 
+            // let align_ref_write_task = tokio::spawn({
+            //     let align_ref_pipe_path = align_ref_pipe_path.clone();
             //     async move {
-            //         write_hdf5_seq_to_fifo(filter_seq, &filter_accession, &filter_ref_pipe_path).await;
+            //         write_hdf5_seq_to_fifo(&filter_align_seq, &filter_align_accession, &filter_ref_pipe_path).await;
             //     }
             // });
             // 
-            // 
+            
+
             // let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
             // 
             // let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
