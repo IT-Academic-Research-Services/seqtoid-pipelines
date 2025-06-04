@@ -232,17 +232,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
     // Split for file write and passing on to next stage
     let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
-
-    // Determine number of needed streams
-    match technology {
-        Technology::Illumina => {
-            
-        }
-        Technology::ONT => {
-            
-        }
-
-    }
+    
     
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
@@ -297,7 +287,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let ercc_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc stream"))?;
             let ercc_bypass_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc bypass stream"))?;
             let mut ercc_stream = ReceiverStream::new(ercc_stream);
-            // let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
+            let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
 
 
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
@@ -357,10 +347,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ));
             
             
-            let ercc_output_write_task = tokio::spawn(stream_to_file(
-                ercc_bypass_stream,
-                PathBuf::from("test_samtools_ercc.sam"),
-            ));
+
 
 
 
@@ -372,6 +359,43 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
             
             else {
+
+                eprintln!("filter");
+                let filter_ref_temp = NamedTempFile::new()?;
+                let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
+                
+                if filter_ref_pipe_path.exists() {
+                    std::fs::remove_file(&filter_ref_pipe_path)?;
+                }
+                Command::new("mkfifo")
+                    .arg(&filter_ref_pipe_path)
+                    .status()?;
+
+                let (filter_accession, filter_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+
+                let filter_ref_write_task = tokio::spawn({
+                    let filter_ref_pipe_path = filter_ref_pipe_path.clone();
+                    async move {
+                        write_hdf5_seq_to_fifo(filter_seq, &filter_accession, &filter_ref_pipe_path).await;
+                    }
+                });
+
+
+                let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
+
+                let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
+                let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, args.verbose).await?;
+                let filter_minimap2_out_stream = parse_child_output(
+                    &mut filter_minimap2_child,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    args.buffer_size / 4,
+                ).await?;
+
+                let filter_output_write_task = tokio::spawn(stream_to_file(
+                    filter_minimap2_out_stream,
+                    PathBuf::from("test_samtools_filter.sam"),
+                ));
 
                 // let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
                 // let kraken2_classified_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified.fq"), "_");
@@ -386,6 +410,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 // 
                 // let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
                 // eprintln!("Filter reads: {:?}", filter_reads_kraken2_args);
+
+                filter_query_write_task.await??;
+                filter_ref_write_task.await?;
+                filter_output_write_task.await?;
             }
             
             
@@ -398,6 +426,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ercc_samtools_task_stats.await??;
             ercc_stats_write_task.await??;
             ercc_done_rx.await??;
+
+            
             
             
         } // end tech illumina
