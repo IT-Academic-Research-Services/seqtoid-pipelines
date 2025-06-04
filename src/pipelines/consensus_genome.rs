@@ -392,10 +392,37 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     args.buffer_size / 4,
                 ).await?;
 
+
+                
+                
+                //Convert to FASTQ
+
+                let filter_samtools_config_fastq = SamtoolsConfig {
+                    subcommand: SamtoolsSubcommand::Fastq,
+                    subcommand_fields: HashMap::from([("-".to_string(), None)]),
+                };
+                let filter_samtools_args_fastq = generate_cli(
+                    SAMTOOLS_TAG,
+                    &args,
+                    Some(&filter_samtools_config_fastq),
+                )?;
+
+                let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
+                let filter_samtools_out_stream_fastq = parse_child_output(
+                    &mut filter_samtools_child_fastq,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    args.buffer_size / 4,
+                ).await?;
+                // let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
+
+
                 let filter_output_write_task = tokio::spawn(stream_to_file(
-                    filter_minimap2_out_stream,
-                    PathBuf::from("test_samtools_filter.sam"),
+                    filter_samtools_out_stream_fastq,
+                    PathBuf::from("test_samtools_filter.fastq"),
                 ));
+
+
 
                 // let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
                 // let kraken2_classified_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified.fq"), "_");
