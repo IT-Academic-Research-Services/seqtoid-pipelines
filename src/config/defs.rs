@@ -4,12 +4,16 @@ pub const PIGZ_TAG: &str = "pigz";
 pub const H5DUMP_TAG: &str = "h5dump";
 pub const MINIMAP2_TAG: &str = "minimap2";
 pub const SAMTOOLS_TAG: &str = "samtools";
+pub const KRAKEN2_TAG: &str = "kraken2";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
     View,
     Fastq,
-    Stats
+    Stats,
+    Sort,
+    Index,
+    Mpileup
 }
 pub const BCFTOOLS_TAG: &str = "bcftools";
 

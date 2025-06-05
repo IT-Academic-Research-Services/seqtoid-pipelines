@@ -53,14 +53,17 @@ pub struct Arguments {
     #[arg(long, default_value_t = 10000)]
     pub buffer_size: usize,
 
-    #[arg(short = 'a', long = "host_accession")]
+    #[arg(short = 'a', long = "host_accession")]  // For host removal
     pub host_accession : Option<String>,
 
-    #[arg(long)]
+    #[arg(long)]  // For host removal
     pub host_sequence : Option<String>,
 
-    #[arg(short = 'r', long = "ref_accession")]
+    #[arg(short = 'r', long = "ref_accession")]  // For target aligning
     pub ref_accession : Option<String>,
+
+    #[arg(long)] // For target aligning
+    pub ref_sequence : Option<String>,
 
     #[arg(short = 'd', long = "db")]
     pub ref_db : Option<String>,
@@ -70,5 +73,14 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = false)]
     pub limit_align_threads: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub dont_filter_reads: bool,
+
+    #[arg(short = 'k', long = "kdb")]
+    pub kraken_db : Option<String>,
+
+    #[arg(long)]
+    pub adapter_fasta : Option<String>,
     
 }

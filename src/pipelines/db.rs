@@ -50,7 +50,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
 
         }
     };
-    // let ref_accession = match technology {
+
     if all_fastas.is_empty() {
         let the_fastas = match scan_files_with_extensions(&cwd, FASTA_EXTS)
         {

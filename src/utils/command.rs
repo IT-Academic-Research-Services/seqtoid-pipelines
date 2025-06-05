@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG};
 use crate::cli::Arguments;
 
 
@@ -12,12 +12,14 @@ pub trait ArgGenerator {
 }
 
 mod fastp {
+    use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
     use crate::cli::Arguments;
     use crate::config::defs::FASTP_TAG;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
+    use crate::utils::file::file_path_manipulator;
 
     pub struct FastpArgGenerator;
     
@@ -33,7 +35,7 @@ mod fastp {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn {}: {}. Is fastp installed?", cmd_tag_owned, e))?;
 
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
         let first_line = lines
             .first()
             .ok_or_else(|| anyhow!("No output from fastp -v"))?;
@@ -58,6 +60,17 @@ mod fastp {
             args_vec.push(args.quality.to_string());
             args_vec.push("-w".to_string());
             args_vec.push(args.threads.to_string());
+
+            if let Some(adapter_fasta) = &args.adapter_fasta {
+                let cwd = std::env::current_dir()?;
+                let adapter_path = file_path_manipulator(&PathBuf::from(adapter_fasta), &cwd.clone(), None, None, "");
+                if !adapter_path.exists() {
+                    return Err(anyhow!("Adapter FASTA file does not exist: {}", adapter_path.display()));
+                }
+                args_vec.push("--adapter_fasta".to_string());
+                args_vec.push(adapter_path.to_string_lossy().into_owned());
+            }
+            
             Ok(args_vec)
         }
     }
@@ -225,10 +238,9 @@ mod minimap2 {
 
 pub mod samtools {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::{Arguments, Technology};
+    use crate::cli::{Arguments};
     use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
@@ -298,6 +310,24 @@ pub mod samtools {
                     }
                 SamtoolsSubcommand::Stats => {
                     args_vec.push("stats".to_string());
+                    }
+                SamtoolsSubcommand::Sort => {
+                    args_vec.push("sort".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(args.threads.to_string());
+                    }
+                SamtoolsSubcommand::Index => {
+                    args_vec.push("index".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(args.threads.to_string());
+                }
+                SamtoolsSubcommand::Mpileup => {
+                    args_vec.push("mpileup".to_string());
+                    args_vec.push("-A".to_string()); // do not discard anomalous read pairs
+                    args_vec.push("-d".to_string()); // max depth zero
+                    args_vec.push("0".to_string());
+                    args_vec.push("-Q0".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+
                 }
                 }
             for (key, value) in config.subcommand_fields.iter() {
@@ -312,12 +342,96 @@ pub mod samtools {
             }
         }
     }
+
+pub mod kraken2 {
+    use anyhow::anyhow;
+    use std::path::PathBuf;
+    use tokio::process::Command;
+    use crate::cli::Arguments;
+    use crate::config::defs::{KRAKEN2_TAG};
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::command::ArgGenerator;
+
+    #[derive(Debug)]
+    pub struct Kraken2Config {
+        pub report_path: PathBuf, 
+        pub classified_path: PathBuf,
+        pub fastq_path: PathBuf,  
+    }
+
+    pub struct Kraken2ArgGenerator;
+
+    pub async fn kraken2_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["--version"];
+
+        let mut child = Command::new(KRAKEN2_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
+        }
+        Ok(version)
+    }
+    
+    impl ArgGenerator for Kraken2ArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<Kraken2Config>())
+                .ok_or_else(|| anyhow!("Kraken2 requires a Kraken2Config as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+            
+            match &args.kraken_db{
+                Some(db) => {
+                    args_vec.push(format!("--db={}", db));
+                }
+                None => {
+                    return Err(anyhow!("No kraken_db specified"));
+                }
+            }
+            
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push(format!("--threads {}", num_cores));
+            args_vec.push(format!("--report {}", config.report_path.to_string_lossy()));
+            args_vec.push(format!("--classified-out {}", config.classified_path.to_string_lossy()));
+            args_vec.push(format!("--output -")); // "-" will suppress normal output
+            args_vec.push(format!("--memory-mapping"));
+            args_vec.push(format!("--gzip-compressed"));
+
+            args_vec.push(config.fastq_path.to_string_lossy().to_string()); // input, should be a mkfifo
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
         PIGZ_TAG => Box::new(pigz::PigzArgGenerator),
         MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
         SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
+        KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
@@ -332,6 +446,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
         H5DUMP_TAG => h5dump::h5dump_presence_check().await,
         MINIMAP2_TAG => {minimap2::minimap2_presence_check().await},
         SAMTOOLS_TAG => {samtools::samtools_presence_check().await},
+        KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
@@ -346,7 +461,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<HashMap<String, String>>
                 versions.insert(tool.to_string(), version);
             }
             Err(err) => {
-                return Err(anyhow!("Cannot find external tool in path: {}", tool));
+                return Err(anyhow!("Cannot find external tool in path: {}. Error: {}", tool, err));
             }
         };
     }
