@@ -310,11 +310,24 @@ pub mod samtools {
                     }
                 SamtoolsSubcommand::Stats => {
                     args_vec.push("stats".to_string());
-                }
+                    }
                 SamtoolsSubcommand::Sort => {
                     args_vec.push("sort".to_string());
                     args_vec.push("-@".to_string());
                     args_vec.push(args.threads.to_string());
+                    }
+                SamtoolsSubcommand::Index => {
+                    args_vec.push("index".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(args.threads.to_string());
+                }
+                SamtoolsSubcommand::Mpileup => {
+                    args_vec.push("mpileup".to_string());
+                    args_vec.push("-A".to_string()); // do not discard anomalous read pairs
+                    args_vec.push("-d".to_string()); // max depth zero
+                    args_vec.push("0".to_string());
+                    args_vec.push("-Q0".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+
                 }
                 }
             for (key, value) in config.subcommand_fields.iter() {

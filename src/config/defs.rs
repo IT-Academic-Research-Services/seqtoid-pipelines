@@ -11,7 +11,9 @@ pub enum SamtoolsSubcommand {
     View,
     Fastq,
     Stats,
-    Sort
+    Sort,
+    Index,
+    Mpileup
 }
 pub const BCFTOOLS_TAG: &str = "bcftools";
 
