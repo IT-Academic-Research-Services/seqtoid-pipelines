@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
@@ -345,11 +346,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ercc_samtools_out_stream_stats,
                 PathBuf::from(ercc_stats_file_path),
             ));
-
-
+            
 
             let (filter_align_accession, filter_align_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-
+            let filter_align_seq = Arc::new(filter_align_seq);
+            let filter_align_accession = Arc::new(filter_align_accession);
+            
             //*****************
             // Filter Reads
 
@@ -371,11 +373,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     .arg(&filter_ref_pipe_path)
                     .status()?;
 
-
+                let filter_align_seq_clone = Arc::clone(&filter_align_seq);
+                let filter_align_accession_clone = Arc::clone(&filter_align_accession);
                 let filter_ref_write_task = tokio::spawn({
                     let filter_ref_pipe_path = filter_ref_pipe_path.clone();
                     async move {
-                        write_hdf5_seq_to_fifo(&filter_align_seq, &filter_align_accession, &filter_ref_pipe_path).await;
+                        write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &filter_ref_pipe_path).await;
                     }
                 });
                 let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
@@ -443,51 +446,50 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
 
             
-
-            let filter_output_write_task = tokio::spawn(stream_to_file(
-                filter_reads_out_stream.into_inner(),
-                PathBuf::from("test_samtools_filter.fastq"),
-            ));
-
             //*****************
             // Align Reads to Target
+            
+            let align_ref_temp = NamedTempFile::new()?;
+            let align_ref_pipe_path = align_ref_temp.path().to_path_buf();
+            
+            if align_ref_pipe_path.exists() {
+                std::fs::remove_file(&align_ref_pipe_path)?;
+            }
+            Command::new("mkfifo")
+                .arg(&align_ref_pipe_path)
+                .status()?;
 
-            // let align_ref_temp = NamedTempFile::new()?;
-            // let align_ref_pipe_path = align_ref_temp.path().to_path_buf();
-            // 
-            // if align_ref_pipe_path.exists() {
-            //     std::fs::remove_file(&align_ref_pipe_path)?;
-            // }
-            // Command::new("mkfifo")
-            //     .arg(&align_ref_pipe_path)
-            //     .status()?;
-            // 
-            // 
-            // let align_ref_write_task = tokio::spawn({
-            //     let align_ref_pipe_path = align_ref_pipe_path.clone();
-            //     async move {
-            //         write_hdf5_seq_to_fifo(&filter_align_seq, &filter_align_accession, &filter_ref_pipe_path).await;
-            //     }
-            // });
-            // 
+            let filter_align_seq_clone = Arc::clone(&filter_align_seq);
+            let filter_align_accession_clone = Arc::clone(&filter_align_accession);
+            let align_ref_write_task = tokio::spawn({
+                let align_ref_pipe_path = align_ref_pipe_path.clone();
+                async move {
+                    write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &align_ref_pipe_path).await;
+                }
+            });
             
 
-            // let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
-            // 
-            // let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
-            // let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, args.verbose).await?;
-            // let filter_minimap2_out_stream = parse_child_output(
-            //     &mut filter_minimap2_child,
-            //     ChildStream::Stdout,
-            //     ParseMode::Bytes,
-            //     args.buffer_size / 4,
-            // ).await?;
-            // 
+            let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
+            
+            let align_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(align_ref_pipe_path.clone(), align_query_pipe_path.clone())))?;
+            let (mut align_minimap2_child,  align_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, align_minimap2_args, args.verbose).await?;
+            let align_minimap2_out_stream = parse_child_output(
+                &mut align_minimap2_child,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+
+            
+            let align_output_write_task = tokio::spawn(stream_to_file(
+                align_minimap2_out_stream,
+                PathBuf::from("test_samtools_align.bam"),
+            ));
 
 
-
-
-
+            align_ref_write_task.await?;
+            align_query_write_task.await??;
+            align_output_write_task.await??;
             ercc_query_write_task.await??;
             // ercc_output_write_task.await??;
             ercc_minimap2_err_task.await??;
@@ -496,8 +498,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ercc_stats_write_task.await??;
             ercc_done_rx.await??;
 
-            
-            
             
         } // end tech illumina
         Technology::ONT => {
