@@ -79,5 +79,8 @@ pub struct Arguments {
 
     #[arg(short = 'k', long = "kdb")]
     pub kraken_db : Option<String>,
+
+    #[arg(long)]
+    pub adapter_fasta : Option<String>,
     
 }

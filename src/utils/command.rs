@@ -12,12 +12,14 @@ pub trait ArgGenerator {
 }
 
 mod fastp {
+    use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
     use crate::cli::Arguments;
     use crate::config::defs::FASTP_TAG;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
+    use crate::utils::file::file_path_manipulator;
 
     pub struct FastpArgGenerator;
     
@@ -58,6 +60,17 @@ mod fastp {
             args_vec.push(args.quality.to_string());
             args_vec.push("-w".to_string());
             args_vec.push(args.threads.to_string());
+
+            if let Some(adapter_fasta) = &args.adapter_fasta {
+                let cwd = std::env::current_dir()?;
+                let adapter_path = file_path_manipulator(&PathBuf::from(adapter_fasta), &cwd.clone(), None, None, "");
+                if !adapter_path.exists() {
+                    return Err(anyhow!("Adapter FASTA file does not exist: {}", adapter_path.display()));
+                }
+                args_vec.push("--adapter_fasta".to_string());
+                args_vec.push(adapter_path.to_string_lossy().into_owned());
+            }
+            
             Ok(args_vec)
         }
     }
@@ -225,10 +238,9 @@ mod minimap2 {
 
 pub mod samtools {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::{Arguments, Technology};
+    use crate::cli::{Arguments};
     use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
@@ -436,7 +448,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<HashMap<String, String>>
                 versions.insert(tool.to_string(), version);
             }
             Err(err) => {
-                return Err(anyhow!("Cannot find external tool in path: {}", tool));
+                return Err(anyhow!("Cannot find external tool in path: {}. Error: {}", tool, err));
             }
         };
     }
