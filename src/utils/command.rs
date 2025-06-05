@@ -296,7 +296,6 @@ pub mod samtools {
                     args_vec.push("-@".to_string());
                     args_vec.push(args.threads.to_string());
                     args_vec.push("--no-PG".to_string());
-                    // args_vec.push("-u".to_string());
                 
                     }
                 SamtoolsSubcommand::Fastq => {
