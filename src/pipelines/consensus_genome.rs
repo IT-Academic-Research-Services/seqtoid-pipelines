@@ -582,37 +582,37 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ).await?;
 
 
-            // split the mpileup output stream for writing to a file and further processing
-            // let mpileup_output_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("mpileup.txt"), "_");
-            // let (mpileup_streams, mpileup_done_rx) = t_junction(
-            //     ReceiverStream::new(mpileup_samtools_out_stream),
-            //     2,
-            //     args.buffer_size,
-            //     args.stall_threshold.try_into().unwrap(),
-            //     Some(args.stream_sleep_ms),
-            //     50,
-            // ).await?;
-            //
-            // if mpileup_streams.len() != 2 {
-            //     return Err(anyhow!("Expected exactly 2 streams, got {}", mpileup_streams.len()));
-            // }
-            //
-            // let mut mpileup_streams_iter = mpileup_streams.into_iter();
-            // let mpileup_output_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup output stream"))?;
-            // let mpileup_file_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup file stream"))?;
-            //
-            // let mpileup_write_task = tokio::spawn(stream_to_file(
-            //     mpileup_file_stream,
-            //     PathBuf::from(mpileup_output_file_path),
-            // ));
+            //split the mpileup output stream for writing to a file and further processing
+            let mpileup_output_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("mpileup.txt"), "_");
+            let (mpileup_streams, mpileup_done_rx) = t_junction(
+                ReceiverStream::new(mpileup_samtools_out_stream),
+                2,
+                args.buffer_size,
+                args.stall_threshold.try_into().unwrap(),
+                Some(args.stream_sleep_ms),
+                50,
+            ).await?;
+            
+            if mpileup_streams.len() != 2 {
+                return Err(anyhow!("Expected exactly 2 streams, got {}", mpileup_streams.len()));
+            }
+            
+            let mut mpileup_streams_iter = mpileup_streams.into_iter();
+            let mpileup_output_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup output stream"))?;
+            let mpileup_file_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup file stream"))?;
+            
+            let mpileup_write_task = tokio::spawn(stream_to_file(
+                mpileup_file_stream,
+                PathBuf::from(mpileup_output_file_path),
+            ));
 
             //
             let align_output_write_task = tokio::spawn(stream_to_file(
-                mpileup_samtools_out_stream,
+                mpileup_output_stream,
                 PathBuf::from("test_mpileup.txt"),
             ));
 
-
+            mpileup_write_task.await??;
             // mpileup_ref_write_task.await??;
             mpileup_samtools_stream_task.await??;
             mpileup_samtools_err_task.await??;
