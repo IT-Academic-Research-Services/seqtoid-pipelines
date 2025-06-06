@@ -346,8 +346,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ercc_samtools_out_stream_stats,
                 PathBuf::from(ercc_stats_file_path),
             ));
-            
-            
+
+
             //*****************
             // Filter Reads
 
@@ -362,26 +362,26 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //     PathBuf::from("test_samtools_align.fastq"),
             // ));
             // filter_output_write_task.await??;
-            
+
             let mut filter_reads_out_stream: ReceiverStream<ParseOutput>;
 
-            
+
             if args.dont_filter_reads {
                 filter_reads_out_stream = ReceiverStream::new(ercc_bypass_stream);
             }
-            
+
             else {
                 let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
                 let filter_ref_temp = NamedTempFile::new()?;
                 let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
-                
+
                 if filter_ref_pipe_path.exists() {
                     std::fs::remove_file(&filter_ref_pipe_path)?;
                 }
                 Command::new("mkfifo")
                     .arg(&filter_ref_pipe_path)
                     .status()?;
-            
+
                 let filter_align_seq_clone = Arc::clone(&filter_align_seq);
                 let filter_align_accession_clone = Arc::clone(&filter_align_accession);
                 let filter_ref_write_task = tokio::spawn({
@@ -391,7 +391,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     }
                 });
                 let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
-            
+
                 let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
                 let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, args.verbose).await?;
                 let filter_minimap2_out_stream = parse_child_output(
@@ -400,10 +400,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     ParseMode::Bytes,
                     args.buffer_size / 4,
                 ).await?;
-            
-                
+
+
                 //Convert to FASTQ
-            
+
                 let filter_samtools_config_fastq = SamtoolsConfig {
                     subcommand: SamtoolsSubcommand::Fastq,
                     subcommand_fields: HashMap::from([("-".to_string(), None)]),
@@ -413,7 +413,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     &args,
                     Some(&filter_samtools_config_fastq),
                 )?;
-            
+
                 let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
                 let filter_samtools_out_stream_fastq = parse_child_output(
                     &mut filter_samtools_child_fastq,
@@ -422,22 +422,22 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     args.buffer_size / 4,
                 ).await?;
                 // let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
-            
-            
+
+
                 // let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
                 // let kraken2_classified_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified.fq"), "_");
                 // let (kraken2_query_write_task, kraken2_query_pipe_path) = write_parse_output_to_temp(filter_samtools_out_stream_fastq, None).await?;
-                // 
+                //
                 // let filter_reads_kraken2_config = Kraken2Config {
                 //     report_path: kraken2_report_path,
                 //     classified_path: kraken2_classified_path,
                 //     fastq_path: kraken2_query_pipe_path
                 // };
-                // 
+                //
                 // let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
                 // eprintln!("Filter reads kraken2 args: {:?}", filter_reads_kraken2_args);
-                // 
-                // 
+                //
+                //
                 // let (mut filter_kraken2_child, _filter_kraken2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_reads_kraken2_args, args.verbose).await?;
                 // let filter_kraken2_out_stream = parse_child_output(
                 //     &mut filter_kraken2_child,
@@ -445,12 +445,12 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 //     ParseMode::Bytes,
                 //     args.buffer_size / 4,
                 // ).await?;
-                
-            
+
+
                 // filter_query_write_task.await??;
                 // filter_ref_write_task.await?;
                 // filter_output_write_task.await?;
-            
+
                 filter_reads_out_stream = ReceiverStream::new(filter_samtools_out_stream_fastq);
             }
 
@@ -461,14 +461,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
             
             let align_ref_temp = NamedTempFile::new()?;
             let align_ref_pipe_path = align_ref_temp.path().to_path_buf();
-            
+
             if align_ref_pipe_path.exists() {
                 std::fs::remove_file(&align_ref_pipe_path)?;
             }
             Command::new("mkfifo")
                 .arg(&align_ref_pipe_path)
                 .status()?;
-            
+
             let filter_align_seq_clone = Arc::clone(&filter_align_seq);
             let filter_align_accession_clone = Arc::clone(&filter_align_accession);
             let align_ref_write_task = tokio::spawn({
@@ -477,10 +477,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &align_ref_pipe_path).await;
                 }
             });
-            
-            
+
+
             let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
-            
+
             let align_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(align_ref_pipe_path.clone(), align_query_pipe_path.clone())))?;
             let (mut align_minimap2_child,  align_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, align_minimap2_args, args.verbose).await?;
             let align_minimap2_out_stream = parse_child_output(
@@ -489,8 +489,8 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-            
-            
+
+
             let align_samtools_config_sort = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Sort,
                 // subcommand_fields: HashMap::from([("-o".to_string(), Some("test_samtools_align.sam".to_string())),("-".to_string(), None)]),
@@ -518,17 +518,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
             align_query_write_task.await??;
             align_samtools_task_sort.await??;
             align_samtools_err_task_sort.await??;
-            
-            
+
+
             //*****************
             // Make Consensus
-            
+
             let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
             // let align_bam_index_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam.bai"), "_");
-            // 
+            //
 
             let mut align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
-            
+
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
@@ -554,55 +554,77 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ));
 
 
+            //Samtools mpileup
 
-            let align_output_write_task = tokio::spawn(stream_to_file(
-                consensus_bam_output_stream,
-                PathBuf::from("test_samtools_align.bam"),
-            ));
             
-            // 
-            // 
-            // let consensus_samtools_index_temp = NamedTempFile::new()?;
-            // let consensus_samtools_index_temp_pipe_path = consensus_samtools_index_temp.path().to_path_buf();
-            // 
-            // if consensus_samtools_index_temp_pipe_path.exists() {
-            //     std::fs::remove_file(&consensus_samtools_index_temp_pipe_path)?;
-            // }
-            // Command::new("mkfifo")
-            //     .arg(&consensus_samtools_index_temp_pipe_path)
-            //     .status()?;
-            // 
-            // let consensus_samtools_config_index = SamtoolsConfig {
-            //     subcommand: SamtoolsSubcommand::Index,
-            //     subcommand_fields: HashMap::from([("-o".to_string(), Some(consensus_samtools_index_temp_pipe_path.to_string_lossy().into_owned())),("-".to_string(), None)]),
-            // };
-            // let consensus_samtools_args_index = generate_cli(
-            //     SAMTOOLS_TAG,
-            //     &args,
-            //     Some(&consensus_samtools_config_index),
-            // )?;
-            // 
-            // 
-            // let (mut consensus_samtools_child_index, consensus_samtools_index_stream_task, consensus_index_err_task) = stream_to_cmd(align_samtools_out_stream_sort, SAMTOOLS_TAG, consensus_samtools_args_index, StreamDataType::JustBytes, args.verbose).await?;
-            // 
-            // let consensus_samtools_out_stream_index = parse_child_output(
-            //     &mut consensus_samtools_child_index,
-            //     ChildStream::Stdout,
-            //     ParseMode::Bytes,
-            //     args.buffer_size / 4,
+            let mpileup_samtools_config = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::Mpileup,
+                subcommand_fields: HashMap::from([
+                    ("-".to_string(), None),
+                ]),
+            };
+            let mpileup_samtools_args = generate_cli(SAMTOOLS_TAG, &args, Some(&mpileup_samtools_config))?;
+            
+            
+            let (mut mpileup_samtools_child, mpileup_samtools_stream_task, mpileup_samtools_err_task) = stream_to_cmd(
+                consensus_bam_output_stream,
+                SAMTOOLS_TAG,
+                mpileup_samtools_args,
+                StreamDataType::JustBytes,
+                args.verbose,
+            ).await?;
+            
+            let mpileup_samtools_out_stream = parse_child_output(
+                &mut mpileup_samtools_child,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+
+
+            // split the mpileup output stream for writing to a file and further processing
+            // let mpileup_output_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("mpileup.txt"), "_");
+            // let (mpileup_streams, mpileup_done_rx) = t_junction(
+            //     ReceiverStream::new(mpileup_samtools_out_stream),
+            //     2,
+            //     args.buffer_size,
+            //     args.stall_threshold.try_into().unwrap(),
+            //     Some(args.stream_sleep_ms),
+            //     50,
             // ).await?;
-            // 
-            // let align_output_write_task = tokio::spawn(stream_to_file(
-            //     consensus_samtools_out_stream_index,
-            //     PathBuf::from("test_samtools_align.bam.bai"),
+            //
+            // if mpileup_streams.len() != 2 {
+            //     return Err(anyhow!("Expected exactly 2 streams, got {}", mpileup_streams.len()));
+            // }
+            //
+            // let mut mpileup_streams_iter = mpileup_streams.into_iter();
+            // let mpileup_output_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup output stream"))?;
+            // let mpileup_file_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup file stream"))?;
+            //
+            // let mpileup_write_task = tokio::spawn(stream_to_file(
+            //     mpileup_file_stream,
+            //     PathBuf::from(mpileup_output_file_path),
             // ));
 
+            //
+            let align_output_write_task = tokio::spawn(stream_to_file(
+                mpileup_samtools_out_stream,
+                PathBuf::from("test_mpileup.txt"),
+            ));
+
+
+            // mpileup_ref_write_task.await??;
+            mpileup_samtools_stream_task.await??;
+            mpileup_samtools_err_task.await??;
+            // mpileup_write_task.await??;
+            // mpileup_done_rx.await??;
+            align_output_write_task.await??;
             consensus_bam_write_task.await??;
             // consensus_samtools_index_stream_task.await??;
             // consensus_index_err_task.await??;
             // align_ref_write_task.await?;
             // align_query_write_task.await??;
-            align_output_write_task.await??;
+            // align_output_write_task.await??;
             ercc_query_write_task.await??;
             // ercc_output_write_task.await??;
             ercc_minimap2_err_task.await??;
@@ -610,6 +632,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ercc_samtools_task_stats.await??;
             ercc_stats_write_task.await??;
             ercc_done_rx.await??;
+            
 
             
         } // end tech illumina
