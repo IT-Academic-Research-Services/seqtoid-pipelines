@@ -291,7 +291,7 @@ pub async fn spawn_cmd(
     args: Vec<String>,
     verbose: bool
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
-    eprintln!("spawning {}", cmd_tag);
+
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)

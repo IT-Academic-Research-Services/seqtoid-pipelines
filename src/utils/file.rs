@@ -274,3 +274,5 @@ pub async fn write_parse_output_to_temp(
 
     Ok((task, temp_path))
 }
+
+

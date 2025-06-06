@@ -510,35 +510,99 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ).await?;
 
 
-            let align_output_write_task = tokio::spawn(stream_to_file(
-                align_samtools_out_stream_sort,
-                PathBuf::from("test_samtools_align.bam"),
-            ));
+            // let align_output_write_task = tokio::spawn(stream_to_file(
+            //     align_samtools_out_stream_sort,
+            //     PathBuf::from("test_samtools_align.bam"),
+            // ));
 
             align_query_write_task.await??;
             align_samtools_task_sort.await??;
             align_samtools_err_task_sort.await??;
             
+            
             //*****************
             // Make Consensus
-            // let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
+            
+            let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
             // let align_bam_index_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam.bai"), "_");
+            // 
+
+            let mut align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
+            
+            // Split stream for BAM writing
+            let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
+                align_samtools_out_stream_sort,
+                2,
+                args.buffer_size,
+                args.stall_threshold.try_into().unwrap(),
+                Some(args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+
+            if consensus_bam_streams.len() != 2 {
+                return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
+            }
+
+            let mut streams_iter = consensus_bam_streams.into_iter();
+            let consensus_bam_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+            let consensus_bam_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+
+            let consensus_bam_write_task = tokio::spawn(stream_to_file(
+                consensus_bam_file_stream,
+                PathBuf::from(align_bam_path),
+            ));
+
+
+
+            let align_output_write_task = tokio::spawn(stream_to_file(
+                consensus_bam_output_stream,
+                PathBuf::from("test_samtools_align.bam"),
+            ));
+            
+            // 
+            // 
+            // let consensus_samtools_index_temp = NamedTempFile::new()?;
+            // let consensus_samtools_index_temp_pipe_path = consensus_samtools_index_temp.path().to_path_buf();
+            // 
+            // if consensus_samtools_index_temp_pipe_path.exists() {
+            //     std::fs::remove_file(&consensus_samtools_index_temp_pipe_path)?;
+            // }
+            // Command::new("mkfifo")
+            //     .arg(&consensus_samtools_index_temp_pipe_path)
+            //     .status()?;
             // 
             // let consensus_samtools_config_index = SamtoolsConfig {
             //     subcommand: SamtoolsSubcommand::Index,
-            //     subcommand_fields: HashMap::from([("-".to_string(), None)]),
+            //     subcommand_fields: HashMap::from([("-o".to_string(), Some(consensus_samtools_index_temp_pipe_path.to_string_lossy().into_owned())),("-".to_string(), None)]),
             // };
-            // let filter_samtools_args_fastq = generate_cli(
+            // let consensus_samtools_args_index = generate_cli(
             //     SAMTOOLS_TAG,
             //     &args,
-            //     Some(&filter_samtools_config_fastq),
+            //     Some(&consensus_samtools_config_index),
             // )?;
-            // let consensus_index_args = generate_cli(MINIMAP2_TAG, &args, Some(&(align_ref_pipe_path.clone(), align_query_pipe_path.clone())))?;
             // 
+            // 
+            // let (mut consensus_samtools_child_index, consensus_samtools_index_stream_task, consensus_index_err_task) = stream_to_cmd(align_samtools_out_stream_sort, SAMTOOLS_TAG, consensus_samtools_args_index, StreamDataType::JustBytes, args.verbose).await?;
+            // 
+            // let consensus_samtools_out_stream_index = parse_child_output(
+            //     &mut consensus_samtools_child_index,
+            //     ChildStream::Stdout,
+            //     ParseMode::Bytes,
+            //     args.buffer_size / 4,
+            // ).await?;
+            // 
+            // let align_output_write_task = tokio::spawn(stream_to_file(
+            //     consensus_samtools_out_stream_index,
+            //     PathBuf::from("test_samtools_align.bam.bai"),
+            // ));
 
+            consensus_bam_write_task.await??;
+            // consensus_samtools_index_stream_task.await??;
+            // consensus_index_err_task.await??;
             // align_ref_write_task.await?;
             // align_query_write_task.await??;
-            // align_output_write_task.await??;
+            align_output_write_task.await??;
             ercc_query_write_task.await??;
             // ercc_output_write_task.await??;
             ercc_minimap2_err_task.await??;
