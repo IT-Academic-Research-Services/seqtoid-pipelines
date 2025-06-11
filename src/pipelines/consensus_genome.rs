@@ -5,18 +5,18 @@ use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
-use crate::cli::{Arguments, Technology};
+use crate::cli::{Arguments, Technology, TargetType};
 use std::process::Command;
 use std::time::Instant;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::command::{generate_cli, check_versions};
+use crate::utils::command::{generate_cli, check_versions, check_version};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, IVAR_TAG};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
@@ -31,7 +31,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let cwd = std::env::current_dir()?;
     
     //External tools check
-    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG]).await?;
+    let mut tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG]).await?;
 
     // Arguments and files check
 
@@ -552,8 +552,20 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 consensus_bam_file_stream,
                 PathBuf::from(align_bam_path),
             ));
-
-
+            
+            
+            //Check target type, only allow viral
+            match args.target_type {
+                TargetType::Viral => {
+                    let ivar_version = check_version(IVAR_TAG).await.map_err(|err| anyhow!("Cannot find ivar tool in path. Error: {}", err))?;
+                    tool_versions.insert(IVAR_TAG.to_string(), ivar_version);
+                }
+                
+                _ => {
+                    return Err(anyhow!("Only viral consensus target types supported at this time."));
+                }
+            }
+            
             //Samtools mpileup
 
             

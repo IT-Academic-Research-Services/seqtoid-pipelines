@@ -7,6 +7,13 @@ pub enum Technology {
     ONT,
 }
 
+#[derive(Debug, Clone, ValueEnum, Default, PartialEq)]
+pub enum TargetType {
+    #[default]
+    Viral,
+    Bacterial,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
@@ -82,5 +89,8 @@ pub struct Arguments {
 
     #[arg(long)]
     pub adapter_fasta : Option<String>,
+
+    #[arg( long = "target_type", default_value = "viral", value_enum)]
+    pub target_type: TargetType,
     
 }
