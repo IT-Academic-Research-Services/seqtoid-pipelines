@@ -325,7 +325,8 @@ pub mod samtools {
                     args_vec.push("-A".to_string()); // do not discard anomalous read pairs
                     args_vec.push("-d".to_string()); // max depth zero
                     args_vec.push("0".to_string());
-                    args_vec.push("-Q0".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push(args.quality.to_string());
 
                 }
                 }
@@ -346,7 +347,10 @@ pub mod bcftools {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG};
+    use crate::cli::Arguments;
+    use crate::config::defs::{BcftoolsSubcommand, SamtoolsSubcommand, BCFTOOLS_TAG};
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::samtools::{SamtoolsArgGenerator, SamtoolsConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[derive(Debug)]
@@ -354,6 +358,8 @@ pub mod bcftools {
         pub subcommand: BcftoolsSubcommand,
         pub subcommand_fields: HashMap<String, Option<String>>,
     }
+
+    pub struct BcftoolsArgGenerator;
 
     pub async fn bcftools_presence_check() -> anyhow::Result<String> {
         let args: Vec<&str> = vec!["-v"];
@@ -380,10 +386,32 @@ pub mod bcftools {
         }
         Ok(version)
     }
-    
-}
 
-pub mod kraken2 {
+    impl ArgGenerator for BcftoolsArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<BcftoolsConfig>())
+                .ok_or_else(|| anyhow!("Samtools requires a BcftoolsConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                BcftoolsSubcommand::Consensus => {
+                    args_vec.push("consensus".to_string());
+                    args
+                }
+
+                BcftoolsSubcommand::Call => {
+                args_vec.push("call".to_string());}
+            }
+
+
+            }
+
+        }
+    }
+
+    pub mod kraken2 {
     use anyhow::anyhow;
     use std::path::PathBuf;
     use tokio::process::Command;
