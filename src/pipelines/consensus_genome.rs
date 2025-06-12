@@ -16,9 +16,10 @@ use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_o
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, IVAR_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, IVAR_TAG, IvarSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
+use crate::utils::command::ivar::IvarConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
 
 
@@ -552,85 +553,29 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 consensus_bam_file_stream,
                 PathBuf::from(align_bam_path),
             ));
-            
-            
+
+
             //Check target type, only allow viral
             match args.target_type {
                 TargetType::Viral => {
-                    let ivar_version = check_version(IVAR_TAG).await.map_err(|err| anyhow!("Cannot find ivar tool in path. Error: {}", err))?;
-                    tool_versions.insert(IVAR_TAG.to_string(), ivar_version);
-                }
-                
+                   
+
+
+
+                }  // End if viral
+
                 _ => {
                     return Err(anyhow!("Only viral consensus target types supported at this time."));
                 }
             }
-            
+
             //Samtools mpileup
 
             
-            let mpileup_samtools_config = SamtoolsConfig {
-                subcommand: SamtoolsSubcommand::Mpileup,
-                subcommand_fields: HashMap::from([
-                    ("-".to_string(), None),
-                ]),
-            };
-            let mpileup_samtools_args = generate_cli(SAMTOOLS_TAG, &args, Some(&mpileup_samtools_config))?;
-            
-            
-            let (mut mpileup_samtools_child, mpileup_samtools_stream_task, mpileup_samtools_err_task) = stream_to_cmd(
-                consensus_bam_output_stream,
-                SAMTOOLS_TAG,
-                mpileup_samtools_args,
-                StreamDataType::JustBytes,
-                args.verbose,
-            ).await?;
-            
-            let mpileup_samtools_out_stream = parse_child_output(
-                &mut mpileup_samtools_child,
-                ChildStream::Stdout,
-                ParseMode::Bytes,
-                args.buffer_size / 4,
-            ).await?;
 
 
-            //split the mpileup output stream for writing to a file and further processing
-            let mpileup_output_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("mpileup.txt"), "_");
-            let (mpileup_streams, mpileup_done_rx) = t_junction(
-                ReceiverStream::new(mpileup_samtools_out_stream),
-                2,
-                args.buffer_size,
-                args.stall_threshold.try_into().unwrap(),
-                Some(args.stream_sleep_ms),
-                50,
-            ).await?;
-            
-            if mpileup_streams.len() != 2 {
-                return Err(anyhow!("Expected exactly 2 streams, got {}", mpileup_streams.len()));
-            }
-            
-            let mut mpileup_streams_iter = mpileup_streams.into_iter();
-            let mpileup_output_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup output stream"))?;
-            let mpileup_file_stream = mpileup_streams_iter.next().ok_or_else(|| anyhow!("Missing mpileup file stream"))?;
-            
-            let mpileup_write_task = tokio::spawn(stream_to_file(
-                mpileup_file_stream,
-                PathBuf::from(mpileup_output_file_path),
-            ));
 
-            //
-            let align_output_write_task = tokio::spawn(stream_to_file(
-                mpileup_output_stream,
-                PathBuf::from("test_mpileup.txt"),
-            ));
 
-            mpileup_write_task.await??;
-            // mpileup_ref_write_task.await??;
-            mpileup_samtools_stream_task.await??;
-            mpileup_samtools_err_task.await??;
-            // mpileup_write_task.await??;
-            // mpileup_done_rx.await??;
-            align_output_write_task.await??;
             consensus_bam_write_task.await??;
             // consensus_samtools_index_stream_task.await??;
             // consensus_index_err_task.await??;
