@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, IVAR_FREQ_THRESHOLD, IVAR_QUAL_THRESHOLD};
 use crate::cli::Arguments;
 
 
@@ -494,10 +494,22 @@ pub mod bcftools {
 }
 
 pub mod ivar {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{IVAR_TAG, IvarSubcommand};
+    use crate::cli::Arguments;
+    use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
+    use crate::utils::command::ArgGenerator;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    #[derive(Debug)]
+    pub struct IvarConfig {
+        pub subcommand: IvarSubcommand,
+        pub subcommand_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct IvarArgGenerator;
 
     pub async fn ivar_presence_check() -> anyhow::Result<String> {
         let args: Vec<&str> = vec!["version"];
@@ -525,9 +537,39 @@ pub mod ivar {
             return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
         }
         Ok(version)
-        
     }
-    
+
+    impl ArgGenerator for IvarArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<IvarConfig>())
+                .ok_or_else(|| anyhow!("IVar requires a IvarConfig as extra argument"))?;
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                IvarSubcommand::Consensus => {
+                    args_vec.push("consensus".to_string());
+                    args_vec.push("-q".to_string());
+                    args_vec.push(IVAR_QUAL_THRESHOLD.to_string());
+                    args_vec.push("-t".to_string());
+                    args_vec.push(IVAR_FREQ_THRESHOLD.to_string());
+                    args_vec.push("-m".to_string());
+                    args_vec.push(args.min_depth.to_string());
+                    args_vec.push("-n N".to_string());
+                }
+            }
+
+
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
+            
+        }
+    }
 }
 
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {

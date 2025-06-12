@@ -29,6 +29,9 @@ pub enum IvarSubcommand {
     Consensus
 }
 
+pub const IVAR_QUAL_THRESHOLD: usize = 20;
+pub const IVAR_FREQ_THRESHOLD: f64 = 0.75;
+
 pub const FASTA_TAG : &str = "fasta";
 pub const FASTQ_TAG : &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];

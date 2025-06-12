@@ -93,4 +93,7 @@ pub struct Arguments {
     #[arg( long = "target_type", default_value = "viral", value_enum)]
     pub target_type: TargetType,
     
+    #[arg(long, default_value_t = 10)]
+    pub min_depth: usize,
+    
 }
