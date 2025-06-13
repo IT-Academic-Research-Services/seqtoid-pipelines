@@ -419,8 +419,9 @@ pub mod bcftools {
     use crate::config::defs::{KRAKEN2_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
+        use crate::utils::file::file_path_manipulator;
 
-    #[derive(Debug)]
+        #[derive(Debug)]
     pub struct Kraken2Config {
         pub report_path: PathBuf, 
         pub classified_path: PathBuf,
@@ -465,10 +466,16 @@ pub mod bcftools {
                 .ok_or_else(|| anyhow!("Kraken2 requires a Kraken2Config as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
-            
+            let cwd = std::env::current_dir()?;
             match &args.kraken_db{
                 Some(db) => {
-                    args_vec.push(format!("--db={}", db));
+                    let kraken2_db_path = file_path_manipulator(&PathBuf::from(db), &cwd, None, None, "");
+                    if !kraken2_db_path.exists() || !kraken2_db_path.is_dir() {
+                        return Err(anyhow!("Kraken2 database path does not exist or is not a directory: {:?}", kraken2_db_path));
+                    }
+                    
+                    args_vec.push("--db".to_string());
+                    args_vec.push(kraken2_db_path.to_string_lossy().to_string());
                 }
                 None => {
                     return Err(anyhow!("No kraken_db specified"));
@@ -479,12 +486,16 @@ pub mod bcftools {
                 true => args.threads,
                 false => num_cpus::get()-1,
             };
-            args_vec.push(format!("--threads {}", num_cores));
-            args_vec.push(format!("--report {}", config.report_path.to_string_lossy()));
-            args_vec.push(format!("--classified-out {}", config.classified_path.to_string_lossy()));
-            args_vec.push(format!("--output -")); // "-" will suppress normal output
-            args_vec.push(format!("--memory-mapping"));
-            args_vec.push(format!("--gzip-compressed"));
+            args_vec.push("--threads".to_string());
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--report".to_string());
+            args_vec.push( config.report_path.to_string_lossy().to_string());
+            args_vec.push("--classified-out".to_string());
+            args_vec.push(config.classified_path.to_string_lossy().to_string());
+            args_vec.push("--output".to_string());
+            args_vec.push("-".to_string()); // "-" will suppress normal output
+            // args_vec.push("--memory-mapping".to_string());
+            // args_vec.push("--gzip-compressed".to_string());
 
             args_vec.push(config.fastq_path.to_string_lossy().to_string()); // input, should be a mkfifo
 
@@ -567,7 +578,7 @@ pub mod ivar {
                     None => { },
                 }
             }
-            
+            Ok(args_vec)
         }
     }
 }
