@@ -13,14 +13,15 @@ use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions, check_version};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo, parse_and_filter_fastq_id};
 use crate::utils::db::write_hdf5_seq_to_fifo;
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_bytes};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_bytes, parse_fastq};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, IVAR_TAG, IvarSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::ivar::IvarConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
+use tokio::sync::mpsc;
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -455,23 +456,45 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 let (mut _filter_kraken2_child, _filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
                 
                 let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
-                let kraken2_classified_out_stream_rx = parse_bytes(kraken2_classified_stream, args.buffer_size / 4).await?;
-                
-                // test output of classified
-                let kraken2_classified_output_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified_out.fastq"), "_");
-                let kraken2_classified_write_task = tokio::spawn(stream_to_file(
-                    kraken2_classified_out_stream_rx,
-                    kraken2_classified_output_path.clone(),
-                ));
 
+                // let kraken2_classified_out_stream_rx = parse_bytes(kraken2_classified_stream, args.buffer_size / 4).await?;
+                // let kraken2_classified_output_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified_out.fastq"), "_");
+                // let test_write_task = tokio::spawn(stream_to_file(
+                //     kraken2_classified_out_stream_rx,
+                //     kraken2_classified_output_path.clone(),
+                // ));
+                
+
+                let parse_rx = parse_fastq(kraken2_classified_stream, args.buffer_size).await?;
+                let filter_fn = |id: &str| id.contains("kraken:taxid|2697049");  // TODO no hard code
+                
+                let filtered_rx = parse_and_filter_fastq_id(parse_rx, args.buffer_size, filter_fn).await?;
+
+                let (parse_output_tx, parse_output_rx) = mpsc::channel(args.buffer_size);
+                tokio::spawn(async move {
+                    let mut stream = ReceiverStream::new(filtered_rx);
+                    while let Some(record) = stream.next().await {
+                        if parse_output_tx.send(ParseOutput::Fastq(record)).await.is_err() {
+                            eprintln!("Failed to send ParseOutput::Fastq");
+                            break;
+                        }
+                    }
+                });
+
+                // filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
+
+                let test_write_task = tokio::spawn(stream_to_file(
+                    parse_output_rx,
+                    PathBuf::from("test_filter_reads_id.fq"),
+                ));
                 
                 kraken2_query_write_task.await??;
-                kraken2_classified_write_task.await??;
                 filter_query_write_task.await??;
                 filter_ref_write_task.await?;
-                // filter_output_write_task.await?;
+                test_write_task.await??;
 
-                // filter_reads_out_stream = ReceiverStream::new(filter_samtools_out_stream_fastq);
+
+
             }
 
 
@@ -497,7 +520,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //         write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &align_ref_pipe_path).await;
             //     }
             // });
-            // 
             // 
             // let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
             // 
@@ -530,10 +552,16 @@ pub async fn run(args: &Arguments) -> Result<()> {
             // ).await?;
             // 
             // 
+            // let test_write_task = tokio::spawn(stream_to_file(
+            //     align_samtools_out_stream_sort,
+            //     PathBuf::from("test_samtools_align.bam"),
+            // ));
+            // 
+            // align_ref_write_task.await?;
             // align_query_write_task.await??;
             // align_samtools_task_sort.await??;
             // align_samtools_err_task_sort.await??;
-
+            // test_write_task.await??;
 
             //*****************
             // Make Consensus
