@@ -428,72 +428,45 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     args.buffer_size / 4,
                 ).await?;
                 let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
-
-
-                // let kraken2_wtf_task = tokio::spawn(stream_to_file(
-                //     filter_samtools_out_stream_fastq, 
-                //     PathBuf::from("krakentest.fq"),
-                // ));  
-                //works to here
-
-
-                let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
-                // let kraken2_classified_temp = NamedTempFile::new()?; 
-                // let kraken2_classified_pipe_path = kraken2_classified_temp.path().to_path_buf();
-                // 
-                // if kraken2_classified_pipe_path.exists() {
-                //     std::fs::remove_file(&kraken2_classified_pipe_path)?;
-                // }
-                // Command::new("mkfifo")
-                //     .arg(&kraken2_classified_pipe_path)
-                //     .status()?
-                //     .success()
-                //     .then(|| ())
-                //     .ok_or_else(|| anyhow!("Failed to create mkfifo for Kraken2 classified output"))?;
-
-                let kraken2_classified_chk_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified.fq"), "_");
                 
-
+                let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
+                let kraken2_classified_temp = NamedTempFile::new()?; 
+                let kraken2_classified_pipe_path = kraken2_classified_temp.path().to_path_buf();
+                
+                if kraken2_classified_pipe_path.exists() {
+                    std::fs::remove_file(&kraken2_classified_pipe_path)?;
+                }
+                Command::new("mkfifo")
+                    .arg(&kraken2_classified_pipe_path)
+                    .status()?
+                    .success()
+                    .then(|| ())
+                    .ok_or_else(|| anyhow!("Failed to create mkfifo for Kraken2 classified output"))?;
+                
                 let (kraken2_query_write_task, kraken2_query_pipe_path) = write_parse_output_to_temp(filter_samtools_out_stream_fastq, None).await?;
                 
                 let filter_reads_kraken2_config = Kraken2Config {
                     report_path: kraken2_report_path,
-                    classified_path: kraken2_classified_chk_path.clone(),
+                    classified_path: kraken2_classified_pipe_path.clone(),
                     fastq_path: kraken2_query_pipe_path
                 };
                 
                 let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
-                eprintln!("Filter reads kraken2 args: {:?}", filter_reads_kraken2_args);
+                let (mut _filter_kraken2_child, _filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
                 
-                let (mut filter_kraken2_child, _filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
+                let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
+                let kraken2_classified_out_stream_rx = parse_bytes(kraken2_classified_stream, args.buffer_size / 4).await?;
                 
-                // let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
-                // let kraken2_classified_out_stream_rx = parse_bytes(kraken2_classified_stream, args.buffer_size / 4).await?;
-                // // let mut kraken2_classified_out_stream = ReceiverStream::new(kraken2_classified_out_stream_rx);
-                // 
-                // // test output of classified
-                // let kraken2_classified_output_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified_out.fastq"), "_");
-                // eprintln!("Kraken2 classified output path: {:?}", kraken2_classified_output_path);
-                // let kraken2_classified_write_task = tokio::spawn(stream_to_file(
-                //     kraken2_classified_out_stream_rx, // Clone the receiver for writing
-                //     kraken2_classified_output_path.clone(),
-                // ));
-                // 
-                // let filter_kraken2_out_stream = parse_child_output(
-                //     &mut filter_kraken2_child,
-                //     ChildStream::Stdout,
-                //     ParseMode::Bytes,
-                //     args.buffer_size / 4,
-                // ).await?;
-                // let kraken2_wtf_task = tokio::spawn(stream_to_file(
-                //     filter_kraken2_out_stream, // Clone the receiver for writing
-                //     PathBuf::from("whattheass"),
-                // ));
+                // test output of classified
+                let kraken2_classified_output_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified_out.fastq"), "_");
+                let kraken2_classified_write_task = tokio::spawn(stream_to_file(
+                    kraken2_classified_out_stream_rx,
+                    kraken2_classified_output_path.clone(),
+                ));
 
-
-
+                
                 kraken2_query_write_task.await??;
-                // kraken2_classified_write_task.await??;
+                kraken2_classified_write_task.await??;
                 filter_query_write_task.await??;
                 filter_ref_write_task.await?;
                 // filter_output_write_task.await?;
