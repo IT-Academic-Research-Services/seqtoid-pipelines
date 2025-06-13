@@ -393,7 +393,7 @@ pub async fn parse_child_output(
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
-async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
+pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
     buffer_size: usize,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
@@ -420,11 +420,9 @@ async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 eprintln!("Invalid FASTQ format: expected '@', got '{}'", id_line);
                 return;
             }
-
-            let (id, desc) = match id_line[1..].split_once(' ') {
-                Some((id, desc)) => (id.to_string(), Some(desc.to_string())),
-                None => (id_line[1..].to_string(), None),
-            };
+            
+            let id = id_line[1..].to_string();
+            let desc = None;
 
             buffer.clear();
             if reader.read_line(&mut buffer).await.is_err() {
@@ -481,6 +479,7 @@ async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
+        
     });
 
     Ok(rx)
