@@ -22,6 +22,7 @@ use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::ivar::IvarConfig;
 use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -393,7 +394,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 let filter_ref_write_task = tokio::spawn({
                     let filter_ref_pipe_path = filter_ref_pipe_path.clone();
                     async move {
-                        write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &filter_ref_pipe_path).await;
+                        eprintln!("Starting to write reference to FIFO: {}", filter_ref_pipe_path.display());
+                        let result = write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &filter_ref_pipe_path).await;
+                        eprintln!("Finished writing reference to FIFO: {:?}", result);
+                        result
                     }
                 });
                 let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
@@ -407,6 +411,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     ParseMode::Bytes,
                     args.buffer_size / 4,
                 ).await?;
+
+                let filter_minimap2_err_task = tokio::spawn(async move {
+                    if let Err(e) = filter_minimap2_err_task.await {
+                        eprintln!("minimap2 stderr error in filtering: {}", e);
+                        Err(anyhow!("minimap2 stderr error: {}", e))
+                    } else {
+                        eprintln!("minimap2 stderr task completed in filtering");
+                        Ok(())
+                    }
+                });
+
 
 
                 //Convert to FASTQ
@@ -422,18 +437,22 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 )?;
 
                 let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
+
+
                 let filter_samtools_out_stream_fastq = parse_child_output(
                     &mut filter_samtools_child_fastq,
                     ChildStream::Stdout,
                     ParseMode::Bytes,
                     args.buffer_size / 4,
                 ).await?;
+                eprintln!("Created samtools fastq output stream");
+
                 let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
-                
+
                 let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
-                let kraken2_classified_temp = NamedTempFile::new()?; 
+                let kraken2_classified_temp = NamedTempFile::new()?;
                 let kraken2_classified_pipe_path = kraken2_classified_temp.path().to_path_buf();
-                
+
                 if kraken2_classified_pipe_path.exists() {
                     std::fs::remove_file(&kraken2_classified_pipe_path)?;
                 }
@@ -443,31 +462,37 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     .success()
                     .then(|| ())
                     .ok_or_else(|| anyhow!("Failed to create mkfifo for Kraken2 classified output"))?;
-                
+
+                // Create a temporary FIFO for kraken2 input
                 let (kraken2_query_write_task, kraken2_query_pipe_path) = write_parse_output_to_temp(filter_samtools_out_stream_fastq, None).await?;
-                
+                eprintln!("Kraken2 query FIFO path: {}", kraken2_query_pipe_path.display());
+
+                // Spawn kraken2 to read the FIFO
                 let filter_reads_kraken2_config = Kraken2Config {
                     report_path: kraken2_report_path,
                     classified_path: kraken2_classified_pipe_path.clone(),
-                    fastq_path: kraken2_query_pipe_path
+                    fastq_path: kraken2_query_pipe_path.clone(),
                 };
-                
-                let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
-                let (mut _filter_kraken2_child, _filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
-                
-                let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
 
-                // let kraken2_classified_out_stream_rx = parse_bytes(kraken2_classified_stream, args.buffer_size / 4).await?;
-                // let kraken2_classified_output_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("classified_out.fastq"), "_");
-                // let test_write_task = tokio::spawn(stream_to_file(
-                //     kraken2_classified_out_stream_rx,
-                //     kraken2_classified_output_path.clone(),
-                // ));
-                
+                let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
+                eprintln!("kraken2 args: {:?}", filter_reads_kraken2_args);
+                let (mut filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
+
+                let filter_kraken2_err_task = tokio::spawn(async move {
+                    if let Err(e) = filter_kraken2_err_task.await {
+                        eprintln!("kraken2 stderr error: {}", e);
+                        Err(anyhow!("kraken2 stderr error: {}", e))
+                    } else {
+                        eprintln!("kraken2 stderr task completed");
+                        Ok(())
+                    }
+                });
+
+                let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
+                eprintln!("Opened kraken2 classified pipe: {}", kraken2_classified_pipe_path.display());
 
                 let parse_rx = parse_fastq(kraken2_classified_stream, args.buffer_size).await?;
-                let filter_fn = |id: &str| id.contains("kraken:taxid|2697049");  // TODO no hard code
-                
+                let filter_fn = |id: &str| id.contains("kraken:taxid|2697049"); // TODO no hard code
                 let filtered_rx = parse_and_filter_fastq_id(parse_rx, args.buffer_size, filter_fn).await?;
 
                 let (parse_output_tx, parse_output_rx) = mpsc::channel(args.buffer_size);
@@ -482,15 +507,18 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 });
 
                 // filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
-
                 let test_write_task = tokio::spawn(stream_to_file(
                     parse_output_rx,
                     PathBuf::from("test_filter_reads_id.fq"),
                 ));
-                
+
                 kraken2_query_write_task.await??;
                 filter_query_write_task.await??;
-                filter_ref_write_task.await?;
+                filter_ref_write_task.await??;
+                filter_minimap2_err_task.await??;
+                filter_samtools_task_fastq.await??;
+                filter_samtools_err_task_fastq.await??;
+                filter_kraken2_err_task.await??;
                 test_write_task.await??;
 
 
@@ -498,7 +526,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             }
 
 
-            
             //*****************
             // Align Reads to Target
             
@@ -550,14 +577,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //     ParseMode::Bytes,
             //     args.buffer_size / 4,
             // ).await?;
-            // 
-            // 
-            // let test_write_task = tokio::spawn(stream_to_file(
-            //     align_samtools_out_stream_sort,
-            //     PathBuf::from("test_samtools_align.bam"),
-            // ));
-            // 
-            // align_ref_write_task.await?;
+
+
+
+
+
+
+
+
             // align_query_write_task.await??;
             // align_samtools_task_sort.await??;
             // align_samtools_err_task_sort.await??;
