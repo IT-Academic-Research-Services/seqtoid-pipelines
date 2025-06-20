@@ -11,8 +11,9 @@ use futures::StreamExt;
 use crate::cli::{Arguments, Technology};
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
-use crate::utils::file::file_path_manipulator;
+use crate::utils::file::{extension_remover, file_path_manipulator};
 use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
+use tokio::time::{timeout, Duration};
 
 const CHUNK_SIZE: usize = 1000;
 const TEST_FASTA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt.fa");
@@ -27,13 +28,12 @@ struct IndexEntry {
     index: u64,
 }
 
-/// Asynchronous fxn for writing to an hdf5 file.
+/// Asynchronous function for writing to an HDF5 file.
 ///
 /// # Arguments
 ///
 /// * `rx_stream` - ReceiverStream<SequenceRecord> from read_and_interleave_sequences or similar.
-/// * `hdf_file_name' - HDF5 file to write to.
-/// * `threads' - Number of Blosc compression threads.
+/// * `hdf5_file_name` - HDF5 file to write to.
 ///
 /// # Returns
 /// anyhow::Result<()>
@@ -41,6 +41,7 @@ struct IndexEntry {
 pub async fn write_sequences_to_hdf5(
     rx_stream: &mut ReceiverStream<SequenceRecord>,
     hdf5_file_name: &PathBuf,
+    single_accession: Option<String>,
 ) -> anyhow::Result<()> {
     // Open file in read-write mode, create if it doesn't exist
     let hdf5_file = if hdf5_file_name.exists() {
@@ -48,12 +49,12 @@ pub async fn write_sequences_to_hdf5(
     } else {
         File::create::<&Path>(hdf5_file_name.as_ref())?
     };
-    
+
     let hdf5_group = match hdf5_file.group("db") {
         Ok(group) => group,
         Err(_) => hdf5_file.create_group("db")?,
     };
-    
+
     let seq_dataset = match hdf5_group.dataset("sequences") {
         Ok(dataset) => dataset,
         Err(_) => hdf5_group
@@ -95,77 +96,152 @@ pub async fn write_sequences_to_hdf5(
     let mut id_buffer: Vec<FixedAscii<24>> = Vec::new();
     let mut index_buffer: Vec<IndexEntry> = Vec::new();
 
-    while let Some(record) = rx_stream.next().await {
-        let accession = record
-            .id()
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Invalid header: {}", record.id()))?;
-        if accession.len() > 23 {
-            eprintln!(
-                "ERROR: Skipping ID '{}' ({} bytes), exceeds 23-byte limit",
-                accession,
-                accession.len()
-            );
-            continue;
-        }
-        let mut accession_bytes = accession.as_bytes().to_vec();
-        accession_bytes.push(0); // Add null terminator
-        let id = FixedAscii::from_ascii(&accession_bytes)
-            .map_err(|e| anyhow::anyhow!("Invalid ASCII in '{}': {}", accession, e))?;
-        seq_buffer.push(record.seq().into());
-        id_buffer.push(id.clone());
-        index_buffer.push(IndexEntry { id, index: global_index });
-        global_index += 1;
+    match single_accession {
+        Some(single_accession) => {
+            if single_accession.len() > 23 {
+                return Err(anyhow!(
+                    "Single accession '{}' ({} bytes) exceeds 23-byte limit",
+                    single_accession,
+                    single_accession.len()
+                ));
+            }
+            let mut accession_bytes = single_accession.as_bytes().to_vec();
+            accession_bytes.push(0); // Add null terminator
+            let id = FixedAscii::from_ascii(&accession_bytes)
+                .map_err(|e| anyhow!("Invalid ASCII in '{}': {}", single_accession, e))?;
 
-        if seq_buffer.len() >= CHUNK_SIZE {
-            let count = seq_buffer.len();
-            index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-            write_chunk_async(
-                seq_dataset.clone(),
-                id_dataset.clone(),
-                index_dataset.clone(),
-                seq_buffer,
-                id_buffer,
-                index_buffer,
-                count,
-            )
-                .await?;
-            seq_buffer = Vec::new();
-            id_buffer = Vec::new();
-            index_buffer = Vec::new();
-        }
-    }
+            while let Some(record) = rx_stream.next().await {
+                let chrom = record
+                    .id()
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| anyhow!("Invalid header: {}", record.id()))?;
+                eprintln!("chrom {}", chrom);
+                // Construct full FASTA record: header + sequence + newline
+                let mut fasta_record = Vec::new();
+                fasta_record.extend_from_slice(format!(">{}\n", chrom).as_bytes());
+                fasta_record.extend_from_slice(record.seq());
+                fasta_record.push(b'\n');
 
-    if !seq_buffer.is_empty() {
-        let count = seq_buffer.len();
-        index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        write_chunk_async(
-            seq_dataset,
-            id_dataset,
-            index_dataset,
-            seq_buffer,
-            id_buffer,
-            index_buffer,
-            count,
-        )
-            .await?;
+                seq_buffer.push(VarLenArray::from(&fasta_record[..]));
+                id_buffer.push(id.clone());
+                index_buffer.push(IndexEntry { id: id.clone(), index: global_index });
+                global_index += 1;
+
+                if seq_buffer.len() >= CHUNK_SIZE {
+                    let count = seq_buffer.len();
+                    index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+                    write_chunk_async(
+                        seq_dataset.clone(),
+                        id_dataset.clone(),
+                        index_dataset.clone(),
+                        seq_buffer,
+                        id_buffer,
+                        index_buffer,
+                        count,
+                    )
+                        .await?;
+                    seq_buffer = Vec::new();
+                    id_buffer = Vec::new();
+                    index_buffer = Vec::new();
+                }
+            }
+
+            if !seq_buffer.is_empty() {
+                let count = seq_buffer.len();
+                index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+                write_chunk_async(
+                    seq_dataset.clone(),
+                    id_dataset.clone(),
+                    index_dataset.clone(),
+                    seq_buffer,
+                    id_buffer,
+                    index_buffer,
+                    count,
+                )
+                    .await?;
+            }
+        }
+        None => {
+            while let Some(record) = rx_stream.next().await {
+                let accession = record
+                    .id()
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| anyhow!("Invalid header: {}", record.id()))?;
+                if accession.len() > 23 {
+                    eprintln!(
+                        "ERROR: Skipping ID '{}' ({} bytes), exceeds 23-byte limit",
+                        accession,
+                        accession.len()
+                    );
+                    continue;
+                }
+                let mut accession_bytes = accession.as_bytes().to_vec();
+                accession_bytes.push(0); // Add null terminator
+                let id = FixedAscii::from_ascii(&accession_bytes)
+                    .map_err(|e| anyhow!("Invalid ASCII in '{}': {}", accession, e))?;
+
+                // Construct full FASTA record: header + sequence + newline
+                let mut fasta_record = Vec::new();
+                fasta_record.extend_from_slice(format!(">{}\n", accession).as_bytes());
+                fasta_record.extend_from_slice(record.seq());
+                fasta_record.push(b'\n');
+
+                seq_buffer.push(VarLenArray::from(&fasta_record[..]));
+                id_buffer.push(id.clone());
+                index_buffer.push(IndexEntry { id, index: global_index });
+                global_index += 1;
+
+                if seq_buffer.len() >= CHUNK_SIZE {
+                    let count = seq_buffer.len();
+                    index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+                    write_chunk_async(
+                        seq_dataset.clone(),
+                        id_dataset.clone(),
+                        index_dataset.clone(),
+                        seq_buffer,
+                        id_buffer,
+                        index_buffer,
+                        count,
+                    )
+                        .await?;
+                    seq_buffer = Vec::new();
+                    id_buffer = Vec::new();
+                    index_buffer = Vec::new();
+                }
+            }
+
+            if !seq_buffer.is_empty() {
+                let count = seq_buffer.len();
+                index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+                write_chunk_async(
+                    seq_dataset,
+                    id_dataset,
+                    index_dataset,
+                    seq_buffer,
+                    id_buffer,
+                    index_buffer,
+                    count,
+                )
+                    .await?;
+            }
+        }
     }
 
     Ok(())
 }
-
 /// Asynchronous caller of write_chunk.
 ///
 /// # Arguments
 ///
 /// * `seq_dataset` - Dataset of sequence data.
-/// * `id_dataset' - Dataset of id data.
-/// * `index_dataset' - "dataset of id:sequence associations.
+/// * `id_dataset` - Dataset of id data.
+/// * `index_dataset` - Dataset of id:sequence associations.
 /// * `seq_buffer` - Buffer of data to be written to the sequence dataset.
 /// * `id_buffer` - Buffer of data to be written to the id dataset.
 /// * `index_buffer` - Buffer of data to be written to the index dataset.
-/// * 'count' - Passed to use for resizing.
+/// * `count` - Passed to use for resizing.
 ///
 /// # Returns
 /// anyhow::Result<()>
@@ -199,12 +275,12 @@ async fn write_chunk_async(
 /// # Arguments
 ///
 /// * `seq_dataset` - Dataset of sequence data.
-/// * `id_dataset' - Dataset of id data.
-/// * `index_dataset' - "dataset of id:sequence associations.
+/// * `id_dataset` - Dataset of id data.
+/// * `index_dataset` - Dataset of id:sequence associations.
 /// * `seq_buffer` - Buffer of data to be written to the sequence dataset.
 /// * `id_buffer` - Buffer of data to be written to the id dataset.
 /// * `index_buffer` - Buffer of data to be written to the index dataset.
-/// * 'count' - Passed to use for resizing.
+/// * `count` - Passed to use for resizing.
 ///
 /// # Returns
 /// anyhow::Result<()>
@@ -273,7 +349,6 @@ pub async fn build_new_in_memory_index(h5_path: &PathBuf, cache_file_name: &Path
     Ok(index_map)
 }
 
-
 /// Loads an index file associated with an HDF5 file.
 ///
 /// # Arguments
@@ -297,10 +372,10 @@ pub async fn load_index(index_path: &PathBuf) -> anyhow::Result<HashMap<[u8; 24]
 ///
 /// * `h5_file_name` - Name of index file.
 /// * `index_file_name` - Name of index file.
-/// * 'target_id` - Accession ID to test.
+/// * `target_id` - Accession ID to test.
 ///
 /// # Returns
-/// anyhow::Result<HashMap<[u8; 24], u64>> the index
+/// anyhow::Result<()>
 ///
 pub async fn check_db(h5_path: &PathBuf, index_path: &PathBuf, target_id: Option<&str>) -> anyhow::Result<()> {
     println!("Checking HDF5 file: {}", h5_path.display());
@@ -339,19 +414,18 @@ pub async fn check_db(h5_path: &PathBuf, index_path: &PathBuf, target_id: Option
     Ok(())
 }
 
-
 /// Retrieve a sequence from an H5 file.
 ///
 /// # Arguments
 ///
 /// * `h5_file_name` - Name of index file.
-/// * 'target_id` - Accession ID to test.
-/// * `index_map' - Index associated with H5 file.
+/// * `index_map` - Index associated with H5 file.
+/// * `target_id` - Accession ID to test.
 ///
 /// # Returns
-/// anyhow::Result<HashMap<[u8; 24], u64>> the index
+/// anyhow::Result<Vec<u8>> the FASTA record (header + sequence + newline)
 ///
-pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u64>, target_id: &String) -> anyhow::Result<Vec<u8>> {
+pub async fn lookup_sequence(h5_path: &PathBuf, index_map: &HashMap<[u8; 24], u64>, target_id: &String) -> anyhow::Result<Vec<u8>> {
     if target_id.len() > 23 {
         return Err(anyhow::anyhow!(
             "Target ID '{}' ({} bytes) exceeds 23-byte limit",
@@ -364,13 +438,6 @@ pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u
     let seq_dataset = group.dataset("sequences")?;
 
     let mut id_bytes = [0u8; 24];
-    if target_id.len() > 23 {
-        return Err(anyhow::anyhow!(
-        "Target ID '{}' ({} bytes) exceeds 23-byte limit",
-        target_id,
-        target_id.len()
-    ));
-    }
     id_bytes[..target_id.len()].copy_from_slice(target_id.as_bytes());
     let index = index_map
         .get(&id_bytes)
@@ -392,26 +459,33 @@ pub async fn lookup_sequence(h5_path: &PathBuf,  index_map: &HashMap<[u8; 24], u
 ///
 /// # Arguments
 ///
-/// * `seq` - The retrieved sequence.
-/// * 'accession` - Accession ID for naming in the FIFO pipe.
-/// * `fifo_path' - Will be used as named pipe for passing.
+/// * `seq` - The retrieved FASTA record (header + sequence + newline).
+/// * `accession` - Accession ID (not used for writing, kept for compatibility).
+/// * `fifo_path` - Path to the named pipe for passing.
 ///
 /// # Returns
-/// Result
+/// Result<()>
 ///
 pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
-    let mut fifo_file = TokioFile::create(fifo_path).await?;
-    fifo_file.write_all(format!(">{}\n", accession).as_bytes()).await?;
-    let seq_str = String::from_utf8_lossy(seq);
-    const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
-    for chunk in seq_str.as_bytes().chunks(CHUNK_SIZE) {
-        fifo_file.write_all(chunk).await?;
+    let mut fifo_file = timeout(Duration::from_secs(10), TokioFile::create(fifo_path)).await??;
+    eprintln!("Writing FASTA record to FIFO: {}", fifo_path.display());
+    eprintln!("FASTA record length: {} bytes", seq.len());
+
+    if seq.is_empty() {
+        return Err(anyhow!("Empty FASTA record for FIFO: {}", fifo_path.display()));
     }
-    fifo_file.write_all(b"\n").await?;
-    fifo_file.flush().await?;
+
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1 MB chunks
+    let mut total_bytes = 0;
+    for chunk in seq.chunks(CHUNK_SIZE) {
+        timeout(Duration::from_secs(10), fifo_file.write_all(chunk)).await??;
+        total_bytes += chunk.len();
+        eprintln!("Wrote chunk of {} bytes to FIFO: {}", chunk.len(), fifo_path.display());
+    }
+    timeout(Duration::from_secs(10), fifo_file.flush()).await??;
+    eprintln!("Wrote total {} bytes to FIFO: {}", total_bytes, fifo_path.display());
     Ok(())
 }
-
 
 /// Retrieves an index HashMap from file if provided, otherwise builds one.
 ///
@@ -452,15 +526,14 @@ pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64
 /// # Arguments
 ///
 /// * `args` - CLI arguments.
-/// * 'ref_db_path` - Optional path to existing DB for retrieval.
-/// * `h5_index' - Optional hdf5 index file.
+/// * `ref_db_path` - Optional path to existing DB for retrieval.
+/// * `h5_index` - Optional HDF5 index file.
 ///
 /// # Returns
-/// anyhow::Result<(String, Vec<u8>)> <accession, sequence>
+/// anyhow::Result<(String, Vec<u8>)> <accession, FASTA record>
 ///
 pub async fn retrieve_h5_seq(accession: Option<String>, sequence_file: Option<String>, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<(String, Vec<u8>)> {
     let cwd = std::env::current_dir()?;
-
 
     match (sequence_file, accession) {
         (Some(sequence_file), None) => {
@@ -477,8 +550,11 @@ pub async fn retrieve_h5_seq(accession: Option<String>, sequence_file: Option<St
                 .map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
             let seq_record: SequenceRecord = record.to_owned().into();
             let accession = seq_record.id().to_string();
-            let sequence = seq_record.seq().to_vec();
-            Ok((accession, sequence))
+            let mut fasta_record = Vec::new();
+            fasta_record.extend_from_slice(format!(">{}\n", accession).as_bytes());
+            fasta_record.extend_from_slice(seq_record.seq());
+            fasta_record.push(b'\n');
+            Ok((accession, fasta_record))
         }
         (None, Some(accession)) => {
             let db_path = ref_db_path.ok_or_else(|| anyhow!("Reference DB path not provided"))?;
@@ -538,7 +614,9 @@ mod tests {
         assert_eq!(index_dataset.shape()[0], 100);
 
         let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..100).unwrap().to_vec();
+        let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..100).unwrap().to_vec();
         assert_eq!(ids[0].as_str(), "read1");
+        assert!(String::from_utf8_lossy(&seqs[0]).starts_with(">read1\n"));
 
         Ok(())
     }
@@ -574,7 +652,9 @@ mod tests {
         assert_eq!(index_dataset.shape()[0], 100);
 
         let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..100).unwrap().to_vec();
+        let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..100).unwrap().to_vec();
         assert_eq!(ids[0].as_str(), "read1");
+        assert!(String::from_utf8_lossy(&seqs[0]).starts_with(">read1\n"));
 
         Ok(())
     }
@@ -614,14 +694,14 @@ mod tests {
         let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..7).unwrap().to_vec();
         assert_eq!(ids[0].as_str(), "NC_049488.1");
         assert_eq!(ids[6].as_str(), "test7");
-        assert_eq!(seqs[6].to_vec(), b"ACGT");
+        assert!(String::from_utf8_lossy(&seqs[6]).starts_with(">test7\n"));
+        assert!(String::from_utf8_lossy(&seqs[6]).ends_with("ACGT\n"));
 
         Ok(())
     }
-    
+
     #[tokio::test]
     async fn test_seq_lookup() -> anyhow::Result<()> {
-
         let path = PathBuf::from(TEST_FASTA_PATH);
         assert!(path.exists(), "Test file {} does not exist", TEST_FASTA_PATH);
 
@@ -649,18 +729,18 @@ mod tests {
         let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..7).unwrap().to_vec();
         let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..7).unwrap().to_vec();
         assert_eq!(ids[6].as_str(), "test7");
-        
+
         let index_path = hdf5_path.with_extension("index.bin");
         let _ = fs::remove_file(&index_path);
-        
+
         let index_map = build_new_in_memory_index(&hdf5_path, &index_path).await?;
-        
-        let seq = lookup_sequence(&hdf5_path,  &index_map, &TEST_FASTA_ID.to_string()).await?;
-        let seq_str = std::str::from_utf8(&seq).unwrap();
-        assert_eq!(seq_str, TEST_FASTA_SEQ);
-        
+
+        let seq = lookup_sequence(&hdf5_path, &index_map, &TEST_FASTA_ID.to_string()).await?;
+        let seq_str = String::from_utf8_lossy(&seq);
+        assert!(seq_str.starts_with(">test7\n"));
+        assert!(seq_str.ends_with("ACGT\n"));
+
         Ok(())
-        
     }
 
     #[tokio::test]
@@ -683,36 +763,30 @@ mod tests {
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
         assert!(result.is_ok());
 
-        let (stem, _extensions) = extension_remover(&PathBuf::from(&hdf5_path));
-        let base = stem.to_str().unwrap_or("");
-
         let index_path = hdf5_path.with_extension("index.bin");
         let _ = fs::remove_file(&index_path);
 
         let index_map_from_build = build_new_in_memory_index(&hdf5_path, &index_path).await?;
 
         let index_map_from_file = load_index(&index_path).await?;
-        
+
         assert_eq!(index_map_from_build.len(), index_map_from_file.len());
 
         for (key, value) in index_map_from_build.iter() {
             match index_map_from_file.get(key) {
                 Some(&map2_value) => {
                     assert_eq!(map2_value, *value);
-
                 }
                 None => assert!(false), // Key missing
             }
         }
-        
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_read_too_long_to_db() -> anyhow::Result<()> {
-        
         let path = PathBuf::from(TEST_FASTA_TOOLONG_PATH);
-        
         assert!(path.exists(), "Test file {} does not exist", TEST_FASTA_TOOLONG_PATH);
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -744,12 +818,11 @@ mod tests {
         let ids: Vec<FixedAscii<24>> = id_dataset.read_slice(0..6).unwrap().to_vec();
         let seqs: Vec<VarLenArray<u8>> = seq_dataset.read_slice(0..6).unwrap().to_vec();
 
-        assert_eq!(ids[0].as_str(), "NC_039199.1"); // NB: This is actually the second entry, 
-        // so this assertion implies the first entry was skipped for excessive length
+        assert_eq!(ids[0].as_str(), "NC_039199.1");
         assert_eq!(ids[5].as_str(), "test7");
-        assert_eq!(seqs[5].to_vec(), b"ACGT");
+        assert!(String::from_utf8_lossy(&seqs[5]).starts_with(">test7\n"));
+        assert!(String::from_utf8_lossy(&seqs[5]).ends_with("ACGT\n"));
 
         Ok(())
     }
-
 }
