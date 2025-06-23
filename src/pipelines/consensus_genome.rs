@@ -182,58 +182,20 @@ pub async fn run(args: &Arguments) -> Result<()> {
         .status()?;
     
     let (host_accession, host_seq) = retrieve_h5_seq(args.host_accession.clone(), args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-    // // Create FIFO pipe from either the host_sequence or host_accession
     let host_ref_write_task = tokio::spawn({
         let host_ref_pipe_path = host_ref_pipe_path.clone();
         async move {
             let result = write_hdf5_seq_to_fifo(&host_seq, &host_accession, &host_ref_pipe_path).await;
-            eprintln!("Finished reference FIFO write: {:?}", result); // Debug log
             result
         }
     });
-    // 
-    // Create a temporary file for the reference instead of a FIFO
-    // let host_ref_file_path = tempfile::Builder::new()
-    //     .prefix("ref_")
-    //     .suffix(".fasta")
-    //     .tempfile()?
-    //     .into_temp_path()
-    //     .to_path_buf();
-
-    // let host_ref_file_path = PathBuf::from(&"test_ref.fasta");
     
-    // Write reference to file
-    // let host_ref_write_task = tokio::spawn({
-    //     let host_ref_file_path = host_ref_file_path.clone();
-    //     async move {
-    //         let mut writer_file = TokioFile::create(&host_ref_file_path).await?;
-    //         let mut writer = BufWriter::with_capacity(1_000_000, writer_file);
-    //         eprintln!("Writing {} bytes of sequence", host_seq.len());
-    //         writer.write_all(&host_seq).await?;
-    //         writer.flush().await?;
-    //         writer.shutdown().await?;
-    //         eprintln!("Finished writing reference to file: {}", host_ref_file_path.display());
-    //         Ok::<(), anyhow::Error>(())
-    //     }
-    // });
-
-
-
     // Create FIFO pipe for the fastp output to stream to minimap2
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
-    eprintln!("Created query FIFO: {}", host_query_pipe_path.display());
-
-
-    eprintln!("Starting minimap2");
-    
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
-    eprintln!("arghs {}", host_minimap2_args.join(" "));
     let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, args.verbose).await?;
-    eprintln!("Minimap2 spawned");
-    // Small delay to ensure reference FIFO header is written
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     
-    // Log minimap2 stderr concurrently
     let host_minimap2_err_handle = tokio::spawn(async move {
         let err_result = host_minimap2_err_task.await;
         eprintln!("Minimap2 stderr task completed: {:?}", err_result);

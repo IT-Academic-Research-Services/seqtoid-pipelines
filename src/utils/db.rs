@@ -456,9 +456,7 @@ pub async fn lookup_sequence(h5_path: &PathBuf, index_map: &HashMap<[u8; 24], u6
 ///
 pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
     let mut fifo_file = timeout(Duration::from_secs(10), TokioFile::create(fifo_path)).await??;
-    eprintln!("Writing FASTA record to FIFO: {}", fifo_path.display());
-    eprintln!("FASTA record length: {} bytes", seq.len());
-
+    
     if seq.is_empty() {
         return Err(anyhow!("Empty FASTA record for FIFO: {}", fifo_path.display()));
     }
@@ -468,10 +466,9 @@ pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, accession: &str, fifo_path: &
     for chunk in seq.chunks(CHUNK_SIZE) {
         timeout(Duration::from_secs(10), fifo_file.write_all(chunk)).await??;
         total_bytes += chunk.len();
-        eprintln!("Wrote chunk of {} bytes to FIFO: {}", chunk.len(), fifo_path.display());
+
     }
     timeout(Duration::from_secs(10), fifo_file.flush()).await??;
-    eprintln!("Wrote total {} bytes to FIFO: {}", total_bytes, fifo_path.display());
     Ok(())
 }
 
