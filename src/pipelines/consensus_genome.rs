@@ -210,90 +210,86 @@ pub async fn run(args: &Arguments) -> Result<()> {
     ).await?;
     
     
-    let test_write_task = tokio::spawn(stream_to_file(
-        host_minimap2_out_stream,
-        PathBuf::from("test_host_removed.bam"),
+    let host_samtools_config_view = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
+    };
+    let host_samtools_args_view = generate_cli(
+        SAMTOOLS_TAG,
+        &args,
+        Some(&host_samtools_config_view),
+    )?;
+    
+    let (mut host_samtools_child_view, host_samtools_task_view, host_samtools_err_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
+    let host_samtools_out_stream_view = parse_child_output(
+        &mut host_samtools_child_view,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    cleanup_tasks.push(host_samtools_task_view);
+    cleanup_tasks.push(host_samtools_err_task_view);
+    
+    // //Output to FASTQ through samtools
+    let host_samtools_config_fastq = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
+    };
+    let host_samtools_args_fastq = generate_cli(
+        SAMTOOLS_TAG,
+        &args,
+        Some(&host_samtools_config_fastq),
+    )?;
+    
+    let (mut host_samtools_child_fastq, host_samtools_task_fastq, host_samtools_err_task_fastq) = stream_to_cmd(host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
+    let host_samtools_out_stream_fastq = parse_child_output(
+        &mut host_samtools_child_fastq,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        args.buffer_size / 4,
+    ).await?;
+    let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
+    cleanup_tasks.push(host_samtools_task_fastq);
+    cleanup_tasks.push(host_samtools_err_task_fastq);
+    
+    // Split for file write and passing on to next stage
+    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
+    
+    let (host_streams, host_done_rx) = t_junction(
+        host_samtools_out_stream_fastq,
+        2,
+        args.buffer_size,
+        args.stall_threshold.try_into().unwrap(),
+        Some(args.stream_sleep_ms),
+        50,
+    )
+        .await?;
+    
+    if host_streams.len() != 2 {
+        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
+    }
+    cleanup_receivers.push(host_done_rx);
+    
+    let mut streams_iter = host_streams.into_iter();
+    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    
+    let host_samtools_write_task = tokio::spawn(stream_to_file(
+        no_host_file_stream,
+        PathBuf::from(no_host_file_path),
     ));
-    
-    eprintln!("BAM write task spawned");
-
-    test_write_task.await??;
-
-    
-    eprintln!("BAM file written");
-
-
-    
-    // let host_samtools_config_view = SamtoolsConfig {
-    //     subcommand: SamtoolsSubcommand::View,
-    //     subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
-    // };
-    // let host_samtools_args_view = generate_cli(
-    //     SAMTOOLS_TAG,
-    //     &args,
-    //     Some(&host_samtools_config_view),
-    // )?;
-    // 
-    // let (mut host_samtools_child_view, host_samtools_task_view, host_samtools_err_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes, args.verbose).await?;
-    // let host_samtools_out_stream_view = parse_child_output(
-    //     &mut host_samtools_child_view,
-    //     ChildStream::Stdout,
-    //     ParseMode::Bytes,
-    //     args.buffer_size / 4,
-    // ).await?;
-    // 
-    // // //Output to FASTQ through samtools
-    // let host_samtools_config_fastq = SamtoolsConfig {
-    //     subcommand: SamtoolsSubcommand::Fastq,
-    //     subcommand_fields: HashMap::from([("-".to_string(), None)]),
-    // };
-    // let host_samtools_args_fastq = generate_cli(
-    //     SAMTOOLS_TAG,
-    //     &args,
-    //     Some(&host_samtools_config_fastq),
-    // )?;
-    // 
-    // let (mut host_samtools_child_fastq, host_samtools_task_fastq, host_samtools_err_task_fastq) = stream_to_cmd(host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
-    // let host_samtools_out_stream_fastq = parse_child_output(
-    //     &mut host_samtools_child_fastq,
-    //     ChildStream::Stdout,
-    //     ParseMode::Bytes,
-    //     args.buffer_size / 4,
-    // ).await?;
-    // let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
-    // 
-    // 
-    // // Split for file write and passing on to next stage
-    // let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
-    // 
-    // 
-    // let (host_streams, host_done_rx) = t_junction(
-    //     host_samtools_out_stream_fastq,
-    //     2,
-    //     args.buffer_size,
-    //     args.stall_threshold.try_into().unwrap(),
-    //     Some(args.stream_sleep_ms),
-    //     50,
-    // )
-    //     .await?;
-    // 
-    // if host_streams.len() != 2 {
-    //     return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
-    // }
-    // 
-    // let mut streams_iter = host_streams.into_iter();
-    // let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-    // let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-    // 
-    // let host_samtools_write_task = tokio::spawn(stream_to_file(
-    //     no_host_file_stream,
-    //     PathBuf::from(no_host_file_path),
-    // ));
+    cleanup_tasks.push(host_samtools_write_task);
 
     // let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
+    let test_write_task = tokio::spawn(stream_to_file(
+        no_host_output_stream,
+        PathBuf::from("test_host_removed.fq"),
+    ));
     
-
+    
+    test_write_task.await??;
+    
     
     //*****************
     // Split by Technology
