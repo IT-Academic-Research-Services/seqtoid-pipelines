@@ -168,7 +168,8 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let index_path = h5_path.with_extension("index.bin");
     
     let _index_map = build_new_in_memory_index(&h5_path, &index_path).await?;
-    check_db(&h5_path, &index_path, Option::from(None)).await?;
+    check_db(&h5_path, &index_path, Option::from("hg38")).await?;
+    check_db(&h5_path, &index_path, Option::from("MN908947.3")).await?;
     
     println!("Created DB File: {}", h5_path.display());
     println!("Created DB Index: {}", index_path.display());

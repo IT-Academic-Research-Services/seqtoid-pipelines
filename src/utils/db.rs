@@ -96,7 +96,7 @@ pub async fn write_sequences_to_hdf5(
     let mut id_buffer: Vec<FixedAscii<24>> = Vec::new();
     let mut index_buffer: Vec<IndexEntry> = Vec::new();
 
-    match single_accession {
+    match single_accession {  // Case of single file all for one species
         Some(single_accession) => {
             if single_accession.len() > 23 {
                 return Err(anyhow!(
@@ -110,65 +110,47 @@ pub async fn write_sequences_to_hdf5(
             let id = FixedAscii::from_ascii(&accession_bytes)
                 .map_err(|e| anyhow!("Invalid ASCII in '{}': {}", single_accession, e))?;
 
+            // Accumulate all FASTA records into a single buffer
+            let mut full_fasta = Vec::new();
             while let Some(record) = rx_stream.next().await {
-                let chrom = record
-                    .id()
-                    .split_whitespace()
-                    .next()
-                    .ok_or_else(|| anyhow!("Invalid header: {}", record.id()))?;
-                eprintln!("chrom {}", chrom);
-                // Construct full FASTA record: header + sequence + newline
-                let mut fasta_record = Vec::new();
-                fasta_record.extend_from_slice(format!(">{}\n", chrom).as_bytes());
-                fasta_record.extend_from_slice(record.seq());
-                fasta_record.push(b'\n');
-
-                seq_buffer.push(VarLenArray::from(&fasta_record[..]));
-                id_buffer.push(id.clone());
-                index_buffer.push(IndexEntry { id: id.clone(), index: global_index });
-                global_index += 1;
-
-                if seq_buffer.len() >= CHUNK_SIZE {
-                    let count = seq_buffer.len();
-                    index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-                    write_chunk_async(
-                        seq_dataset.clone(),
-                        id_dataset.clone(),
-                        index_dataset.clone(),
-                        seq_buffer,
-                        id_buffer,
-                        index_buffer,
-                        count,
-                    )
-                        .await?;
-                    seq_buffer = Vec::new();
-                    id_buffer = Vec::new();
-                    index_buffer = Vec::new();
-                }
+                let chrom = record.id(); // Use full ID line
+                eprintln!("Processing chromosome: {}", chrom);
+                full_fasta.push(b'>');
+                full_fasta.extend_from_slice(chrom.as_bytes());
+                full_fasta.push(b'\n');
+                full_fasta.extend_from_slice(record.seq());
+                full_fasta.push(b'\n');
             }
 
-            if !seq_buffer.is_empty() {
-                let count = seq_buffer.len();
-                index_buffer.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-                write_chunk_async(
-                    seq_dataset.clone(),
-                    id_dataset.clone(),
-                    index_dataset.clone(),
-                    seq_buffer,
-                    id_buffer,
-                    index_buffer,
-                    count,
-                )
-                    .await?;
+            if full_fasta.is_empty() {
+                return Err(anyhow!("No FASTA records found for accession '{}'", single_accession));
             }
+
+            seq_buffer.push(VarLenArray::from(&full_fasta[..]));
+            id_buffer.push(id.clone());
+            index_buffer.push(IndexEntry { id, index: global_index });
+            global_index += 1;
+
+            let count = seq_buffer.len();
+            write_chunk_async(
+                seq_dataset,
+                id_dataset,
+                index_dataset,
+                seq_buffer,
+                id_buffer,
+                index_buffer,
+                count,
+            )
+                .await?;
         }
-        None => {
+        None => {  // Case of one entry per entry in FASTA
             while let Some(record) = rx_stream.next().await {
                 let accession = record
                     .id()
                     .split_whitespace()
                     .next()
-                    .ok_or_else(|| anyhow!("Invalid header: {}", record.id()))?;
+                    .ok_or_else(|| anyhow!("Invalid header: {}", record.id()))?
+                    .trim_start_matches('>');
                 if accession.len() > 23 {
                     eprintln!(
                         "ERROR: Skipping ID '{}' ({} bytes), exceeds 23-byte limit",
@@ -182,9 +164,11 @@ pub async fn write_sequences_to_hdf5(
                 let id = FixedAscii::from_ascii(&accession_bytes)
                     .map_err(|e| anyhow!("Invalid ASCII in '{}': {}", accession, e))?;
 
-                // Construct full FASTA record: header + sequence + newline
+                // Construct full FASTA record: full header + sequence + newline
                 let mut fasta_record = Vec::new();
-                fasta_record.extend_from_slice(format!(">{}\n", accession).as_bytes());
+                fasta_record.push(b'>');
+                fasta_record.extend_from_slice(record.id().as_bytes());
+                fasta_record.push(b'\n');
                 fasta_record.extend_from_slice(record.seq());
                 fasta_record.push(b'\n');
 
@@ -231,6 +215,9 @@ pub async fn write_sequences_to_hdf5(
 
     Ok(())
 }
+
+
+
 /// Asynchronous caller of write_chunk.
 ///
 /// # Arguments
@@ -409,6 +396,7 @@ pub async fn check_db(h5_path: &PathBuf, index_path: &PathBuf, target_id: Option
 
         let index_map = load_index(index_path).await?;
         let _seq = lookup_sequence(h5_path, &index_map, &id.to_string()).await?;
+        
     }
 
     Ok(())
@@ -600,7 +588,7 @@ mod tests {
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
         let mut rx_stream = ReceiverStream::new(rx);
-        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
+        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
         let file = File::open(hdf5_path).unwrap();
@@ -638,7 +626,7 @@ mod tests {
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
         let mut rx_stream = ReceiverStream::new(rx);
-        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
+        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
         let file = File::open(hdf5_path).unwrap();
@@ -677,7 +665,7 @@ mod tests {
         )?;
 
         let mut rx_stream = ReceiverStream::new(rx);
-        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
+        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
         let file = File::open(hdf5_path).unwrap();
@@ -718,7 +706,7 @@ mod tests {
         )?;
 
         let mut rx_stream = ReceiverStream::new(rx);
-        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
+        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
         let file = File::open(&hdf5_path).unwrap();
@@ -760,7 +748,7 @@ mod tests {
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
         let mut rx_stream = ReceiverStream::new(rx);
-        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
+        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
         let index_path = hdf5_path.with_extension("index.bin");
@@ -802,7 +790,7 @@ mod tests {
         )?;
 
         let mut rx_stream = ReceiverStream::new(rx);
-        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path).await;
+        let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
         let file = File::open(&hdf5_path).unwrap();
