@@ -208,7 +208,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         StreamDataType::IlluminaFastq => (131_072, 131_072),
         StreamDataType::OntFastq => (524_288, 524_288),
     };
-    eprintln!("spawning {}", cmd_tag);
+
     let cmd_tag_owned = cmd_tag.to_string();
     let cmd_tag_err_owned = cmd_tag.to_string();
     

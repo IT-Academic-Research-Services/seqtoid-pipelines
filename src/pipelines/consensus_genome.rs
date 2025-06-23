@@ -24,6 +24,7 @@ use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, g
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tokio::io::BufWriter;
+use futures::future::try_join_all;
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -33,6 +34,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
     println!("Running consensus genome with module: {}", args.module);
 
     let cwd = std::env::current_dir()?;
+
+    // Initialize cleanup tasks
+    let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     
     //External tools check
     let mut tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG]).await?;
@@ -115,10 +120,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
         50,
     )
         .await?;
-
+    
     if val_streams.len() != 2 {
         return Err(anyhow!("Expected exactly 2 streams, got {}", val_streams.len()));
     }
+    cleanup_receivers.push(val_done_rx);
 
     let mut streams_iter = val_streams.into_iter();
     let val_fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
@@ -127,7 +133,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     //Pigz stream to intermediate file output
     let val_pigz_args = generate_cli(PIGZ_TAG, &args, None)?;
     let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq, args.verbose).await?;
-
+    cleanup_tasks.push(val_pigz_stream_task);
+    cleanup_tasks.push(val_pigz_err_task);
+    
     let val_pigz_out_stream = parse_child_output(
         &mut val_pigz_child,
         ChildStream::Stdout,
@@ -138,11 +146,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
         val_pigz_out_stream,
         validated_interleaved_file_path,
     ));
+    cleanup_tasks.push(val_pigz_write_task);
 
 
     // Fastp stream
     let val_fastp_args = generate_cli(FASTP_TAG, &args, None)?;
     let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq, args.verbose).await?;
+    cleanup_tasks.push(val_fastp_stream_task);
+    cleanup_tasks.push(val_fastp_err_task);
     let val_fastp_out_stream = parse_child_output(
         &mut val_fastp_child,
         ChildStream::Stdout,
@@ -150,13 +161,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
         args.buffer_size / 4,
     ).await?;
     let mut val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
-
-
-    // let test_write_task = tokio::spawn(stream_to_file(
-    //     val_fastp_out_stream,
-    //     PathBuf::from("test.fq"),
-    // ));
-    // test_write_task.await??;
 
     
     //*****************
@@ -189,18 +193,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
             result
         }
     });
+    cleanup_tasks.push(host_ref_write_task);
     
     // Create FIFO pipe for the fastp output to stream to minimap2
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
+    cleanup_tasks.push(host_query_write_task);
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
     let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, args.verbose).await?;
-
-    
-    let host_minimap2_err_handle = tokio::spawn(async move {
-        let err_result = host_minimap2_err_task.await;
-        eprintln!("Minimap2 stderr task completed: {:?}", err_result);
-        err_result
-    });
+    cleanup_tasks.push(host_minimap2_err_task);
     
     let host_minimap2_out_stream = parse_child_output(
         &mut host_minimap2_child,
@@ -208,7 +208,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    eprintln!("Minimap2 output parsed");
     
     
     let test_write_task = tokio::spawn(stream_to_file(
@@ -217,26 +216,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
     ));
     
     eprintln!("BAM write task spawned");
-    // Await all tasks concurrently
-    let (ref_write_result, query_write_result, test_write_result, minimap2_err_result) = tokio::try_join!(
-    host_ref_write_task,
-    host_query_write_task,
-    test_write_task,
-    host_minimap2_err_handle,
-)?;
 
-    ref_write_result?;
-    query_write_result?;
-    test_write_result?;
-    minimap2_err_result?;
+    test_write_task.await??;
+
+    
     eprintln!("BAM file written");
-    
-    // std::fs::remove_file(&host_ref_file_path)?;
-    // 
 
 
-    
-    // TEST MARKER
     
     // let host_samtools_config_view = SamtoolsConfig {
     //     subcommand: SamtoolsSubcommand::View,
@@ -715,23 +701,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
 
-    // let val_fastp_status = val_fastp_child.wait().await?;
-    // if val_fastp_status.success() {
-    //     eprintln!("Fastp exited successfully");
-    // }
-    // else {
-    //     return Err(anyhow!("Fastp exited with non-zero status: {}", val_fastp_status));
-    // }
-
-
-
-    val_fastp_stream_task.await??;
-    val_fastp_err_task.await??;
-    val_done_rx.await??;
-    eprintln!("All tasks completed");
-
-
-
 
 
 
@@ -761,17 +730,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
 
 
-    val_pigz_stream_task.await??;
-    val_pigz_err_task.await??;
-    val_pigz_write_task.await??;
-    let pigz_status = val_pigz_child.wait().await?;
-    if pigz_status.success() {
-        eprintln!("Pigz exited successfully");
-    }
-    else {
-        return Err(anyhow!("pigz exited with non-zero status: {}", pigz_status));
-    }
 
+
+    
     // host_samtools_task_fastq.await??;
     // host_samtools_err_task_fastq.await??;
 
@@ -786,6 +747,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // host_samtools_write_task.await??;
 
 
+    let results = try_join_all(cleanup_tasks).await?;
+    for result in results {
+        result?; // Propagate inner Result errors
+    }
+
+    for receiver in cleanup_receivers {
+        receiver.await??; 
+    }
     
     eprintln!("Finished generating consensus genome");
     
