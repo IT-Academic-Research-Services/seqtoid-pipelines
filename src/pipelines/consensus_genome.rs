@@ -377,99 +377,89 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
             //*****************
             // Filter Reads
-            // 
-            // let (filter_align_accession, filter_align_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-            // let filter_align_seq = Arc::new(filter_align_seq);
-            // let filter_align_accession = Arc::new(filter_align_accession);
-            // eprintln!("align accession: {:?}", filter_align_accession);
-    
-    
-    
-            let filter_output_write_task = tokio::spawn(stream_to_file(
-                ercc_bypass_stream,
-                PathBuf::from("test_samtools_align.fastq"),
-            ));
-            filter_output_write_task.await??;
-    
+            
+            let (filter_align_accession, filter_align_seq) = retrieve_h5_seq(args.ref_accession.clone(), args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            let filter_align_seq = Arc::new(filter_align_seq);
+            let filter_align_accession = Arc::new(filter_align_accession);
+            eprintln!("Align accession: {:?}", filter_align_accession);
+            
             let mut filter_reads_out_stream: ReceiverStream<ParseOutput>;
-    
-    
-            // if args.dont_filter_reads {
-            //     filter_reads_out_stream = ReceiverStream::new(ercc_bypass_stream);
-            // }
+            
+            if args.dont_filter_reads {
+                filter_reads_out_stream = ReceiverStream::new(ercc_bypass_stream);
+            }
             // 
-            // else {
-            //     eprintln!("filtering");
-            //     let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
-            //     let filter_ref_temp = NamedTempFile::new()?;
-            //     let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
-            // 
-            //     if filter_ref_pipe_path.exists() {
-            //         std::fs::remove_file(&filter_ref_pipe_path)?;
-            //     }
-            //     Command::new("mkfifo")
-            //         .arg(&filter_ref_pipe_path)
-            //         .status()?;
-            // 
-            //     let filter_align_seq_clone = Arc::clone(&filter_align_seq);
-            //     // eprintln!("filter align: {:?}", filter_align_seq_clone);
-            //     let filter_align_accession_clone = Arc::clone(&filter_align_accession);
-            //     eprintln!("filter acc: {:?}", filter_align_accession_clone);
-            //     let filter_ref_write_task = tokio::spawn({
-            //         let filter_ref_pipe_path = filter_ref_pipe_path.clone();
-            //         async move {
-            //             eprintln!("Starting to write reference to FIFO: {}", filter_ref_pipe_path.display());
-            //             let result = write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &filter_ref_pipe_path).await;
-            //             eprintln!("Finished writing reference to FIFO: {:?}", result);
-            //             result
-            //         }
-            //     });
-            //     let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
-            // 
-            //     let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
-            //     eprintln!("filtering args: {:?}", filter_minimap2_args);
-            //     let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, args.verbose).await?;
-            //     let filter_minimap2_out_stream = parse_child_output(
-            //         &mut filter_minimap2_child,
-            //         ChildStream::Stdout,
-            //         ParseMode::Bytes,
-            //         args.buffer_size / 4,
-            //     ).await?;
-            // 
-            //     let filter_minimap2_err_task = tokio::spawn(async move {
-            //         if let Err(e) = filter_minimap2_err_task.await {
-            //             eprintln!("minimap2 stderr error in filtering: {}", e);
-            //             Err(anyhow!("minimap2 stderr error: {}", e))
-            //         } else {
-            //             eprintln!("minimap2 stderr task completed in filtering");
-            //             Ok(())
-            //         }
-            //     });
-            // 
-            // 
-            // 
-            //     //Convert to FASTQ
-            // 
-            //     let filter_samtools_config_fastq = SamtoolsConfig {
-            //         subcommand: SamtoolsSubcommand::Fastq,
-            //         subcommand_fields: HashMap::from([("-".to_string(), None)]),
-            //     };
-            //     let filter_samtools_args_fastq = generate_cli(
-            //         SAMTOOLS_TAG,
-            //         &args,
-            //         Some(&filter_samtools_config_fastq),
-            //     )?;
-            // 
-            //     let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
-            // 
-            // 
-            //     let filter_samtools_out_stream_fastq = parse_child_output(
-            //         &mut filter_samtools_child_fastq,
-            //         ChildStream::Stdout,
-            //         ParseMode::Bytes,
-            //         args.buffer_size / 4,
-            //     ).await?;
-            //     eprintln!("Created samtools fastq output stream");
+            else {
+                eprintln!("Filtering");
+                let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
+                let filter_ref_temp = NamedTempFile::new()?;
+                let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
+            
+                if filter_ref_pipe_path.exists() {
+                    std::fs::remove_file(&filter_ref_pipe_path)?;
+                }
+                Command::new("mkfifo")
+                    .arg(&filter_ref_pipe_path)
+                    .status()?;
+            
+                let filter_align_seq_clone = Arc::clone(&filter_align_seq);
+                let filter_align_accession_clone = Arc::clone(&filter_align_accession);
+                eprintln!("Filter accession: {:?}", filter_align_accession_clone);
+                let filter_ref_write_task = tokio::spawn({
+                    let filter_ref_pipe_path = filter_ref_pipe_path.clone();
+                    async move {
+                        let result = write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &filter_ref_pipe_path).await;
+                        result
+                    }
+                });
+                cleanup_tasks.push(filter_ref_write_task);
+                
+                let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
+                cleanup_tasks.push(filter_query_write_task);
+                
+                let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
+                let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, args.verbose).await?;
+                let filter_minimap2_out_stream = parse_child_output(
+                    &mut filter_minimap2_child,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    args.buffer_size / 4,
+                ).await?;
+                cleanup_tasks.push(filter_minimap2_err_task);
+                
+                
+                //Convert to FASTQ
+            
+                let filter_samtools_config_fastq = SamtoolsConfig {
+                    subcommand: SamtoolsSubcommand::Fastq,
+                    subcommand_fields: HashMap::from([("-".to_string(), None)]),
+                };
+                let filter_samtools_args_fastq = generate_cli(
+                    SAMTOOLS_TAG,
+                    &args,
+                    Some(&filter_samtools_config_fastq),
+                )?;
+            
+                let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
+                cleanup_tasks.push(filter_samtools_task_fastq);
+                cleanup_tasks.push(filter_samtools_err_task_fastq);
+                let filter_samtools_out_stream_fastq = parse_child_output(
+                    &mut filter_samtools_child_fastq,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    args.buffer_size / 4,
+                ).await?;
+
+
+                let test_write_task = tokio::spawn(stream_to_file(
+                    filter_samtools_out_stream_fastq,
+                    PathBuf::from("test_filtered.fq"),
+                ));
+
+
+                test_write_task.await??;
+                
+
             // 
             //     let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
             // 
@@ -547,7 +537,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             // 
             // 
             // 
-            // }
+            }
     
     
     //         //*****************
