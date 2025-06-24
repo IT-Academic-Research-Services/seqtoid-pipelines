@@ -599,62 +599,90 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ).await?;
 
 
-                let test_write_task = tokio::spawn(stream_to_file(
-                    align_samtools_out_stream_sort,
-                    PathBuf::from("test_align_reads.bam"),
-                ));
+                // let test_write_task = tokio::spawn(stream_to_file(
+                //     align_samtools_out_stream_sort,
+                //     PathBuf::from("test_align_reads.bam"),
+                // ));
+                // 
+                // test_write_task.await??;
+    
+    
+    
             
-                test_write_task.await??;
-    
-    
-    
+            //*****************
+            // Make Consensus
+            
+            let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
+            
+            let mut align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
+            
+            // Split stream for BAM writing
+            let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
+                align_samtools_out_stream_sort,
+                2,
+                args.buffer_size,
+                args.stall_threshold.try_into().unwrap(),
+                Some(args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+            
+            if consensus_bam_streams.len() != 2 {
+                return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
+            }
+            
+            let mut streams_iter = consensus_bam_streams.into_iter();
+            let consensus_bam_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
+            let consensus_bam_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+            
+            let consensus_bam_write_task = tokio::spawn(stream_to_file(
+                consensus_bam_file_stream,
+                PathBuf::from(align_bam_path),
+            ));
+            cleanup_tasks.push(consensus_bam_write_task);
 
 
-    // 
-    //         //*****************
-    //         // Make Consensus
-    // 
-    //         // let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
-    //         // 
-    //         // let mut align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
-    //         // 
-    //         // // Split stream for BAM writing
-    //         // let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
-    //         //     align_samtools_out_stream_sort,
-    //         //     2,
-    //         //     args.buffer_size,
-    //         //     args.stall_threshold.try_into().unwrap(),
-    //         //     Some(args.stream_sleep_ms),
-    //         //     50,
-    //         // )
-    //         //     .await?;
-    //         // 
-    //         // if consensus_bam_streams.len() != 2 {
-    //         //     return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
-    //         // }
-    //         // 
-    //         // let mut streams_iter = consensus_bam_streams.into_iter();
-    //         // let consensus_bam_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-    //         // let consensus_bam_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-    //         // 
-    //         // let consensus_bam_write_task = tokio::spawn(stream_to_file(
-    //         //     consensus_bam_file_stream,
-    //         //     PathBuf::from(align_bam_path),
-    //         // ));
-    // 
-    // 
+
+            let consensus_samtools_config_mpileup = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::Mpileup,
+                subcommand_fields: HashMap::from([("-".to_string(), None)]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
+            };
+            let conensus_samtools_args_mpileup = generate_cli(
+                SAMTOOLS_TAG,
+                &args,
+                Some(&consensus_samtools_config_mpileup),
+            )?;
+
+            let (mut consensus_samtools_child_mpileup, consensus_samtools_task_mpileup, consensus_samtools_err_task_mpileup) = stream_to_cmd(consensus_bam_output_stream, SAMTOOLS_TAG, conensus_samtools_args_mpileup, StreamDataType::JustBytes, args.verbose).await?;
+            let consensus_samtools_out_stream_mpileup = parse_child_output(
+                &mut consensus_samtools_child_mpileup,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                args.buffer_size / 4,
+            ).await?;
+            cleanup_tasks.push(consensus_samtools_task_mpileup);
+            cleanup_tasks.push(consensus_samtools_err_task_mpileup);
+
+            let test_write_task = tokio::spawn(stream_to_file(
+                consensus_samtools_out_stream_mpileup,
+                PathBuf::from("test_consensus_mpileup.txt"),
+            ));
+            
+            test_write_task.await??;
+            
+
     //         //Check target type, only allow viral
-    //         match args.target_type {
-    //             TargetType::Viral => {
-    //                
-    //                 
-    // 
-    //             }  // End if viral
-    // 
-    //             _ => {
-    //                 return Err(anyhow!("Only viral consensus target types supported at this time."));
-    //             }
-    //         }
+            match args.target_type {
+                TargetType::Viral => {
+                   eprintln!("Viral");
+                    
+    
+                }  // End if viral
+    
+                _ => {
+                    return Err(anyhow!("Only viral consensus target types supported at this time."));
+                }
+            }
     // 
     //         //Samtools mpileup
     // 

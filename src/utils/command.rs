@@ -326,7 +326,8 @@ pub mod samtools {
                     args_vec.push("-d".to_string()); // max depth zero
                     args_vec.push("0".to_string());
                     args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push(args.quality.to_string());
+                    args_vec.push("0".to_string());
+                    // args_vec.push(args.quality.to_string());
 
                 }
                 }
