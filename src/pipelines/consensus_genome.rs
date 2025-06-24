@@ -481,11 +481,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 // test_write_task.await??;
             
                 let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
-            
+
                 let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
                 let kraken2_classified_temp = NamedTempFile::new()?;
                 let kraken2_classified_pipe_path = kraken2_classified_temp.path().to_path_buf();
-            
+
                 if kraken2_classified_pipe_path.exists() {
                     std::fs::remove_file(&kraken2_classified_pipe_path)?;
                 }
@@ -495,44 +495,31 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     .success()
                     .then(|| ())
                     .ok_or_else(|| anyhow!("Failed to create mkfifo for Kraken2 classified output"))?;
-            
+
                 // Create a temporary FIFO for kraken2 input
                 let (kraken2_query_write_task, kraken2_query_pipe_path) = write_parse_output_to_temp(filter_samtools_out_stream_fastq, None).await?;
                 cleanup_tasks.push(kraken2_query_write_task);
-            
+
                 let filter_reads_kraken2_config = Kraken2Config {
                     report_path: kraken2_report_path,
                     classified_path: kraken2_classified_pipe_path.clone(),
                     fastq_path: kraken2_query_pipe_path.clone(),
                 };
-            
+
                 let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
                 eprintln!("kraken2 args: {:?}", filter_reads_kraken2_args);
                 let (mut filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
                 cleanup_tasks.push(filter_kraken2_err_task);
-                
+
                 let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
                 eprintln!("Opened kraken2 classified pipe: {}", kraken2_classified_pipe_path.display());
                 
-                // let (parse_rx, parse_task) = {
-                //     let buffer_size = args.buffer_size;
-                //     let (tx, rx) = mpsc::channel(buffer_size);
-                //     let task = tokio::spawn(async move {
-                //         parse_fastq(kraken2_classified_stream, buffer_size)
-                //             .await
-                //             .map(|_| ())
-                //             .map_err(|e| anyhow::anyhow!("parse_fastq failed: {}", e)) // Convert error to anyhow::Error
-                //     });
-                //     (rx, task)
-                // };
-                // cleanup_tasks.push(parse_task);
-            
                 let parse_rx = parse_fastq(kraken2_classified_stream, args.buffer_size).await?; // KEEP THIS until you test the above
                 let filter_fn = |id: &str| id.contains("kraken:taxid|2697049"); // TODO no hard code
-            
+
                 let (filtered_rx, filter_task) = parse_and_filter_fastq_id(parse_rx, args.buffer_size, filter_fn.clone());
                 cleanup_tasks.push(filter_task);
-                
+
                 let (parse_output_tx, parse_output_rx) = mpsc::channel(args.buffer_size);
                 tokio::spawn(async move {
                     let mut stream = ReceiverStream::new(filtered_rx);
@@ -543,14 +530,14 @@ pub async fn run(args: &Arguments) -> Result<()> {
                         }
                     }
                 });
-                
-            
+
+
             //     // filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
                 let test_write_task = tokio::spawn(stream_to_file(
                     parse_output_rx,
                     PathBuf::from("test_filter_reads_id.fq"),
                 ));
-            
+
                 test_write_task.await??;
 
             }
