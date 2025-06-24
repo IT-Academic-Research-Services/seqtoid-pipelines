@@ -427,14 +427,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ).await?;
                 cleanup_tasks.push(filter_minimap2_err_task);
 
-                // let test_write_task = tokio::spawn(stream_to_file(
-                //     filter_minimap2_out_stream,
-                //     PathBuf::from("test_filtered.bam"),
-                // ));
-                // 
-                // test_write_task.await??;
-
-
+                
                 
                 // Sort output
                 let filter_samtools_config_sort = SamtoolsConfig {
@@ -457,42 +450,35 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     args.buffer_size / 4,
                 ).await?;
                 
-                let test_write_task = tokio::spawn(stream_to_file(
-                    filter_samtools_out_stream_sort,
-                    PathBuf::from("test_filtered_sorted.bam"),
-                ));
-                test_write_task.await??;
-            
-
-                // 
+                
                 //Convert to FASTQ
             
-                // let filter_samtools_config_fastq = SamtoolsConfig {
-                //     subcommand: SamtoolsSubcommand::Fastq,
-                //     subcommand_fields: HashMap::from([("-".to_string(), None)]),
-                // };
-                // let filter_samtools_args_fastq = generate_cli(
-                //     SAMTOOLS_TAG,
-                //     &args,
-                //     Some(&filter_samtools_config_fastq),
-                // )?;
-                // 
-                // let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
-                // cleanup_tasks.push(filter_samtools_task_fastq);
-                // cleanup_tasks.push(filter_samtools_err_task_fastq);
-                // let filter_samtools_out_stream_fastq = parse_child_output(
-                //     &mut filter_samtools_child_fastq,
-                //     ChildStream::Stdout,
-                //     ParseMode::Bytes,
-                //     args.buffer_size / 4,
-                // ).await?;
+                let filter_samtools_config_fastq = SamtoolsConfig {
+                    subcommand: SamtoolsSubcommand::Fastq,
+                    subcommand_fields: HashMap::from([("-".to_string(), None)]),
+                };
+                let filter_samtools_args_fastq = generate_cli(
+                    SAMTOOLS_TAG,
+                    &args,
+                    Some(&filter_samtools_config_fastq),
+                )?;
+                
+                let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_samtools_out_stream_sort, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
+                cleanup_tasks.push(filter_samtools_task_fastq);
+                cleanup_tasks.push(filter_samtools_err_task_fastq);
+                let filter_samtools_out_stream_fastq = parse_child_output(
+                    &mut filter_samtools_child_fastq,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    args.buffer_size / 4,
+                ).await?;
 
 
-                // let test_write_task = tokio::spawn(stream_to_file(
-                //     filter_samtools_out_stream_fastq,
-                //     PathBuf::from("test_filtered.fq"),
-                // ));
-                // test_write_task.await??;
+                let test_write_task = tokio::spawn(stream_to_file(
+                    filter_samtools_out_stream_fastq,
+                    PathBuf::from("test_filtered.fq"),
+                ));
+                test_write_task.await??;
             
             //     let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
             // 
