@@ -631,25 +631,27 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
 /// * `filter_fn` - Function to filter records based on their ID.
 ///
 /// # Returns
-/// Result containing a Receiver of filtered SequenceRecord items.
-pub async fn parse_and_filter_fastq_id(
+/// Tuple of (mpsc of sequence records, task join handle result)
+pub fn parse_and_filter_fastq_id(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
     filter_fn: impl Fn(&str) -> bool + Send + 'static,
-) -> Result<mpsc::Receiver<SequenceRecord>> {
+) -> (mpsc::Receiver<SequenceRecord>, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
     let (filtered_tx, filtered_rx) = mpsc::channel(buffer_size);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(input_rx);
         let mut count = 0;
 
         while let Some(item) = stream.next().await {
             if let ParseOutput::Fastq(record) = item {
-
                 if filter_fn(record.id()) {
                     if filtered_tx.send(record).await.is_err() {
                         eprintln!("Failed to send filtered FASTQ record at count {}", count + 1);
-                        break;
+                        return Err(anyhow::anyhow!(
+                            "Failed to send filtered FASTQ record at count {}",
+                            count + 1
+                        ));
                     }
                     count += 1;
                 }
@@ -665,10 +667,10 @@ pub async fn parse_and_filter_fastq_id(
         }
 
         eprintln!("Filtered {} FASTQ records from Kraken2 classified stream", count);
-        Ok::<(), anyhow::Error>(())
+        Ok(())
     });
 
-    Ok(filtered_rx)
+    (filtered_rx, task)
 }
 
 #[cfg(test)]
