@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tokio::io::BufWriter;
 use futures::future::try_join_all;
+use crate::utils::streams::ToBytes;
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -524,12 +525,16 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 tokio::spawn(async move {
                     let mut stream = ReceiverStream::new(filtered_rx);
                     while let Some(record) = stream.next().await {
-                        if parse_output_tx.send(ParseOutput::Fastq(record)).await.is_err() {
-                            eprintln!("Failed to send ParseOutput::Fastq");
+                        let bytes = record.to_bytes()?;
+                        if parse_output_tx.send(ParseOutput::Bytes(bytes)).await.is_err() {
+                            eprintln!("Failed to send ParseOutput::Bytes");
                             break;
                         }
                     }
+                    Ok::<(), anyhow::Error>(()) // Ensure task returns Result for error handling
                 });
+
+
 
 
             //     // filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
