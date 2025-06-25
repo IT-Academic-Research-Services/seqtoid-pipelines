@@ -330,7 +330,23 @@ pub mod samtools {
                     // args_vec.push(args.quality.to_string());
 
                 }
+                
+                SamtoolsSubcommand::Consensus => {
+                    args_vec.push("consensus".to_string());
+                    args_vec.push("-f".to_string());
+                    args_vec.push("fasta".to_string());
+                    args_vec.push("-m".to_string());
+                    args_vec.push("simple".to_string());
+                    args_vec.push("--min-BQ".to_string());
+                    args_vec.push(args.quality.to_string());
+                    args_vec.push("-d".to_string());
+                    args_vec.push(args.min_depth.to_string());
+                    // args_vec.push("-l".to_string());
+                    // args_vec.push("50".to_string());
+                    
+
                 }
+            }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(format!("{}", key));
                 match value {
@@ -399,12 +415,33 @@ pub mod bcftools {
             match config.subcommand {
                 BcftoolsSubcommand::Consensus => {
                     args_vec.push("consensus".to_string());
-
                 }
 
                 BcftoolsSubcommand::Call => {
-                args_vec.push("call".to_string());}
+                args_vec.push("call".to_string());
+                }
+
+                BcftoolsSubcommand::Mpileup => {
+                    args_vec.push("mpileup".to_string());
+                    args_vec.push("-A".to_string()); // do not discard anomalous read pairs
+                    args_vec.push("-d".to_string()); // max depth zero
+                    args_vec.push("0".to_string());
+                    args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push("0".to_string());
+                    args_vec.push("-O".to_string());
+                    args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
+                }
+                
             }
+
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
+
 
             Ok(args_vec)
             }
@@ -591,6 +628,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
         SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
         KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
+        BCFTOOLS_TAG => Box::new(bcftools::BcftoolsArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };

@@ -16,7 +16,7 @@ use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_o
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo, parse_and_filter_fastq_id};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_bytes, parse_fastq};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, IVAR_TAG, IvarSubcommand};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::ivar::IvarConfig;
@@ -27,6 +27,8 @@ use tokio::io::BufWriter;
 use futures::future::try_join_all;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::streams::ToBytes;
+use std::fs::File;
+use std::io::Write;
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -475,7 +477,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     args.buffer_size / 4,
                 ).await?;
 
-                
+
                 let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
 
                 let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
@@ -537,7 +539,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             //         parse_output_rx,
             //         PathBuf::from("test_filter_reads_id.fq"),
             //     ));
-            // 
+            //
             //     test_write_task.await??;
 
             }
@@ -545,17 +547,17 @@ pub async fn run(args: &Arguments) -> Result<()> {
     
             //*****************
             // Align Reads to Target
-            
+
             let align_ref_temp = NamedTempFile::new()?;
             let align_ref_pipe_path = align_ref_temp.path().to_path_buf();
-            
+
             if align_ref_pipe_path.exists() {
                 std::fs::remove_file(&align_ref_pipe_path)?;
             }
             Command::new("mkfifo")
                 .arg(&align_ref_pipe_path)
                 .status()?;
-            
+
             let filter_align_seq_clone = Arc::clone(&filter_align_seq);
             let filter_align_accession_clone = Arc::clone(&filter_align_accession);
             let align_ref_write_task = tokio::spawn({
@@ -565,10 +567,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 }
             });
             cleanup_tasks.push(align_ref_write_task);
-            
+
             let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
             cleanup_tasks.push(align_query_write_task);
-            
+
             let align_minimap2_args = generate_cli(MINIMAP2_TAG, &args, Some(&(align_ref_pipe_path.clone(), align_query_pipe_path.clone())))?;
             let (mut align_minimap2_child,  align_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, align_minimap2_args, args.verbose).await?;
             cleanup_tasks.push(align_minimap2_err_task);
@@ -578,7 +580,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-            
+
             let align_samtools_config_sort = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Sort,
                 subcommand_fields: HashMap::from([("-O".to_string(), Some("bam".to_string())), ("-".to_string(), None)]),
@@ -604,19 +606,19 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 //     align_samtools_out_stream_sort,
                 //     PathBuf::from("test_align_reads.bam"),
                 // ));
-                // 
+                //
                 // test_write_task.await??;
-    
-    
-    
-            
+
+
+
+
             //*****************
             // Make Consensus
-            
+
             let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
-            
+
             let mut align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
-            
+
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
@@ -627,15 +629,15 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 50,
             )
                 .await?;
-            
+
             if consensus_bam_streams.len() != 2 {
                 return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
             }
-            
+
             let mut streams_iter = consensus_bam_streams.into_iter();
             let consensus_bam_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
             let consensus_bam_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
-            
+
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
                 PathBuf::from(align_bam_path),
@@ -643,26 +645,32 @@ pub async fn run(args: &Arguments) -> Result<()> {
             cleanup_tasks.push(consensus_bam_write_task);
 
 
-
-            let consensus_samtools_config_mpileup = SamtoolsConfig {
-                subcommand: SamtoolsSubcommand::Mpileup,
-                subcommand_fields: HashMap::from([("-".to_string(), None)]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
+            let consensus_samtools_config = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::Consensus,
+                subcommand_fields: HashMap::from([("-".to_string(), None)]),
             };
-            let conensus_samtools_args_mpileup = generate_cli(
+            let consensus_samtools_args = generate_cli(
                 SAMTOOLS_TAG,
                 &args,
-                Some(&consensus_samtools_config_mpileup),
+                Some(&consensus_samtools_config),
             )?;
-            let (mut consensus_samtools_child_mpileup, consensus_samtools_task_mpileup, consensus_samtools_err_task_mpileup) = stream_to_cmd(consensus_bam_output_stream, SAMTOOLS_TAG, conensus_samtools_args_mpileup, StreamDataType::JustBytes, args.verbose).await?;
-            let consensus_samtools_out_stream_mpileup = parse_child_output(
-                &mut consensus_samtools_child_mpileup,
+
+            let (mut consensus_samtools_child, consensus_samtools_task_sort, consensus_samtools_err_task_sort) = stream_to_cmd(consensus_bam_output_stream, SAMTOOLS_TAG, consensus_samtools_args, StreamDataType::JustBytes, args.verbose).await?;
+            cleanup_tasks.push(consensus_samtools_task_sort);
+            cleanup_tasks.push(consensus_samtools_err_task_sort);
+            let consensus_samtools_out_stream = parse_child_output(
+                &mut consensus_samtools_child,
                 ChildStream::Stdout,
                 ParseMode::Bytes,
                 args.buffer_size / 4,
             ).await?;
-            cleanup_tasks.push(consensus_samtools_task_mpileup);
-            cleanup_tasks.push(consensus_samtools_err_task_mpileup);
-
+            
+            let test_write_task = tokio::spawn(stream_to_file(
+                consensus_samtools_out_stream,
+                PathBuf::from("test_consensus.fa"),
+            ));
+            
+            test_write_task.await??;
 
             
 
@@ -672,35 +680,11 @@ pub async fn run(args: &Arguments) -> Result<()> {
                    eprintln!("Viral");
 
 
-                    // let consensus_bcftools_config_call = BcftoolsConfig {
-                    //     subcommand: BcftoolsSubcommand::Call,
-                    //     subcommand_fields: HashMap::from([("-c".to_string(), None), ("-v".to_string(), None), ("-".to_string(), None)]), 
-                    // };
-                    // let consensus_bcftools_args_call = generate_cli(
-                    //     BCFTOOLS_TAG,
-                    //     &args,
-                    //     Some(&consensus_bcftools_config_call),
-                    // )?;
-                    // let (mut consensus_bcftools_child_call, consensus_bcftools_task_call, consensus_bcftools_err_task_call) = stream_to_cmd(consensus_samtools_out_stream_mpileup, BCFTOOLS_TAG, consensus_bcftools_args_call, StreamDataType::JustBytes, args.verbose).await?;
-                    // let consensus_bcftools_out_stream_call = parse_child_output(
-                    //     &mut consensus_bcftools_child_call,
-                    //     ChildStream::Stdout,
-                    //     ParseMode::Bytes,
-                    //     args.buffer_size / 4,
-                    // ).await?;
-                    // cleanup_tasks.push(consensus_bcftools_task_call);
-                    // cleanup_tasks.push(consensus_bcftools_err_task_call);
-                    // 
-                    // let test_write_task = tokio::spawn(stream_to_file(
-                    //     consensus_bcftools_out_stream_call,
-                    //     PathBuf::from("test_consensus_call.fa"),
-                    // ));
-                    // 
-                    // test_write_task.await??;
-                    
-    
+                  
+
+
                 }  // End if viral
-    
+
                 _ => {
                     return Err(anyhow!("Only viral consensus target types supported at this time."));
                 }

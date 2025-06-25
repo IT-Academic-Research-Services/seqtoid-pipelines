@@ -15,13 +15,15 @@ pub enum SamtoolsSubcommand {
     Stats,
     Sort,
     Index,
-    Mpileup
+    Mpileup,
+    Consensus
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BcftoolsSubcommand {
     Call,
-    Consensus
+    Consensus,
+    Mpileup
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
