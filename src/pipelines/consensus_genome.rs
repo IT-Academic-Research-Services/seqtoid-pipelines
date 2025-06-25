@@ -37,10 +37,9 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     
     //External tools check
-    let mut tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG]).await?;
+    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG]).await?;
 
     // Arguments and files check
-
     let file1_path: PathBuf = match &args.file1 {
         Some(file) => {
             let file1_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
@@ -55,8 +54,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
         }
     };
     
-    
-    eprintln!("{}", file1_path.display());
     let sample_base: String;
     let file1_r1r2 = r1r2_base(&file1_path);
     match file1_r1r2.file_name {
@@ -73,8 +70,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
     let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
     let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-
-
+    
     let file2_path: Option<PathBuf> = match &args.file2 {
         Some(file) => {
             let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd.clone(), None, None, "");
@@ -157,7 +153,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
         ParseMode::Bytes,
         args.buffer_size / 4,
     ).await?;
-    let mut val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
+    let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
 
     
     //*****************
@@ -306,7 +302,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let mut streams_iter = ercc_streams.into_iter();
             let ercc_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc stream"))?;
             let ercc_bypass_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc bypass stream"))?;
-            let mut ercc_stream = ReceiverStream::new(ercc_stream);
+            let ercc_stream = ReceiverStream::new(ercc_stream);
     
             
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
@@ -381,14 +377,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
             eprintln!("Align accession: {:?}", filter_align_accession);
             
             let mut filter_reads_out_stream: ReceiverStream<ParseOutput>;
-            
             if args.dont_filter_reads {
                 filter_reads_out_stream = ReceiverStream::new(ercc_bypass_stream);
             }
-            // 
+            
             else {
                 eprintln!("Filtering");
-                let mut ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
+                let ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
                 let filter_ref_temp = NamedTempFile::new()?;
                 let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
             
@@ -423,7 +418,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     args.buffer_size / 4,
                 ).await?;
                 cleanup_tasks.push(filter_minimap2_err_task);
-
                 
                 
                 // Sort output
@@ -436,7 +430,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     &args,
                     Some(&filter_samtools_config_sort),
                 )?;
-                eprintln!("Filter samtools: {:?}", filter_samtools_args_sort);
                 let (mut filter_samtools_child_sort, filter_samtools_task_sort, filter_samtools_err_task_sort) = stream_to_cmd(filter_minimap2_out_stream, SAMTOOLS_TAG, filter_samtools_args_sort, StreamDataType::JustBytes, args.verbose).await?;
                 cleanup_tasks.push(filter_samtools_task_sort);
                 cleanup_tasks.push(filter_samtools_err_task_sort);
@@ -449,7 +442,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 
                 
                 //Convert to FASTQ
-            
                 let filter_samtools_config_fastq = SamtoolsConfig {
                     subcommand: SamtoolsSubcommand::Fastq,
                     subcommand_fields: HashMap::from([("-".to_string(), None)]),
@@ -459,7 +451,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     &args,
                     Some(&filter_samtools_config_fastq),
                 )?;
-                
                 let (mut filter_samtools_child_fastq, filter_samtools_task_fastq, filter_samtools_err_task_fastq) = stream_to_cmd(filter_samtools_out_stream_sort, SAMTOOLS_TAG, filter_samtools_args_fastq, StreamDataType::JustBytes, args.verbose).await?;
                 cleanup_tasks.push(filter_samtools_task_fastq);
                 cleanup_tasks.push(filter_samtools_err_task_fastq);
@@ -469,14 +460,13 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     ParseMode::Bytes,
                     args.buffer_size / 4,
                 ).await?;
-
-
-                let mut filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
-
+                let filter_samtools_out_stream_fastq = ReceiverStream::new(filter_samtools_out_stream_fastq);
+                
+                
+                //Kraken2
                 let kraken2_report_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("kraken2_report.txt"), "_");
                 let kraken2_classified_temp = NamedTempFile::new()?;
                 let kraken2_classified_pipe_path = kraken2_classified_temp.path().to_path_buf();
-
                 if kraken2_classified_pipe_path.exists() {
                     std::fs::remove_file(&kraken2_classified_pipe_path)?;
                 }
@@ -499,7 +489,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
                 let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
                 eprintln!("kraken2 args: {:?}", filter_reads_kraken2_args);
-                let (mut _filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
+                let (_filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
                 cleanup_tasks.push(filter_kraken2_err_task);
 
                 let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
@@ -568,7 +558,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             let align_samtools_config_sort = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Sort,
                 subcommand_fields: HashMap::from([("-O".to_string(), Some("bam".to_string())), ("-".to_string(), None)]),
-                // subcommand_fields: HashMap::from([("-".to_string(), None)]),
             };
             let align_samtools_args_sort = generate_cli(
                 SAMTOOLS_TAG,
@@ -590,8 +579,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
             // Make Consensus
 
             let align_bam_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("align.bam"), "_");
-
-            let mut align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
+            let align_samtools_out_stream_sort = ReceiverStream::new(align_samtools_out_stream_sort);
 
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
