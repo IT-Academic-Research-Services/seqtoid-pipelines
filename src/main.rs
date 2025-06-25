@@ -3,16 +3,19 @@ mod utils;
 mod config;
 
 use std::time::Instant;
-use std::env;
+use std::{env, fs};
+use std::path::PathBuf;
 use clap::Parser;
 use anyhow::Result;
 
 
-use crate::cli::{parse, Arguments};
+use crate::cli::parse;
+use crate::config::defs::RunConfig;
 use pipelines::consensus_genome;
 use pipelines::db;
 
 mod cli;
+
 
 
 #[tokio::main]
@@ -25,13 +28,20 @@ async fn main() -> Result<()> {
 
     let dir = env::current_dir()?;
     println!("The current directory is {:?}\n", dir);
+    
+    let ram_temp_dir = get_ram_temp_dir();
+    println!("The RAM temp directory is {:?}\n", ram_temp_dir);
 
     let args = parse();
+    let module = args.module.clone();
+    
+    let run_config = RunConfig { cwd: dir, ram_temp_dir, args };
 
-    if let Err(e) = match args.module.as_str() {
-        "consensus_genome" => consensus_genome_run(&args).await,
-        "create_db" => create_db_run(&args).await,
-        _ => Err(anyhow::anyhow!("Invalid module: {}", args.module)),
+
+    if let Err(e) = match module.as_str() {
+        "consensus_genome" => consensus_genome_run(&run_config).await,
+        "create_db" => create_db_run(&run_config).await,
+        _ => Err(anyhow::anyhow!("Invalid module: {}", module)),
     } {
         eprintln!("Pipeline failed: {}", e);
         std::process::exit(1);
@@ -41,9 +51,42 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn consensus_genome_run(args: &Arguments) -> Result<()> {
-    consensus_genome::run(args).await
+async fn consensus_genome_run(run_config: &RunConfig) -> Result<()> {
+    consensus_genome::run(run_config).await
 }
-async fn create_db_run(args: &Arguments) -> Result<()> {
-    db::create_db(args).await
+async fn create_db_run(run_config: &RunConfig) -> Result<()> {
+    db::create_db(run_config).await
+}
+
+
+//*****************
+// Setup functions
+
+/// Searches for a directory for RAM temp files.
+/// Prefers /dev/shm (RAM disk) for linux, otherwise returns the standard temp dir.
+/// # Arguments
+///
+///
+/// # Returns
+/// PathBuf: temp dir for RAM files.
+fn get_ram_temp_dir() -> PathBuf {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if let Ok(metadata) = fs::metadata("/dev/shm") {
+            if metadata.is_dir() {
+                return PathBuf::from("/dev/shm");
+            }
+        }
+        std::env::temp_dir()
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::env::temp_dir()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        std::env::temp_dir()
+    }
 }
