@@ -191,11 +191,10 @@ pub async fn write_parse_output_to_fifo(
     mut input_stream: ReceiverStream<ParseOutput>,
     buffer_size: Option<usize>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-
     if fifo_path.exists() {
         std::fs::remove_file(fifo_path)?;
     }
-    
+
     let status = Command::new("mkfifo")
         .arg(fifo_path)
         .status()
@@ -206,9 +205,9 @@ pub async fn write_parse_output_to_fifo(
     }
     
     let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB
-    
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
+        eprintln!("Starting query FIFO write to {}", fifo_path.display());
         let mut writer_file = TokioFile::create(&fifo_path)
             .await
             .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
@@ -243,7 +242,7 @@ pub async fn write_parse_output_to_fifo(
             return Err(anyhow!("No data written to FIFO at {}", fifo_path.display()));
         }
 
-        eprintln!("Wrote {} bytes to FIFO at {}", byte_count, fifo_path.display());
+        eprintln!("Finished query FIFO write: {} bytes to {}", byte_count, fifo_path.display());
         Ok(())
     });
 
@@ -274,3 +273,5 @@ pub async fn write_parse_output_to_temp(
 
     Ok((task, temp_path))
 }
+
+

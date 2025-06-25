@@ -14,6 +14,11 @@ use tokio_stream::{self as stream};
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
 use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
+use futures::stream::StreamExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use crate::utils::streams::{ParseOutput};
+use tokio::time::Duration;
 
 
 lazy_static! {
@@ -617,6 +622,56 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
+
+/// Filters a stream of FASTQ records based on a predicate applied to the ID line.
+///
+/// # Arguments
+/// * `input_rx` - Receiver of parsed FASTQ records (from `parse_fastq` or similar).
+/// * `buffer_size` - Size of the output channel buffer.
+/// * `filter_fn` - Function to filter records based on their ID.
+///
+/// # Returns
+/// Tuple of (mpsc of sequence records, task join handle result)
+pub fn parse_and_filter_fastq_id(
+    input_rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+    filter_fn: impl Fn(&str) -> bool + Send + 'static,
+) -> (mpsc::Receiver<SequenceRecord>, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+    let (filtered_tx, filtered_rx) = mpsc::channel(buffer_size);
+
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(input_rx);
+        let mut count = 0;
+
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Fastq(record) = item {
+                if filter_fn(record.id()) {
+                    if filtered_tx.send(record).await.is_err() {
+                        eprintln!("Failed to send filtered FASTQ record at count {}", count + 1);
+                        return Err(anyhow::anyhow!(
+                            "Failed to send filtered FASTQ record at count {}",
+                            count + 1
+                        ));
+                    }
+                    count += 1;
+                }
+            } else {
+                eprintln!("Unexpected ParseOutput::Bytes at count {}", count + 1);
+                continue; // Skip non-FASTQ items
+            }
+
+            // Periodic sleep to prevent tight loops
+            if count % 1000 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        eprintln!("Filtered {} FASTQ records from Kraken2 classified stream", count);
+        Ok(())
+    });
+
+    (filtered_rx, task)
+}
 
 #[cfg(test)]
 mod tests {

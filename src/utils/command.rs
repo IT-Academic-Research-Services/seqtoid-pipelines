@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, IVAR_FREQ_THRESHOLD, IVAR_QUAL_THRESHOLD};
 use crate::cli::Arguments;
 
 
@@ -296,7 +296,6 @@ pub mod samtools {
                     args_vec.push("-@".to_string());
                     args_vec.push(args.threads.to_string());
                     args_vec.push("--no-PG".to_string());
-                    // args_vec.push("-u".to_string());
                 
                     }
                 SamtoolsSubcommand::Fastq => {
@@ -326,10 +325,28 @@ pub mod samtools {
                     args_vec.push("-A".to_string()); // do not discard anomalous read pairs
                     args_vec.push("-d".to_string()); // max depth zero
                     args_vec.push("0".to_string());
-                    args_vec.push("-Q0".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push("0".to_string());
+                    // args_vec.push(args.quality.to_string());
 
                 }
+                
+                SamtoolsSubcommand::Consensus => {
+                    args_vec.push("consensus".to_string());
+                    args_vec.push("-f".to_string());
+                    args_vec.push("fasta".to_string());
+                    args_vec.push("-m".to_string());
+                    args_vec.push("simple".to_string());
+                    args_vec.push("--min-BQ".to_string());
+                    args_vec.push(args.quality.to_string());
+                    args_vec.push("-d".to_string());
+                    args_vec.push(args.min_depth.to_string());
+                    // args_vec.push("-l".to_string());
+                    // args_vec.push("50".to_string());
+                    
+
                 }
+            }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(format!("{}", key));
                 match value {
@@ -343,7 +360,96 @@ pub mod samtools {
         }
     }
 
-pub mod kraken2 {
+pub mod bcftools {
+    use std::collections::HashMap;
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::cli::Arguments;
+    use crate::config::defs::{BcftoolsSubcommand, SamtoolsSubcommand, BCFTOOLS_TAG};
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::samtools::{SamtoolsArgGenerator, SamtoolsConfig};
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    #[derive(Debug)]
+    pub struct BcftoolsConfig {
+        pub subcommand: BcftoolsSubcommand,
+        pub subcommand_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct BcftoolsArgGenerator;
+
+    pub async fn bcftools_presence_check() -> anyhow::Result<String> {
+        let args: Vec<&str> = vec!["-v"];
+
+        let mut child = Command::new(BCFTOOLS_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
+        let version = first_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
+            .to_string();
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
+        }
+        Ok(version)
+    }
+
+    impl ArgGenerator for BcftoolsArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<BcftoolsConfig>())
+                .ok_or_else(|| anyhow!("Samtools requires a BcftoolsConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                BcftoolsSubcommand::Consensus => {
+                    args_vec.push("consensus".to_string());
+                }
+
+                BcftoolsSubcommand::Call => {
+                args_vec.push("call".to_string());
+                }
+
+                BcftoolsSubcommand::Mpileup => {
+                    args_vec.push("mpileup".to_string());
+                    args_vec.push("-A".to_string()); // do not discard anomalous read pairs
+                    args_vec.push("-d".to_string()); // max depth zero
+                    args_vec.push("0".to_string());
+                    args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push("0".to_string());
+                    args_vec.push("-O".to_string());
+                    args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
+                }
+                
+            }
+
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
+
+
+            Ok(args_vec)
+            }
+
+        }
+    }
+
+    pub mod kraken2 {
     use anyhow::anyhow;
     use std::path::PathBuf;
     use tokio::process::Command;
@@ -351,8 +457,9 @@ pub mod kraken2 {
     use crate::config::defs::{KRAKEN2_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::ArgGenerator;
+        use crate::utils::file::file_path_manipulator;
 
-    #[derive(Debug)]
+        #[derive(Debug)]
     pub struct Kraken2Config {
         pub report_path: PathBuf, 
         pub classified_path: PathBuf,
@@ -397,10 +504,16 @@ pub mod kraken2 {
                 .ok_or_else(|| anyhow!("Kraken2 requires a Kraken2Config as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
-            
+            let cwd = std::env::current_dir()?;
             match &args.kraken_db{
                 Some(db) => {
-                    args_vec.push(format!("--db={}", db));
+                    let kraken2_db_path = file_path_manipulator(&PathBuf::from(db), &cwd, None, None, "");
+                    if !kraken2_db_path.exists() || !kraken2_db_path.is_dir() {
+                        return Err(anyhow!("Kraken2 database path does not exist or is not a directory: {:?}", kraken2_db_path));
+                    }
+                    
+                    args_vec.push("--db".to_string());
+                    args_vec.push(kraken2_db_path.to_string_lossy().to_string());
                 }
                 None => {
                     return Err(anyhow!("No kraken_db specified"));
@@ -411,15 +524,98 @@ pub mod kraken2 {
                 true => args.threads,
                 false => num_cpus::get()-1,
             };
-            args_vec.push(format!("--threads {}", num_cores));
-            args_vec.push(format!("--report {}", config.report_path.to_string_lossy()));
-            args_vec.push(format!("--classified-out {}", config.classified_path.to_string_lossy()));
-            args_vec.push(format!("--output -")); // "-" will suppress normal output
-            args_vec.push(format!("--memory-mapping"));
-            args_vec.push(format!("--gzip-compressed"));
+            args_vec.push("--threads".to_string());
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--report".to_string());
+            args_vec.push( config.report_path.to_string_lossy().to_string());
+            args_vec.push("--classified-out".to_string());
+            args_vec.push(config.classified_path.to_string_lossy().to_string());
+            args_vec.push("--output".to_string());
+            args_vec.push("-".to_string()); // "-" will suppress normal output
+            // args_vec.push("--memory-mapping".to_string());
+            // args_vec.push("--gzip-compressed".to_string());
 
             args_vec.push(config.fastq_path.to_string_lossy().to_string()); // input, should be a mkfifo
 
+            Ok(args_vec)
+        }
+    }
+}
+
+pub mod ivar {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::cli::Arguments;
+    use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    #[derive(Debug)]
+    pub struct IvarConfig {
+        pub subcommand: IvarSubcommand,
+        pub subcommand_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct IvarArgGenerator;
+
+    pub async fn ivar_presence_check() -> anyhow::Result<String> {
+        let args: Vec<&str> = vec!["version"];
+
+        let mut child = Command::new(IVAR_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(2)
+            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
+        }
+        Ok(version)
+    }
+
+    impl ArgGenerator for IvarArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<IvarConfig>())
+                .ok_or_else(|| anyhow!("IVar requires a IvarConfig as extra argument"))?;
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                IvarSubcommand::Consensus => {
+                    args_vec.push("consensus".to_string());
+                    args_vec.push("-q".to_string());
+                    args_vec.push(IVAR_QUAL_THRESHOLD.to_string());
+                    args_vec.push("-t".to_string());
+                    args_vec.push(IVAR_FREQ_THRESHOLD.to_string());
+                    args_vec.push("-m".to_string());
+                    args_vec.push(args.min_depth.to_string());
+                    args_vec.push("-n N".to_string());
+                }
+            }
+
+
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
             Ok(args_vec)
         }
     }
@@ -432,6 +628,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
         SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
         KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
+        BCFTOOLS_TAG => Box::new(bcftools::BcftoolsArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
@@ -447,6 +644,8 @@ pub async fn check_version(tool: &str) -> Result<String> {
         MINIMAP2_TAG => {minimap2::minimap2_presence_check().await},
         SAMTOOLS_TAG => {samtools::samtools_presence_check().await},
         KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
+        BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
+        IVAR_TAG => ivar::ivar_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
