@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 use tokio::io::BufWriter;
 use futures::future::try_join_all;
+use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::streams::ToBytes;
 
 
@@ -652,7 +653,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 &args,
                 Some(&consensus_samtools_config_mpileup),
             )?;
-
             let (mut consensus_samtools_child_mpileup, consensus_samtools_task_mpileup, consensus_samtools_err_task_mpileup) = stream_to_cmd(consensus_bam_output_stream, SAMTOOLS_TAG, conensus_samtools_args_mpileup, StreamDataType::JustBytes, args.verbose).await?;
             let consensus_samtools_out_stream_mpileup = parse_child_output(
                 &mut consensus_samtools_child_mpileup,
@@ -663,18 +663,40 @@ pub async fn run(args: &Arguments) -> Result<()> {
             cleanup_tasks.push(consensus_samtools_task_mpileup);
             cleanup_tasks.push(consensus_samtools_err_task_mpileup);
 
-            let test_write_task = tokio::spawn(stream_to_file(
-                consensus_samtools_out_stream_mpileup,
-                PathBuf::from("test_consensus_mpileup.txt"),
-            ));
-            
-            test_write_task.await??;
+
             
 
     //         //Check target type, only allow viral
             match args.target_type {
                 TargetType::Viral => {
                    eprintln!("Viral");
+
+
+                    // let consensus_bcftools_config_call = BcftoolsConfig {
+                    //     subcommand: BcftoolsSubcommand::Call,
+                    //     subcommand_fields: HashMap::from([("-c".to_string(), None), ("-v".to_string(), None), ("-".to_string(), None)]), 
+                    // };
+                    // let consensus_bcftools_args_call = generate_cli(
+                    //     BCFTOOLS_TAG,
+                    //     &args,
+                    //     Some(&consensus_bcftools_config_call),
+                    // )?;
+                    // let (mut consensus_bcftools_child_call, consensus_bcftools_task_call, consensus_bcftools_err_task_call) = stream_to_cmd(consensus_samtools_out_stream_mpileup, BCFTOOLS_TAG, consensus_bcftools_args_call, StreamDataType::JustBytes, args.verbose).await?;
+                    // let consensus_bcftools_out_stream_call = parse_child_output(
+                    //     &mut consensus_bcftools_child_call,
+                    //     ChildStream::Stdout,
+                    //     ParseMode::Bytes,
+                    //     args.buffer_size / 4,
+                    // ).await?;
+                    // cleanup_tasks.push(consensus_bcftools_task_call);
+                    // cleanup_tasks.push(consensus_bcftools_err_task_call);
+                    // 
+                    // let test_write_task = tokio::spawn(stream_to_file(
+                    //     consensus_bcftools_out_stream_call,
+                    //     PathBuf::from("test_consensus_call.fa"),
+                    // ));
+                    // 
+                    // test_write_task.await??;
                     
     
                 }  // End if viral
