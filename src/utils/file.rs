@@ -46,7 +46,7 @@ pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
 /// Then returns absolute path.
 /// # Arguments
 ///
-/// * `path`: PAthBuf - File path
+/// * `path`: PathBuf - File path
 /// * 'prefix': Option<&str> = added ahead of base
 /// * 'postfix': Option<&str> = added after of base
 /// /// * 'postfix': Option<&str> = added after of base

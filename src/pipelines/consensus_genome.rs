@@ -12,7 +12,7 @@ use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, write_fasta_to_temp};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG};
@@ -31,8 +31,9 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", config.args.module);
 
-    let cwd = std::env::current_dir()?;
-
+    let cwd = config.cwd.clone();
+    let ram_temp_dir = config.ram_temp_dir.clone();
+    
     // Initialize cleanup tasks
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
@@ -168,31 +169,17 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     //Host Removal
     
-    // Create FIFO pipes
-    let host_ref_temp = NamedTempFile::new()?;
-    let host_ref_pipe_path = host_ref_temp.path().to_path_buf();
-
-    if host_ref_pipe_path.exists() {
-        std::fs::remove_file(&host_ref_pipe_path)?;
-    }
-    Command::new("mkfifo")
-        .arg(&host_ref_pipe_path)
-        .status()?;
-    
+    // Create host sequence temp file
     let (host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-    let host_ref_write_task = tokio::spawn({
-        let host_ref_pipe_path = host_ref_pipe_path.clone();
-        async move {
-            let result = write_hdf5_seq_to_fifo(&host_seq, &host_accession, &host_ref_pipe_path).await;
-            result
-        }
-    });
+    let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
+    let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
+    let host_ref_write_task = write_fasta_to_temp(host_seq.clone(), host_accession.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
     cleanup_tasks.push(host_ref_write_task);
     
     // Create FIFO pipe for the fastp output to stream to minimap2
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
-    let host_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(host_ref_pipe_path.clone(), host_query_pipe_path.clone())))?;
+    let host_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(host_ref_fasta_path.clone(), host_query_pipe_path.clone())))?;
     let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, config.args.verbose).await?;
     cleanup_tasks.push(host_minimap2_err_task);
     
@@ -666,9 +653,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //     return Err(anyhow!("Samtools exited with non-zero status: {}", samtools_status));
     // }
 
-    // if host_ref_pipe_path.exists() {
-    //     std::fs::remove_file(&host_ref_pipe_path)?;
-    // }
 
 
 
