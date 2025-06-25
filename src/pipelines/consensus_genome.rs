@@ -5,30 +5,23 @@ use crate::utils::streams::ParseOutput;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
-use crate::cli::{Arguments, Technology, TargetType};
+use crate::cli::{Arguments, Technology};
 use std::process::Command;
 use std::time::Instant;
 use tokio::fs::File as TokioFile;
-use tokio::io::AsyncWriteExt;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::command::{generate_cli, check_versions, check_version};
+use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, write_fasta_to_fifo, parse_and_filter_fastq_id};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
 use crate::utils::db::write_hdf5_seq_to_fifo;
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_bytes, parse_fastq};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
-use crate::utils::command::ivar::IvarConfig;
-use crate::utils::db::{lookup_sequence, load_index, build_new_in_memory_index, get_index, retrieve_h5_seq};
+use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
-use tokio::io::BufWriter;
 use futures::future::try_join_all;
-use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::streams::ToBytes;
-use std::fs::File;
-use std::io::Write;
 
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
@@ -305,7 +298,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 50,
             )
                 .await?;
-    
+            cleanup_receivers.push(ercc_done_rx);
             if ercc_streams.len() != 2 {
                 return Err(anyhow!("Expected exactly 2 streams, got {}", ercc_streams.len()));
             }
@@ -506,7 +499,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
 
                 let filter_reads_kraken2_args = generate_cli(KRAKEN2_TAG, &args, Some(&filter_reads_kraken2_config))?;
                 eprintln!("kraken2 args: {:?}", filter_reads_kraken2_args);
-                let (mut filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
+                let (mut _filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(KRAKEN2_TAG, filter_reads_kraken2_args, args.verbose).await?;
                 cleanup_tasks.push(filter_kraken2_err_task);
 
                 let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
@@ -531,16 +524,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                     Ok::<(), anyhow::Error>(()) // Ensure task returns Result for error handling
                 });
 
-
-
-
                 filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
-            //     let test_write_task = tokio::spawn(stream_to_file(
-            //         parse_output_rx,
-            //         PathBuf::from("test_filter_reads_id.fq"),
-            //     ));
-            //
-            //     test_write_task.await??;
 
             }
     
@@ -602,16 +586,6 @@ pub async fn run(args: &Arguments) -> Result<()> {
             ).await?;
 
 
-                // let test_write_task = tokio::spawn(stream_to_file(
-                //     align_samtools_out_stream_sort,
-                //     PathBuf::from("test_align_reads.bam"),
-                // ));
-                //
-                // test_write_task.await??;
-
-
-
-
             //*****************
             // Make Consensus
 
@@ -629,6 +603,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 50,
             )
                 .await?;
+            cleanup_receivers.push(consensus_bam_done_rx);
 
             if consensus_bam_streams.len() != 2 {
                 return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
@@ -669,51 +644,10 @@ pub async fn run(args: &Arguments) -> Result<()> {
                 consensus_samtools_out_stream,
                 PathBuf::from("test_consensus.fa"),
             ));
-            
+            // NB: this eventually goes to realign consensus
             test_write_task.await??;
-
             
-
-    //         //Check target type, only allow viral
-            match args.target_type {
-                TargetType::Viral => {
-                   eprintln!("Viral");
-
-
-                  
-
-
-                }  // End if viral
-
-                _ => {
-                    return Err(anyhow!("Only viral consensus target types supported at this time."));
-                }
-            }
-    // 
-    //         //Samtools mpileup
-    // 
-    //         
-    // 
-    // 
-    // 
-    // 
-    //         // consensus_bam_write_task.await??;
-    //         // consensus_samtools_index_stream_task.await??;
-    //         // consensus_index_err_task.await??;
-    //         // align_ref_write_task.await?;
-    //         // align_query_write_task.await??;
-    //         // align_output_write_task.await??;
-    //         ercc_query_write_task.await??;
-    //         // ercc_output_write_task.await??;
-    //         ercc_minimap2_err_task.await??;
-    //         ercc_samtools_task_view.await??;
-    //         ercc_samtools_task_stats.await??;
-    //         ercc_stats_write_task.await??;
-    //         ercc_done_rx.await??;
-    //         
-    // 
-    //         
-        } // end tech illumina
+        } // end tech == illumina
         Technology::ONT => {
             return Err(anyhow!("Minion not ready"));
         }
@@ -724,11 +658,7 @@ pub async fn run(args: &Arguments) -> Result<()> {
     // Cleanup, hanging tasks
 
 
-
-
-
-
-
+    
     // let minimap2_status = host_minimap2_child.wait().await?;
     // if minimap2_status.success() {
     //     eprintln!("Minimap2 exited successfully");
