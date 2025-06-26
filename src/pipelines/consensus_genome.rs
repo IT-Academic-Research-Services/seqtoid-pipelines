@@ -64,7 +64,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         },
     }
     if !file1_path.exists() {
-        return Err(anyhow!("Specficied file1 {:?} does not exist.", file1_path));
+        return Err(anyhow!("Specified file1 {:?} does not exist.", file1_path));
     }
 
     let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
@@ -114,14 +114,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     )
         .await?;
     
-    if val_streams.len() != 2 {
-        return Err(anyhow!("Expected exactly 2 streams, got {}", val_streams.len()));
-    }
     cleanup_receivers.push(val_done_rx);
 
     let mut streams_iter = val_streams.into_iter();
-    let val_fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
-    let val_pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    let val_fastp_stream = streams_iter.next().unwrap();
+    let val_pigz_stream = streams_iter.next().unwrap();
 
     //Pigz stream to intermediate file output
     let val_pigz_args = generate_cli(PIGZ_TAG, &config.args, None)?;
@@ -188,7 +185,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         config.args.buffer_size / 4,
     ).await?;
     
-    
     let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string())),]), // Require unmapped reads (SAM flag 4). Pass only unmapped reads here
@@ -227,7 +223,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         ParseMode::Bytes,
         config.args.buffer_size / 4,
     ).await?;
-    let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
+    let host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
     
@@ -243,15 +239,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         50,
     )
         .await?;
-    
-    if host_streams.len() != 2 {
-        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
-    }
     cleanup_receivers.push(host_done_rx);
     
     let mut streams_iter = host_streams.into_iter();
-    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    let no_host_output_stream = streams_iter.next().unwrap();
+    let no_host_file_stream = streams_iter.next().unwrap();
     
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_file_stream,
@@ -290,15 +282,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )
                 .await?;
             cleanup_receivers.push(ercc_done_rx);
-            if ercc_streams.len() != 2 {
-                return Err(anyhow!("Expected exactly 2 streams, got {}", ercc_streams.len()));
-            }
-    
+            
             let mut streams_iter = ercc_streams.into_iter();
-            let ercc_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc stream"))?;
-            let ercc_bypass_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc bypass stream"))?;
+            let ercc_stream = streams_iter.next().unwrap();
+            let ercc_bypass_stream = streams_iter.next().unwrap();
             let ercc_stream = ReceiverStream::new(ercc_stream);
-    
             
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
             cleanup_tasks.push(ercc_query_write_task);
@@ -543,14 +531,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )
                 .await?;
             cleanup_receivers.push(consensus_bam_done_rx);
-
-            if consensus_bam_streams.len() != 2 {
-                return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
-            }
-
+            
             let mut streams_iter = consensus_bam_streams.into_iter();
-            let consensus_bam_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-            let consensus_bam_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+            let consensus_bam_output_stream = streams_iter.next().unwrap();
+            let consensus_bam_file_stream = streams_iter.next().unwrap();
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
