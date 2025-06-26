@@ -92,8 +92,11 @@ pub struct Arguments {
 
     #[arg( long = "target_type", default_value = "viral", value_enum)]
     pub target_type: TargetType,
-    
+
     #[arg(long, default_value_t = 10)]
     pub min_depth: usize,
+
+    #[arg(long, default_value_t = 0.0006)] // assumes about 20 mutations between 2 random samples
+    pub bcftools_call_theta: f64,  // (this is an overestimate to increase sensitivity)
     
 }

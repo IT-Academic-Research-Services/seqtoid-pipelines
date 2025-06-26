@@ -581,7 +581,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                     ("-f".to_string(), Some(target_ref_fasta_path.to_string_lossy().into_owned())),
                     ("-".to_string(), None),
                 ])
-
             };
             let call_bcftools_args_mpileup = generate_cli(
                 BCFTOOLS_TAG,
@@ -597,9 +596,35 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 ParseMode::Bytes,
                 config.args.buffer_size / 4,
             ).await?;
+            
+
+            let call_bcftools_config_call = BcftoolsConfig {
+                subcommand: BcftoolsSubcommand::Call,
+                subcommand_fields: HashMap::from([
+                    ("--ploidy".to_string(), Some("1".to_string())),
+                    ("-m".to_string(), None),
+                    ("-v".to_string(), None),
+                    ("-P".to_string(), Some(config.args.bcftools_call_theta.to_string())),
+                    ("-".to_string(), None),
+                ])
+            };
+            let call_bcftools_args_call = generate_cli(
+                BCFTOOLS_TAG,
+                &config.args,
+                Some(&call_bcftools_config_call),
+            )?;
+            let (mut call_bcftools_child_call, call_bcftools_task_call, call_bcftools_err_task_call) = stream_to_cmd(call_bcftools_out_stream_mpileup, BCFTOOLS_TAG, call_bcftools_args_call, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(call_bcftools_task_call);
+            cleanup_tasks.push(call_bcftools_err_task_call);
+            let call_bcftools_out_stream_call = parse_child_output(
+                &mut call_bcftools_child_call,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
 
             let test_write_task = tokio::spawn(stream_to_file(
-                call_bcftools_out_stream_mpileup,
+                call_bcftools_out_stream_call,
                 PathBuf::from("test_call.bcf"),
             ));
             test_write_task.await??;
