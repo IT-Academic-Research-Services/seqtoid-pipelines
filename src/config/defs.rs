@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use crate::cli::Arguments;
+
 pub const GZIP_EXT: &str = "gz";
 pub const FASTP_TAG: &str = "fastp";
 pub const PIGZ_TAG: &str = "pigz";
@@ -38,3 +41,10 @@ pub const FASTA_TAG : &str = "fasta";
 pub const FASTQ_TAG : &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
+
+
+pub struct RunConfig  {
+    pub cwd: PathBuf,
+    pub ram_temp_dir: PathBuf,
+    pub args: Arguments
+}

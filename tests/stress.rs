@@ -330,11 +330,11 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     ).await?;
 
     let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
-    let (child, inner_task) = stream_to_cmd(
+    let (mut child, inner_task, _inner_err_task) = stream_to_cmd(
         rx,
         cmd_tag,
         args,
-        StreamDataType::IlluminaFastq
+        StreamDataType::IlluminaFastq, false
     ).await?;
 
     match timeout(Duration::from_secs(30), inner_task).await {
@@ -449,11 +449,12 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     let cmd_tag = cmd_tag.to_string();
                                     let args = args.iter().map(|&s| s.to_string()).collect::<Vec<_>>();
 
-                                    let (mut child, stream_task) = match stream_to_cmd(
+                                    let (mut child, stream_task, _stream_err_task) = match stream_to_cmd(
                                         rx,
                                         &cmd_tag,
                                         args,
-                                        StreamDataType::IlluminaFastq
+                                        StreamDataType::IlluminaFastq,
+                                        false
                                     )
                                         .await {
                                         Ok(result) => result,

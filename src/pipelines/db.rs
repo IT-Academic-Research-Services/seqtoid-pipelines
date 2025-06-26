@@ -3,7 +3,7 @@ use anyhow::anyhow;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Instant;
-use crate::cli::Arguments;
+use crate::config::defs::RunConfig;
 use crate::config::defs::{FASTA_EXTS, H5DUMP_TAG};
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::check_version;
@@ -23,7 +23,7 @@ use crate::utils::db::{write_sequences_to_hdf5, build_new_in_memory_index, check
 /// # Returns
 /// anyhow::Result<()>
 ///
-pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
+pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
     println!("\n-------------\n Create DB\n-------------\n");
     println!("Generating HDF5 DB");
     let start = Instant::now();
@@ -31,7 +31,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     let h5v = check_version(H5DUMP_TAG).await?;
     eprintln!("HDF5 version: {}", h5v);
 
-    let technology = Some(args.technology.clone());
+    let technology = Some(config.args.technology.clone());
 
     let cwd = std::env::current_dir()?;
     
@@ -45,7 +45,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     // if file2 is a fir
 
 
-    match &args.file1 {
+    match &config.args.file1 {
         Some(f1) => {
             
             let eff_1 = PathBuf::from_str(&f1)?;
@@ -76,7 +76,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
         }
     };
 
-    match &args.file2 {
+    match &config.args.file2 {
         Some(f2) => {
             let eff_2 = PathBuf::from_str(&f2)?;
             if eff_2.is_dir(){
@@ -116,7 +116,7 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
     eprintln!("Single-sample FASTA files for input {:?}", all_singles);
     
     
-    let h5_path = match &args.ref_db {
+    let h5_path = match &config.args.ref_db {
         Some(file) => {
             let file_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
             file_path.with_extension("h5")
@@ -134,9 +134,9 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
             multi_path,
             None,
             technology.clone(),
-            args.max_reads,
-            args.min_read_len,
-            args.max_read_len,
+            config.args.max_reads,
+            config.args.min_read_len,
+            config.args.max_read_len,
         )?;
         let mut rx_stream = ReceiverStream::new(rx);
         write_sequences_to_hdf5(&mut rx_stream, &h5_path, None).await?;
@@ -154,9 +154,9 @@ pub async fn create_db(args: &Arguments) -> anyhow::Result<()> {
             single_path,
             None,
             technology.clone(),
-            args.max_reads,
-            args.min_read_len,
-            args.max_read_len,
+            config.args.max_reads,
+            config.args.min_read_len,
+            config.args.max_read_len,
         )?;
         let mut rx_stream = ReceiverStream::new(rx);
         write_sequences_to_hdf5(&mut rx_stream, &h5_path, Some(no_ext_sample_base)).await?;

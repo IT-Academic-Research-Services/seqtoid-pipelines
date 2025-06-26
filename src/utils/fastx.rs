@@ -20,7 +20,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::streams::{ParseOutput};
 use tokio::time::Duration;
 
-
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
         let mut m = HashMap::new();
