@@ -568,7 +568,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&consensus_samtools_config),
             )?;
-
+            let consensus_file_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("consensus.fa"), "_");
             let (mut consensus_samtools_child, consensus_samtools_task_sort, consensus_samtools_err_task_sort) = stream_to_cmd(consensus_bam_output_stream, SAMTOOLS_TAG, consensus_samtools_args, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(consensus_samtools_task_sort);
             cleanup_tasks.push(consensus_samtools_err_task_sort);
@@ -579,12 +579,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.buffer_size / 4,
             ).await?;
             
-            let test_write_task = tokio::spawn(stream_to_file(
+            let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_samtools_out_stream,
-                PathBuf::from("test_consensus.fa"),
+                consensus_file_path
             ));
-            // NB: this eventually goes to realign consensus
-            test_write_task.await??;
+            cleanup_tasks.push(consensus_fa_write_task);
             
         } // end tech == illumina
         Technology::ONT => {
