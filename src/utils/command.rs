@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, IVAR_FREQ_THRESHOLD, IVAR_QUAL_THRESHOLD};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG};
 use crate::cli::Arguments;
 
 
@@ -365,9 +365,8 @@ pub mod bcftools {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::{BcftoolsSubcommand, SamtoolsSubcommand, BCFTOOLS_TAG};
+    use crate::config::defs::{BcftoolsSubcommand,  BCFTOOLS_TAG};
     use crate::utils::command::ArgGenerator;
-    use crate::utils::command::samtools::{SamtoolsArgGenerator, SamtoolsConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[derive(Debug)]
@@ -423,11 +422,14 @@ pub mod bcftools {
 
                 BcftoolsSubcommand::Mpileup => {
                     args_vec.push("mpileup".to_string());
-                    args_vec.push("-A".to_string()); // do not discard anomalous read pairs
-                    args_vec.push("-d".to_string()); // max depth zero
-                    args_vec.push("0".to_string());
-                    args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push("0".to_string());
+                    args_vec.push("-a".to_string());
+                    args_vec.push("AD".to_string()); // include allele depth (AD) for all positions, including those with zero coverage, mimicking -aa.
+                    args_vec.push("-d".to_string()); 
+                    args_vec.push("100000000".to_string()); // max depth essentially without limit
+                    args_vec.push("-L".to_string());
+                    args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
+                    args_vec.push("-Q".to_string()); 
+                    args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
                     args_vec.push("-O".to_string());
                     args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
                 }
@@ -544,7 +546,6 @@ pub mod bcftools {
 
 pub mod ivar {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;

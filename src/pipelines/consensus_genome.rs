@@ -13,9 +13,10 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
+use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
 use futures::future::try_join_all;
@@ -523,7 +524,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                2,
+                3,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -535,6 +536,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_bam_streams.into_iter();
             let consensus_bam_output_stream = streams_iter.next().unwrap();
             let consensus_bam_file_stream = streams_iter.next().unwrap();
+            let consensus_bam_call_stream = streams_iter.next().unwrap();
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -568,6 +570,39 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 consensus_file_path
             ));
             cleanup_tasks.push(consensus_fa_write_task);
+
+
+            //*****************
+            // Call Variants
+
+            let call_bcftools_config_mpileup = BcftoolsConfig {
+                subcommand: BcftoolsSubcommand::Mpileup,
+                subcommand_fields: HashMap::from([
+                    ("-f".to_string(), Some(target_ref_fasta_path.to_string_lossy().into_owned())),
+                    ("-".to_string(), None),
+                ])
+
+            };
+            let call_bcftools_args_mpileup = generate_cli(
+                BCFTOOLS_TAG,
+                &config.args,
+                Some(&call_bcftools_config_mpileup),
+            )?;
+            let (mut call_bcftools_child_mpileup, call_bcftools_task_mpileup, call_bcftools_err_task_mpileup) = stream_to_cmd(consensus_bam_call_stream, BCFTOOLS_TAG, call_bcftools_args_mpileup, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(call_bcftools_task_mpileup);
+            cleanup_tasks.push(call_bcftools_err_task_mpileup);
+            let call_bcftools_out_stream_mpileup = parse_child_output(
+                &mut call_bcftools_child_mpileup,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
+
+            let test_write_task = tokio::spawn(stream_to_file(
+                call_bcftools_out_stream_mpileup,
+                PathBuf::from("test_call.bcf"),
+            ));
+            test_write_task.await??;
             
         } // end tech == illumina
         Technology::ONT => {
