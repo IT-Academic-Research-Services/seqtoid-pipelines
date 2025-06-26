@@ -286,12 +286,12 @@ pub async fn write_parse_output_to_temp(
 /// # Returns
 ///
 /// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
-pub async fn write_vecu8_to_file(
+pub async fn write_vecu8_to_file<P: AsRef<Path>>(
     data: Vec<u8>,
-    temp_path: &PathBuf,
+    temp_path: P,
     buffer_size: usize,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    let temp_path = temp_path.clone();
+    let temp_path = temp_path.as_ref().to_path_buf(); // Convert to PathBuf for display
     let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
     let task = tokio::spawn(async move {
         let file = TokioFile::create(&temp_path)
@@ -300,7 +300,6 @@ pub async fn write_vecu8_to_file(
         let mut writer = BufWriter::with_capacity(buffer_capacity, file);
 
         let mut byte_count = 0;
-        
         const CHUNK_SIZE: usize = 1024 * 1024;
         for chunk in data.chunks(CHUNK_SIZE) {
             writer
@@ -322,9 +321,44 @@ pub async fn write_vecu8_to_file(
         if byte_count == 0 {
             return Err(anyhow!("No data written to file at {}", temp_path.display()));
         }
-        
+
         Ok(())
     });
 
     Ok(task)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_write_vecu8_to_file() -> std::io::Result<()> {
+        let test_data: Vec<u8> = vec![1, 2, 3, 4];
+        let temp_name = NamedTempFile::new()?;
+        let temp_path = temp_name.into_temp_path();
+        
+        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        write_task
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .and_then(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            })?;
+        
+        let mut read_file = std::fs::File::open(&temp_path)?;
+        let mut chk_buffer = Vec::new();
+        read_file.read_to_end(&mut chk_buffer)?;
+        eprintln!("chk_buffer: {:?}", chk_buffer);
+        assert_eq!(chk_buffer.len(), test_data.len());
+        assert_eq!(chk_buffer, test_data); 
+        
+        std::fs::remove_file(&temp_path)?;
+        Ok(())
+    }
 }
