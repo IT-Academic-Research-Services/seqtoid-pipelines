@@ -275,3 +275,56 @@ pub async fn write_parse_output_to_temp(
 }
 
 
+/// Writes a Vec<u8> to a file asynchronously.
+///
+/// # Arguments
+///
+/// - `data`: The data as a byte vector (e.g., genomic sequence).
+/// - `temp_path`: Path to the file (e.g., in /dev/shm).
+/// - `buffer_size`: Buffer size for the writer (e.g., 4 MB).
+///
+/// # Returns
+///
+/// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
+pub async fn write_vecu8_to_file(
+    data: Vec<u8>,
+    temp_path: &PathBuf,
+    buffer_size: usize,
+) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
+    let temp_path = temp_path.clone();
+    let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
+    let task = tokio::spawn(async move {
+        let file = TokioFile::create(&temp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to create file at {}: {}", temp_path.display(), e))?;
+        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
+
+        let mut byte_count = 0;
+        
+        const CHUNK_SIZE: usize = 1024 * 1024;
+        for chunk in data.chunks(CHUNK_SIZE) {
+            writer
+                .write_all(chunk)
+                .await
+                .map_err(|e| anyhow!("Failed to write to file at {}: {}", temp_path.display(), e))?;
+            byte_count += chunk.len();
+        }
+
+        writer
+            .flush()
+            .await
+            .map_err(|e| anyhow!("Failed to flush file at {}: {}", temp_path.display(), e))?;
+        writer
+            .shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown file at {}: {}", temp_path.display(), e))?;
+
+        if byte_count == 0 {
+            return Err(anyhow!("No data written to file at {}", temp_path.display()));
+        }
+        
+        Ok(())
+    });
+
+    Ok(task)
+}

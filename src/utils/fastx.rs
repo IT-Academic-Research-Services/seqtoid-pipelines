@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::io::Write;
-use std::sync::Arc;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 use anyhow::{Result, anyhow};
@@ -20,10 +19,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::streams::{ParseOutput};
 use tokio::time::Duration;
-use tokio::task::JoinHandle;
-use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncWriteExt, BufWriter};
-
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -626,62 +621,7 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
-/// Writes a FASTA-formatted sequence and accession to a file asynchronously.
-///
-/// # Arguments
-///
-/// - `seq`: The  sequence data as a byte vector (e.g., genomic sequence).
-/// - `temp_path`: Path to the file (e.g., in /dev/shm).
-/// - `buffer_size`: Buffer size for the writer (e.g., 4 MB).
-///
-/// # Returns
-///
-/// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
-pub async fn write_fasta_to_file(
-    seq: Vec<u8>,
-    temp_path: &PathBuf,
-    buffer_size: usize,
-) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    let temp_path = temp_path.clone();
-    let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
-    let task = tokio::spawn(async move {
-        eprintln!("Starting FASTA write to {}", temp_path.display());
-        let file = TokioFile::create(&temp_path)
-            .await
-            .map_err(|e| anyhow!("Failed to create file at {}: {}", temp_path.display(), e))?;
-        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
 
-        let mut byte_count = 0;
-        
-        
-        const CHUNK_SIZE: usize = 1024 * 1024;
-        for chunk in seq.chunks(CHUNK_SIZE) {
-            writer
-                .write_all(chunk)
-                .await
-                .map_err(|e| anyhow!("Failed to write sequence to file at {}: {}", temp_path.display(), e))?;
-            byte_count += chunk.len();
-        }
-
-        writer
-            .flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush file at {}: {}", temp_path.display(), e))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown file at {}: {}", temp_path.display(), e))?;
-
-        if byte_count == 0 {
-            return Err(anyhow!("No data written to file at {}", temp_path.display()));
-        }
-
-        eprintln!("Finished FASTA write: {} bytes to {}", byte_count, temp_path.display());
-        Ok(())
-    });
-
-    Ok(task)
-}
 /// Filters a stream of FASTQ records based on a predicate applied to the ID line.
 ///
 /// # Arguments
