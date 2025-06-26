@@ -629,17 +629,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.buffer_size / 4,
             ).await?;
 
-            // let test_write_task = tokio::spawn(stream_to_file(
-            //     call_bcftools_out_stream_call,
-            //     PathBuf::from("test_call.bcf"),
-            // ));
-            // test_write_task.await??;
-
+            
             let called_variants_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("called.vcf"), "_");
             let call_bcftools_config_view = BcftoolsConfig {
                 subcommand: BcftoolsSubcommand::View,
                 subcommand_fields: HashMap::from([
-                    // ("-i".to_string(), Some(format!("DP>={}", config.args.min_depth))),
+                    ("-i".to_string(), Some(format!("DP>={}", config.args.min_depth))),
                     ("-O".to_string(), Some("v".to_string())),
                     ("-".to_string(), None),
                 ])
