@@ -435,6 +435,9 @@ pub mod bcftools {
                     args_vec.push("-O".to_string());
                     args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
                 }
+                BcftoolsSubcommand::View => {
+                    args_vec.push("view".to_string());
+                }
                 
             }
 

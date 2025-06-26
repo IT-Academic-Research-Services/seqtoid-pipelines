@@ -253,6 +253,16 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_write_task);
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
+
+
+    //*****************
+    // Get Target sequence
+    let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+    let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
+    let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
+    let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), &target_ref_fasta_path, config.args.buffer_size).await?;
+    cleanup_tasks.push(target_ref_write_task);
+    
     
     
     //*****************
@@ -262,13 +272,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         Technology::Illumina => {
             eprintln!("Illumina");
             
-            //*****************
-            // Get Target sequence
-            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-            let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
-            let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
-            let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), &target_ref_fasta_path, config.args.buffer_size).await?;
-            cleanup_tasks.push(target_ref_write_task);
+
             
             
             //*****************
@@ -587,6 +591,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&call_bcftools_config_mpileup),
             )?;
+            eprintln!("{:?}", call_bcftools_args_mpileup);
             let (mut call_bcftools_child_mpileup, call_bcftools_task_mpileup, call_bcftools_err_task_mpileup) = stream_to_cmd(consensus_bam_call_stream, BCFTOOLS_TAG, call_bcftools_args_mpileup, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(call_bcftools_task_mpileup);
             cleanup_tasks.push(call_bcftools_err_task_mpileup);
@@ -613,6 +618,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&call_bcftools_config_call),
             )?;
+            eprintln!("{:?}", call_bcftools_args_call);
             let (mut call_bcftools_child_call, call_bcftools_task_call, call_bcftools_err_task_call) = stream_to_cmd(call_bcftools_out_stream_mpileup, BCFTOOLS_TAG, call_bcftools_args_call, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(call_bcftools_task_call);
             cleanup_tasks.push(call_bcftools_err_task_call);
@@ -623,11 +629,44 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.buffer_size / 4,
             ).await?;
 
-            let test_write_task = tokio::spawn(stream_to_file(
-                call_bcftools_out_stream_call,
-                PathBuf::from("test_call.bcf"),
+            // let test_write_task = tokio::spawn(stream_to_file(
+            //     call_bcftools_out_stream_call,
+            //     PathBuf::from("test_call.bcf"),
+            // ));
+            // test_write_task.await??;
+
+            let called_variants_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("called.vcf"), "_");
+            let call_bcftools_config_view = BcftoolsConfig {
+                subcommand: BcftoolsSubcommand::View,
+                subcommand_fields: HashMap::from([
+                    // ("-i".to_string(), Some(format!("DP>={}", config.args.min_depth))),
+                    ("-O".to_string(), Some("v".to_string())),
+                    ("-".to_string(), None),
+                ])
+            };
+            let call_bcftools_args_view = generate_cli(
+                BCFTOOLS_TAG,
+                &config.args,
+                Some(&call_bcftools_config_view),
+            )?;
+            eprintln!("{:?}", call_bcftools_args_view);
+            let (mut call_bcftools_child_view, call_bcftools_task_view, call_bcftools_err_task_view) = stream_to_cmd(call_bcftools_out_stream_call, BCFTOOLS_TAG, call_bcftools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(call_bcftools_task_view);
+            cleanup_tasks.push(call_bcftools_err_task_view);
+            
+            let call_bcftools_out_stream_view = parse_child_output(
+                &mut call_bcftools_child_view,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
+            
+            let called_variants_write_task = tokio::spawn(stream_to_file(
+                call_bcftools_out_stream_view,
+                called_variants_path
             ));
-            test_write_task.await??;
+            cleanup_tasks.push(called_variants_write_task);
+            
             
         } // end tech == illumina
         Technology::ONT => {
@@ -682,7 +721,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let results = try_join_all(cleanup_tasks).await?;
     for result in results {
-        result?; // Propagate inner Result errors
+        result?; 
     }
 
     for receiver in cleanup_receivers {
