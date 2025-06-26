@@ -630,8 +630,7 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
 ///
 /// # Arguments
 ///
-/// - `seq`: The shared sequence data as a byte vector (e.g., genomic sequence).
-/// - `accession`: The shared sequence identifier for the FASTA header.
+/// - `seq`: The  sequence data as a byte vector (e.g., genomic sequence).
 /// - `temp_path`: Path to the file (e.g., in /dev/shm).
 /// - `buffer_size`: Buffer size for the writer (e.g., 4 MB).
 ///
@@ -639,13 +638,12 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
 ///
 /// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
 pub async fn write_fasta_to_file(
-    seq: Arc<Vec<u8>>,
-    accession: Arc<String>,
+    seq: Vec<u8>,
     temp_path: &PathBuf,
     buffer_size: usize,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     let temp_path = temp_path.clone();
-    let buffer_capacity = buffer_size.max(4 * 1024 * 1024); // Ensure at least 4MB buffer
+    let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
     let task = tokio::spawn(async move {
         eprintln!("Starting FASTA write to {}", temp_path.display());
         let file = TokioFile::create(&temp_path)
@@ -654,18 +652,9 @@ pub async fn write_fasta_to_file(
         let mut writer = BufWriter::with_capacity(buffer_capacity, file);
 
         let mut byte_count = 0;
-
-        // Write FASTA header: >accession\n
-        let header = format!(">{}\n", accession);
-        let header_bytes = header.as_bytes();
-        writer
-            .write_all(header_bytes)
-            .await
-            .map_err(|e| anyhow!("Failed to write header to file at {}: {}", temp_path.display(), e))?;
-        byte_count += header_bytes.len();
-
-        // Write sequence in chunks
-        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+        
+        
+        const CHUNK_SIZE: usize = 1024 * 1024;
         for chunk in seq.chunks(CHUNK_SIZE) {
             writer
                 .write_all(chunk)

@@ -170,10 +170,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //Host Removal
     
     // Create host sequence temp file
-    let (host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+    let (_host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
     let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
-    let host_ref_write_task = write_fasta_to_file(Arc::new(host_seq), Arc::new(host_accession), &host_ref_fasta_path, config.args.buffer_size).await?;
+    let host_ref_write_task = write_fasta_to_file(host_seq.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
     cleanup_tasks.push(host_ref_write_task);
     
     // Create FIFO pipe for the fastp output to stream to minimap2
@@ -270,9 +270,18 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     match technology {
         Technology::Illumina => {
             eprintln!("Illumina");
+            
+            //*****************
+            // Get Target sequence
+            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
+            let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
+            let target_ref_write_task = write_fasta_to_file(filter_align_seq.clone(), &target_ref_fasta_path, config.args.buffer_size).await?;
+            cleanup_tasks.push(target_ref_write_task);
+            
+            
             //*****************
             // ERCC
-    
             let (ercc_streams, ercc_done_rx) = t_junction(
                 no_host_output_stream,
                 2,
@@ -359,10 +368,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             //*****************
             // Filter Reads
             
-            let (filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-            let filter_align_seq = Arc::new(filter_align_seq);
-            let filter_align_accession = Arc::new(filter_align_accession);
-            eprintln!("Align accession: {:?}", filter_align_accession);
             
             let mut filter_reads_out_stream: ReceiverStream<ParseOutput>;
             if config.args.dont_filter_reads {
@@ -372,32 +377,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             else {
                 eprintln!("Filtering");
                 let ercc_bypass_stream = ReceiverStream::new(ercc_bypass_stream);
-                let filter_ref_temp = NamedTempFile::new()?;
-                let filter_ref_pipe_path = filter_ref_temp.path().to_path_buf();
-            
-                if filter_ref_pipe_path.exists() {
-                    std::fs::remove_file(&filter_ref_pipe_path)?;
-                }
-                Command::new("mkfifo")
-                    .arg(&filter_ref_pipe_path)
-                    .status()?;
-            
-                let filter_align_seq_clone = Arc::clone(&filter_align_seq);
-                let filter_align_accession_clone = Arc::clone(&filter_align_accession);
-                eprintln!("Filter accession: {:?}", filter_align_accession_clone);
-                let filter_ref_write_task = tokio::spawn({
-                    let filter_ref_pipe_path = filter_ref_pipe_path.clone();
-                    async move {
-                        let result = write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &filter_ref_pipe_path).await;
-                        result
-                    }
-                });
-                cleanup_tasks.push(filter_ref_write_task);
                 
                 let (filter_query_write_task, filter_query_pipe_path) = write_parse_output_to_temp(ercc_bypass_stream, None).await?;
                 cleanup_tasks.push(filter_query_write_task);
-                
-                let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(filter_ref_pipe_path.clone(), filter_query_pipe_path.clone())))?;
+
+                let filter_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(target_ref_fasta_path.clone(), filter_query_pipe_path)))?;
                 let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, filter_minimap2_args, config.args.verbose).await?;
                 let filter_minimap2_out_stream = parse_child_output(
                     &mut filter_minimap2_child,
@@ -510,30 +494,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             //*****************
             // Align Reads to Target
 
-            let align_ref_temp = NamedTempFile::new()?;
-            let align_ref_pipe_path = align_ref_temp.path().to_path_buf();
-
-            if align_ref_pipe_path.exists() {
-                std::fs::remove_file(&align_ref_pipe_path)?;
-            }
-            Command::new("mkfifo")
-                .arg(&align_ref_pipe_path)
-                .status()?;
-
-            let filter_align_seq_clone = Arc::clone(&filter_align_seq);
-            let filter_align_accession_clone = Arc::clone(&filter_align_accession);
-            let align_ref_write_task = tokio::spawn({
-                let align_ref_pipe_path = align_ref_pipe_path.clone();
-                async move {
-                    write_hdf5_seq_to_fifo(&filter_align_seq_clone, &filter_align_accession_clone, &align_ref_pipe_path).await
-                }
-            });
-            cleanup_tasks.push(align_ref_write_task);
-
+            
             let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
             cleanup_tasks.push(align_query_write_task);
 
-            let align_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(align_ref_pipe_path.clone(), align_query_pipe_path.clone())))?;
+            let align_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(target_ref_fasta_path.clone(), align_query_pipe_path)))?;
             let (mut align_minimap2_child,  align_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, align_minimap2_args, config.args.verbose).await?;
             cleanup_tasks.push(align_minimap2_err_task);
             let align_minimap2_out_stream = parse_child_output(
