@@ -12,7 +12,7 @@ use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, write_fasta_to_temp};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, write_fasta_to_file};
 use crate::utils::db::write_hdf5_seq_to_fifo;
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG};
@@ -173,7 +173,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let (host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
     let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
-    let host_ref_write_task = write_fasta_to_temp(host_seq.clone(), host_accession.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
+    let host_ref_write_task = write_fasta_to_file(Arc::new(host_seq), Arc::new(host_accession), &host_ref_fasta_path, config.args.buffer_size).await?;
     cleanup_tasks.push(host_ref_write_task);
     
     // Create FIFO pipe for the fastp output to stream to minimap2

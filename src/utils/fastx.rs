@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 use anyhow::{Result, anyhow};
@@ -625,21 +626,21 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
-/// Writes a FASTA-formatted sequence and accession to a RAM-based temporary file asynchronously.
+/// Writes a FASTA-formatted sequence and accession to a file asynchronously.
 ///
 /// # Arguments
 ///
-/// - `seq`: The owned sequence data as a byte vector (e.g., genomic sequence).
-/// - `accession`: The owned sequence identifier for the FASTA header.
-/// - `temp_path`: Path to the temporary file (e.g., in /dev/shm).
+/// - `seq`: The shared sequence data as a byte vector (e.g., genomic sequence).
+/// - `accession`: The shared sequence identifier for the FASTA header.
+/// - `temp_path`: Path to the file (e.g., in /dev/shm).
 /// - `buffer_size`: Buffer size for the writer (e.g., 4 MB).
 ///
 /// # Returns
 ///
 /// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
-pub async fn write_fasta_to_temp(
-    seq: Vec<u8>,
-    accession: String,
+pub async fn write_fasta_to_file(
+    seq: Arc<Vec<u8>>,
+    accession: Arc<String>,
     temp_path: &PathBuf,
     buffer_size: usize,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
@@ -692,7 +693,6 @@ pub async fn write_fasta_to_temp(
 
     Ok(task)
 }
-
 /// Filters a stream of FASTQ records based on a predicate applied to the ID line.
 ///
 /// # Arguments
