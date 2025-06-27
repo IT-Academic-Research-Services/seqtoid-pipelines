@@ -12,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, combine_streams};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MUSCLE_TAG, MAFFT_TAG};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
@@ -256,7 +256,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
     
-    
     //*****************
     // Split by Technology
 
@@ -482,7 +481,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     
             //*****************
             // Align Reads to Target
-
             
             let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
             cleanup_tasks.push(align_query_write_task);
@@ -682,46 +680,28 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Turn the target ref into a stream
             let reference_file = TokioFile::open(&target_ref_fasta_path).await?;
             let reference_rx = parse_bytes(reference_file, config.args.buffer_size).await?;
-
-            // let test_write_task = tokio::spawn(stream_to_file(
-            //     reference_rx,
-            //     PathBuf::from("wtf.fa"),
-            // ));
-            // test_write_task.await??;
-
-
-
-
+            
             let realign_streams = vec![consensus_realign_stream, reference_rx];
-            let (combined_rx, combined_task) = combine_streams(realign_streams, config.args.buffer_size).await?;
+            let (combined_rx, combined_task) = y_junction(realign_streams, config.args.buffer_size).await?;
             cleanup_tasks.push(combined_task);
-
-            let testt_write_task = tokio::spawn(stream_to_file(
-                combined_rx,
-                PathBuf::from("wtb.fa"),
+            
+            let realign_consensus_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("consensus_realigned.fa"), "_");
+            let realign_mafft_args = generate_cli(MAFFT_TAG, &config.args, None)?;
+            let (mut realign_consensus_mafft_child, realign_consensus_mafft_task, realign_consensus_mafft_err_task) = stream_to_cmd(combined_rx, MAFFT_TAG, realign_mafft_args, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(realign_consensus_mafft_task);
+            cleanup_tasks.push(realign_consensus_mafft_err_task);
+            let consensus_samtools_out_stream = parse_child_output(
+                &mut realign_consensus_mafft_child,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
+            
+            let realign_consensus_write_task = tokio::spawn(stream_to_file(
+                consensus_samtools_out_stream,
+                PathBuf::from(realign_consensus_path),
             ));
-            testt_write_task.await??;
-            
-            
-            
-            // let realign_consensus_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("consensus_realigned.fa"), "_");
-            // let realign_mafft_args = generate_cli(MAFFT_TAG, &config.args, None)?;
-            // 
-            // let (mut realign_consensus_mafft_child, realign_consensus_mafft_task, realign_consensus_mafft_err_task) = stream_to_cmd(combined_rx, SAMTOOLS_TAG, realign_mafft_args, StreamDataType::JustBytes, config.args.verbose).await?;
-            // cleanup_tasks.push(realign_consensus_mafft_task);
-            // cleanup_tasks.push(realign_consensus_mafft_err_task);
-            // let consensus_samtools_out_stream = parse_child_output(
-            //     &mut realign_consensus_mafft_child,
-            //     ChildStream::Stdout,
-            //     ParseMode::Bytes,
-            //     config.args.buffer_size / 4,
-            // ).await?;
-            // 
-            // let realign_consensus_write_task = tokio::spawn(stream_to_file(
-            //     consensus_samtools_out_stream,
-            //     PathBuf::from(realign_consensus_path),
-            // ));
-            // cleanup_tasks.push(realign_consensus_write_task);
+            cleanup_tasks.push(realign_consensus_write_task);
             
         } // end tech == illumina
         Technology::ONT => {
@@ -730,62 +710,19 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     
     }
 
+    
     //*****************
     // Cleanup, hanging tasks
-
-
     
-    // let minimap2_status = host_minimap2_child.wait().await?;
-    // if minimap2_status.success() {
-    //     eprintln!("Minimap2 exited successfully");
-    // }
-    // else {
-    //     return Err(anyhow!("Minimap2 exited with non-zero status: {}", minimap2_status));
-    // }
-    //
-    // host_samtools_task_view.await??;
-    // host_samtools_err_task_view.await??;
-    // let samtools_status = host_samtools_child_view.wait().await?;
-    // if samtools_status.success() {
-    //     eprintln!("Samtools exited successfully");
-    // }
-    // else {
-    //     return Err(anyhow!("Samtools exited with non-zero status: {}", samtools_status));
-    // }
-
-
-
-
-
-
-
-    
-    // host_samtools_task_fastq.await??;
-    // host_samtools_err_task_fastq.await??;
-
-    // let host_samtools_task_fastq_status = host_samtools_child_fastq.wait().await?;
-    // if  host_samtools_task_fastq_status.success() {
-    //     eprintln!("Samtools fastq exited successfully");
-    // }
-    // else {
-    //     return Err(anyhow!("Samtools fastq exited with non-zero status: {}", host_samtools_task_fastq_status));
-    // }
-
-    // host_samtools_write_task.await??;
-
-
     let results = try_join_all(cleanup_tasks).await?;
     for result in results {
         result?; 
     }
-
     for receiver in cleanup_receivers {
         receiver.await??; 
     }
-    
     drop(temp_files);
-    
-    eprintln!("Finished generating consensus genome");
+    println!("Finished generating consensus genome");
     
     Ok(())
 }

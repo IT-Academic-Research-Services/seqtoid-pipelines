@@ -712,6 +712,7 @@ pub mod mafft {
                 true => args.threads,
                 false => num_cpus::get()-1,
             };
+            args_vec.push("--auto".to_string());
             args_vec.push("--thread".to_string());
             args_vec.push(num_cores.to_string());
             args_vec.push("-".to_string());
