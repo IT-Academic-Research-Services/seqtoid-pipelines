@@ -593,6 +593,30 @@ pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) ->
     Ok(lines)
 }
 
+
+pub async fn combine_streams(
+    streams: Vec<mpsc::Receiver<ParseOutput>>,
+    buffer_size: usize,
+) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
+
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let combined_task = tokio::spawn(async move {
+        for mut rx in streams {
+            eprintln!("stream");
+            while let Some(item) = rx.recv().await {
+                if tx.send(item).await.is_err() {
+                    return Err(anyhow!("Failed to send item to combined stream"));
+                }
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok((rx, combined_task))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

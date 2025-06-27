@@ -731,6 +731,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
         KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
         BCFTOOLS_TAG => Box::new(bcftools::BcftoolsArgGenerator),
+        MAFFT_TAG => Box::new(mafft::MafftArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
