@@ -637,7 +637,7 @@ pub mod muscle {
     pub async fn muscle_presence_check() -> anyhow::Result<String> {
 
         let args: Vec<&str> = vec!["-version"];
-        
+
         let mut child = Command::new(MUSCLE_TAG)
             .args(&args)
             .stdin(std::process::Stdio::piped())
@@ -667,12 +667,14 @@ pub mod muscle {
 pub mod mafft {
     use anyhow::anyhow;
     use tokio::process::Command;
+    use crate::cli::Arguments;
     use crate::config::defs::{MAFFT_TAG};
+    use crate::utils::command::ArgGenerator;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct MafftArgGenerator;
     pub async fn mafft_presence_check() -> anyhow::Result<String> {
-        
+
         let args: Vec<&str> = vec!["--version"];
 
         let mut child = Command::new(MAFFT_TAG)
@@ -700,6 +702,25 @@ pub mod mafft {
         }
         Ok(version)
     }
+
+
+    impl ArgGenerator for MafftArgGenerator {
+        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let mut args_vec: Vec<String> = Vec::new();
+
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push("--thread".to_string());
+            args_vec.push(num_cores.to_string());
+            args_vec.push("-".to_string());
+            
+            Ok(args_vec)
+        }
+    }
+    
+    
 }
 
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
