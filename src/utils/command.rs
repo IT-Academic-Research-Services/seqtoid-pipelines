@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG};
 use crate::cli::Arguments;
 
 
@@ -627,6 +627,43 @@ pub mod ivar {
     }
 }
 
+pub mod muscle {
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::config::defs::MUSCLE_TAG;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub struct MuscleArgGenerator;
+    pub async fn muscle_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["-version"];
+        
+        let mut child = Command::new(MUSCLE_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is muscle installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from muscle -version"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("Invalid muscle -versionoutput: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in muscle -version output: {}", first_line));
+        }
+        Ok(version)
+    }
+}
+
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -652,6 +689,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
         KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
         BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
         IVAR_TAG => ivar::ivar_presence_check().await,
+        MUSCLE_TAG => muscle::muscle_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
