@@ -255,7 +255,9 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
-    
+
+    let mut consensus_eval_ref_stream: Option<mpsc::Receiver<ParseOutput>> = None;  // This will be picked up by both the Illumina and Minion clauses and passed as nput to quast
+    let mut consensus_eval_bam_stream: Option<mpsc::Receiver<ParseOutput>> = None; 
     //*****************
     // Split by Technology
 
@@ -524,7 +526,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                3,
+                4,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -537,6 +539,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_output_stream = streams_iter.next().unwrap();
             let consensus_bam_file_stream = streams_iter.next().unwrap();
             let consensus_bam_call_stream = streams_iter.next().unwrap();
+            consensus_eval_bam_stream = Some(streams_iter.next().unwrap());
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -569,7 +572,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                2,
+                3,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -580,6 +583,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_streams.into_iter();
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
+            consensus_eval_ref_stream = Some(streams_iter.next().unwrap());
             
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_file_stream,
@@ -705,11 +709,30 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             
         } // end tech == illumina
         Technology::ONT => {
-            return Err(anyhow!("Minion not ready"));
+            consensus_eval_ref_stream = None;
+            consensus_eval_bam_stream = None;
+                return Err(anyhow!("Minion not ready"));
         }
     
     }
 
+
+    //*****************
+    // Assembly Evaluation
+
+
+    if let (Some(ref_stream), Some(bam_stream)) = (consensus_eval_ref_stream, consensus_eval_bam_stream) {
+        let ref_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_ref.fa"), "_");
+        let bam_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_bam.bam"), "_");
+
+        let ref_write_task = tokio::spawn(stream_to_file(ref_stream, ref_file_path));
+        let bam_write_task = tokio::spawn(stream_to_file(bam_stream, bam_file_path));
+
+        cleanup_tasks.push(ref_write_task);
+        cleanup_tasks.push(bam_write_task);
+    }
+
+    
     
     //*****************
     // Cleanup, hanging tasks
