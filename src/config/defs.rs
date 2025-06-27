@@ -11,6 +11,7 @@ pub const BCFTOOLS_TAG: &str = "bcftools";
 pub const KRAKEN2_TAG: &str = "kraken2";
 pub const IVAR_TAG: &str = "ivar";
 pub const MUSCLE_TAG: &str = "muscle";
+pub const MAFFT_TAG: &str = "mafft";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
