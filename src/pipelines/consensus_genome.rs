@@ -32,6 +32,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let cwd = config.cwd.clone();
     let ram_temp_dir = config.ram_temp_dir.clone();
+    let mut temp_files = Vec::new();
     
     // Initialize cleanup tasks
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -169,6 +170,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let (_host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
     let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
+    temp_files.push(host_ref_temp);
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
     cleanup_tasks.push(host_ref_write_task);
     
@@ -254,15 +256,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
-
-    //*****************
-    // Get Target sequence
-    let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-    let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
-    let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
-    let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), &target_ref_fasta_path, config.args.buffer_size).await?;
-    cleanup_tasks.push(target_ref_write_task);
-    
     
     
     //*****************
@@ -272,8 +265,14 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         Technology::Illumina => {
             eprintln!("Illumina");
             
-
-            
+            //*****************
+            // Get Target sequence
+            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
+            let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
+            temp_files.push(target_ref_temp);
+            let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), &target_ref_fasta_path, config.args.buffer_size).await?;
+            cleanup_tasks.push(target_ref_write_task);
             
             //*****************
             // ERCC
@@ -591,7 +590,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&call_bcftools_config_mpileup),
             )?;
-            eprintln!("{:?}", call_bcftools_args_mpileup);
             let (mut call_bcftools_child_mpileup, call_bcftools_task_mpileup, call_bcftools_err_task_mpileup) = stream_to_cmd(consensus_bam_call_stream, BCFTOOLS_TAG, call_bcftools_args_mpileup, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(call_bcftools_task_mpileup);
             cleanup_tasks.push(call_bcftools_err_task_mpileup);
@@ -618,7 +616,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&call_bcftools_config_call),
             )?;
-            eprintln!("{:?}", call_bcftools_args_call);
+
             let (mut call_bcftools_child_call, call_bcftools_task_call, call_bcftools_err_task_call) = stream_to_cmd(call_bcftools_out_stream_mpileup, BCFTOOLS_TAG, call_bcftools_args_call, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(call_bcftools_task_call);
             cleanup_tasks.push(call_bcftools_err_task_call);
@@ -644,7 +642,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&call_bcftools_config_view),
             )?;
-            eprintln!("{:?}", call_bcftools_args_view);
+
             let (mut call_bcftools_child_view, call_bcftools_task_view, call_bcftools_err_task_view) = stream_to_cmd(call_bcftools_out_stream_call, BCFTOOLS_TAG, call_bcftools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(call_bcftools_task_view);
             cleanup_tasks.push(call_bcftools_err_task_view);
@@ -723,7 +721,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         receiver.await??; 
     }
     
-    
+    drop(temp_files);
     
     eprintln!("Finished generating consensus genome");
     
