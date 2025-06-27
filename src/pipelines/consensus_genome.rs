@@ -13,9 +13,10 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
+use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
 use futures::future::try_join_all;
@@ -31,6 +32,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let cwd = config.cwd.clone();
     let ram_temp_dir = config.ram_temp_dir.clone();
+    let mut temp_files = Vec::new();
     
     // Initialize cleanup tasks
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -64,7 +66,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         },
     }
     if !file1_path.exists() {
-        return Err(anyhow!("Specficied file1 {:?} does not exist.", file1_path));
+        return Err(anyhow!("Specified file1 {:?} does not exist.", file1_path));
     }
 
     let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
@@ -114,14 +116,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     )
         .await?;
     
-    if val_streams.len() != 2 {
-        return Err(anyhow!("Expected exactly 2 streams, got {}", val_streams.len()));
-    }
     cleanup_receivers.push(val_done_rx);
 
     let mut streams_iter = val_streams.into_iter();
-    let val_fastp_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing fastp stream"))?;
-    let val_pigz_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    let val_fastp_stream = streams_iter.next().unwrap();
+    let val_pigz_stream = streams_iter.next().unwrap();
 
     //Pigz stream to intermediate file output
     let val_pigz_args = generate_cli(PIGZ_TAG, &config.args, None)?;
@@ -171,6 +170,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let (_host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
     let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
+    temp_files.push(host_ref_temp);
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
     cleanup_tasks.push(host_ref_write_task);
     
@@ -187,7 +187,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         ParseMode::Bytes,
         config.args.buffer_size / 4,
     ).await?;
-    
     
     let host_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
@@ -227,7 +226,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         ParseMode::Bytes,
         config.args.buffer_size / 4,
     ).await?;
-    let mut host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
+    let host_samtools_out_stream_fastq = ReceiverStream::new(host_samtools_out_stream_fastq);
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
     
@@ -243,15 +242,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         50,
     )
         .await?;
-    
-    if host_streams.len() != 2 {
-        return Err(anyhow!("Expected exactly 2 streams, got {}", host_streams.len()));
-    }
     cleanup_receivers.push(host_done_rx);
     
     let mut streams_iter = host_streams.into_iter();
-    let no_host_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-    let no_host_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+    let no_host_output_stream = streams_iter.next().unwrap();
+    let no_host_file_stream = streams_iter.next().unwrap();
     
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_file_stream,
@@ -260,6 +255,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_write_task);
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
+
     
     
     //*****************
@@ -274,9 +270,9 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
             let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
             let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
+            temp_files.push(target_ref_temp);
             let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), &target_ref_fasta_path, config.args.buffer_size).await?;
             cleanup_tasks.push(target_ref_write_task);
-            
             
             //*****************
             // ERCC
@@ -290,15 +286,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )
                 .await?;
             cleanup_receivers.push(ercc_done_rx);
-            if ercc_streams.len() != 2 {
-                return Err(anyhow!("Expected exactly 2 streams, got {}", ercc_streams.len()));
-            }
-    
+            
             let mut streams_iter = ercc_streams.into_iter();
-            let ercc_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc stream"))?;
-            let ercc_bypass_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing ercc bypass stream"))?;
+            let ercc_stream = streams_iter.next().unwrap();
+            let ercc_bypass_stream = streams_iter.next().unwrap();
             let ercc_stream = ReceiverStream::new(ercc_stream);
-    
             
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
             cleanup_tasks.push(ercc_query_write_task);
@@ -535,7 +527,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                2,
+                3,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -543,14 +535,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )
                 .await?;
             cleanup_receivers.push(consensus_bam_done_rx);
-
-            if consensus_bam_streams.len() != 2 {
-                return Err(anyhow!("Expected exactly 2 streams, got {}", consensus_bam_streams.len()));
-            }
-
+            
             let mut streams_iter = consensus_bam_streams.into_iter();
-            let consensus_bam_output_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing output stream"))?;
-            let consensus_bam_file_stream = streams_iter.next().ok_or_else(|| anyhow!("Missing file stream"))?;
+            let consensus_bam_output_stream = streams_iter.next().unwrap();
+            let consensus_bam_file_stream = streams_iter.next().unwrap();
+            let consensus_bam_call_stream = streams_iter.next().unwrap();
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -568,7 +557,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &config.args,
                 Some(&consensus_samtools_config),
             )?;
-
+            let consensus_file_path = file_path_manipulator(&PathBuf::from(&no_ext_sample_base_buf), &cwd.clone(), None, Some("consensus.fa"), "_");
             let (mut consensus_samtools_child, consensus_samtools_task_sort, consensus_samtools_err_task_sort) = stream_to_cmd(consensus_bam_output_stream, SAMTOOLS_TAG, consensus_samtools_args, StreamDataType::JustBytes, config.args.verbose).await?;
             cleanup_tasks.push(consensus_samtools_task_sort);
             cleanup_tasks.push(consensus_samtools_err_task_sort);
@@ -579,12 +568,98 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.buffer_size / 4,
             ).await?;
             
-            let test_write_task = tokio::spawn(stream_to_file(
+            let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_samtools_out_stream,
-                PathBuf::from("test_consensus.fa"),
+                consensus_file_path
             ));
-            // NB: this eventually goes to realign consensus
-            test_write_task.await??;
+            cleanup_tasks.push(consensus_fa_write_task);
+
+
+            //*****************
+            // Call Variants
+
+            let call_bcftools_config_mpileup = BcftoolsConfig {
+                subcommand: BcftoolsSubcommand::Mpileup,
+                subcommand_fields: HashMap::from([
+                    ("-f".to_string(), Some(target_ref_fasta_path.to_string_lossy().into_owned())),
+                    ("-".to_string(), None),
+                ])
+            };
+            let call_bcftools_args_mpileup = generate_cli(
+                BCFTOOLS_TAG,
+                &config.args,
+                Some(&call_bcftools_config_mpileup),
+            )?;
+            let (mut call_bcftools_child_mpileup, call_bcftools_task_mpileup, call_bcftools_err_task_mpileup) = stream_to_cmd(consensus_bam_call_stream, BCFTOOLS_TAG, call_bcftools_args_mpileup, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(call_bcftools_task_mpileup);
+            cleanup_tasks.push(call_bcftools_err_task_mpileup);
+            let call_bcftools_out_stream_mpileup = parse_child_output(
+                &mut call_bcftools_child_mpileup,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
+            
+
+            let call_bcftools_config_call = BcftoolsConfig {
+                subcommand: BcftoolsSubcommand::Call,
+                subcommand_fields: HashMap::from([
+                    ("--ploidy".to_string(), Some("1".to_string())),
+                    ("-m".to_string(), None),
+                    ("-v".to_string(), None),
+                    ("-P".to_string(), Some(config.args.bcftools_call_theta.to_string())),
+                    ("-".to_string(), None),
+                ])
+            };
+            let call_bcftools_args_call = generate_cli(
+                BCFTOOLS_TAG,
+                &config.args,
+                Some(&call_bcftools_config_call),
+            )?;
+
+            let (mut call_bcftools_child_call, call_bcftools_task_call, call_bcftools_err_task_call) = stream_to_cmd(call_bcftools_out_stream_mpileup, BCFTOOLS_TAG, call_bcftools_args_call, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(call_bcftools_task_call);
+            cleanup_tasks.push(call_bcftools_err_task_call);
+            let call_bcftools_out_stream_call = parse_child_output(
+                &mut call_bcftools_child_call,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
+
+            
+            let called_variants_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("called.vcf"), "_");
+            let call_bcftools_config_view = BcftoolsConfig {
+                subcommand: BcftoolsSubcommand::View,
+                subcommand_fields: HashMap::from([
+                    ("-i".to_string(), Some(format!("DP>={}", config.args.min_depth))),
+                    ("-O".to_string(), Some("v".to_string())),
+                    ("-".to_string(), None),
+                ])
+            };
+            let call_bcftools_args_view = generate_cli(
+                BCFTOOLS_TAG,
+                &config.args,
+                Some(&call_bcftools_config_view),
+            )?;
+
+            let (mut call_bcftools_child_view, call_bcftools_task_view, call_bcftools_err_task_view) = stream_to_cmd(call_bcftools_out_stream_call, BCFTOOLS_TAG, call_bcftools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
+            cleanup_tasks.push(call_bcftools_task_view);
+            cleanup_tasks.push(call_bcftools_err_task_view);
+            
+            let call_bcftools_out_stream_view = parse_child_output(
+                &mut call_bcftools_child_view,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?;
+            
+            let called_variants_write_task = tokio::spawn(stream_to_file(
+                call_bcftools_out_stream_view,
+                called_variants_path
+            ));
+            cleanup_tasks.push(called_variants_write_task);
+            
             
         } // end tech == illumina
         Technology::ONT => {
@@ -639,14 +714,14 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let results = try_join_all(cleanup_tasks).await?;
     for result in results {
-        result?; // Propagate inner Result errors
+        result?; 
     }
 
     for receiver in cleanup_receivers {
         receiver.await??; 
     }
     
-    
+    drop(temp_files);
     
     eprintln!("Finished generating consensus genome");
     

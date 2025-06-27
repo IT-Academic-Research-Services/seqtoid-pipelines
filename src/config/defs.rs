@@ -26,7 +26,8 @@ pub enum SamtoolsSubcommand {
 pub enum BcftoolsSubcommand {
     Call,
     Consensus,
-    Mpileup
+    Mpileup,
+    View
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
