@@ -38,6 +38,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Initialize cleanup tasks
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let mut quast_write_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     
     //External tools check
     let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, QUAST_TAG]).await?;
@@ -255,12 +256,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_write_task);
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
-
-
-    // These will be picked up by both the Illumina and Minion clauses and passed as input to quast
-    let mut consensus_eval_stream: Option<mpsc::Receiver<ParseOutput>> = None;  // consensus sequence as FASTA
-    let mut consensus_eval_bam_stream: Option<mpsc::Receiver<ParseOutput>> = None;  // BAM aligned to target reference
-    let mut consensus_eval_fastq_stream: Option<mpsc::Receiver<ParseOutput>> = None;
+    
     //*****************
     // Split by Technology
 
@@ -491,28 +487,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             }
 
-            //Split stream, one for aligning reads, the other to pass to assembly evaluaiton
-            let (filter_out_streams, filter_out_done_rx) = t_junction(
-                filter_reads_out_stream,
-                2,
-                config.args.buffer_size,
-                config.args.stall_threshold.try_into().unwrap(),
-                Some(config.args.stream_sleep_ms),
-                50,
-            )
-                .await?;
-            cleanup_receivers.push(filter_out_done_rx);
-            let mut streams_iter = filter_out_streams.into_iter();
-            let filter_reads_align_stream = streams_iter.next().unwrap();
-            consensus_eval_fastq_stream = Some(streams_iter.next().unwrap());
-
-            let filter_reads_align_stream = ReceiverStream::new(filter_reads_align_stream);
-    
+            
             //*****************
             // Align Reads to Target
             
-            let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_align_stream, None).await?;
-            cleanup_tasks.push(align_query_write_task);
+            let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
+            quast_write_tasks.push(align_query_write_task);
 
             let align_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(target_ref_fasta_path.clone(), align_query_pipe_path)))?;
             let (mut align_minimap2_child,  align_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, align_minimap2_args, config.args.verbose).await?;
@@ -553,7 +533,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Split stream for BAM writing
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                4,
+                3,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -566,13 +546,14 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_output_stream = streams_iter.next().unwrap();
             let consensus_bam_file_stream = streams_iter.next().unwrap();
             let consensus_bam_call_stream = streams_iter.next().unwrap();
-            consensus_eval_bam_stream = Some(streams_iter.next().unwrap());
+
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
                 PathBuf::from(align_bam_path),
             ));
-            cleanup_tasks.push(consensus_bam_write_task);
+
+            quast_write_tasks.push(consensus_bam_write_task);
 
 
             let consensus_samtools_config = SamtoolsConfig {
@@ -599,7 +580,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                3,
+                2,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -610,13 +591,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_streams.into_iter();
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
-            consensus_eval_stream = Some(streams_iter.next().unwrap());
             
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_file_stream,
                 consensus_file_path
             ));
-            cleanup_tasks.push(consensus_fa_write_task);
+            quast_write_tasks.push(consensus_fa_write_task);
 
 
             //*****************
@@ -736,8 +716,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             
         } // end tech == illumina
         Technology::ONT => {
-            consensus_eval_stream = None;
-            consensus_eval_bam_stream = None;
                 return Err(anyhow!("Minion not ready"));
         }
     
@@ -747,20 +725,15 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Assembly Evaluation
 
+    //check if assembly is empty
 
-    if let (Some(ref_stream), Some(bam_stream), Some(fastq_stream)) = (consensus_eval_stream, consensus_eval_bam_stream, consensus_eval_fastq_stream) {
-        let ref_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_ref.fa"), "_");
-        let bam_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_bam.bam"), "_");
-        let fastq_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_bam.fq"), "_");
-
-        let ref_write_task = tokio::spawn(stream_to_file(ref_stream, ref_file_path));
-        let bam_write_task = tokio::spawn(stream_to_file(bam_stream, bam_file_path));
-        let fastq_write_task = tokio::spawn(stream_to_file(fastq_stream, fastq_file_path));
-
-        cleanup_tasks.push(ref_write_task);
-        cleanup_tasks.push(bam_write_task);
-        cleanup_tasks.push(fastq_write_task);
+    // force all input file streams to await
+    let results = try_join_all(quast_write_tasks).await?;
+    for result in results {
+        result?;
     }
+    
+
 
     
     
