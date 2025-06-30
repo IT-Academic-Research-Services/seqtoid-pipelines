@@ -12,6 +12,7 @@ pub const KRAKEN2_TAG: &str = "kraken2";
 pub const IVAR_TAG: &str = "ivar";
 pub const MUSCLE_TAG: &str = "muscle";
 pub const MAFFT_TAG: &str = "mafft";
+pub const QUAST_TAG: &str = "quast.py";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {

@@ -3,8 +3,18 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG};
 use crate::cli::Arguments;
+use lazy_static::lazy_static;
+
+
+lazy_static! {
+    static ref MIN_VERSIONS: HashMap<&'static str, &'static f64> = {
+        let mut m = HashMap::new();
+        m.insert(FASTP_TAG, &1.0);
+        m
+    };
+}
 
 
 pub trait ArgGenerator {
@@ -721,7 +731,45 @@ pub mod mafft {
         }
     }
     
-    
+}
+
+pub mod quast {
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::config::defs::QUAST_TAG;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub struct QuastArgGenerator;
+
+    pub async fn quast_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["-v"];
+
+        let mut child = Command::new(QUAST_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is quast installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from quast -v"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("Invalid quast -v output: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in quast -v output: {}", first_line));
+        }
+        Ok(version)
+    }
 }
 
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
@@ -752,6 +800,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
         IVAR_TAG => ivar::ivar_presence_check().await,
         MUSCLE_TAG => muscle::muscle_presence_check().await,
         MAFFT_TAG => mafft::mafft_presence_check().await,
+        QUAST_TAG => quast::quast_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
