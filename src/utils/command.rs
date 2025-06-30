@@ -552,7 +552,7 @@ pub mod bcftools {
             // args_vec.push("--memory-mapping".to_string());
             // args_vec.push("--gzip-compressed".to_string());
 
-            args_vec.push(config.fastq_path.to_string_lossy().to_string()); // input, should be a mkfifo
+            args_vec.push(config.fastq_path.to_string_lossy().to_string()); 
 
             Ok(args_vec)
         }
@@ -734,15 +734,22 @@ pub mod mafft {
 }
 
 pub mod quast {
+
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
     use crate::config::defs::QUAST_TAG;
     use crate::utils::command::ArgGenerator;
-    use crate::utils::command::mafft::MafftArgGenerator;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct QuastArgGenerator;
+
+    pub struct QuastConfig {
+        pub ref_fasta: String,
+        pub ref_bam: String,
+        pub fastq: String,
+        pub assembly_fasta: String,
+    }
 
     pub async fn quast_presence_check() -> anyhow::Result<String> {
 
@@ -775,7 +782,11 @@ pub mod quast {
     }
 
     impl ArgGenerator for QuastArgGenerator {
-        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<QuastConfig>())
+                .ok_or_else(|| anyhow!("Quast requires a QuastConfig as extra argument"))?;
+            
             let mut args_vec: Vec<String> = Vec::new();
 
             let num_cores: usize = match args.limit_align_threads {
