@@ -257,8 +257,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
 
-    let mut consensus_eval_ref_stream: Option<mpsc::Receiver<ParseOutput>> = None;  // This will be picked up by both the Illumina and Minion clauses and passed as nput to quast
-    let mut consensus_eval_bam_stream: Option<mpsc::Receiver<ParseOutput>> = None; 
+    // These will be picked up by both the Illumina and Minion clauses and passed as input to quast
+    let mut consensus_eval_stream: Option<mpsc::Receiver<ParseOutput>> = None;  // consensus sequence as FASTA
+    let mut consensus_eval_bam_stream: Option<mpsc::Receiver<ParseOutput>> = None;  // BAM aligned to target reference
+    let mut consensus_eval_fastq_stream: Option<mpsc::Receiver<ParseOutput>> = None;
     //*****************
     // Split by Technology
 
@@ -488,12 +490,28 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
 
             }
-    
+
+            //Split stream, one for aligning reads, the other to pass to assembly evaluaiton
+            let (filter_out_streams, filter_out_done_rx) = t_junction(
+                filter_reads_out_stream,
+                2,
+                config.args.buffer_size,
+                config.args.stall_threshold.try_into().unwrap(),
+                Some(config.args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+            cleanup_receivers.push(filter_out_done_rx);
+            let mut streams_iter = filter_out_streams.into_iter();
+            let filter_reads_align_stream = streams_iter.next().unwrap();
+            consensus_eval_fastq_stream = Some(streams_iter.next().unwrap());
+
+            let filter_reads_align_stream = ReceiverStream::new(filter_reads_align_stream);
     
             //*****************
             // Align Reads to Target
             
-            let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_out_stream, None).await?;
+            let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(filter_reads_align_stream, None).await?;
             cleanup_tasks.push(align_query_write_task);
 
             let align_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(target_ref_fasta_path.clone(), align_query_pipe_path)))?;
@@ -592,7 +610,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_streams.into_iter();
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
-            consensus_eval_ref_stream = Some(streams_iter.next().unwrap());
+            consensus_eval_stream = Some(streams_iter.next().unwrap());
             
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_file_stream,
@@ -718,7 +736,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             
         } // end tech == illumina
         Technology::ONT => {
-            consensus_eval_ref_stream = None;
+            consensus_eval_stream = None;
             consensus_eval_bam_stream = None;
                 return Err(anyhow!("Minion not ready"));
         }
@@ -730,15 +748,18 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Assembly Evaluation
 
 
-    if let (Some(ref_stream), Some(bam_stream)) = (consensus_eval_ref_stream, consensus_eval_bam_stream) {
+    if let (Some(ref_stream), Some(bam_stream), Some(fastq_stream)) = (consensus_eval_stream, consensus_eval_bam_stream, consensus_eval_fastq_stream) {
         let ref_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_ref.fa"), "_");
         let bam_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_bam.bam"), "_");
+        let fastq_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd, None, Some("consensus_eval_bam.fq"), "_");
 
         let ref_write_task = tokio::spawn(stream_to_file(ref_stream, ref_file_path));
         let bam_write_task = tokio::spawn(stream_to_file(bam_stream, bam_file_path));
+        let fastq_write_task = tokio::spawn(stream_to_file(fastq_stream, fastq_file_path));
 
         cleanup_tasks.push(ref_write_task);
         cleanup_tasks.push(bam_write_task);
+        cleanup_tasks.push(fastq_write_task);
     }
 
     
