@@ -8,7 +8,7 @@ use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::cli::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use crate::utils::sequence::{DNA, normal_phred_qual_string};
+use crate::utils::sequence::{DNA, normal_phred_qual_string, valid_bases}; 
 use futures::Stream;
 use tokio_stream::{self as stream};
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
@@ -114,6 +114,15 @@ impl From<FastqOwnedRecord> for SequenceRecord {
 pub enum SequenceReader {
     Fasta(FastaReader<FileReader>),
     Fastq(FastqReader<FileReader>),
+}
+
+
+pub fn validate_sequence(seq: &[u8], valid_bases: &[u8]) -> Result<(), String> {
+    if seq.iter().all(|&b| valid_bases.contains(&b)) {
+        Ok(())
+    } else {
+        Err("Invalid nucleotide found in sequence".to_string())
+    }
 }
 
 /// Creates a SequenceReader for either FASTA or FASTQ files.

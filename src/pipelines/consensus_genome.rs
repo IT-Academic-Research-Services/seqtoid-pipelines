@@ -11,9 +11,10 @@ use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG};
+use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
@@ -268,6 +269,14 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             //*****************
             // Get Target sequence
             let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            
+            // let filter_align_seq = if validate_sequence(&filter_align_seq, DNA_WITH_N).is_ok() {
+            //     filter_align_seq
+            // } else {
+            //     return Err(anyhow!("Invalid target reference sequence: contains non-nucleotide base"));
+            // };
+            // eprintln!("Filter align: {:?}", filter_align_seq);
+            
             let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
             let target_ref_fasta_path =  target_ref_temp.path().to_path_buf();
             temp_files.push(target_ref_temp);

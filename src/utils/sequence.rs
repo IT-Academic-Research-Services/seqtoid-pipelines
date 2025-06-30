@@ -53,6 +53,15 @@ impl DNA {
     }
 }
 
+
+pub mod valid_bases {
+    /// Valid DNA nucleotide bases in ASCII: A, C, G, T, a, c, g, t
+    pub const DNA: &[u8] = &[65, 67, 71, 84, 97, 99, 103, 116];
+
+    /// Valid DNA nucleotide bases including 'N' in ASCII: A, C, G, T, N, a, c, g, t, n
+    pub const DNA_WITH_N: &[u8] = &[65, 67, 71, 84, 78, 97, 99, 103, 116, 110];
+}
+
 fn phred33(score: u8) -> u8 {
     score + 33
 }
