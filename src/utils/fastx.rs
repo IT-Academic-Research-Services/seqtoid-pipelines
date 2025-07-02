@@ -46,10 +46,12 @@ lazy_static! {
 
 #[derive(Debug)]
 pub struct AssemblyMetrics {
+    pub num_contigs: usize,                    // Total number of contigs
     pub contig_counts: BTreeMap<usize, usize>, // Threshold -> Count of contigs >= threshold
-    pub total_length: usize,
-    pub largest_contig: usize,
-    pub n50: usize,
+    pub total_lengths: BTreeMap<usize, usize>, // Threshold -> Total length of contigs >= threshold
+    pub total_length: usize,                   // Total length of all contigs
+    pub largest_contig: usize,                 // Length of the largest contig
+    pub n50: usize,                            // N50 statistic
 }
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
@@ -696,6 +698,14 @@ pub fn parse_and_filter_fastq_id(
 }
 
 
+/// Computes the QUAST-like metrics for a FASTA file
+///
+/// # Arguments
+/// * `rx` - Receiver of SeqeunceRecord::FAsta
+/// * `buffer_size` - Size of the output channel buffer.
+///
+/// # Returns
+/// Result<AssemblyMetrics>
 pub async fn compute_assembly_metrics(
     mut rx: mpsc::Receiver<SequenceRecord>,
     thresholds: &[usize],
@@ -713,15 +723,20 @@ pub async fn compute_assembly_metrics(
             }
         }
     }
-    
+
+    // Compute metrics
+    let num_contigs = contig_lengths.len(); // Total number of contigs
+    let total_length: usize = contig_lengths.iter().sum(); // Total length of all contigs
+    let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0); // Largest contig length
+
+    // Compute counts and total lengths per threshold
     let mut contig_counts = BTreeMap::new();
+    let mut total_lengths = BTreeMap::new();
     for &threshold in thresholds {
-        let count = contig_lengths.iter().filter(|&&len| len >= threshold).count();
-        contig_counts.insert(threshold, count);
+        let filtered_lengths: Vec<_> = contig_lengths.iter().filter(|&&len| len >= threshold).cloned().collect();
+        contig_counts.insert(threshold, filtered_lengths.len());
+        total_lengths.insert(threshold, filtered_lengths.iter().sum());
     }
-    
-    let total_length: usize = contig_lengths.iter().sum();
-    let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0);
 
     // Compute N50
     let n50 = if !contig_lengths.is_empty() {
@@ -737,7 +752,9 @@ pub async fn compute_assembly_metrics(
     };
 
     Ok(AssemblyMetrics {
+        num_contigs,
         contig_counts,
+        total_lengths,
         total_length,
         largest_contig,
         n50,
