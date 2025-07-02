@@ -673,7 +673,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_samtools_out_stream = parse_child_output(
                 &mut consensus_samtools_child,
                 ChildStream::Stdout,
-                ParseMode::Bytes,
+                ParseMode::Fasta,
                 config.args.buffer_size / 4,
             ).await?;
 
@@ -875,7 +875,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Assembly Evaluation
     
-    
+
     //*****************
     // Cleanup, hanging tasks
     let results = try_join_all(cleanup_tasks).await?;
