@@ -11,8 +11,8 @@ use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, compute_assembly_metrics, CONTIG_THRESHOLDS};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, convert_stream};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -681,7 +681,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                2,
+                3,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -692,7 +692,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_streams.into_iter();
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
+            let consensus_stats_stream = streams_iter.next().unwrap();
 
+            let (stats_rx, stats_task) = convert_stream(consensus_stats_stream, config.args.buffer_size / 4).await?;
+            let assembly_metrics = compute_assembly_metrics(stats_rx, &CONTIG_THRESHOLDS).await?;
+            cleanup_tasks.push(stats_task);
+            
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_file_stream,
                 consensus_file_path.as_ref().unwrap().clone()

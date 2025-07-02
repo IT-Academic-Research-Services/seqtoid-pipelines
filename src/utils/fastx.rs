@@ -41,7 +41,7 @@ lazy_static! {
 
 /// Define size of contig thresholds to mimic what Quast does
 lazy_static! {
-    static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
+    pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
 }
 
 #[derive(Debug)]

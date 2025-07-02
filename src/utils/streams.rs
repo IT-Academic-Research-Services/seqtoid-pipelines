@@ -502,7 +502,7 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
 /// # Arguments
 ///
 /// * `reader` - reading stream
-/// * `buffer_size` - stream buffer size 
+/// * `buffer_size` - stream buffer size
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
@@ -704,6 +704,35 @@ pub async fn y_junction(
     Ok((rx, combined_task))
 }
 
+
+pub async fn convert_stream(
+    rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+) -> Result<(mpsc::Receiver<SequenceRecord>, JoinHandle<Result<(), anyhow::Error>>)> {
+    let (stats_tx, stats_rx) = mpsc::channel(buffer_size);
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(rx);
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Fasta(record) = item {
+                match record {
+                    SequenceRecord::Fasta { .. } => {
+                        if stats_tx.send(record).await.is_err() {
+                            eprintln!("Failed to send FASTA record to stats");
+                            return Err(anyhow::anyhow!("Failed to send FASTA record"));
+                        }
+                    }
+                    SequenceRecord::Fastq { .. } => {
+                        eprintln!("Unexpected FASTQ record in consensus_stats_stream");
+                    }
+                }
+            } else {
+                eprintln!("Unexpected non-FASTA item in stream");
+            }
+        }
+        Ok(())
+    });
+    Ok((stats_rx, task))
+}
 
 #[cfg(test)]
 mod tests {
