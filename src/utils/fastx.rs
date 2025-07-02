@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::streams::{ParseOutput};
 use tokio::time::Duration;
+use std::collections::BTreeMap;
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -36,6 +37,19 @@ lazy_static! {
         m.insert("read1", "read2");
         m
     };
+}
+
+/// Define size of contig thresholds to mimic what Quast does
+lazy_static! {
+    static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
+}
+
+#[derive(Debug)]
+pub struct AssemblyMetrics {
+    pub contig_counts: BTreeMap<usize, usize>, // Threshold -> Count of contigs >= threshold
+    pub total_length: usize,
+    pub largest_contig: usize,
+    pub n50: usize,
 }
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
@@ -679,6 +693,55 @@ pub fn parse_and_filter_fastq_id(
     });
 
     (filtered_rx, task)
+}
+
+
+pub async fn compute_assembly_metrics(
+    mut rx: mpsc::Receiver<SequenceRecord>,
+    thresholds: &[usize],
+) -> Result<AssemblyMetrics> {
+    let mut contig_lengths = Vec::new();
+
+    // Collect lengths of all contigs from the stream
+    while let Some(record) = rx.recv().await {
+        match record {
+            SequenceRecord::Fasta { seq, .. } => {
+                contig_lengths.push(seq.len());
+            }
+            SequenceRecord::Fastq { .. } => {
+                return Err(anyhow::anyhow!("Expected FASTA record, got FASTQ"));
+            }
+        }
+    }
+    
+    let mut contig_counts = BTreeMap::new();
+    for &threshold in thresholds {
+        let count = contig_lengths.iter().filter(|&&len| len >= threshold).count();
+        contig_counts.insert(threshold, count);
+    }
+    
+    let total_length: usize = contig_lengths.iter().sum();
+    let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0);
+
+    // Compute N50
+    let n50 = if !contig_lengths.is_empty() {
+        contig_lengths.sort_by(|a, b| b.cmp(a)); // Sort descending
+        let half_total = total_length / 2;
+        let mut sum = 0;
+        *contig_lengths.iter().find(|&&len| {
+            sum += len;
+            sum >= half_total
+        }).unwrap_or(&0)
+    } else {
+        0
+    };
+
+    Ok(AssemblyMetrics {
+        contig_counts,
+        total_length,
+        largest_contig,
+        n50,
+    })
 }
 
 #[cfg(test)]
