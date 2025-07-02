@@ -63,6 +63,7 @@ impl ToBytes for ParseOutput {
     fn to_bytes(&self) -> Result<Vec<u8>> {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
+            ParseOutput::Fasta(record) => record.to_bytes(),
             ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
         }
     }
@@ -84,6 +85,7 @@ pub enum ParseMode {
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
     Fastq(SequenceRecord),
+    Fasta(SequenceRecord),
     Bytes(Vec<u8>),
 }
 
@@ -528,7 +530,10 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                         desc: current_desc.take(),
                         seq: current_seq.clone(),
                     };
-                    tx.send(ParseOutput::Fastq(record)).await.unwrap();
+                    if tx.send(ParseOutput::Fasta(record)).await.is_err() {
+                        eprintln!("No active receivers for FASTA record");
+                        break;
+                    }
                     current_seq.clear();
                 }
                 let (id, desc) = parse_header(line.as_bytes(), '>');
@@ -545,7 +550,9 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                 desc: current_desc.take(),
                 seq: current_seq,
             };
-            tx.send(ParseOutput::Fastq(record)).await.unwrap();
+            if tx.send(ParseOutput::Fasta(record)).await.is_err() {
+                eprintln!("No active receivers for FASTA record");
+            }
         }
     });
     Ok(rx)
@@ -610,6 +617,10 @@ pub async fn stream_to_file(rx: mpsc::Receiver<ParseOutput>, path: PathBuf) -> R
                 let bytes = record.to_bytes()?;
                 writer.write_all(&bytes).await?;
             }
+            ParseOutput::Fasta(record) => {
+                let bytes = record.to_bytes()?;
+                writer.write_all(&bytes).await?;
+            }
             ParseOutput::Bytes(bytes) => {
                 writer.write_all(&bytes).await?;
             }
@@ -646,6 +657,9 @@ pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) ->
                 }
             }
             ParseOutput::Fastq(_) => {
+                return Err(anyhow!("Unexpected Fastq record when parsing bytes"));
+            }
+            ParseOutput::Fasta(_) => {
                 return Err(anyhow!("Unexpected Fastq record when parsing bytes"));
             }
         }
