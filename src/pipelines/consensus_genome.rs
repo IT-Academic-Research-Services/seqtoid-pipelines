@@ -510,16 +510,48 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                             break;
                         }
                     }
-                    Ok::<(), anyhow::Error>(()) // Ensure task returns Result for error handling
+                    Ok::<(), anyhow::Error>(())
                 });
 
                 filter_reads_out_stream = ReceiverStream::new(parse_output_rx);
             }
 
+
+            let align_fastq_path = file_path_manipulator(
+                &PathBuf::from(&no_ext_sample_base_buf),
+                &cwd.clone(),
+                None,
+                Some("filtered.fq"),
+                "_"
+            );
+
+            let (align_streams, align_done_rx) = t_junction(
+                filter_reads_out_stream,
+                2,
+                config.args.buffer_size,
+                config.args.stall_threshold.try_into().unwrap(),
+                Some(config.args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+            cleanup_receivers.push(align_done_rx);
+
+            let mut streams_iter = align_streams.into_iter();
+            let align_query_stream = streams_iter.next().unwrap();
+            let align_file_stream = streams_iter.next().unwrap();
+            let align_query_stream = ReceiverStream::new(align_query_stream);
+
+            let align_file_write_task = tokio::spawn(stream_to_file(
+                align_file_stream,
+                align_fastq_path.clone(),
+            ));
+            cleanup_tasks.push(align_file_write_task);
+
+
             //*****************
             // Align Reads to Target
             let (align_query_write_task, align_query_pipe_path_temp) = write_parse_output_to_temp(
-                filter_reads_out_stream,
+                align_query_stream,
                 None
             ).await?;
             align_query_pipe_path = Some(align_query_pipe_path_temp.clone());
