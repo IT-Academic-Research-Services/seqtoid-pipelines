@@ -298,7 +298,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
 /// # Returns
 /// Tuple: (id, desc) split of header on whitespace.
 ///
-fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
+pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     let head_str = String::from_utf8_lossy(head).into_owned();
     let parts: Vec<&str> = head_str.splitn(2, |c: char| c.is_whitespace()).collect();
     let id = parts[0].trim_start_matches(prefix).to_string();

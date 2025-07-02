@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::fastx::SequenceRecord;
+use crate::utils::fastx::{SequenceRecord, parse_header};
 use tokio::task::JoinHandle;
 
 // Enum to specify the data type for tuning batch sizes
@@ -77,6 +77,7 @@ pub enum ChildStream {
 #[derive(Clone, Copy, Debug)]
 pub enum ParseMode {
     Fastq,
+    Fasta,
     Bytes,
 }
 
@@ -367,6 +368,14 @@ pub async fn parse_child_output(
                 .ok_or_else(|| anyhow!("Child stderr not available"))?;
             parse_fastq(stderr, buffer_size).await
         }
+        (ChildStream::Stdout, ParseMode::Fasta) => {
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_fasta(stdout, buffer_size).await
+        }
+        (ChildStream::Stderr, ParseMode::Fasta) => {
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_fasta(stderr, buffer_size).await
+        }
         (ChildStream::Stdout, ParseMode::Bytes) => {
             let stdout = child
                 .stdout
@@ -482,6 +491,63 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
         
     });
 
+    Ok(rx)
+}
+
+
+/// Helper function to parse FASTA data
+///
+/// # Arguments
+///
+/// * `reader` - reading stream
+/// * `buffer_size` - stream buffer size 
+///
+/// # Returns
+/// Result<mpsc::Receiver<ParseOutput>>
+pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    buffer_size: usize,
+) -> Result<mpsc::Receiver<ParseOutput>> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+    let mut buffer = String::new();
+    let mut current_id = None;
+    let mut current_desc = None;
+    let mut current_seq = Vec::new();
+
+    tokio::spawn(async move {
+        while reader.read_line(&mut buffer).await.is_ok() {
+            let line = buffer.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with('>') {
+                if let Some(id) = current_id.take() {
+                    let record = SequenceRecord::Fasta {
+                        id,
+                        desc: current_desc.take(),
+                        seq: current_seq.clone(),
+                    };
+                    tx.send(ParseOutput::Fastq(record)).await.unwrap();
+                    current_seq.clear();
+                }
+                let (id, desc) = parse_header(line.as_bytes(), '>');
+                current_id = Some(id);
+                current_desc = desc;
+            } else if current_id.is_some() {
+                current_seq.extend_from_slice(line.as_bytes());
+            }
+            buffer.clear();
+        }
+        if let Some(id) = current_id.take() {
+            let record = SequenceRecord::Fasta {
+                id,
+                desc: current_desc.take(),
+                seq: current_seq,
+            };
+            tx.send(ParseOutput::Fastq(record)).await.unwrap();
+        }
+    });
     Ok(rx)
 }
 
