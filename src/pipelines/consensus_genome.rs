@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::Instant;
 use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc::Receiver;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, compute_assembly_metrics, compute_reference_metrics, CONTIG_THRESHOLDS};
@@ -251,6 +252,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut align_bam_path: Option<PathBuf> = None;
     let mut align_query_pipe_path: Option<PathBuf> = None;
     let mut consensus_file_path: Option<PathBuf> = None;
+    let mut consensus_stats_stream : Option<Receiver<ParseOutput>>  = None;
 
     //*****************
     // Split by Technology
@@ -692,15 +694,9 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_streams.into_iter();
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
-            let consensus_stats_stream = streams_iter.next().unwrap();
+            consensus_stats_stream = Some(streams_iter.next().unwrap());
 
-            // TODO move this downstream
-            let (stats_rx, stats_task) = convert_stream(consensus_stats_stream, config.args.buffer_size / 4).await?;
-            let assembly_metrics = compute_assembly_metrics(stats_rx, &CONTIG_THRESHOLDS).await?;
-            eprintln!("{:?}", assembly_metrics);
-            cleanup_tasks.push(stats_task);
 
-            
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_file_stream,
                 consensus_file_path.as_ref().unwrap().clone()
@@ -884,8 +880,22 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Assembly Evaluation
 
 
+    let assembly_metrics = match consensus_stats_stream {
+        Some(stream) => {
+            let (stats_rx, stats_task) = convert_stream(stream, config.args.buffer_size / 4).await?;
+            cleanup_tasks.push(stats_task);
+            compute_assembly_metrics(stats_rx, &CONTIG_THRESHOLDS).await?
+        }
+        None => {
+            return Err(anyhow!("Consensus stats stream not available for assembly metrics"));
+        }
+    };
+
+    eprintln!("{:?}", assembly_metrics);
+    // cleanup_tasks.push(stats_task);
+
     let reference_metrics = compute_reference_metrics(target_ref_fasta_path.as_ref().unwrap()).await?;
-    // eprintln!("{:?}", reference_metrics);
+    eprintln!("{:?}", reference_metrics);
 
     //*****************
     // Cleanup, hanging tasks
