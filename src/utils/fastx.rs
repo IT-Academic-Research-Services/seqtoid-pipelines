@@ -52,6 +52,10 @@ pub struct AssemblyMetrics {
     pub total_length: usize,                   // Total length of all contigs
     pub largest_contig: usize,                 // Length of the largest contig
     pub n50: usize,                            // N50 statistic
+    pub n75: usize,                            // N75 statistic
+    pub l50: usize,                            // L50 statistic
+    pub l75: usize,                            // L75 statistic
+    pub gc_percent: f64,                       // GC percentage
 }
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
@@ -711,12 +715,17 @@ pub async fn compute_assembly_metrics(
     thresholds: &[usize],
 ) -> Result<AssemblyMetrics> {
     let mut contig_lengths = Vec::new();
+    let mut total_gc = 0;
+    let mut total_bases = 0;
 
-    // Collect lengths of all contigs from the stream
+    // Collect lengths and GC content from the stream
     while let Some(record) = rx.recv().await {
         match record {
             SequenceRecord::Fasta { seq, .. } => {
-                contig_lengths.push(seq.len());
+                let len = seq.len();
+                contig_lengths.push(len);
+                total_bases += len;
+                total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
             }
             SequenceRecord::Fastq { .. } => {
                 return Err(anyhow::anyhow!("Expected FASTA record, got FASTQ"));
@@ -728,6 +737,11 @@ pub async fn compute_assembly_metrics(
     let num_contigs = contig_lengths.len(); // Total number of contigs
     let total_length: usize = contig_lengths.iter().sum(); // Total length of all contigs
     let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0); // Largest contig length
+    let gc_percent = if total_bases > 0 {
+        (total_gc as f64 / total_bases as f64) * 100.0
+    } else {
+        0.0
+    };
 
     // Compute counts and total lengths per threshold
     let mut contig_counts = BTreeMap::new();
@@ -738,17 +752,45 @@ pub async fn compute_assembly_metrics(
         total_lengths.insert(threshold, filtered_lengths.iter().sum());
     }
 
-    // Compute N50
-    let n50 = if !contig_lengths.is_empty() {
-        contig_lengths.sort_by(|a, b| b.cmp(a)); // Sort descending
+    // Sort lengths descending for N50, N75, L50, L75
+    contig_lengths.sort_by(|a, b| b.cmp(a));
+
+    // Compute N50 and L50
+    let (n50, l50) = if !contig_lengths.is_empty() {
         let half_total = total_length / 2;
         let mut sum = 0;
-        *contig_lengths.iter().find(|&&len| {
+        let mut n50_len = 0;
+        let mut l50 = 0;
+        for (i, &len) in contig_lengths.iter().enumerate() {
             sum += len;
-            sum >= half_total
-        }).unwrap_or(&0)
+            l50 = i + 1;
+            if sum >= half_total {
+                n50_len = len;
+                break;
+            }
+        }
+        (n50_len, l50)
     } else {
-        0
+        (0, 0)
+    };
+
+    // Compute N75 and L75
+    let (n75, l75) = if !contig_lengths.is_empty() {
+        let three_quarter_total = total_length * 3 / 4;
+        let mut sum = 0;
+        let mut n75_len = 0;
+        let mut l75 = 0;
+        for (i, &len) in contig_lengths.iter().enumerate() {
+            sum += len;
+            l75 = i + 1;
+            if sum >= three_quarter_total {
+                n75_len = len;
+                break;
+            }
+        }
+        (n75_len, l75)
+    } else {
+        (0, 0)
     };
 
     Ok(AssemblyMetrics {
@@ -758,6 +800,10 @@ pub async fn compute_assembly_metrics(
         total_length,
         largest_contig,
         n50,
+        n75,
+        l50,
+        l75,
+        gc_percent,
     })
 }
 
