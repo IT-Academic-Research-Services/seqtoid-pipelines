@@ -11,7 +11,7 @@ use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, compute_assembly_metrics, CONTIG_THRESHOLDS};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, compute_assembly_metrics, compute_reference_metrics, CONTIG_THRESHOLDS};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, convert_stream};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
@@ -261,7 +261,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             //*****************
             // Get Target sequence
             let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
-            let target_ref_temp = NamedTempFile::new_in(&config.ram_temp_dir)?;
+            let target_ref_temp = NamedTempFile::with_suffix_in(".fasta", &config.ram_temp_dir)?;
             target_ref_fasta_path = Some(target_ref_temp.path().to_path_buf());
             temp_files.push(target_ref_temp);
             let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), target_ref_fasta_path.as_ref().unwrap(), config.args.buffer_size).await?;
@@ -694,9 +694,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_realign_stream = streams_iter.next().unwrap();
             let consensus_stats_stream = streams_iter.next().unwrap();
 
+            // TODO move this downstream
             let (stats_rx, stats_task) = convert_stream(consensus_stats_stream, config.args.buffer_size / 4).await?;
             let assembly_metrics = compute_assembly_metrics(stats_rx, &CONTIG_THRESHOLDS).await?;
+            eprintln!("{:?}", assembly_metrics);
             cleanup_tasks.push(stats_task);
+
             
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
                 consensus_file_stream,
@@ -879,7 +882,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     //*****************
     // Assembly Evaluation
-    
+
+
+    let reference_metrics = compute_reference_metrics(target_ref_fasta_path.as_ref().unwrap()).await?;
+    // eprintln!("{:?}", reference_metrics);
 
     //*****************
     // Cleanup, hanging tasks
