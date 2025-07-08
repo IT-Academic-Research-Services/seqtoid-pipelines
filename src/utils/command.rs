@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG};
 use crate::cli::Arguments;
 use lazy_static::lazy_static;
 
@@ -805,6 +805,48 @@ pub mod quast {
     
 }
 
+pub mod nucmer {
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::config::defs::NUCMER_TAG;
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub struct NucmerArgGenerator;
+
+
+    pub async fn nucmer_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["--version"];
+
+        let mut child = Command::new(NUCMER_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is nucmer installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from nucmer --version"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(0)
+            .ok_or_else(|| anyhow!("Invalid nucmer --version output: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in nucmer --version output: {}", first_line));
+        }
+        Ok(version)
+    }
+
+}
+
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -834,6 +876,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
         MUSCLE_TAG => muscle::muscle_presence_check().await,
         MAFFT_TAG => mafft::mafft_presence_check().await,
         QUAST_TAG => quast::quast_presence_check().await,
+        NUCMER_TAG => nucmer::nucmer_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
