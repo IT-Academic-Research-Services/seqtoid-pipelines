@@ -807,6 +807,35 @@ pub async fn compute_assembly_metrics(
     })
 }
 
+
+/// Computes the QUAST-like metrics for a reference FASTA file
+///
+/// # Arguments
+/// * `path` - PAth to FASTA file. Internally, this is likely to be a RAM file in /dev/shm, but can be any file
+///
+/// # Returns
+/// Result<(total_length, gc_percent)>
+pub async fn compute_reference_metrics(path: &PathBuf) -> Result<(usize, f64)> {
+    let mut reader = match sequence_reader(path)? {
+        SequenceReader::Fasta(reader) => reader,
+        _ => return Err(anyhow!("Expected FASTA file for reference")),
+    };
+    let mut total_length = 0;
+    let mut total_gc = 0;
+    for result in reader.into_records() {
+        let record = result.map_err(|e| anyhow!("Error reading reference FASTA: {}", e))?;
+        let seq = record.seq;
+        total_length += seq.len();
+        total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
+    }
+    let gc_percent = if total_length > 0 {
+        (total_gc as f64 / total_length as f64) * 100.0
+    } else {
+        0.0
+    };
+    Ok((total_length, gc_percent))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
