@@ -807,12 +807,20 @@ pub mod quast {
 
 pub mod nucmer {
     use anyhow::anyhow;
+    use std::path::PathBuf;
     use tokio::process::Command;
+    use crate::cli::Arguments;
     use crate::config::defs::NUCMER_TAG;
     use crate::utils::command::ArgGenerator;
+    use crate::utils::command::quast::{QuastArgGenerator, QuastConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct NucmerArgGenerator;
+
+    pub struct NucmerConfig {
+        pub ref_fasta: PathBuf,
+        pub assembly_fasta: PathBuf,
+    }
 
 
     pub async fn nucmer_presence_check() -> anyhow::Result<String> {
@@ -845,6 +853,28 @@ pub mod nucmer {
         Ok(version)
     }
 
+
+    impl ArgGenerator for NucmerArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<NucmerConfig>())
+                .ok_or_else(|| anyhow!("Nucmer requires a NucmerConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push("-t".to_string());
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--prefix=alignment".to_string());
+            args_vec.push(config.ref_fasta.to_string_lossy().to_string());
+            args_vec.push(config.assembly_fasta.to_string_lossy().to_string());
+
+            Ok(args_vec)
+        }
+    }
 }
 
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
@@ -856,6 +886,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
         BCFTOOLS_TAG => Box::new(bcftools::BcftoolsArgGenerator),
         MAFFT_TAG => Box::new(mafft::MafftArgGenerator),
+        NUCMER_TAG => Box::new(nucmer::NucmerArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
