@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use crate::cli::Arguments;
 
+// External software
 pub const GZIP_EXT: &str = "gz";
 pub const FASTP_TAG: &str = "fastp";
 pub const PIGZ_TAG: &str = "pigz";
@@ -14,6 +15,8 @@ pub const MUSCLE_TAG: &str = "muscle";
 pub const MAFFT_TAG: &str = "mafft";
 pub const QUAST_TAG: &str = "quast.py";
 pub const NUCMER_TAG: &str = "nucmer";
+pub const SHOW_COORDS_TAG: &str = "show-coords";
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
@@ -38,6 +41,13 @@ pub enum BcftoolsSubcommand {
 pub enum IvarSubcommand {
     Consensus
 }
+
+
+// Static Filenames
+pub const NUCMER_DELTA: &str = "alignment.delta";
+
+
+// Static Parameters
 
 pub const IVAR_QUAL_THRESHOLD: usize = 20;
 pub const IVAR_FREQ_THRESHOLD: f64 = 0.75;

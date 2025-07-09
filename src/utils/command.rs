@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, NUCMER_DELTA};
 use crate::cli::Arguments;
 use lazy_static::lazy_static;
 
@@ -872,6 +872,29 @@ pub mod nucmer {
             args_vec.push(config.ref_fasta.to_string_lossy().to_string());
             args_vec.push(config.assembly_fasta.to_string_lossy().to_string());
 
+            Ok(args_vec)
+        }
+    }
+}
+
+
+pub mod show_coords {
+    use anyhow::anyhow;
+    use crate::cli::Arguments;
+    use crate::config::defs::{SHOW_COORDS_TAG,NUCMER_DELTA};
+    use crate::utils::command::ArgGenerator;
+    
+    pub struct ShowCoordsArgGenerator;
+
+    impl ArgGenerator for ShowCoordsArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            
+            let mut args_vec: Vec<String> = Vec::new();
+            
+            args_vec.push("-r".to_string());
+            args_vec.push("-c".to_string());
+            args_vec.push(NUCMER_DELTA.to_string());
+            
             Ok(args_vec)
         }
     }
