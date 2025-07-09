@@ -36,7 +36,7 @@ pub struct AssemblyMetrics {
 /// # Returns
 /// Result<AssemblyMetrics>
 pub async fn compute_assembly_metrics(
-    mut rx: mpsc::Receiver<SequenceRecord>,
+    mut rx: Receiver<SequenceRecord>,
     thresholds: &[usize],
 ) -> Result<AssemblyMetrics> {
     let mut contig_lengths = Vec::new();
@@ -53,15 +53,15 @@ pub async fn compute_assembly_metrics(
                 total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
             }
             SequenceRecord::Fastq { .. } => {
-                return Err(anyhow::anyhow!("Expected FASTA record, got FASTQ"));
+                return Err(anyhow!("Expected FASTA record, got FASTQ"));
             }
         }
     }
 
     // Compute metrics
-    let num_contigs = contig_lengths.len(); // Total number of contigs
-    let total_length: usize = contig_lengths.iter().sum(); // Total length of all contigs
-    let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0); // Largest contig length
+    let num_contigs = contig_lengths.len();
+    let total_length: usize = contig_lengths.iter().sum();
+    let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0);
     let gc_percent = if total_bases > 0 {
         (total_gc as f64 / total_bases as f64) * 100.0
     } else {
@@ -77,46 +77,14 @@ pub async fn compute_assembly_metrics(
         total_lengths.insert(threshold, filtered_lengths.iter().sum());
     }
 
-    // Sort lengths descending for N50, N75, L50, L75
+
     contig_lengths.sort_by(|a, b| b.cmp(a));
+    let lengths_u64: Vec<u64> = contig_lengths.iter().map(|&len| len as u64).collect();
 
-    // Compute N50 and L50
-    let (n50, l50) = if !contig_lengths.is_empty() {
-        let half_total = total_length / 2;
-        let mut sum = 0;
-        let mut n50_len = 0;
-        let mut l50 = 0;
-        for (i, &len) in contig_lengths.iter().enumerate() {
-            sum += len;
-            l50 = i + 1;
-            if sum >= half_total {
-                n50_len = len;
-                break;
-            }
-        }
-        (n50_len, l50)
-    } else {
-        (0, 0)
-    };
-
-    // Compute N75 and L75
-    let (n75, l75) = if !contig_lengths.is_empty() {
-        let three_quarter_total = total_length * 3 / 4;
-        let mut sum = 0;
-        let mut n75_len = 0;
-        let mut l75 = 0;
-        for (i, &len) in contig_lengths.iter().enumerate() {
-            sum += len;
-            l75 = i + 1;
-            if sum >= three_quarter_total {
-                n75_len = len;
-                break;
-            }
-        }
-        (n75_len, l75)
-    } else {
-        (0, 0)
-    };
+    let n50 = compute_nx(&lengths_u64, 0.5) as usize;
+    let n75 = compute_nx(&lengths_u64, 0.75) as usize;
+    let l50 = compute_lx(&lengths_u64, 0.5) as usize;
+    let l75 = compute_lx(&lengths_u64, 0.75) as usize;
 
     Ok(AssemblyMetrics {
         num_contigs,
