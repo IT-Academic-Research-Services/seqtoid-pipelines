@@ -1,3 +1,4 @@
+use std::fs;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
@@ -19,6 +20,7 @@ use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
+use crate::utils::command::nucmer::NucmerConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
 use futures::future::try_join_all;
@@ -26,6 +28,7 @@ use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
+const NUCMER_DELTA: &str = "alignment.delta";
 
 pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
@@ -261,7 +264,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             eprintln!("Illumina");
 
             //*****************
-            // Get Target sequence
+            // Get Target reference sequence
             let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
             let target_ref_temp = NamedTempFile::with_suffix_in(".fasta", &config.ram_temp_dir)?;
             target_ref_fasta_path = Some(target_ref_temp.path().to_path_buf());
@@ -896,6 +899,28 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let reference_metrics = compute_reference_metrics(target_ref_fasta_path.as_ref().unwrap()).await?;
     eprintln!("{:?}", reference_metrics);
+
+    let nucmer_delta_buf:  PathBuf = PathBuf::from(&NUCMER_DELTA);
+    if nucmer_delta_buf.exists() {
+        fs::remove_file(nucmer_delta_buf)?;
+    }
+
+    let assembly_eval_nucmer_config = NucmerConfig {
+        ref_fasta: target_ref_fasta_path.as_ref().unwrap().clone(),
+        assembly_fasta: consensus_file_path.as_ref().unwrap().clone(),
+    };
+
+    let assembly_eval_args = generate_cli(
+        NUCMER_TAG,
+        &config.args,
+        Some(&assembly_eval_nucmer_config),
+    )?;
+
+
+    let (_assembly_eval_nucmer_child, assembly_eval_nucmer_err_task) = spawn_cmd(NUCMER_TAG, assembly_eval_args, config.args.verbose).await?;
+    cleanup_tasks.push(assembly_eval_nucmer_err_task);
+
+
 
     //*****************
     // Cleanup, hanging tasks
