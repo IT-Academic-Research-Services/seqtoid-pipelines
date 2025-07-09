@@ -1,11 +1,170 @@
 /// Calculation of metrics from result files.
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use anyhow::{anyhow, Result};
+use tokio::sync::mpsc;
 use crate::utils::stats::{compute_lx, compute_nx};
 use crate::utils::streams::ParseOutput;
 use tokio::sync::mpsc::Receiver;
+use crate::utils::fastx::{sequence_reader, SequenceReader, SequenceRecord};
 
 
-// MUMmer
+/* Mummer-based metrics */
+
+//Assembly Metrics
+#[derive(Debug)]
+pub struct AssemblyMetrics {
+    pub num_contigs: usize,                    // Total number of contigs
+    pub contig_counts: BTreeMap<usize, usize>, // Threshold -> Count of contigs >= threshold
+    pub total_lengths: BTreeMap<usize, usize>, // Threshold -> Total length of contigs >= threshold
+    pub total_length: usize,                   // Total length of all contigs
+    pub largest_contig: usize,                 // Length of the largest contig
+    pub n50: usize,                            // N50 statistic
+    pub n75: usize,                            // N75 statistic
+    pub l50: usize,                            // L50 statistic
+    pub l75: usize,                            // L75 statistic
+    pub gc_percent: f64,                       // GC percentage
+}
+
+
+/// Computes the QUAST-like metrics for a FASTA file
+///
+/// # Arguments
+/// * `rx` - Receiver of SeqeunceRecord::FAsta
+/// * `buffer_size` - Size of the output channel buffer.
+///
+/// # Returns
+/// Result<AssemblyMetrics>
+pub async fn compute_assembly_metrics(
+    mut rx: mpsc::Receiver<SequenceRecord>,
+    thresholds: &[usize],
+) -> Result<AssemblyMetrics> {
+    let mut contig_lengths = Vec::new();
+    let mut total_gc = 0;
+    let mut total_bases = 0;
+
+    // Collect lengths and GC content from the stream
+    while let Some(record) = rx.recv().await {
+        match record {
+            SequenceRecord::Fasta { seq, .. } => {
+                let len = seq.len();
+                contig_lengths.push(len);
+                total_bases += len;
+                total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
+            }
+            SequenceRecord::Fastq { .. } => {
+                return Err(anyhow::anyhow!("Expected FASTA record, got FASTQ"));
+            }
+        }
+    }
+
+    // Compute metrics
+    let num_contigs = contig_lengths.len(); // Total number of contigs
+    let total_length: usize = contig_lengths.iter().sum(); // Total length of all contigs
+    let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0); // Largest contig length
+    let gc_percent = if total_bases > 0 {
+        (total_gc as f64 / total_bases as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Compute counts and total lengths per threshold
+    let mut contig_counts = BTreeMap::new();
+    let mut total_lengths = BTreeMap::new();
+    for &threshold in thresholds {
+        let filtered_lengths: Vec<_> = contig_lengths.iter().filter(|&&len| len >= threshold).cloned().collect();
+        contig_counts.insert(threshold, filtered_lengths.len());
+        total_lengths.insert(threshold, filtered_lengths.iter().sum());
+    }
+
+    // Sort lengths descending for N50, N75, L50, L75
+    contig_lengths.sort_by(|a, b| b.cmp(a));
+
+    // Compute N50 and L50
+    let (n50, l50) = if !contig_lengths.is_empty() {
+        let half_total = total_length / 2;
+        let mut sum = 0;
+        let mut n50_len = 0;
+        let mut l50 = 0;
+        for (i, &len) in contig_lengths.iter().enumerate() {
+            sum += len;
+            l50 = i + 1;
+            if sum >= half_total {
+                n50_len = len;
+                break;
+            }
+        }
+        (n50_len, l50)
+    } else {
+        (0, 0)
+    };
+
+    // Compute N75 and L75
+    let (n75, l75) = if !contig_lengths.is_empty() {
+        let three_quarter_total = total_length * 3 / 4;
+        let mut sum = 0;
+        let mut n75_len = 0;
+        let mut l75 = 0;
+        for (i, &len) in contig_lengths.iter().enumerate() {
+            sum += len;
+            l75 = i + 1;
+            if sum >= three_quarter_total {
+                n75_len = len;
+                break;
+            }
+        }
+        (n75_len, l75)
+    } else {
+        (0, 0)
+    };
+
+    Ok(AssemblyMetrics {
+        num_contigs,
+        contig_counts,
+        total_lengths,
+        total_length,
+        largest_contig,
+        n50,
+        n75,
+        l50,
+        l75,
+        gc_percent,
+    })
+}
+
+
+//Reference Metrics
+
+/// Computes the QUAST-like metrics for a reference FASTA file
+///
+/// # Arguments
+/// * `path` - PAth to FASTA file. Internally, this is likely to be a RAM file in /dev/shm, but can be any file
+///
+/// # Returns
+/// Result<(total_length, gc_percent)>
+pub async fn compute_reference_metrics(path: &PathBuf) -> Result<(usize, f64)> {
+    let mut reader = match sequence_reader(path)? {
+        SequenceReader::Fasta(reader) => reader,
+        _ => return Err(anyhow!("Expected FASTA file for reference")),
+    };
+    let mut total_length = 0;
+    let mut total_gc = 0;
+    for result in reader.into_records() {
+        let record = result.map_err(|e| anyhow!("Error reading reference FASTA: {}", e))?;
+        let seq = record.seq;
+        total_length += seq.len();
+        total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
+    }
+    let gc_percent = if total_length > 0 {
+        (total_gc as f64 / total_length as f64) * 100.0
+    } else {
+        0.0
+    };
+    Ok((total_length, gc_percent))
+}
+
+
+
 // For the show-coords executable from MUMmer suite
 #[derive(Debug)]
 pub struct AlignmentMetrics {
