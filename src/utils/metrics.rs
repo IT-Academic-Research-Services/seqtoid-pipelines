@@ -639,3 +639,102 @@ pub async fn compute_all_metrics(
         },
     })
 }
+
+pub async fn write_metrics_to_tsv(
+    fasta_rx: Receiver<SequenceRecord>,
+    ref_fasta_path: &PathBuf,
+    bam_stream: Receiver<ParseOutput>,
+    show_coords_stream: Receiver<ParseOutput>,
+    delta_path: &Path,
+    thresholds: &[usize],
+    output_path: &PathBuf,
+) -> Result<()> {
+    // Compute all metrics
+    let metrics = compute_all_metrics(
+        fasta_rx,
+        ref_fasta_path,
+        bam_stream,
+        show_coords_stream,
+        delta_path,
+        thresholds,
+    ).await?;
+
+    // Build the TSV content
+    let mut tsv_content = String::new();
+    tsv_content.push_str("Assembly\tconsensus\n");
+
+    // Assembly metrics with thresholds
+    for &threshold in thresholds {
+        tsv_content.push_str(&format!(
+            "# contigs (>= {} bp)\t{}\n",
+            threshold,
+            metrics.assembly.contig_counts.get(&threshold).unwrap_or(&0)
+        ));
+    }
+    for &threshold in thresholds {
+        tsv_content.push_str(&format!(
+            "Total length (>= {} bp)\t{}\n",
+            threshold,
+            metrics.assembly.total_lengths.get(&threshold).unwrap_or(&0)
+        ));
+    }
+    tsv_content.push_str(&format!("# contigs\t{}\n", metrics.assembly.num_contigs));
+    tsv_content.push_str(&format!("Largest contig\t{}\n", metrics.assembly.largest_contig));
+    tsv_content.push_str(&format!("Total length\t{}\n", metrics.assembly.total_length));
+    tsv_content.push_str(&format!("Reference length\t{}\n", metrics.reference.total_length));
+    tsv_content.push_str(&format!("GC (%)\t{:.2}\n", metrics.assembly.gc_percent));
+    tsv_content.push_str(&format!("Reference GC (%)\t{:.2}\n", metrics.reference.gc_percent));
+    tsv_content.push_str(&format!("N50\t{}\n", metrics.assembly.n50));
+    tsv_content.push_str(&format!("NG50\t{}\n", metrics.assembly.n50)); // Assuming NG50 same as N50
+    tsv_content.push_str(&format!("N75\t{}\n", metrics.assembly.n75));
+    tsv_content.push_str(&format!("NG75\t{}\n", metrics.assembly.n75)); // Assuming NG75 same as N75
+    tsv_content.push_str(&format!("L50\t{}\n", metrics.assembly.l50));
+    tsv_content.push_str(&format!("LG50\t{}\n", metrics.assembly.l50)); // Assuming LG50 same as L50
+    tsv_content.push_str(&format!("L75\t{}\n", metrics.assembly.l75));
+    tsv_content.push_str(&format!("LG75\t{}\n", metrics.assembly.l75)); // Assuming LG75 same as L75
+    tsv_content.push_str(&format!("# total reads\t{}\n", metrics.bam.total_reads));
+    tsv_content.push_str(&format!("# left\t{}\n", metrics.bam.left_reads));
+    tsv_content.push_str(&format!("# right\t{}\n", metrics.bam.right_reads));
+    tsv_content.push_str(&format!("Mapped (%)\t{:.1}\n", metrics.bam.percent_mapped));
+    tsv_content.push_str(&format!("Reference mapped (%)\t{:.1}\n", metrics.bam.ref_mapped));
+    tsv_content.push_str(&format!("Properly paired (%)\t{:.2}\n", metrics.bam.properly_paired));
+    tsv_content.push_str(&format!("Reference properly paired (%)\t{:.2}\n", metrics.bam.ref_properly_paired));
+    tsv_content.push_str(&format!("Avg. coverage depth\t{}\n", metrics.bam.avg_coverage_depth));
+    tsv_content.push_str(&format!("Reference avg. coverage depth\t{}\n", metrics.bam.ref_avg_coverage_depth));
+    tsv_content.push_str(&format!("Coverage >= 1x (%)\t{:.2}\n", metrics.bam.coverage_above_1x));
+    tsv_content.push_str(&format!("Reference coverage >= 1x (%)\t{:.2}\n", metrics.bam.ref_coverage_above_1x));
+    tsv_content.push_str(&format!("# misassemblies\t{}\n", metrics.alignment.misassemblies));
+    tsv_content.push_str(&format!("# misassembled contigs\t{}\n", metrics.alignment.misassembled_contigs));
+    tsv_content.push_str(&format!("Misassembled contigs length\t{}\n", metrics.alignment.misassembled_contigs_length));
+    tsv_content.push_str(&format!("# local misassemblies\t{}\n", metrics.alignment.local_misassemblies));
+    tsv_content.push_str(&format!("# scaffold gap ext. mis.\t{}\n", metrics.alignment.scaffold_gap_ext_mis));
+    tsv_content.push_str(&format!("# scaffold gap loc. mis.\t{}\n", metrics.alignment.scaffold_gap_loc_mis));
+    tsv_content.push_str(&format!("# unaligned mis. contigs\t{}\n", metrics.alignment.unaligned_mis_contigs));
+    tsv_content.push_str(&format!("# unaligned contigs\t{} + {} part\n", metrics.assembly.unaligned_contigs, 0)); // Assuming no partial unaligned
+    tsv_content.push_str(&format!("Unaligned length\t{}\n", metrics.assembly.unaligned_length));
+    tsv_content.push_str(&format!("Genome fraction (%)\t{:.3}\n", metrics.alignment.genome_fraction));
+    tsv_content.push_str(&format!("Duplication ratio\t{:.3}\n", metrics.alignment.duplication_ratio));
+    tsv_content.push_str(&format!("# N's per 100 kbp\t{:.2}\n", metrics.assembly.n_per_100kbp));
+    tsv_content.push_str(&format!("# mismatches per 100 kbp\t{:.2}\n", metrics.alignment.mismatches_per_100kbp));
+    tsv_content.push_str(&format!("# indels per 100 kbp\t{:.2}\n", metrics.alignment.indels_per_100kbp));
+    tsv_content.push_str(&format!("Largest alignment\t{}\n", metrics.alignment.largest_alignment));
+    tsv_content.push_str(&format!("Total aligned length\t{}\n", metrics.alignment.total_aligned_length));
+    tsv_content.push_str(&format!("NA50\t{}\n", metrics.alignment.na50));
+    tsv_content.push_str(&format!("NGA50\t{}\n", metrics.alignment.nga50));
+    tsv_content.push_str(&format!("NA75\t{}\n", metrics.alignment.na75));
+    tsv_content.push_str(&format!("NGA75\t{}\n", metrics.alignment.nga75));
+    tsv_content.push_str(&format!("LA50\t{}\n", metrics.alignment.la50));
+    tsv_content.push_str(&format!("LGA50\t{}\n", metrics.alignment.lga50));
+    tsv_content.push_str(&format!("LA75\t{}\n", metrics.alignment.la75));
+    tsv_content.push_str(&format!("LGA75\t{}\n", metrics.alignment.lga75));
+
+    // Write to file
+    let mut file = File::create(output_path).await
+        .map_err(|e| anyhow!("Failed to create output file {}: {}", output_path.display(), e))?;
+    file.write_all(tsv_content.as_bytes()).await
+        .map_err(|e| anyhow!("Failed to write to output file {}: {}", output_path.display(), e))?;
+    file.flush().await
+        .map_err(|e| anyhow!("Failed to flush output file {}: {}", output_path.display(), e))?;
+
+    Ok(())
+}
