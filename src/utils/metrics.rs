@@ -1,52 +1,101 @@
-/// Calculation of metrics from result files.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use crate::utils::stats::{compute_lx, compute_nx};
 use crate::utils::streams::ParseOutput;
-use tokio::sync::mpsc::Receiver;
-use crate::utils::fastx::{sequence_reader, SequenceReader, SequenceRecord};
+use crate::utils::fastx::SequenceRecord;
+use tokio::sync::mpsc::{Receiver, Sender};
+use crate::utils::fastx::{sequence_reader, SequenceReader};
+use rust_htslib::{bam, bam::Read, bam::record::Record, bam::Header, bam::HeaderView};
 
 
-/* Mummer-based metrics */
 
-//Assembly Metrics
 #[derive(Debug)]
 pub struct AssemblyMetrics {
-    pub num_contigs: usize,                    // Total number of contigs
-    pub contig_counts: BTreeMap<usize, usize>, // Threshold -> Count of contigs >= threshold
-    pub total_lengths: BTreeMap<usize, usize>, // Threshold -> Total length of contigs >= threshold
-    pub total_length: usize,                   // Total length of all contigs
-    pub largest_contig: usize,                 // Length of the largest contig
-    pub n50: usize,                            // N50 statistic
-    pub n75: usize,                            // N75 statistic
-    pub l50: usize,                            // L50 statistic
-    pub l75: usize,                            // L75 statistic
-    pub gc_percent: f64,                       // GC percentage
+    pub num_contigs: usize,
+    pub contig_counts: BTreeMap<usize, usize>,
+    pub total_lengths: BTreeMap<usize, usize>,
+    pub total_length: usize,
+    pub largest_contig: usize,
+    pub n50: usize,
+    pub n75: usize,
+    pub l50: usize,
+    pub l75: usize,
+    pub gc_percent: f64,
     pub unaligned_length: usize,
+    pub unaligned_contigs: usize,
+    pub n_per_100kbp: f64,
 }
 
+#[derive(Debug)]
+pub struct ReferenceMetrics {
+    pub total_length: usize,
+    pub gc_percent: f64,
+}
 
-/// Computes the QUAST-like metrics for a FASTA file
-///
-/// # Arguments
-/// * `rx` - Receiver of SeqeunceRecord::FAsta
-/// * `buffer_size` - Size of the output channel buffer.
-///
-/// # Returns
-/// Result<AssemblyMetrics>
+#[derive(Debug)]
+pub struct BAMMetrics {
+    pub total_reads: usize,
+    pub left_reads: usize,
+    pub right_reads: usize,
+    pub percent_mapped: f64,
+    pub properly_paired: f64,
+    pub avg_coverage_depth: usize,
+    pub coverage_above_1x: f64,
+    pub ref_mapped: f64,
+    pub ref_properly_paired: f64,
+    pub ref_avg_coverage_depth: usize,
+    pub ref_coverage_above_1x: f64,
+}
+
+#[derive(Debug)]
+pub struct AlignmentMetrics {
+    pub total_aligned_length: u64,
+    pub largest_alignment: u64,
+    pub genome_fraction: f64,
+    pub na50: u64,
+    pub nga50: u64,
+    pub na75: u64,
+    pub nga75: u64,
+    pub la50: u32,
+    pub lga50: u32,
+    pub la75: u32,
+    pub lga75: u32,
+    pub duplication_ratio: f64,
+    pub mismatches_per_100kbp: f64,
+    pub indels_per_100kbp: f64,
+    pub misassemblies: u32,
+    pub misassembled_contigs: usize,
+    pub misassembled_contigs_length: usize,
+    pub local_misassemblies: u32,
+    pub scaffold_gap_ext_mis: u32,
+    pub scaffold_gap_loc_mis: u32,
+    pub unaligned_mis_contigs: usize,
+}
+
+#[derive(Debug)]
+pub struct AllMetrics {
+    pub assembly: AssemblyMetrics,
+    pub reference: ReferenceMetrics,
+    pub bam: BAMMetrics,
+    pub alignment: AlignmentMetrics,
+}
+
 pub async fn compute_assembly_metrics(
     mut rx: Receiver<SequenceRecord>,
     thresholds: &[usize],
+    show_coords_stream: Receiver<ParseOutput>,
 ) -> Result<AssemblyMetrics> {
     let mut contig_lengths = Vec::new();
     let mut total_gc = 0;
     let mut total_bases = 0;
+    let mut total_ns = 0;
 
-    // Collect lengths and GC content from the stream
     while let Some(record) = rx.recv().await {
         match record {
             SequenceRecord::Fasta { seq, .. } => {
@@ -54,6 +103,7 @@ pub async fn compute_assembly_metrics(
                 contig_lengths.push(len);
                 total_bases += len;
                 total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
+                total_ns += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'N').count();
             }
             SequenceRecord::Fastq { .. } => {
                 return Err(anyhow!("Expected FASTA record, got FASTQ"));
@@ -61,7 +111,6 @@ pub async fn compute_assembly_metrics(
         }
     }
 
-    // Compute metrics
     let num_contigs = contig_lengths.len();
     let total_length: usize = contig_lengths.iter().sum();
     let largest_contig = contig_lengths.iter().max().copied().unwrap_or(0);
@@ -70,8 +119,12 @@ pub async fn compute_assembly_metrics(
     } else {
         0.0
     };
+    let n_per_100kbp = if total_bases > 0 {
+        (total_ns as f64 / total_bases as f64) * 100_000.0
+    } else {
+        0.0
+    };
 
-    // Compute counts and total lengths per threshold
     let mut contig_counts = BTreeMap::new();
     let mut total_lengths = BTreeMap::new();
     for &threshold in thresholds {
@@ -80,7 +133,6 @@ pub async fn compute_assembly_metrics(
         total_lengths.insert(threshold, filtered_lengths.iter().sum());
     }
 
-
     contig_lengths.sort_by(|a, b| b.cmp(a));
     let lengths_u64: Vec<u64> = contig_lengths.iter().map(|&len| len as u64).collect();
 
@@ -88,6 +140,8 @@ pub async fn compute_assembly_metrics(
     let n75 = compute_nx(&lengths_u64, 0.75) as usize;
     let l50 = compute_lx(&lengths_u64, 0.5) as usize;
     let l75 = compute_lx(&lengths_u64, 0.75) as usize;
+
+    let (unaligned_length, unaligned_contigs) = compute_unaligned_metrics(show_coords_stream, total_length as u64, &contig_lengths).await?;
 
     Ok(AssemblyMetrics {
         num_contigs,
@@ -100,17 +154,19 @@ pub async fn compute_assembly_metrics(
         l50,
         l75,
         gc_percent,
-        unaligned_length,
+        unaligned_length: unaligned_length as usize,
+        unaligned_contigs,
+        n_per_100kbp,
     })
 }
 
-
-
-pub async fn compute_unaligned_length(
+async fn compute_unaligned_metrics(
     mut stdout_stream: Receiver<ParseOutput>,
     total_contig_length: u64,
-) -> Result<u64> {
+    contig_lengths: &[usize],
+) -> Result<(u64, usize)> {
     let mut total_aligned_length = 0;
+    let mut aligned_contigs = HashSet::new();
 
     while let Some(parse_output) = stdout_stream.recv().await {
         let line = match parse_output {
@@ -125,13 +181,19 @@ pub async fn compute_unaligned_length(
             continue;
         }
         total_aligned_length += fields[6].parse::<u64>().unwrap_or(0); // LEN 2 (query length)
+        if let Some(contig_name) = fields.get(11) {
+            aligned_contigs.insert(contig_name.to_string());
+        }
     }
 
     if total_aligned_length == 0 {
         return Err(anyhow!("No valid alignments found in show-coords output"));
     }
 
-    Ok(total_contig_length.saturating_sub(total_aligned_length))
+    let unaligned_length = total_contig_length.saturating_sub(total_aligned_length);
+    let unaligned_contigs = contig_lengths.len() - aligned_contigs.len();
+
+    Ok((unaligned_length, unaligned_contigs))
 }
 
 pub async fn compute_duplication_ratio(
@@ -161,11 +223,9 @@ pub async fn compute_duplication_ratio(
         return Err(anyhow!("No valid alignments found in show-coords output"));
     }
 
-
     let total_aligned = aligned_bases.iter().map(|&(s, e)| e - s + 1).sum::<u64>();
     Ok(total_aligned as f64 / total_contig_length as f64)
 }
-
 
 pub async fn compute_mismatches_per_100kbp(delta_path: &Path) -> Result<f64> {
     let file = File::open(delta_path).await?;
@@ -194,7 +254,6 @@ pub async fn compute_mismatches_per_100kbp(delta_path: &Path) -> Result<f64> {
     Ok((mismatches as f64 / aligned_bases as f64) * 100_000.0)
 }
 
-
 pub async fn compute_indels_per_100kbp(delta_path: &Path) -> Result<f64> {
     let file = File::open(delta_path).await?;
     let reader = BufReader::new(file);
@@ -222,11 +281,16 @@ pub async fn compute_indels_per_100kbp(delta_path: &Path) -> Result<f64> {
     Ok((indels as f64 / aligned_bases as f64) * 100_000.0)
 }
 
-pub async fn compute_misassemblies(delta_path: &Path) -> Result<u32> {
+pub async fn compute_misassemblies(
+    delta_path: &Path,
+    contig_lengths: &BTreeMap<String, usize>,
+) -> Result<(u32, usize, usize, u32, u32, u32, usize)> {
     let file = File::open(delta_path).await?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
     let mut misassemblies = 0;
+    let mut local_misassemblies = 0;
+    let mut misassembled_contigs = HashSet::new();
     let mut prev_end = 0;
     let mut prev_contig = String::new();
 
@@ -240,33 +304,36 @@ pub async fn compute_misassemblies(delta_path: &Path) -> Result<u32> {
         if fields.len() >= 7 {
             let start = fields[3].parse::<u64>().unwrap_or(0); // S2
             let end = fields[4].parse::<u64>().unwrap_or(0); // E2
-            if !prev_contig.is_empty() && start > prev_end + 1000 { // Threshold for break
-                misassemblies += 1;
+            let len2 = fields[2].parse::<u64>().unwrap_or(0); // LEN 2
+            if !prev_contig.is_empty() {
+                if start > prev_end + 1000 {
+                    misassemblies += 1;
+                    misassembled_contigs.insert(prev_contig.clone());
+                } else if start > prev_end + 100 && len2 < 1000 {
+                    local_misassemblies += 1;
+                    misassembled_contigs.insert(prev_contig.clone());
+                }
             }
             prev_end = end;
         }
     }
 
-    Ok(misassemblies)
+    let misassembled_contigs_length = misassembled_contigs
+        .iter()
+        .map(|contig| contig_lengths.get(contig).copied().unwrap_or(0))
+        .sum::<usize>();
+
+    Ok((
+        misassemblies,
+        misassembled_contigs.len(),
+        misassembled_contigs_length,
+        local_misassemblies,
+        0, // scaffold_gap_ext_mis
+        0, // scaffold_gap_loc_mis
+        0, // unaligned_mis_contigs
+    ))
 }
 
-
-//Reference Metrics
-
-
-#[derive(Debug)]
-pub struct ReferenceMetrics {
-    pub total_length: usize,                   // Total length of all contigs
-    pub gc_percent: f64,                       // GC percentage
-}
-
-/// Computes the QUAST-like metrics for a reference FASTA file
-///
-/// # Arguments
-/// * `path` - PAth to FASTA file. Internally, this is likely to be a RAM file in /dev/shm, but can be any file
-///
-/// # Returns
-/// Result<(total_length, gc_percent)>
 pub async fn compute_reference_metrics(path: &PathBuf) -> Result<ReferenceMetrics> {
     let mut reader = match sequence_reader(path)? {
         SequenceReader::Fasta(reader) => reader,
@@ -285,38 +352,9 @@ pub async fn compute_reference_metrics(path: &PathBuf) -> Result<ReferenceMetric
     } else {
         0.0
     };
-    Ok(ReferenceMetrics{total_length, gc_percent})
+    Ok(ReferenceMetrics { total_length, gc_percent })
 }
 
-
-
-// For the show-coords executable from MUMmer suite
-#[derive(Debug)]
-pub struct AlignmentMetrics {
-    pub total_aligned_length: u64,
-    pub largest_alignment: u64,
-    pub genome_fraction: f64,
-    pub na50: u64,
-    pub nga50: u64,
-    pub na75: u64,
-    pub nga75: u64,
-    pub la50: u32,
-    pub lga50: u32,
-    pub la75: u32,
-    pub lga75: u32,
-
-}
-
-/// Calculation of metrics from the MUMmer show-coords program
-///
-/// # Arguments
-///
-/// - `lengths`: Lengths series from show-coords or alignment.delta
-/// - `fraction`: The threashold i.e. the '50' in N50.
-///
-/// # Returns
-///
-/// An Nx (N50, N75) unsigned float.
 pub async fn parse_show_coords(
     mut stdout_stream: Receiver<ParseOutput>,
     reference_length: u64,
@@ -324,23 +362,18 @@ pub async fn parse_show_coords(
 ) -> Result<AlignmentMetrics> {
     let mut alignments = Vec::new();
 
-    // Process the stream
     while let Some(parse_output) = stdout_stream.recv().await {
         let line = match parse_output {
             ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
-            _ => continue, // Skip non-byte data
+            _ => continue,
         };
-
-        // Skip header and non-data lines
         if line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
             continue;
         }
-
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 11 {
-            continue; // Skip malformed lines
+            continue;
         }
-
         let alignment = (
             fields[0].parse::<u64>().unwrap_or(0), // S1
             fields[1].parse::<u64>().unwrap_or(0), // E1
@@ -358,12 +391,14 @@ pub async fn parse_show_coords(
         return Err(anyhow!("No valid alignments found in show-coords output"));
     }
 
-    // Compute metrics
     let total_aligned_length = alignments.iter().map(|a| a.4).sum::<u64>();
     let largest_alignment = alignments.iter().map(|a| a.4).max().unwrap_or(0);
-    let genome_fraction = (total_aligned_length as f64 / reference_length as f64) * 100.0;
+    let genome_fraction = if reference_length > 0 {
+        (total_aligned_length as f64 / reference_length as f64) * 100.0
+    } else {
+        0.0
+    };
 
-    // Nx/Lx metrics
     let mut sorted_lengths: Vec<u64> = alignments.iter().map(|a| a.4).collect();
     sorted_lengths.sort_by(|a, b| b.cmp(a));
     let na50 = compute_nx(&sorted_lengths, 0.5);
@@ -374,7 +409,6 @@ pub async fn parse_show_coords(
     let lga50 = compute_lx(&sorted_lengths, 0.5);
     let la75 = compute_lx(&sorted_lengths, 0.75);
     let lga75 = compute_lx(&sorted_lengths, 0.75);
-
 
     Ok(AlignmentMetrics {
         total_aligned_length,
@@ -388,5 +422,220 @@ pub async fn parse_show_coords(
         lga50,
         la75,
         lga75,
+        duplication_ratio: 0.0, // Computed separately
+        mismatches_per_100kbp: 0.0, // Computed separately
+        indels_per_100kbp: 0.0, // Computed separately
+        misassemblies: 0, // Computed separately
+        misassembled_contigs: 0, // Computed separately
+        misassembled_contigs_length: 0, // Computed separately
+        local_misassemblies: 0, // Computed separately
+        scaffold_gap_ext_mis: 0, // Computed separately
+        scaffold_gap_loc_mis: 0, // Computed separately
+        unaligned_mis_contigs: 0, // Computed separately
+    })
+}
+
+
+pub async fn compute_bam_metrics(
+    mut bam_stream: Receiver<ParseOutput>,
+    reference_length: u64,
+) -> Result<BAMMetrics> {
+    // Create a minimal header (adjust based on your reference if needed)
+    let mut header = Header::new();
+    header.push_record(
+        bam::header::HeaderRecord::new(b"SQ")
+            .push_tag(b"SN", &"ref")
+            .push_tag(b"LN", &(reference_length as i32)),
+    );
+    let header_view = HeaderView::from_header(&header);
+
+    let mut total_reads = 0;
+    let mut left_reads = 0;
+    let mut right_reads = 0;
+    let mut mapped_reads = 0;
+    let mut properly_paired = 0;
+    let mut total_depth = 0;
+    let mut bases_covered = 0;
+    let mut pileup_positions = Vec::new();
+
+    while let Some(parse_output) = bam_stream.recv().await {
+        let record_bytes = match parse_output {
+            ParseOutput::Bytes(bytes) => bytes,
+            _ => continue,
+        };
+
+        let sam_line = String::from_utf8(record_bytes)
+            .map_err(|e| anyhow!("Invalid UTF-8 in SAM line: {}", e))?;
+        let record = Record::from_sam(&header_view, sam_line.as_bytes())
+            .map_err(|e| anyhow!("Failed to parse SAM record: {}", e))?;
+
+        total_reads += 1;
+        if record.is_first_in_template() {
+            left_reads += 1;
+        } else if record.is_last_in_template() {
+            right_reads += 1;
+        }
+        if !record.is_unmapped() {
+            mapped_reads += 1;
+            let start = record.pos() as u64;
+            let end_i64 = record.cigar().end_pos();
+            if end_i64 < 0 {
+                return Err(anyhow!("Invalid end position for record: {}", end_i64));
+            }
+            let end = end_i64 as u64;
+            if end > reference_length {
+                return Err(anyhow!("End position {} exceeds reference length {}", end, reference_length));
+            }
+            for pos in start..=end {
+                pileup_positions.push(pos);
+            }
+        }
+        if record.is_proper_pair() {
+            properly_paired += 1;
+        }
+    }
+
+    let mut coverage_counts = std::collections::HashMap::new();
+    for pos in pileup_positions {
+        *coverage_counts.entry(pos).or_insert(0) += 1;
+    }
+    total_depth = coverage_counts.values().sum::<u64>();
+    bases_covered = coverage_counts.len() as u64;
+
+    let percent_mapped = if total_reads > 0 {
+        (mapped_reads as f64 / total_reads as f64) * 100.0
+    } else {
+        0.0
+    };
+    let properly_paired_percent = if total_reads > 0 {
+        (properly_paired as f64 / total_reads as f64) * 100.0
+    } else {
+        0.0
+    };
+    let avg_coverage_depth = if reference_length > 0 {
+        (total_depth / reference_length) as usize
+    } else {
+        0
+    };
+    let coverage_above_1x = if reference_length > 0 {
+        (bases_covered as f64 / reference_length as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(BAMMetrics {
+        total_reads,
+        left_reads,
+        right_reads,
+        percent_mapped,
+        properly_paired: properly_paired_percent,
+        avg_coverage_depth,
+        coverage_above_1x,
+        ref_mapped: percent_mapped,
+        ref_properly_paired: properly_paired_percent,
+        ref_avg_coverage_depth: avg_coverage_depth,
+        ref_coverage_above_1x: coverage_above_1x,
+    })
+}
+
+
+
+pub async fn compute_all_metrics(
+    fasta_rx: Receiver<SequenceRecord>,
+    ref_fasta_path: &PathBuf,
+    bam_stream: Receiver<ParseOutput>,
+    show_coords_stream: Receiver<ParseOutput>,
+    delta_path: &Path,
+    thresholds: &[usize],
+) -> Result<AllMetrics> {
+    // Split show-coords stream for three consumers
+    let (tx1, rx1) = tokio::sync::mpsc::channel(100);
+    let (tx2, rx2) = tokio::sync::mpsc::channel(100);
+    let (tx3, rx3) = tokio::sync::mpsc::channel(100);
+    tokio::spawn(async move {
+        let mut rx = show_coords_stream;
+        while let Some(output) = rx.recv().await {
+            let _ = tx1.send(output.clone()).await;
+            let _ = tx2.send(output.clone()).await;
+            let _ = tx3.send(output).await;
+        }
+    });
+
+    // Split fasta_rx to collect contig lengths and names
+    let (tx_fasta, rx_fasta) = tokio::sync::mpsc::channel(100);
+    let contig_length_map = Arc::new(Mutex::new(BTreeMap::new()));
+    let contig_length_map_clone = Arc::clone(&contig_length_map);
+    tokio::spawn(async move {
+        let mut rx = fasta_rx;
+        while let Some(record) = rx.recv().await {
+            if let SequenceRecord::Fasta { id, seq, desc: _ } = &record {
+                contig_length_map_clone.lock().await.insert(id.clone(), seq.len());
+            }
+            let _ = tx_fasta.send(record).await;
+        }
+        Result::<()>::Ok(())
+    });
+
+    // Compute reference metrics first
+    let reference_metrics = compute_reference_metrics(ref_fasta_path).await?;
+
+    // Compute assembly metrics (needs show-coords stream)
+    let assembly_metrics = compute_assembly_metrics(rx_fasta, thresholds, rx1).await?;
+
+    // Compute remaining metrics concurrently
+    let (bam_metrics, alignment_metrics, duplication_ratio) = tokio::try_join!(
+        compute_bam_metrics(bam_stream, reference_metrics.total_length as u64),
+        parse_show_coords(rx2, reference_metrics.total_length as u64, assembly_metrics.total_length as u64),
+        compute_duplication_ratio(rx3, assembly_metrics.total_length as u64),
+    )?;
+
+    let guard = contig_length_map.lock().await;
+    let (misassemblies, misassembled_contigs, misassembled_contigs_length, local_misassemblies, scaffold_gap_ext_mis, scaffold_gap_loc_mis, unaligned_mis_contigs) =
+        compute_misassemblies(delta_path, &*guard).await?;
+
+    Ok(AllMetrics {
+        assembly: AssemblyMetrics {
+            num_contigs: assembly_metrics.num_contigs,
+            contig_counts: assembly_metrics.contig_counts,
+            total_lengths: assembly_metrics.total_lengths,
+            total_length: assembly_metrics.total_length,
+            largest_contig: assembly_metrics.largest_contig,
+            n50: assembly_metrics.n50,
+            n75: assembly_metrics.n75,
+            l50: assembly_metrics.l50,
+            l75: assembly_metrics.l75,
+            gc_percent: assembly_metrics.gc_percent,
+            unaligned_length: assembly_metrics.unaligned_length,
+            unaligned_contigs: assembly_metrics.unaligned_contigs,
+            n_per_100kbp: assembly_metrics.n_per_100kbp,
+        },
+        reference: ReferenceMetrics {
+            total_length: reference_metrics.total_length,
+            gc_percent: reference_metrics.gc_percent,
+        },
+        bam: bam_metrics,
+        alignment: AlignmentMetrics {
+            total_aligned_length: alignment_metrics.total_aligned_length,
+            largest_alignment: alignment_metrics.largest_alignment,
+            genome_fraction: alignment_metrics.genome_fraction,
+            na50: alignment_metrics.na50,
+            nga50: alignment_metrics.nga50,
+            na75: alignment_metrics.na75,
+            nga75: alignment_metrics.nga75,
+            la50: alignment_metrics.la50,
+            lga50: alignment_metrics.lga50,
+            la75: alignment_metrics.la75,
+            lga75: alignment_metrics.lga75,
+            duplication_ratio,
+            mismatches_per_100kbp: compute_mismatches_per_100kbp(delta_path).await?,
+            indels_per_100kbp: compute_indels_per_100kbp(delta_path).await?,
+            misassemblies,
+            misassembled_contigs,
+            misassembled_contigs_length,
+            local_misassemblies,
+            scaffold_gap_ext_mis,
+            scaffold_gap_loc_mis,
+            unaligned_mis_contigs,
+        },
     })
 }
