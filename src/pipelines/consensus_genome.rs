@@ -15,7 +15,7 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, compute_assembly_metrics, compute_reference_metrics, CONTIG_THRESHOLDS};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, convert_stream};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, NUCMER_DELTA};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
@@ -28,7 +28,6 @@ use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
-const NUCMER_DELTA: &str = "alignment.delta";
 
 pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
@@ -895,14 +894,13 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
 
     eprintln!("{:?}", assembly_metrics);
-    // cleanup_tasks.push(stats_task);
 
     let reference_metrics = compute_reference_metrics(target_ref_fasta_path.as_ref().unwrap()).await?;
     eprintln!("{:?}", reference_metrics);
 
     let nucmer_delta_buf:  PathBuf = PathBuf::from(&NUCMER_DELTA);
-    if nucmer_delta_buf.exists() {
-        fs::remove_file(nucmer_delta_buf)?;
+    if nucmer_delta_buf.clone().exists() {
+        fs::remove_file(nucmer_delta_buf.clone())?;
     }
 
     let assembly_eval_nucmer_config = NucmerConfig {
@@ -916,10 +914,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         Some(&assembly_eval_nucmer_config),
     )?;
 
-
     let (_assembly_eval_nucmer_child, assembly_eval_nucmer_err_task) = spawn_cmd(NUCMER_TAG, assembly_eval_args, config.args.verbose).await?;
     cleanup_tasks.push(assembly_eval_nucmer_err_task);
 
+    // if !nucmer_delta_buf.clone().exists() {
+    //     return Err(anyhow!("File alignment.delta missing after nucmer run."));
+    // }
 
 
     //*****************
