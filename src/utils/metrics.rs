@@ -2,7 +2,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use std::path::Path;
 use crate::utils::stats::{compute_lx, compute_nx};
 use crate::utils::streams::ParseOutput;
 use tokio::sync::mpsc::Receiver;
@@ -24,6 +26,7 @@ pub struct AssemblyMetrics {
     pub l50: usize,                            // L50 statistic
     pub l75: usize,                            // L75 statistic
     pub gc_percent: f64,                       // GC percentage
+    pub unaligned_length: usize,
 }
 
 
@@ -97,11 +100,165 @@ pub async fn compute_assembly_metrics(
         l50,
         l75,
         gc_percent,
+        unaligned_length,
     })
 }
 
 
+
+pub async fn compute_unaligned_length(
+    mut stdout_stream: Receiver<ParseOutput>,
+    total_contig_length: u64,
+) -> Result<u64> {
+    let mut total_aligned_length = 0;
+
+    while let Some(parse_output) = stdout_stream.recv().await {
+        let line = match parse_output {
+            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
+            _ => continue,
+        };
+        if line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 11 {
+            continue;
+        }
+        total_aligned_length += fields[6].parse::<u64>().unwrap_or(0); // LEN 2 (query length)
+    }
+
+    if total_aligned_length == 0 {
+        return Err(anyhow!("No valid alignments found in show-coords output"));
+    }
+
+    Ok(total_contig_length.saturating_sub(total_aligned_length))
+}
+
+pub async fn compute_duplication_ratio(
+    mut stdout_stream: Receiver<ParseOutput>,
+    total_contig_length: u64,
+) -> Result<f64> {
+    let mut aligned_bases = Vec::new();
+
+    while let Some(parse_output) = stdout_stream.recv().await {
+        let line = match parse_output {
+            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
+            _ => continue,
+        };
+        if line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 11 {
+            continue;
+        }
+        let s2 = fields[3].parse::<u64>().unwrap_or(0);
+        let e2 = fields[4].parse::<u64>().unwrap_or(0);
+        aligned_bases.push((s2, e2));
+    }
+
+    if aligned_bases.is_empty() {
+        return Err(anyhow!("No valid alignments found in show-coords output"));
+    }
+
+
+    let total_aligned = aligned_bases.iter().map(|&(s, e)| e - s + 1).sum::<u64>();
+    Ok(total_aligned as f64 / total_contig_length as f64)
+}
+
+
+pub async fn compute_mismatches_per_100kbp(delta_path: &Path) -> Result<f64> {
+    let file = File::open(delta_path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut mismatches = 0;
+    let mut aligned_bases = 0;
+
+    while let Some(line) = lines.next_line().await? {
+        if line.starts_with('>') || line.starts_with("NUCMER") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 7 {
+            aligned_bases += fields[2].parse::<u64>().unwrap_or(0); // LEN 2
+            if fields.len() > 7 {
+                mismatches += fields.get(7).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            }
+        }
+    }
+
+    if aligned_bases == 0 {
+        return Err(anyhow!("No aligned bases found in delta file"));
+    }
+
+    Ok((mismatches as f64 / aligned_bases as f64) * 100_000.0)
+}
+
+
+pub async fn compute_indels_per_100kbp(delta_path: &Path) -> Result<f64> {
+    let file = File::open(delta_path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut indels = 0;
+    let mut aligned_bases = 0;
+
+    while let Some(line) = lines.next_line().await? {
+        if line.starts_with('>') || line.starts_with("NUCMER") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 7 {
+            aligned_bases += fields[2].parse::<u64>().unwrap_or(0); // LEN 2
+            if fields.len() > 8 {
+                indels += fields.get(8).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            }
+        }
+    }
+
+    if aligned_bases == 0 {
+        return Err(anyhow!("No aligned bases found in delta file"));
+    }
+
+    Ok((indels as f64 / aligned_bases as f64) * 100_000.0)
+}
+
+pub async fn compute_misassemblies(delta_path: &Path) -> Result<u32> {
+    let file = File::open(delta_path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut misassemblies = 0;
+    let mut prev_end = 0;
+    let mut prev_contig = String::new();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.starts_with('>') {
+            prev_contig = line.split_whitespace().nth(1).unwrap_or("").to_string();
+            prev_end = 0;
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 7 {
+            let start = fields[3].parse::<u64>().unwrap_or(0); // S2
+            let end = fields[4].parse::<u64>().unwrap_or(0); // E2
+            if !prev_contig.is_empty() && start > prev_end + 1000 { // Threshold for break
+                misassemblies += 1;
+            }
+            prev_end = end;
+        }
+    }
+
+    Ok(misassemblies)
+}
+
+
 //Reference Metrics
+
+
+#[derive(Debug)]
+pub struct ReferenceMetrics {
+    pub total_length: usize,                   // Total length of all contigs
+    pub gc_percent: f64,                       // GC percentage
+}
 
 /// Computes the QUAST-like metrics for a reference FASTA file
 ///
@@ -110,7 +267,7 @@ pub async fn compute_assembly_metrics(
 ///
 /// # Returns
 /// Result<(total_length, gc_percent)>
-pub async fn compute_reference_metrics(path: &PathBuf) -> Result<(usize, f64)> {
+pub async fn compute_reference_metrics(path: &PathBuf) -> Result<ReferenceMetrics> {
     let mut reader = match sequence_reader(path)? {
         SequenceReader::Fasta(reader) => reader,
         _ => return Err(anyhow!("Expected FASTA file for reference")),
@@ -128,7 +285,7 @@ pub async fn compute_reference_metrics(path: &PathBuf) -> Result<(usize, f64)> {
     } else {
         0.0
     };
-    Ok((total_length, gc_percent))
+    Ok(ReferenceMetrics{total_length, gc_percent})
 }
 
 
