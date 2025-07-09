@@ -4,4 +4,6 @@ pub mod streams;
 pub mod command;
 pub mod sequence;
 pub mod db;
+mod stats;
+mod metrics;
 
