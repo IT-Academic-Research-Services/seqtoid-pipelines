@@ -899,28 +899,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     )?;
 
     let (_assembly_eval_nucmer_child, assembly_eval_nucmer_err_task) = spawn_cmd(NUCMER_TAG, assembly_eval_args, config.args.verbose).await?;
-    cleanup_tasks.push(assembly_eval_nucmer_err_task);
+    assembly_eval_nucmer_err_task.await?;
 
-    // if !nucmer_delta_buf.clone().exists() {
-    //     return Err(anyhow!("File alignment.delta missing after nucmer run."));
-    // }
+    if !nucmer_delta_buf.clone().exists() {
+        return Err(anyhow!("File alignment.delta missing after nucmer run."));
+    }
 
-    // let assembly_metrics = match consensus_stats_stream {
-    //     Some(stream) => {
-    //         let (stats_rx, stats_task) = convert_stream(stream, config.args.buffer_size / 4).await?;
-    //         cleanup_tasks.push(stats_task);
-    //         compute_assembly_metrics(stats_rx, &CONTIG_THRESHOLDS).await?
-    //     }
-    //     None => {
-    //         return Err(anyhow!("Consensus stats stream not available for assembly metrics"));
-    //     }
-    // };
-    //
-    // eprintln!("{:?}", assembly_metrics);
-    //
-    // let reference_metrics = compute_reference_metrics(target_ref_fasta_path.as_ref().unwrap()).await?;
-    // eprintln!("{:?}", reference_metrics);
-    //
 
 
 
