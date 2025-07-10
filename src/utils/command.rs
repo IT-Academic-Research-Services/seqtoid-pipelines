@@ -883,18 +883,18 @@ pub mod show_coords {
     use crate::cli::Arguments;
     use crate::config::defs::{SHOW_COORDS_TAG, NUCMER_DELTA};
     use crate::utils::command::ArgGenerator;
-    
+
     pub struct ShowCoordsArgGenerator;
 
     impl ArgGenerator for ShowCoordsArgGenerator {
         fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            
+
             let mut args_vec: Vec<String> = Vec::new();
-            
+
             args_vec.push("-r".to_string());
             args_vec.push("-c".to_string());
             args_vec.push(NUCMER_DELTA.to_string());
-            
+
             Ok(args_vec)
         }
     }
@@ -910,6 +910,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         BCFTOOLS_TAG => Box::new(bcftools::BcftoolsArgGenerator),
         MAFFT_TAG => Box::new(mafft::MafftArgGenerator),
         NUCMER_TAG => Box::new(nucmer::NucmerArgGenerator),
+        SHOW_COORDS_TAG => Box::new(show_coords::ShowCoordsArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };

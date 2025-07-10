@@ -255,8 +255,8 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut align_bam_path: Option<PathBuf> = None;
     let mut align_query_pipe_path: Option<PathBuf> = None;
     let mut consensus_file_path: Option<PathBuf> = None;
-    let mut consensus_stats_stream : Option<Receiver<ParseOutput>>  = None;
     let mut consensus_eval_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_bam_eval_stream : Option<Receiver<ParseOutput>>  = None;
 
     //*****************
     // Split by Technology
@@ -640,7 +640,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_output_stream = streams_iter.next().unwrap();
             let consensus_bam_file_stream = streams_iter.next().unwrap();
             let consensus_bam_call_stream = streams_iter.next().unwrap();
-            let consensus_bam_eval_stream = streams_iter.next().unwrap();
+            consensus_bam_eval_stream = Some(streams_iter.next().unwrap());
 
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
@@ -689,7 +689,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                4,
+                3,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -700,7 +700,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let mut streams_iter = consensus_streams.into_iter();
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
-            consensus_stats_stream = Some(streams_iter.next().unwrap());
             consensus_eval_stream = Some(streams_iter.next().unwrap());
 
 
@@ -934,17 +933,19 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     );
 
 
+    let consensus_eval_stream = consensus_eval_stream.ok_or_else(|| anyhow!("Consensus eval stream is None"))?;
+    let (fasta_rx, convert_task) = convert_stream(consensus_eval_stream, config.args.buffer_size).await?;
+    cleanup_tasks.push(convert_task);
 
-    // fasta_rx: Receiver<SequenceRecord>, ->   consensus_eval_stream
-    // ref_fasta_path: &PathBuf, -> target_ref_fasta_path
-    // bam_stream: Receiver<ParseOutput>, ->  , -> consensus_bam_eval_stream
-    // show_coords_stream: Receiver<ParseOutput>,  -> assembly_show_coords_out_stream
-    // delta_path: &Path, -> NUCMER_DELTA
-    // thresholds: &[usize], CONTIG_THRESHOLDS
-    // output_path: &PathBuf, -> assembly_eval_report_path
+    let consensus_bam_eval_stream = consensus_bam_eval_stream.ok_or_else(|| anyhow!("Consensus BAM eval stream is None"))?;
 
-
-
+    write_metrics_to_tsv(fasta_rx,
+                         &target_ref_fasta_path.as_ref().unwrap().clone(),
+                         consensus_bam_eval_stream,
+                         assembly_show_coords_out_stream,
+                         &nucmer_delta_buf.clone(),
+                         &CONTIG_THRESHOLDS,
+                         &assembly_eval_report_path).await?;
 
 
 

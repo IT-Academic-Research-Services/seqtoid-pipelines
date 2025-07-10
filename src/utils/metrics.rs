@@ -645,7 +645,7 @@ pub async fn write_metrics_to_tsv(
     ref_fasta_path: &PathBuf,
     bam_stream: Receiver<ParseOutput>,
     show_coords_stream: Receiver<ParseOutput>,
-    delta_path: &Path,
+    delta_path: &PathBuf,
     thresholds: &[usize],
     output_path: &PathBuf,
 ) -> Result<()> {
