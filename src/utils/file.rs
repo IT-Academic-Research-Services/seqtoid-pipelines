@@ -207,7 +207,7 @@ pub async fn write_parse_output_to_fifo(
     let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
-        eprintln!("Starting query FIFO write to {}", fifo_path.display());
+        // eprintln!("Starting query FIFO write to {}", fifo_path.display());
         let mut writer_file = TokioFile::create(&fifo_path)
             .await
             .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
@@ -242,7 +242,7 @@ pub async fn write_parse_output_to_fifo(
             return Err(anyhow!("No data written to FIFO at {}", fifo_path.display()));
         }
 
-        eprintln!("Finished query FIFO write: {} bytes to {}", byte_count, fifo_path.display());
+        // eprintln!("Finished query FIFO write: {} bytes to {}", byte_count, fifo_path.display());
         Ok(())
     });
 
