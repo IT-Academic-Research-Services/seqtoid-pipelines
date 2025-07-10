@@ -2,7 +2,7 @@ use std::fs;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
 use crate::cli::Technology;
@@ -13,11 +13,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, CONTIG_THRESHOLDS};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, CONTIG_THRESHOLDS, SequenceRecord};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, convert_stream};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, NUCMER_DELTA};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, NUCMER_DELTA, SHOW_COORDS_TAG};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
-use crate::utils::metrics::{compute_assembly_metrics, compute_reference_metrics};
+use crate::utils::metrics::write_metrics_to_tsv;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
@@ -256,6 +256,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut align_query_pipe_path: Option<PathBuf> = None;
     let mut consensus_file_path: Option<PathBuf> = None;
     let mut consensus_stats_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_eval_stream : Option<Receiver<ParseOutput>>  = None;
 
     //*****************
     // Split by Technology
@@ -626,7 +627,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                3,
+                4,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -639,6 +640,8 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_output_stream = streams_iter.next().unwrap();
             let consensus_bam_file_stream = streams_iter.next().unwrap();
             let consensus_bam_call_stream = streams_iter.next().unwrap();
+            let consensus_bam_eval_stream = streams_iter.next().unwrap();
+
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -686,7 +689,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                3,
+                4,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -698,6 +701,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
             consensus_stats_stream = Some(streams_iter.next().unwrap());
+            consensus_eval_stream = Some(streams_iter.next().unwrap());
 
 
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
@@ -904,6 +908,40 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     if !nucmer_delta_buf.clone().exists() {
         return Err(anyhow!("File alignment.delta missing after nucmer run."));
     }
+
+    let assembly_show_coords_args = generate_cli(
+        SHOW_COORDS_TAG,
+        &config.args,
+        None,
+    )?;
+
+    let (mut assembly_show_coords_child, assembly_show_coords_err_task) = spawn_cmd(SHOW_COORDS_TAG, assembly_show_coords_args, config.args.verbose).await?;
+    let assembly_show_coords_out_stream = parse_child_output(
+        &mut assembly_show_coords_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.args.buffer_size / 4,
+    ).await?;
+    cleanup_tasks.push(assembly_show_coords_err_task);
+
+
+    let assembly_eval_report_path = file_path_manipulator(
+        &no_ext_sample_base_buf,
+        &cwd.clone(),
+        None,
+        Some("assembly_eval_report.tsv"),
+        "_"
+    );
+
+
+
+    // fasta_rx: Receiver<SequenceRecord>, ->   consensus_eval_stream
+    // ref_fasta_path: &PathBuf, -> target_ref_fasta_path
+    // bam_stream: Receiver<ParseOutput>, ->  , -> consensus_bam_eval_stream
+    // show_coords_stream: Receiver<ParseOutput>,  -> assembly_show_coords_out_stream
+    // delta_path: &Path, -> NUCMER_DELTA
+    // thresholds: &[usize], CONTIG_THRESHOLDS
+    // output_path: &PathBuf, -> assembly_eval_report_path
 
 
 

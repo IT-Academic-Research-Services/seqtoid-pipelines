@@ -881,7 +881,7 @@ pub mod nucmer {
 pub mod show_coords {
     use anyhow::anyhow;
     use crate::cli::Arguments;
-    use crate::config::defs::{SHOW_COORDS_TAG,NUCMER_DELTA};
+    use crate::config::defs::{SHOW_COORDS_TAG, NUCMER_DELTA};
     use crate::utils::command::ArgGenerator;
     
     pub struct ShowCoordsArgGenerator;

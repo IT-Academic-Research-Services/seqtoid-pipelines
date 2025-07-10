@@ -579,7 +579,7 @@ pub async fn compute_all_metrics(
     // Compute reference metrics first
     let reference_metrics = compute_reference_metrics(ref_fasta_path).await?;
 
-    // Compute assembly metrics (needs show-coords stream)
+    // Compute assembly metrics
     let assembly_metrics = compute_assembly_metrics(rx_fasta, thresholds, rx1).await?;
 
     // Compute remaining metrics concurrently
