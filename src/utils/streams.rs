@@ -80,6 +80,7 @@ pub enum ParseMode {
     Fastq,
     Fasta,
     Bytes,
+    Lines
 }
 
 #[derive(Clone, Debug)]
@@ -357,17 +358,11 @@ pub async fn parse_child_output(
 ) -> Result<mpsc::Receiver<ParseOutput>> {
     match (stream, mode) {
         (ChildStream::Stdout, ParseMode::Fastq) => {
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
             parse_fastq(stdout, buffer_size).await
         }
         (ChildStream::Stderr, ParseMode::Fastq) => {
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
             parse_fastq(stderr, buffer_size).await
         }
         (ChildStream::Stdout, ParseMode::Fasta) => {
@@ -375,22 +370,24 @@ pub async fn parse_child_output(
             parse_fasta(stdout, buffer_size).await
         }
         (ChildStream::Stderr, ParseMode::Fasta) => {
-            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
             parse_fasta(stderr, buffer_size).await
         }
         (ChildStream::Stdout, ParseMode::Bytes) => {
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
             parse_bytes(stdout, buffer_size).await
         }
         (ChildStream::Stderr, ParseMode::Bytes) => {
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
             parse_bytes(stderr, buffer_size).await
+        }
+        (ChildStream::Stdout, ParseMode::Lines) => {
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_lines(stdout, buffer_size).await
+        }
+        (ChildStream::Stderr, ParseMode::Lines) => {
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_lines(stderr, buffer_size).await
         }
     }
 }
@@ -592,6 +589,39 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 }
             }
         }
+    });
+
+    Ok(rx)
+}
+
+/// Helper function to parse line data
+///
+/// # Arguments
+///
+/// * `reader` - reading stream
+/// * `buffer_size` - stream buffer size
+///
+/// # Returns
+/// Result<mpsc::Receiver<ParseOutput>>
+pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    buffer_size: usize,
+) -> Result<mpsc::Receiver<ParseOutput>> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+    let mut line = String::new();
+
+    tokio::spawn(async move {
+        while reader.read_line(&mut line).await? > 0 {
+            // Remove trailing newline for consistency
+            let trimmed_line = line.trim_end().to_string();
+            if tx.send(ParseOutput::Bytes(trimmed_line.into_bytes())).await.is_err() {
+                eprintln!("No active receivers for line");
+                break;
+            }
+            line.clear();
+        }
+        Ok::<(), anyhow::Error>(())
     });
 
     Ok(rx)
