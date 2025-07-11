@@ -95,20 +95,30 @@ pub async fn compute_assembly_metrics(
     let mut total_gc = 0;
     let mut total_bases = 0;
     let mut total_ns = 0;
+    let mut record_count = 0;
 
+    eprintln!("Starting compute_assembly_metrics");
     while let Some(record) = rx.recv().await {
+        record_count += 1;
+        // eprintln!("Received FASTA record {}: {:?}", record_count, record);
         match record {
-            SequenceRecord::Fasta { seq, .. } => {
+            SequenceRecord::Fasta { seq, id, .. } => {
                 let len = seq.len();
+                eprintln!("FASTA record id: {}, length: {}", id, len);
                 contig_lengths.push(len);
                 total_bases += len;
                 total_gc += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'G' || b.to_ascii_uppercase() == b'C').count();
                 total_ns += seq.iter().filter(|&&b| b.to_ascii_uppercase() == b'N').count();
             }
             SequenceRecord::Fastq { .. } => {
-                return Err(anyhow!("Expected FASTA record, got FASTQ"));
+                return Err(anyhow!("Expected FASTA record, got FASTQ at record {}", record_count));
             }
         }
+    }
+    eprintln!("Total FASTA records processed: {}, contig_lengths: {:?}", record_count, contig_lengths);
+
+    if contig_lengths.is_empty() {
+        return Err(anyhow!("No valid FASTA records found in consensus_eval_stream"));
     }
 
     let num_contigs = contig_lengths.len();
@@ -167,31 +177,58 @@ async fn compute_unaligned_metrics(
 ) -> Result<(u64, usize)> {
     let mut total_aligned_length = 0;
     let mut aligned_contigs = HashSet::new();
+    eprintln!("Starting compute_unaligned_metrics");
 
     while let Some(parse_output) = stdout_stream.recv().await {
         let line = match parse_output {
-            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
-            _ => continue,
+            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)
+                .map_err(|e| anyhow!("Invalid UTF-8: {}", e))?,
+            _ => {
+                eprintln!("Skipping non-bytes output");
+                continue;
+            }
         };
-        if line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
+        eprintln!("Received line: {}", line);
+        if line.is_empty() || line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
+            eprintln!("Skipping header, footer, or empty line: {}", line);
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 11 {
+        eprintln!("Fields (len={}): {:?}", fields.len(), fields);
+        // Check for alignment line: must have at least 13 fields, numeric S1, LEN 2, and tags
+        if fields.len() < 13 || !fields[0].parse::<u64>().is_ok() || !fields[6].parse::<u64>().is_ok() {
+            eprintln!("Skipping non-alignment line: {}", line);
             continue;
         }
-        total_aligned_length += fields[6].parse::<u64>().unwrap_or(0); // LEN 2 (query length)
-        if let Some(contig_name) = fields.get(11) {
+        // Find the query contig name (last field)
+        if let Some(contig_name) = fields.last() {
+            total_aligned_length += fields[6].parse::<u64>().map_err(|e| {
+                anyhow!("Failed to parse LEN 2 from '{}': {}", fields[6], e)
+            })?;
             aligned_contigs.insert(contig_name.to_string());
+            eprintln!("Added query contig: {}", contig_name);
+        } else {
+            eprintln!("No query contig found in line: {}", line);
+            continue;
         }
     }
 
     if total_aligned_length == 0 {
-        return Err(anyhow!("No valid alignments found in show-coords output"));
+        return Err(anyhow!("compute_unaligned_metrics: No valid alignments found in show-coords output"));
     }
 
-    let unaligned_length = total_contig_length.saturating_sub(total_aligned_length);
+    if aligned_contigs.len() > contig_lengths.len() {
+        eprintln!("Error: aligned_contigs.len() ({}) > contig_lengths.len() ({})",
+                  aligned_contigs.len(), contig_lengths.len());
+        eprintln!("Aligned contigs: {:?}", aligned_contigs);
+        return Err(anyhow!("More aligned contigs than total contigs in assembly"));
+    }
+
     let unaligned_contigs = contig_lengths.len() - aligned_contigs.len();
+    let unaligned_length = total_contig_length.saturating_sub(total_aligned_length);
+
+    eprintln!("Total aligned length: {}, Unaligned length: {}, Unaligned contigs: {}",
+              total_aligned_length, unaligned_length, unaligned_contigs);
 
     Ok((unaligned_length, unaligned_contigs))
 }
@@ -220,7 +257,7 @@ pub async fn compute_duplication_ratio(
     }
 
     if aligned_bases.is_empty() {
-        return Err(anyhow!("No valid alignments found in show-coords output"));
+        return Err(anyhow!("compute_duplication_ratio: No valid alignments found in show-coords output"));
     }
 
     let total_aligned = aligned_bases.iter().map(|&(s, e)| e - s + 1).sum::<u64>();
@@ -367,11 +404,11 @@ pub async fn parse_show_coords(
             ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
             _ => continue,
         };
-        if line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
+        if line.is_empty() || line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 11 {
+        if fields.len() < 13 || !fields[0].parse::<u64>().is_ok() {
             continue;
         }
         let alignment = (
@@ -379,7 +416,7 @@ pub async fn parse_show_coords(
             fields[1].parse::<u64>().unwrap_or(0), // E1
             fields[3].parse::<u64>().unwrap_or(0), // S2
             fields[4].parse::<u64>().unwrap_or(0), // E2
-            fields[6].parse::<u64>().unwrap_or(0), // LEN 2 (query length)
+            fields[6].parse::<u64>().unwrap_or(0), // LEN 2
             fields[7].parse::<f64>().unwrap_or(0.0), // % IDY
             fields[9].parse::<f64>().unwrap_or(0.0), // COV R
             fields[10].parse::<f64>().unwrap_or(0.0), // COV Q
@@ -387,8 +424,10 @@ pub async fn parse_show_coords(
         alignments.push(alignment);
     }
 
+
+
     if alignments.is_empty() {
-        return Err(anyhow!("No valid alignments found in show-coords output"));
+        return Err(anyhow!("parse_show_coords: No valid alignments found in show-coords output"));
     }
 
     let total_aligned_length = alignments.iter().map(|a| a.4).sum::<u64>();
