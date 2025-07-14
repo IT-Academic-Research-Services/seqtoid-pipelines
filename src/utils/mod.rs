@@ -6,4 +6,5 @@ pub mod sequence;
 pub mod db;
 mod stats;
 pub mod metrics;
+pub mod align;
 

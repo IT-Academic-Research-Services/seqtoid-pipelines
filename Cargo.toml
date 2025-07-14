@@ -22,6 +22,7 @@ bincode = { version = "2.0.1", features = ["serde"] }
 ndarray = "0.16.1"
 num_cpus = "1.16"
 rust-htslib = "0.50.0"
+bio = "2.3.0"
 
 [dev-dependencies]
 sysinfo = "0.35.0"
