@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
+use crate::utils::command::quast::QuastConfig;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -892,6 +893,31 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     //*****************
     // Assembly Evaluation
+
+
+//quast try
+    // Makes sure the needed files for Quast are written
+    let results = try_join_all(quast_write_tasks).await?;
+    for result in results {
+        result?;
+    }
+
+
+    if [
+        target_ref_fasta_path.as_ref(),
+        align_bam_path.as_ref(),
+        align_query_pipe_path.as_ref(),
+        consensus_file_path.as_ref()
+    ].iter().any(|opt| opt.is_none()) {
+        return Err(anyhow!("One or more required paths are not set"));
+    }
+
+    let quast_config = QuastConfig {
+        ref_fasta: target_ref_fasta_path.unwrap().to_string_lossy().into_owned(),
+        ref_bam: align_bam_path.unwrap().to_string_lossy().into_owned(),
+        fastq: align_query_pipe_path.unwrap().to_string_lossy().into_owned(),
+        assembly_fasta: consensus_file_path.unwrap().to_string_lossy().into_owned(),
+    };
 
 
     // let nucmer_delta_buf = file_path_manipulator(&PathBuf::from(NUCMER_DELTA), &cwd, None, None, "");
