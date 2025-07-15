@@ -25,6 +25,7 @@ use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
+use crate::utils::stats::parse_samtools_stats;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -950,7 +951,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             parse_child_output(
                 &mut stats_samtools_child_stats,
                 ChildStream::Stdout,
-                ParseMode::Bytes,
+                ParseMode::Lines,
                 config.args.buffer_size / 4,
             ).await?
         }
@@ -975,11 +976,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         }
     }
 
-    let sam_write_task = tokio::spawn(stream_to_file(
-        stats_samtools_out_stream_stats,
-        PathBuf::from("samstats.txt"),
-    ));
-    cleanup_tasks.push(sam_write_task);
+    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats);
 
 
     if let Some(stream) = consensus_stats_stream {
