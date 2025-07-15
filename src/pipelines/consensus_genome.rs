@@ -15,7 +15,7 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, CONTIG_THRESHOLDS, SequenceRecord};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, convert_stream};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, NUCMER_DELTA, SHOW_COORDS_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, NUCMER_DELTA, SHOW_COORDS_TAG, QUAST_TAG};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::metrics::write_metrics_to_tsv;
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -42,6 +42,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Initialize cleanup tasks
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let mut quast_write_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
     // External tools check
     let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, NUCMER_TAG]).await?;
@@ -274,8 +275,9 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), target_ref_fasta_path.as_ref().unwrap(), config.args.buffer_size).await?;
 
             println!("Temporary FASTA written to: {:?}", target_ref_fasta_path.as_ref().unwrap());
+            quast_write_tasks.push(target_ref_write_task);
 
-            cleanup_tasks.push(target_ref_write_task);
+
 
             //*****************
             // ERCC
@@ -563,7 +565,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 None
             ).await?;
             align_query_pipe_path = Some(align_query_pipe_path_temp.clone());
-            cleanup_tasks.push(align_query_write_task);
+            quast_write_tasks.push(align_query_write_task);
 
             let align_minimap2_args = generate_cli(
                 MINIMAP2_TAG,
@@ -651,7 +653,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 consensus_bam_file_stream,
                 align_bam_path.as_ref().unwrap().clone(),
             ));
-            cleanup_tasks.push(consensus_bam_write_task);
+            quast_write_tasks.push(consensus_bam_write_task);
 
             let consensus_samtools_config = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Consensus,
@@ -711,7 +713,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 consensus_file_stream,
                 consensus_file_path.as_ref().unwrap().clone()
             ));
-            // cleanup_tasks.push(consensus_fa_write_task);
+            quast_write_tasks.push(consensus_fa_write_task);
 
             //*****************
             // Call Variants
@@ -877,9 +879,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             ));
             cleanup_tasks.push(realign_consensus_write_task);
 
-            // Await this here so it's ready for Nucmer
-            consensus_fa_write_task.await?;
-
 
         } // end tech == illumina
         Technology::ONT => {
@@ -906,7 +905,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     if [
         target_ref_fasta_path.as_ref(),
         align_bam_path.as_ref(),
-        align_query_pipe_path.as_ref(),
         consensus_file_path.as_ref()
     ].iter().any(|opt| opt.is_none()) {
         return Err(anyhow!("One or more required paths are not set"));
@@ -915,11 +913,18 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let quast_config = QuastConfig {
         ref_fasta: target_ref_fasta_path.unwrap().to_string_lossy().into_owned(),
         ref_bam: align_bam_path.unwrap().to_string_lossy().into_owned(),
-        fastq: align_query_pipe_path.unwrap().to_string_lossy().into_owned(),
         assembly_fasta: consensus_file_path.unwrap().to_string_lossy().into_owned(),
     };
 
+    let assembly_eval_quast_args = generate_cli(
+        QUAST_TAG,
+        &config.args,
+        Some(&quast_config),
+    )?;
+    eprintln!("{:?}", assembly_eval_quast_args);
 
+
+    // internal evaluation try
     // let nucmer_delta_buf = file_path_manipulator(&PathBuf::from(NUCMER_DELTA), &cwd, None, None, "");
     // eprintln!("nucmer delta {}", nucmer_delta_buf.to_string_lossy());
     // if nucmer_delta_buf.exists() {

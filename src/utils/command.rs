@@ -747,7 +747,6 @@ pub mod quast {
     pub struct QuastConfig {
         pub ref_fasta: String,
         pub ref_bam: String,
-        pub fastq: String,
         pub assembly_fasta: String,
     }
 
@@ -797,7 +796,13 @@ pub mod quast {
             args_vec.push("0".to_string());
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
-
+            args_vec.push("-o".to_string());
+            args_vec.push("quast".to_string());
+            args_vec.push("-r".to_string());
+            args_vec.push( config.ref_fasta.to_string());
+            args_vec.push("--ref-bam".to_string());
+            args_vec.push( config.ref_bam.to_string());
+            args_vec.push( config.assembly_fasta.to_string());
 
             Ok(args_vec)
         }
@@ -911,6 +916,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         MAFFT_TAG => Box::new(mafft::MafftArgGenerator),
         NUCMER_TAG => Box::new(nucmer::NucmerArgGenerator),
         SHOW_COORDS_TAG => Box::new(show_coords::ShowCoordsArgGenerator),
+        QUAST_TAG => Box::new(quast::QuastArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
