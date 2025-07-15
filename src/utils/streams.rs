@@ -612,9 +612,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
 
     tokio::spawn(async move {
         while reader.read_line(&mut line).await? > 0 {
-            // Remove trailing newline for consistency
-            let trimmed_line = line.trim_end().to_string();
-            if tx.send(ParseOutput::Bytes(trimmed_line.into_bytes())).await.is_err() {
+            if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
                 eprintln!("No active receivers for line");
                 break;
             }
