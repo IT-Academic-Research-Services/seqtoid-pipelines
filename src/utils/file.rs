@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::fs::File as TokioFile;
 use tokio::process::Command;
 use tokio_stream::StreamExt;
+use crate::utils::streams::ToBytes;
 
 
 
@@ -194,7 +195,6 @@ pub async fn write_parse_output_to_fifo(
     if fifo_path.exists() {
         std::fs::remove_file(fifo_path)?;
     }
-
     let status = Command::new("mkfifo")
         .arg(fifo_path)
         .status()
@@ -203,17 +203,14 @@ pub async fn write_parse_output_to_fifo(
     if !status.success() {
         return Err(anyhow!("mkfifo failed with status: {}", status));
     }
-    
-    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB
+    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024);
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
-        // eprintln!("Starting query FIFO write to {}", fifo_path.display());
         let mut writer_file = TokioFile::create(&fifo_path)
             .await
             .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
         let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
         let mut byte_count = 0;
-
         while let Some(item) = input_stream.next().await {
             match item {
                 ParseOutput::Bytes(data) => {
@@ -223,12 +220,27 @@ pub async fn write_parse_output_to_fifo(
                         .map_err(|e| anyhow!("Failed to write to FIFO at {}: {}", fifo_path.display(), e))?;
                     byte_count += data.len();
                 }
+                ParseOutput::Fasta(record) => {
+                    let bytes = record.to_bytes()?;
+                    writer
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| anyhow!("Failed to write FASTA to FIFO at {}: {}", fifo_path.display(), e))?;
+                    byte_count += bytes.len();
+                }
+                ParseOutput::Fastq(record) => {
+                    let bytes = record.to_bytes()?;
+                    writer
+                        .write_all(&bytes)
+                        .await
+                        .map_err(|e| anyhow!("Failed to write FASTQ to FIFO at {}: {}", fifo_path.display(), e))?;
+                    byte_count += bytes.len();
+                }
                 _ => {
-                    return Err(anyhow!("Expected Bytes in stream, got unexpected data at {}", fifo_path.display()));
+                    return Err(anyhow!("Unexpected data in stream at {}", fifo_path.display()));
                 }
             }
         }
-
         writer
             .flush()
             .await
@@ -237,15 +249,11 @@ pub async fn write_parse_output_to_fifo(
             .shutdown()
             .await
             .map_err(|e| anyhow!("Failed to shutdown FIFO at {}: {}", fifo_path.display(), e))?;
-
         if byte_count == 0 {
             return Err(anyhow!("No data written to FIFO at {}", fifo_path.display()));
         }
-
-        // eprintln!("Finished query FIFO write: {} bytes to {}", byte_count, fifo_path.display());
         Ok(())
     });
-
     Ok(task)
 }
 
