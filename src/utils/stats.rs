@@ -2,7 +2,11 @@
 use std::path::Path;
 use std::process::Command;
 use anyhow::{Result, anyhow};
-
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+use std::collections::HashMap;
+use crate::utils::streams::ParseOutput;
 
 
 
@@ -52,4 +56,51 @@ pub fn compute_lx(lengths: &[u64], fraction: f64) -> u32 {
         }
     }
     0
+}
+
+
+
+/// Parses samtools stats lines.
+///
+/// # Arguments
+///
+/// * `rx` - samtools stats `ParseOutput::Bytes`
+///
+/// # Returns
+///
+/// Hamshmap <String, String>
+pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
+    let mut stats = HashMap::new();
+    let mut stream = ReceiverStream::new(rx);
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Bytes(line_bytes) => {
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Parse lines starting with "SN" (Summary Numbers)
+                if line.starts_with("SN") {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 3 {
+                        let key = parts[1].trim_end_matches(':').to_string();
+                        let value = parts[2].to_string();
+                        stats.insert(key, value);
+                    }
+                }
+                // other sections (e.g., FFQ, COV) if needfed in future
+            }
+            _ => {
+                return Err(anyhow!("Unexpected non-byte data in samtools stats stream"));
+            }
+        }
+    }
+
+    if stats.is_empty() {
+        return Err(anyhow!("No valid samtools stats data parsed"));
+    }
+
+    Ok(stats)
 }
