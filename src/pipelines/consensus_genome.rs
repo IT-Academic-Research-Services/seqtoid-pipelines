@@ -256,6 +256,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut consensus_file_path: Option<PathBuf> = None;
     let mut consensus_eval_stream : Option<Receiver<ParseOutput>>  = None;
     let mut consensus_bam_eval_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut ercc_stats_stream: Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_bam_stats_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_stats_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut call_bcftools_stats_stream : Option<Receiver<ParseOutput>>  = None;
 
     //*****************
     // Split by Technology
@@ -348,8 +352,24 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             cleanup_tasks.push(ercc_samtools_task_stats);
             cleanup_tasks.push(ercc_samtools_err_task_stats);
 
-            let ercc_stats_write_task = tokio::spawn(stream_to_file(
+            let ercc_samtools_out_stream_stats = ReceiverStream::new(ercc_samtools_out_stream_stats);
+            let (ercc_streams, ercc_done_rx) = t_junction(
                 ercc_samtools_out_stream_stats,
+                2,
+                config.args.buffer_size,
+                config.args.stall_threshold.try_into().unwrap(),
+                Some(config.args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+            cleanup_receivers.push(ercc_done_rx);
+
+            let mut streams_iter = ercc_streams.into_iter();
+            let ercc_file_stream = streams_iter.next().unwrap();
+            ercc_stats_stream  = Some(streams_iter.next().unwrap());
+
+            let ercc_stats_write_task = tokio::spawn(stream_to_file(
+                ercc_file_stream,
                 PathBuf::from(ercc_stats_file_path),
             ));
             cleanup_tasks.push(ercc_stats_write_task);
@@ -629,7 +649,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                4,
+                5,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -643,7 +663,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_file_stream = streams_iter.next().unwrap();
             let consensus_bam_call_stream = streams_iter.next().unwrap();
             consensus_bam_eval_stream = Some(streams_iter.next().unwrap());
-
+            consensus_bam_stats_stream = Some(streams_iter.next().unwrap());
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -691,7 +711,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                3,
+                4,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -703,6 +723,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
             consensus_eval_stream = Some(streams_iter.next().unwrap());
+            consensus_stats_stream = Some(streams_iter.next().unwrap());
 
 
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
@@ -826,8 +847,23 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.buffer_size / 4,
             ).await?;
 
-            let called_variants_write_task = tokio::spawn(stream_to_file(
+            let call_bcftools_out_stream_view = ReceiverStream::new(call_bcftools_out_stream_view);
+            let (call_bcftools_out_streams, call_bcftools_done_rx) = t_junction(
                 call_bcftools_out_stream_view,
+                2,
+                config.args.buffer_size,
+                config.args.stall_threshold.try_into().unwrap(),
+                Some(config.args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+            cleanup_receivers.push(call_bcftools_done_rx);
+
+            let mut streams_iter = call_bcftools_out_streams.into_iter();
+            let call_bcftools_file_stream = streams_iter.next().unwrap();
+            call_bcftools_stats_stream  = Some(streams_iter.next().unwrap());
+            let called_variants_write_task = tokio::spawn(stream_to_file(
+                call_bcftools_file_stream,
                 called_variants_path
             ));
             cleanup_tasks.push(called_variants_write_task);
@@ -885,6 +921,91 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             return Err(anyhow!("Minion not ready"));
         }
     }
+
+
+    //*****************
+    // Calculate Statistics
+
+    let stats_samtools_config_stats = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Stats,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
+    };
+    let stats_samtools_args_stats = generate_cli(
+        SAMTOOLS_TAG,
+        &config.args,
+        Some(&stats_samtools_config_stats),
+    )?;
+
+    let stats_samtools_out_stream_stats = match consensus_bam_stats_stream {
+        Some(stream) => {
+            let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(
+                stream,
+                SAMTOOLS_TAG,
+                stats_samtools_args_stats.clone(),
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
+            cleanup_tasks.push(stats_samtools_task_stats);
+            cleanup_tasks.push(stats_samtools_err_task_stats);
+            parse_child_output(
+                &mut stats_samtools_child_stats,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.args.buffer_size / 4,
+            ).await?
+        }
+        None => {
+            return Err(anyhow!("consensus_bam_stats_stream is not available"));
+        }
+    };
+
+
+    // test writes
+
+    match ercc_stats_stream {
+        Some(stream) => {
+            let ercc_write_task = tokio::spawn(stream_to_file(
+                stream,
+                PathBuf::from("test_ercc.txt"),
+            ));
+            cleanup_tasks.push(ercc_write_task);
+        }
+        None => {
+            eprintln!("Warning: ercc_stats_stream is not available, skipping write to test_ercc.txt");
+        }
+    }
+
+    let sam_write_task = tokio::spawn(stream_to_file(
+        stats_samtools_out_stream_stats,
+        PathBuf::from("samstats.txt"),
+    ));
+    cleanup_tasks.push(sam_write_task);
+
+
+    if let Some(stream) = consensus_stats_stream {
+        let consensus_stats_write_task = tokio::spawn(stream_to_file(
+            stream,
+            PathBuf::from("consensus_stats.txt"),
+        ));
+        cleanup_tasks.push(consensus_stats_write_task);
+    } else {
+        eprintln!("Warning: consensus_stats_stream is not available, skipping write to consensus_stats.txt");
+    }
+
+    if let Some(stream) = call_bcftools_stats_stream {
+        let bcftools_stats_write_task = tokio::spawn(stream_to_file(
+            stream,
+            PathBuf::from("bcftools_stats.txt"),
+        ));
+        cleanup_tasks.push(bcftools_stats_write_task);
+    } else {
+        eprintln!("Warning: call_bcftools_stats_stream is not available, skipping write to bcftools_stats.txt");
+    }
+
+
+
+    //
+
 
     //*****************
     // Assembly Evaluation

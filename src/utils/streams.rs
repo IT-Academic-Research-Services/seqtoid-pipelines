@@ -259,7 +259,6 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
         writer.flush().await?;
         writer.shutdown().await?;
-        eprintln!("Completed writing to {} (total: {} bytes)", cmd_tag_owned, total_written);
         Ok(())
     });
 
