@@ -1,8 +1,7 @@
-use std::fs;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
 use crate::cli::Technology;
@@ -13,15 +12,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, CONTIG_THRESHOLDS, SequenceRecord};
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, convert_stream};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, NUCMER_DELTA, SHOW_COORDS_TAG, QUAST_TAG};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
-use crate::utils::metrics::write_metrics_to_tsv;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
-use crate::utils::command::nucmer::NucmerConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
 use futures::future::try_join_all;
@@ -277,8 +274,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             println!("Temporary FASTA written to: {:?}", target_ref_fasta_path.as_ref().unwrap());
             quast_write_tasks.push(target_ref_write_task);
 
-
-
+            
             //*****************
             // ERCC
             let (ercc_streams, ercc_done_rx) = t_junction(
@@ -893,14 +889,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Assembly Evaluation
 
-
-//quast try
     // Makes sure the needed files for Quast are written
     let results = try_join_all(quast_write_tasks).await?;
     for result in results {
         result?;
     }
-
 
     if [
         target_ref_fasta_path.as_ref(),
@@ -921,88 +914,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         &config.args,
         Some(&quast_config),
     )?;
-    eprintln!("{:?}", assembly_eval_quast_args);
 
+    let (_assembly_eval_quast_child, assembly_eval_quast_err_task) = spawn_cmd(QUAST_TAG, assembly_eval_quast_args, config.args.verbose).await?;
+    cleanup_tasks.push(assembly_eval_quast_err_task);
 
-    // internal evaluation try
-    // let nucmer_delta_buf = file_path_manipulator(&PathBuf::from(NUCMER_DELTA), &cwd, None, None, "");
-    // eprintln!("nucmer delta {}", nucmer_delta_buf.to_string_lossy());
-    // if nucmer_delta_buf.exists() {
-    //     fs::remove_file(&nucmer_delta_buf)?;
-    // }
-    //
-    // let assembly_eval_nucmer_config = NucmerConfig {
-    //     ref_fasta: target_ref_fasta_path.as_ref().unwrap().clone(),
-    //     assembly_fasta: consensus_file_path.as_ref().unwrap().clone(),
-    // };
-    //
-    // let assembly_eval_args = generate_cli(
-    //     NUCMER_TAG,
-    //     &config.args,
-    //     Some(&assembly_eval_nucmer_config),
-    // )?;
-    //
-    // eprintln!("nucmer args: {:?}", assembly_eval_args);
-    //
-    // let preserved_path = PathBuf::from("preserved_reference.fasta");
-    // fs::copy(&assembly_eval_nucmer_config.ref_fasta, &preserved_path)?;
-    // println!("Preserved reference FASTA at: {:?}", preserved_path);
-    //
-    // let (mut assembly_eval_nucmer_child, assembly_eval_nucmer_err_task) = spawn_cmd(NUCMER_TAG, assembly_eval_args, true).await?;
-    // let status = assembly_eval_nucmer_child
-    //     .wait()
-    //     .await
-    //     .map_err(|e| anyhow!("Failed to wait for nucmer: {}", e))?;
-    // println!("nucmer exit status: {:?}", status);
-    // cleanup_tasks.push(assembly_eval_nucmer_err_task);
-    //
-    // if !nucmer_delta_buf.exists() {
-    //     return Err(anyhow!("File alignment.delta missing after nucmer run."));
-    // }
-    //
-    //
-    //
-    // let assembly_show_coords_args = generate_cli(
-    //     SHOW_COORDS_TAG,
-    //     &config.args,
-    //     None,
-    // )?;
-    // eprintln!("show coords args: {:?}", assembly_show_coords_args);
-    // let (mut assembly_show_coords_child, assembly_show_coords_err_task) = spawn_cmd(SHOW_COORDS_TAG, assembly_show_coords_args, true).await?;
-    // let assembly_show_coords_out_stream = parse_child_output(
-    //     &mut assembly_show_coords_child,
-    //     ChildStream::Stdout,
-    //     ParseMode::Lines,
-    //     config.args.buffer_size / 4,
-    // ).await?;
-    // cleanup_tasks.push(assembly_show_coords_err_task);
-    //
-    //
-    // let assembly_eval_report_path = file_path_manipulator(
-    //     &no_ext_sample_base_buf,
-    //     &cwd.clone(),
-    //     None,
-    //     Some("assembly_eval_report.tsv"),
-    //     "_"
-    // );
-    //
-    //
-    // let consensus_eval_stream = consensus_eval_stream.ok_or_else(|| anyhow!("Consensus eval stream is None"))?;
-    // let (fasta_rx, convert_task) = convert_stream(consensus_eval_stream, config.args.buffer_size).await?;
-    // cleanup_tasks.push(convert_task);
-    // eprintln!("Finished convert_stream, fasta_rx created");
-    //
-    // let consensus_bam_eval_stream = consensus_bam_eval_stream.ok_or_else(|| anyhow!("Consensus BAM eval stream is None"))?;
-    //
-    // write_metrics_to_tsv(fasta_rx,
-    //                      &target_ref_fasta_path.as_ref().unwrap().clone(),
-    //                      consensus_bam_eval_stream,
-    //                      assembly_show_coords_out_stream,
-    //                      &nucmer_delta_buf.clone(),
-    //                      &CONTIG_THRESHOLDS,
-    //                      &assembly_eval_report_path).await?;
-    //
-    //
 
     //*****************
     // Cleanup, hanging tasks
