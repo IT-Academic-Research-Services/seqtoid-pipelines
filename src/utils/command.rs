@@ -353,8 +353,12 @@ pub mod samtools {
                     args_vec.push(args.min_depth.to_string());
                     // args_vec.push("-l".to_string());
                     // args_vec.push("50".to_string());
-                    
-
+                }
+                SamtoolsSubcommand::Depth => {
+                    args_vec.push("depth".to_string());
+                    args_vec.push("-aa".to_string());
+                    args_vec.push("-d".to_string());
+                    args_vec.push("0".to_string());
                 }
             }
             for (key, value) in config.subcommand_fields.iter() {
