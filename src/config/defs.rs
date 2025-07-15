@@ -26,7 +26,8 @@ pub enum SamtoolsSubcommand {
     Sort,
     Index,
     Mpileup,
-    Consensus
+    Consensus,
+    Depth
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
