@@ -8,7 +8,7 @@ use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::cli::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use crate::utils::sequence::{DNA, normal_phred_qual_string};
+use crate::utils::sequence::{DNA, normal_phred_qual_string, valid_bases}; 
 use futures::Stream;
 use tokio_stream::{self as stream};
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::streams::{ParseOutput};
 use tokio::time::Duration;
+use std::collections::BTreeMap;
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -37,6 +38,13 @@ lazy_static! {
         m
     };
 }
+
+/// Define size of contig thresholds to mimic what Quast does
+lazy_static! {
+    pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
+}
+
+
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone, Debug)]
@@ -114,6 +122,15 @@ impl From<FastqOwnedRecord> for SequenceRecord {
 pub enum SequenceReader {
     Fasta(FastaReader<FileReader>),
     Fastq(FastqReader<FileReader>),
+}
+
+
+pub fn validate_sequence(seq: &[u8], valid_bases: &[u8]) -> Result<(), String> {
+    if seq.iter().all(|&b| valid_bases.contains(&b)) {
+        Ok(())
+    } else {
+        Err("Invalid nucleotide found in sequence".to_string())
+    }
 }
 
 /// Creates a SequenceReader for either FASTA or FASTQ files.
@@ -275,7 +292,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
 /// # Returns
 /// Tuple: (id, desc) split of header on whitespace.
 ///
-fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
+pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     let head_str = String::from_utf8_lossy(head).into_owned();
     let parts: Vec<&str> = head_str.splitn(2, |c: char| c.is_whitespace()).collect();
     let id = parts[0].trim_start_matches(prefix).to_string();
@@ -671,6 +688,7 @@ pub fn parse_and_filter_fastq_id(
 
     (filtered_rx, task)
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::fastx::SequenceRecord;
+use crate::utils::fastx::{SequenceRecord, parse_header};
 use tokio::task::JoinHandle;
 
 // Enum to specify the data type for tuning batch sizes
@@ -63,6 +63,7 @@ impl ToBytes for ParseOutput {
     fn to_bytes(&self) -> Result<Vec<u8>> {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
+            ParseOutput::Fasta(record) => record.to_bytes(),
             ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
         }
     }
@@ -77,12 +78,15 @@ pub enum ChildStream {
 #[derive(Clone, Copy, Debug)]
 pub enum ParseMode {
     Fastq,
+    Fasta,
     Bytes,
+    Lines
 }
 
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
     Fastq(SequenceRecord),
+    Fasta(SequenceRecord),
     Bytes(Vec<u8>),
 }
 
@@ -354,32 +358,36 @@ pub async fn parse_child_output(
 ) -> Result<mpsc::Receiver<ParseOutput>> {
     match (stream, mode) {
         (ChildStream::Stdout, ParseMode::Fastq) => {
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
             parse_fastq(stdout, buffer_size).await
         }
         (ChildStream::Stderr, ParseMode::Fastq) => {
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
             parse_fastq(stderr, buffer_size).await
         }
+        (ChildStream::Stdout, ParseMode::Fasta) => {
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_fasta(stdout, buffer_size).await
+        }
+        (ChildStream::Stderr, ParseMode::Fasta) => {
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_fasta(stderr, buffer_size).await
+        }
         (ChildStream::Stdout, ParseMode::Bytes) => {
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
             parse_bytes(stdout, buffer_size).await
         }
         (ChildStream::Stderr, ParseMode::Bytes) => {
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
             parse_bytes(stderr, buffer_size).await
+        }
+        (ChildStream::Stdout, ParseMode::Lines) => {
+            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_lines(stdout, buffer_size).await
+        }
+        (ChildStream::Stderr, ParseMode::Lines) => {
+            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_lines(stderr, buffer_size).await
         }
     }
 }
@@ -485,6 +493,68 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
     Ok(rx)
 }
 
+
+/// Helper function to parse FASTA data
+///
+/// # Arguments
+///
+/// * `reader` - reading stream
+/// * `buffer_size` - stream buffer size
+///
+/// # Returns
+/// Result<mpsc::Receiver<ParseOutput>>
+pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    buffer_size: usize,
+) -> Result<mpsc::Receiver<ParseOutput>> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+    let mut buffer = String::new();
+    let mut current_id = None;
+    let mut current_desc = None;
+    let mut current_seq = Vec::new();
+
+    tokio::spawn(async move {
+        while reader.read_line(&mut buffer).await.is_ok() {
+            let line = buffer.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with('>') {
+                if let Some(id) = current_id.take() {
+                    let record = SequenceRecord::Fasta {
+                        id,
+                        desc: current_desc.take(),
+                        seq: current_seq.clone(),
+                    };
+                    if tx.send(ParseOutput::Fasta(record)).await.is_err() {
+                        eprintln!("No active receivers for FASTA record");
+                        break;
+                    }
+                    current_seq.clear();
+                }
+                let (id, desc) = parse_header(line.as_bytes(), '>');
+                current_id = Some(id);
+                current_desc = desc;
+            } else if current_id.is_some() {
+                current_seq.extend_from_slice(line.as_bytes());
+            }
+            buffer.clear();
+        }
+        if let Some(id) = current_id.take() {
+            let record = SequenceRecord::Fasta {
+                id,
+                desc: current_desc.take(),
+                seq: current_seq,
+            };
+            if tx.send(ParseOutput::Fasta(record)).await.is_err() {
+                eprintln!("No active receivers for FASTA record");
+            }
+        }
+    });
+    Ok(rx)
+}
+
 /// Helper function to parse byte data
 ///
 /// # Arguments
@@ -524,6 +594,39 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
     Ok(rx)
 }
 
+/// Helper function to parse line data
+///
+/// # Arguments
+///
+/// * `reader` - reading stream
+/// * `buffer_size` - stream buffer size
+///
+/// # Returns
+/// Result<mpsc::Receiver<ParseOutput>>
+pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    buffer_size: usize,
+) -> Result<mpsc::Receiver<ParseOutput>> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+    let mut line = String::new();
+
+    tokio::spawn(async move {
+        while reader.read_line(&mut line).await? > 0 {
+            // Remove trailing newline for consistency
+            let trimmed_line = line.trim_end().to_string();
+            if tx.send(ParseOutput::Bytes(trimmed_line.into_bytes())).await.is_err() {
+                eprintln!("No active receivers for line");
+                break;
+            }
+            line.clear();
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok(rx)
+}
+
 /// Takes a ReceiverStream and writes it to a file
 ///
 /// # Arguments
@@ -541,6 +644,10 @@ pub async fn stream_to_file(rx: mpsc::Receiver<ParseOutput>, path: PathBuf) -> R
     while let Some(item) = stream.next().await {
         match item {
             ParseOutput::Fastq(record) => {
+                let bytes = record.to_bytes()?;
+                writer.write_all(&bytes).await?;
+            }
+            ParseOutput::Fasta(record) => {
                 let bytes = record.to_bytes()?;
                 writer.write_all(&bytes).await?;
             }
@@ -580,6 +687,9 @@ pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) ->
                 }
             }
             ParseOutput::Fastq(_) => {
+                return Err(anyhow!("Unexpected Fastq record when parsing bytes"));
+            }
+            ParseOutput::Fasta(_) => {
                 return Err(anyhow!("Unexpected Fastq record when parsing bytes"));
             }
         }
@@ -624,6 +734,35 @@ pub async fn y_junction(
     Ok((rx, combined_task))
 }
 
+
+pub async fn convert_stream(
+    rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+) -> Result<(mpsc::Receiver<SequenceRecord>, JoinHandle<Result<(), anyhow::Error>>)> {
+    let (stats_tx, stats_rx) = mpsc::channel(buffer_size);
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(rx);
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Fasta(record) = item {
+                match record {
+                    SequenceRecord::Fasta { .. } => {
+                        if stats_tx.send(record).await.is_err() {
+                            eprintln!("Failed to send FASTA record to stats");
+                            return Err(anyhow::anyhow!("Failed to send FASTA record"));
+                        }
+                    }
+                    SequenceRecord::Fastq { .. } => {
+                        eprintln!("Unexpected FASTQ record in consensus_stats_stream");
+                    }
+                }
+            } else {
+                eprintln!("Unexpected non-FASTA item in stream");
+            }
+        }
+        Ok(())
+    });
+    Ok((stats_rx, task))
+}
 
 #[cfg(test)]
 mod tests {

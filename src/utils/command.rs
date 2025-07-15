@@ -3,8 +3,18 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG};
+use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, NUCMER_DELTA};
 use crate::cli::Arguments;
+use lazy_static::lazy_static;
+
+
+lazy_static! {
+    static ref MIN_VERSIONS: HashMap<&'static str, &'static f64> = {
+        let mut m = HashMap::new();
+        m.insert(FASTP_TAG, &1.0);
+        m
+    };
+}
 
 
 pub trait ArgGenerator {
@@ -542,7 +552,7 @@ pub mod bcftools {
             // args_vec.push("--memory-mapping".to_string());
             // args_vec.push("--gzip-compressed".to_string());
 
-            args_vec.push(config.fastq_path.to_string_lossy().to_string()); // input, should be a mkfifo
+            args_vec.push(config.fastq_path.to_string_lossy().to_string()); 
 
             Ok(args_vec)
         }
@@ -721,7 +731,178 @@ pub mod mafft {
         }
     }
     
+}
+
+pub mod quast {
+
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::cli::Arguments;
+    use crate::config::defs::QUAST_TAG;
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub struct QuastArgGenerator;
+
+    pub struct QuastConfig {
+        pub ref_fasta: String,
+        pub ref_bam: String,
+        pub assembly_fasta: String,
+    }
+
+    pub async fn quast_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["-v"];
+
+        let mut child = Command::new(QUAST_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is quast installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from quast -v"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("Invalid quast -v output: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in quast -v output: {}", first_line));
+        }
+        Ok(version)
+    }
+
+    impl ArgGenerator for QuastArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<QuastConfig>())
+                .ok_or_else(|| anyhow!("Quast requires a QuastConfig as extra argument"))?;
+            
+            let mut args_vec: Vec<String> = Vec::new();
+
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push("--min-contig".to_string());
+            args_vec.push("0".to_string());
+            args_vec.push("-t".to_string());
+            args_vec.push(num_cores.to_string());
+            args_vec.push("-o".to_string());
+            args_vec.push("quast".to_string());
+            args_vec.push("-r".to_string());
+            args_vec.push( config.ref_fasta.to_string());
+            args_vec.push("--ref-bam".to_string());
+            args_vec.push( config.ref_bam.to_string());
+            args_vec.push( config.assembly_fasta.to_string());
+
+            Ok(args_vec)
+        }
+    }
     
+}
+
+pub mod nucmer {
+    use anyhow::anyhow;
+    use std::path::PathBuf;
+    use tokio::process::Command;
+    use crate::cli::Arguments;
+    use crate::config::defs::NUCMER_TAG;
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::quast::{QuastArgGenerator, QuastConfig};
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub struct NucmerArgGenerator;
+
+    pub struct NucmerConfig {
+        pub ref_fasta: PathBuf,
+        pub assembly_fasta: PathBuf,
+    }
+
+
+    pub async fn nucmer_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["--version"];
+
+        let mut child = Command::new(NUCMER_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is nucmer installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+
+        let first_line = lines
+            .first()
+            .ok_or_else(|| anyhow!("No output from nucmer --version"))?;
+
+        let version = first_line
+            .split_whitespace()
+            .nth(0)
+            .ok_or_else(|| anyhow!("Invalid nucmer --version output: {}", first_line))?
+            .to_string();
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in nucmer --version output: {}", first_line));
+        }
+        Ok(version)
+    }
+
+
+    impl ArgGenerator for NucmerArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<NucmerConfig>())
+                .ok_or_else(|| anyhow!("Nucmer requires a NucmerConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            let num_cores: usize = match args.limit_align_threads {
+                true => args.threads,
+                false => num_cpus::get()-1,
+            };
+            args_vec.push("-t".to_string());
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--prefix=alignment".to_string());
+            args_vec.push(config.ref_fasta.to_string_lossy().to_string());
+            args_vec.push(config.assembly_fasta.to_string_lossy().to_string());
+
+            Ok(args_vec)
+        }
+    }
+}
+
+
+pub mod show_coords {
+    use anyhow::anyhow;
+    use crate::cli::Arguments;
+    use crate::config::defs::{SHOW_COORDS_TAG, NUCMER_DELTA};
+    use crate::utils::command::ArgGenerator;
+
+    pub struct ShowCoordsArgGenerator;
+
+    impl ArgGenerator for ShowCoordsArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            args_vec.push("-r".to_string());
+            args_vec.push("-c".to_string());
+            args_vec.push(NUCMER_DELTA.to_string());
+
+            Ok(args_vec)
+        }
+    }
 }
 
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
@@ -733,6 +914,9 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
         BCFTOOLS_TAG => Box::new(bcftools::BcftoolsArgGenerator),
         MAFFT_TAG => Box::new(mafft::MafftArgGenerator),
+        NUCMER_TAG => Box::new(nucmer::NucmerArgGenerator),
+        SHOW_COORDS_TAG => Box::new(show_coords::ShowCoordsArgGenerator),
+        QUAST_TAG => Box::new(quast::QuastArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
@@ -752,6 +936,8 @@ pub async fn check_version(tool: &str) -> Result<String> {
         IVAR_TAG => ivar::ivar_presence_check().await,
         MUSCLE_TAG => muscle::muscle_presence_check().await,
         MAFFT_TAG => mafft::mafft_presence_check().await,
+        QUAST_TAG => quast::quast_presence_check().await,
+        NUCMER_TAG => nucmer::nucmer_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
