@@ -114,7 +114,7 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
 ///
 /// # Returns
 ///
-/// Hamshmap <String, String>
+/// Hamshmap <String, u32>
 pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, u32>> {
     let mut depth_map = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
@@ -160,4 +160,68 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
     }
 
     Ok(depth_map)
+}
+
+
+/// The is meant to be used by the results of parse_samtools_depth
+///
+/// # Arguments
+///
+/// * `depth_map` - Hamshmap <String, u32>`
+///
+/// # Returns
+///
+/// Hashmap <String, f64>
+pub fn compute_depth_stats(depth_map: &HashMap<String, u32>) -> Result<HashMap<String, f64>> {
+    if depth_map.is_empty() {
+        return Err(anyhow!("InsufficientReadsError: There was insufficient coverage so a consensus genome could not be created."));
+    }
+
+    let mut depths: Vec<u32> = depth_map.values().copied().collect();
+    let count = depths.len() as f64;
+
+    let sum: u64 = depths.iter().map(|&x| x as u64).sum();
+    let depth_avg = sum as f64 / count;
+
+    // Sort depths for quantiles
+    depths.sort_unstable();
+
+    // Compute quantiles
+    let depth_q25 = if count > 0.0 {
+        let idx = ((count * 0.25).ceil() - 1.0) as usize;
+        depths.get(idx).copied().unwrap_or(0) as f64
+    } else {
+        0.0
+    };
+
+    let depth_q5 = if count > 0.0 {
+        let idx = ((count * 0.5).ceil() - 1.0) as usize;
+        depths.get(idx).copied().unwrap_or(0) as f64
+    } else {
+        0.0
+    };
+
+    let depth_q75 = if count > 0.0 {
+        let idx = ((count * 0.75).ceil() - 1.0) as usize;
+        depths.get(idx).copied().unwrap_or(0) as f64
+    } else {
+        0.0
+    };
+
+    let depth_frac_above_10x = depths.iter().filter(|&&d| d >= 10).count() as f64 / count;
+    let depth_frac_above_25x = depths.iter().filter(|&&d| d >= 25).count() as f64 / count;
+    let depth_frac_above_50x = depths.iter().filter(|&&d| d >= 50).count() as f64 / count;
+    let depth_frac_above_100x = depths.iter().filter(|&&d| d >= 100).count() as f64 / count;
+
+    let mut stats = HashMap::new();
+    stats.insert("depth_avg".to_string(), depth_avg);
+    stats.insert("depth_q.25".to_string(), depth_q25);
+    stats.insert("depth_q.5".to_string(), depth_q5);
+    stats.insert("depth_q.75".to_string(), depth_q75);
+    stats.insert("depth_frac_above_10x".to_string(), depth_frac_above_10x);
+    stats.insert("depth_frac_above_25x".to_string(), depth_frac_above_25x);
+    stats.insert("depth_frac_above_50x".to_string(), depth_frac_above_50x);
+    stats.insert("depth_frac_above_100x".to_string(), depth_frac_above_100x);
+
+    Ok(stats)
 }
