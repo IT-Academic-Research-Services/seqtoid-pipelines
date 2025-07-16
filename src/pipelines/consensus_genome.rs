@@ -25,7 +25,7 @@ use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
-use crate::utils::stats::parse_samtools_stats;
+use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats};
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -259,6 +259,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut consensus_bam_eval_stream : Option<Receiver<ParseOutput>>  = None;
     let mut ercc_stats_stream: Option<Receiver<ParseOutput>>  = None;
     let mut consensus_bam_stats_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_bam_depth_stream : Option<Receiver<ParseOutput>>  = None;
     let mut consensus_stats_stream : Option<Receiver<ParseOutput>>  = None;
     let mut call_bcftools_stats_stream : Option<Receiver<ParseOutput>>  = None;
 
@@ -650,7 +651,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                5,
+                6,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -665,6 +666,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_call_stream = streams_iter.next().unwrap();
             consensus_bam_eval_stream = Some(streams_iter.next().unwrap());
             consensus_bam_stats_stream = Some(streams_iter.next().unwrap());
+            consensus_bam_depth_stream = Some(streams_iter.next().unwrap());
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -959,7 +961,49 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             return Err(anyhow!("consensus_bam_stats_stream is not available"));
         }
     };
+    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats);
 
+    // depth
+
+    let depth_samtools_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Depth,
+        subcommand_fields: HashMap::from([
+            ("-aa".to_string(), None),
+            ("-d".to_string(), Some("0".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+    let depth_samtools_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config.args,
+        Some(&depth_samtools_config),
+    )?;
+
+    let depth_samtools_out_stream = match consensus_bam_depth_stream {
+        Some(stream) => {
+            let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(
+                stream,
+                SAMTOOLS_TAG,
+                depth_samtools_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
+            cleanup_tasks.push(depth_samtools_task);
+            cleanup_tasks.push(depth_samtools_err_task);
+            parse_child_output(
+                &mut depth_samtools_child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config.args.buffer_size / 4,
+            ).await?
+        }
+        None => {
+            return Err(anyhow!("consensus_bam_stats_stream is not available"));
+        }
+    };
+
+    let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
+    let samtools_depth_stats = compute_depth_stats(&depth_map)?;
 
     // test writes
 
@@ -976,7 +1020,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         }
     }
 
-    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats);
+
 
 
     if let Some(stream) = consensus_stats_stream {
