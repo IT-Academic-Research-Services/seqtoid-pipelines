@@ -17,7 +17,7 @@ use crate::utils::streams::ParseOutput;
 /// # Arguments
 ///
 /// - `lengths`: Lengths series from show-coords or alignment.delta
-/// - `fraction`: The threashold i.e. the '50' in N50.
+/// - `fraction`: The threshold i.e. the '50' in N50.
 ///
 /// # Returns
 ///
@@ -103,4 +103,61 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
     }
 
     Ok(stats)
+}
+
+
+/// Parses samtools depth lines.
+///
+/// # Arguments
+///
+/// * `rx` - samtools stats `ParseOutput::Bytes`
+///
+/// # Returns
+///
+/// Hamshmap <String, String>
+pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, u32>> {
+    let mut depth_map = HashMap::new();
+    let mut stream = ReceiverStream::new(rx);
+    let mut line_count = 0;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Bytes(line_bytes) => {
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+
+                line_count += 1;
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() != 3 {
+                    return Err(anyhow!(
+                        "Invalid samtools depth format at line {}: expected 3 fields, found {}",
+                        line_count,
+                        parts.len()
+                    ));
+                }
+
+                let chr = parts[0].to_string();
+                let pos: u64 = parts[1]
+                    .parse()
+                    .map_err(|e| anyhow!("Failed to parse position at line {}: {}", line_count, e))?;
+                let depth: u32 = parts[2]
+                    .parse()
+                    .map_err(|e| anyhow!("Failed to parse depth at line {}: {}", line_count, e))?;
+
+                let key = format!("{}:{}", chr, pos);
+                depth_map.insert(key, depth);
+            }
+            _ => {
+                return Err(anyhow!("Unexpected non-byte data in samtools depth stream at line {}", line_count));
+            }
+        }
+    }
+
+    if depth_map.is_empty() {
+        return Err(anyhow!("No valid samtools depth data parsed"));
+    }
+
+    Ok(depth_map)
 }
