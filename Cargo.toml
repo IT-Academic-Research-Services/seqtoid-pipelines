@@ -23,6 +23,7 @@ ndarray = "0.16.1"
 num_cpus = "1.16"
 rust-htslib = "0.50.0"
 bio = "2.3.0"
+serde = { version = "1.0.219", features = ["derive"] }
 
 [dev-dependencies]
 sysinfo = "0.35.0"

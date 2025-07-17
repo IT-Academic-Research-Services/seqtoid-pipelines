@@ -10,6 +10,7 @@ use std::time::Instant;
 use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
+use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
@@ -29,6 +30,40 @@ use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats};
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
+
+#[derive(Serialize)]
+struct Stats {
+    sample_name: String,
+    depth_avg: f64,
+    depth_q25: f64,
+    depth_q50: f64,
+    depth_q75: f64,
+    depth_frac_above_10x: f64,
+    depth_frac_above_25x: f64,
+    depth_frac_above_50x: f64,
+    depth_frac_above_100x: f64,
+    allele_counts: HashMap<char, u64>,
+    total_reads: u64,
+    mapped_reads: u64,
+    mapped_paired: Option<u64>,
+    paired_inward: Option<u64>,
+    paired_outward: Option<u64>,
+    paired_other_orientation: Option<u64>,
+    ercc_mapped_reads: Option<u64>,
+    ercc_mapped_paired: Option<u64>,
+    ref_snps: u64,
+    ref_mnps: u64,
+    ref_indels: u64,
+    n_actg: u64,
+    n_missing: u64,
+    n_gap: u64,
+    n_ambiguous: u64,
+    coverage_breadth: f64,
+    max_aligned_length: usize,
+    total_length: usize,
+    coverage_bin_size: f64,
+    coverage: Vec<(usize, f64, f64, u8, u8)>,
+}
 
 pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
