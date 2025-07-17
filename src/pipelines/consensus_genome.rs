@@ -291,7 +291,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Split by Technology
     match technology {
         Technology::Illumina => {
-            eprintln!("Illumina");
+            eprintln!("Technology: Illumina");
 
             //*****************
             // Get Target reference sequence
@@ -1041,21 +1041,26 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats);
 
 
-    // test writes
 
-    match ercc_stats_stream {
-        Some(stream) => {
-            let ercc_write_task = tokio::spawn(stream_to_file(
-                stream,
-                PathBuf::from("test_ercc.txt"),
-            ));
-            cleanup_tasks.push(ercc_write_task);
-        }
-        None => {
-            eprintln!("Warning: ercc_stats_stream is not available, skipping write to test_ercc.txt");
+    // ERCC stats if Illumina
+
+    if let _technology = Technology::Illumina {
+        match ercc_stats_stream {
+            Some(stream) => {
+                let ercc_write_task = tokio::spawn(stream_to_file(
+                    stream,
+                    PathBuf::from("test_ercc.txt"),
+                ));
+                cleanup_tasks.push(ercc_write_task);
+            }
+            None => {
+                eprintln!("Warning: ercc_stats_stream is not available, skipping write to test_ercc.txt");
+            }
         }
     }
 
+
+    // test writes
 
 
 
