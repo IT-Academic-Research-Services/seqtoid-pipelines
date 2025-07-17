@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Write;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
@@ -27,7 +29,8 @@ use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
-use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats};
+use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
+use crate::utils::vcf::parse_vcf_stream;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -1028,7 +1031,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     //*****************
     // Calculate Statistics
-
     let results = try_join_all(stats_tasks).await?;
     for result in results {
         result?;
@@ -1055,20 +1057,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             ).await?;
             cleanup_tasks.push(stats_samtools_task_stats);
             cleanup_tasks.push(stats_samtools_err_task_stats);
-            parse_child_output(
-                &mut stats_samtools_child_stats,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                config.args.buffer_size / 4,
-            ).await?
+            parse_child_output(&mut stats_samtools_child_stats, ChildStream::Stdout, ParseMode::Lines, config.args.buffer_size / 4).await?
         }
-        None => {
-            return Err(anyhow!("consensus_bam_stats_stream is not available"));
-        }
+        None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
     };
-    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats);
-
-    // depth
+    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats).await?;
 
     let depth_samtools_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Depth,
@@ -1109,14 +1102,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
     let samtools_depth_stats = compute_depth_stats(&depth_map)?;
+    let depths: Vec<u32> = depth_map.values().copied().collect();
 
+    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats).await?;
 
-    // pick up fastq count
-
-    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats);
-
-
-    // ERCC stats if Illumina
     let ercc_stats = if let Technology::Illumina = technology {
         match ercc_stats_task {
             Some(task) => match task.await {
@@ -1130,35 +1119,64 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         HashMap::new() // Empty stats for ONT
     };
 
-
-
-    // test writes
-
-
-
-    if let Some(stream) = consensus_stats_stream {
-        let consensus_stats_write_task = tokio::spawn(stream_to_file(
-            stream,
-            PathBuf::from("consensus_stats.txt"),
-        ));
-        cleanup_tasks.push(consensus_stats_write_task);
+    let allele_counts = if let Some(stream) = consensus_stats_stream {
+        compute_allele_counts(stream).await?
     } else {
-        eprintln!("Warning: consensus_stats_stream is not available, skipping write to consensus_stats.txt");
-    }
+        HashMap::new()
+    };
 
-    if let Some(stream) = call_bcftools_stats_stream {
-        let bcftools_stats_write_task = tokio::spawn(stream_to_file(
-            stream,
-            PathBuf::from("bcftools_stats.txt"),
-        ));
-        cleanup_tasks.push(bcftools_stats_write_task);
+    let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
+        parse_vcf_stream(stream).await?
     } else {
-        eprintln!("Warning: call_bcftools_stats_stream is not available, skipping write to bcftools_stats.txt");
-    }
+        (0, 0, 0)
+    };
 
+    let n_actg = allele_counts.iter().filter(|&(k, _)| "ACTGU".contains(*k)).map(|(_, &v)| v).sum::<u64>();
+    let n_missing = allele_counts.get(&'N').copied().unwrap_or(0);
+    let n_gap = allele_counts.get(&'-').copied().unwrap_or(0);
+    let n_ambiguous = allele_counts.iter().filter(|&(k, _)| !"ACTGUN-".contains(*k)).map(|(_, &v)| v).sum::<u64>();
 
+    let coverage_breadth = if !depths.is_empty() { depths.iter().filter(|&&d| d > 0).count() as f64 / depths.len() as f64 } else { 0.0 };
+    let max_aligned_length = depths.len();
+    let total_length = depths.len();
+    let (coverage_bin_size, coverage) = if !depths.is_empty() { compute_coverage_bins(&depths, 500) } else { (0.0, Vec::new()) };
 
-    //
+    let stats = Stats {
+        sample_name: no_ext_sample_base.clone(),
+        depth_avg: samtools_depth_stats.get("depth_avg").copied().unwrap_or(0.0),
+        depth_q25: samtools_depth_stats.get("depth_q.25").copied().unwrap_or(0.0),
+        depth_q50: samtools_depth_stats.get("depth_q.5").copied().unwrap_or(0.0),
+        depth_q75: samtools_depth_stats.get("depth_q.75").copied().unwrap_or(0.0),
+        depth_frac_above_10x: samtools_depth_stats.get("depth_frac_above_10x").copied().unwrap_or(0.0),
+        depth_frac_above_25x: samtools_depth_stats.get("depth_frac_above_25x").copied().unwrap_or(0.0),
+        depth_frac_above_50x: samtools_depth_stats.get("depth_frac_above_50x").copied().unwrap_or(0.0),
+        depth_frac_above_100x: samtools_depth_stats.get("depth_frac_above_100x").copied().unwrap_or(0.0),
+        allele_counts,
+        total_reads: seqkit_stats.get("num_seqs").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_reads: samtools_stats_out.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_paired: samtools_stats_out.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
+        paired_inward: samtools_stats_out.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_outward: samtools_stats_out.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_other_orientation: samtools_stats_out.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        ercc_mapped_reads: ercc_stats.get("ercc_mapped_reads").copied(),
+        ercc_mapped_paired: ercc_stats.get("ercc_mapped_paired").copied(),
+        ref_snps,
+        ref_mnps,
+        ref_indels,
+        n_actg,
+        n_missing,
+        n_gap,
+        n_ambiguous,
+        coverage_breadth,
+        max_aligned_length,
+        total_length,
+        coverage_bin_size,
+        coverage,
+    };
+
+    let stats_file_path = cwd.join(format!("{}_stats.json", no_ext_sample_base));
+    let mut stats_file = File::create(&stats_file_path)?;
+    serde_json::to_writer_pretty(&mut stats_file, &stats)?;
 
 
     //*****************
