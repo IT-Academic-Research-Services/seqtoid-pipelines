@@ -13,7 +13,7 @@ use tokio::sync::mpsc::Receiver;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -26,7 +26,7 @@ use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
-use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats};
+use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats};
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -43,6 +43,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     let mut quast_write_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut stats_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut ercc_stats_task: Option<tokio::task::JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
 
     // External tools check
     let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, NUCMER_TAG, SEQKIT_TAG]).await?;
@@ -314,8 +315,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
                 50,
-            )
-                .await?;
+            ).await?;
             cleanup_receivers.push(ercc_done_rx);
 
             let mut streams_iter = ercc_streams.into_iter();
@@ -325,9 +325,17 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
             cleanup_tasks.push(ercc_query_write_task);
-            let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
+            let ercc_minimap2_args = generate_cli(
+                MINIMAP2_TAG,
+                &config.args,
+                Some(&(ercc_path, ercc_query_pipe_path.clone())),
+            )?;
 
-            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, config.args.verbose).await?;
+            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(
+                MINIMAP2_TAG,
+                ercc_minimap2_args,
+                config.args.verbose,
+            ).await?;
             let ercc_minimap2_out_stream = parse_child_output(
                 &mut ercc_minimap2_child,
                 ChildStream::Stdout,
@@ -346,7 +354,13 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 Some(&ercc_samtools_config_view),
             )?;
 
-            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(ercc_minimap2_out_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
+            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(
+                ercc_minimap2_out_stream,
+                SAMTOOLS_TAG,
+                ercc_samtools_args_view,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
             let ercc_samtools_out_stream_view = parse_child_output(
                 &mut ercc_samtools_child_view,
                 ChildStream::Stdout,
@@ -367,12 +381,18 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )?;
 
             let ercc_stats_file_path = no_ext_sample_base.clone() + "_stats.txt";
-            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(ercc_samtools_out_stream_view, SAMTOOLS_TAG, ercc_samtools_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
+            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(
+                ercc_samtools_out_stream_view,
+                SAMTOOLS_TAG,
+                ercc_samtools_args_stats,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
 
             let ercc_samtools_out_stream_stats = parse_child_output(
                 &mut ercc_samtools_child_stats,
                 ChildStream::Stdout,
-                ParseMode::Bytes,
+                ParseMode::Lines, // Changed from ParseMode::Bytes to ParseMode::Lines
                 config.args.buffer_size / 4,
             ).await?;
             cleanup_tasks.push(ercc_samtools_task_stats);
@@ -386,19 +406,40 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
                 50,
-            )
-                .await?;
+            ).await?;
             cleanup_receivers.push(ercc_done_rx);
 
             let mut streams_iter = ercc_streams.into_iter();
             let ercc_file_stream = streams_iter.next().unwrap();
-            ercc_stats_stream  = Some(streams_iter.next().unwrap());
+            ercc_stats_stream = Some(streams_iter.next().unwrap());
 
-            let ercc_stats_write_task = tokio::spawn(stream_to_file(
-                ercc_file_stream,
-                PathBuf::from(ercc_stats_file_path),
-            ));
-            cleanup_tasks.push(ercc_stats_write_task);
+            match ercc_stats_stream {
+                Some(stream) => {
+                    // Convert byte stream to line stream
+                    let (line_stream, line_task) = bytes_to_lines(stream, config.args.buffer_size / 4).await?;
+                    stats_tasks.push(line_task);
+
+                    // Spawn ERCC stats parsing task
+                    ercc_stats_task = Some(tokio::spawn(async move {
+                        let result = parse_ercc_stats(line_stream).await;
+                        if result.is_err() {
+                            eprintln!("Warning: Failed to parse ERCC stats: {:?}", result);
+                        }
+                        result
+                    }));
+
+                    // Write ERCC stats to file
+                    let ercc_stats_write_task = tokio::spawn(stream_to_file(
+                        ercc_file_stream,
+                        PathBuf::from(ercc_stats_file_path),
+                    ));
+                    cleanup_tasks.push(ercc_stats_write_task);
+                }
+                None => {
+                    eprintln!("Warning: ercc_stats_stream is not available, skipping ERCC stats parsing and file write");
+                }
+            }
+
 
             //*****************
             // Filter Reads
@@ -953,7 +994,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Calculate Statistics
 
-    // Makes sure the needed files for Quast are written
     let results = try_join_all(stats_tasks).await?;
     for result in results {
         result?;
@@ -1041,23 +1081,20 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats);
 
 
-
     // ERCC stats if Illumina
-
-    if let _technology = Technology::Illumina {
-        match ercc_stats_stream {
-            Some(stream) => {
-                let ercc_write_task = tokio::spawn(stream_to_file(
-                    stream,
-                    PathBuf::from("test_ercc.txt"),
-                ));
-                cleanup_tasks.push(ercc_write_task);
-            }
-            None => {
-                eprintln!("Warning: ercc_stats_stream is not available, skipping write to test_ercc.txt");
-            }
+    let ercc_stats = if let Technology::Illumina = technology {
+        match ercc_stats_task {
+            Some(task) => match task.await {
+                Ok(Ok(stats)) => stats,
+                Ok(Err(e)) => return Err(anyhow!("Failed to parse ERCC stats: {}", e)),
+                Err(e) => return Err(anyhow!("ERCC stats task failed: {}", e)),
+            },
+            None => return Err(anyhow!("ERCC stats task not initialized for Illumina technology")),
         }
-    }
+    } else {
+        HashMap::new() // Empty stats for ONT
+    };
+
 
 
     // test writes
