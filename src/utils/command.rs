@@ -906,6 +906,47 @@ pub mod show_coords {
     }
 }
 
+
+pub mod seqkit {
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::config::defs::SEQKIT_TAG;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    pub struct SeqkitArgGenerator;
+
+    pub async fn seqkit_presence_check() -> anyhow::Result<String> {
+
+        let args: Vec<&str> = vec!["--help"];
+
+        let mut child = Command::new(SEQKIT_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is seqkit installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+
+        let second_line = lines
+            .get(1) // Index 1 for the second element
+            .ok_or_else(|| anyhow!("No second line in seqkit --version output"))?;
+
+        let version = second_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("Invalid seqkit --version output: {}", second_line))?;
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in nucmer --version output: {}", second_line));
+        }
+
+        Ok(version.to_string())
+    }
+
+}
+
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -939,6 +980,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
         MAFFT_TAG => mafft::mafft_presence_check().await,
         QUAST_TAG => quast::quast_presence_check().await,
         NUCMER_TAG => nucmer::nucmer_presence_check().await,
+        SEQKIT_TAG => seqkit::seqkit_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)
