@@ -227,8 +227,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
 
-    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
-
+    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("no_host.fq"), "_");
 
     let stats_seqkit_config_stats = SeqkitConfig {
         subcommand: SeqkitSubcommand::Stats,
@@ -238,7 +237,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         &config.args,
         Some(&stats_seqkit_config_stats),
     )?;
-
 
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
@@ -268,12 +266,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
 
 
-
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_file_stream,
         PathBuf::from(no_host_file_path),
     ));
-    cleanup_tasks.push(host_samtools_write_task);
+    stats_tasks.push(host_samtools_write_task);
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
