@@ -14,18 +14,19 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
+use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
 use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
-use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats};
+use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats};
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -41,9 +42,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     let mut quast_write_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut stats_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
     // External tools check
-    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, NUCMER_TAG]).await?;
+    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, NUCMER_TAG, SEQKIT_TAG]).await?;
 
     // Arguments and files check
     let file1_path: PathBuf = match &config.args.file1 {
@@ -227,9 +229,20 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
 
+
+    let stats_seqkit_config_stats = SeqkitConfig {
+        subcommand: SeqkitSubcommand::Stats,
+    };
+    let stats_seqkit_args_stats = generate_cli(
+        SEQKIT_TAG,
+        &config.args,
+        Some(&stats_seqkit_config_stats),
+    )?;
+
+
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
-        2,
+        3,
         config.args.buffer_size,
         config.args.stall_threshold.try_into().unwrap(),
         Some(config.args.stream_sleep_ms),
@@ -241,6 +254,20 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().unwrap();
     let no_host_file_stream = streams_iter.next().unwrap();
+    let no_host_count_stream = streams_iter.next().unwrap();
+
+
+    let (mut no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(no_host_count_stream, SEQKIT_TAG, stats_seqkit_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
+    let no_host_seqkit_out_stream_stats = parse_child_output(
+        &mut no_host_seqkit_child_stats,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        config.args.buffer_size / 4,
+    ).await?;
+    stats_tasks.push(no_host_seqkit_task_stats);
+    cleanup_tasks.push(no_host_seqkit_err_task_stats);
+
+
 
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_file_stream,
@@ -929,6 +956,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Calculate Statistics
 
+    // Makes sure the needed files for Quast are written
+    let results = try_join_all(stats_tasks).await?;
+    for result in results {
+        result?;
+    }
+
     let stats_samtools_config_stats = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Stats,
         subcommand_fields: HashMap::from([("-".to_string(), None)]),
@@ -1004,6 +1037,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
     let samtools_depth_stats = compute_depth_stats(&depth_map)?;
+
+
+    // pick up fastq count
+
+    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats);
+
 
     // test writes
 

@@ -225,3 +225,61 @@ pub fn compute_depth_stats(depth_map: &HashMap<String, u32>) -> Result<HashMap<S
 
     Ok(stats)
 }
+
+
+/// Pars seqkit stats output
+///
+/// # Arguments
+///
+/// * `rx` - A Receiver stream of ParseOutput::Lines containing seqkit stats output
+///
+/// # Returns
+///
+/// HashMap<String, String> 
+pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
+    let mut stats = HashMap::new();
+    let mut stream = ReceiverStream::new(rx);
+    let mut header_processed = false;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Bytes(line_bytes) => {
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+
+                let parts: Vec<&str> = line.split_whitespace().collect();
+
+                if !header_processed {
+                    // Skip header line
+                    header_processed = true;
+                    continue;
+                }
+
+                if parts.len() < 8 {
+                    return Err(anyhow!("Invalid seqkit stats format: expected at least 8 fields, found {}", parts.len()));
+                }
+
+                // Extract fields
+                stats.insert("file".to_string(), parts[0].to_string());
+                stats.insert("format".to_string(), parts[1].to_string());
+                stats.insert("type".to_string(), parts[2].to_string());
+                stats.insert("num_seqs".to_string(), parts[3].replace(",", "").to_string());
+                stats.insert("sum_len".to_string(), parts[4].replace(",", "").to_string());
+                stats.insert("min_len".to_string(), parts[5].replace(",", "").to_string());
+                stats.insert("avg_len".to_string(), parts[6].to_string());
+                stats.insert("max_len".to_string(), parts[7].replace(",", "").to_string());
+            }
+            _ => {
+                return Err(anyhow!("Unexpected non-byte data in seqkit stats stream"));
+            }
+        }
+    }
+
+    if stats.is_empty() {
+        return Err(anyhow!("No valid seqkit stats data parsed"));
+    }
+
+    Ok(stats)
+}
