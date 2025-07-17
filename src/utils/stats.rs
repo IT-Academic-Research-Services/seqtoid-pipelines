@@ -7,6 +7,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use std::collections::HashMap;
 use crate::utils::streams::ParseOutput;
+use crate::utils::fastx::SequenceRecord;
 
 
 
@@ -351,4 +352,111 @@ pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap
     }
 
     Ok(stats)
+}
+
+
+/// Compute allel counts from a stream
+///
+/// # Arguments
+///
+/// * `rx` - A Receiver stream of  ParseMode::Fasta,
+///
+/// # Returns
+///
+/// HashMap<char, u64>
+pub async fn compute_allele_counts(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<char, u64>> {
+    let mut counts = HashMap::new();
+    let mut stream = ReceiverStream::new(rx);
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Fasta(record) => {
+                // Access seq field from SequenceRecord::Fasta variant
+                match record {
+                    SequenceRecord::Fasta { seq, .. } => {
+                        for base in seq.iter().map(|&b| b as char) {
+                            *counts.entry(base).or_insert(0) += 1;
+                        }
+                    }
+                    SequenceRecord::Fastq { .. } => {
+                        return Err(anyhow!("Unexpected Fastq record in FASTA stream"));
+                    }
+                }
+            }
+            _ => return Err(anyhow!("Unexpected ParseOutput variant in FASTA stream")),
+        }
+    }
+    Ok(counts)
+}
+
+
+/// Compute covergae bins
+///
+/// # Arguments
+///
+/// * depths: vector of depth
+/// * max_nums_bins: maximum number of bins
+///
+/// # Returns
+///
+/// (f64, Vec<(usize, f64, f64, u8, u8)> where: index, avg_depth, avg_breafdth, 1, 0
+pub fn compute_coverage_bins(depths: &[u32], max_num_bins: usize) -> (f64, Vec<(usize, f64, f64, u8, u8)>) {
+    let len = depths.len();
+    let num_bins = if len <= max_num_bins { len } else { max_num_bins };
+    let bin_size = len as f64 / num_bins as f64;
+    let mut coverage = Vec::with_capacity(num_bins);
+    for index in 0..num_bins {
+        let bin_start = (index as f64 * bin_size).floor() as usize;
+        let bin_end = ((index + 1) as f64 * bin_size).ceil() as usize;
+        let bin_depths = &depths[bin_start..bin_end];
+        let sum_depth: u32 = bin_depths.iter().sum();
+        let count = bin_depths.len() as f64;
+        let avg_depth = sum_depth as f64 / count;
+        let avg_breadth = bin_depths.iter().filter(|&&d| d > 0).count() as f64 / count;
+        coverage.push((index, avg_depth, avg_breadth, 1, 0));
+    }
+    (bin_size, coverage)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::streams::{ParseOutput, SequenceRecord};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_compute_allele_counts() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let record = SequenceRecord::Fasta {
+            id: "test".to_string(),
+            desc: None,
+            seq: b"ATCGN".to_vec(),
+        };
+        tx.send(ParseOutput::Fasta(record)).await?;
+        drop(tx); // Close the channel
+
+        let counts = compute_allele_counts(rx).await?;
+        assert_eq!(counts.get(&'A'), Some(&1));
+        assert_eq!(counts.get(&'T'), Some(&1));
+        assert_eq!(counts.get(&'C'), Some(&1));
+        assert_eq!(counts.get(&'G'), Some(&1));
+        assert_eq!(counts.get(&'N'), Some(&1));
+        assert_eq!(counts.len(), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compute_allele_counts_invalid_variant() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(ParseOutput::Bytes(b"invalid".to_vec())).await?;
+        drop(tx);
+
+        let result = compute_allele_counts(rx).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Unexpected ParseOutput variant in FASTA stream"
+        );
+        Ok(())
+    }
 }
