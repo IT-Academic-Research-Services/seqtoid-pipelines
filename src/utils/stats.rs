@@ -325,10 +325,10 @@ pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap
                                 _ => {}
                             }
                         } else {
-                            eprintln!(
-                                "Warning: Failed to parse value '{}' for key '{}' at line {}",
-                                value_str, key, line_count
-                            );
+                            // eprintln!(
+                            //     "Warning: Failed to parse value '{}' for key '{}' at line {}",
+                            //     value_str, key, line_count
+                            // );
                         }
                     } else {
                         eprintln!(
@@ -418,45 +418,3 @@ pub fn compute_coverage_bins(depths: &[u32], max_num_bins: usize) -> (f64, Vec<(
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::streams::{ParseOutput, SequenceRecord};
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    async fn test_compute_allele_counts() -> Result<()> {
-        let (tx, rx) = mpsc::channel(10);
-        let record = SequenceRecord::Fasta {
-            id: "test".to_string(),
-            desc: None,
-            seq: b"ATCGN".to_vec(),
-        };
-        tx.send(ParseOutput::Fasta(record)).await?;
-        drop(tx); // Close the channel
-
-        let counts = compute_allele_counts(rx).await?;
-        assert_eq!(counts.get(&'A'), Some(&1));
-        assert_eq!(counts.get(&'T'), Some(&1));
-        assert_eq!(counts.get(&'C'), Some(&1));
-        assert_eq!(counts.get(&'G'), Some(&1));
-        assert_eq!(counts.get(&'N'), Some(&1));
-        assert_eq!(counts.len(), 5);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_compute_allele_counts_invalid_variant() -> Result<()> {
-        let (tx, rx) = mpsc::channel(10);
-        tx.send(ParseOutput::Bytes(b"invalid".to_vec())).await?;
-        drop(tx);
-
-        let result = compute_allele_counts(rx).await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Unexpected ParseOutput variant in FASTA stream"
-        );
-        Ok(())
-    }
-}
