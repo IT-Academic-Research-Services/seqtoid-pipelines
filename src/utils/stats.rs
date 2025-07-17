@@ -235,7 +235,7 @@ pub fn compute_depth_stats(depth_map: &HashMap<String, u32>) -> Result<HashMap<S
 ///
 /// # Returns
 ///
-/// HashMap<String, String> 
+/// HashMap<String, String>
 pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
     let mut stats = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
@@ -279,6 +279,75 @@ pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashM
 
     if stats.is_empty() {
         return Err(anyhow!("No valid seqkit stats data parsed"));
+    }
+
+    Ok(stats)
+}
+
+
+/// Parse  stats from ERCC stream
+///
+/// # Arguments
+///
+/// * `rx` - A Receiver stream of ParseOutput::Lines containing seqkit stats output
+///
+/// # Returns
+///
+/// HashMap<String, u64>
+pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, u64>> {
+    let mut stats = HashMap::new();
+    let mut stream = ReceiverStream::new(rx);
+    let mut line_count = 0;
+
+    while let Some(item) = stream.next().await {
+        line_count += 1;
+        match item {
+            ParseOutput::Bytes(line_bytes) => {
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+
+                if line.starts_with("SN") {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 3 {
+                        let key = parts[1].trim_end_matches(':').to_string();
+                        let value_str = parts[2];
+                        if let Ok(value) = value_str.parse::<u64>() {
+                            match key.as_str() {
+                                "reads mapped" => {
+                                    stats.insert("ercc_mapped_reads".to_string(), value);
+                                }
+                                "reads mapped and paired" => {
+                                    stats.insert("ercc_mapped_paired".to_string(), value);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            eprintln!(
+                                "Warning: Failed to parse value '{}' for key '{}' at line {}",
+                                value_str, key, line_count
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "Warning: Invalid line format at line {}: {}",
+                            line_count, line
+                        );
+                    }
+                }
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unexpected non-byte data in ERCC stats stream at line {}",
+                    line_count
+                ));
+            }
+        }
+    }
+
+    if stats.is_empty() {
+        eprintln!("Warning: No valid ERCC stats data parsed");
     }
 
     Ok(stats)
