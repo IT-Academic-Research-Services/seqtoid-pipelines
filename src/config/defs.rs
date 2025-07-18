@@ -16,6 +16,7 @@ pub const MAFFT_TAG: &str = "mafft";
 pub const QUAST_TAG: &str = "quast.py";
 pub const NUCMER_TAG: &str = "nucmer";
 pub const SHOW_COORDS_TAG: &str = "show-coords";
+pub const SEQKIT_TAG: &str = "seqkit";
 
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,7 +27,8 @@ pub enum SamtoolsSubcommand {
     Sort,
     Index,
     Mpileup,
-    Consensus
+    Consensus,
+    Depth
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +44,10 @@ pub enum IvarSubcommand {
     Consensus
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeqkitSubcommand {
+    Stats
+}
 
 // Static Filenames
 pub const NUCMER_DELTA: &str = "alignment.delta";

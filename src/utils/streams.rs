@@ -259,7 +259,6 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
         writer.flush().await?;
         writer.shutdown().await?;
-        eprintln!("Completed writing to {} (total: {} bytes)", cmd_tag_owned, total_written);
         Ok(())
     });
 
@@ -613,9 +612,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
 
     tokio::spawn(async move {
         while reader.read_line(&mut line).await? > 0 {
-            // Remove trailing newline for consistency
-            let trimmed_line = line.trim_end().to_string();
-            if tx.send(ParseOutput::Bytes(trimmed_line.into_bytes())).await.is_err() {
+            if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
                 eprintln!("No active receivers for line");
                 break;
             }
@@ -763,6 +760,60 @@ pub async fn convert_stream(
     });
     Ok((stats_rx, task))
 }
+
+
+pub async fn bytes_to_lines(
+    rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
+    let (tx, output_rx) = mpsc::channel(buffer_size);
+    let mut leftover = Vec::new();
+
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(rx);
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(mut bytes) => {
+                    if !leftover.is_empty() {
+                        leftover.append(&mut bytes);
+                        bytes = leftover;
+                        leftover = Vec::new();
+                    }
+
+                    let mut start = 0;
+                    for i in 0..bytes.len() {
+                        if bytes[i] == b'\n' {
+                            let line = bytes[start..=i].to_vec();
+                            if tx.send(ParseOutput::Bytes(line)).await.is_err() {
+                                eprintln!("Warning: Receiver dropped in bytes_to_lines, stopping line processing");
+                                break;
+                            }
+                            start = i + 1;
+                        }
+                    }
+
+                    if start < bytes.len() {
+                        leftover = bytes[start..].to_vec();
+                    }
+                }
+                _ => {
+                    return Err(anyhow!("Expected ParseOutput::Bytes, got unexpected variant"));
+                }
+            }
+        }
+
+        if !leftover.is_empty() {
+            if tx.send(ParseOutput::Bytes(leftover)).await.is_err() {
+                eprintln!("Warning: Receiver dropped when sending final leftover line");
+            }
+        }
+
+        Ok(())
+    });
+
+    Ok((output_rx, task))
+}
+
 
 #[cfg(test)]
 mod tests {

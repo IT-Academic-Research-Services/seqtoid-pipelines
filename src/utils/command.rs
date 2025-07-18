@@ -353,8 +353,9 @@ pub mod samtools {
                     args_vec.push(args.min_depth.to_string());
                     // args_vec.push("-l".to_string());
                     // args_vec.push("50".to_string());
-                    
-
+                }
+                SamtoolsSubcommand::Depth => {
+                    args_vec.push("depth".to_string());
                 }
             }
             for (key, value) in config.subcommand_fields.iter() {
@@ -905,6 +906,74 @@ pub mod show_coords {
     }
 }
 
+
+pub mod seqkit {
+
+    use anyhow::anyhow;
+    use tokio::process::Command;
+    use crate::cli::Arguments;
+    use crate::config::defs::{SeqkitSubcommand, SEQKIT_TAG};
+    use crate::utils::command::ArgGenerator;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+
+    #[derive(Debug)]
+    pub struct SeqkitConfig {
+        pub subcommand: SeqkitSubcommand,
+    }
+
+    pub struct SeqkitArgGenerator;
+
+    pub async fn seqkit_presence_check() -> anyhow::Result<String> {
+        let args: Vec<&str> = vec!["--help"];
+
+        let mut child = Command::new(SEQKIT_TAG)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn: {}. Is seqkit installed?",  e))?;
+
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+
+        let second_line = lines
+            .get(1) // Index 1 for the second element
+            .ok_or_else(|| anyhow!("No second line in seqkit --version output"))?;
+
+        let version = second_line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow!("Invalid seqkit --version output: {}", second_line))?;
+
+        if version.is_empty() {
+            return Err(anyhow!("Empty version number in nucmer --version output: {}", second_line));
+        }
+
+        Ok(version.to_string())
+    }
+
+    impl ArgGenerator for SeqkitArgGenerator {
+        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<SeqkitConfig>())
+                .ok_or_else(|| anyhow!("Samtools requires a SeqkitConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                SeqkitSubcommand::Stats => {
+                    args_vec.push("stats".to_string());
+                    // args_vec.push("--thread".to_string());
+                    // args_vec.push(args.threads.to_string());
+                    args_vec.push("-".to_string());
+                }
+            }
+
+            Ok(args_vec)
+            }
+        }
+}
+
 pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -917,6 +986,7 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         NUCMER_TAG => Box::new(nucmer::NucmerArgGenerator),
         SHOW_COORDS_TAG => Box::new(show_coords::ShowCoordsArgGenerator),
         QUAST_TAG => Box::new(quast::QuastArgGenerator),
+        SEQKIT_TAG => Box::new(seqkit::SeqkitArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
@@ -938,6 +1008,7 @@ pub async fn check_version(tool: &str) -> Result<String> {
         MAFFT_TAG => mafft::mafft_presence_check().await,
         QUAST_TAG => quast::quast_presence_check().await,
         NUCMER_TAG => nucmer::nucmer_presence_check().await,
+        SEQKIT_TAG => seqkit::seqkit_presence_check().await,
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
     Ok(version?)

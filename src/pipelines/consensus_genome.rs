@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
@@ -10,23 +11,62 @@ use std::time::Instant;
 use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
+use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
-use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
-use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG};
+use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
+use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
+use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::mpsc;
 use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
+use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
+use crate::utils::vcf::parse_vcf_stream;
+use crate::utils::plotting::plot_depths;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
+
+#[derive(Serialize)]
+struct Stats {
+    sample_name: String,
+    depth_avg: f64,
+    depth_q25: f64,
+    depth_q50: f64,
+    depth_q75: f64,
+    depth_frac_above_10x: f64,
+    depth_frac_above_25x: f64,
+    depth_frac_above_50x: f64,
+    depth_frac_above_100x: f64,
+    allele_counts: HashMap<char, u64>,
+    total_reads: u64,
+    mapped_reads: u64,
+    mapped_paired: Option<u64>,
+    paired_inward: Option<u64>,
+    paired_outward: Option<u64>,
+    paired_other_orientation: Option<u64>,
+    ercc_mapped_reads: Option<u64>,
+    ercc_mapped_paired: Option<u64>,
+    ref_snps: u64,
+    ref_mnps: u64,
+    ref_indels: u64,
+    n_actg: u64,
+    n_missing: u64,
+    n_gap: u64,
+    n_ambiguous: u64,
+    coverage_breadth: f64,
+    max_aligned_length: usize,
+    total_length: usize,
+    coverage_bin_size: f64,
+    coverage: Vec<(usize, f64, f64, u8, u8)>,
+}
 
 pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
@@ -40,9 +80,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     let mut quast_write_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut stats_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut ercc_stats_task: Option<tokio::task::JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
 
     // External tools check
-    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, NUCMER_TAG]).await?;
+    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, NUCMER_TAG, SEQKIT_TAG]).await?;
 
     // Arguments and files check
     let file1_path: PathBuf = match &config.args.file1 {
@@ -224,11 +266,20 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
 
-    let no_host_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("no_host"), "_");
+    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("no_host.fq"), "_");
+
+    let stats_seqkit_config_stats = SeqkitConfig {
+        subcommand: SeqkitSubcommand::Stats,
+    };
+    let stats_seqkit_args_stats = generate_cli(
+        SEQKIT_TAG,
+        &config.args,
+        Some(&stats_seqkit_config_stats),
+    )?;
 
     let (host_streams, host_done_rx) = t_junction(
         host_samtools_out_stream_fastq,
-        2,
+        3,
         config.args.buffer_size,
         config.args.stall_threshold.try_into().unwrap(),
         Some(config.args.stream_sleep_ms),
@@ -240,12 +291,25 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().unwrap();
     let no_host_file_stream = streams_iter.next().unwrap();
+    let no_host_count_stream = streams_iter.next().unwrap();
+
+
+    let (mut no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(no_host_count_stream, SEQKIT_TAG, stats_seqkit_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
+    let no_host_seqkit_out_stream_stats = parse_child_output(
+        &mut no_host_seqkit_child_stats,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        config.args.buffer_size / 4,
+    ).await?;
+    stats_tasks.push(no_host_seqkit_task_stats);
+    cleanup_tasks.push(no_host_seqkit_err_task_stats);
+
 
     let host_samtools_write_task = tokio::spawn(stream_to_file(
         no_host_file_stream,
         PathBuf::from(no_host_file_path),
     ));
-    cleanup_tasks.push(host_samtools_write_task);
+    stats_tasks.push(host_samtools_write_task);
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
@@ -256,12 +320,17 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut consensus_file_path: Option<PathBuf> = None;
     let mut consensus_eval_stream : Option<Receiver<ParseOutput>>  = None;
     let mut consensus_bam_eval_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut ercc_stats_stream: Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_bam_stats_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_bam_depth_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut consensus_stats_stream : Option<Receiver<ParseOutput>>  = None;
+    let mut call_bcftools_stats_stream : Option<Receiver<ParseOutput>>  = None;
 
     //*****************
     // Split by Technology
     match technology {
         Technology::Illumina => {
-            eprintln!("Illumina");
+            eprintln!("Technology: Illumina");
 
             //*****************
             // Get Target reference sequence
@@ -284,8 +353,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
                 50,
-            )
-                .await?;
+            ).await?;
             cleanup_receivers.push(ercc_done_rx);
 
             let mut streams_iter = ercc_streams.into_iter();
@@ -295,9 +363,17 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(ercc_stream, None).await?;
             cleanup_tasks.push(ercc_query_write_task);
-            let ercc_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(ercc_path, ercc_query_pipe_path.clone())))?;
+            let ercc_minimap2_args = generate_cli(
+                MINIMAP2_TAG,
+                &config.args,
+                Some(&(ercc_path, ercc_query_pipe_path.clone())),
+            )?;
 
-            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, ercc_minimap2_args, config.args.verbose).await?;
+            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(
+                MINIMAP2_TAG,
+                ercc_minimap2_args,
+                config.args.verbose,
+            ).await?;
             let ercc_minimap2_out_stream = parse_child_output(
                 &mut ercc_minimap2_child,
                 ChildStream::Stdout,
@@ -316,7 +392,13 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 Some(&ercc_samtools_config_view),
             )?;
 
-            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(ercc_minimap2_out_stream, SAMTOOLS_TAG, ercc_samtools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
+            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(
+                ercc_minimap2_out_stream,
+                SAMTOOLS_TAG,
+                ercc_samtools_args_view,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
             let ercc_samtools_out_stream_view = parse_child_output(
                 &mut ercc_samtools_child_view,
                 ChildStream::Stdout,
@@ -337,22 +419,65 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )?;
 
             let ercc_stats_file_path = no_ext_sample_base.clone() + "_stats.txt";
-            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(ercc_samtools_out_stream_view, SAMTOOLS_TAG, ercc_samtools_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
+            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(
+                ercc_samtools_out_stream_view,
+                SAMTOOLS_TAG,
+                ercc_samtools_args_stats,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
 
             let ercc_samtools_out_stream_stats = parse_child_output(
                 &mut ercc_samtools_child_stats,
                 ChildStream::Stdout,
-                ParseMode::Bytes,
+                ParseMode::Lines, // Changed from ParseMode::Bytes to ParseMode::Lines
                 config.args.buffer_size / 4,
             ).await?;
             cleanup_tasks.push(ercc_samtools_task_stats);
             cleanup_tasks.push(ercc_samtools_err_task_stats);
 
-            let ercc_stats_write_task = tokio::spawn(stream_to_file(
+            let ercc_samtools_out_stream_stats = ReceiverStream::new(ercc_samtools_out_stream_stats);
+            let (ercc_streams, ercc_done_rx) = t_junction(
                 ercc_samtools_out_stream_stats,
-                PathBuf::from(ercc_stats_file_path),
-            ));
-            cleanup_tasks.push(ercc_stats_write_task);
+                2,
+                config.args.buffer_size,
+                config.args.stall_threshold.try_into().unwrap(),
+                Some(config.args.stream_sleep_ms),
+                50,
+            ).await?;
+            cleanup_receivers.push(ercc_done_rx);
+
+            let mut streams_iter = ercc_streams.into_iter();
+            let ercc_file_stream = streams_iter.next().unwrap();
+            ercc_stats_stream = Some(streams_iter.next().unwrap());
+
+            match ercc_stats_stream {
+                Some(stream) => {
+                    // Convert byte stream to line stream
+                    let (line_stream, line_task) = bytes_to_lines(stream, config.args.buffer_size / 4).await?;
+                    stats_tasks.push(line_task);
+
+                    // Spawn ERCC stats parsing task
+                    ercc_stats_task = Some(tokio::spawn(async move {
+                        let result = parse_ercc_stats(line_stream).await;
+                        if result.is_err() {
+                            eprintln!("Warning: Failed to parse ERCC stats: {:?}", result);
+                        }
+                        result
+                    }));
+
+                    // Write ERCC stats to file
+                    let ercc_stats_write_task = tokio::spawn(stream_to_file(
+                        ercc_file_stream,
+                        PathBuf::from(ercc_stats_file_path),
+                    ));
+                    cleanup_tasks.push(ercc_stats_write_task);
+                }
+                None => {
+                    eprintln!("Warning: ercc_stats_stream is not available, skipping ERCC stats parsing and file write");
+                }
+            }
+
 
             //*****************
             // Filter Reads
@@ -629,7 +754,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_bam_streams, consensus_bam_done_rx) = t_junction(
                 align_samtools_out_stream_sort,
-                4,
+                6,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -643,7 +768,8 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_bam_file_stream = streams_iter.next().unwrap();
             let consensus_bam_call_stream = streams_iter.next().unwrap();
             consensus_bam_eval_stream = Some(streams_iter.next().unwrap());
-
+            consensus_bam_stats_stream = Some(streams_iter.next().unwrap());
+            consensus_bam_depth_stream = Some(streams_iter.next().unwrap());
 
             let consensus_bam_write_task = tokio::spawn(stream_to_file(
                 consensus_bam_file_stream,
@@ -691,7 +817,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let (consensus_streams, consensus_done_rx) = t_junction(
                 consensus_samtools_out_stream,
-                3,
+                4,
                 config.args.buffer_size,
                 config.args.stall_threshold.try_into().unwrap(),
                 Some(config.args.stream_sleep_ms),
@@ -703,6 +829,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let consensus_file_stream = streams_iter.next().unwrap();
             let consensus_realign_stream = streams_iter.next().unwrap();
             consensus_eval_stream = Some(streams_iter.next().unwrap());
+            consensus_stats_stream = Some(streams_iter.next().unwrap());
 
 
             let consensus_fa_write_task = tokio::spawn(stream_to_file(
@@ -826,8 +953,23 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 config.args.buffer_size / 4,
             ).await?;
 
-            let called_variants_write_task = tokio::spawn(stream_to_file(
+            let call_bcftools_out_stream_view = ReceiverStream::new(call_bcftools_out_stream_view);
+            let (call_bcftools_out_streams, call_bcftools_done_rx) = t_junction(
                 call_bcftools_out_stream_view,
+                2,
+                config.args.buffer_size,
+                config.args.stall_threshold.try_into().unwrap(),
+                Some(config.args.stream_sleep_ms),
+                50,
+            )
+                .await?;
+            cleanup_receivers.push(call_bcftools_done_rx);
+
+            let mut streams_iter = call_bcftools_out_streams.into_iter();
+            let call_bcftools_file_stream = streams_iter.next().unwrap();
+            call_bcftools_stats_stream  = Some(streams_iter.next().unwrap());
+            let called_variants_write_task = tokio::spawn(stream_to_file(
+                call_bcftools_file_stream,
                 called_variants_path
             ));
             cleanup_tasks.push(called_variants_write_task);
@@ -885,6 +1027,173 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             return Err(anyhow!("Minion not ready"));
         }
     }
+
+
+    //*****************
+    // Calculate Statistics
+    let results = try_join_all(stats_tasks).await?;
+    for result in results {
+        result?;
+    }
+
+    let stats_samtools_config_stats = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Stats,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
+    };
+    let stats_samtools_args_stats = generate_cli(
+        SAMTOOLS_TAG,
+        &config.args,
+        Some(&stats_samtools_config_stats),
+    )?;
+
+    let stats_samtools_out_stream_stats = match consensus_bam_stats_stream {
+        Some(stream) => {
+            let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(
+                stream,
+                SAMTOOLS_TAG,
+                stats_samtools_args_stats.clone(),
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
+            cleanup_tasks.push(stats_samtools_task_stats);
+            cleanup_tasks.push(stats_samtools_err_task_stats);
+            parse_child_output(&mut stats_samtools_child_stats, ChildStream::Stdout, ParseMode::Lines, config.args.buffer_size / 4).await?
+        }
+        None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
+    };
+    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats).await?;
+
+    let depth_samtools_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Depth,
+        subcommand_fields: HashMap::from([
+            ("-aa".to_string(), None),
+            ("-d".to_string(), Some("0".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+    let depth_samtools_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config.args,
+        Some(&depth_samtools_config),
+    )?;
+
+    let depth_samtools_out_stream = match consensus_bam_depth_stream {
+        Some(stream) => {
+            let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(
+                stream,
+                SAMTOOLS_TAG,
+                depth_samtools_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            ).await?;
+            cleanup_tasks.push(depth_samtools_task);
+            cleanup_tasks.push(depth_samtools_err_task);
+            parse_child_output(
+                &mut depth_samtools_child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config.args.buffer_size / 4,
+            ).await?
+        }
+        None => {
+            return Err(anyhow!("consensus_bam_stats_stream is not available"));
+        }
+    };
+
+    let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
+    if depth_map.is_empty() {
+        return Err(anyhow!("No depth data found"));
+    }
+    // NB: for this pipeline, for now at least, there should only be one chrom, so takingt he first one
+    let first_chr = depth_map.keys().next().ok_or_else(|| anyhow!("No chromosomes found"))?.clone();
+    let first_chr_depth_map = depth_map.get(&first_chr).unwrap();
+    let depths: Vec<u32> = first_chr_depth_map.values().copied().collect();
+    let samtools_depth_stats = compute_depth_stats(&depths)?;
+
+    let depth_plot_path = file_path_manipulator(
+        &PathBuf::from(&no_ext_sample_base_buf),
+        &cwd.clone(),
+        None,
+        Some("depth.png"),
+        "_"
+    );
+
+    plot_depths(&first_chr_depth_map, &no_ext_sample_base, &depth_plot_path)?;
+
+    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats).await?;
+
+    let ercc_stats = if let Technology::Illumina = technology {
+        match ercc_stats_task {
+            Some(task) => match task.await {
+                Ok(Ok(stats)) => stats,
+                Ok(Err(e)) => return Err(anyhow!("Failed to parse ERCC stats: {}", e)),
+                Err(e) => return Err(anyhow!("ERCC stats task failed: {}", e)),
+            },
+            None => return Err(anyhow!("ERCC stats task not initialized for Illumina technology")),
+        }
+    } else {
+        HashMap::new() // Empty stats for ONT
+    };
+
+    let allele_counts = if let Some(stream) = consensus_stats_stream {
+        compute_allele_counts(stream).await?
+    } else {
+        HashMap::new()
+    };
+
+    let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
+        parse_vcf_stream(stream).await?
+    } else {
+        (0, 0, 0)
+    };
+
+    let n_actg = allele_counts.iter().filter(|&(k, _)| "ACTGU".contains(*k)).map(|(_, &v)| v).sum::<u64>();
+    let n_missing = allele_counts.get(&'N').copied().unwrap_or(0);
+    let n_gap = allele_counts.get(&'-').copied().unwrap_or(0);
+    let n_ambiguous = allele_counts.iter().filter(|&(k, _)| !"ACTGUN-".contains(*k)).map(|(_, &v)| v).sum::<u64>();
+
+    let coverage_breadth = if !depths.is_empty() { depths.iter().filter(|&&d| d > 0).count() as f64 / depths.len() as f64 } else { 0.0 };
+    let max_aligned_length = depths.len();
+    let total_length = depths.len();
+    let (coverage_bin_size, coverage) = if !depths.is_empty() { compute_coverage_bins(&depths, 500) } else { (0.0, Vec::new()) };
+
+    let stats = Stats {
+        sample_name: no_ext_sample_base.clone(),
+        depth_avg: samtools_depth_stats.get("depth_avg").copied().unwrap_or(0.0),
+        depth_q25: samtools_depth_stats.get("depth_q.25").copied().unwrap_or(0.0),
+        depth_q50: samtools_depth_stats.get("depth_q.5").copied().unwrap_or(0.0),
+        depth_q75: samtools_depth_stats.get("depth_q.75").copied().unwrap_or(0.0),
+        depth_frac_above_10x: samtools_depth_stats.get("depth_frac_above_10x").copied().unwrap_or(0.0),
+        depth_frac_above_25x: samtools_depth_stats.get("depth_frac_above_25x").copied().unwrap_or(0.0),
+        depth_frac_above_50x: samtools_depth_stats.get("depth_frac_above_50x").copied().unwrap_or(0.0),
+        depth_frac_above_100x: samtools_depth_stats.get("depth_frac_above_100x").copied().unwrap_or(0.0),
+        allele_counts,
+        total_reads: seqkit_stats.get("num_seqs").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_reads: samtools_stats_out.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_paired: samtools_stats_out.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
+        paired_inward: samtools_stats_out.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_outward: samtools_stats_out.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_other_orientation: samtools_stats_out.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        ercc_mapped_reads: ercc_stats.get("ercc_mapped_reads").copied(),
+        ercc_mapped_paired: ercc_stats.get("ercc_mapped_paired").copied(),
+        ref_snps,
+        ref_mnps,
+        ref_indels,
+        n_actg,
+        n_missing,
+        n_gap,
+        n_ambiguous,
+        coverage_breadth,
+        max_aligned_length,
+        total_length,
+        coverage_bin_size,
+        coverage,
+    };
+
+    let stats_file_path = cwd.join(format!("{}_stats.json", no_ext_sample_base));
+    let mut stats_file = File::create(&stats_file_path)?;
+    serde_json::to_writer_pretty(&mut stats_file, &stats)?;
+
 
     //*****************
     // Assembly Evaluation

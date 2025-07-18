@@ -4,7 +4,9 @@ pub mod streams;
 pub mod command;
 pub mod sequence;
 pub mod db;
-mod stats;
+pub mod stats;
 pub mod metrics;
 pub mod align;
+pub mod vcf;
+pub mod plotting;
 
