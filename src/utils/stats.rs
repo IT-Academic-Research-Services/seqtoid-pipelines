@@ -116,8 +116,8 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
 /// # Returns
 ///
 /// Hamshmap <String, u32>
-pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, u32>> {
-    let mut depth_map = HashMap::new();
+pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, HashMap<usize, u32>>> {
+    let mut depth_map: HashMap<String, HashMap<usize, u32>> = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
     let mut line_count = 0;
 
@@ -140,15 +140,17 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
                 }
 
                 let chr = parts[0].to_string();
-                let pos: u64 = parts[1]
+                let pos: usize = parts[1]
                     .parse()
                     .map_err(|e| anyhow!("Failed to parse position at line {}: {}", line_count, e))?;
                 let depth: u32 = parts[2]
                     .parse()
                     .map_err(|e| anyhow!("Failed to parse depth at line {}: {}", line_count, e))?;
 
-                let key = format!("{}:{}", chr, pos);
-                depth_map.insert(key, depth);
+                depth_map
+                    .entry(chr)
+                    .or_insert_with(HashMap::new)
+                    .insert(pos, depth);
             }
             _ => {
                 return Err(anyhow!("Unexpected non-byte data in samtools depth stream at line {}", line_count));
@@ -173,38 +175,37 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
 /// # Returns
 ///
 /// Hashmap <String, f64>
-pub fn compute_depth_stats(depth_map: &HashMap<String, u32>) -> Result<HashMap<String, f64>> {
-    if depth_map.is_empty() {
+pub fn compute_depth_stats(depths: &[u32]) -> Result<HashMap<String, f64>> {
+    if depths.is_empty() {
         return Err(anyhow!("InsufficientReadsError: There was insufficient coverage so a consensus genome could not be created."));
     }
 
-    let mut depths: Vec<u32> = depth_map.values().copied().collect();
     let count = depths.len() as f64;
-
     let sum: u64 = depths.iter().map(|&x| x as u64).sum();
     let depth_avg = sum as f64 / count;
 
     // Sort depths for quantiles
-    depths.sort_unstable();
+    let mut depths_sorted = depths.to_vec();
+    depths_sorted.sort_unstable();
 
     // Compute quantiles
     let depth_q25 = if count > 0.0 {
         let idx = ((count * 0.25).ceil() - 1.0) as usize;
-        depths.get(idx).copied().unwrap_or(0) as f64
+        depths_sorted.get(idx).copied().unwrap_or(0) as f64
     } else {
         0.0
     };
 
     let depth_q5 = if count > 0.0 {
         let idx = ((count * 0.5).ceil() - 1.0) as usize;
-        depths.get(idx).copied().unwrap_or(0) as f64
+        depths_sorted.get(idx).copied().unwrap_or(0) as f64
     } else {
         0.0
     };
 
     let depth_q75 = if count > 0.0 {
         let idx = ((count * 0.75).ceil() - 1.0) as usize;
-        depths.get(idx).copied().unwrap_or(0) as f64
+        depths_sorted.get(idx).copied().unwrap_or(0) as f64
     } else {
         0.0
     };

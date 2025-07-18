@@ -1101,8 +1101,15 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
 
     let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
-    let samtools_depth_stats = compute_depth_stats(&depth_map)?;
-    let depths: Vec<u32> = depth_map.values().copied().collect();
+    if depth_map.is_empty() {
+        return Err(anyhow!("No depth data found"));
+    }
+    // NB: for this pipeline, for now at least, there should only be one chrom, so takingt he first one
+    let first_chr = depth_map.keys().next().ok_or_else(|| anyhow!("No chromosomes found"))?.clone();
+    let first_chr_depth_map = depth_map.get(&first_chr).unwrap();
+    let depths: Vec<u32> = first_chr_depth_map.values().copied().collect();
+    let samtools_depth_stats = compute_depth_stats(&depths)?;
+
 
     let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats).await?;
 
