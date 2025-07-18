@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Write;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
@@ -31,6 +30,7 @@ use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
 use crate::utils::vcf::parse_vcf_stream;
+use crate::utils::plotting::plot_depths;
 
 const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
@@ -1110,6 +1110,15 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let depths: Vec<u32> = first_chr_depth_map.values().copied().collect();
     let samtools_depth_stats = compute_depth_stats(&depths)?;
 
+    let depth_plot_path = file_path_manipulator(
+        &PathBuf::from(&no_ext_sample_base_buf),
+        &cwd.clone(),
+        None,
+        Some("depth.png"),
+        "_"
+    );
+
+    plot_depths(&first_chr_depth_map, &no_ext_sample_base, &depth_plot_path)?;
 
     let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats).await?;
 

@@ -8,4 +8,5 @@ pub mod stats;
 pub mod metrics;
 pub mod align;
 pub mod vcf;
+pub mod plotting;
 
