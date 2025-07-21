@@ -46,7 +46,8 @@ pub enum IvarSubcommand {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeqkitSubcommand {
-    Stats
+    Stats,
+    Grep
 }
 
 // Static Filenames

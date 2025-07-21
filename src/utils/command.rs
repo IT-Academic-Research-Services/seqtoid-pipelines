@@ -908,7 +908,7 @@ pub mod show_coords {
 
 
 pub mod seqkit {
-
+    use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
@@ -919,6 +919,7 @@ pub mod seqkit {
     #[derive(Debug)]
     pub struct SeqkitConfig {
         pub subcommand: SeqkitSubcommand,
+        pub subcommand_fields: HashMap<String, Option<String>>,
     }
 
     pub struct SeqkitArgGenerator;
@@ -963,9 +964,18 @@ pub mod seqkit {
             match config.subcommand {
                 SeqkitSubcommand::Stats => {
                     args_vec.push("stats".to_string());
-                    // args_vec.push("--thread".to_string());
-                    // args_vec.push(args.threads.to_string());
                     args_vec.push("-".to_string());
+                }
+                SeqkitSubcommand::Grep => {
+                    args_vec.push("grep".to_string());
+                }
+            }
+
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
                 }
             }
 
