@@ -210,7 +210,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
     temp_files.push(host_ref_temp);
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
-    cleanup_tasks.push(host_ref_write_task);
+    host_ref_write_task.await?;  // This has to be done immediately to make sure the host query minimap2 can read it
 
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
@@ -341,7 +341,6 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), target_ref_fasta_path.as_ref().unwrap(), config.args.buffer_size).await?;
 
             println!("Temporary FASTA written to: {:?}", target_ref_fasta_path.as_ref().unwrap());
-            quast_write_tasks.push(target_ref_write_task);
 
             
             //*****************
@@ -478,6 +477,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 }
             }
 
+            target_ref_write_task.await?;  // Need to make sure the target reference is fully written by this point
 
             //*****************
             // Filter Reads
