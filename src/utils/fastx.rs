@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::collections::HashSet;
 use anyhow::{Result, anyhow};
 use flate2::read::GzDecoder;
@@ -9,7 +10,7 @@ use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::cli::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use crate::utils::sequence::{DNA, normal_phred_qual_string, valid_bases}; 
+use crate::utils::sequence::{DNA, normal_phred_qual_string}; 
 use futures::Stream;
 use tokio_stream::{self as stream};
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
@@ -137,10 +138,10 @@ pub enum SequenceReader {
 ///
 /// # Returns
 /// Result<(), String> for error if any
-pub fn validate_sequence(seq: &[u8], valid_bases: &[u8]) -> Result<(), String> {
+pub fn validate_sequence(seq: &Arc<Vec<u8>>, valid_bases: &[u8]) -> Result<()> {
     let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
     if let Some(&invalid_base) = seq.iter().find(|&&b| !valid_bases_set.contains(&b)) {
-        Err(format!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
+        Err(anyhow::anyhow!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
     } else {
         Ok(())
     }
@@ -158,15 +159,21 @@ pub fn validate_sequence(seq: &[u8], valid_bases: &[u8]) -> Result<(), String> {
 ///
 /// # Returns
 /// Result<(), String> for error if any
-async fn validate_sequence_parallel(seq: &[u8], valid_bases: &[u8], num_threads: usize) -> Result<(), String> {
+pub async fn validate_sequence_parallel(seq: Arc<Vec<u8>>, valid_bases: &[u8], num_threads: usize) -> Result<()> {
     let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
-    let chunk_size = (seq.len() + num_threads - 1) / num_threads; // Ceiling division
+    let chunk_size = (seq.len() + num_threads - 1) / num_threads;
     let mut handles: Vec<JoinHandle<Result<(), String>>> = Vec::new();
 
-    for chunk in seq.chunks(chunk_size) {
-        let chunk = chunk.to_vec(); // Clone chunk for task
+    for i in 0..num_threads {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(seq.len());
+        if start >= seq.len() {
+            break;
+        }
+        let seq_arc = Arc::clone(&seq);
         let valid_bases_set = valid_bases_set.clone();
         let handle = tokio::spawn(async move {
+            let chunk = &seq_arc[start..end];
             if let Some(&invalid_base) = chunk.iter().find(|&&b| !valid_bases_set.contains(&b)) {
                 Err(format!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
             } else {
@@ -178,7 +185,7 @@ async fn validate_sequence_parallel(seq: &[u8], valid_bases: &[u8], num_threads:
 
     let results = try_join_all(handles).await?;
     for result in results {
-        result?;
+        result.map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(())
 }
@@ -738,45 +745,6 @@ pub fn parse_and_filter_fastq_id(
 
     (filtered_rx, task)
 }
-
-
-/// Cohecks for illegal bases
-///
-/// # Arguments
-/// * `rx` - Receiver of parsed FASTA records `parse_fasta.
-/// * `valid_bases` - vec of allowed bases in all sequence records in fasta
-///
-/// # Returns
-/// Result
-pub async fn validate_fasta_stream(
-    rx: mpsc::Receiver<ParseOutput>,
-    valid_bases: &[u8],
-) -> Result<()> {
-    let mut stream = ReceiverStream::new(rx);
-    let mut count = 0;
-
-    while let Some(item) = stream.next().await {
-        match item {
-            ParseOutput::Fasta(record) => {
-                count += 1;
-                let seq = record.seq();
-                validate_sequence(seq, valid_bases).map_err(|e| {
-                    anyhow!("Invalid bases in sequence '{}' (record {}): {}",
-                            record.id(), count, e)
-                })?;
-            }
-            _ => {
-                return Err(anyhow!(
-                    "Unexpected non_FASTA data in stream at  {}",
-                    count
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 
 
 #[cfg(test)]
