@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 use crate::cli::Arguments;
+use lazy_static::lazy_static;
+use std::collections::HashMap;
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -18,6 +20,23 @@ pub const NUCMER_TAG: &str = "nucmer";
 pub const SHOW_COORDS_TAG: &str = "show-coords";
 pub const SEQKIT_TAG: &str = "seqkit";
 
+
+lazy_static! {
+    pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
+        let mut m = HashMap::new();
+        m.insert(SAMTOOLS_TAG, 1.20);
+        m.insert(BCFTOOLS_TAG, 1.20);
+        m.insert(MINIMAP2_TAG, 2.24);
+        m.insert(KRAKEN2_TAG, 2.1);
+        m.insert(PIGZ_TAG, 2.8);
+        m.insert(FASTP_TAG, 1.0);
+        m.insert(MAFFT_TAG, 7.5);
+        m.insert(QUAST_TAG, 5.20);
+        m.insert(SEQKIT_TAG, 2.10);
+
+        m
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
