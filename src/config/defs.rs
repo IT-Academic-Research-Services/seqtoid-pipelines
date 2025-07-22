@@ -27,7 +27,7 @@ lazy_static! {
         m.insert(SAMTOOLS_TAG, 1.20);
         m.insert(BCFTOOLS_TAG, 1.20);
         m.insert(MINIMAP2_TAG, 2.24);
-        m.insert(KRAKEN2_TAG, 2.15);
+        m.insert(KRAKEN2_TAG, 2.1);
         m.insert(PIGZ_TAG, 2.8);
         m.insert(FASTP_TAG, 1.0);
         m.insert(MAFFT_TAG, 7.5);

@@ -3,22 +3,68 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use num_cpus;
-use crate::config::defs::{FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, NUCMER_DELTA};
+use tokio::process::Command;
+use futures::future::try_join_all;
+use crate::config::defs::{TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG};
 use crate::cli::Arguments;
-use lazy_static::lazy_static;
-
-
-lazy_static! {
-    static ref MIN_VERSIONS: HashMap<&'static str, &'static f64> = {
-        let mut m = HashMap::new();
-        m.insert(FASTP_TAG, &1.0);
-        m
-    };
-}
-
+use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
 pub trait ArgGenerator {
     fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>>; 
+}
+
+
+/// Checks the version of a CLI external tool.
+/// NB: ONLY keeps tracks of major plus minor, i.e. 2.1, 4.3, not a point release like 3.4.5
+/// Strips all non digit parts of the version.
+/// # Arguments
+///
+/// * `command_tag` - Executable name of tool.
+/// * `version_args` - CLI args necessary to get tool to output version.
+/// * `version_line` - Which output line contains the version.
+/// * `version_column` - Which output column contains the version.
+/// * `child_stream` - Is the verion on stdout or stderr.
+///
+/// # Returns
+/// Result<f32>major/minor version number
+pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_line: usize, version_column: usize, child_stream: ChildStream) -> Result<f32> {
+    let cmd_tag_owned = command_tag.to_string();
+    let args: Vec<&str> = version_args;
+
+    let mut child = Command::new(&cmd_tag_owned)
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn {}. Is it installed? Error: {}.", cmd_tag_owned.clone(), e))?;
+
+    let lines = read_child_output_to_vec(&mut child, child_stream).await?;
+    let line_w_version = lines
+        .get(version_line)
+        .ok_or_else(|| anyhow!("No line {} in {} version output", version_line, cmd_tag_owned.clone()))?;
+
+    let version_string = line_w_version
+        .split_whitespace()
+        .nth(version_column)
+        .ok_or_else(|| anyhow!("Invalid {} version output: {}", cmd_tag_owned.clone(), line_w_version))?;
+
+    if version_string.is_empty() {
+        return Err(anyhow!("Empty version number string in {} version output: {}", cmd_tag_owned.clone(), line_w_version));
+    }
+
+    let version_parts:  Vec<_>  = version_string.split(".").collect();
+    let major_version = version_parts[0];
+    let major_version_digits: String = major_version.chars().filter(|c| c.is_digit(10)).collect();
+    let mut minor_version = "0";
+    if version_parts.len() > 1 {
+        minor_version = version_parts[1];  // To avoid problems with things like version 2.15.1, only going to track major/minor a la 2.15
+    }
+    let minor_version_digits: String = minor_version.chars().filter(|c| c.is_digit(10)).collect();
+    let version_string_formatted = format!("{}.{}", major_version_digits, minor_version_digits);
+    let version = version_string_formatted.parse::<f32>()?;
+    Ok(version)
+
 }
 
 mod fastp {
@@ -26,37 +72,15 @@ mod fastp {
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::FASTP_TAG;
+    use crate::config::defs::{FASTP_TAG, KRAKEN2_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
     pub struct FastpArgGenerator;
     
-    pub async fn fastp_presence_check() -> Result<String> {
-        let args: Vec<&str> = vec!["-v"];
-
-        let cmd_tag_owned = FASTP_TAG.to_string();
-        let mut child = Command::new(FASTP_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn {}: {}. Is fastp installed?", cmd_tag_owned, e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from fastp -v"))?;
-        let version = first_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Invalid fastp -v output: {}", first_line))?
-            .to_string();
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in fastp -v output: {}", first_line));
-        }
+    pub async fn fastp_presence_check() -> Result<f32> {
+        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
     
@@ -89,8 +113,16 @@ mod fastp {
 
 mod pigz {
     use crate::cli::Arguments;
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{FASTP_TAG, PIGZ_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
     pub struct PigzArgGenerator;
+
+    pub async fn pigz_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout).await?;
+        Ok(version)
+    }
 
     impl ArgGenerator for PigzArgGenerator {
         fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
@@ -106,33 +138,12 @@ mod pigz {
 mod h5dump {
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{H5DUMP_TAG};
+    use crate::config::defs::{H5DUMP_TAG, PIGZ_TAG};
+    use crate::utils::command::version_check;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     
-    pub async fn h5dump_presence_check() -> anyhow::Result<String> {
-        let args: Vec<&str> = vec!["-V"];
-
-
-        let mut child = Command::new(H5DUMP_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is hddump installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from h5dump -V"))?;
-        let version = first_line
-            .split_whitespace()
-            .nth(2)
-            .ok_or_else(|| anyhow!("Invalid h5dump -V output: {}", first_line))?
-            .to_string();
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in h5dump -V output: {}", first_line));
-        }
+    pub async fn h5dump_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout).await?;
         Ok(version)
     }
 }
@@ -142,36 +153,14 @@ mod minimap2 {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::{Arguments, Technology};
-    use crate::config::defs::MINIMAP2_TAG;
+    use crate::config::defs::{H5DUMP_TAG, MINIMAP2_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::{version_check, ArgGenerator};
 
     pub struct Minimap2ArgGenerator;
-    pub async fn minimap2_presence_check() -> anyhow::Result<String> {
-        let args: Vec<&str> = vec!["-V"];
-
-        let mut child = Command::new(MINIMAP2_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is minimap2 installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from minimap2 -V"))?;
-        let version = first_line
-            .split_whitespace()
-            .nth(0)
-            .ok_or_else(|| anyhow!("Invalid minimap2 -V output: {}", first_line))?
-            .to_string();
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in minimap2 -V output: {}", first_line));
-        }
+    pub async fn minimap2_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 0 , ChildStream::Stdout).await?;
         Ok(version)
-        
     }
 
     impl ArgGenerator for Minimap2ArgGenerator {
@@ -251,9 +240,9 @@ pub mod samtools {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::{Arguments};
-    use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand};
+    use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand, H5DUMP_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::{version_check, ArgGenerator};
     
     #[derive(Debug)]
     pub struct SamtoolsConfig {
@@ -263,32 +252,8 @@ pub mod samtools {
     
     pub struct SamtoolsArgGenerator;
 
-
-
-
-    pub async fn samtools_presence_check() -> anyhow::Result<String> {
-        let args: Vec<&str> = vec!["--version"];
-
-        let mut child = Command::new(SAMTOOLS_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
-        let version = first_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
-            .to_string();
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
-        }
+    pub async fn samtools_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(SAMTOOLS_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
 
@@ -376,8 +341,8 @@ pub mod bcftools {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::{BcftoolsSubcommand,  BCFTOOLS_TAG};
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, SAMTOOLS_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[derive(Debug)]
@@ -388,29 +353,8 @@ pub mod bcftools {
 
     pub struct BcftoolsArgGenerator;
 
-    pub async fn bcftools_presence_check() -> anyhow::Result<String> {
-        let args: Vec<&str> = vec!["-v"];
-
-        let mut child = Command::new(BCFTOOLS_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
-        let version = first_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
-            .to_string();
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
-        }
+    pub async fn bcftools_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
 
@@ -474,7 +418,7 @@ pub mod bcftools {
     use crate::cli::Arguments;
     use crate::config::defs::{KRAKEN2_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-    use crate::utils::command::ArgGenerator;
+    use crate::utils::command::{version_check, ArgGenerator};
         use crate::utils::file::file_path_manipulator;
 
         #[derive(Debug)]
@@ -486,32 +430,8 @@ pub mod bcftools {
 
     pub struct Kraken2ArgGenerator;
 
-    pub async fn kraken2_presence_check() -> anyhow::Result<String> {
-
-        let args: Vec<&str> = vec!["--version"];
-
-        let mut child = Command::new(KRAKEN2_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
-
-        let version = first_line
-            .split_whitespace()
-            .nth(2)
-            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
-            .to_string();
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
-        }
+    pub async fn kraken2_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout).await?;
         Ok(version)
     }
     
@@ -565,8 +485,8 @@ pub mod ivar {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD, BCFTOOLS_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[derive(Debug)]
@@ -577,31 +497,8 @@ pub mod ivar {
 
     pub struct IvarArgGenerator;
 
-    pub async fn ivar_presence_check() -> anyhow::Result<String> {
-        let args: Vec<&str> = vec!["version"];
-
-        let mut child = Command::new(IVAR_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is samtools installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from samtools --version"))?;
-
-        let version = first_line
-            .split_whitespace()
-            .nth(2)
-            .ok_or_else(|| anyhow!("Invalid samtools --version output: {}", first_line))?
-            .to_string();
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in samtools --version output: {}", first_line));
-        }
+    pub async fn ivar_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout).await?;
         Ok(version)
     }
 
@@ -641,36 +538,13 @@ pub mod ivar {
 pub mod muscle {
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{MUSCLE_TAG};
+    use crate::config::defs::{IVAR_TAG, MUSCLE_TAG};
+    use crate::utils::command::version_check;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct MuscleArgGenerator;
-    pub async fn muscle_presence_check() -> anyhow::Result<String> {
-
-        let args: Vec<&str> = vec!["-version"];
-
-        let mut child = Command::new(MUSCLE_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is muscle installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from muscle -version"))?;
-
-        let version = first_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Invalid muscle -versionoutput: {}", first_line))?
-            .to_string();
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in muscle -version output: {}", first_line));
-        }
+    pub async fn muscle_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
 }
@@ -679,41 +553,15 @@ pub mod mafft {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::{MAFFT_TAG};
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{MAFFT_TAG, MUSCLE_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct MafftArgGenerator;
-    pub async fn mafft_presence_check() -> anyhow::Result<String> {
-
-        let args: Vec<&str> = vec!["--version"];
-
-        let mut child = Command::new(MAFFT_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is mafft installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
-
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from mafft --version"))?;
-
-        let version = first_line
-            .split_whitespace()
-            .nth(0)
-            .ok_or_else(|| anyhow!("Invalid mafft --version output: {}", first_line))?
-            .to_string();
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in mafft --version output: {}", first_line));
-        }
+    pub async fn mafft_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr).await?;
         Ok(version)
     }
-
 
     impl ArgGenerator for MafftArgGenerator {
         fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
@@ -739,8 +587,8 @@ pub mod quast {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::QUAST_TAG;
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{MUSCLE_TAG, QUAST_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct QuastArgGenerator;
@@ -751,33 +599,8 @@ pub mod quast {
         pub assembly_fasta: String,
     }
 
-    pub async fn quast_presence_check() -> anyhow::Result<String> {
-
-        let args: Vec<&str> = vec!["-v"];
-
-        let mut child = Command::new(QUAST_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is quast installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-        
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from quast -v"))?;
-
-        let version = first_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Invalid quast -v output: {}", first_line))?
-            .to_string();
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in quast -v output: {}", first_line));
-        }
+    pub async fn quast_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
 
@@ -816,8 +639,8 @@ pub mod nucmer {
     use std::path::PathBuf;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::NUCMER_TAG;
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{NUCMER_DELTA, NUCMER_TAG, QUAST_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::command::quast::{QuastArgGenerator, QuastConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -828,37 +651,10 @@ pub mod nucmer {
         pub assembly_fasta: PathBuf,
     }
 
-
-    pub async fn nucmer_presence_check() -> anyhow::Result<String> {
-
-        let args: Vec<&str> = vec!["--version"];
-
-        let mut child = Command::new(NUCMER_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is nucmer installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-
-        let first_line = lines
-            .first()
-            .ok_or_else(|| anyhow!("No output from nucmer --version"))?;
-
-        let version = first_line
-            .split_whitespace()
-            .nth(0)
-            .ok_or_else(|| anyhow!("Invalid nucmer --version output: {}", first_line))?
-            .to_string();
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in nucmer --version output: {}", first_line));
-        }
+    pub async fn nucmer_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
-
 
     impl ArgGenerator for NucmerArgGenerator {
         fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
@@ -912,8 +708,8 @@ pub mod seqkit {
     use anyhow::anyhow;
     use tokio::process::Command;
     use crate::cli::Arguments;
-    use crate::config::defs::{SeqkitSubcommand, SEQKIT_TAG};
-    use crate::utils::command::ArgGenerator;
+    use crate::config::defs::{SeqkitSubcommand, QUAST_TAG, SEQKIT_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     #[derive(Debug)]
@@ -924,33 +720,9 @@ pub mod seqkit {
 
     pub struct SeqkitArgGenerator;
 
-    pub async fn seqkit_presence_check() -> anyhow::Result<String> {
-        let args: Vec<&str> = vec!["--help"];
-
-        let mut child = Command::new(SEQKIT_TAG)
-            .args(&args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn: {}. Is seqkit installed?",  e))?;
-
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
-
-        let second_line = lines
-            .get(1) // Index 1 for the second element
-            .ok_or_else(|| anyhow!("No second line in seqkit --version output"))?;
-
-        let version = second_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow!("Invalid seqkit --version output: {}", second_line))?;
-
-        if version.is_empty() {
-            return Err(anyhow!("Empty version number in nucmer --version output: {}", second_line));
-        }
-
-        Ok(version.to_string())
+    pub async fn seqkit_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout).await?;
+        Ok(version)
     }
 
     impl ArgGenerator for SeqkitArgGenerator {
@@ -1005,37 +777,50 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
 }
 
 
-pub async fn check_version(tool: &str) -> Result<String> {
-    let version = match tool {
-        FASTP_TAG => fastp::fastp_presence_check().await,
-        H5DUMP_TAG => h5dump::h5dump_presence_check().await,
-        MINIMAP2_TAG => {minimap2::minimap2_presence_check().await},
-        SAMTOOLS_TAG => {samtools::samtools_presence_check().await},
-        KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
-        BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
-        IVAR_TAG => ivar::ivar_presence_check().await,
-        MUSCLE_TAG => muscle::muscle_presence_check().await,
-        MAFFT_TAG => mafft::mafft_presence_check().await,
-        QUAST_TAG => quast::quast_presence_check().await,
-        NUCMER_TAG => nucmer::nucmer_presence_check().await,
-        SEQKIT_TAG => seqkit::seqkit_presence_check().await,
-        _ => return Err(anyhow!("Unknown tool: {}", tool)),
-    };
-    Ok(version?)
-}
+pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
+    let checks = tools.into_iter().map(|tool| async move {
+        let version = match tool {
+            FASTP_TAG => fastp::fastp_presence_check().await,
+            H5DUMP_TAG => h5dump::h5dump_presence_check().await,
+            MINIMAP2_TAG => minimap2::minimap2_presence_check().await,
+            SAMTOOLS_TAG => samtools::samtools_presence_check().await,
+            KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
+            BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
+            IVAR_TAG => ivar::ivar_presence_check().await,
+            MUSCLE_TAG => muscle::muscle_presence_check().await,
+            MAFFT_TAG => mafft::mafft_presence_check().await,
+            QUAST_TAG => quast::quast_presence_check().await,
+            NUCMER_TAG => nucmer::nucmer_presence_check().await,
+            SEQKIT_TAG => seqkit::seqkit_presence_check().await,
+            _ => return Err(anyhow!("Unknown tool: {}", tool)),
+        }?;
+        Ok((tool.to_string(), version))
+    });
 
+    let results = try_join_all(checks).await?;
+    let mut failed_tools = Vec::new();
 
-pub async fn check_versions(tools: Vec<&str>) -> Result<HashMap<String, String>>{
-    let mut versions: HashMap<String, String> = HashMap::new();
-    for tool in tools {
-        let _tool_version = match check_version(tool).await {
-            Ok(version) => {
-                versions.insert(tool.to_string(), version);
+    for (tool, version) in &results {
+        // println!("Tool: {}, Version: {}", tool, version);
+        if let Some(&min_version) = TOOL_VERSIONS.get(tool.as_str()) {
+            if *version < min_version {
+                failed_tools.push(format!(
+                    "{} (version found: {}, required: >= {})",
+                    tool, version, min_version
+                ));
             }
-            Err(err) => {
-                return Err(anyhow!("Cannot find external tool in path: {}. Error: {}", tool, err));
-            }
-        };
+        } else {
+            println!("Warning: No minimum version specified for tool: {}", tool);
+        }
     }
-    Ok(versions)
+
+    if !failed_tools.is_empty() {
+        return Err(anyhow!(
+            "The following tools have versions below the minimum required: {}",
+            failed_tools.join(", ")
+        ));
+    }
+
+    Ok(())
 }
+

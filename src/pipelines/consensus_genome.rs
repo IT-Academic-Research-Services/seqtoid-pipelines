@@ -84,7 +84,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let mut ercc_stats_task: Option<tokio::task::JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
 
     // External tools check
-    let _tool_versions = check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG]).await?;
+    check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG]).await?;
 
     // Arguments and files check
     let file1_path: PathBuf = match &config.args.file1 {

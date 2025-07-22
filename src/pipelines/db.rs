@@ -6,12 +6,11 @@ use std::time::Instant;
 use crate::config::defs::RunConfig;
 use crate::config::defs::{FASTA_EXTS, H5DUMP_TAG};
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::command::check_version;
+use crate::utils::command::version_check;
 use crate::utils::file::{file_path_manipulator, scan_files_with_extensions, extension_remover};
 use crate::utils::fastx::read_and_interleave_sequences;
 use crate::utils::db::{write_sequences_to_hdf5, build_new_in_memory_index, check_db};
-
-
+use crate::utils::streams::ChildStream;
 
 /// Creates a new, HDF5-backed database of id's and
 /// sequences.
@@ -27,8 +26,8 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
     println!("\n-------------\n Create DB\n-------------\n");
     println!("Generating HDF5 DB");
     let start = Instant::now();
-    
-    let h5v = check_version(H5DUMP_TAG).await?;
+
+    let h5v = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout).await?;
     eprintln!("HDF5 version: {}", h5v);
 
     let technology = Some(config.args.technology.clone());
