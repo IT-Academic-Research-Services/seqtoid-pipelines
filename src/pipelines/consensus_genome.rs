@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::sync::Arc;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
@@ -14,7 +15,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel};
 use crate::utils::streams::{t_junction, stream_to_cmd, StreamDataType, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
 use crate::config::defs::{PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, NUCMER_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::sequence::valid_bases::DNA_WITH_N;
@@ -210,7 +211,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
     temp_files.push(host_ref_temp);
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.args.buffer_size).await?;
-    cleanup_tasks.push(host_ref_write_task);
+    host_ref_write_task.await?;  // This has to be done immediately to make sure the host query minimap2 can read it
 
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
@@ -270,6 +271,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let stats_seqkit_config_stats = SeqkitConfig {
         subcommand: SeqkitSubcommand::Stats,
+        subcommand_fields: HashMap::from([]),
     };
     let stats_seqkit_args_stats = generate_cli(
         SEQKIT_TAG,
@@ -338,10 +340,14 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let target_ref_temp = NamedTempFile::with_suffix_in(".fasta", &config.ram_temp_dir)?;
             target_ref_fasta_path = Some(target_ref_temp.path().to_path_buf());
             temp_files.push(target_ref_temp);
-            let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), target_ref_fasta_path.as_ref().unwrap(), config.args.buffer_size).await?;
 
-            println!("Temporary FASTA written to: {:?}", target_ref_fasta_path.as_ref().unwrap());
-            quast_write_tasks.push(target_ref_write_task);
+            let seq_len = filter_align_seq.len();
+            let seq_arc = Arc::new(filter_align_seq.clone());
+            let validation_handle = if seq_len > 1_000_000 {
+                tokio::spawn(validate_sequence_parallel(seq_arc.clone(), b"ACGTN", config.args.threads.min(16).max(1)))
+            } else {
+                tokio::spawn(async move { validate_sequence(&seq_arc, b"ACGTN") })
+            };
 
             
             //*****************
@@ -430,7 +436,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let ercc_samtools_out_stream_stats = parse_child_output(
                 &mut ercc_samtools_child_stats,
                 ChildStream::Stdout,
-                ParseMode::Lines, // Changed from ParseMode::Bytes to ParseMode::Lines
+                ParseMode::Lines,
                 config.args.buffer_size / 4,
             ).await?;
             cleanup_tasks.push(ercc_samtools_task_stats);
@@ -478,6 +484,11 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 }
             }
 
+            // Check that the target ref is ACGTN, get handle here
+            validation_handle.await?;
+            let target_ref_write_task = write_vecu8_to_file(filter_align_seq.clone(), target_ref_fasta_path.as_ref().unwrap(), config.args.buffer_size).await?;
+            println!("Temporary FASTA written to: {:?}", target_ref_fasta_path.as_ref().unwrap());
+            target_ref_write_task.await?;  // Must make sure this file is written
 
             //*****************
             // Filter Reads
