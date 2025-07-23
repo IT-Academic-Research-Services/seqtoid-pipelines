@@ -167,7 +167,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let val_pigz_stream = streams_iter.next().unwrap();
 
     //Pigz stream to intermediate file output
-    let val_pigz_args = generate_cli(PIGZ_TAG, &config.args, None)?;
+    let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
     let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
     cleanup_tasks.push(val_pigz_stream_task);
     cleanup_tasks.push(val_pigz_err_task);
@@ -185,7 +185,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(val_pigz_write_task);
 
     // Fastp stream
-    let val_fastp_args = generate_cli(FASTP_TAG, &config.args, None)?;
+    let val_fastp_args = generate_cli(FASTP_TAG, &config, None)?;
     let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
     cleanup_tasks.push(val_fastp_stream_task);
     cleanup_tasks.push(val_fastp_err_task);
@@ -214,7 +214,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
-    let host_minimap2_args = generate_cli(MINIMAP2_TAG, &config.args, Some(&(host_ref_fasta_path.clone(), host_query_pipe_path.clone())))?;
+    let host_minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_ref_fasta_path.clone(), host_query_pipe_path.clone())))?;
     let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, config.args.verbose).await?;
     cleanup_tasks.push(host_minimap2_err_task);
 
@@ -231,7 +231,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
     let host_samtools_args_view = generate_cli(
         SAMTOOLS_TAG,
-        &config.args,
+        &config,
         Some(&host_samtools_config_view),
     )?;
 
@@ -251,7 +251,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
     let host_samtools_args_fastq = generate_cli(
         SAMTOOLS_TAG,
-        &config.args,
+        &config,
         Some(&host_samtools_config_fastq),
     )?;
 
@@ -274,7 +274,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
     let stats_seqkit_args_stats = generate_cli(
         SEQKIT_TAG,
-        &config.args,
+        &config,
         Some(&stats_seqkit_config_stats),
     )?;
 
@@ -370,7 +370,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             cleanup_tasks.push(ercc_query_write_task);
             let ercc_minimap2_args = generate_cli(
                 MINIMAP2_TAG,
-                &config.args,
+                &config,
                 Some(&(ercc_path, ercc_query_pipe_path.clone())),
             )?;
 
@@ -393,7 +393,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let ercc_samtools_args_view = generate_cli(
                 SAMTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&ercc_samtools_config_view),
             )?;
 
@@ -419,7 +419,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let ercc_samtools_args_stats = generate_cli(
                 SAMTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&ercc_samtools_config_stats),
             )?;
 
@@ -506,7 +506,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
                 let filter_minimap2_args = generate_cli(
                     MINIMAP2_TAG,
-                    &config.args,
+                    &config,
                     Some(&(
                         target_ref_fasta_path.as_ref().unwrap().clone(),
                         filter_query_pipe_path
@@ -536,7 +536,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 };
                 let filter_samtools_args_sort = generate_cli(
                     SAMTOOLS_TAG,
-                    &config.args,
+                    &config,
                     Some(&filter_samtools_config_sort),
                 )?;
                 let (
@@ -566,7 +566,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 };
                 let filter_samtools_args_fastq = generate_cli(
                     SAMTOOLS_TAG,
-                    &config.args,
+                    &config,
                     Some(&filter_samtools_config_fastq),
                 )?;
                 let (
@@ -624,7 +624,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
                 let filter_reads_kraken2_args = generate_cli(
                     KRAKEN2_TAG,
-                    &config.args,
+                    &config,
                     Some(&filter_reads_kraken2_config)
                 )?;
                 let (_filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(
@@ -700,7 +700,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let align_minimap2_args = generate_cli(
                 MINIMAP2_TAG,
-                &config.args,
+                &config,
                 Some(&(
                     target_ref_fasta_path.as_ref().unwrap().clone(),
                     align_query_pipe_path_temp
@@ -728,7 +728,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let align_samtools_args_sort = generate_cli(
                 SAMTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&align_samtools_config_sort),
             )?;
             let (
@@ -793,7 +793,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let consensus_samtools_args = generate_cli(
                 SAMTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&consensus_samtools_config),
             )?;
             consensus_file_path = Some(file_path_manipulator(
@@ -862,7 +862,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let call_bcftools_args_mpileup = generate_cli(
                 BCFTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&call_bcftools_config_mpileup),
             )?;
             let (
@@ -897,7 +897,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let call_bcftools_args_call = generate_cli(
                 BCFTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&call_bcftools_config_call),
             )?;
 
@@ -938,7 +938,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             };
             let call_bcftools_args_view = generate_cli(
                 BCFTOOLS_TAG,
-                &config.args,
+                &config,
                 Some(&call_bcftools_config_view),
             )?;
 
@@ -1000,7 +1000,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 Some("consensus_realigned.fa"),
                 "_"
             );
-            let realign_mafft_args = generate_cli(MAFFT_TAG, &config.args, None)?;
+            let realign_mafft_args = generate_cli(MAFFT_TAG, &config, None)?;
             let (
                 mut realign_consensus_mafft_child,
                 realign_consensus_mafft_task,
@@ -1052,7 +1052,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
     let stats_samtools_args_stats = generate_cli(
         SAMTOOLS_TAG,
-        &config.args,
+        &config,
         Some(&stats_samtools_config_stats),
     )?;
 
@@ -1083,7 +1083,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     };
     let depth_samtools_args = generate_cli(
         SAMTOOLS_TAG,
-        &config.args,
+        &config,
         Some(&depth_samtools_config),
     )?;
 
@@ -1230,7 +1230,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let assembly_eval_quast_args = generate_cli(
         QUAST_TAG,
-        &config.args,
+        &config,
         Some(&quast_config),
     )?;
 

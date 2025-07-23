@@ -4,10 +4,17 @@ mod config;
 
 use std::time::Instant;
 use std::{env, fs};
+use std::cmp::min;
 use std::path::PathBuf;
-use clap::Parser;
-use anyhow::Result;
+use std::sync::Arc;
 
+use anyhow::Result;
+use clap::Parser;
+use num_cpus;
+use rayon::ThreadPool;
+use tokio::sync::Semaphore;
+use tokio::runtime::Builder;
+use rayon::ThreadPoolBuilder;
 
 use crate::cli::parse;
 use crate::config::defs::RunConfig;
@@ -15,7 +22,6 @@ use pipelines::consensus_genome;
 use pipelines::db;
 
 mod cli;
-
 
 
 #[tokio::main]
@@ -33,10 +39,13 @@ async fn main() -> Result<()> {
     println!("The RAM temp directory is {:?}\n", ram_temp_dir);
 
     let args = parse();
-    let module = args.module.clone();
-    
-    let run_config = RunConfig { cwd: dir, ram_temp_dir, args };
 
+    let max_cores = min(num_cpus::get(), args.threads);
+    let thread_pool = Arc::new(create_thread_pool(max_cores));
+    let maximal_semaphore = Arc::new(Semaphore::new(2));
+
+    let module = args.module.clone();
+    let run_config = RunConfig { cwd: dir, ram_temp_dir, args, thread_pool, maximal_semaphore};
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(&run_config).await,
@@ -89,4 +98,19 @@ fn get_ram_temp_dir() -> PathBuf {
     {
         std::env::temp_dir()
     }
+}
+
+
+/// Creates a pool of threads for running sub-processes.
+///
+/// # Arguments
+/// # 'max_cores' : Maximum cores allowed or discovered.
+///
+/// # Returns
+/// rayon::ThreadPool
+fn create_thread_pool(max_cores: usize) -> ThreadPool {
+    ThreadPoolBuilder::new()
+        .num_threads(max_cores)
+        .build()
+        .expect("Failed to create thread pool")
 }

@@ -1,18 +1,17 @@
-use std::collections::HashMap;
 /// Functions and structs for working with creating command-line arguments
 
+use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG};
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
 pub trait ArgGenerator {
-    fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>>; 
+    fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>>;
 }
-
 
 /// Checks the version of a CLI external tool.
 /// NB: ONLY keeps tracks of major plus minor, i.e. 2.1, 4.3, not a point release like 3.4.5
@@ -64,28 +63,27 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
     let version_string_formatted = format!("{}.{}", major_version_digits, minor_version_digits);
     let version = version_string_formatted.parse::<f32>()?;
     Ok(version)
-
 }
 
 mod fastp {
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{FASTP_TAG, KRAKEN2_TAG};
+    use crate::config::defs::{FASTP_TAG, KRAKEN2_TAG, RunConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
     pub struct FastpArgGenerator;
-    
+
     pub async fn fastp_presence_check() -> Result<f32> {
         let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
         Ok(version)
     }
-    
+
     impl ArgGenerator for FastpArgGenerator {
-        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
@@ -93,7 +91,7 @@ mod fastp {
             args_vec.push("-q".to_string());
             args_vec.push(args.quality.to_string());
             args_vec.push("-w".to_string());
-            args_vec.push(args.threads.to_string());
+            args_vec.push(RunConfig::thread_allocation(run_config, FASTP_TAG, None).to_string());
 
             if let Some(adapter_fasta) = &args.adapter_fasta {
                 let cwd = std::env::current_dir()?;
@@ -104,16 +102,14 @@ mod fastp {
                 args_vec.push("--adapter_fasta".to_string());
                 args_vec.push(adapter_path.to_string_lossy().into_owned());
             }
-            
+
             Ok(args_vec)
         }
     }
-    
 }
 
 mod pigz {
-    use crate::cli::Arguments;
-    use crate::config::defs::{FASTP_TAG, PIGZ_TAG};
+    use crate::config::defs::{FASTP_TAG, PIGZ_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
@@ -125,11 +121,11 @@ mod pigz {
     }
 
     impl ArgGenerator for PigzArgGenerator {
-        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("-c".to_string());
             args_vec.push("-p".to_string());
-            args_vec.push(args.threads.to_string());
+            args_vec.push(RunConfig::thread_allocation(run_config, PIGZ_TAG, None).to_string());
             Ok(args_vec)
         }
     }
@@ -141,7 +137,7 @@ mod h5dump {
     use crate::config::defs::{H5DUMP_TAG, PIGZ_TAG};
     use crate::utils::command::version_check;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-    
+
     pub async fn h5dump_presence_check() -> anyhow::Result<f32> {
         let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout).await?;
         Ok(version)
@@ -152,31 +148,29 @@ mod minimap2 {
     use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::{Arguments, Technology};
-    use crate::config::defs::{H5DUMP_TAG, MINIMAP2_TAG};
+    use crate::cli::{Technology};
+    use crate::config::defs::{MINIMAP2_TAG, RunConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
 
     pub struct Minimap2ArgGenerator;
     pub async fn minimap2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 0 , ChildStream::Stdout).await?;
+        let version = version_check(MINIMAP2_TAG,vec!["--version"], 0, 0 , ChildStream::Stdout).await?;
         Ok(version)
     }
 
     impl ArgGenerator for Minimap2ArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let paths = extra
                 .and_then(|e| e.downcast_ref::<(PathBuf, PathBuf)>())
                 .ok_or_else(|| anyhow!("Minimap2 requires (ref_pipe_path, query_pipe_path) as extra arguments"))?;
 
             let (ref_pipe_path, query_pipe_path) = paths;
-            
+
             let mut args_vec: Vec<String> = Vec::new();
 
-            let num_cores: usize = match args.limit_align_threads {
-                true => args.threads,
-                false => num_cpus::get()-1,
-            };
+            let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
@@ -189,29 +183,20 @@ mod minimap2 {
                 Technology::ONT => {
                     args_vec.push("map-ont".to_string());
                 }
-
             }
 
             args_vec.push(ref_pipe_path.to_string_lossy().to_string());
             args_vec.push(query_pipe_path.to_string_lossy().to_string());
 
             Ok(args_vec)
-            
         }
     }
 
-    pub fn arg_generator(args: &Arguments, ref_pipe_path: &PathBuf, query_pipe_path: &PathBuf) -> Vec<String> {
+    pub fn arg_generator(run_config: &RunConfig, ref_pipe_path: &PathBuf, query_pipe_path: &PathBuf) -> Vec<String> {
+        let args = &run_config.args;
         let mut args_vec: Vec<String> = Vec::new();
 
-        let num_cores : usize = match &args.limit_align_threads {
-            true => {
-                args.threads
-            }
-            false => {
-                num_cpus::get()
-            }
-        };
-
+        let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
         args_vec.push("-t".to_string());
         args_vec.push(num_cores.to_string());
 
@@ -223,7 +208,6 @@ mod minimap2 {
             Technology::ONT => {
                 args_vec.push("-ax map-ont".to_string());
             }
-            
         }
 
         args_vec.push(ref_pipe_path.to_string_lossy().to_string());
@@ -231,25 +215,22 @@ mod minimap2 {
 
         args_vec
     }
-    
 }
-
 
 pub mod samtools {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::{Arguments};
-    use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand, H5DUMP_TAG};
+    use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand, RunConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
-    
+
     #[derive(Debug)]
     pub struct SamtoolsConfig {
         pub subcommand: SamtoolsSubcommand,
         pub subcommand_fields: HashMap<String, Option<String>>,
     }
-    
+
     pub struct SamtoolsArgGenerator;
 
     pub async fn samtools_presence_check() -> anyhow::Result<f32> {
@@ -258,7 +239,8 @@ pub mod samtools {
     }
 
     impl ArgGenerator for SamtoolsArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<SamtoolsConfig>())
                 .ok_or_else(|| anyhow!("Samtools requires a SamtoolsConfig as extra argument"))?;
@@ -269,31 +251,29 @@ pub mod samtools {
                 SamtoolsSubcommand::View => {
                     args_vec.push("view".to_string());
                     args_vec.push("-@".to_string());
-                    args_vec.push(args.threads.to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("view")).to_string());
                     args_vec.push("--no-PG".to_string());
-                
-                    }
+                }
                 SamtoolsSubcommand::Fastq => {
                     args_vec.push("fastq".to_string());
                     args_vec.push("-@".to_string());
-                    args_vec.push(args.threads.to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fastq")).to_string());
                     args_vec.push("-c".to_string());
                     args_vec.push("6".to_string());
                     args_vec.push("-n".to_string());
-                    
-                    }
+                }
                 SamtoolsSubcommand::Stats => {
                     args_vec.push("stats".to_string());
-                    }
+                }
                 SamtoolsSubcommand::Sort => {
                     args_vec.push("sort".to_string());
                     args_vec.push("-@".to_string());
-                    args_vec.push(args.threads.to_string());
-                    }
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("sort")).to_string());
+                }
                 SamtoolsSubcommand::Index => {
                     args_vec.push("index".to_string());
                     args_vec.push("-@".to_string());
-                    args_vec.push(args.threads.to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("index")).to_string());
                 }
                 SamtoolsSubcommand::Mpileup => {
                     args_vec.push("mpileup".to_string());
@@ -302,10 +282,7 @@ pub mod samtools {
                     args_vec.push("0".to_string());
                     args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
                     args_vec.push("0".to_string());
-                    // args_vec.push(args.quality.to_string());
-
                 }
-                
                 SamtoolsSubcommand::Consensus => {
                     args_vec.push("consensus".to_string());
                     args_vec.push("-f".to_string());
@@ -316,8 +293,6 @@ pub mod samtools {
                     args_vec.push(args.quality.to_string());
                     args_vec.push("-d".to_string());
                     args_vec.push(args.min_depth.to_string());
-                    // args_vec.push("-l".to_string());
-                    // args_vec.push("50".to_string());
                 }
                 SamtoolsSubcommand::Depth => {
                     args_vec.push("depth".to_string());
@@ -330,18 +305,17 @@ pub mod samtools {
                     None => { },
                 }
             }
-            
+
             Ok(args_vec)
-            }
         }
     }
+}
 
 pub mod bcftools {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, SAMTOOLS_TAG};
+    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -359,10 +333,11 @@ pub mod bcftools {
     }
 
     impl ArgGenerator for BcftoolsArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<BcftoolsConfig>())
-                .ok_or_else(|| anyhow!("Samtools requires a BcftoolsConfig as extra argument"))?;
+                .ok_or_else(|| anyhow!("Bcftools requires a BcftoolsConfig as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
 
@@ -370,22 +345,20 @@ pub mod bcftools {
                 BcftoolsSubcommand::Consensus => {
                     args_vec.push("consensus".to_string());
                 }
-
                 BcftoolsSubcommand::Call => {
-                args_vec.push("call".to_string());
+                    args_vec.push("call".to_string());
                     args_vec.push("-O".to_string());
                     args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
                 }
-
                 BcftoolsSubcommand::Mpileup => {
                     args_vec.push("mpileup".to_string());
                     args_vec.push("-a".to_string());
                     args_vec.push("AD".to_string()); // include allele depth (AD) for all positions, including those with zero coverage, mimicking -aa.
-                    args_vec.push("-d".to_string()); 
+                    args_vec.push("-d".to_string());
                     args_vec.push("100000000".to_string()); // max depth essentially without limit
                     args_vec.push("-L".to_string());
                     args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
-                    args_vec.push("-Q".to_string()); 
+                    args_vec.push("-Q".to_string());
                     args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
                     args_vec.push("-O".to_string());
                     args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
@@ -393,7 +366,6 @@ pub mod bcftools {
                 BcftoolsSubcommand::View => {
                     args_vec.push("view".to_string());
                 }
-                
             }
 
             for (key, value) in config.subcommand_fields.iter() {
@@ -404,28 +376,25 @@ pub mod bcftools {
                 }
             }
 
-
             Ok(args_vec)
-            }
-
         }
     }
+}
 
-    pub mod kraken2 {
+pub mod kraken2 {
     use anyhow::anyhow;
     use std::path::PathBuf;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{KRAKEN2_TAG};
+    use crate::config::defs::{KRAKEN2_TAG, RunConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
-        use crate::utils::file::file_path_manipulator;
+    use crate::utils::file::file_path_manipulator;
 
-        #[derive(Debug)]
+    #[derive(Debug)]
     pub struct Kraken2Config {
-        pub report_path: PathBuf, 
+        pub report_path: PathBuf,
         pub classified_path: PathBuf,
-        pub fastq_path: PathBuf,  
+        pub fastq_path: PathBuf,
     }
 
     pub struct Kraken2ArgGenerator;
@@ -434,9 +403,10 @@ pub mod bcftools {
         let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout).await?;
         Ok(version)
     }
-    
+
     impl ArgGenerator for Kraken2ArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<Kraken2Config>())
                 .ok_or_else(|| anyhow!("Kraken2 requires a Kraken2Config as extra argument"))?;
@@ -449,7 +419,7 @@ pub mod bcftools {
                     if !kraken2_db_path.exists() || !kraken2_db_path.is_dir() {
                         return Err(anyhow!("Kraken2 database path does not exist or is not a directory: {:?}", kraken2_db_path));
                     }
-                    
+
                     args_vec.push("--db".to_string());
                     args_vec.push(kraken2_db_path.to_string_lossy().to_string());
                 }
@@ -457,23 +427,18 @@ pub mod bcftools {
                     return Err(anyhow!("No kraken_db specified"));
                 }
             }
-            
-            let num_cores: usize = match args.limit_align_threads {
-                true => args.threads,
-                false => num_cpus::get()-1,
-            };
+
+            let num_cores: usize = RunConfig::thread_allocation(run_config, KRAKEN2_TAG, None);
             args_vec.push("--threads".to_string());
             args_vec.push(num_cores.to_string());
             args_vec.push("--report".to_string());
-            args_vec.push( config.report_path.to_string_lossy().to_string());
+            args_vec.push(config.report_path.to_string_lossy().to_string());
             args_vec.push("--classified-out".to_string());
             args_vec.push(config.classified_path.to_string_lossy().to_string());
             args_vec.push("--output".to_string());
             args_vec.push("-".to_string()); // "-" will suppress normal output
-            // args_vec.push("--memory-mapping".to_string());
-            // args_vec.push("--gzip-compressed".to_string());
 
-            args_vec.push(config.fastq_path.to_string_lossy().to_string()); 
+            args_vec.push(config.fastq_path.to_string_lossy().to_string());
 
             Ok(args_vec)
         }
@@ -484,8 +449,8 @@ pub mod ivar {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD, BCFTOOLS_TAG};
+    use crate::config::defs::RunConfig;
+    use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -503,7 +468,8 @@ pub mod ivar {
     }
 
     impl ArgGenerator for IvarArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<IvarConfig>())
                 .ok_or_else(|| anyhow!("IVar requires a IvarConfig as extra argument"))?;
@@ -521,7 +487,6 @@ pub mod ivar {
                     args_vec.push("-n N".to_string());
                 }
             }
-
 
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(format!("{}", key));
@@ -552,8 +517,7 @@ pub mod muscle {
 pub mod mafft {
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{MAFFT_TAG, MUSCLE_TAG};
+    use crate::config::defs::{MAFFT_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -564,30 +528,24 @@ pub mod mafft {
     }
 
     impl ArgGenerator for MafftArgGenerator {
-        fn generate_args(&self, args: &Arguments, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let mut args_vec: Vec<String> = Vec::new();
 
-            let num_cores: usize = match args.limit_align_threads {
-                true => args.threads,
-                false => num_cpus::get()-1,
-            };
+            let num_cores: usize = RunConfig::thread_allocation(run_config, MAFFT_TAG, None);
             args_vec.push("--auto".to_string());
             args_vec.push("--thread".to_string());
             args_vec.push(num_cores.to_string());
             args_vec.push("-".to_string());
-            
+
             Ok(args_vec)
         }
     }
-    
 }
 
 pub mod quast {
-
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{MUSCLE_TAG, QUAST_TAG};
+    use crate::config::defs::{QUAST_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -605,17 +563,15 @@ pub mod quast {
     }
 
     impl ArgGenerator for QuastArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<QuastConfig>())
                 .ok_or_else(|| anyhow!("Quast requires a QuastConfig as extra argument"))?;
-            
+
             let mut args_vec: Vec<String> = Vec::new();
 
-            let num_cores: usize = match args.limit_align_threads {
-                true => args.threads,
-                false => num_cpus::get()-1,
-            };
+            let num_cores: usize = RunConfig::thread_allocation(run_config, QUAST_TAG, None);
             args_vec.push("--min-contig".to_string());
             args_vec.push("0".to_string());
             args_vec.push("-t".to_string());
@@ -623,25 +579,22 @@ pub mod quast {
             args_vec.push("-o".to_string());
             args_vec.push("quast".to_string());
             args_vec.push("-r".to_string());
-            args_vec.push( config.ref_fasta.to_string());
+            args_vec.push(config.ref_fasta.to_string());
             args_vec.push("--ref-bam".to_string());
-            args_vec.push( config.ref_bam.to_string());
-            args_vec.push( config.assembly_fasta.to_string());
+            args_vec.push(config.ref_bam.to_string());
+            args_vec.push(config.assembly_fasta.to_string());
 
             Ok(args_vec)
         }
     }
-    
 }
 
 pub mod nucmer {
     use anyhow::anyhow;
     use std::path::PathBuf;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{NUCMER_DELTA, NUCMER_TAG, QUAST_TAG};
+    use crate::config::defs::{NUCMER_DELTA, NUCMER_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::command::quast::{QuastArgGenerator, QuastConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct NucmerArgGenerator;
@@ -657,17 +610,14 @@ pub mod nucmer {
     }
 
     impl ArgGenerator for NucmerArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<NucmerConfig>())
                 .ok_or_else(|| anyhow!("Nucmer requires a NucmerConfig as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
 
-            let num_cores: usize = match args.limit_align_threads {
-                true => args.threads,
-                false => num_cpus::get()-1,
-            };
+            let num_cores: usize = RunConfig::thread_allocation(run_config, NUCMER_TAG, None);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
             args_vec.push("--prefix=alignment".to_string());
@@ -679,18 +629,16 @@ pub mod nucmer {
     }
 }
 
-
 pub mod show_coords {
     use anyhow::anyhow;
-    use crate::cli::Arguments;
+    use crate::config::defs::RunConfig;
     use crate::config::defs::{SHOW_COORDS_TAG, NUCMER_DELTA};
     use crate::utils::command::ArgGenerator;
 
     pub struct ShowCoordsArgGenerator;
 
     impl ArgGenerator for ShowCoordsArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let mut args_vec: Vec<String> = Vec::new();
 
             args_vec.push("-r".to_string());
@@ -702,13 +650,12 @@ pub mod show_coords {
     }
 }
 
-
 pub mod seqkit {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::Arguments;
-    use crate::config::defs::{SeqkitSubcommand, QUAST_TAG, SEQKIT_TAG};
+    use crate::config::defs::RunConfig;
+    use crate::config::defs::{SeqkitSubcommand, SEQKIT_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -726,10 +673,10 @@ pub mod seqkit {
     }
 
     impl ArgGenerator for SeqkitArgGenerator {
-        fn generate_args(&self, args: &Arguments, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<SeqkitConfig>())
-                .ok_or_else(|| anyhow!("Samtools requires a SeqkitConfig as extra argument"))?;
+                .ok_or_else(|| anyhow!("Seqkit requires a SeqkitConfig as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
 
@@ -752,11 +699,11 @@ pub mod seqkit {
             }
 
             Ok(args_vec)
-            }
         }
+    }
 }
 
-pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
+pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
         PIGZ_TAG => Box::new(pigz::PigzArgGenerator),
@@ -773,9 +720,8 @@ pub fn generate_cli(tool: &str, args: &Arguments, extra: Option<&dyn std::any::A
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
-    generator.generate_args(args, extra)
+    generator.generate_args(run_config, extra)
 }
-
 
 pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
     let checks = tools.into_iter().map(|tool| async move {
@@ -801,7 +747,6 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
     let mut failed_tools = Vec::new();
 
     for (tool, version) in &results {
-        // println!("Tool: {}, Version: {}", tool, version);
         if let Some(&min_version) = TOOL_VERSIONS.get(tool.as_str()) {
             if *version < min_version {
                 failed_tools.push(format!(
@@ -823,4 +768,3 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
 
     Ok(())
 }
-

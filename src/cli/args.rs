@@ -45,7 +45,7 @@ pub struct Arguments {
     #[arg(long)]
     pub max_read_len: Option<usize>,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 64)]
     pub threads: usize,
 
     #[arg(short = 'q', long = "quality", default_value_t = 30)]

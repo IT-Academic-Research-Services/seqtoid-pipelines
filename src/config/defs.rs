@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use crate::cli::Arguments;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::cmp::min;
+use std::sync::Arc;
+use rayon::ThreadPool;
+use tokio::sync::Semaphore;
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -84,8 +88,26 @@ pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "f
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
 
-pub struct RunConfig  {
+pub struct RunConfig {
     pub cwd: PathBuf,
     pub ram_temp_dir: PathBuf,
-    pub args: Arguments
+    pub args: Arguments,
+    pub thread_pool: Arc<ThreadPool>,
+    pub maximal_semaphore: Arc<Semaphore>,
+}
+
+
+impl RunConfig {
+    pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
+        let max_cores = std::cmp::min(num_cpus::get(), self.args.threads);
+        match (tag, subcommand) {
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) => max_cores, // MAX
+            (FASTP_TAG, _) | (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
+            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => max_cores / 2, // HIGH
+            (PIGZ_TAG, _) | (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
+            (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => max_cores / 4, // LOW
+            (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => 1, // MIN
+            _ => 1, // Default to MIN
+        }
+    }
 }
