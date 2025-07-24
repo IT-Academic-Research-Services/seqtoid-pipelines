@@ -79,6 +79,14 @@ pub enum CoreAllocation {
     Minimal
 }
 
+// Enum to specify the data type for tuning batch sizes
+#[derive(Clone, Copy, Debug)]
+pub enum StreamDataType {
+    JustBytes,        // Streamed Vec<u8> from samtools, minimap2, BWA, etc.
+    IlluminaFastq, // SequenceRecord for Illumina FASTQ or FASTA
+    OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
+}
+
 // Static Filenames
 pub const NUCMER_DELTA: &str = "alignment.delta";
 
@@ -97,6 +105,7 @@ pub struct RunConfig {
     pub args: Arguments,
     pub thread_pool: Arc<ThreadPool>,
     pub maximal_semaphore: Arc<Semaphore>,
+    pub base_buffer_size: usize,
 }
 
 impl RunConfig {
@@ -113,7 +122,7 @@ impl RunConfig {
     }
 
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
-        let max_cores = std::cmp::min(num_cpus::get(), self.args.threads);
+        let max_cores = min(num_cpus::get(), self.args.threads);
         match self.get_core_allocation(tag, subcommand) {
             CoreAllocation::Maximal => max_cores,
             CoreAllocation::High => (max_cores / 2).max(1),

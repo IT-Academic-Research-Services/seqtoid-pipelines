@@ -7,6 +7,7 @@ use std::{env, fs};
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
+use sysinfo::System;
 
 use anyhow::Result;
 use clap::Parser;
@@ -17,7 +18,8 @@ use tokio::runtime::Builder;
 use rayon::ThreadPoolBuilder;
 
 use crate::cli::parse;
-use crate::config::defs::RunConfig;
+use crate::config::defs::{RunConfig, StreamDataType};
+use crate::cli::args::Technology;
 use pipelines::consensus_genome;
 use pipelines::db;
 
@@ -44,8 +46,17 @@ async fn main() -> Result<()> {
     let thread_pool = Arc::new(create_thread_pool(max_cores));
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let available_ram = system.available_memory();
+
+    let sdt = match args.technology {
+        Technology::Illumina => StreamDataType::IlluminaFastq,
+        Technology::ONT => StreamDataType::OntFastq,
+    };
+    let base_buffer_size = compute_base_buffer_size(available_ram, max_cores, sdt);
     let module = args.module.clone();
-    let run_config = RunConfig { cwd: dir, ram_temp_dir, args, thread_pool, maximal_semaphore};
+    let run_config = RunConfig { cwd: dir, ram_temp_dir, args, thread_pool, maximal_semaphore, base_buffer_size};
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(&run_config).await,
@@ -113,4 +124,18 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .num_threads(max_cores)
         .build()
         .expect("Failed to create thread pool")
+}
+
+
+fn compute_base_buffer_size(available_ram: u64, num_cores: usize, data_type: StreamDataType) -> usize {
+    let record_size = match data_type {
+        StreamDataType::IlluminaFastq => 1_000,
+        StreamDataType::OntFastq => 10_000,
+        StreamDataType::JustBytes => 500,
+    };
+    let ram_fraction = 0.25;
+    let min_buffer = 10_000;
+    let max_buffer = 1_000_000;
+    ((available_ram as f64 * ram_fraction / num_cores as f64) / record_size as f64)
+        .clamp(min_buffer as f64, max_buffer as f64) as usize
 }

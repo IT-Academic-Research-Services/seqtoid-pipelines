@@ -56,10 +56,7 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
-
-    #[arg(long, default_value_t = 10000)]
-    pub buffer_size: usize,
-
+    
     #[arg(short = 'a', long = "host_accession")]  // For host removal
     pub host_accession : Option<String>,
 
