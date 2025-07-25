@@ -307,11 +307,22 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     stats_tasks.push(no_host_seqkit_task_stats);
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
 
-    let host_samtools_write_task = tokio::spawn(stream_to_file(
-        no_host_file_stream,
-        PathBuf::from(no_host_file_path),
+    let host_pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
+    let (mut host_pigz_child, host_pigz_stream_task, host_pigz_err_task) = stream_to_cmd(config_arc.clone(), no_host_file_stream, PIGZ_TAG, host_pigz_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
+    cleanup_tasks.push(host_pigz_stream_task);
+    cleanup_tasks.push(host_pigz_err_task);
+
+    let host_pigz_out_stream = parse_child_output(
+        &mut host_pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    ).await?;
+    let host_pigz_write_task = tokio::spawn(stream_to_file(
+        host_pigz_out_stream,
+        no_host_file_path,
     ));
-    stats_tasks.push(host_samtools_write_task);
+    cleanup_tasks.push(host_pigz_write_task);
 
     let no_host_output_stream = ReceiverStream::new(no_host_output_stream);
 
@@ -663,7 +674,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 &PathBuf::from(&no_ext_sample_base_buf),
                 &cwd.clone(),
                 None,
-                Some("filtered.fq"),
+                Some("filtered.fq.gz"),
                 "_"
             );
 
@@ -684,11 +695,22 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             let align_file_stream = streams_iter.next().unwrap();
             let align_query_stream = ReceiverStream::new(align_query_stream);
 
-            let align_file_write_task = tokio::spawn(stream_to_file(
-                align_file_stream,
-                align_fastq_path.clone(),
+            let align_pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
+            let (mut align_pigz_child, align_pigz_stream_task, align_pigz_err_task) = stream_to_cmd(config_arc.clone(), align_file_stream, PIGZ_TAG, align_pigz_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
+            cleanup_tasks.push(align_pigz_stream_task);
+            cleanup_tasks.push(align_pigz_err_task);
+
+            let align_pigz_out_stream = parse_child_output(
+                &mut align_pigz_child,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.base_buffer_size,
+            ).await?;
+            let align_pigz_write_task = tokio::spawn(stream_to_file(
+                align_pigz_out_stream,
+                align_fastq_path,
             ));
-            cleanup_tasks.push(align_file_write_task);
+            cleanup_tasks.push(align_pigz_write_task);
 
             //*****************
             // Align Reads to Target
