@@ -14,7 +14,7 @@ pub enum TargetType {
     Bacterial,
 }
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
 
