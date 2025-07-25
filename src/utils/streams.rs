@@ -832,7 +832,6 @@ pub async fn bytes_to_lines(
 
     Ok((output_rx, task))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,13 +839,44 @@ mod tests {
     use std::path::Path;
     use tokio::process::Command;
     use tokio::task;
-    use tokio::time;
+    use tokio::time::{self, Duration};
     use crate::utils::fastx::fastx_generator;
+    use crate::config::defs::{RunConfig, StreamDataType};
+    use std::sync::Arc;
+    use rayon::ThreadPoolBuilder;
+    use tokio::sync::Semaphore;
+    use std::path::PathBuf;
+    use crate::cli::Arguments;
+
+    // Helper function to create a RunConfig for tests
+    fn create_test_run_config() -> Arc<RunConfig> {
+        let args = Arguments {
+            threads: 8, // Laptop
+            ..Default::default()
+        };
+        Arc::new(RunConfig {
+            cwd: PathBuf::from("."),
+            ram_temp_dir: std::env::temp_dir(),
+            args,
+            thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
+            maximal_semaphore: Arc::new(Semaphore::new(8)),
+            base_buffer_size: 50_000,
+        })
+    }
 
     #[tokio::test]
     async fn test_t_junction_zero_streams() -> Result<()> {
         let stream = fastx_generator(10, 143, 35.0, 3.0);
-        let result = t_junction(stream, 0, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await;
+        let result = t_junction(
+            stream,
+            0,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await;
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.to_string(), "No subscribers: cannot process stream");
@@ -870,7 +900,16 @@ mod tests {
             },
         ];
         let stream = tokio_stream::iter(records);
-        let (mut outputs, done_rx) = t_junction(stream, 2, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            2,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         let mut output1 = ReceiverStream::new(outputs.pop().unwrap());
         let mut output2 = ReceiverStream::new(outputs.pop().unwrap());
         let mut records1 = Vec::new();
@@ -891,8 +930,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_long_stream() -> Result<()> {
-        let stream = fastx_generator(10000, 143, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 2, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
+        let stream = fastx_generator(10_000, 143, 35.0, 3.0);
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            2,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         let mut output1 = ReceiverStream::new(outputs.pop().unwrap());
         let mut output2 = ReceiverStream::new(outputs.pop().unwrap());
         let mut records1 = Vec::new();
@@ -903,16 +951,25 @@ mod tests {
         while let Some(record) = output2.next().await {
             records2.push(record);
         }
-        assert_eq!(records1.len(), 10000);
-        assert_eq!(records2.len(), 10000);
+        assert_eq!(records1.len(), 10_000);
+        assert_eq!(records2.len(), 10_000);
         done_rx.await??;
         Ok(())
     }
 
     #[tokio::test]
     async fn test_t_junction_ten_thousand_records_ten_streams() -> Result<()> {
-        let stream = fastx_generator(10000, 143, 35.0, 3.0);
-        let (outputs, done_rx) = t_junction(stream, 10, 50000, 10000, Some(0), 50, StreamDataType::IlluminaFastq).await?;
+        let stream = fastx_generator(10_000, 143, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(
+            stream,
+            10,
+            50_000,
+            10_000,
+            Some(0),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         let mut records = vec![Vec::new(); outputs.len()];
         let mut handles = Vec::new();
 
@@ -934,7 +991,7 @@ mod tests {
         }
 
         for record_set in &records {
-            assert_eq!(record_set.len(), 10000);
+            assert_eq!(record_set.len(), 10_000);
         }
         done_rx.await??;
         Ok(())
@@ -943,7 +1000,16 @@ mod tests {
     #[tokio::test]
     async fn test_t_junction_empty_stream() -> Result<()> {
         let stream = fastx_generator(0, 50, 35.0, 3.0);
-        let (outputs, done_rx) = t_junction(stream, 2, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
+        let (outputs, done_rx) = t_junction(
+            stream,
+            2,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         for rx in outputs {
             let mut stream = ReceiverStream::new(rx);
             assert!(stream.next().await.is_none(), "Empty stream should yield no items");
@@ -955,7 +1021,16 @@ mod tests {
     #[tokio::test]
     async fn test_t_junction_single_record() -> Result<()> {
         let stream = fastx_generator(1, 50, 35.0, 3.0);
-        let (outputs, done_rx) = t_junction(stream, 2, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
+        let (outputs, done_rx) = t_junction(
+            stream,
+            2,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         let mut handles = Vec::new();
         for rx in outputs {
             handles.push(task::spawn(async move {
@@ -985,8 +1060,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_slow_consumer() -> Result<()> {
-        let stream = fastx_generator(1000, 50, 35.0, 3.0);
-        let (outputs, done_rx) = t_junction(stream, 2, 500, 10, Some(100), 50, StreamDataType::IlluminaFastq).await?;
+        let stream = fastx_generator(1_000, 50, 35.0, 3.0);
+        let (outputs, done_rx) = t_junction(
+            stream,
+            2,
+            500,
+            10,
+            Some(100),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         let mut handles = Vec::new();
         for (i, rx) in outputs.into_iter().enumerate() {
             let handle = task::spawn(async move {
@@ -1014,13 +1098,13 @@ mod tests {
             assert_eq!(all_records.len(), 2, "Expected exactly 2 consumer outputs");
             assert_eq!(
                 all_records[0].len(),
-                1000,
+                1_000,
                 "Consumer 0 should have all 1000 records, got {}",
                 all_records[0].len()
             );
             assert_eq!(
                 all_records[1].len(),
-                1000,
+                1_000,
                 "Consumer 1 should have all 1000 records, got {}",
                 all_records[1].len()
             );
@@ -1034,9 +1118,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_million_records_ten_streams() -> Result<()> {
-        let num_records = 1000000;
+        let num_records = 1_000_000;
         let stream = fastx_generator(num_records, 143, 35.0, 3.0);
-        let (outputs, done_rx) = t_junction(stream, 2, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
+        let (outputs, done_rx) = t_junction(
+            stream,
+            2,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
 
         let mut handles = Vec::new();
         for rx in outputs {
@@ -1097,9 +1190,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_valid() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(100, 50, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "cat",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -1112,9 +1223,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_valid_cat() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(2, 10, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "cat",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -1131,8 +1260,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_valid_parseoutput() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(2, 10, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
         let rx = outputs.pop().unwrap();
         let (tx, rx_parse) = mpsc::channel(100);
         tokio::spawn(async move {
@@ -1144,7 +1283,15 @@ mod tests {
                 }
             }
         });
-        let (mut child, task, _err_task) = stream_to_cmd(rx_parse, "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            rx_parse,
+            "cat",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -1161,20 +1308,59 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_invalid_command() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(2, 10, 35.0, 3.0);
-        let (mut outputs, _done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let result = stream_to_cmd(outputs.pop().unwrap(), "nonexistent_cmd", vec![], StreamDataType::IlluminaFastq, false).await;
+        let (mut outputs, _done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let result = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "nonexistent_cmd",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await;
         assert!(result.is_err(), "Should fail for invalid command");
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("Failed to spawn nonexistent_cmd"), "Error should mention command name");
+        assert!(
+            err.to_string().contains("Failed to spawn nonexistent_cmd"),
+            "Error should mention command name"
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_stream_to_cmd_empty_stream() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(0, 10, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "cat",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -1188,10 +1374,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_large_stream() -> Result<()> {
-        let num_records = 10000;
+        let config = create_test_run_config();
+        let num_records = 10_000;
         let stream = fastx_generator(num_records, 50, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "cat",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -1228,9 +1432,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_premature_exit() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(10, 10, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "head", vec!["-n".to_string(), "1".to_string()], StreamDataType::IlluminaFastq, false).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "head",
+            vec!["-n".to_string(), "1".to_string()],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         let mut stdout = child.stdout.take().unwrap();
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
@@ -1247,9 +1469,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_cmd_resource_cleanup() -> Result<()> {
+        let config = create_test_run_config();
         let stream = fastx_generator(5, 10, 35.0, 3.0);
-        let (mut outputs, done_rx) = t_junction(stream, 1, 50000, 10000, Some(1), 50, StreamDataType::IlluminaFastq).await?;
-        let (mut child, task, _err_task) = stream_to_cmd(outputs.pop().unwrap(), "cat", vec![], StreamDataType::IlluminaFastq, false).await?;
+        let (mut outputs, done_rx) = t_junction(
+            stream,
+            1,
+            50_000,
+            10_000,
+            Some(1),
+            50,
+            StreamDataType::IlluminaFastq,
+        )
+            .await?;
+        let (mut child, task, _err_task) = stream_to_cmd(
+            config,
+            outputs.pop().unwrap(),
+            "cat",
+            vec![],
+            StreamDataType::IlluminaFastq,
+            false,
+        )
+            .await?;
         task.await??;
         done_rx.await??;
         let status = child.wait().await?;
@@ -1306,11 +1546,15 @@ mod tests {
             }
         });
 
-        let write_task = tokio::spawn(stream_to_file(rx, Path::new("stream_to_file_test.fq").to_path_buf()));
+        let write_task = tokio::spawn(stream_to_file(
+            rx,
+            Path::new("stream_to_file_test.fq").to_path_buf(),
+        ));
         write_task.await??;
 
         assert!(Path::new("stream_to_file_test.fq").exists(), "Output file was not created");
         let content = fs::read_to_string("stream_to_file_test.fq")?;
+        eprintln!("stream_to_file_test.fq content: {}", content);
         let num_records = content.lines().filter(|line| line.starts_with('@')).count();
         assert_eq!(num_records, 2, "Expected 2 FASTQ records, found {}", num_records);
 
@@ -1333,10 +1577,16 @@ mod tests {
             }
         });
 
-        let write_task = tokio::spawn(stream_to_file(rx, Path::new("stream_to_file_norecord_test.fq").to_path_buf()));
+        let write_task = tokio::spawn(stream_to_file(
+            rx,
+            Path::new("stream_to_file_norecord_test.fq").to_path_buf(),
+        ));
         write_task.await??;
 
-        assert!(Path::new("stream_to_file_norecord_test.fq").exists(), "Output file was not created");
+        assert!(
+            Path::new("stream_to_file_norecord_test.fq").exists(),
+            "Output file was not created"
+        );
         let content = fs::read_to_string("stream_to_file_norecord_test.fq")?;
         let num_records = content.lines().filter(|line| line.starts_with('@')).count();
         assert_eq!(num_records, 0, "Expected 0 FASTQ records, found {}", num_records);
@@ -1371,8 +1621,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_cmd_stderr_verbose() -> Result<()> {
+        let config = create_test_run_config();
         let args = vec!["-c".to_string(), "echo error >&2".to_string()];
-        let (mut child, stderr_task) = spawn_cmd("sh", args, true).await?;
+        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, true).await?;
         let status = child.wait().await?;
         stderr_task.await??;
         assert!(status.success(), "Child process should exit successfully");
@@ -1381,8 +1632,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_cmd_stderr_non_verbose() -> Result<()> {
+        let config = create_test_run_config();
         let args = vec!["-c".to_string(), "echo error >&2".to_string()];
-        let (mut child, stderr_task) = spawn_cmd("sh", args, false).await?;
+        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, false).await?;
         let status = child.wait().await?;
         stderr_task.await??;
         assert!(status.success(), "Child process should exit successfully");
