@@ -14,10 +14,10 @@ pub enum TargetType {
     Bacterial,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
-    
+
     #[arg(short, long)]
     pub module: String,
 
@@ -56,7 +56,7 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
-    
+
     #[arg(short = 'a', long = "host_accession")]  // For host removal
     pub host_accession : Option<String>,
 

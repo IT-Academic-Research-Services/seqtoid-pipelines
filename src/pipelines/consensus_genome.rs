@@ -75,6 +75,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let cwd = config.cwd.clone();
     let ram_temp_dir = config.ram_temp_dir.clone();
     let mut temp_files = Vec::new();
+    let config_arc = Arc::new((*config).clone());
 
     // Initialize cleanup tasks
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -169,7 +170,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     // Pigz stream to intermediate file output
     let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
-    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
+    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(config_arc.clone(), val_pigz_stream, PIGZ_TAG, val_pigz_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
     cleanup_tasks.push(val_pigz_stream_task);
     cleanup_tasks.push(val_pigz_err_task);
 
@@ -187,7 +188,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     // Fastp stream
     let val_fastp_args = generate_cli(FASTP_TAG, &config, None)?;
-    let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
+    let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(config_arc.clone(), val_fastp_stream, FASTP_TAG, val_fastp_args, StreamDataType::IlluminaFastq, config.args.verbose).await?;
     cleanup_tasks.push(val_fastp_stream_task);
     cleanup_tasks.push(val_fastp_err_task);
     let val_fastp_out_stream = parse_child_output(
@@ -216,7 +217,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
     let host_minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_ref_fasta_path.clone(), host_query_pipe_path.clone())))?;
-    let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(MINIMAP2_TAG, host_minimap2_args, config.args.verbose).await?;
+    let (mut host_minimap2_child, host_minimap2_err_task) = spawn_cmd(config_arc.clone(), MINIMAP2_TAG, host_minimap2_args, config.args.verbose).await?;
     cleanup_tasks.push(host_minimap2_err_task);
 
     let host_minimap2_out_stream = parse_child_output(
@@ -236,7 +237,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         Some(&host_samtools_config_view),
     )?;
 
-    let (mut host_samtools_child_view, host_samtools_task_view, host_samtools_err_task_view) = stream_to_cmd(host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
+    let (mut host_samtools_child_view, host_samtools_task_view, host_samtools_err_task_view) = stream_to_cmd(config_arc.clone(), host_minimap2_out_stream, SAMTOOLS_TAG, host_samtools_args_view, StreamDataType::JustBytes, config.args.verbose).await?;
     let host_samtools_out_stream_view = parse_child_output(
         &mut host_samtools_child_view,
         ChildStream::Stdout,
@@ -256,7 +257,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         Some(&host_samtools_config_fastq),
     )?;
 
-    let (mut host_samtools_child_fastq, host_samtools_task_fastq, host_samtools_err_task_fastq) = stream_to_cmd(host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes, config.args.verbose).await?;
+    let (mut host_samtools_child_fastq, host_samtools_task_fastq, host_samtools_err_task_fastq) = stream_to_cmd(config_arc.clone(), host_samtools_out_stream_view, SAMTOOLS_TAG, host_samtools_args_fastq, StreamDataType::JustBytes, config.args.verbose).await?;
     let host_samtools_out_stream_fastq = parse_child_output(
         &mut host_samtools_child_fastq,
         ChildStream::Stdout,
@@ -296,7 +297,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     let no_host_file_stream = streams_iter.next().unwrap();
     let no_host_count_stream = streams_iter.next().unwrap();
 
-    let (mut no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(no_host_count_stream, SEQKIT_TAG, stats_seqkit_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
+    let (mut no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(config_arc.clone(), no_host_count_stream, SEQKIT_TAG, stats_seqkit_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
     let no_host_seqkit_out_stream_stats = parse_child_output(
         &mut no_host_seqkit_child_stats,
         ChildStream::Stdout,
@@ -374,7 +375,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 Some(&(ercc_path, ercc_query_pipe_path.clone())),
             )?;
 
-            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(
+            let (mut ercc_minimap2_child, ercc_minimap2_err_task) = spawn_cmd(config_arc.clone(),
                 MINIMAP2_TAG,
                 ercc_minimap2_args,
                 config.args.verbose,
@@ -397,7 +398,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 Some(&ercc_samtools_config_view),
             )?;
 
-            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(
+            let (mut ercc_samtools_child_view, ercc_samtools_task_view, ercc_samtools_err_task_view) = stream_to_cmd(config_arc.clone(),
                 ercc_minimap2_out_stream,
                 SAMTOOLS_TAG,
                 ercc_samtools_args_view,
@@ -424,7 +425,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )?;
 
             let ercc_stats_file_path = no_ext_sample_base.clone() + "_stats.txt";
-            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(
+            let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(config_arc.clone(),
                 ercc_samtools_out_stream_view,
                 SAMTOOLS_TAG,
                 ercc_samtools_args_stats,
@@ -513,7 +514,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                         filter_query_pipe_path
                     ))
                 )?;
-                let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(
+                let (mut filter_minimap2_child, filter_minimap2_err_task) = spawn_cmd(config_arc.clone(),
                     MINIMAP2_TAG,
                     filter_minimap2_args,
                     config.args.verbose
@@ -544,7 +545,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                     mut filter_samtools_child_sort,
                     filter_samtools_task_sort,
                     filter_samtools_err_task_sort
-                ) = stream_to_cmd(
+                ) = stream_to_cmd(config_arc.clone(),
                     filter_minimap2_out_stream,
                     SAMTOOLS_TAG,
                     filter_samtools_args_sort,
@@ -574,7 +575,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                     mut filter_samtools_child_fastq,
                     filter_samtools_task_fastq,
                     filter_samtools_err_task_fastq
-                ) = stream_to_cmd(
+                ) = stream_to_cmd(config_arc.clone(),
                     filter_samtools_out_stream_sort,
                     SAMTOOLS_TAG,
                     filter_samtools_args_fastq,
@@ -628,7 +629,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                     &config,
                     Some(&filter_reads_kraken2_config)
                 )?;
-                let (_filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(
+                let (_filter_kraken2_child, filter_kraken2_err_task) = spawn_cmd(config_arc.clone(),
                     KRAKEN2_TAG,
                     filter_reads_kraken2_args,
                     config.args.verbose
@@ -706,7 +707,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                     align_query_pipe_path_temp
                 ))
             )?;
-            let (mut align_minimap2_child, align_minimap2_err_task) = spawn_cmd(
+            let (mut align_minimap2_child, align_minimap2_err_task) = spawn_cmd(config_arc.clone(),
                 MINIMAP2_TAG,
                 align_minimap2_args,
                 config.args.verbose
@@ -735,7 +736,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 mut align_samtools_child_sort,
                 align_samtools_task_sort,
                 align_samtools_err_task_sort
-            ) = stream_to_cmd(
+            ) = stream_to_cmd(config_arc.clone(),
                 align_minimap2_out_stream,
                 SAMTOOLS_TAG,
                 align_samtools_args_sort,
@@ -808,7 +809,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 mut consensus_samtools_child,
                 consensus_samtools_task_sort,
                 consensus_samtools_err_task_sort
-            ) = stream_to_cmd(
+            ) = stream_to_cmd(config_arc.clone(),
                 consensus_bam_output_stream,
                 SAMTOOLS_TAG,
                 consensus_samtools_args,
@@ -870,7 +871,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 mut call_bcftools_child_mpileup,
                 call_bcftools_task_mpileup,
                 call_bcftools_err_task_mpileup
-            ) = stream_to_cmd(
+            ) = stream_to_cmd(config_arc.clone(),
                 consensus_bam_call_stream,
                 BCFTOOLS_TAG,
                 call_bcftools_args_mpileup,
@@ -906,7 +907,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 mut call_bcftools_child_call,
                 call_bcftools_task_call,
                 call_bcftools_err_task_call
-            ) = stream_to_cmd(
+            ) = stream_to_cmd(config_arc.clone(),
                 call_bcftools_out_stream_mpileup,
                 BCFTOOLS_TAG,
                 call_bcftools_args_call,
@@ -947,7 +948,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 mut call_bcftools_child_view,
                 call_bcftools_task_view,
                 call_bcftools_err_task_view
-            ) = stream_to_cmd(
+            ) = stream_to_cmd(config_arc.clone(),
                 call_bcftools_out_stream_call,
                 BCFTOOLS_TAG,
                 call_bcftools_args_view,
@@ -1007,7 +1008,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 mut realign_consensus_mafft_child,
                 realign_consensus_mafft_task,
                 realign_consensus_mafft_err_task
-            ) = stream_to_cmd(
+            ) = stream_to_cmd(config_arc.clone(),
                 combined_rx,
                 MAFFT_TAG,
                 realign_mafft_args,
@@ -1057,7 +1058,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let stats_samtools_out_stream_stats = match consensus_bam_stats_stream {
         Some(stream) => {
-            let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(
+            let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(config_arc.clone(),
                 stream,
                 SAMTOOLS_TAG,
                 stats_samtools_args_stats.clone(),
@@ -1088,7 +1089,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let depth_samtools_out_stream = match consensus_bam_depth_stream {
         Some(stream) => {
-            let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(
+            let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(config_arc.clone(),
                 stream,
                 SAMTOOLS_TAG,
                 depth_samtools_args,
@@ -1232,7 +1233,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         Some(&quast_config),
     )?;
 
-    let (_assembly_eval_quast_child, assembly_eval_quast_err_task) = spawn_cmd(QUAST_TAG, assembly_eval_quast_args, config.args.verbose).await?;
+    let (_assembly_eval_quast_child, assembly_eval_quast_err_task) = spawn_cmd(config_arc.clone(), QUAST_TAG, assembly_eval_quast_args, config.args.verbose).await?;
     cleanup_tasks.push(assembly_eval_quast_err_task);
 
     //*****************

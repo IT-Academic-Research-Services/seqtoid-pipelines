@@ -99,6 +99,8 @@ pub const FASTQ_TAG: &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
+
+#[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
     pub ram_temp_dir: PathBuf,

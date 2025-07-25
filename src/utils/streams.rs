@@ -2,6 +2,8 @@ use sysinfo::System;
 use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
+
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
@@ -9,9 +11,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
-use tokio::task::JoinHandle;
+use crate::config::defs::{CoreAllocation, RunConfig};
 
 
 
@@ -197,13 +202,23 @@ where
 ///
 /// # Returns
 /// tokio::process::Command containing stdout and stderr
+
 pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
+    config: Arc<RunConfig>,
     rx: mpsc::Receiver<T>,
     cmd_tag: &str,
     args: Vec<String>,
     data_type: StreamDataType,
     verbose: bool,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
+
+    let core_allocation = config.get_core_allocation(cmd_tag, None);
+    let _permit = if core_allocation == CoreAllocation::Maximal {
+        Some(config.maximal_semaphore.clone().acquire_owned().await?)
+    } else {
+        None
+    };
+
     let (batch_size_bytes, writer_capacity) = match data_type {
         StreamDataType::JustBytes => (65_536, 65_536),
         StreamDataType::IlluminaFastq => (131_072, 131_072),
@@ -212,7 +227,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
     let cmd_tag_owned = cmd_tag.to_string();
     let cmd_tag_err_owned = cmd_tag.to_string();
-    
+
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
         .stdin(std::process::Stdio::piped())
@@ -282,15 +297,22 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         Ok(())
     });
 
+    // Permit is automatically dropped when the function exits, releasing it
     Ok((child, stdin_task, stderr_task))
 }
 
-
 pub async fn spawn_cmd(
+    config: Arc<RunConfig>,
     cmd_tag: &str,
     args: Vec<String>,
-    verbose: bool
+    verbose: bool,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
+    let core_allocation = config.get_core_allocation(cmd_tag, None);
+    let _permit = if core_allocation == CoreAllocation::Maximal {
+        Some(config.maximal_semaphore.clone().acquire_owned().await?)
+    } else {
+        None
+    };
 
     let cmd_tag_owned = cmd_tag.to_string();
     let mut child = Command::new(&cmd_tag_owned)
@@ -309,11 +331,11 @@ pub async fn spawn_cmd(
         let cmd_tag_clone = cmd_tag_owned.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
-            let mut buffer = vec![0u8; 8192]; // Buffer for reading stderr chunks
+            let mut buffer = vec![0u8; 8192];
             if verbose {
                 loop {
                     match reader.read(&mut buffer).await {
-                        Ok(0) => break, // EOF
+                        Ok(0) => break,
                         Ok(n) => {
                             let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
                             eprintln!("[{} stderr]: {}", cmd_tag_clone, stderr_chunk);
@@ -325,13 +347,13 @@ pub async fn spawn_cmd(
                     }
                 }
             } else {
-                // Consume stderr without printing to prevent pipe blocking
                 while reader.read(&mut buffer).await? != 0 {}
             }
             Ok(())
         })
     };
 
+    // Permit is automatically dropped when the function exits, releasing it
     Ok((child, stderr_task))
 }
 
