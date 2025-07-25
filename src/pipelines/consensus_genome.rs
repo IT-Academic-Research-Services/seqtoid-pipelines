@@ -268,7 +268,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
 
-    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("no_host.fq"), "_");
+    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("no_host.fq.gz"), "_");
 
     let stats_seqkit_config_stats = SeqkitConfig {
         subcommand: SeqkitSubcommand::Stats,
