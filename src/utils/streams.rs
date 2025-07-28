@@ -839,6 +839,7 @@ mod tests {
     use std::path::Path;
     use tokio::process::Command;
     use tokio::task;
+    use tokio::fs::File as TokioFile;
     use tokio::time::{self, Duration};
     use crate::utils::fastx::fastx_generator;
     use crate::config::defs::{RunConfig, StreamDataType};
@@ -847,6 +848,7 @@ mod tests {
     use tokio::sync::Semaphore;
     use std::path::PathBuf;
     use crate::cli::Arguments;
+
 
     // Helper function to create a RunConfig for tests
     fn create_test_run_config() -> Arc<RunConfig> {
@@ -1531,10 +1533,12 @@ mod tests {
         Ok(())
     }
 
+
     #[tokio::test]
     async fn test_stream_to_file_fastq() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_test_illumina.fq");
-        let mut records = fastx_generator(2, 150, 30.0, 8.0);
+        let num_records = 2;
+        let mut records = fastx_generator(num_records, 150, 30.0, 8.0);
         let (tx, rx) = mpsc::channel(1024);
 
         tokio::spawn(async move {
@@ -1546,19 +1550,37 @@ mod tests {
             }
         });
 
+        let output_path = Path::new("stream_to_file_test_illumina.fq").to_path_buf();
         let write_task = tokio::spawn(stream_to_file(
             rx,
-            Path::new("stream_to_file_test.fq").to_path_buf(),
+            output_path.clone(),
         ));
         write_task.await??;
 
-        assert!(Path::new("stream_to_file_test.fq").exists(), "Output file was not created");
-        let content = fs::read_to_string("stream_to_file_test.fq")?;
-        eprintln!("stream_to_file_test.fq content: {}", content);
-        let num_records = content.lines().filter(|line| line.starts_with('@')).count();
-        assert_eq!(num_records, 2, "Expected 2 FASTQ records, found {}", num_records);
+        assert!(output_path.exists(), "Output file was not created");
 
-        fs::remove_file("stream_to_file_test.fq")?;
+        // Parse the output file back into SequenceRecords using parse_fastq
+        let file = TokioFile::open(&output_path).await?;
+        let rx = parse_fastq(file, 1024).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut parsed_records = Vec::new();
+
+        while let Some(ParseOutput::Fastq(record)) = stream.next().await {
+            parsed_records.push(record);
+        }
+
+        eprintln!("Parsed {} records from file", parsed_records.len());
+
+        assert_eq!(
+            parsed_records.len(),
+            num_records,
+            "Expected {} FASTQ records, found {}",
+            num_records,
+            parsed_records.len()
+        );
+
+        // Clean up
+        fs::remove_file(output_path)?;
         Ok(())
     }
 
@@ -1577,21 +1599,39 @@ mod tests {
             }
         });
 
+        let output_path = Path::new("stream_to_file_norecord_test.fq").to_path_buf();
         let write_task = tokio::spawn(stream_to_file(
             rx,
-            Path::new("stream_to_file_norecord_test.fq").to_path_buf(),
+            output_path.clone(),
         ));
         write_task.await??;
 
         assert!(
-            Path::new("stream_to_file_norecord_test.fq").exists(),
+            output_path.exists(),
             "Output file was not created"
         );
-        let content = fs::read_to_string("stream_to_file_norecord_test.fq")?;
-        let num_records = content.lines().filter(|line| line.starts_with('@')).count();
-        assert_eq!(num_records, 0, "Expected 0 FASTQ records, found {}", num_records);
 
-        fs::remove_file("stream_to_file_norecord_test.fq")?;
+        // Parse the output file using parse_fastq
+        let file = TokioFile::open(&output_path).await?;
+        let rx = parse_fastq(file, 1024).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut parsed_records = Vec::new();
+
+        while let Some(ParseOutput::Fastq(record)) = stream.next().await {
+            parsed_records.push(record);
+        }
+
+        eprintln!("Parsed {} records from file", parsed_records.len());
+
+        assert_eq!(
+            parsed_records.len(),
+            0,
+            "Expected 0 FASTQ records, found {}",
+            parsed_records.len()
+        );
+
+        // Clean up
+        fs::remove_file(output_path)?;
         Ok(())
     }
 
