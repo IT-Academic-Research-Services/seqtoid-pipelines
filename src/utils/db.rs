@@ -564,6 +564,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use tempfile::NamedTempFile;
+    use crate::config::defs::StreamDataType;
     use crate::utils::fastx::{fastx_generator, read_and_interleave_sequences};
     use crate::utils::file::extension_remover;
     use crate::utils::streams::t_junction;
@@ -580,7 +581,8 @@ mod tests {
             100_000,
             100,
             Some(0),
-            50
+            50,
+            StreamDataType::IlluminaFastq,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -618,7 +620,8 @@ mod tests {
             100_000,
             100,
             Some(0),
-            50
+            50,
+            StreamDataType::OntFastq,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -740,7 +743,8 @@ mod tests {
             100_000,
             100,
             Some(0),
-            50
+            50,
+            StreamDataType::IlluminaFastq,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;

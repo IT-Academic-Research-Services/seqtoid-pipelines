@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Instant;
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
-use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, StreamDataType};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode,};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Command;
@@ -15,6 +15,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 use futures::future::join_all;
+use seqtoid_pipelines::config::defs::{RunConfig, StreamDataType};
+use std::path::PathBuf;
+use rayon::ThreadPoolBuilder;
+use tokio::sync::Semaphore;
+use seqtoid_pipelines::cli::Arguments;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -95,7 +100,7 @@ async fn test_fastx_generator_count() -> Result<()> {
                     "fastx_generator failed: expected {}, got {}",
                     num_read, count
                 )?;
-                return Err(anyhow::anyhow!(
+                return Err(anyhow!(
                     "fastx_generator produced {} records, expected {}", 
                     count, num_read
                 ));
@@ -129,6 +134,22 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
     assert_eq!(count, 0, "Zero read size should produce no records");
 
     Ok(())
+}
+
+// Helper function to create a RunConfig for tests
+fn create_test_run_config() -> Arc<RunConfig> {
+    let args = Arguments {
+        threads: 84, // Matches dual socket AMD Epyc 84c
+        ..Default::default()
+    };
+    Arc::new(RunConfig {
+        cwd: PathBuf::from("."),
+        ram_temp_dir: PathBuf::from("/scratch"), // Matches 3.8TB NVMe scratch
+        args,
+        thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(84).build().unwrap()),
+        maximal_semaphore: Arc::new(Semaphore::new(84)),
+        base_buffer_size: 50_000, // Reasonable for 1.5TB RAM
+    })
 }
 
 #[tokio::test]
@@ -170,6 +191,7 @@ async fn test_t_junction_stress() -> Result<()> {
                         stall_threshold,
                         sleep_ms,
                         backpressure_pause_ms,
+                        StreamDataType::IlluminaFastq,
                     )
                         .await?;
 
@@ -263,7 +285,8 @@ async fn test_t_junction_count() -> Result<()> {
         buffer_size,
         stall_threshold,
         sleep_ms,
-        backpressure_pause_ms
+        backpressure_pause_ms,
+        StreamDataType::IlluminaFastq,
     ).await?;
     let mut counts = vec![0usize; 2];
     let mut handles = Vec::new();
@@ -309,6 +332,7 @@ async fn test_t_junction_count() -> Result<()> {
 
 #[tokio::test]
 async fn test_stream_to_cmd_direct() -> Result<()> {
+    let config = create_test_run_config();
     let num_read = 100;
     let read_size = 50;
     let cmd_tag = "cat";
@@ -326,15 +350,18 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         100_000,
         100,
         Some(1),
-        500
+        500,
+        StreamDataType::IlluminaFastq,
     ).await?;
 
     let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
     let (mut child, inner_task, _inner_err_task) = stream_to_cmd(
+        config,
         rx,
         cmd_tag,
         args,
-        StreamDataType::IlluminaFastq, false
+        StreamDataType::IlluminaFastq,
+        false,
     ).await?;
 
     match timeout(Duration::from_secs(30), inner_task).await {
@@ -372,8 +399,9 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 84)]
 async fn test_stream_to_cmd_stress() -> Result<()> {
+    let config = create_test_run_config();
     let num_reads = vec![100, 10_000, 100_000];
     let read_sizes = vec![50, 500];
     let stream_nums = vec![1, 5];
@@ -422,7 +450,8 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     *buffer_size,
                                     10000,
                                     if *sleep == 0 { None } else { Some(*sleep) },
-                                    backpressure_pause_ms
+                                    backpressure_pause_ms,
+                                    StreamDataType::IlluminaFastq,
                                 )
                                     .await {
                                     Ok(result) => result,
@@ -439,7 +468,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 let mut outfiles = Vec::new();
 
                                 for (i, rx) in outputs.into_iter().enumerate() {
-                                    let stream_outfile = format!("stream_to_cmd_stress.{}.log", i);
+                                    let stream_outfile = format!("stream_to_cmd_stress.{}.fq", i);
 
                                     if fs::metadata(&stream_outfile).is_ok() {
                                         fs::remove_file(&stream_outfile)?;
@@ -447,14 +476,15 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                                     outfiles.push(stream_outfile.clone());
                                     let cmd_tag = cmd_tag.to_string();
-                                    let args = args.iter().map(|&s| s.to_string()).collect::<Vec<_>>();
+                                    let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
                                     let (mut child, stream_task, _stream_err_task) = match stream_to_cmd(
+                                        config.clone(),
                                         rx,
                                         &cmd_tag,
                                         args,
                                         StreamDataType::IlluminaFastq,
-                                        false
+                                        false,
                                     )
                                         .await {
                                         Ok(result) => result,
@@ -469,7 +499,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         &mut child,
                                         ChildStream::Stdout,
                                         ParseMode::Fastq,
-                                        *buffer_size
+                                        *buffer_size,
                                     ).await?;
                                     let write_task = tokio::spawn(stream_to_file(
                                         out_stream,
@@ -487,7 +517,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                                 done_rx.await??; // Propagates any t_junction errors
 
-                                for outfile in outfiles {
+                                for outfile in &outfiles {
                                     let mut cmd = String::new();
                                     let mut args_vec: Vec<String> = Vec::new();
                                     match *cmd_tag {
@@ -553,6 +583,10 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                                 eprintln!("done");
                                 stderr().flush()?;
+
+                                for outfile in outfiles {
+                                    let _ = fs::remove_file(&outfile);
+                                }
 
                                 if !run_success {
                                     return Err(anyhow!(

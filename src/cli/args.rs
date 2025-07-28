@@ -14,10 +14,10 @@ pub enum TargetType {
     Bacterial,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone, Default)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
-    
+
     #[arg(short, long)]
     pub module: String,
 
@@ -45,7 +45,7 @@ pub struct Arguments {
     #[arg(long)]
     pub max_read_len: Option<usize>,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 64)]
     pub threads: usize,
 
     #[arg(short = 'q', long = "quality", default_value_t = 30)]
@@ -56,9 +56,6 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
-
-    #[arg(long, default_value_t = 10000)]
-    pub buffer_size: usize,
 
     #[arg(short = 'a', long = "host_accession")]  // For host removal
     pub host_accession : Option<String>,

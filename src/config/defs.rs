@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use crate::cli::Arguments;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::cmp::min;
+use std::sync::Arc;
+use rayon::ThreadPool;
+use tokio::sync::Semaphore;
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -20,7 +24,6 @@ pub const NUCMER_TAG: &str = "nucmer";
 pub const SHOW_COORDS_TAG: &str = "show-coords";
 pub const SEQKIT_TAG: &str = "seqkit";
 
-
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();
@@ -33,7 +36,6 @@ lazy_static! {
         m.insert(MAFFT_TAG, 7.5);
         m.insert(QUAST_TAG, 5.20);
         m.insert(SEQKIT_TAG, 2.10);
-
         m
     };
 }
@@ -69,23 +71,65 @@ pub enum SeqkitSubcommand {
     Grep
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CoreAllocation {
+    Maximal,
+    High,
+    Low,
+    Minimal
+}
+
+// Enum to specify the data type for tuning batch sizes
+#[derive(Clone, Copy, Debug)]
+pub enum StreamDataType {
+    JustBytes,        // Streamed Vec<u8> from samtools, minimap2, BWA, etc.
+    IlluminaFastq, // SequenceRecord for Illumina FASTQ or FASTA
+    OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
+}
+
 // Static Filenames
 pub const NUCMER_DELTA: &str = "alignment.delta";
 
-
 // Static Parameters
-
 pub const IVAR_QUAL_THRESHOLD: usize = 20;
 pub const IVAR_FREQ_THRESHOLD: f64 = 0.75;
 
-pub const FASTA_TAG : &str = "fasta";
-pub const FASTQ_TAG : &str = "fastq";
+pub const FASTA_TAG: &str = "fasta";
+pub const FASTQ_TAG: &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
 
-pub struct RunConfig  {
+#[derive(Clone, Debug)]
+pub struct RunConfig {
     pub cwd: PathBuf,
     pub ram_temp_dir: PathBuf,
-    pub args: Arguments
+    pub args: Arguments,
+    pub thread_pool: Arc<ThreadPool>,
+    pub maximal_semaphore: Arc<Semaphore>,
+    pub base_buffer_size: usize,
+}
+
+impl RunConfig {
+    pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
+        match (tag, subcommand) {
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) => CoreAllocation::Maximal,
+            (FASTP_TAG, _) | (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
+            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
+            (PIGZ_TAG, _) | (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
+            (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
+            (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
+            _ => CoreAllocation::Minimal,
+        }
+    }
+
+    pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
+        let max_cores = min(num_cpus::get(), self.args.threads);
+        match self.get_core_allocation(tag, subcommand) {
+            CoreAllocation::Maximal => max_cores,
+            CoreAllocation::High => (max_cores / 2).max(1),
+            CoreAllocation::Low => (max_cores / 4).max(1),
+            CoreAllocation::Minimal => 1,
+        }
+    }
 }
