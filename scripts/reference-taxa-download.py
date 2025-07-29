@@ -178,6 +178,8 @@ def main(namesfile = 'names.dmp'):
     #     taxid, taxon_name, new_file = download_genome(taxid, name_data)
     #     print(f"{taxid}    {taxon_name}    {new_file}")
 
+    write_tsv(results, "genomes.tsv")
+
 
 
 if __name__ == "__main__":
