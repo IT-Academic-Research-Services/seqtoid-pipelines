@@ -1,10 +1,12 @@
+
 """
 reference-taxa-download.py: Downloads reference genome files from NCBI based on the names.dmp file
 format as found in NCBI taxonomy.
 That file can be found by the following.
 wget ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
 Requires the NCBI datasets program from: https://www.ncbi.nlm.nih.gov/datasets/
-Prefers genomes with the--refrence argument, falls back to --assembly-level chromosome,complete
+Preers genomes with the --reference argument, falls back to --assembly-level chromosome,complete
+hndles multiple FASTA files by seleting the best assembly based on metadata.
 """
 
 import os
@@ -14,6 +16,7 @@ import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from tqdm import tqdm
+import json
 
 SCIENTIFIC_NAME_TAG = 'scientific name'
 SYNONYM_NAME_TAG = 'synonym'
@@ -37,7 +40,6 @@ def load_taxids_by_block(names_file):
             ff = fline.strip().split("\t|\t")
             if len(ff) >= 4:
                 taxid = ff[0]
-
                 taxids_found.add(taxid)
                 name = ff[1].strip()
                 name_type_base = ff[3].strip()
@@ -48,12 +50,11 @@ def load_taxids_by_block(names_file):
                     taxid_blocks[taxid].append([name, name_type_make_sure])
                 else:
                     taxid_blocks[taxid] = [[name, name_type_make_sure]]
-
+            else:
+                logging.warning(f"Skipping bad line: {fline.strip()}")
 
     print(f"Total taxids in file {len(taxids_found)}")
-
     return taxid_blocks
-
 
 def filter_taxid_blocks(taxid_blocks_dict):
     taxids = {}
@@ -65,7 +66,6 @@ def filter_taxid_blocks(taxid_blocks_dict):
             name_candidate = name_datum[0]
             name_type_candidate = name_datum[1]
             if SCIENTIFIC_NAME_TAG in name_type_candidate:
-
                 final_name = name_candidate
                 final_name_type = name_type_candidate
                 break
@@ -75,41 +75,80 @@ def filter_taxid_blocks(taxid_blocks_dict):
         taxids[taxid] = [final_name, final_name_type]
     return taxids
 
+def select_best_assembly(metadata_file, fasta_files):
 
+    try:
+        assembly_priority = {"chromosome": 4, "complete": 3, "scaffold": 2, "contig": 1}
+        best_file = None
+        best_score = -1
+        best_date = ""
+        best_accession = ""
 
+        with open(metadata_file, 'r') as f:
+            for line in f:
+                data = json.loads(line.strip())
+                accession = data.get("accession", "")
+                assembly_level = data.get("assembly_info", {}).get("assembly_level", "").lower()
+                release_date = data.get("assembly_info", {}).get("release_date", "1900-01-01")
+
+                for fasta in fasta_files:
+                    if accession in fasta:
+                        score = assembly_priority.get(assembly_level, 0)
+                        if score > best_score or (score == best_score and release_date > best_date):
+                            best_file = fasta
+                            best_score = score
+                            best_date = release_date
+                            best_accession = accession
+                            break
+
+        if best_file:
+            logging.info(f"picked File {best_file} accession: {best_accession} level: {assembly_level} date: {best_date})")
+            return best_file
+        logging.warning("No matching assembly found in metadata")
+        return None
+    except Exception as e:
+        logging.error(f"Error parsing metadata {metadata_file}: {e}")
+        return None
 
 def download_genome_counter(args):
     taxid, name_data = args
     return download_genome(taxid, name_data)
+
 def download_genome(taxid, name_data):
     cwd = os.getcwd()
-
     taxon_name = name_data[0]
     try:
-
         zip_file = f"ncbi_dataset_{taxid}.zip"
+        genome_dir = os.path.join(cwd, f"genome_{taxid}")
         cmd = ["datasets", "download", "genome", "taxon", taxid, "--reference", "--filename", zip_file]
         result = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, check=False
         )
 
-        if result.returncode == 0:
+        if result.returncode == 0 and os.path.exists(zip_file):
             unzip_cmd = ["unzip", "-o", zip_file, "-d", f"genome_{taxid}"]
             unzip_result = subprocess.run(
                 unzip_cmd, cwd=cwd, capture_output=True, text=True, check=False
             )
             if unzip_result.returncode == 0:
-                genome_dir = os.path.join(cwd, f"genome_{taxid}", "ncbi_dataset", "data")
-                for root, _, files in os.walk(genome_dir):
+                data_dir = os.path.join(cwd, f"genome_{taxid}", "ncbi_dataset", "data")
+                metadata_file = os.path.join(data_dir, "assembly_data_report.jsonl")
+                fasta_files = []
+                for root, _, files in os.walk(data_dir):
                     for file in files:
                         if file.endswith("_genomic.fna"):
-                            genome_file = os.path.join(root, file)
-                            new_file = os.path.join(cwd, f"taxid_{taxid}_{taxon_name.replace(' ', '_')}_genomic.fna")
-                            os.rename(genome_file, new_file)
-                            subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
-                            logging.info(f"Successfully downloaded reference genome for TaxID {taxid}: {new_file}")
+                            fasta_files.append(os.path.join(root, file))
+
+                if fasta_files:
+                    logging.info(f"Found {len(fasta_files)} FASTA files for TaxID {taxid}: {fasta_files}")
+                    selected_file = select_best_assembly(metadata_file, fasta_files) if os.path.exists(metadata_file) else fasta_files[0]
+                    if selected_file:
+                        new_file = os.path.join(cwd, f"taxid_{taxid}_{taxon_name.replace(' ', '_')}_genomic.fna")
+                        os.rename(selected_file, new_file)
+                        subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
+                        logging.info(f"Successfully downloaded reference genome for TaxID {taxid}: {new_file}")
                         return taxid, taxon_name, new_file
-                logging.warning(f"No genomic.fna file found for TaxID {taxid} in reference download")
+                logging.warning(f"No genomic.fna files found for TaxID {taxid} in reference download")
                 subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
 
         logging.info(f"Attempting fallback download for TaxID {taxid} (non-reference)")
@@ -118,19 +157,31 @@ def download_genome(taxid, name_data):
             cmd_fallback, cwd=cwd, capture_output=True, text=True, check=False
         )
 
-        if result_fallback.returncode == 0:
-            genome_dir = os.path.join(cwd, f"genome_{taxid}", "ncbi_dataset", "data")
-            for root, _, files in os.walk(cwd):
-                for file in files:
-                    if file.endswith("_genomic.fna"):
-                        genome_file = os.path.join(root, file)
-                        new_file = os.path.join(cwd, f"taxid_{taxid}_{taxon_name.replace(' ', '_')}_genomic.fna")
-                        os.rename(genome_file, new_file)
+        if result_fallback.returncode == 0 and os.path.exists(zip_file):
+            unzip_cmd = ["unzip", "-o", zip_file, "-d", f"genome_{taxid}"]
+            unzip_result = subprocess.run(
+                unzip_cmd, cwd=cwd, capture_output=True, text=True, check=False
+            )
+            if unzip_result.returncode == 0:
+                data_dir = os.path.join(cwd, f"genome_{taxid}", "ncbi_dataset", "data")
+                metadata_file = os.path.join(data_dir, "assembly_data_report.jsonl")
+                fasta_files = []
+                for root, _, files in os.walk(data_dir):
+                    for file in files:
+                        if file.endswith("_genomic.fna"):
+                            fasta_files.append(os.path.join(root, file))
+
+                if fasta_files:
+                    logging.info(f"Found {len(fasta_files)} FASTA files for TaxID {taxid} (fallback): {fasta_files}")
+                    selected_file = select_best_assembly(metadata_file, fasta_files) if os.path.exists(metadata_file) else fasta_files[0]
+                    if selected_file:
+                        new_file = os.path.join(cwd, f"taxid_{taxid}_{taxon_name.replace(' ', '_')}_nonref_genomic.fna")
+                        os.rename(selected_file, new_file)
                         subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
-                        logging.info(f"Successfully downloaded reference genome for TaxID {taxid}: {new_file}")
-                    return taxid, taxon_name, new_file
-            logging.warning(f"No genomic.fna file found for TaxID {taxid} in reference download")
-            subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
+                        logging.info(f"Successfully downloaded non-reference genome for TaxID {taxid}: {new_file}")
+                        return taxid, taxon_name, new_file
+                logging.warning(f"No genomic.fna files found for TaxID {taxid} in fallback download")
+                subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
 
         logging.warning(f"No genome available for TaxID {taxid}")
         return taxid, taxon_name, "N/A"
@@ -153,7 +204,8 @@ def main(namesfile = 'names.dmp'):
     print("NCBI Reference Genome download")
 
     taxid_blocks = load_taxids_by_block(names_file=namesfile)
-
+    if not taxid_blocks:
+        return
 
     taxids = filter_taxid_blocks(taxid_blocks)
 
@@ -169,17 +221,10 @@ def main(namesfile = 'names.dmp'):
     num_cores = mp.cpu_count()
     print(f"Using {num_cores} threads to process and download {len(taxids)} taxa.")
 
-
     with mp.Pool(processes=num_cores) as pool:
         results = list(tqdm(pool.imap_unordered(download_genome_counter, taxids.items()), total=len(taxids), desc="Processing taxon IDs"))
 
-    # for taxid, name_data in taxids.items():
-    #     taxid, taxon_name, new_file = download_genome(taxid, name_data)
-    #     print(f"{taxid}    {taxon_name}    {new_file}")
-
     write_tsv(results, "genomes.tsv")
-
-
 
 if __name__ == "__main__":
     main("names.dmp")
