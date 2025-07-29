@@ -84,7 +84,6 @@ def download_genome_counter(args):
 def download_genome(taxid, name_data):
     cwd = os.getcwd()
 
-    print(f"{taxid}")
     taxon_name = name_data[0]
     try:
 
@@ -183,5 +182,5 @@ def main(namesfile = 'names.dmp'):
 
 
 if __name__ == "__main__":
-    # main("names.dmp")
-    main("names-head.dmp")
+    main("names.dmp")
+
