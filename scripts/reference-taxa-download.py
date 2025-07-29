@@ -120,17 +120,17 @@ def download_genome(taxid, name_data):
 
         if result_fallback.returncode == 0:
             genome_dir = os.path.join(cwd, f"genome_{taxid}", "ncbi_dataset", "data")
-        for root, _, files in os.walk(cwd):
-            for file in files:
-                if file.endswith("_genomic.fna"):
-                    genome_file = os.path.join(root, file)
-                    new_file = os.path.join(cwd, f"taxid_{taxid}_{taxon_name.replace(' ', '_')}_genomic.fna")
-                    os.rename(genome_file, new_file)
-                    subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
-                    logging.info(f"Successfully downloaded reference genome for TaxID {taxid}: {new_file}")
-                return taxid, taxon_name, new_file
-        logging.warning(f"No genomic.fna file found for TaxID {taxid} in reference download")
-        subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
+            for root, _, files in os.walk(cwd):
+                for file in files:
+                    if file.endswith("_genomic.fna"):
+                        genome_file = os.path.join(root, file)
+                        new_file = os.path.join(cwd, f"taxid_{taxid}_{taxon_name.replace(' ', '_')}_genomic.fna")
+                        os.rename(genome_file, new_file)
+                        subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
+                        logging.info(f"Successfully downloaded reference genome for TaxID {taxid}: {new_file}")
+                    return taxid, taxon_name, new_file
+            logging.warning(f"No genomic.fna file found for TaxID {taxid} in reference download")
+            subprocess.run(["rm", "-rf", f"genome_{taxid}", zip_file], cwd=cwd)
 
         logging.warning(f"No genome available for TaxID {taxid}")
         return taxid, taxon_name, "N/A"
