@@ -237,14 +237,14 @@ def main(namesfile = 'names.dmp', nodesfile = 'nodes.dmp'):
             f.write(str(name_data[1]))
             f.write("\n")
 
-    # num_cores = mp.cpu_count()
-    # print(f"Using {num_cores} threads to process and download {len(taxids)} taxa.")
-    #
-    # with mp.Pool(processes=num_cores) as pool:
-    #     results = list(tqdm(pool.imap_unordered(download_genome_counter, taxids.items()), total=len(taxids), desc="Processing taxon IDs"))
-    #
-    # write_tsv(results, "genomes.tsv")
+    num_cores = mp.cpu_count()
+    print(f"Using {num_cores} threads to process and download {len(taxids)} taxa.")
+
+    with mp.Pool(processes=num_cores) as pool:
+        results = list(tqdm(pool.imap_unordered(download_genome_counter, taxids.items()), total=len(taxids), desc="Processing taxon IDs"))
+
+    write_tsv(results, "genomes.tsv")
 
 if __name__ == "__main__":
-    main("names.dmp")
+    main()
 
