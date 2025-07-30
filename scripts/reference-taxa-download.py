@@ -28,9 +28,23 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-def load_taxids_by_block(names_file):
+def load_species_taxids(nodes_file):
+    species_taxids = set()
+    with open(nodes_file) as f:
+        for line in f:
+            fields = line.strip().split("\t|\t")
+            if len(fields) >= 3:
+                taxid = fields[0].strip()
+                rank = fields[2].strip()
+                if rank == "species":
+                    species_taxids.add(taxid)
+    return species_taxids
+
+def load_taxids_by_block(names_file, species_taxids):
     taxid_blocks = {}
     taxids_found = set()
+    all_taxids = set()
+
 
     if not os.path.isfile(names_file):
         print(f"The names file {names_file} in .dmp format from NCBI taxaonomy cannot be found ")
@@ -39,21 +53,24 @@ def load_taxids_by_block(names_file):
         for fline in f:
             ff = fline.strip().split("\t|\t")
             if len(ff) >= 4:
-                taxid = ff[0]
-                taxids_found.add(taxid)
-                name = ff[1].strip()
-                name_type_base = ff[3].strip()
-                name_type_no_pipe = name_type_base.strip().rstrip("|")
-                name_type_make_sure = name_type_no_pipe.strip() # ugh
+                taxid = ff[0].strip()
+                all_taxids.add(taxid)
+                if taxid in species_taxids:
+                    taxids_found.add(taxid)
+                    name = ff[1].strip()
+                    name_type_base = ff[3].strip()
+                    name_type_no_pipe = name_type_base.strip().rstrip("|")
+                    name_type_make_sure = name_type_no_pipe.strip() # ugh
 
-                if taxid in taxid_blocks:
-                    taxid_blocks[taxid].append([name, name_type_make_sure])
-                else:
-                    taxid_blocks[taxid] = [[name, name_type_make_sure]]
+                    if taxid in taxid_blocks:
+                        taxid_blocks[taxid].append([name, name_type_make_sure])
+                    else:
+                        taxid_blocks[taxid] = [[name, name_type_make_sure]]
             else:
                 logging.warning(f"Skipping bad line: {fline.strip()}")
 
-    print(f"Total taxids in file {len(taxids_found)}")
+    print(f"Total species taxids in file {len(taxids_found)}")
+    print(f"Total of all taxids in file {len(all_taxids)}")
     return taxid_blocks
 
 def filter_taxid_blocks(taxid_blocks_dict):
@@ -200,10 +217,12 @@ def write_tsv(results: List[Tuple[str, str, str]], output_tsv) -> None:
         logging.error(f"Error writing TSV file {output_tsv}: {e}")
         raise
 
-def main(namesfile = 'names.dmp'):
+def main(namesfile = 'names.dmp', nodesfile = 'nodes.dmp'):
     print("NCBI Reference Genome download")
 
-    taxid_blocks = load_taxids_by_block(names_file=namesfile)
+    species_taxids = load_species_taxids(nodesfile)
+
+    taxid_blocks = load_taxids_by_block(namesfile, species_taxids)
     if not taxid_blocks:
         return
 
@@ -218,13 +237,13 @@ def main(namesfile = 'names.dmp'):
             f.write(str(name_data[1]))
             f.write("\n")
 
-    num_cores = mp.cpu_count()
-    print(f"Using {num_cores} threads to process and download {len(taxids)} taxa.")
-
-    with mp.Pool(processes=num_cores) as pool:
-        results = list(tqdm(pool.imap_unordered(download_genome_counter, taxids.items()), total=len(taxids), desc="Processing taxon IDs"))
-
-    write_tsv(results, "genomes.tsv")
+    # num_cores = mp.cpu_count()
+    # print(f"Using {num_cores} threads to process and download {len(taxids)} taxa.")
+    #
+    # with mp.Pool(processes=num_cores) as pool:
+    #     results = list(tqdm(pool.imap_unordered(download_genome_counter, taxids.items()), total=len(taxids), desc="Processing taxon IDs"))
+    #
+    # write_tsv(results, "genomes.tsv")
 
 if __name__ == "__main__":
     main("names.dmp")
