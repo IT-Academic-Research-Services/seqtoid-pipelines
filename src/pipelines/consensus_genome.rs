@@ -32,7 +32,6 @@ use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_de
 use crate::utils::vcf::parse_vcf_stream;
 use crate::utils::plotting::plot_depths;
 
-const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
 #[derive(Serialize)]
 struct Stats {
@@ -141,7 +140,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    let ercc_path = file_path_manipulator(&PathBuf::from(ERCC_FASTA), Some(&cwd), None, None, "");
+    let ercc_path = file_path_manipulator(&PathBuf::from(&config.args.ercc_sequences), Some(&cwd), None, None, "");
     if !ercc_path.exists() {
         return Err(anyhow!("Specified ercc {:?} does not exist.", ercc_path));
     }

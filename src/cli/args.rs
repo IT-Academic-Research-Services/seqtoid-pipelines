@@ -87,6 +87,9 @@ pub struct Arguments {
     #[arg(long)]
     pub adapter_fasta : Option<String>,
 
+    #[arg(long, default_value = "ercc_sequences.fasta")]
+    pub ercc_sequences : String,
+
     #[arg( long = "target_type", default_value = "viral", value_enum)]
     pub target_type: TargetType,
 
