@@ -95,7 +95,7 @@ mod fastp {
 
             if let Some(adapter_fasta) = &args.adapter_fasta {
                 let cwd = std::env::current_dir()?;
-                let adapter_path = file_path_manipulator(&PathBuf::from(adapter_fasta), &cwd.clone(), None, None, "");
+                let adapter_path = file_path_manipulator(&PathBuf::from(adapter_fasta), Some(&cwd.clone()), None, None, "");
                 if !adapter_path.exists() {
                     return Err(anyhow!("Adapter FASTA file does not exist: {}", adapter_path.display()));
                 }
@@ -415,7 +415,7 @@ pub mod kraken2 {
             let cwd = std::env::current_dir()?;
             match &args.kraken_db{
                 Some(db) => {
-                    let kraken2_db_path = file_path_manipulator(&PathBuf::from(db), &cwd, None, None, "");
+                    let kraken2_db_path = file_path_manipulator(&PathBuf::from(db), Some(&cwd), None, None, "");
                     if !kraken2_db_path.exists() || !kraken2_db_path.is_dir() {
                         return Err(anyhow!("Kraken2 database path does not exist or is not a directory: {:?}", kraken2_db_path));
                     }

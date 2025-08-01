@@ -90,7 +90,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Arguments and files check
     let file1_path: PathBuf = match &config.args.file1 {
         Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
             if file1_full_path.exists() {
                 file1_full_path
             } else {
@@ -121,7 +121,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let file2_path: Option<PathBuf> = match &config.args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd.clone(), None, None, "");
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
             if file2_full_path.exists() {
                 Some(file2_full_path)
             } else {
@@ -141,7 +141,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     })?;
     let ref_db_path = PathBuf::from(&ref_db);
 
-    let ercc_path = file_path_manipulator(&PathBuf::from(ERCC_FASTA), &cwd, None, None, "");
+    let ercc_path = file_path_manipulator(&PathBuf::from(ERCC_FASTA), Some(&cwd), None, None, "");
     if !ercc_path.exists() {
         return Err(anyhow!("Specified ercc {:?} does not exist.", ercc_path));
     }
@@ -149,7 +149,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Input Validation
 
-    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("validated"), "_");
+    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), Some(&cwd.clone()), None, Some("validated"), "_");
     let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology.clone()), config.args.max_reads, config.args.min_read_len, config.args.max_read_len)?;
     let val_rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
@@ -268,7 +268,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
 
-    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("no_host.fq.gz"), "_");
+    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, Some(&cwd.clone()), None, Some("no_host.fq.gz"), "_");
 
     let stats_seqkit_config_stats = SeqkitConfig {
         subcommand: SeqkitSubcommand::Stats,
@@ -606,7 +606,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 // Kraken2
                 let kraken2_report_path = file_path_manipulator(
                     &PathBuf::from(&no_ext_sample_base_buf),
-                    &cwd.clone(),
+                    Some(&cwd.clone()),
                     None,
                     Some("kraken2_report.txt"),
                     "_"
@@ -672,7 +672,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let align_fastq_path = file_path_manipulator(
                 &PathBuf::from(&no_ext_sample_base_buf),
-                &cwd.clone(),
+                Some(&cwd.clone()),
                 None,
                 Some("filtered.fq.gz"),
                 "_"
@@ -778,7 +778,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Make Consensus
             align_bam_path = Some(file_path_manipulator(
                 &no_ext_sample_base_buf,
-                &cwd.clone(),
+                Some(&cwd.clone()),
                 None,
                 Some("align.sam"),
                 "_"
@@ -822,7 +822,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )?;
             consensus_file_path = Some(file_path_manipulator(
                 &PathBuf::from(&no_ext_sample_base_buf),
-                &cwd.clone(),
+                (Some(&cwd.clone())),
                 None,
                 Some("consensus.fa"),
                 "_"
@@ -947,7 +947,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let called_variants_path = file_path_manipulator(
                 &no_ext_sample_base_buf,
-                &cwd.clone(),
+                Some(&cwd.clone()),
                 None,
                 Some("called.vcf"),
                 "_"
@@ -1020,7 +1020,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let realign_consensus_path = file_path_manipulator(
                 &no_ext_sample_base_buf,
-                &cwd.clone(),
+                Some(&cwd.clone()),
                 None,
                 Some("consensus_realigned.fa"),
                 "_"
@@ -1144,7 +1144,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let depth_plot_path = file_path_manipulator(
         &PathBuf::from(&no_ext_sample_base_buf),
-        &cwd.clone(),
+        Some(&cwd.clone()),
         None,
         Some("depth.png"),
         "_"
