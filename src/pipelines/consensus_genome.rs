@@ -135,10 +135,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let technology = config.args.technology.clone();
 
-    let ref_db = config.args.ref_db.clone().ok_or_else(|| {
-        anyhow!("HDF5 database file must be given (-d).")
-    })?;
-    let ref_db_path = PathBuf::from(&ref_db);
+    let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(|ref_db| PathBuf::from(ref_db));
 
     let ercc_path = file_path_manipulator(&PathBuf::from(&config.args.ercc_sequences), Some(&cwd), None, None, "");
     if !ercc_path.exists() {
@@ -206,12 +203,17 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     //*****************
     // Host Removal
-    let (_host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+    let (_host_accession, host_seq) = retrieve_h5_seq(
+        config.args.host_accession.clone(),
+        config.args.host_sequence.clone(),
+        ref_db_path.as_ref(),
+        h5_index.as_ref(),
+    ).await?;
     let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
     temp_files.push(host_ref_temp);
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.base_buffer_size).await?;
-    host_ref_write_task.await?;  // This has to be done immediately to make sure the host query minimap2 can read it
+    host_ref_write_task.await?; // This has to be done immediately to make sure the host query minimap2 can read
 
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
@@ -346,7 +348,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             //*****************
             // Get Target reference sequence
-            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(
+                config.args.ref_accession.clone(),
+                config.args.ref_sequence.clone(),
+                ref_db_path.as_ref(),
+                h5_index.as_ref(),
+            ).await?;
             let target_ref_temp = NamedTempFile::with_suffix_in(".fasta", &config.ram_temp_dir)?;
             target_ref_fasta_path = Some(target_ref_temp.path().to_path_buf());
             temp_files.push(target_ref_temp);

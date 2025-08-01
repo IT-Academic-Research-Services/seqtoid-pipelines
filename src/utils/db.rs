@@ -479,45 +479,56 @@ pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, accession: &str, fifo_path: &
 /// * `args` - CLI arguments.
 ///
 /// # Returns
-/// anyhow::Result<HashMap<[u8; 24], u64>>
+/// anyhow::Result<Option<HashMap<[u8; 24], u64>>>
 ///
-pub async fn get_index(args: &Arguments) -> anyhow::Result<HashMap<[u8; 24], u64>> {
+pub async fn get_index(args: &Arguments) -> anyhow::Result<Option<HashMap<[u8; 24], u64>>> {
     let cwd = std::env::current_dir()?;
 
-    let ref_db = args.ref_db.clone().ok_or_else(|| {
-        anyhow!("HDF5 database file must be given (-d).")
-    })?;
-    let ref_db_path = PathBuf::from(&ref_db);
+    match &args.ref_db {
+        Some(ref_db) => {
+            let ref_db_path = PathBuf::from(ref_db);
+            if !ref_db_path.exists() {
+                return Err(anyhow!("HDF5 database file does not exist: {}", ref_db_path.display()));
+            }
 
-    let h5_index = if let Some(index_file) = &args.ref_index {
-        let index_full_path = file_path_manipulator(&PathBuf::from(index_file), Some(&cwd), None, None, "");
-        if index_full_path.exists() {
-            load_index(&index_full_path).await?
-        } else {
-            eprintln!("Index path does not exist: {}", index_full_path.display());
-            build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+            let h5_index = if let Some(index_file) = &args.ref_index {
+                let index_full_path = file_path_manipulator(&PathBuf::from(index_file), Some(&cwd), None, None, "");
+                if index_full_path.exists() {
+                    load_index(&index_full_path).await?
+                } else {
+                    eprintln!("Index path does not exist: {}. Building new index.", index_full_path.display());
+                    build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+                }
+            } else {
+                let index_full_path = ref_db_path.with_extension("index.bin");
+                eprintln!("No index file provided, creating new index: {}", index_full_path.display());
+                build_new_in_memory_index(&ref_db_path, &index_full_path).await?
+            };
+
+            Ok(Some(h5_index))
         }
-    } else {
-        let index_full_path = ref_db_path.with_extension("index.bin");
-        eprintln!("No index file provided, creating new index: {}", index_full_path.display());
-        build_new_in_memory_index(&ref_db_path, &index_full_path).await?
-    };
-
-    Ok(h5_index)
+        None => Ok(None),
+    }
 }
 
-/// Converts the retrieved sequence from an HDF5 file to a FIFO pipe.
+/// Retrieves a sequence from an HDF5 file or a provided FASTA file.
 ///
 /// # Arguments
 ///
-/// * `args` - CLI arguments.
+/// * `accession` - Optional accession ID for lookup in HDF5.
+/// * `sequence_file` - Optional path to a FASTA file.
 /// * `ref_db_path` - Optional path to existing DB for retrieval.
-/// * `h5_index` - Optional HDF5 index file.
+/// * `h5_index` - Optional HDF5 index map.
 ///
 /// # Returns
 /// anyhow::Result<(String, Vec<u8>)> <accession, FASTA record>
 ///
-pub async fn retrieve_h5_seq(accession: Option<String>, sequence_file: Option<String>, ref_db_path: Option<&PathBuf>, h5_index: Option<&HashMap<[u8; 24], u64>>) -> anyhow::Result<(String, Vec<u8>)> {
+pub async fn retrieve_h5_seq(
+    accession: Option<String>,
+    sequence_file: Option<String>,
+    ref_db_path: Option<&PathBuf>,
+    h5_index: Option<&HashMap<[u8; 24], u64>>,
+) -> anyhow::Result<(String, Vec<u8>)> {
     let cwd = std::env::current_dir()?;
 
     match (sequence_file, accession) {
