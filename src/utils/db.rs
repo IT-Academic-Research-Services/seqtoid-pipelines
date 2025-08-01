@@ -522,16 +522,22 @@ pub async fn retrieve_h5_seq(accession: Option<String>, sequence_file: Option<St
 
     match (sequence_file, accession) {
         (Some(sequence_file), None) => {
-            let sequence_path = file_path_manipulator(&PathBuf::from(&sequence_file), &cwd, None, None, "");
-            eprintln!("Reading sequence from FASTA: {}", sequence_path.display());
-            let mut reader = match sequence_reader(&sequence_path)? {
+            let sequence_path = PathBuf::from(&sequence_file);
+            let resolved_path = if sequence_path.is_absolute() {
+                sequence_path
+            } else {
+                cwd.join(sequence_path)
+            };
+
+            eprintln!("Reading sequence from FASTA: {}", resolved_path.display());
+            let mut reader = match sequence_reader(&resolved_path)? {
                 SequenceReader::Fasta(reader) => reader,
-                _ => return Err(anyhow!("Sequence file must be FASTA: {}", sequence_path.display())),
+                _ => return Err(anyhow!("Sequence file must be FASTA: {}", resolved_path.display())),
             };
             let record = reader
                 .into_records()
                 .next()
-                .ok_or_else(|| anyhow!("No records found in FASTA file: {}", sequence_path.display()))?
+                .ok_or_else(|| anyhow!("No records found in FASTA file: {}", resolved_path.display()))?
                 .map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
             let seq_record: SequenceRecord = record.to_owned().into();
             let accession = seq_record.id().to_string();
