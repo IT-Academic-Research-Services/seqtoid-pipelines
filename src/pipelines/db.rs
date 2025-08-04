@@ -60,7 +60,7 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
                 all_multis = the_multis.clone();
             }
             else {
-                let fasta_full_path = file_path_manipulator(&PathBuf::from(f1), &cwd, None, None, "");
+                let fasta_full_path = file_path_manipulator(&PathBuf::from(f1), Some(&cwd), None, None, "");
                 if fasta_full_path.exists() {
                     all_multis.push(fasta_full_path.clone());
                 } else {
@@ -89,7 +89,7 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
                 all_singles = the_singles.clone();
             }
             else {
-                let fasta_full_path = file_path_manipulator(&PathBuf::from(f2), &cwd, None, None, "");
+                let fasta_full_path = file_path_manipulator(&PathBuf::from(f2), Some(&cwd), None, None, "");
                 if fasta_full_path.exists() {
                     all_singles.push(fasta_full_path.clone());
                 } else {
@@ -117,11 +117,11 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
     
     let h5_path = match &config.args.ref_db {
         Some(file) => {
-            let file_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            let file_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
             file_path.with_extension("h5")
         }
         None => {
-            file_path_manipulator(&PathBuf::from("db.h5"), &cwd, None, None, "")
+            file_path_manipulator(&PathBuf::from("db.h5"), Some(&cwd), None, None, "")
         }
     };
     eprintln!("Writing to: {}", h5_path.display());

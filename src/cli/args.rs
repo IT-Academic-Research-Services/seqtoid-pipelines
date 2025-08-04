@@ -30,8 +30,8 @@ pub struct Arguments {
     #[arg(short = 'I', long = "file2")]
     pub file2: Option<String>,
 
-    #[arg(short = 'o', long = "out")]
-    pub out_file: Option<String>,
+    #[arg(short = 'o', long = "out", help = "Output directory for all generated files. If not specified, a directory named '<sample_base>_YYYYMMDD' will be created in the current working directory.")]
+    pub out_dir: Option<String>,
 
     #[arg(long, default_value_t = 50000000)]
     pub max_reads: usize,
@@ -69,6 +69,9 @@ pub struct Arguments {
     #[arg(long)] // For target aligning
     pub ref_sequence : Option<String>,
 
+    #[arg(long)]
+    pub ref_taxid : Option<String>,
+
     #[arg(short = 'd', long = "db")]
     pub ref_db : Option<String>,
 
@@ -86,6 +89,9 @@ pub struct Arguments {
 
     #[arg(long)]
     pub adapter_fasta : Option<String>,
+
+    #[arg(long, default_value = "ercc_sequences.fasta")]
+    pub ercc_sequences : String,
 
     #[arg( long = "target_type", default_value = "viral", value_enum)]
     pub target_type: TargetType,

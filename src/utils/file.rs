@@ -55,12 +55,15 @@ pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
 ///
 /// # Returns
 /// PathBuf: modified, absolute path
-pub fn file_path_manipulator(path: &PathBuf, parent_dir: &PathBuf, prefix: Option<&str>, postfix: Option<&str>, delimiter: &str) -> PathBuf {
-    
-    let absolute_path = parent_dir.canonicalize().ok().expect("Parent directory not found. {parent_dir:?}");
-    let new_file_name = file_name_manipulator(path, prefix, postfix, delimiter);
-    let new_file_path = PathBuf::from(new_file_name);
-    let absolute_file_path = absolute_path.join(&new_file_path);
+pub fn file_path_manipulator(path: &PathBuf, parent_dir: Option<&PathBuf>, prefix: Option<&str>, postfix: Option<&str>, delimiter: &str) -> PathBuf {
+    let resolved_path = if path.is_absolute() {
+        path
+    } else {
+        let parent_path = parent_dir.expect("parent_dir must not be None when path is relative").canonicalize().ok().expect("Parent directory not found. {parent_dir:?}");
+        &parent_path.join(path)
+    };
+    let absolute_file_name = file_name_manipulator(resolved_path, prefix, postfix, delimiter);
+    let absolute_file_path = PathBuf::from(absolute_file_name);
 
     absolute_file_path
 }
@@ -98,8 +101,17 @@ pub fn file_name_manipulator(path: &PathBuf, prefix: Option<&str>, postfix:Optio
     new_file_name
 }
 
+
+/// Strips either one extension, or two if the last one is gz
+/// # Arguments
+///
+/// * `path`: PathBuf - File path
+///
+/// # Returns
+/// PathBuf of stripped file, extensions.
 pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
-    let path = Path::new(&path);
+    let path = Path::new(path);
+    let parent = path.parent().unwrap_or(Path::new(""));
     let mut current = path;
     let mut extensions = Vec::new();
 
@@ -107,7 +119,7 @@ pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
 
         match extensions.len() {
             1 => {
-                if extensions[0] == GZIP_EXT {
+                if extensions[0] == "gz" {
                     extensions.push(ext.to_string());
                 } else {
                     break;
@@ -123,8 +135,13 @@ pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
 
         current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
     }
-    
-    let out_path_buf = PathBuf::from(current.to_string_lossy().into_owned());
+
+    let stem = current.to_string_lossy().into_owned();
+    let out_path_buf = if parent == Path::new("") {
+        PathBuf::from(stem)
+    } else {
+        parent.join(stem)
+    };
     extensions.reverse();
     (out_path_buf, extensions)
 }
@@ -164,7 +181,7 @@ pub fn scan_files_with_extensions(dir: &PathBuf, valid_extensions: &[&str]) -> R
         let (_, extensions) = extension_remover(&path);
         
         if path.is_file() && has_any_extension_from_path(&extensions, valid_extensions) {
-            let full_path = file_path_manipulator(&path, dir, None, None, "");
+            let full_path = file_path_manipulator(&path, Some(dir), None, None, "");
             matching_files.push(full_path);
         }
     }

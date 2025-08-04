@@ -104,6 +104,7 @@ pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 pub struct RunConfig {
     pub cwd: PathBuf,
     pub ram_temp_dir: PathBuf,
+    pub out_dir: PathBuf,
     pub args: Arguments,
     pub thread_pool: Arc<ThreadPool>,
     pub maximal_semaphore: Arc<Semaphore>,

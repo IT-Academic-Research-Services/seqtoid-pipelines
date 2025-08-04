@@ -32,7 +32,6 @@ use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_de
 use crate::utils::vcf::parse_vcf_stream;
 use crate::utils::plotting::plot_depths;
 
-const ERCC_FASTA: &str = "ercc_sequences.fasta";
 
 #[derive(Serialize)]
 struct Stats {
@@ -72,8 +71,13 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", config.args.module);
 
+    if config.args.ref_taxid == None {
+        return Err(anyhow!("The ref_taxid argument must be set for this pipeline. Consult https://www.ncbi.nlm.nih.gov/taxonomy for the taxid you need."));
+    }
+
     let cwd = config.cwd.clone();
     let ram_temp_dir = config.ram_temp_dir.clone();
+    let out_dir = config.out_dir.clone();
     let mut temp_files = Vec::new();
     let config_arc = Arc::new((*config).clone());
 
@@ -90,7 +94,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     // Arguments and files check
     let file1_path: PathBuf = match &config.args.file1 {
         Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), &cwd, None, None, "");
+            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
             if file1_full_path.exists() {
                 file1_full_path
             } else {
@@ -121,7 +125,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let file2_path: Option<PathBuf> = match &config.args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), &cwd.clone(), None, None, "");
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
             if file2_full_path.exists() {
                 Some(file2_full_path)
             } else {
@@ -136,12 +140,9 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let technology = config.args.technology.clone();
 
-    let ref_db = config.args.ref_db.clone().ok_or_else(|| {
-        anyhow!("HDF5 database file must be given (-d).")
-    })?;
-    let ref_db_path = PathBuf::from(&ref_db);
+    let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(|ref_db| PathBuf::from(ref_db));
 
-    let ercc_path = file_path_manipulator(&PathBuf::from(ERCC_FASTA), &cwd, None, None, "");
+    let ercc_path = file_path_manipulator(&PathBuf::from(&config.args.ercc_sequences), Some(&cwd), None, None, "");
     if !ercc_path.exists() {
         return Err(anyhow!("Specified ercc {:?} does not exist.", ercc_path));
     }
@@ -149,7 +150,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     //*****************
     // Input Validation
 
-    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), &cwd.clone(), None, Some("validated"), "_");
+    let validated_interleaved_file_path = file_path_manipulator(&PathBuf::from(&sample_base), Some(&out_dir), None, Some("validated"), "_");
     let rx = read_and_interleave_sequences(file1_path, file2_path, Some(technology.clone()), config.args.max_reads, config.args.min_read_len, config.args.max_read_len)?;
     let val_rx_stream = ReceiverStream::new(rx);
     let (val_streams, val_done_rx) = t_junction(
@@ -207,12 +208,17 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     //*****************
     // Host Removal
-    let (_host_accession, host_seq) = retrieve_h5_seq(config.args.host_accession.clone(), config.args.host_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+    let (_host_accession, host_seq) = retrieve_h5_seq(
+        config.args.host_accession.clone(),
+        config.args.host_sequence.clone(),
+        ref_db_path.as_ref(),
+        h5_index.as_ref(),
+    ).await?;
     let host_ref_temp = NamedTempFile::new_in(&ram_temp_dir)?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
     temp_files.push(host_ref_temp);
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.base_buffer_size).await?;
-    host_ref_write_task.await?;  // This has to be done immediately to make sure the host query minimap2 can read it
+    host_ref_write_task.await?; // This has to be done immediately to make sure the host query minimap2 can read
 
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(val_fastp_out_stream, None).await?;
     cleanup_tasks.push(host_query_write_task);
@@ -268,7 +274,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     cleanup_tasks.push(host_samtools_task_fastq);
     cleanup_tasks.push(host_samtools_err_task_fastq);
 
-    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, &cwd.clone(), None, Some("no_host.fq.gz"), "_");
+    let no_host_file_path = file_path_manipulator(&no_ext_sample_base_buf, Some(&out_dir), None, Some("no_host.fq.gz"), "_");
 
     let stats_seqkit_config_stats = SeqkitConfig {
         subcommand: SeqkitSubcommand::Stats,
@@ -347,7 +353,12 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             //*****************
             // Get Target reference sequence
-            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(config.args.ref_accession.clone(), config.args.ref_sequence.clone(), Some(&ref_db_path), Some(&h5_index)).await?;
+            let (_filter_align_accession, filter_align_seq) = retrieve_h5_seq(
+                config.args.ref_accession.clone(),
+                config.args.ref_sequence.clone(),
+                ref_db_path.as_ref(),
+                h5_index.as_ref(),
+            ).await?;
             let target_ref_temp = NamedTempFile::with_suffix_in(".fasta", &config.ram_temp_dir)?;
             target_ref_fasta_path = Some(target_ref_temp.path().to_path_buf());
             temp_files.push(target_ref_temp);
@@ -435,7 +446,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 Some(&ercc_samtools_config_stats),
             )?;
 
-            let ercc_stats_file_path = no_ext_sample_base.clone() + "_stats.txt";
+            let ercc_stats_file_path = out_dir.join(format!("{}_ercc_stats.txt", no_ext_sample_base));
             let (mut ercc_samtools_child_stats, ercc_samtools_task_stats, ercc_samtools_err_task_stats) = stream_to_cmd(config_arc.clone(),
                 ercc_samtools_out_stream_view,
                 SAMTOOLS_TAG,
@@ -606,7 +617,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
                 // Kraken2
                 let kraken2_report_path = file_path_manipulator(
                     &PathBuf::from(&no_ext_sample_base_buf),
-                    &cwd.clone(),
+                    Some(&out_dir),
                     None,
                     Some("kraken2_report.txt"),
                     "_"
@@ -649,7 +660,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
                 let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
                 let parse_rx = parse_fastq(kraken2_classified_stream, config.base_buffer_size).await?;
-                let filter_fn = |id: &str| id.contains("kraken:taxid|2697049");
+
+                let taxid = config.args.ref_taxid.as_ref().expect("ref_taxid should be Some");
+                let pattern = format!("kraken:taxid|{}", taxid);
+                let filter_fn = move |id: &str| id.contains(&pattern);
 
                 let (filtered_rx, filter_task) = parse_and_filter_fastq_id(parse_rx, config.base_buffer_size, filter_fn.clone());
                 cleanup_tasks.push(filter_task);
@@ -672,7 +686,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let align_fastq_path = file_path_manipulator(
                 &PathBuf::from(&no_ext_sample_base_buf),
-                &cwd.clone(),
+                Some(&out_dir),
                 None,
                 Some("filtered.fq.gz"),
                 "_"
@@ -778,7 +792,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             // Make Consensus
             align_bam_path = Some(file_path_manipulator(
                 &no_ext_sample_base_buf,
-                &cwd.clone(),
+                Some(&out_dir),
                 None,
                 Some("align.sam"),
                 "_"
@@ -822,7 +836,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
             )?;
             consensus_file_path = Some(file_path_manipulator(
                 &PathBuf::from(&no_ext_sample_base_buf),
-                &cwd.clone(),
+                Some(&out_dir),
                 None,
                 Some("consensus.fa"),
                 "_"
@@ -947,7 +961,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let called_variants_path = file_path_manipulator(
                 &no_ext_sample_base_buf,
-                &cwd.clone(),
+                Some(&out_dir),
                 None,
                 Some("called.vcf"),
                 "_"
@@ -1020,7 +1034,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
             let realign_consensus_path = file_path_manipulator(
                 &no_ext_sample_base_buf,
-                &cwd.clone(),
+                Some(&out_dir),
                 None,
                 Some("consensus_realigned.fa"),
                 "_"
@@ -1144,7 +1158,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
     let depth_plot_path = file_path_manipulator(
         &PathBuf::from(&no_ext_sample_base_buf),
-        &cwd.clone(),
+        Some(&out_dir),
         None,
         Some("depth.png"),
         "_"
@@ -1222,7 +1236,7 @@ pub async fn run(config: &RunConfig) -> Result<()> {
         coverage,
     };
 
-    let stats_file_path = cwd.join(format!("{}_stats.json", no_ext_sample_base));
+    let stats_file_path = out_dir.join(format!("{}_stats.json", no_ext_sample_base));
     let mut stats_file = File::create(&stats_file_path)?;
     serde_json::to_writer_pretty(&mut stats_file, &stats)?;
 
