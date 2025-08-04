@@ -144,7 +144,8 @@ fn create_test_run_config() -> Arc<RunConfig> {
     };
     Arc::new(RunConfig {
         cwd: PathBuf::from("."),
-        ram_temp_dir: PathBuf::from("/scratch"), // Matches 3.8TB NVMe scratch
+        ram_temp_dir: PathBuf::from("/scratch"),
+        out_dir: PathBuf::from("test"),
         args,
         thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(84).build().unwrap()),
         maximal_semaphore: Arc::new(Semaphore::new(84)),

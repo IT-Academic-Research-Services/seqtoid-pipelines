@@ -2,7 +2,7 @@ mod pipelines;
 mod utils;
 mod config;
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use std::{env, fs};
 use std::cmp::min;
 use std::path::PathBuf;
@@ -20,11 +20,11 @@ use rayon::ThreadPoolBuilder;
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType};
 use crate::cli::args::Technology;
+use crate::utils::file::extension_remover;
 use pipelines::consensus_genome;
 use pipelines::db;
 
 mod cli;
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 
     let dir = env::current_dir()?;
     println!("The current directory is {:?}\n", dir);
-    
+
     let ram_temp_dir = get_ram_temp_dir();
     println!("The RAM temp directory is {:?}\n", ram_temp_dir);
 
@@ -55,8 +55,18 @@ async fn main() -> Result<()> {
         Technology::ONT => StreamDataType::OntFastq,
     };
     let base_buffer_size = compute_base_buffer_size(available_ram, max_cores, sdt);
+
+    let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
-    let run_config = RunConfig { cwd: dir, ram_temp_dir, args, thread_pool, maximal_semaphore, base_buffer_size};
+    let run_config = RunConfig {
+        cwd: dir,
+        ram_temp_dir,
+        out_dir,
+        args,
+        thread_pool,
+        maximal_semaphore,
+        base_buffer_size
+    };
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(&run_config).await,
@@ -74,18 +84,53 @@ async fn main() -> Result<()> {
 async fn consensus_genome_run(run_config: &RunConfig) -> Result<()> {
     consensus_genome::run(run_config).await
 }
+
 async fn create_db_run(run_config: &RunConfig) -> Result<()> {
     db::create_db(run_config).await
 }
 
-
-//*****************
-// Setup functions
+/// Sets up output directory
+/// If `out_dir` is specified from args, uses it;
+/// otherwise, creates a directory named `<sample_base>_YYYYMMDD`.
+/// Ensures the directory exists.
+///
+/// # Arguments
+/// * `args` - The arsed command-line arguments.
+/// * `cwd` - The current working directory.
+/// # Returns
+/// path to the output directory.
+fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBuf> {
+    let out_dir = match &args.out_dir {
+        Some(out) => {
+            let path = PathBuf::from(out);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        }
+        None => {
+            let file1_path = args.file1.as_ref().ok_or_else(|| anyhow::anyhow!("File1 path required"))?;
+            let sample_base_buf = PathBuf::from(file1_path);
+            let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
+            let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .map(|secs| {
+                    let dt = chrono::NaiveDateTime::from_timestamp_opt(secs as i64, 0).unwrap();
+                    dt.format("%Y%m%d").to_string()
+                })
+                .unwrap_or_else(|_| "19700101".to_string());
+            cwd.join(format!("{}_{}", no_ext_sample_base, timestamp))
+        }
+    };
+    fs::create_dir_all(&out_dir)?;
+    Ok(out_dir)
+}
 
 /// Searches for a directory for RAM temp files.
 /// Prefers /dev/shm (RAM disk) for linux, otherwise returns the standard temp dir.
-/// # Arguments
-///
 ///
 /// # Returns
 /// PathBuf: temp dir for RAM files.
@@ -111,7 +156,6 @@ fn get_ram_temp_dir() -> PathBuf {
     }
 }
 
-
 /// Creates a pool of threads for running sub-processes.
 ///
 /// # Arguments
@@ -125,7 +169,6 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .build()
         .expect("Failed to create thread pool")
 }
-
 
 fn compute_base_buffer_size(available_ram: u64, num_cores: usize, data_type: StreamDataType) -> usize {
     let record_size = match data_type {

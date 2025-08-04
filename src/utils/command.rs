@@ -90,6 +90,13 @@ mod fastp {
             args_vec.push("--interleaved_in".to_string());
             args_vec.push("-q".to_string());
             args_vec.push(args.quality.to_string());
+
+            let json_out = run_config.out_dir.join("fastp.json");
+            args_vec.push("-j".to_string());
+            args_vec.push(json_out.as_os_str().to_str().unwrap().to_string());
+            let html_out = run_config.out_dir.join("fastp.html");
+            args_vec.push("-h".to_string());
+            args_vec.push(html_out.as_os_str().to_str().unwrap().to_string());
             args_vec.push("-w".to_string());
             args_vec.push(RunConfig::thread_allocation(run_config, FASTP_TAG, None).to_string());
 
@@ -577,7 +584,9 @@ pub mod quast {
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
             args_vec.push("-o".to_string());
-            args_vec.push("quast".to_string());
+
+            let quast_out = run_config.out_dir.join("quast");
+            args_vec.push(quast_out.as_os_str().to_str().unwrap().to_string());
             args_vec.push("-r".to_string());
             args_vec.push(config.ref_fasta.to_string());
             args_vec.push("--ref-bam".to_string());

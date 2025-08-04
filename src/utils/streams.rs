@@ -859,6 +859,7 @@ mod tests {
         Arc::new(RunConfig {
             cwd: PathBuf::from("."),
             ram_temp_dir: std::env::temp_dir(),
+            out_dir: PathBuf::from("test"),
             args,
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
