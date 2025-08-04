@@ -71,6 +71,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", config.args.module);
 
+    if config.args.ref_taxid == None {
+        return Err(anyhow!("The ref_taxid argument must be set for this pipeline. Consult https://www.ncbi.nlm.nih.gov/taxonomy for the taxid you need."));
+    }
+
     let cwd = config.cwd.clone();
     let ram_temp_dir = config.ram_temp_dir.clone();
     let out_dir = config.out_dir.clone();
@@ -656,7 +660,10 @@ pub async fn run(config: &RunConfig) -> Result<()> {
 
                 let kraken2_classified_stream = TokioFile::open(&kraken2_classified_pipe_path).await?;
                 let parse_rx = parse_fastq(kraken2_classified_stream, config.base_buffer_size).await?;
-                let filter_fn = |id: &str| id.contains("kraken:taxid|2697049");
+
+                let taxid = config.args.ref_taxid.as_ref().expect("ref_taxid should be Some");
+                let pattern = format!("kraken:taxid|{}", taxid);
+                let filter_fn = move |id: &str| id.contains(&pattern);
 
                 let (filtered_rx, filter_task) = parse_and_filter_fastq_id(parse_rx, config.base_buffer_size, filter_fn.clone());
                 cleanup_tasks.push(filter_task);

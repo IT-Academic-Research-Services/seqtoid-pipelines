@@ -69,6 +69,9 @@ pub struct Arguments {
     #[arg(long)] // For target aligning
     pub ref_sequence : Option<String>,
 
+    #[arg(long)]
+    pub ref_taxid : Option<String>,
+
     #[arg(short = 'd', long = "db")]
     pub ref_db : Option<String>,
 
