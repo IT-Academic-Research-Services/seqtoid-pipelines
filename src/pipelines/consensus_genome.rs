@@ -1696,6 +1696,29 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         host_ref_fasta_path,
         no_host_file_path,
     ).await?;
+
+    // Counting stats for the host-removed reads
+    let stats_seqkit_config_stats = SeqkitConfig {
+        subcommand: SeqkitSubcommand::Stats,
+        subcommand_fields: HashMap::from([]),
+    };
+    let stats_seqkit_args_stats = generate_cli(
+        SEQKIT_TAG,
+        &config,
+        Some(&stats_seqkit_config_stats),
+    )?;
+    let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
+    let (mut no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(config.clone(), no_host_seqkit_out_stream_stats, SEQKIT_TAG, stats_seqkit_args_stats, StreamDataType::JustBytes, config.args.verbose).await?;
+    let no_host_seqkit_out_stream_stats = parse_child_output(
+        &mut no_host_seqkit_child_stats,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        config.base_buffer_size / 2,
+    ).await?;
+    stats_tasks.push(no_host_seqkit_task_stats);
+    cleanup_tasks.push(no_host_seqkit_err_task_stats);
+
+
     //
     // let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
     //
