@@ -250,7 +250,7 @@ async fn align_to_host(
     input_stream: ReceiverStream<ParseOutput>,
     host_ref_path: PathBuf,
     no_host_file_path: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -420,18 +420,7 @@ async fn align_to_host(
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, no_host_file_path));
     cleanup_tasks.push(pigz_write_task);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver.await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
-
-    Ok((ReceiverStream::new(no_host_output_stream), ReceiverStream::new(no_host_count_stream)))
+    Ok((ReceiverStream::new(no_host_output_stream), ReceiverStream::new(no_host_count_stream), cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -1681,12 +1670,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     );
 
     //
-    let (no_host_output_stream, no_host_seqkit_out_stream_stats) = align_to_host(
+    let (no_host_output_stream, no_host_seqkit_out_stream_stats, no_host_cleanup_tasks, no_host_cleanup_receivers) = align_to_host(
         config.clone(),
         val_fastp_out_stream,
         host_ref_fasta_path,
         no_host_file_path,
     ).await?;
+    cleanup_tasks.extend(no_host_cleanup_tasks);
+    cleanup_receivers.extend(no_host_cleanup_receivers);
 
     // Counting stats for the host-removed reads
     let stats_seqkit_config_stats = SeqkitConfig {
