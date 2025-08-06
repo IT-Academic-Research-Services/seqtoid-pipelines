@@ -77,7 +77,7 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
 
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
@@ -189,18 +189,7 @@ async fn validate_input(
         })?;
     let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver.await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
-
-    Ok(val_fastp_out_stream)
+    Ok((val_fastp_out_stream, cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -1649,13 +1638,15 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
 
     // Input Validation
-    let val_fastp_out_stream = validate_input(
+    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
         sample_base_buf.clone(),
         &out_dir,
     ).await?;
+    cleanup_tasks.extend(validate_cleanup_tasks);
+    cleanup_receivers.extend(validate_cleanup_receivers);
 
     // Retrieve Index: if ref_db is None will return a None quickly
     let index_start = Instant::now();
@@ -1740,6 +1731,16 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             temp_files.push(target_ref_temp);
 
 
+            // ERCC
+            let (ercc_bypass_stream, ercc_stats_stream_option) = process_ercc(
+                config.clone(),
+                no_host_output_stream,
+                ercc_path,
+                &out_dir,
+                &no_ext_sample_base,
+            ).await?;
+
+
         }
 
         Technology::ONT => {
@@ -1748,15 +1749,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
 
 
-    //
-    // // ERCC
-    // let (ercc_bypass_stream, ercc_stats_stream_option) = process_ercc(
-    //     config.clone(),
-    //     no_host_output_stream,
-    //     ercc_path,
-    //     &out_dir,
-    //     &no_ext_sample_base,
-    // ).await?;
+
     //
     // if let Some(ercc_stats_stream) = ercc_stats_stream_option {
     //     let (line_stream, line_task) = bytes_to_lines(ercc_stats_stream.into_inner(), config.base_buffer_size / 2).await
