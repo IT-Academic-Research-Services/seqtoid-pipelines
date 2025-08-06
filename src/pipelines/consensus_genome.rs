@@ -187,9 +187,9 @@ async fn validate_input(
             tool: FASTP_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
+    // let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
 
-    Ok((val_fastp_out_stream, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -430,7 +430,7 @@ async fn process_ercc(
     ercc_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
-) -> Result<(ReceiverStream<ParseOutput>, Option<ReceiverStream<ParseOutput>>), PipelineError> {
+) ->  Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let ercc_bam_path = file_path_manipulator(
         &PathBuf::from(no_ext_sample_base),
         Some(out_dir),
@@ -608,18 +608,7 @@ async fn process_ercc(
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, ercc_bam_path));
     cleanup_tasks.push(pigz_write_task);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver.await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
-
-    Ok((ReceiverStream::new(ercc_bypass_stream), Some(ReceiverStream::new(ercc_stats_stream))))
+    Ok((ReceiverStream::new(ercc_bypass_stream), ReceiverStream::new(ercc_stats_stream), cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -1723,14 +1712,15 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // ERCC
-            let (ercc_bypass_stream, ercc_stats_stream_option) = process_ercc(
+            let (ercc_bypass_stream, ercc_stats_stream, ercc_cleanup_tasks, ercc_cleanup_receivers) = process_ercc(
                 config.clone(),
                 no_host_output_stream,
                 ercc_path,
                 &out_dir,
                 &no_ext_sample_base,
             ).await?;
-
+            cleanup_tasks.extend(ercc_cleanup_tasks);
+            cleanup_receivers.extend(ercc_cleanup_receivers);
 
         }
 
@@ -1826,6 +1816,13 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     // ).await?;
     //
     // // Calculate Statistics
+
+    let results = try_join_all(stats_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+
     // calculate_statistics(
     //     config.clone(),
     //     &no_ext_sample_base,
