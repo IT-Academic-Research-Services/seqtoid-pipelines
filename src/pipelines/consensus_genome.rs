@@ -204,17 +204,17 @@ async fn validate_input(
 }
 
 
-async fn fetch_host_reference(
+async fn fetch_host_reference<'a>(
     config: &RunConfig,
     ref_db_path: Option<PathBuf>,
     ram_temp_dir: &PathBuf,
-    h5_index: Option<FxHashMap<[u8; 24], u64>>,
+    h5_index: Option<&'a FxHashMap<[u8; 24], u64>>,
 ) -> Result<(PathBuf, NamedTempFile,JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
     let (_host_accession, host_seq) = retrieve_h5_seq(
         config.args.host_accession.clone(),
         config.args.host_sequence.clone(),
         ref_db_path.as_ref(),
-        h5_index.as_ref(),
+        h5_index,
     )
         .await
         .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
@@ -230,18 +230,18 @@ async fn fetch_host_reference(
     Ok((host_ref_fasta_path, host_ref_temp, host_ref_write_task))
 }
 
-async fn fetch_target_reference(
+async fn fetch_target_reference<'a>(
     config: &RunConfig,
     ref_db_path: Option<PathBuf>,
     ram_temp_dir: &PathBuf,
-    h5_index: Option<FxHashMap<[u8; 24], u64>>
+    h5_index: Option<&'a FxHashMap<[u8; 24], u64>>,
 ) -> Result<(PathBuf, NamedTempFile,JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
 
     let (_target_accession, target_seq) = retrieve_h5_seq(
         config.args.ref_accession.clone(),
         config.args.ref_sequence.clone(),
         ref_db_path.as_ref(),
-        h5_index.as_ref(),
+        h5_index,
     )
         .await
         .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
@@ -1666,19 +1666,19 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
     }
 
-    // Fetch reference
+    // Fetch host reference
     let (host_ref_fasta_path, host_ref_temp, host_ref_write_task) = fetch_host_reference(
         &*config,
-        ref_db_path,
+        ref_db_path.clone(),
         &ram_temp_dir,
-        h5_index
+        h5_index.as_ref()
     ).await?;
     host_ref_write_task
         .await
         .map_err(|e| PipelineError::Other(e.into()))?
         .map_err(|e| PipelineError::Other(e))?;
-
     temp_files.push(host_ref_temp);
+
 
     // Host Removal
     let no_host_file_path = file_path_manipulator(
@@ -1724,6 +1724,22 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
+
+
+            // Fetch target reference
+            let (target_ref_fasta_path, target_ref_temp, target_ref_write_task) = fetch_target_reference(
+                &*config,
+                ref_db_path.clone(),
+                &ram_temp_dir,
+                h5_index.as_ref()
+            ).await?;
+            target_ref_write_task
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?
+                .map_err(|e| PipelineError::Other(e))?;
+            temp_files.push(target_ref_temp);
+
+
         }
 
         Technology::ONT => {
@@ -1731,8 +1747,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         }
     }
 
-        //
-    // let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
+
     //
     // // ERCC
     // let (ercc_bypass_stream, ercc_stats_stream_option) = process_ercc(
