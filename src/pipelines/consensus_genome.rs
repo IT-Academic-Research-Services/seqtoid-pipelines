@@ -1719,7 +1719,19 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
 
 
-    //
+    //*****************
+    // Split by Technology
+    match technology {
+        Technology::Illumina => {
+            eprintln!("Technology: Illumina");
+        }
+
+        Technology::ONT => {
+            eprintln!("Technology: ONT not ready");
+        }
+    }
+
+        //
     // let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
     //
     // // ERCC
