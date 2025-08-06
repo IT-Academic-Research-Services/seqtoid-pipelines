@@ -1722,6 +1722,15 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_tasks.extend(ercc_cleanup_tasks);
             cleanup_receivers.extend(ercc_cleanup_receivers);
 
+
+            let (line_stream, line_task) = bytes_to_lines(ercc_stats_stream.into_inner(), config.base_buffer_size / 2).await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            stats_tasks.push(line_task);
+
+            ercc_stats_task = Some(tokio::spawn(async move {
+                parse_ercc_stats(line_stream).await
+            }));
+
         }
 
         Technology::ONT => {
@@ -1731,15 +1740,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
 
-    //
-    // if let Some(ercc_stats_stream) = ercc_stats_stream_option {
-    //     let (line_stream, line_task) = bytes_to_lines(ercc_stats_stream.into_inner(), config.base_buffer_size / 2).await
-    //         .map_err(|e| PipelineError::Other(e.into()))?;
-    //     stats_tasks.push(line_task);
-    //
-    //     ercc_stats_task = Some(tokio::spawn(async move {
-    //         parse_ercc_stats(line_stream).await
-    //     }));
+
     // }
     //
     // // Filter Reads
