@@ -1,3 +1,4 @@
+use std::io;
 use std::fs::File;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -8,6 +9,7 @@ use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
 use crate::cli::Technology;
 use std::process::Command;
+use tokio::task::JoinHandle;
 use std::time::Instant;
 use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,13 +19,13 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
-use crate::config::defs::{StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
+use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
@@ -67,7 +69,1762 @@ struct Stats {
     coverage: Vec<(usize, f64, f64, u8, u8)>,
 }
 
-pub async fn run(config: &RunConfig) -> Result<()> {
+
+async fn validate_input(
+    config: Arc<RunConfig>,
+    file1_path: PathBuf,
+    file2_path: Option<PathBuf>,
+    sample_base_buf: PathBuf,
+    out_dir: &PathBuf,
+) -> Result<(String, ReceiverStream<ParseOutput>), PipelineError> {
+    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
+    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+
+    let validated_interleaved_file_path = file_path_manipulator(
+        &PathBuf::from(&sample_base_buf),
+        Some(out_dir),
+        None,
+        Some("validated"),
+        "_",
+    );
+
+    let rx = read_and_interleave_sequences(
+        file1_path,
+        file2_path,
+        Some(config.args.technology.clone()),
+        config.args.max_reads,
+        config.args.min_read_len,
+        config.args.max_read_len,
+    )
+        .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+
+    let val_rx_stream = ReceiverStream::new(rx);
+    let (val_streams, val_done_rx) = t_junction(
+        val_rx_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if val_streams.is_empty() {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = vec![val_done_rx];
+    let mut streams_iter = val_streams.into_iter();
+    let val_fastp_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_pigz_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        val_pigz_stream,
+        PIGZ_TAG,
+        val_pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(val_pigz_stream_task);
+    cleanup_tasks.push(val_pigz_err_task);
+
+    let val_pigz_out_stream = parse_child_output(
+        &mut val_pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let val_pigz_write_task = tokio::spawn(stream_to_file(val_pigz_out_stream, validated_interleaved_file_path));
+    cleanup_tasks.push(val_pigz_write_task);
+
+    let val_fastp_args = generate_cli(FASTP_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(
+        config.clone(),
+        val_fastp_stream,
+        FASTP_TAG,
+        val_fastp_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(val_fastp_stream_task);
+    cleanup_tasks.push(val_fastp_err_task);
+
+    let val_fastp_out_stream = parse_child_output(
+        &mut val_fastp_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok((no_ext_sample_base, val_fastp_out_stream))
+}
+
+
+
+
+async fn fetch_reference(
+    config: &RunConfig,
+    ref_db_path: Option<PathBuf>,
+    ram_temp_dir: &PathBuf,
+) -> Result<(PathBuf, Vec<u8>, PathBuf, Vec<u8>), PipelineError> {
+    let index_start = Instant::now();
+    let h5_index = get_index(&config.args)
+        .await
+        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
+    println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
+
+    let (_host_accession, host_seq) = retrieve_h5_seq(
+        config.args.host_accession.clone(),
+        config.args.host_sequence.clone(),
+        ref_db_path.as_ref(),
+        h5_index.as_ref(),
+    )
+        .await
+        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
+
+    let host_ref_temp = NamedTempFile::new_in(ram_temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
+    let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.base_buffer_size)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    host_ref_write_task.await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let (_target_accession, target_seq) = retrieve_h5_seq(
+        config.args.ref_accession.clone(),
+        config.args.ref_sequence.clone(),
+        ref_db_path.as_ref(),
+        h5_index.as_ref(),
+    )
+        .await
+        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
+
+    let target_ref_temp = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let target_ref_fasta_path = target_ref_temp.path().to_path_buf();
+    let target_ref_write_task = write_vecu8_to_file(target_seq.clone(), &target_ref_fasta_path, config.base_buffer_size)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    target_ref_write_task.await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    Ok((host_ref_fasta_path, host_seq, target_ref_fasta_path, target_seq))
+}
+
+
+
+async fn align_to_host(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    host_ref_path: PathBuf,
+    no_host_file_path: PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>), PipelineError> {
+    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let mut cleanup_tasks = vec![host_query_write_task];
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_ref_path, host_query_pipe_path)))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+        config.clone(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_out_stream = parse_child_output(
+        &mut minimap2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let samtools_config_view = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string()))]),
+    };
+    let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
+        config.clone(),
+        minimap2_out_stream,
+        SAMTOOLS_TAG,
+        samtools_args_view,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_task_view);
+    cleanup_tasks.push(samtools_err_task_view);
+
+    let samtools_out_stream_view = parse_child_output(
+        &mut samtools_child_view,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let samtools_config_fastq = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
+    };
+    let samtools_args_fastq = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_fastq))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
+        config.clone(),
+        samtools_out_stream_view,
+        SAMTOOLS_TAG,
+        samtools_args_fastq,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_task_fastq);
+    cleanup_tasks.push(samtools_err_task_fastq);
+
+    let samtools_out_stream_fastq = parse_child_output(
+        &mut samtools_child_fastq,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
+
+    let (host_streams, host_done_rx) = t_junction(
+        samtools_out_stream_fastq,
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if host_streams.len() < 3 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![host_done_rx];
+    let mut streams_iter = host_streams.into_iter();
+    let no_host_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let no_host_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let no_host_count_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        no_host_file_stream,
+        PIGZ_TAG,
+        pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(pigz_stream_task);
+    cleanup_tasks.push(pigz_err_task);
+
+    let pigz_out_stream = parse_child_output(
+        &mut pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, no_host_file_path));
+    cleanup_tasks.push(pigz_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok((ReceiverStream::new(no_host_output_stream), ReceiverStream::new(no_host_count_stream)))
+}
+
+
+async fn process_ercc(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    ercc_path: PathBuf,
+    out_dir: &PathBuf,
+    no_ext_sample_base: &str,
+) -> Result<(ReceiverStream<ParseOutput>, Option<ReceiverStream<ParseOutput>>), PipelineError> {
+    let ercc_bam_path = file_path_manipulator(
+        &PathBuf::from(no_ext_sample_base),
+        Some(out_dir),
+        None,
+        Some("ercc.bam"),
+        "_",
+    );
+
+    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let mut cleanup_tasks = vec![ercc_query_write_task];
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(ercc_path, ercc_query_pipe_path)))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+        config.clone(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_out_stream = parse_child_output(
+        &mut minimap2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let samtools_config_view = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([("-F".to_string(), Some("4".to_string()))]),
+    };
+    let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
+        config.clone(),
+        minimap2_out_stream,
+        SAMTOOLS_TAG,
+        samtools_args_view,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_task_view);
+    cleanup_tasks.push(samtools_err_task_view);
+
+    let samtools_out_stream_view = parse_child_output(
+        &mut samtools_child_view,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let samtools_config_fastq = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
+    };
+    let samtools_args_fastq = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_fastq))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
+        config.clone(),
+        samtools_out_stream_view,
+        SAMTOOLS_TAG,
+        samtools_args_fastq,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_task_fastq);
+    cleanup_tasks.push(samtools_err_task_fastq);
+
+    let samtools_out_stream_fastq = parse_child_output(
+        &mut samtools_child_fastq,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
+
+    let (ercc_streams, ercc_done_rx) = t_junction(
+        samtools_out_stream_fastq,
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if ercc_streams.len() < 3 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![ercc_done_rx];
+    let mut streams_iter = ercc_streams.into_iter();
+    let ercc_bypass_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let ercc_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let ercc_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        ercc_file_stream,
+        PIGZ_TAG,
+        pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(pigz_stream_task);
+    cleanup_tasks.push(pigz_err_task);
+
+    let pigz_out_stream = parse_child_output(
+        &mut pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, ercc_bam_path));
+    cleanup_tasks.push(pigz_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok((ReceiverStream::new(ercc_bypass_stream), Some(ReceiverStream::new(ercc_stats_stream))))
+}
+
+
+
+async fn filter_with_kraken(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    target_ref_path: PathBuf,
+    out_dir: &PathBuf,
+    sample_base_buf: &PathBuf,
+    target_taxid: &str,
+) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
+    let kraken2_classified_path = file_path_manipulator(
+        sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("classified.fq"),
+        "_",
+    );
+    let kraken2_report_path = file_path_manipulator(
+        sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("kraken2_report.txt"),
+        "_",
+    );
+
+    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let mut cleanup_tasks = vec![kraken_query_write_task];
+
+    let kraken2_config = Kraken2Config {
+        report_path: kraken2_report_path.clone(),
+        classified_path: kraken2_classified_path.clone(),
+        fastq_path: kraken_query_pipe_path.clone(),
+    };
+    let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: KRAKEN2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(
+        config.clone(),
+        KRAKEN2_TAG,
+        kraken2_args,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: KRAKEN2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(kraken2_err_task);
+
+    let kraken2_out_stream = parse_child_output(
+        &mut kraken2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: KRAKEN2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let seqkit_config = SeqkitConfig {
+        subcommand: SeqkitSubcommand::Grep,
+        subcommand_fields: HashMap::from([
+            ("-p".to_string(), Some(target_taxid.to_string())),
+            ("-o".to_string(), Some(kraken2_classified_path.to_string_lossy().into_owned())),
+        ]),
+    };
+    let seqkit_args = generate_cli(SEQKIT_TAG, &config, Some(&seqkit_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SEQKIT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut seqkit_child, seqkit_task, seqkit_err_task) = stream_to_cmd(
+        config.clone(),
+        kraken2_out_stream,
+        SEQKIT_TAG,
+        seqkit_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SEQKIT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(seqkit_task);
+    cleanup_tasks.push(seqkit_err_task);
+
+    let seqkit_out_stream = parse_child_output(
+        &mut seqkit_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SEQKIT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let seqkit_out_stream = ReceiverStream::new(seqkit_out_stream);
+
+    let (kraken_streams, kraken_done_rx) = t_junction(
+        seqkit_out_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if kraken_streams.len() < 2 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![kraken_done_rx];
+    let mut streams_iter = kraken_streams.into_iter();
+    let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        kraken_file_stream,
+        PIGZ_TAG,
+        pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(pigz_stream_task);
+    cleanup_tasks.push(pigz_err_task);
+
+    let pigz_out_stream = parse_child_output(
+        &mut pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, kraken2_classified_path));
+    cleanup_tasks.push(pigz_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok(ReceiverStream::new(kraken_output_stream))
+}
+async fn align_to_target(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    target_ref_path: PathBuf,
+    out_dir: &PathBuf,
+    sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, PathBuf, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let align_fastq_path = file_path_manipulator(
+        sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("target_aligned.fq"),
+        "_",
+    );
+    let align_bam_path = file_path_manipulator(
+        sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("target_aligned.bam"),
+        "_",
+    );
+
+    let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let mut cleanup_tasks = vec![];
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_ref_path, align_query_pipe_path)))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+        config.clone(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_out_stream = parse_child_output(
+        &mut minimap2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let samtools_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([("-o".to_string(), Some(align_bam_path.to_string_lossy().into_owned()))]),
+    };
+    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+        config.clone(),
+        minimap2_out_stream,
+        SAMTOOLS_TAG,
+        samtools_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_sort_task);
+    cleanup_tasks.push(samtools_sort_err_task);
+
+    let samtools_sort_out_stream = parse_child_output(
+        &mut samtools_sort_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let samtools_sort_out_stream = ReceiverStream::new(samtools_sort_out_stream);
+
+    let (bam_streams, bam_done_rx) = t_junction(
+        samtools_sort_out_stream,
+        4, // Increased to 4 streams to include pigz
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if bam_streams.len() < 4 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![bam_done_rx];
+    let mut streams_iter = bam_streams.into_iter();
+    let bam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_depth_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let samtools_index_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Index,
+        subcommand_fields: HashMap::from([("-".to_string(), Some(align_bam_path.to_string_lossy().into_owned()))]),
+    };
+    let samtools_index_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_index_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (samtools_index_child, samtools_index_err_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        samtools_index_args,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_index_err_task);
+
+    let pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        bam_file_stream,
+        PIGZ_TAG,
+        pigz_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(pigz_stream_task);
+    cleanup_tasks.push(pigz_err_task);
+
+    let pigz_out_stream = parse_child_output(
+        &mut pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, align_fastq_path.clone()));
+    cleanup_tasks.push(pigz_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok((
+        ReceiverStream::new(bam_output_stream),
+        ReceiverStream::new(bam_stats_stream),
+        ReceiverStream::new(bam_depth_stream),
+        align_fastq_path,
+        align_bam_path,
+        align_query_write_task,
+    ))
+}
+
+
+async fn generate_consensus(
+    config: Arc<RunConfig>,
+    bam_stream: ReceiverStream<ParseOutput>,
+    out_dir: &PathBuf,
+    sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf), PipelineError> {
+    let consensus_file_path = file_path_manipulator(
+        sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("consensus.fa"),
+        "_",
+    );
+
+    let samtools_consensus_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Consensus,
+        subcommand_fields: HashMap::from([("-o".to_string(), Some(consensus_file_path.to_string_lossy().into_owned()))]),
+    };
+    let samtools_consensus_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_consensus_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_consensus_child, samtools_consensus_task, samtools_consensus_err_task) = stream_to_cmd(
+        config.clone(),
+        bam_stream.into_inner(),
+        SAMTOOLS_TAG,
+        samtools_consensus_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let mut cleanup_tasks = vec![samtools_consensus_task, samtools_consensus_err_task];
+
+    let samtools_consensus_out_stream = parse_child_output(
+        &mut samtools_consensus_child,
+        ChildStream::Stdout,
+        ParseMode::Fasta,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let samtools_consensus_out_stream = ReceiverStream::new(samtools_consensus_out_stream);
+
+    let (consensus_streams, consensus_done_rx) = t_junction(
+        samtools_consensus_out_stream,
+        3, // Increased to 3 streams
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if consensus_streams.len() < 3 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![consensus_done_rx];
+    let mut streams_iter = consensus_streams.into_iter();
+    let consensus_realign_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let consensus_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let consensus_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let consensus_write_task = tokio::spawn(stream_to_file(
+        consensus_file_stream,
+        consensus_file_path.clone(),
+    ));
+    cleanup_tasks.push(consensus_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok((
+        ReceiverStream::new(consensus_realign_stream),
+        ReceiverStream::new(consensus_stats_stream),
+        consensus_file_path,
+    ))
+}
+
+
+async fn call_variants(
+    config: Arc<RunConfig>,
+    bam_stream: ReceiverStream<ParseOutput>,
+    target_ref_path: PathBuf,
+    out_dir: &PathBuf,
+    sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, PathBuf), PipelineError> {
+    let vcf_file_path = file_path_manipulator(
+        sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("variants.vcf"),
+        "_",
+    );
+
+    let bcftools_mpileup_config = BcftoolsConfig {
+        subcommand: BcftoolsSubcommand::Mpileup,
+        subcommand_fields: HashMap::from([("-f".to_string(), Some(target_ref_path.to_string_lossy().into_owned()))]),
+    };
+    let bcftools_mpileup_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_mpileup_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut bcftools_mpileup_child, bcftools_mpileup_task, bcftools_mpileup_err_task) = stream_to_cmd(
+        config.clone(),
+        bam_stream.into_inner(),
+        BCFTOOLS_TAG,
+        bcftools_mpileup_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let mut cleanup_tasks = vec![bcftools_mpileup_task, bcftools_mpileup_err_task];
+
+    let bcftools_mpileup_out_stream = parse_child_output(
+        &mut bcftools_mpileup_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let bcftools_call_config = BcftoolsConfig {
+        subcommand: BcftoolsSubcommand::Call,
+        subcommand_fields: HashMap::from([("-o".to_string(), Some(vcf_file_path.to_string_lossy().into_owned()))]),
+    };
+    let bcftools_call_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_call_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut bcftools_call_child, bcftools_call_task, bcftools_call_err_task) = stream_to_cmd(
+        config.clone(),
+        bcftools_mpileup_out_stream,
+        BCFTOOLS_TAG,
+        bcftools_call_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(bcftools_call_task);
+    cleanup_tasks.push(bcftools_call_err_task);
+
+    let bcftools_call_out_stream = parse_child_output(
+        &mut bcftools_call_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let bcftools_call_out_stream = ReceiverStream::new(bcftools_call_out_stream);
+
+    let (vcf_streams, vcf_done_rx) = t_junction(
+        bcftools_call_out_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if vcf_streams.len() < 2 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![vcf_done_rx];
+    let mut streams_iter = vcf_streams.into_iter();
+    let vcf_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let vcf_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let vcf_write_task = tokio::spawn(stream_to_file(
+        vcf_file_stream,
+        vcf_file_path.clone(),
+    ));
+    cleanup_tasks.push(vcf_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok((ReceiverStream::new(vcf_output_stream), vcf_file_path))
+}
+
+
+async fn realign_consensus_to_ref(
+    config: Arc<RunConfig>,
+    consensus_realign_stream: mpsc::Receiver<ParseOutput>,
+    target_ref_fasta_path: PathBuf,
+    out_dir: &PathBuf,
+    no_ext_sample_base_buf: &PathBuf,
+) -> Result<(), PipelineError> {
+    let reference_file = TokioFile::open(&target_ref_fasta_path).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let reference_rx = parse_bytes(reference_file, config.base_buffer_size).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let realign_streams = vec![consensus_realign_stream, reference_rx];
+    let (combined_rx, combined_task) = y_junction(realign_streams, config.base_buffer_size).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let realign_consensus_path = file_path_manipulator(
+        no_ext_sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("consensus_realigned.fa"),
+        "_"
+    );
+    let realign_mafft_args = generate_cli(MAFFT_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAFFT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (
+        mut realign_consensus_mafft_child,
+        realign_consensus_mafft_task,
+        realign_consensus_mafft_err_task
+    ) = stream_to_cmd(config.clone(),
+                      combined_rx,
+                      MAFFT_TAG,
+                      realign_mafft_args,
+                      StreamDataType::JustBytes,
+                      config.args.verbose
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAFFT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let mut cleanup_tasks = vec![combined_task, realign_consensus_mafft_task, realign_consensus_mafft_err_task];
+
+    let consensus_samtools_out_stream = parse_child_output(
+        &mut realign_consensus_mafft_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAFFT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let realign_consensus_write_task = tokio::spawn(stream_to_file(
+        consensus_samtools_out_stream,
+        realign_consensus_path,
+    ));
+    cleanup_tasks.push(realign_consensus_write_task);
+
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok(())
+}
+
+
+async fn calculate_statistics(
+    config: Arc<RunConfig>,
+    no_ext_sample_base: &str,
+    consensus_bam_stats_stream: Option<Receiver<ParseOutput>>,
+    consensus_bam_depth_stream: Option<Receiver<ParseOutput>>,
+    no_host_seqkit_out_stream_stats: Receiver<ParseOutput>,
+    ercc_stats_task: Option<tokio::task::JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
+    consensus_stats_stream: Option<Receiver<ParseOutput>>,
+    call_bcftools_stats_stream: Option<Receiver<ParseOutput>>,
+    out_dir: &PathBuf,
+    technology: Technology,
+) -> Result<(), PipelineError> {
+
+    let mut stats_tasks = Vec::new();
+
+    let samtools_stats_out = if let Some(stream) = consensus_bam_stats_stream {
+        let stats_samtools_config_stats = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Stats,
+            subcommand_fields: HashMap::from([("-".to_string(), None)]),
+        };
+        let stats_samtools_args_stats = generate_cli(SAMTOOLS_TAG, &config, Some(&stats_samtools_config_stats))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+        let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(
+            config.clone(),
+            stream,
+            SAMTOOLS_TAG,
+            stats_samtools_args_stats,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+        stats_tasks.push(stats_samtools_task_stats);
+        stats_tasks.push(stats_samtools_err_task_stats);
+        parse_child_output(&mut stats_samtools_child_stats, ChildStream::Stdout, ParseMode::Lines, config.base_buffer_size / 2)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?
+    } else {
+        return Err(PipelineError::EmptyStream);
+    };
+    let samtools_stats_out = parse_samtools_stats(samtools_stats_out)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let depth_samtools_out_stream = if let Some(stream) = consensus_bam_depth_stream {
+        let depth_samtools_config = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Depth,
+            subcommand_fields: HashMap::from([
+                ("-aa".to_string(), None),
+                ("-d".to_string(), Some("0".to_string())),
+                ("-".to_string(), None),
+            ]),
+        };
+        let depth_samtools_args = generate_cli(SAMTOOLS_TAG, &config, Some(&depth_samtools_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+        let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(
+            config.clone(),
+            stream,
+            SAMTOOLS_TAG,
+            depth_samtools_args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+        stats_tasks.push(depth_samtools_task);
+        stats_tasks.push(depth_samtools_err_task);
+        parse_child_output(
+            &mut depth_samtools_child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size / 2,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?
+    } else {
+        return Err(PipelineError::EmptyStream);
+    };
+
+    let depth_map = parse_samtools_depth(depth_samtools_out_stream)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    if depth_map.is_empty() {
+        return Err(PipelineError::EmptyStream);
+    }
+    let first_chr = depth_map
+        .keys()
+        .next()
+        .ok_or_else(|| PipelineError::Other(anyhow!("No chromosomes found")))?.clone();
+    let first_chr_depth_map = depth_map.get(&first_chr).unwrap();
+    let depths: Vec<u32> = first_chr_depth_map.values().copied().collect();
+    let samtools_depth_stats = compute_depth_stats(&depths)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let depth_plot_path = file_path_manipulator(
+        &PathBuf::from(no_ext_sample_base),
+        Some(out_dir),
+        None,
+        Some("depth.png"),
+        "_",
+    );
+
+    plot_depths(&first_chr_depth_map, no_ext_sample_base, &depth_plot_path)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let ercc_stats = if let Technology::Illumina = technology {
+        if let Some(task) = ercc_stats_task {
+            match task.await {
+                Ok(Ok(stats)) => stats,
+                Ok(Err(e)) => return Err(PipelineError::Other(anyhow!("Failed to parse ERCC stats: {}", e))),
+                Err(e) => return Err(PipelineError::Other(anyhow!("ERCC stats task failed: {}", e))),
+            }
+        } else {
+            return Err(PipelineError::Other(anyhow!("ERCC stats task not initialized for Illumina technology")));
+        }
+    } else {
+        HashMap::new() // Empty stats for ONT
+    };
+
+    let allele_counts = if let Some(stream) = consensus_stats_stream {
+        compute_allele_counts(stream)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?
+    } else {
+        HashMap::new()
+    };
+
+    let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
+        parse_vcf_stream(stream)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?
+    } else {
+        (0, 0, 0)
+    };
+
+    let n_actg = allele_counts.iter().filter(|&(k, _)| "ACTGU".contains(*k)).map(|(_, &v)| v).sum::<u64>();
+    let n_missing = allele_counts.get(&'N').copied().unwrap_or(0);
+    let n_gap = allele_counts.get(&'-').copied().unwrap_or(0);
+    let n_ambiguous = allele_counts.iter().filter(|&(k, _)| !"ACTGUN-".contains(*k)).map(|(_, &v)| v).sum::<u64>();
+
+    let coverage_breadth = if !depths.is_empty() { depths.iter().filter(|&&d| d > 0).count() as f64 / depths.len() as f64 } else { 0.0 };
+    let max_aligned_length = depths.len();
+    let total_length = depths.len();
+    let (coverage_bin_size, coverage) = if !depths.is_empty() { compute_coverage_bins(&depths, 500) } else { (0.0, Vec::new()) };
+
+    let stats = Stats {
+        sample_name: no_ext_sample_base.to_string(),
+        depth_avg: samtools_depth_stats.get("depth_avg").copied().unwrap_or(0.0),
+        depth_q25: samtools_depth_stats.get("depth_q.25").copied().unwrap_or(0.0),
+        depth_q50: samtools_depth_stats.get("depth_q.5").copied().unwrap_or(0.0),
+        depth_q75: samtools_depth_stats.get("depth_q.75").copied().unwrap_or(0.0),
+        depth_frac_above_10x: samtools_depth_stats.get("depth_frac_above_10x").copied().unwrap_or(0.0),
+        depth_frac_above_25x: samtools_depth_stats.get("depth_frac_above_25x").copied().unwrap_or(0.0),
+        depth_frac_above_50x: samtools_depth_stats.get("depth_frac_above_50x").copied().unwrap_or(0.0),
+        depth_frac_above_100x: samtools_depth_stats.get("depth_frac_above_100x").copied().unwrap_or(0.0),
+        allele_counts,
+        total_reads: seqkit_stats.get("num_seqs").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_reads: samtools_stats_out.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_paired: samtools_stats_out.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
+        paired_inward: samtools_stats_out.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_outward: samtools_stats_out.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_other_orientation: samtools_stats_out.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        ercc_mapped_reads: ercc_stats.get("ercc_mapped_reads").copied(),
+        ercc_mapped_paired: ercc_stats.get("ercc_mapped_paired").copied(),
+        ref_snps,
+        ref_mnps,
+        ref_indels,
+        n_actg,
+        n_missing,
+        n_gap,
+        n_ambiguous,
+        coverage_breadth,
+        max_aligned_length,
+        total_length,
+        coverage_bin_size,
+        coverage,
+    };
+
+    let stats_file_path = out_dir.join(format!("{}_stats.json", no_ext_sample_base));
+    let mut stats_file = File::create(&stats_file_path)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create stats file: {}", e)))?;
+    serde_json::to_writer_pretty(&mut stats_file, &stats)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to serialize stats: {}", e)))?;
+
+    let results = try_join_all(stats_tasks)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+
+    Ok(())
+}
+
+async fn evaluate_assembly(
+    config: Arc<RunConfig>,
+    target_ref_fasta_path: PathBuf,
+    align_bam_path: PathBuf,
+    consensus_file_path: PathBuf,
+) -> Result<(), PipelineError> {
+    let quast_config = QuastConfig {
+        ref_fasta: target_ref_fasta_path.to_string_lossy().into_owned(),
+        ref_bam: align_bam_path.to_string_lossy().into_owned(),
+        assembly_fasta: consensus_file_path.to_string_lossy().into_owned(),
+    };
+
+    let assembly_eval_quast_args = generate_cli(
+        QUAST_TAG,
+        &*config,
+        Some(&quast_config),
+    ).map_err(|e| PipelineError::ToolExecution {
+        tool: QUAST_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+
+    let (_, assembly_eval_quast_err_task) = spawn_cmd(
+        config.clone(),
+        QUAST_TAG,
+        assembly_eval_quast_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: QUAST_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+
+    assembly_eval_quast_err_task.await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+    Ok(())
+}
+
+
+
+
+
+pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+    let ram_temp_dir = config.ram_temp_dir.clone();
+    let out_dir = config.out_dir.clone();
+    let mut temp_files: Vec<NamedTempFile>  = Vec::new();
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let mut quast_write_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut stats_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
+
+    // External tools check
+    check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG]).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // Arguments and files check
+    let file1_path: PathBuf = match &config.args.file1 {
+        Some(file) => {
+            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
+            if file1_full_path.exists() {
+                file1_full_path
+            } else {
+                return Err(PipelineError::FileNotFound(file1_full_path));
+            }
+        }
+        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
+    };
+
+    let sample_base: String;
+    let file1_r1r2 = r1r2_base(&file1_path);
+    sample_base = match file1_r1r2.file_name {
+        Some(prefix) => prefix,
+        None => {
+            eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
+            file1_path.to_string_lossy().into_owned()
+        }
+    };
+
+    if !file1_path.exists() {
+        return Err(PipelineError::FileNotFound(file1_path));
+    }
+
+    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
+    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
+    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+
+    let file2_path: Option<PathBuf> = match &config.args.file2 {
+        Some(file) => {
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
+            if file2_full_path.exists() {
+                Some(file2_full_path)
+            } else {
+                eprintln!("File2 path does not exist: {}", file2_full_path.display());
+                None
+            }
+        }
+        None => None,
+    };
+
+    let technology = config.args.technology.clone();
+
+    let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(PathBuf::from);
+
+    let ercc_path = file_path_manipulator(&PathBuf::from(&config.args.ercc_sequences), Some(&cwd), None, None, "");
+    if !ercc_path.exists() {
+        return Err(PipelineError::FileNotFound(ercc_path));
+    }
+
+    // Input Validation
+    let (_, val_fastp_out_stream) = validate_input(
+        config.clone(),
+        file1_path,
+        file2_path,
+        sample_base_buf.clone(),
+        &out_dir,
+    ).await?;
+
+    // // Fetch reference
+    // let (host_ref_fasta_path, _, target_ref_fasta_path, _) = fetch_reference(
+    //     &*config,
+    //     ref_db_path,
+    //     &ram_temp_dir,
+    // ).await?;
+    //
+    // // Host Removal
+    // let no_host_file_path = file_path_manipulator(
+    //     &no_ext_sample_base_buf,
+    //     Some(&out_dir),
+    //     None,
+    //     Some("no_host.fq.gz"),
+    //     "_",
+    // );
+    //
+    // let (no_host_output_stream, no_host_seqkit_out_stream_stats) = align_to_host(
+    //     config.clone(),
+    //     val_fastp_out_stream,
+    //     host_ref_fasta_path,
+    //     no_host_file_path,
+    // ).await?;
+    //
+    // let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
+    //
+    // // ERCC
+    // let (ercc_bypass_stream, ercc_stats_stream_option) = process_ercc(
+    //     config.clone(),
+    //     no_host_output_stream,
+    //     ercc_path,
+    //     &out_dir,
+    //     &no_ext_sample_base,
+    // ).await?;
+    //
+    // if let Some(ercc_stats_stream) = ercc_stats_stream_option {
+    //     let (line_stream, line_task) = bytes_to_lines(ercc_stats_stream.into_inner(), config.base_buffer_size / 2).await
+    //         .map_err(|e| PipelineError::Other(e.into()))?;
+    //     stats_tasks.push(line_task);
+    //
+    //     ercc_stats_task = Some(tokio::spawn(async move {
+    //         parse_ercc_stats(line_stream).await
+    //     }));
+    // }
+    //
+    // // Filter Reads
+    // let filter_reads_out_stream = filter_with_kraken(
+    //     config.clone(),
+    //     ercc_bypass_stream,
+    //     target_ref_fasta_path.clone(),
+    //     &out_dir,
+    //     &sample_base_buf,
+    //     config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
+    // ).await?;
+    //
+    // // Align Reads to Target
+    // let (bam_output_stream, bam_stats_stream_rx, bam_depth_stream_rx, _, align_bam_path, align_query_write_task) = align_to_target(
+    //     config.clone(),
+    //     filter_reads_out_stream,
+    //     target_ref_fasta_path.clone(),
+    //     &out_dir,
+    //     &sample_base_buf,
+    // ).await?;
+    // quast_write_tasks.push(align_query_write_task);
+    //
+    // let bam_stats_stream = bam_stats_stream_rx.into_inner();
+    // let bam_depth_stream = bam_depth_stream_rx.into_inner();
+    //
+    // // Duplicate bam_stats_stream for call_variants and statistics
+    // let (mut bam_stats_streams, bam_stats_done_rx) = t_junction(
+    //     ReceiverStream::new(bam_stats_stream),
+    //     2,
+    //     config.base_buffer_size,
+    //     config.args.stall_threshold,
+    //     Some(config.args.stream_sleep_ms),
+    //     50,
+    //     StreamDataType::JustBytes,
+    // ).await
+    //     .map_err(|_| PipelineError::StreamDataDropped)?;
+    //
+    // cleanup_receivers.push(bam_stats_done_rx);
+    //
+    // let bam_call_rx = bam_stats_streams.remove(0);
+    // let bam_stats_rx = bam_stats_streams.remove(0);
+    //
+    // let bam_call_stream = ReceiverStream::new(bam_call_rx);
+    // let bam_stats_stream = ReceiverStream::new(bam_stats_rx);
+    //
+    // // Make Consensus
+    // let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path) = generate_consensus(
+    //     config.clone(),
+    //     bam_output_stream,
+    //     &out_dir,
+    //     &sample_base_buf,
+    // ).await?;
+    //
+    // let consensus_stats_stream = consensus_stats_stream_rx.into_inner();
+    //
+    // // Call Variants
+    // let (call_bcftools_stats_stream_rx, _) = call_variants(
+    //     config.clone(),
+    //     bam_call_stream,
+    //     target_ref_fasta_path.clone(),
+    //     &out_dir,
+    //     &sample_base_buf,
+    // ).await?;
+    //
+    // let call_bcftools_stats_stream = call_bcftools_stats_stream_rx.into_inner();
+    //
+    // // Realign Consensus to Ref
+    // realign_consensus_to_ref(
+    //     config.clone(),
+    //     consensus_realign_stream.into_inner(),
+    //     target_ref_fasta_path.clone(),
+    //     &out_dir,
+    //     &no_ext_sample_base_buf,
+    // ).await?;
+    //
+    // // Calculate Statistics
+    // calculate_statistics(
+    //     config.clone(),
+    //     &no_ext_sample_base,
+    //     Some(bam_stats_stream.into_inner()),
+    //     Some(bam_depth_stream),
+    //     no_host_seqkit_out_stream_stats,
+    //     ercc_stats_task,
+    //     Some(consensus_stats_stream),
+    //     Some(call_bcftools_stats_stream),
+    //     &out_dir,
+    //     technology,
+    // ).await?;
+    //
+    // // Assembly Evaluation
+    // let results = try_join_all(quast_write_tasks).await
+    //     .map_err(|e| PipelineError::Other(e.into()))?;
+    // for result in results {
+    //     result.map_err(|e| PipelineError::Other(e))?;
+    // }
+    //
+    // evaluate_assembly(
+    //     config,
+    //     target_ref_fasta_path,
+    //     align_bam_path,
+    //     consensus_file_path,
+    // ).await?;
+
+    // Cleanup
+    let results = try_join_all(cleanup_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+    for receiver in cleanup_receivers {
+        receiver.await
+            .map_err(|e| PipelineError::Other(e.into()))?
+            .map_err(|e| PipelineError::Other(e))?;
+    }
+    drop(temp_files);
+
+    println!("Finished generating consensus genome");
+    Ok(())
+}
+
+
+
+pub async fn old_run(config: &RunConfig) -> Result<()> {
     println!("\n-------------\n Consensus Genome\n-------------\n");
     println!("Running consensus genome with module: {}", config.args.module);
 

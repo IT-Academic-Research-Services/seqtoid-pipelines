@@ -18,7 +18,7 @@ use tokio::runtime::Builder;
 use rayon::ThreadPoolBuilder;
 
 use crate::cli::parse;
-use crate::config::defs::{RunConfig, StreamDataType};
+use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
 use crate::utils::file::extension_remover;
 use pipelines::consensus_genome;
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
-    let run_config = RunConfig {
+    let run_config = Arc::new(RunConfig {
         cwd: dir,
         ram_temp_dir,
         out_dir,
@@ -66,12 +66,12 @@ async fn main() -> Result<()> {
         thread_pool,
         maximal_semaphore,
         base_buffer_size
-    };
+    });
 
     if let Err(e) = match module.as_str() {
-        "consensus_genome" => consensus_genome_run(&run_config).await,
+        "consensus_genome" => consensus_genome_run(run_config.clone()).await,
         "create_db" => create_db_run(&run_config).await,
-        _ => Err(anyhow::anyhow!("Invalid module: {}", module)),
+        _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
         eprintln!("Pipeline failed: {}", e);
         std::process::exit(1);
@@ -81,12 +81,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn consensus_genome_run(run_config: &RunConfig) -> Result<()> {
+async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     consensus_genome::run(run_config).await
 }
 
-async fn create_db_run(run_config: &RunConfig) -> Result<()> {
+async fn create_db_run(run_config: &RunConfig) -> Result<(), PipelineError> {
     db::create_db(run_config).await
+        .map_err(|e| PipelineError::Other(e.into()))
 }
 
 /// Sets up output directory
@@ -95,7 +96,7 @@ async fn create_db_run(run_config: &RunConfig) -> Result<()> {
 /// Ensures the directory exists.
 ///
 /// # Arguments
-/// * `args` - The arsed command-line arguments.
+/// * `args` - The parsed command-line arguments.
 /// * `cwd` - The current working directory.
 /// # Returns
 /// path to the output directory.
