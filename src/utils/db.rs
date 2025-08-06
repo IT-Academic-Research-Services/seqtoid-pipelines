@@ -6,7 +6,7 @@ use hdf5_metno::types::{FixedAscii, VarLenArray};
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::fastx::{sequence_reader, SequenceReader, SequenceRecord};
-use fxhash::{FxHashMap as HashMap, FxHashMap};
+use fxhash::{FxHashMap as HashMap};
 use futures::StreamExt;
 use crate::cli::{Arguments, Technology};
 use tokio::fs::File as TokioFile;

@@ -27,6 +27,7 @@ use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
+use fxhash::FxHashMap as FxHashMap;
 use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
@@ -203,19 +204,12 @@ async fn validate_input(
 }
 
 
-
-
-async fn fetch_reference(
+async fn fetch_host_reference(
     config: &RunConfig,
     ref_db_path: Option<PathBuf>,
     ram_temp_dir: &PathBuf,
-) -> Result<(PathBuf, Vec<u8>, PathBuf, Vec<u8>), PipelineError> {
-    let index_start = Instant::now();
-    let h5_index = get_index(&config.args)
-        .await
-        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
-    println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
-
+    h5_index: Option<FxHashMap<[u8; 24], u64>>,
+) -> Result<(PathBuf, NamedTempFile,JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
     let (_host_accession, host_seq) = retrieve_h5_seq(
         config.args.host_accession.clone(),
         config.args.host_sequence.clone(),
@@ -228,11 +222,20 @@ async fn fetch_reference(
     let host_ref_temp = NamedTempFile::new_in(ram_temp_dir)
         .map_err(|e| PipelineError::Other(e.into()))?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
+
     let host_ref_write_task = write_vecu8_to_file(host_seq.clone(), &host_ref_fasta_path, config.base_buffer_size)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
-    host_ref_write_task.await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    Ok((host_ref_fasta_path, host_ref_temp, host_ref_write_task))
+}
+
+async fn fetch_target_reference(
+    config: &RunConfig,
+    ref_db_path: Option<PathBuf>,
+    ram_temp_dir: &PathBuf,
+    h5_index: Option<FxHashMap<[u8; 24], u64>>
+) -> Result<(PathBuf, NamedTempFile,JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
 
     let (_target_accession, target_seq) = retrieve_h5_seq(
         config.args.ref_accession.clone(),
@@ -249,13 +252,9 @@ async fn fetch_reference(
     let target_ref_write_task = write_vecu8_to_file(target_seq.clone(), &target_ref_fasta_path, config.base_buffer_size)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
-    target_ref_write_task.await
-        .map_err(|e| PipelineError::Other(e.into()))?;
 
-    Ok((host_ref_fasta_path, host_seq, target_ref_fasta_path, target_seq))
+    Ok((target_ref_fasta_path, target_ref_temp,  target_ref_write_task))
 }
-
-
 
 async fn align_to_host(
     config: Arc<RunConfig>,
@@ -1658,13 +1657,29 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         &out_dir,
     ).await?;
 
-    // // Fetch reference
-    // let (host_ref_fasta_path, _, target_ref_fasta_path, _) = fetch_reference(
-    //     &*config,
-    //     ref_db_path,
-    //     &ram_temp_dir,
-    // ).await?;
-    //
+    // Retrieve Index: if ref_db is None will return a None quickly
+    let index_start = Instant::now();
+    let h5_index = get_index(&config.args)
+        .await
+        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
+    if h5_index.is_some() {
+        println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
+    }
+
+    // Fetch reference
+    let (host_ref_fasta_path, host_ref_temp, host_ref_write_task) = fetch_host_reference(
+        &*config,
+        ref_db_path,
+        &ram_temp_dir,
+        h5_index
+    ).await?;
+    host_ref_write_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+    temp_files.push(host_ref_temp);
+
     // // Host Removal
     // let no_host_file_path = file_path_manipulator(
     //     &no_ext_sample_base_buf,
