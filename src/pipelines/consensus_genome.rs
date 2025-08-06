@@ -1680,21 +1680,22 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     temp_files.push(host_ref_temp);
 
-    // // Host Removal
-    // let no_host_file_path = file_path_manipulator(
-    //     &no_ext_sample_base_buf,
-    //     Some(&out_dir),
-    //     None,
-    //     Some("no_host.fq.gz"),
-    //     "_",
-    // );
+    // Host Removal
+    let no_host_file_path = file_path_manipulator(
+        &no_ext_sample_base_buf,
+        Some(&out_dir),
+        None,
+        Some("no_host.fq.gz"),
+        "_",
+    );
+
     //
-    // let (no_host_output_stream, no_host_seqkit_out_stream_stats) = align_to_host(
-    //     config.clone(),
-    //     val_fastp_out_stream,
-    //     host_ref_fasta_path,
-    //     no_host_file_path,
-    // ).await?;
+    let (no_host_output_stream, no_host_seqkit_out_stream_stats) = align_to_host(
+        config.clone(),
+        val_fastp_out_stream,
+        host_ref_fasta_path,
+        no_host_file_path,
+    ).await?;
     //
     // let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
     //
