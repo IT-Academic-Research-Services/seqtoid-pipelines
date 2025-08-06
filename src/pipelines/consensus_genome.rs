@@ -76,9 +76,7 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> Result<(String, ReceiverStream<ParseOutput>), PipelineError> {
-    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
 
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
@@ -201,7 +199,7 @@ async fn validate_input(
             .map_err(|e| PipelineError::Other(e))?;
     }
 
-    Ok((no_ext_sample_base, val_fastp_out_stream))
+    Ok(val_fastp_out_stream)
 }
 
 
@@ -1652,7 +1650,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
 
     // Input Validation
-    let (_, val_fastp_out_stream) = validate_input(
+    let val_fastp_out_stream = validate_input(
         config.clone(),
         file1_path,
         file2_path,
