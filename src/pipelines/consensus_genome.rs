@@ -17,7 +17,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel, SequenceRecord, parse_header};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -651,9 +651,6 @@ async fn process_ercc(
 /// cleanup_tasks
 /// quast_write_tasks
 ///
-
-
-
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -686,6 +683,9 @@ async fn filter_with_kraken(
         "_",
     );
 
+    // Remove existing pipe if exists to avoid errors
+    let _ = tokio::fs::remove_file(&kraken2_pipe_path).await;
+
     // Create named pipe for Kraken2 classified output
     Command::new("mkfifo")
         .arg(&kraken2_pipe_path)
@@ -705,6 +705,7 @@ async fn filter_with_kraken(
         fastq_path: kraken_query_pipe_path.clone(),
     };
     let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))?;
+
     let (mut _kraken2_child, kraken2_err_task) = spawn_cmd(
         config.clone(),
         KRAKEN2_TAG,
@@ -718,49 +719,43 @@ async fn filter_with_kraken(
         })?;
     cleanup_tasks.push(kraken2_err_task);
 
+    // Stream classified FASTQ from named pipe using parse_fastq
     let kraken2_file = tokio::fs::File::open(&kraken2_pipe_path)
         .await
         .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to open named pipe: {}", e)))?;
-    let kraken2_out_rx = parse_fastq(kraken2_file, config.base_buffer_size)
+    let parse_rx = parse_fastq(kraken2_file, config.base_buffer_size)
         .await
         .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to parse FASTQ from named pipe: {}", e)))?;
 
-    let seqkit_config = SeqkitConfig {
-        subcommand: SeqkitSubcommand::Grep,
-        subcommand_fields: HashMap::from([("-p".to_string(), Some(format!("kraken:taxid|{}", target_taxid)))]),
-    };
-    let seqkit_args = generate_cli(SEQKIT_TAG, &config, Some(&seqkit_config))?;
-    let (mut seqkit_child, seqkit_task, seqkit_err_task) = stream_to_cmd(
-        config.clone(),
-        kraken2_out_rx,
-        SEQKIT_TAG,
-        seqkit_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SEQKIT_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(seqkit_task);
-    cleanup_tasks.push(seqkit_err_task);
+    // Filter using parse_and_filter_fastq_id
+    let taxid = target_taxid;
+    let pattern = format!("kraken:taxid|{}", taxid);
+    let filter_fn = move |id: &str| id.contains(&pattern);
+    let (filtered_rx, filter_task) = parse_and_filter_fastq_id(parse_rx, config.base_buffer_size, filter_fn.clone());
+    cleanup_tasks.push(filter_task);
 
-    let seqkit_out_stream = parse_child_output(
-        &mut seqkit_child,
-        ChildStream::Stdout,
-        ParseMode::Fastq, // Parse as FASTQ to ensure SequenceRecord output
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SEQKIT_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    let seqkit_out_stream = ReceiverStream::new(seqkit_out_stream);
+    // Convert SequenceRecord back to ParseOutput::Fastq for downstream compatibility
+    let (parse_output_tx, parse_output_rx) = mpsc::channel(config.base_buffer_size);
+    let conversion_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(filtered_rx);
+        let mut count = 0;
+        while let Some(record) = stream.next().await {
+            validate_sequence(&Arc::new(record.seq().to_vec()), b"ACGTN")
+                .map_err(|e| anyhow::anyhow!("Sequence validation failed at record {}: {}", count + 1, e))?;
+            parse_output_tx.send(ParseOutput::Fastq(record)).await
+                .map_err(|e| anyhow::anyhow!("Failed to send ParseOutput at record {}: {}", count + 1, e))?;
+            count += 1;
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(conversion_task);
 
+
+    let filtered_stream = ReceiverStream::new(parse_output_rx);
+
+    // split stream for output and compression
     let (kraken_streams, kraken_done_rx) = t_junction(
-        seqkit_out_stream,
+        filtered_stream,
         2,
         config.base_buffer_size,
         config.args.stall_threshold,
@@ -780,7 +775,7 @@ async fn filter_with_kraken(
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-
+    // Run pigz to compress filtered output
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
     let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
         config.clone(),
