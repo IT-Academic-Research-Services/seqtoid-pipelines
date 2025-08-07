@@ -828,7 +828,7 @@ async fn filter_with_kraken(
 /// * 'targer_ref_path' -
 ///
 /// # Returns
-/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <--- FASTQ uncompressed
+/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <--- SAM uncompressed
 /// cleanup_tasks
 /// quast_write_tasks
 ///
@@ -1678,15 +1678,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // Align Reads to Target
-            // let (bam_output_stream, align_cleanup_tasks, align_quast_tasks) = align_to_target(
-            //     config.clone(),
-            //     filter_reads_out_stream,
-            //     target_ref_fasta_path.clone(),
-            //
-            // ).await?;
-            // cleanup_tasks.extend(align_cleanup_tasks);
-            // quast_write_tasks.extend(align_quast_tasks);
+            let (sam_output_stream, align_cleanup_tasks, align_quast_tasks) = align_to_target(
+                config.clone(),
+                filter_reads_out_stream,
+                target_ref_fasta_path.clone(),
 
+            ).await?;
+            cleanup_tasks.extend(align_cleanup_tasks);
+            quast_write_tasks.extend(align_quast_tasks);
 
 
 
