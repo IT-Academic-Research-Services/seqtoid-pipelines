@@ -430,16 +430,40 @@ async fn process_ercc(
     ercc_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
-) ->  Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let ercc_bam_path = file_path_manipulator(
+) -> Result<(Receiver<ParseOutput>, Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+    let ercc_stats_file_path = file_path_manipulator(
         &PathBuf::from(no_ext_sample_base),
         Some(out_dir),
         None,
-        Some("ercc.bam"),
+        Some("ercc_stats.txt"),
         "_",
     );
 
-    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+    let (ercc_streams, ercc_done_rx) = t_junction(
+        input_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if ercc_streams.len() < 2 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    let mut cleanup_receivers = vec![ercc_done_rx];
+    let mut streams_iter = ercc_streams.into_iter();
+    let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(
+        ReceiverStream::new(alignment_stream),
+        None,
+    )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     let mut cleanup_tasks = vec![ercc_query_write_task];
@@ -462,7 +486,12 @@ async fn process_ercc(
         })?;
     cleanup_tasks.push(minimap2_err_task);
 
-    let minimap2_out_stream = parse_child_output(
+    // Prepend @HD for valid SAM (handles no-alignments)
+    let (header_tx, minimap2_with_header_rx) = mpsc::channel(config.base_buffer_size);
+    header_tx.send(ParseOutput::Bytes(b"@HD\tVN:1.6\tSO:unknown\n".to_vec())).await
+        .map_err(|e| PipelineError::ToolExecution { tool: MINIMAP2_TAG.to_string(), error: e.to_string() })?;
+
+    let minimap2_raw_out = parse_child_output(
         &mut minimap2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
@@ -474,9 +503,27 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
+    if !minimap2_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
+        return Err(PipelineError::ToolExecution { tool: MINIMAP2_TAG.to_string(), error: "Non-zero exit".to_string() });
+    }
+
+    let forward_task = tokio::spawn(async move {
+        let mut raw_stream = ReceiverStream::new(minimap2_raw_out);
+        while let Some(po) = raw_stream.next().await {
+            if header_tx.send(po).await.is_err() {
+                eprintln!("Downstream receiver dropped during header forward, continuing to drain");
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(forward_task);
+
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([("-F".to_string(), Some("4".to_string()))]),
+        subcommand_fields: HashMap::from([
+            // ("-F".to_string(), Some("4".to_string())), // Mapped only
+            ("--no-PG".to_string(), None),
+        ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
         .map_err(|e| PipelineError::ToolExecution {
@@ -486,7 +533,7 @@ async fn process_ercc(
 
     let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
         config.clone(),
-        minimap2_out_stream,
+        minimap2_with_header_rx,
         SAMTOOLS_TAG,
         samtools_args_view,
         StreamDataType::JustBytes,
@@ -512,21 +559,25 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
-    let samtools_config_fastq = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([("-".to_string(), None)]),
+    if !samtools_child_view.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
+        return Err(PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: "Non-zero exit".to_string() });
+    }
+
+    let stats_samtools_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Stats,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]), // Stdin SAM
     };
-    let samtools_args_fastq = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_fastq))
+    let stats_samtools_args = generate_cli(SAMTOOLS_TAG, &config, Some(&stats_samtools_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
 
-    let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
+    let (mut stats_samtools_child, stats_samtools_task, stats_samtools_err_task) = stream_to_cmd(
         config.clone(),
         samtools_out_stream_view,
         SAMTOOLS_TAG,
-        samtools_args_fastq,
+        stats_samtools_args,
         StreamDataType::JustBytes,
         config.args.verbose,
     )
@@ -535,83 +586,56 @@ async fn process_ercc(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    cleanup_tasks.push(samtools_task_fastq);
-    cleanup_tasks.push(samtools_err_task_fastq);
+    cleanup_tasks.push(stats_samtools_task);
+    cleanup_tasks.push(stats_samtools_err_task);
 
-    let samtools_out_stream_fastq = parse_child_output(
-        &mut samtools_child_fastq,
+    let stats_samtools_out_stream = parse_child_output(
+        &mut stats_samtools_child,
         ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
+        ParseMode::Lines,
+        config.base_buffer_size / 2,
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
 
-    let (ercc_streams, ercc_done_rx) = t_junction(
-        samtools_out_stream_fastq,
-        3,
+    if !stats_samtools_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
+        return Err(PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: "Non-zero exit on ERCC stats".to_string() });
+    }
+
+    let (stats_streams, stats_done_rx) = t_junction(
+        ReceiverStream::new(stats_samtools_out_stream),
+        2,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
         50,
-        StreamDataType::IlluminaFastq,
+        StreamDataType::JustBytes,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if ercc_streams.len() < 3 {
+    if stats_streams.len() < 2 {
         return Err(PipelineError::EmptyStream);
     }
 
-    let mut cleanup_receivers = vec![ercc_done_rx];
-    let mut streams_iter = ercc_streams.into_iter();
-    let ercc_bypass_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let ercc_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let ercc_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    cleanup_receivers.push(stats_done_rx);
+    let mut stats_streams_iter = stats_streams.into_iter();
+    let stats_file_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let stats_parse_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let pigz_args = generate_cli(PIGZ_TAG, &config, None)
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
-        config.clone(),
-        ercc_file_stream,
-        PIGZ_TAG,
-        pigz_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(pigz_stream_task);
-    cleanup_tasks.push(pigz_err_task);
+    let stats_write_task = tokio::spawn(stream_to_file(
+        stats_file_stream,
+        ercc_stats_file_path,
+    ));
+    cleanup_tasks.push(stats_write_task);
 
-    let pigz_out_stream = parse_child_output(
-        &mut pigz_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, ercc_bam_path));
-    cleanup_tasks.push(pigz_write_task);
+    let ercc_stats_task = Some(tokio::spawn(parse_ercc_stats(stats_parse_stream)));
 
-    Ok((ReceiverStream::new(ercc_bypass_stream), ReceiverStream::new(ercc_stats_stream), cleanup_tasks, cleanup_receivers))
+    Ok((bypass_output_stream, ercc_stats_task, cleanup_tasks, cleanup_receivers))
 }
-
-
 
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
@@ -620,7 +644,7 @@ async fn filter_with_kraken(
     out_dir: &PathBuf,
     sample_base_buf: &PathBuf,
     target_taxid: &str,
-) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let kraken2_classified_path = file_path_manipulator(
         sample_base_buf,
         Some(out_dir),
@@ -775,19 +799,10 @@ async fn filter_with_kraken(
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, kraken2_classified_path));
     cleanup_tasks.push(pigz_write_task);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver.await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
-
-    Ok(ReceiverStream::new(kraken_output_stream))
+    Ok((ReceiverStream::new(kraken_output_stream), cleanup_tasks, cleanup_receivers))
 }
+
+
 async fn align_to_target(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -1704,32 +1719,42 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 &ram_temp_dir,
                 h5_index.as_ref()
             ).await?;
-            target_ref_write_task
-                .await
-                .map_err(|e| PipelineError::Other(e.into()))?
-                .map_err(|e| PipelineError::Other(e))?;
-            temp_files.push(target_ref_temp);
 
 
             // ERCC
-            let (ercc_bypass_stream, ercc_stats_stream, ercc_cleanup_tasks, ercc_cleanup_receivers) = process_ercc(
+            let (no_host_ercc_stream, ercc_stats_out_task, mut ercc_cleanup_tasks, mut ercc_cleanup_receivers) = process_ercc(
                 config.clone(),
                 no_host_output_stream,
                 ercc_path,
                 &out_dir,
                 &no_ext_sample_base,
             ).await?;
-            cleanup_tasks.extend(ercc_cleanup_tasks);
-            cleanup_receivers.extend(ercc_cleanup_receivers);
+            ercc_stats_task = ercc_stats_out_task;
+            cleanup_tasks.append(&mut ercc_cleanup_tasks);
+            cleanup_receivers.append(&mut ercc_cleanup_receivers);
 
 
-            let (line_stream, line_task) = bytes_to_lines(ercc_stats_stream.into_inner(), config.base_buffer_size / 2).await
-                .map_err(|e| PipelineError::Other(e.into()))?;
-            stats_tasks.push(line_task);
 
-            ercc_stats_task = Some(tokio::spawn(async move {
-                parse_ercc_stats(line_stream).await
-            }));
+
+            // target_ref_write_task
+            //     .await
+            //     .map_err(|e| PipelineError::Other(e.into()))?
+            //     .map_err(|e| PipelineError::Other(e))?;
+            // temp_files.push(target_ref_temp);
+
+
+            //
+            // // Filter Reads
+            // let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
+            //     config.clone(),
+            //     ercc_bypass_stream,
+            //     target_ref_fasta_path.clone(),
+            //     &out_dir,
+            //     &sample_base_buf,
+            //     config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
+            // ).await?;
+            // cleanup_tasks.extend(filter_reads_cleanup_tasks);
+            // cleanup_receivers.extend(filter_reads_cleanup_receivers);
 
         }
 
@@ -1741,17 +1766,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
 
-    // }
-    //
-    // // Filter Reads
-    // let filter_reads_out_stream = filter_with_kraken(
-    //     config.clone(),
-    //     ercc_bypass_stream,
-    //     target_ref_fasta_path.clone(),
-    //     &out_dir,
-    //     &sample_base_buf,
-    //     config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
-    // ).await?;
+
+
+
     //
     // // Align Reads to Target
     // let (bam_output_stream, bam_stats_stream_rx, bam_depth_stream_rx, _, align_bam_path, align_query_write_task) = align_to_target(
