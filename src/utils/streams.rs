@@ -160,19 +160,16 @@ where
         let mut count = 0;
 
         while let Some(item) = input.next().await {
-            let mut failed = false;
-            for tx in &mut output_txs {
+            let mut active_txs = Vec::new();
+            for tx in output_txs.into_iter() {
                 match tx.send(item.clone()).await {
-                    Ok(()) => (),
-                    Err(_) => {
-                        eprintln!("Receiver dropped at item {}", count + 1);
-                        failed = true;
-                        break;
-                    }
+                    Ok(()) => active_txs.push(tx),
+                    Err(_) => eprintln!("Receiver dropped at item {}, continuing for remaining receivers", count + 1),
                 }
             }
-            if failed {
-                let _ = done_tx.send(Err(anyhow!("Receiver dropped at item {}", count + 1)));
+            output_txs = active_txs;
+            if output_txs.is_empty() {
+                let _ = done_tx.send(Err(anyhow!("All receivers dropped at item {}, data loss occurred", count + 1)));
                 return;
             }
 
