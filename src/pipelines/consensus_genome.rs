@@ -637,6 +637,23 @@ async fn process_ercc(
     Ok((ReceiverStream::new(bypass_output_stream), ercc_stats_task, cleanup_tasks, cleanup_receivers))
 }
 
+
+/// Filters input FASTQ stream through Kraken2
+///
+/// # Arguments
+///
+/// * `config` - reading stream
+/// * `input_stream` - ReceiverStream<ParseOutput>,
+/// * 'targer_ref_path' -
+///
+/// # Returns
+/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <--- FASTQ uncompressed
+/// cleanup_tasks
+/// quast_write_tasks
+///
+
+
+
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -645,13 +662,8 @@ async fn filter_with_kraken(
     no_ext_sample_base_buf: &PathBuf,
     target_taxid: &str,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let kraken2_classified_path = file_path_manipulator(
-        no_ext_sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("classified.fq"),
-        "_",
-    );
+    let mut cleanup_tasks = vec![];
+
     let kraken2_report_path = file_path_manipulator(
         no_ext_sample_base_buf,
         Some(out_dir),
@@ -659,24 +671,41 @@ async fn filter_with_kraken(
         Some("kraken2_report.txt"),
         "_",
     );
+    let final_compressed_path = file_path_manipulator(
+        no_ext_sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("classified_filtered.fq.gz"),
+        "_",
+    );
+    let kraken2_pipe_path = file_path_manipulator(
+        no_ext_sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("kraken2_classified_pipe.fq"),
+        "_",
+    );
 
+    // Create named pipe for Kraken2 classified output
+    Command::new("mkfifo")
+        .arg(&kraken2_pipe_path)
+        .status()
+        .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to create named pipe: {}", e)))?;
+
+    // Write input stream to temp file for Kraken2
     let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
-    let mut cleanup_tasks = vec![kraken_query_write_task];
+    cleanup_tasks.push(kraken_query_write_task);
 
+    // Run Kraken2 with named pipe for classified output
     let kraken2_config = Kraken2Config {
         report_path: kraken2_report_path.clone(),
-        classified_path: kraken2_classified_path.clone(),
+        classified_path: kraken2_pipe_path.clone(),
         fastq_path: kraken_query_pipe_path.clone(),
     };
-    let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: KRAKEN2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(
+    let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))?;
+    let (mut _kraken2_child, kraken2_err_task) = spawn_cmd(
         config.clone(),
         KRAKEN2_TAG,
         kraken2_args,
@@ -689,34 +718,21 @@ async fn filter_with_kraken(
         })?;
     cleanup_tasks.push(kraken2_err_task);
 
-    let kraken2_out_stream = parse_child_output(
-        &mut kraken2_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
+    let kraken2_file = tokio::fs::File::open(&kraken2_pipe_path)
         .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: KRAKEN2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to open named pipe: {}", e)))?;
+    let kraken2_out_rx = parse_fastq(kraken2_file, config.base_buffer_size)
+        .await
+        .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to parse FASTQ from named pipe: {}", e)))?;
 
     let seqkit_config = SeqkitConfig {
         subcommand: SeqkitSubcommand::Grep,
-        subcommand_fields: HashMap::from([
-            ("-p".to_string(), Some(target_taxid.to_string())),
-            ("-o".to_string(), Some(kraken2_classified_path.to_string_lossy().into_owned())),
-        ]),
+        subcommand_fields: HashMap::from([("-p".to_string(), Some(format!("kraken:taxid|{}", target_taxid)))]),
     };
-    let seqkit_args = generate_cli(SEQKIT_TAG, &config, Some(&seqkit_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SEQKIT_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
+    let seqkit_args = generate_cli(SEQKIT_TAG, &config, Some(&seqkit_config))?;
     let (mut seqkit_child, seqkit_task, seqkit_err_task) = stream_to_cmd(
         config.clone(),
-        kraken2_out_stream,
+        kraken2_out_rx,
         SEQKIT_TAG,
         seqkit_args,
         StreamDataType::IlluminaFastq,
@@ -733,7 +749,7 @@ async fn filter_with_kraken(
     let seqkit_out_stream = parse_child_output(
         &mut seqkit_child,
         ChildStream::Stdout,
-        ParseMode::Bytes,
+        ParseMode::Fastq, // Parse as FASTQ to ensure SequenceRecord output
         config.base_buffer_size,
     )
         .await
@@ -764,11 +780,8 @@ async fn filter_with_kraken(
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let pigz_args = generate_cli(PIGZ_TAG, &config, None)
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+
+    let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
     let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
         config.clone(),
         kraken_file_stream,
@@ -796,8 +809,16 @@ async fn filter_with_kraken(
             tool: PIGZ_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, kraken2_classified_path));
+    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, final_compressed_path));
     cleanup_tasks.push(pigz_write_task);
+
+    let cleanup_pipe_task = tokio::spawn(async move {
+        tokio::fs::remove_file(&kraken2_pipe_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to remove named pipe: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(cleanup_pipe_task);
 
     Ok((ReceiverStream::new(kraken_output_stream), cleanup_tasks, cleanup_receivers))
 }
@@ -1662,14 +1683,16 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // Align Reads to Target
-            let (bam_output_stream, align_cleanup_tasks, align_quast_tasks) = align_to_target(
-                config.clone(),
-                filter_reads_out_stream,
-                target_ref_fasta_path.clone(),
+            // let (bam_output_stream, align_cleanup_tasks, align_quast_tasks) = align_to_target(
+            //     config.clone(),
+            //     filter_reads_out_stream,
+            //     target_ref_fasta_path.clone(),
+            //
+            // ).await?;
+            // cleanup_tasks.extend(align_cleanup_tasks);
+            // quast_write_tasks.extend(align_quast_tasks);
 
-            ).await?;
-            cleanup_tasks.extend(align_cleanup_tasks);
-            quast_write_tasks.extend(align_quast_tasks);
+
 
 
         }

@@ -7,7 +7,7 @@ edition = "2024"
 clap = { version = "4.5", features = ["derive"] }
 seq_io = "0.3.4"
 flate2 = "1.1.1"
-tokio = { version = "1.44.2", features = ["full", "io-util"] }
+tokio = { version = "1.44.2", features = ["full", "io-util", "fs", "process", "rt-multi-thread"] }
 anyhow = "1.0.98"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tempfile = "3.19.1"
