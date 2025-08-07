@@ -430,7 +430,7 @@ async fn process_ercc(
     ercc_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
-) -> Result<(Receiver<ParseOutput>, Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let ercc_stats_file_path = file_path_manipulator(
         &PathBuf::from(no_ext_sample_base),
         Some(out_dir),
@@ -634,7 +634,7 @@ async fn process_ercc(
 
     let ercc_stats_task = Some(tokio::spawn(parse_ercc_stats(stats_parse_stream)));
 
-    Ok((bypass_output_stream, ercc_stats_task, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(bypass_output_stream), ercc_stats_task, cleanup_tasks, cleanup_receivers))
 }
 
 async fn filter_with_kraken(
@@ -642,18 +642,18 @@ async fn filter_with_kraken(
     input_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
-    sample_base_buf: &PathBuf,
+    no_ext_sample_base_buf: &PathBuf,
     target_taxid: &str,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let kraken2_classified_path = file_path_manipulator(
-        sample_base_buf,
+        no_ext_sample_base_buf,
         Some(out_dir),
         None,
         Some("classified.fq"),
         "_",
     );
     let kraken2_report_path = file_path_manipulator(
-        sample_base_buf,
+        no_ext_sample_base_buf,
         Some(out_dir),
         None,
         Some("kraken2_report.txt"),
@@ -1734,27 +1734,24 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.append(&mut ercc_cleanup_receivers);
 
 
+            target_ref_write_task
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?
+                .map_err(|e| PipelineError::Other(e))?;
+            temp_files.push(target_ref_temp);
 
 
-            // target_ref_write_task
-            //     .await
-            //     .map_err(|e| PipelineError::Other(e.into()))?
-            //     .map_err(|e| PipelineError::Other(e))?;
-            // temp_files.push(target_ref_temp);
-
-
-            //
-            // // Filter Reads
-            // let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
-            //     config.clone(),
-            //     ercc_bypass_stream,
-            //     target_ref_fasta_path.clone(),
-            //     &out_dir,
-            //     &sample_base_buf,
-            //     config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
-            // ).await?;
-            // cleanup_tasks.extend(filter_reads_cleanup_tasks);
-            // cleanup_receivers.extend(filter_reads_cleanup_receivers);
+            // Filter Reads
+            let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
+                config.clone(),
+                no_host_ercc_stream,
+                target_ref_fasta_path.clone(),
+                &out_dir,
+                &no_ext_sample_base_buf,
+                config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
+            ).await?;
+            cleanup_tasks.extend(filter_reads_cleanup_tasks);
+            cleanup_receivers.extend(filter_reads_cleanup_receivers);
 
         }
 
