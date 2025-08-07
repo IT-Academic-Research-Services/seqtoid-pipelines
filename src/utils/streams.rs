@@ -594,8 +594,7 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 Ok(n) => {
                     let chunk = buffer[..n].to_vec();
                     if tx.send(ParseOutput::Bytes(chunk)).await.is_err() {
-                        eprintln!("No active receivers for byte chunk");
-                        break;
+                        eprintln!("No active receivers for byte chunk, continuing to drain");
                     }
                 }
                 Err(e) => {
@@ -604,6 +603,7 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     Ok(rx)
@@ -629,8 +629,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     tokio::spawn(async move {
         while reader.read_line(&mut line).await? > 0 {
             if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
-                eprintln!("No active receivers for line");
-                break;
+                eprintln!("No active receivers for line, continuing to drain");
             }
             line.clear();
         }
