@@ -1540,6 +1540,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut stats_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
 
+    let mut align_sam_stats_stream: Option<Receiver<ParseOutput>> = None;
+    let mut align_sam_depth_stream: Option<Receiver<ParseOutput>> = None;
+    let mut align_sam_eval_stream: Option<Receiver<ParseOutput>> = None;
+
     // External tools check
     check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG]).await
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -1738,7 +1742,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Split SAM streams for bypass, stats, etc
             let (align_sam_streams, align_sam_done_rx) = t_junction(
                 sam_output_stream,
-                4,
+                5,
                 config.base_buffer_size,
                 config.args.stall_threshold,
                 Some(config.args.stream_sleep_ms),
@@ -1751,8 +1755,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let mut align_streams_iter = align_sam_streams.into_iter();
             let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;  // For call variants
-            let align_sam_stats_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let align_sam_depth_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            align_sam_stats_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
+            align_sam_depth_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
+            align_sam_eval_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
 
             let mut align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
             let mut align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
@@ -1801,73 +1806,15 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
 
 
-
-
-
-
-
-
-    //
-    // let bam_stats_stream = bam_stats_stream_rx.into_inner();
-    // let bam_depth_stream = bam_depth_stream_rx.into_inner();
-    //
-    // // Duplicate bam_stats_stream for call_variants and statistics
-    // let (mut bam_stats_streams, bam_stats_done_rx) = t_junction(
-    //     ReceiverStream::new(bam_stats_stream),
-    //     2,
-    //     config.base_buffer_size,
-    //     config.args.stall_threshold,
-    //     Some(config.args.stream_sleep_ms),
-    //     50,
-    //     StreamDataType::JustBytes,
-    // ).await
-    //     .map_err(|_| PipelineError::StreamDataDropped)?;
-    //
-    // cleanup_receivers.push(bam_stats_done_rx);
-    //
-    // let bam_call_rx = bam_stats_streams.remove(0);
-    // let bam_stats_rx = bam_stats_streams.remove(0);
-    //
-    // let bam_call_stream = ReceiverStream::new(bam_call_rx);
-    // let bam_stats_stream = ReceiverStream::new(bam_stats_rx);
-    //
-    // // Make Consensus
-    // let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path) = generate_consensus(
-    //     config.clone(),
-    //     bam_output_stream,
-    //     &out_dir,
-    //     &sample_base_buf,
-    // ).await?;
-    //
-    // let consensus_stats_stream = consensus_stats_stream_rx.into_inner();
-    //
-    // // Call Variants
-    // let (call_bcftools_stats_stream_rx, _) = call_variants(
-    //     config.clone(),
-    //     bam_call_stream,
-    //     target_ref_fasta_path.clone(),
-    //     &out_dir,
-    //     &sample_base_buf,
-    // ).await?;
-    //
-    // let call_bcftools_stats_stream = call_bcftools_stats_stream_rx.into_inner();
-    //
-    // // Realign Consensus to Ref
-    // realign_consensus_to_ref(
-    //     config.clone(),
-    //     consensus_realign_stream.into_inner(),
-    //     target_ref_fasta_path.clone(),
-    //     &out_dir,
-    //     &no_ext_sample_base_buf,
-    // ).await?;
-    //
-    // // Calculate Statistics
-
     let results = try_join_all(stats_tasks).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     for result in results {
         result.map_err(|e| PipelineError::Other(e))?;
     }
+
+
+    //
+    // // Calculate Statistics
 
     // calculate_statistics(
     //     config.clone(),
