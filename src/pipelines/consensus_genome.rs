@@ -991,7 +991,7 @@ async fn generate_consensus(
     bam_stream: ReceiverStream<ParseOutput>,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
 
@@ -1081,19 +1081,14 @@ async fn call_variants(
     bam_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
-    sample_base_buf: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, PathBuf), PipelineError> {
-    let vcf_file_path = file_path_manipulator(
-        sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("variants.vcf"),
-        "_",
-    );
+    no_ext_sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+    let mut cleanup_tasks = vec![];
+    let mut cleanup_receivers = vec![];
 
     let bcftools_mpileup_config = BcftoolsConfig {
         subcommand: BcftoolsSubcommand::Mpileup,
-        subcommand_fields: HashMap::from([("-f".to_string(), Some(target_ref_path.to_string_lossy().into_owned()))]),
+        subcommand_fields: HashMap::from([("-f".to_string(), Some(target_ref_path.to_string_lossy().into_owned())), ("-".to_string(), None),]),
     };
     let bcftools_mpileup_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_mpileup_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -1114,7 +1109,8 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let mut cleanup_tasks = vec![bcftools_mpileup_task, bcftools_mpileup_err_task];
+    cleanup_tasks.push(bcftools_mpileup_task);
+    cleanup_tasks.push(bcftools_mpileup_err_task);
 
     let bcftools_mpileup_out_stream = parse_child_output(
         &mut bcftools_mpileup_child,
@@ -1130,7 +1126,14 @@ async fn call_variants(
 
     let bcftools_call_config = BcftoolsConfig {
         subcommand: BcftoolsSubcommand::Call,
-        subcommand_fields: HashMap::from([("-o".to_string(), Some(vcf_file_path.to_string_lossy().into_owned()))]),
+        subcommand_fields: HashMap::from([
+            ("--ploidy".to_string(), Some("1".to_string())),
+            ("-m".to_string(), None),
+            ("-v".to_string(), None),
+            ("-P".to_string(), Some(config.args.bcftools_call_theta.to_string())),
+            ("-Ov".to_string(), None),
+            ("-".to_string(), None),
+        ])
     };
     let bcftools_call_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_call_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -1179,14 +1182,19 @@ async fn call_variants(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if vcf_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
+    cleanup_receivers.push(vcf_done_rx);
 
-    let mut cleanup_receivers = vec![vcf_done_rx];
     let mut streams_iter = vcf_streams.into_iter();
     let vcf_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let vcf_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let vcf_file_path = file_path_manipulator(
+        no_ext_sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("variants.vcf"),
+        "_",
+    );
 
     let vcf_write_task = tokio::spawn(stream_to_file(
         vcf_file_stream,
@@ -1194,18 +1202,7 @@ async fn call_variants(
     ));
     cleanup_tasks.push(vcf_write_task);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver.await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
-
-    Ok((ReceiverStream::new(vcf_output_stream), vcf_file_path))
+    Ok((ReceiverStream::new(vcf_output_stream), vcf_file_path, cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -1745,7 +1742,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Split SAM streams for bypass, stats, etc
             let (align_sam_streams, align_sam_done_rx) = t_junction(
                 sam_output_stream,
-                3,
+                4,
                 config.base_buffer_size,
                 config.args.stall_threshold,
                 Some(config.args.stream_sleep_ms),
@@ -1757,10 +1754,12 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.push(align_sam_done_rx);
             let mut align_streams_iter = align_sam_streams.into_iter();
             let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;  // For call variants
             let align_sam_stats_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             let align_sam_depth_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
             let mut align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
+            let mut align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
 
 
             // Make Consensus
@@ -1775,6 +1774,20 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.extend(consensus_cleanup_receivers);
 
             // let consensus_stats_stream = consensus_stats_stream_rx.into_inner();
+
+            // Call Variants
+            let (call_bcftools_stats_stream, _, call_cleanup_tasks, call_cleanup_receivers) = call_variants(
+                config.clone(),
+                align_sam_call_stream,
+                target_ref_fasta_path.clone(),
+                &out_dir,
+                &no_ext_sample_base_buf,
+            ).await?;
+            cleanup_tasks.extend(call_cleanup_tasks);
+            cleanup_receivers.extend(call_cleanup_receivers);
+            //
+            // let call_bcftools_stats_stream = call_bcftools_stats_stream_rx.into_inner();
+
 
         }
 
