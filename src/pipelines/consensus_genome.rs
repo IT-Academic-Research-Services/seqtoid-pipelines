@@ -990,19 +990,14 @@ async fn generate_consensus(
     config: Arc<RunConfig>,
     bam_stream: ReceiverStream<ParseOutput>,
     out_dir: &PathBuf,
-    sample_base_buf: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf), PipelineError> {
-    let consensus_file_path = file_path_manipulator(
-        sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("consensus.fa"),
-        "_",
-    );
+    no_ext_sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,), PipelineError> {
+    let mut cleanup_tasks = vec![];
+    let mut cleanup_receivers = vec![];
 
     let samtools_consensus_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Consensus,
-        subcommand_fields: HashMap::from([("-o".to_string(), Some(consensus_file_path.to_string_lossy().into_owned()))]),
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
     };
     let samtools_consensus_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_consensus_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -1023,9 +1018,10 @@ async fn generate_consensus(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let mut cleanup_tasks = vec![samtools_consensus_task, samtools_consensus_err_task];
+    cleanup_tasks.push(samtools_consensus_task);
+    cleanup_tasks.push(samtools_consensus_err_task);
 
-    let samtools_consensus_out_stream = parse_child_output(
+    let samtools_consensus_out_stream = parse_child_output(  // FASTQ output
         &mut samtools_consensus_child,
         ChildStream::Stdout,
         ParseMode::Fasta,
@@ -1040,7 +1036,7 @@ async fn generate_consensus(
 
     let (consensus_streams, consensus_done_rx) = t_junction(
         samtools_consensus_out_stream,
-        3, // Increased to 3 streams
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
@@ -1050,15 +1046,19 @@ async fn generate_consensus(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if consensus_streams.len() < 3 {
-        return Err(PipelineError::EmptyStream);
-    }
-
-    let mut cleanup_receivers = vec![consensus_done_rx];
+    cleanup_receivers.push(consensus_done_rx);
     let mut streams_iter = consensus_streams.into_iter();
     let consensus_realign_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let consensus_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let consensus_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let consensus_file_path = file_path_manipulator(
+        no_ext_sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("consensus.fa"),
+        "_",
+    );
 
     let consensus_write_task = tokio::spawn(stream_to_file(
         consensus_file_stream,
@@ -1066,21 +1066,12 @@ async fn generate_consensus(
     ));
     cleanup_tasks.push(consensus_write_task);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver.await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
-
     Ok((
         ReceiverStream::new(consensus_realign_stream),
         ReceiverStream::new(consensus_stats_stream),
         consensus_file_path,
+        cleanup_tasks,
+        cleanup_receivers
     ))
 }
 
@@ -1749,24 +1740,41 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.extend(align_cleanup_receivers);
             quast_write_tasks.extend(align_quast_tasks);
 
-            //Split SAM streams for bypass, stats, etc
-            // let (sam_streams, sam_done_rx) = t_junction(
-            //     sam_output_stream,
-            //     3,
-            //     config.base_buffer_size,
-            //     config.args.stall_threshold,
-            //     Some(config.args.stream_sleep_ms),
-            //     50,
-            //     StreamDataType::JustBytes,
-            // )
-            //     .await
-            //     .map_err(|_| PipelineError::StreamDataDropped)?;
-            // let mut streams_iter = sam_streams.into_iter();
-            // let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            // let sam_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            // let sam_depth_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
+            // Split SAM streams for bypass, stats, etc
+            let (align_sam_streams, align_sam_done_rx) = t_junction(
+                sam_output_stream,
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                Some(config.args.stream_sleep_ms),
+                50,
+                StreamDataType::JustBytes,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
+            cleanup_receivers.push(align_sam_done_rx);
+            let mut align_streams_iter = align_sam_streams.into_iter();
+            let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let align_sam_stats_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let align_sam_depth_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            let mut align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
+
+
+            // Make Consensus
+            let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path, consensus_cleanup_tasks, consensus_cleanup_receivers) = generate_consensus(
+                config.clone(),
+                align_sam_output_stream,
+                &out_dir,
+                &no_ext_sample_base_buf,
+            ).await?;
+
+            cleanup_tasks.extend(consensus_cleanup_tasks);
+            cleanup_receivers.extend(consensus_cleanup_receivers);
+
+            // let consensus_stats_stream = consensus_stats_stream_rx.into_inner();
 
         }
 
