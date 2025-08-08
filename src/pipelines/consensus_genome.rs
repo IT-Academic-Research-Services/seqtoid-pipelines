@@ -838,7 +838,7 @@ async fn align_to_target(
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf
-) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, PathBuf), PipelineError> {
 
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
@@ -922,11 +922,11 @@ async fn align_to_target(
 
     let samtools_sort_out_stream = ReceiverStream::new(samtools_sort_out_stream);
 
-    let align_cram_path = file_path_manipulator(
+    let align_bam_path = file_path_manipulator(
         no_ext_sample_base_buf,
         Some(out_dir),
         None,
-        Some("target_aligned.cram"),
+        Some("target_aligned.bam"),
         "_",
     );
 
@@ -951,8 +951,8 @@ async fn align_to_target(
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
             ("-h".to_string(), None),
-            ("-C".to_string(), None),
-            ("-o".to_string(), Some(align_cram_path.display().to_string())),
+            ("-b".to_string(), None),
+            ("-o".to_string(), Some(align_bam_path.display().to_string())),
             ("-".to_string(), None),
         ])
     };
@@ -974,7 +974,7 @@ async fn align_to_target(
             tool:  SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    cleanup_tasks.push(align_samtools_view_stream_task);
+    quast_write_tasks.push(align_samtools_view_stream_task);
     cleanup_tasks.push(align_samtools_view_err_task);
 
 
@@ -982,7 +982,8 @@ async fn align_to_target(
         ReceiverStream::new(sam_output_stream),
         cleanup_tasks,
         cleanup_receivers,
-        quast_write_tasks
+        quast_write_tasks,
+        align_bam_path
     ))
 }
 
@@ -992,9 +993,10 @@ async fn generate_consensus(
     bam_stream: ReceiverStream<ParseOutput>,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
+    let mut quast_write_tasks = vec![];
 
     let samtools_consensus_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Consensus,
@@ -1065,14 +1067,14 @@ async fn generate_consensus(
         consensus_file_stream,
         consensus_file_path.clone(),
     ));
-    cleanup_tasks.push(consensus_write_task);
+    quast_write_tasks.push(consensus_write_task);
 
     Ok((
         ReceiverStream::new(consensus_realign_stream),
         ReceiverStream::new(consensus_stats_stream),
         consensus_file_path,
         cleanup_tasks,
-        cleanup_receivers
+        cleanup_receivers, quast_write_tasks,
     ))
 }
 
@@ -1505,6 +1507,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut stats_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
 
+    let mut target_ref_fasta_path: Option<PathBuf> = None;
+    let mut consensus_file_path: Option<PathBuf> = None;
+    let mut align_bam_path: Option<PathBuf> = None;
     let mut align_sam_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut align_sam_depth_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut align_sam_eval_stream: Option<Receiver<ParseOutput>> = None;
@@ -1653,13 +1658,13 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // Fetch target reference
-            let (target_ref_fasta_path, target_ref_temp, target_ref_write_task) = fetch_target_reference(
+            let (target_ref_fasta_path_inner, target_ref_temp, target_ref_write_task) = fetch_target_reference(
                 &*config,
                 ref_db_path.clone(),
                 &ram_temp_dir,
                 h5_index.as_ref()
             ).await?;
-
+            target_ref_fasta_path = Some(target_ref_fasta_path_inner.clone());
 
             // ERCC
             let (no_host_ercc_stream, ercc_stats_out_task, mut ercc_cleanup_tasks, mut ercc_cleanup_receivers) = process_ercc(
@@ -1685,7 +1690,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
                 no_host_ercc_stream,
-                target_ref_fasta_path.clone(),
+                target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
                 config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
@@ -1695,10 +1700,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // Align Reads to Target
-            let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks) = align_to_target(
+            let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks, align_bam_path_inner) = align_to_target(
                 config.clone(),
                 filter_reads_out_stream,
-                target_ref_fasta_path.clone(),
+                target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
             ).await?;
@@ -1706,7 +1711,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.extend(align_cleanup_receivers);
             quast_write_tasks.extend(align_quast_tasks);
 
-
+            align_bam_path = Some(align_bam_path_inner);
 
             // Split SAM streams for bypass, stats, etc
             let (align_sam_streams, align_sam_done_rx) = t_junction(
@@ -1723,7 +1728,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.push(align_sam_done_rx);
             let mut align_streams_iter = align_sam_streams.into_iter();
             let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;  // For call variants
+            let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             align_sam_stats_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
             align_sam_depth_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
             align_sam_eval_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
@@ -1733,22 +1738,24 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // Make Consensus
-            let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path, consensus_cleanup_tasks, consensus_cleanup_receivers) = generate_consensus(
+            let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path_x, consensus_cleanup_tasks, consensus_cleanup_receivers, consensus_quast_tasks) = generate_consensus(
                 config.clone(),
                 align_sam_output_stream,
                 &out_dir,
                 &no_ext_sample_base_buf,
             ).await?;
 
+            consensus_file_path = Some(consensus_file_path_x);
             cleanup_tasks.extend(consensus_cleanup_tasks);
             cleanup_receivers.extend(consensus_cleanup_receivers);
+            quast_write_tasks.extend(consensus_quast_tasks);
             consensus_stats_stream = Some(consensus_stats_stream_rx);
 
             // Call Variants
             let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) = call_variants(
                 config.clone(),
                 align_sam_call_stream,
-                target_ref_fasta_path.clone(),
+                target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
             ).await?;
@@ -1760,7 +1767,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
                 consensus_realign_stream.into_inner(),
-                target_ref_fasta_path.clone(),
+                target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
             ).await?;
@@ -1782,9 +1789,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
 
 
-    //
-    // // Calculate Statistics
 
+    // // Calculate Statistics
     calculate_statistics(
         config.clone(),
         &no_ext_sample_base,
@@ -1797,20 +1803,22 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         &out_dir,
         technology,
     ).await?;
-    //
-    // // Assembly Evaluation
-    // let results = try_join_all(quast_write_tasks).await
-    //     .map_err(|e| PipelineError::Other(e.into()))?;
-    // for result in results {
-    //     result.map_err(|e| PipelineError::Other(e))?;
-    // }
-    //
-    // evaluate_assembly(
-    //     config,
-    //     target_ref_fasta_path,
-    //     align_bam_path,
-    //     consensus_file_path,
-    // ).await?;
+
+    // Assembly Evaluation
+    let results = try_join_all(quast_write_tasks).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    for result in results {
+        result.map_err(|e| PipelineError::Other(e))?;
+    }
+
+    if let (Some(target_ref_fasta_path), Some(align_bam_path), Some(consensus_file_path)) = (target_ref_fasta_path, align_bam_path, consensus_file_path) {
+        evaluate_assembly(
+            config,
+            target_ref_fasta_path,
+            align_bam_path,
+            consensus_file_path,
+        ).await?;
+    }
 
     // Cleanup
     let results = try_join_all(cleanup_tasks).await
