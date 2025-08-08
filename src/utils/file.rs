@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::fs::File as TokioFile;
 use tokio::process::Command;
 use tokio_stream::StreamExt;
+use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
 
 
@@ -353,6 +354,83 @@ pub async fn write_vecu8_to_file<P: AsRef<Path>>(
     Ok(task)
 }
 
+
+/// Creates a tempfile in the specified directory with an optional suffix and writes data from a ParseOutput stream to it asynchronously.
+///
+/// # Arguments
+///
+/// - `input_steam`:`ReceiverStream` `ParseOutput` items.
+/// - `buffer_size`:
+/// - `suffix`: Optional
+/// - `ram_temp_dir`: Directory for the temporary file (e.g., RAM disk like /dev/shm).
+///
+/// # Returns
+/// A `Result` containing:
+/// - A `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
+/// - The temporary file path as `PathBuf`.
+/// - The `NamedTempFile` handle (hold this to prevent deletion; auto-deletes on drop unless persisted).
+pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
+    input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: Option<usize>,
+    suffix: Option<&str>,
+    ram_temp_dir: P,
+) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf, NamedTempFile)> {
+
+    let mut temp_name = match suffix {
+        Some(s) => TempfileBuilder::new()
+            .suffix(s)
+            .tempfile_in(ram_temp_dir.as_ref()),
+        None => TempfileBuilder::new().tempfile_in(ram_temp_dir.as_ref()),
+    }
+        .map_err(|e| anyhow!("Failed to create temp file in {}: {}", ram_temp_dir.as_ref().display(), e))?;
+    let temp_path = temp_name.path().to_path_buf();
+
+    // Clone the file handle for async writing (original remains in temp_name for auto-delete)
+    let std_file = temp_name.as_file().try_clone()?;
+
+    // Convert to TokioFile for async I/O
+    let writer_file = TokioFile::from_std(std_file);
+
+    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB default, tunable for cluster perf
+    let temp_path_clone = temp_path.clone(); // For error messages in task
+
+    let task = tokio::spawn(async move {
+        let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
+        let mut input_stream = input_stream; // Take ownership
+        let mut byte_count = 0;
+
+        while let Some(item) = input_stream.next().await {
+            let data = match item {
+                ParseOutput::Bytes(data) => data,
+                ParseOutput::Fasta(record) => record.to_bytes()?,
+                ParseOutput::Fastq(record) => record.to_bytes()?,
+                _ => return Err(anyhow!("Unexpected data in stream at {}", temp_path_clone.display())),
+            };
+            writer
+                .write_all(&data)
+                .await
+                .map_err(|e| anyhow!("Failed to write to temp file at {}: {}", temp_path_clone.display(), e))?;
+            byte_count += data.len();
+        }
+
+        writer
+            .flush()
+            .await
+            .map_err(|e| anyhow!("Failed to flush temp file at {}: {}", temp_path_clone.display(), e))?;
+        writer
+            .shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown temp file at {}: {}", temp_path_clone.display(), e))?;
+
+        if byte_count == 0 {
+            return Err(anyhow!("No data written to temp file at {}", temp_path_clone.display()));
+        }
+
+        Ok(())
+    });
+
+    Ok((task, temp_path, temp_name))
+}
 
 #[cfg(test)]
 mod tests {
