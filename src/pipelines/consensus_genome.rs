@@ -1208,11 +1208,11 @@ async fn call_variants(
 
 async fn realign_consensus_to_ref(
     config: Arc<RunConfig>,
-    consensus_realign_stream: mpsc::Receiver<ParseOutput>,
+    consensus_realign_stream: Receiver<ParseOutput>,
     target_ref_fasta_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
-) -> Result<(), PipelineError> {
+) -> Result<(Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let reference_file = TokioFile::open(&target_ref_fasta_path).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     let reference_rx = parse_bytes(reference_file, config.base_buffer_size).await
@@ -1269,13 +1269,9 @@ async fn realign_consensus_to_ref(
     ));
     cleanup_tasks.push(realign_consensus_write_task);
 
-    let results = try_join_all(cleanup_tasks).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
 
-    Ok(())
+
+    Ok((cleanup_tasks))
 }
 
 
@@ -1773,7 +1769,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_tasks.extend(consensus_cleanup_tasks);
             cleanup_receivers.extend(consensus_cleanup_receivers);
 
-            // let consensus_stats_stream = consensus_stats_stream_rx.into_inner();
 
             // Call Variants
             let (call_bcftools_stats_stream, _, call_cleanup_tasks, call_cleanup_receivers) = call_variants(
@@ -1785,8 +1780,17 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             ).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
-            //
-            // let call_bcftools_stats_stream = call_bcftools_stats_stream_rx.into_inner();
+
+
+            // Realign Consensus to Ref
+            let realign_cleanup_tasks = realign_consensus_to_ref(
+                config.clone(),
+                consensus_realign_stream.into_inner(),
+                target_ref_fasta_path.clone(),
+                &out_dir,
+                &no_ext_sample_base_buf,
+            ).await?;
+            cleanup_tasks.extend(realign_cleanup_tasks);
 
 
         }
