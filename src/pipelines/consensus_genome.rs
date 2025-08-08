@@ -836,9 +836,12 @@ async fn align_to_target(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+    out_dir: &PathBuf,
+    no_ext_sample_base_buf: &PathBuf
+) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
 
     let mut cleanup_tasks = vec![];
+    let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
     let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
@@ -917,10 +920,67 @@ async fn align_to_target(
             error: e.to_string(),
         })?;
 
+    // let samtools_sort_out_stream = ReceiverStream::new(samtools_sort_out_stream);
+    //
+    // let align_bam_path = file_path_manipulator(
+    //     no_ext_sample_base_buf,
+    //     Some(out_dir),
+    //     None,
+    //     Some("target_aligned.cram"),
+    //     "_",
+    // );
+    //
+    // let (sam_streams, sam_done_rx) = t_junction(
+    //     samtools_sort_out_stream,
+    //     2,
+    //     config.base_buffer_size,
+    //     config.args.stall_threshold,
+    //     Some(config.args.stream_sleep_ms),
+    //     50,
+    //     StreamDataType::JustBytes,
+    // )
+    //     .await
+    //     .map_err(|_| PipelineError::StreamDataDropped)?;
+    //
+    // cleanup_receivers.push(sam_done_rx);
+    // let mut streams_iter = sam_streams.into_iter();
+    // let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    // let sam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    //
+    // let align_samtools_config_view = SamtoolsConfig {
+    //     subcommand: SamtoolsSubcommand::View,
+    //     subcommand_fields: HashMap::from([
+    //         ("C".to_string(), None),
+    //         ("-o".to_string(), Some(align_bam_path.display().to_string())),
+    //         ("-".to_string(), None),
+    //     ])
+    // };
+    // let align_samtools_args_view = generate_cli(
+    //     SAMTOOLS_TAG,
+    //     &config,
+    //     Some(&align_samtools_config_view),
+    // )?;
+    // let (mut _align_samtools_child_view, align_samtools_view_stream_task, align_samtools_view_err_task) = stream_to_cmd(
+    //     config.clone(),
+    //     sam_file_stream,
+    //     SAMTOOLS_TAG,
+    //     align_samtools_args_view,
+    //     StreamDataType::JustBytes,
+    //     config.args.verbose,
+    // )
+    //     .await
+    //     .map_err(|e| PipelineError::ToolExecution {
+    //         tool:  SAMTOOLS_TAG.to_string(),
+    //         error: e.to_string(),
+    //     })?;
+    // cleanup_tasks.push(align_samtools_view_stream_task);
+    // cleanup_tasks.push(align_samtools_view_err_task);
+
 
     Ok((
         ReceiverStream::new(samtools_sort_out_stream),
         cleanup_tasks,
+        cleanup_receivers,
         quast_write_tasks
     ))
 }
@@ -1678,14 +1738,33 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
             // Align Reads to Target
-            let (sam_output_stream, align_cleanup_tasks, align_quast_tasks) = align_to_target(
+            let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks) = align_to_target(
                 config.clone(),
                 filter_reads_out_stream,
                 target_ref_fasta_path.clone(),
-
+                &out_dir,
+                &no_ext_sample_base_buf,
             ).await?;
             cleanup_tasks.extend(align_cleanup_tasks);
+            cleanup_receivers.extend(align_cleanup_receivers);
             quast_write_tasks.extend(align_quast_tasks);
+
+            //Split SAM streams for bypass, stats, etc
+            // let (sam_streams, sam_done_rx) = t_junction(
+            //     sam_output_stream,
+            //     3,
+            //     config.base_buffer_size,
+            //     config.args.stall_threshold,
+            //     Some(config.args.stream_sleep_ms),
+            //     50,
+            //     StreamDataType::JustBytes,
+            // )
+            //     .await
+            //     .map_err(|_| PipelineError::StreamDataDropped)?;
+            // let mut streams_iter = sam_streams.into_iter();
+            // let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            // let sam_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            // let sam_depth_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
 
