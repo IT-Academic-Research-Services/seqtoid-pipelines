@@ -1279,152 +1279,123 @@ async fn realign_consensus_to_ref(
 async fn calculate_statistics(
     config: Arc<RunConfig>,
     no_ext_sample_base: &str,
-    consensus_bam_stats_stream: Option<Receiver<ParseOutput>>,
-    consensus_bam_depth_stream: Option<Receiver<ParseOutput>>,
+    consensus_bam_stats_stream: Option<ReceiverStream<ParseOutput>>,
+    consensus_bam_depth_stream: Option<ReceiverStream<ParseOutput>>,
     no_host_seqkit_out_stream_stats: Receiver<ParseOutput>,
-    ercc_stats_task: Option<tokio::task::JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
-    consensus_stats_stream: Option<Receiver<ParseOutput>>,
-    call_bcftools_stats_stream: Option<Receiver<ParseOutput>>,
+    ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
+    consensus_stats_stream: Option<ReceiverStream<ParseOutput>>,
+    call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>>,
     out_dir: &PathBuf,
     technology: Technology,
-) -> Result<(), PipelineError> {
+) -> Result<(), anyhow::Error> {
+    let mut local_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
-    let mut stats_tasks = Vec::new();
 
-    let samtools_stats_out = if let Some(stream) = consensus_bam_stats_stream {
-        let stats_samtools_config_stats = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Stats,
-            subcommand_fields: HashMap::from([("-".to_string(), None)]),
-        };
-        let stats_samtools_args_stats = generate_cli(SAMTOOLS_TAG, &config, Some(&stats_samtools_config_stats))
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-
-        let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(
-            config.clone(),
-            stream,
-            SAMTOOLS_TAG,
-            stats_samtools_args_stats,
-            StreamDataType::JustBytes,
-            config.args.verbose,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-        stats_tasks.push(stats_samtools_task_stats);
-        stats_tasks.push(stats_samtools_err_task_stats);
-        parse_child_output(&mut stats_samtools_child_stats, ChildStream::Stdout, ParseMode::Lines, config.base_buffer_size / 2)
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?
-    } else {
-        return Err(PipelineError::EmptyStream);
+    let stats_samtools_config_stats = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Stats,
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
     };
-    let samtools_stats_out = parse_samtools_stats(samtools_stats_out)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    let stats_samtools_args_stats = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&stats_samtools_config_stats),
+    )?;
 
-    let depth_samtools_out_stream = if let Some(stream) = consensus_bam_depth_stream {
-        let depth_samtools_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Depth,
-            subcommand_fields: HashMap::from([
-                ("-aa".to_string(), None),
-                ("-d".to_string(), Some("0".to_string())),
-                ("-".to_string(), None),
-            ]),
-        };
-        let depth_samtools_args = generate_cli(SAMTOOLS_TAG, &config, Some(&depth_samtools_config))
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
+    let stats_samtools_out_stream_stats = match consensus_bam_stats_stream {
+        Some(stream) => {
+            let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(config.clone(),
+                                                                                                                           stream.into_inner(),
+                                                                                                                           SAMTOOLS_TAG,
+                                                                                                                           stats_samtools_args_stats.clone(),
+                                                                                                                           StreamDataType::JustBytes,
+                                                                                                                           config.args.verbose,
+            ).await?;
+            local_cleanup_tasks.push(stats_samtools_task_stats);
+            local_cleanup_tasks.push(stats_samtools_err_task_stats);
+            parse_child_output(&mut stats_samtools_child_stats, ChildStream::Stdout, ParseMode::Lines, config.base_buffer_size / 2).await?
+        }
+        None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
+    };
+    let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats).await?;
 
-        let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(
-            config.clone(),
-            stream,
-            SAMTOOLS_TAG,
-            depth_samtools_args,
-            StreamDataType::JustBytes,
-            config.args.verbose,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-        stats_tasks.push(depth_samtools_task);
-        stats_tasks.push(depth_samtools_err_task);
-        parse_child_output(
-            &mut depth_samtools_child,
-            ChildStream::Stdout,
-            ParseMode::Lines,
-            config.base_buffer_size / 2,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?
-    } else {
-        return Err(PipelineError::EmptyStream);
+    let depth_samtools_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Depth,
+        subcommand_fields: HashMap::from([
+            ("-aa".to_string(), None),
+            ("-d".to_string(), Some("0".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+    let depth_samtools_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&depth_samtools_config),
+    )?;
+
+    let depth_samtools_out_stream = match consensus_bam_depth_stream {
+        Some(stream) => {
+            let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(config.clone(),
+                                                                                                         stream.into_inner(),
+                                                                                                         SAMTOOLS_TAG,
+                                                                                                         depth_samtools_args,
+                                                                                                         StreamDataType::JustBytes,
+                                                                                                         config.args.verbose,
+            ).await?;
+            local_cleanup_tasks.push(depth_samtools_task);
+            local_cleanup_tasks.push(depth_samtools_err_task);
+            parse_child_output(
+                &mut depth_samtools_child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config.base_buffer_size / 2,
+            ).await?
+        }
+        None => {
+            return Err(anyhow!("consensus_bam_depth_stream is not available"));
+        }
     };
 
-    let depth_map = parse_samtools_depth(depth_samtools_out_stream)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
     if depth_map.is_empty() {
-        return Err(PipelineError::EmptyStream);
+        return Err(anyhow!("No depth data found"));
     }
-    let first_chr = depth_map
-        .keys()
-        .next()
-        .ok_or_else(|| PipelineError::Other(anyhow!("No chromosomes found")))?.clone();
+    let first_chr = depth_map.keys().next().ok_or_else(|| anyhow!("No chromosomes found"))?.clone();
     let first_chr_depth_map = depth_map.get(&first_chr).unwrap();
     let depths: Vec<u32> = first_chr_depth_map.values().copied().collect();
-    let samtools_depth_stats = compute_depth_stats(&depths)
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    let samtools_depth_stats = compute_depth_stats(&depths)?;
 
     let depth_plot_path = file_path_manipulator(
         &PathBuf::from(no_ext_sample_base),
         Some(out_dir),
         None,
         Some("depth.png"),
-        "_",
+        "_"
     );
 
-    plot_depths(&first_chr_depth_map, no_ext_sample_base, &depth_plot_path)
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    plot_depths(&first_chr_depth_map, no_ext_sample_base, &depth_plot_path)?;
 
-    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats).await?;
 
     let ercc_stats = if let Technology::Illumina = technology {
-        if let Some(task) = ercc_stats_task {
-            match task.await {
-                Ok(Ok(stats)) => stats,
-                Ok(Err(e)) => return Err(PipelineError::Other(anyhow!("Failed to parse ERCC stats: {}", e))),
-                Err(e) => return Err(PipelineError::Other(anyhow!("ERCC stats task failed: {}", e))),
-            }
-        } else {
-            return Err(PipelineError::Other(anyhow!("ERCC stats task not initialized for Illumina technology")));
+        match ercc_stats_task {
+            Some(task) => match task.await? {
+                Ok(stats) => stats,
+                Err(e) => return Err(anyhow!("Failed to parse ERCC stats: {}", e)),
+            },
+            None => return Err(anyhow!("ERCC stats task not initialized for Illumina technology")),
         }
     } else {
-        HashMap::new() // Empty stats for ONT
+        HashMap::new()
     };
 
     let allele_counts = if let Some(stream) = consensus_stats_stream {
-        compute_allele_counts(stream)
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?
+        compute_allele_counts(stream.into_inner()).await?
     } else {
         HashMap::new()
     };
 
     let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
-        parse_vcf_stream(stream)
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?
+        parse_vcf_stream(stream.into_inner()).await?
     } else {
         (0, 0, 0)
     };
@@ -1473,17 +1444,10 @@ async fn calculate_statistics(
     };
 
     let stats_file_path = out_dir.join(format!("{}_stats.json", no_ext_sample_base));
-    let mut stats_file = File::create(&stats_file_path)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create stats file: {}", e)))?;
-    serde_json::to_writer_pretty(&mut stats_file, &stats)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to serialize stats: {}", e)))?;
+    let mut stats_file = File::create(&stats_file_path)?;
+    serde_json::to_writer_pretty(&mut stats_file, &stats)?;
 
-    let results = try_join_all(stats_tasks)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
+    try_join_all(local_cleanup_tasks).await?.into_iter().collect::<Result<Vec<_>, _>>()?;
 
     Ok(())
 }
@@ -1541,9 +1505,13 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut stats_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>> = None;
 
-    let mut align_sam_stats_stream: Option<Receiver<ParseOutput>> = None;
-    let mut align_sam_depth_stream: Option<Receiver<ParseOutput>> = None;
+    let mut align_sam_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
+    let mut align_sam_depth_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut align_sam_eval_stream: Option<Receiver<ParseOutput>> = None;
+    let mut consensus_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
+    let mut call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
+
+
 
     // External tools check
     check_versions(vec![SAMTOOLS_TAG, MINIMAP2_TAG, FASTP_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG]).await
@@ -1756,8 +1724,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let mut align_streams_iter = align_sam_streams.into_iter();
             let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;  // For call variants
-            align_sam_stats_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
-            align_sam_depth_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
+            align_sam_stats_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
+            align_sam_depth_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
             align_sam_eval_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
 
             let mut align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
@@ -1774,10 +1742,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             cleanup_tasks.extend(consensus_cleanup_tasks);
             cleanup_receivers.extend(consensus_cleanup_receivers);
-
+            consensus_stats_stream = Some(consensus_stats_stream_rx);
 
             // Call Variants
-            let (call_bcftools_stats_stream, _, call_cleanup_tasks, call_cleanup_receivers) = call_variants(
+            let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) = call_variants(
                 config.clone(),
                 align_sam_call_stream,
                 target_ref_fasta_path.clone(),
@@ -1786,7 +1754,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             ).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
-
+            call_bcftools_stats_stream = Some(call_bcftools_stats_stream_out);
 
             // Realign Consensus to Ref
             let realign_cleanup_tasks = realign_consensus_to_ref(
@@ -1817,18 +1785,18 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     //
     // // Calculate Statistics
 
-    // calculate_statistics(
-    //     config.clone(),
-    //     &no_ext_sample_base,
-    //     Some(bam_stats_stream.into_inner()),
-    //     Some(bam_depth_stream),
-    //     no_host_seqkit_out_stream_stats,
-    //     ercc_stats_task,
-    //     Some(consensus_stats_stream),
-    //     Some(call_bcftools_stats_stream),
-    //     &out_dir,
-    //     technology,
-    // ).await?;
+    calculate_statistics(
+        config.clone(),
+        &no_ext_sample_base,
+        align_sam_stats_stream,
+        align_sam_depth_stream,
+        no_host_seqkit_out_stream_stats,
+        ercc_stats_task,
+        consensus_stats_stream,
+        call_bcftools_stats_stream,
+        &out_dir,
+        technology,
+    ).await?;
     //
     // // Assembly Evaluation
     // let results = try_join_all(quast_write_tasks).await
