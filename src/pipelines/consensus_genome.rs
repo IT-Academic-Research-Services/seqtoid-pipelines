@@ -288,7 +288,10 @@ async fn align_to_host(
 
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([("-f".to_string(), Some("4".to_string()))]),
+        subcommand_fields: HashMap::from([
+            ("-f".to_string(), Some("4".to_string())), // unmapped, since what does not map to host is what we want to filter
+            ("-h".to_string(), None),                 // Include header
+        ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
         .map_err(|e| PipelineError::ToolExecution {
@@ -486,12 +489,7 @@ async fn process_ercc(
         })?;
     cleanup_tasks.push(minimap2_err_task);
 
-    // Prepend @HD for valid SAM (handles no-alignments)
-    let (header_tx, minimap2_with_header_rx) = mpsc::channel(config.base_buffer_size);
-    header_tx.send(ParseOutput::Bytes(b"@HD\tVN:1.6\tSO:unknown\n".to_vec())).await
-        .map_err(|e| PipelineError::ToolExecution { tool: MINIMAP2_TAG.to_string(), error: e.to_string() })?;
-
-    let minimap2_raw_out = parse_child_output(
+    let minimap2_out_stream = parse_child_output(
         &mut minimap2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
@@ -507,21 +505,9 @@ async fn process_ercc(
         return Err(PipelineError::ToolExecution { tool: MINIMAP2_TAG.to_string(), error: "Non-zero exit".to_string() });
     }
 
-    let forward_task = tokio::spawn(async move {
-        let mut raw_stream = ReceiverStream::new(minimap2_raw_out);
-        while let Some(po) = raw_stream.next().await {
-            if header_tx.send(po).await.is_err() {
-                eprintln!("Downstream receiver dropped during header forward, continuing to drain");
-            }
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(forward_task);
-
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
-            // ("-F".to_string(), Some("4".to_string())), // Mapped only
             ("--no-PG".to_string(), None),
         ]),
     };
@@ -533,7 +519,7 @@ async fn process_ercc(
 
     let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
         config.clone(),
-        minimap2_with_header_rx,
+        minimap2_out_stream,
         SAMTOOLS_TAG,
         samtools_args_view,
         StreamDataType::JustBytes,
