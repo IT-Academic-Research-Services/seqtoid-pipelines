@@ -521,7 +521,7 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-                
+
             });
         }
         (None, SequenceReader::Fastq(reader)) => {
@@ -626,46 +626,31 @@ pub fn read_and_interleave_sequences(
 /// # Returns
 /// bool: true if reads are a matched pair.
 ///
-fn compare_read_ids(
-    id1: &str,
-    id2: &str,
-) -> bool {
-    
-    // Try Casava 1.8+ format first (space-separated)
-    let id1_parts: Vec<&str> = id1.splitn(2, ' ').collect();
-    let id2_parts: Vec<&str> = id2.splitn(2, ' ').collect();
+fn compare_read_ids(id1: &str, id2: &str) -> bool {
+    // Extract ID parts without @
+    let id_part1 = id1.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
+    let id_part2 = id2.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
 
-    if id1_parts.len() == 2 && id2_parts.len() == 2 {
-        let read_id1 = id1_parts[0];
-        let read_id2 = id2_parts[0];
-        if read_id1 != read_id2 {
-            return false;
-        }
-        let attr1_parts: Vec<&str> = id1_parts[1].split(':').collect();
-        let attr2_parts: Vec<&str> = id2_parts[1].split(':').collect();
-        if attr1_parts.is_empty() || attr2_parts.is_empty() {
-            eprintln!("Invalid attributes format in R1 or R2");
-            return false;
-        }
-        let read_num1 = attr1_parts[0];
-        let read_num2 = attr2_parts[0];
-        return (read_num1 == "1" && read_num2 == "2") || (read_num1 == "2" && read_num2 == "1");
+    // Check for identical IDs (SRA and some Casava 1.8+ cases)
+    if id_part1 == id_part2 {
+        return true;
     }
 
-    // Fallback to /1 and /2 format
-    if id1.ends_with("/1") && id2.ends_with("/2") {
-        let base_id1 = id1.trim_end_matches("/1");
-        let base_id2 = id2.trim_end_matches("/2");
-        return base_id1 == base_id2;
-    } else if id1.ends_with("/2") && id2.ends_with("/1") {
-        let base_id1 = id1.trim_end_matches("/2");
-        let base_id2 = id2.trim_end_matches("/1");
-        return base_id1 == base_id2;
+    // Check for /1 and /2 format (pre-Casava 1.8 Illumina and custom formats)
+    let full_id_part1 = id1.splitn(2, ' ').next().unwrap_or("");
+    let full_id_part2 = id2.splitn(2, ' ').next().unwrap_or("");
+
+
+    if (full_id_part1.ends_with("/1") && full_id_part2.ends_with("/2")) ||
+        (full_id_part1.ends_with("/2") && full_id_part2.ends_with("/1")) {
+        let base1 = &full_id_part1[..full_id_part1.len() - 2];
+        let base2 = &full_id_part2[..full_id_part2.len() - 2];
+        if base1 == base2 {
+            return true;
+        }
     }
 
-    eprintln!("Unsupported read ID format or mismatched pairs");
     false
-    
 }
 
 /// Writes out a FASTA file to a FIFO pipe.

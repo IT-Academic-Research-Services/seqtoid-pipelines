@@ -160,19 +160,16 @@ where
         let mut count = 0;
 
         while let Some(item) = input.next().await {
-            let mut failed = false;
-            for tx in &mut output_txs {
+            let mut active_txs = Vec::new();
+            for tx in output_txs.into_iter() {
                 match tx.send(item.clone()).await {
-                    Ok(()) => (),
-                    Err(_) => {
-                        eprintln!("Receiver dropped at item {}", count + 1);
-                        failed = true;
-                        break;
-                    }
+                    Ok(()) => active_txs.push(tx),
+                    Err(_) => eprintln!("Receiver dropped at item {}, continuing for remaining receivers", count + 1),
                 }
             }
-            if failed {
-                let _ = done_tx.send(Err(anyhow!("Receiver dropped at item {}", count + 1)));
+            output_txs = active_txs;
+            if output_txs.is_empty() {
+                let _ = done_tx.send(Err(anyhow!("All receivers dropped at item {}, data loss occurred", count + 1)));
                 return;
             }
 
@@ -597,8 +594,7 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 Ok(n) => {
                     let chunk = buffer[..n].to_vec();
                     if tx.send(ParseOutput::Bytes(chunk)).await.is_err() {
-                        eprintln!("No active receivers for byte chunk");
-                        break;
+                        eprintln!("No active receivers for byte chunk, continuing to drain");
                     }
                 }
                 Err(e) => {
@@ -607,6 +603,7 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
 
     Ok(rx)
@@ -632,8 +629,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     tokio::spawn(async move {
         while reader.read_line(&mut line).await? > 0 {
             if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
-                eprintln!("No active receivers for line");
-                break;
+                eprintln!("No active receivers for line, continuing to drain");
             }
             line.clear();
         }

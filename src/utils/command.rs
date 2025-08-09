@@ -354,8 +354,6 @@ pub mod bcftools {
                 }
                 BcftoolsSubcommand::Call => {
                     args_vec.push("call".to_string());
-                    args_vec.push("-O".to_string());
-                    args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
                 }
                 BcftoolsSubcommand::Mpileup => {
                     args_vec.push("mpileup".to_string());

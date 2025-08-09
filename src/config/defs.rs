@@ -1,3 +1,4 @@
+// src/config/defs.rs
 use std::path::PathBuf;
 use crate::cli::Arguments;
 use lazy_static::lazy_static;
@@ -99,7 +100,6 @@ pub const FASTQ_TAG: &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
-
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -133,4 +133,24 @@ impl RunConfig {
             CoreAllocation::Minimal => 1,
         }
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum PipelineError {
+    #[error("File not found: {0}")]
+    FileNotFound(PathBuf),
+    #[error("Invalid FASTQ format in {0}")]
+    InvalidFastqFormat(String),
+    #[error("Tool execution failed: {tool} with error: {error}")]
+    ToolExecution { tool: String, error: String },
+    #[error("Stream data dropped unexpectedly")]
+    StreamDataDropped,
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error("Reference sequence retrieval failed: {0}")]
+    ReferenceRetrievalFailed(String),
+    #[error("Empty stream encountered")]
+    EmptyStream,
+    #[error("Other error: {0}")]
+    Other(#[from] anyhow::Error), // Wraps external errors
 }
