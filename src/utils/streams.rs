@@ -144,7 +144,6 @@ where
     let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
     let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size);
 
-
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let mut output_txs = Vec::with_capacity(n_outputs);
     let mut output_rxs = Vec::with_capacity(n_outputs);
@@ -158,13 +157,16 @@ where
     tokio::spawn(async move {
         let mut input = Box::pin(input);
         let mut count = 0;
+        let mut dropped_count = 0;
 
         while let Some(item) = input.next().await {
             let mut active_txs = Vec::new();
             for tx in output_txs.into_iter() {
                 match tx.send(item.clone()).await {
                     Ok(()) => active_txs.push(tx),
-                    Err(_) => eprintln!("Receiver dropped at item {}, continuing for remaining receivers", count + 1),
+                    Err(_) => {
+                        dropped_count += 1;
+                    }
                 }
             }
             output_txs = active_txs;
@@ -181,7 +183,11 @@ where
             }
         }
 
-        let _ = done_tx.send(Ok(()));
+        if dropped_count > 0 {
+            let _ = done_tx.send(Err(anyhow!("{} receivers dropped mid-stream, potential data loss", dropped_count)));
+        } else {
+            let _ = done_tx.send(Ok(()));
+        }
     });
 
     Ok((output_rxs, done_rx))
@@ -543,8 +549,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                         seq: current_seq.clone(),
                     };
                     if tx.send(ParseOutput::Fasta(record)).await.is_err() {
-                        eprintln!("No active receivers for FASTA record");
-                        break;
+                        return Err(anyhow!("Receiver dropped during FASTA parsing, data loss detected"));
                     }
                     current_seq.clear();
                 }
@@ -563,9 +568,10 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                 seq: current_seq,
             };
             if tx.send(ParseOutput::Fasta(record)).await.is_err() {
-                eprintln!("No active receivers for FASTA record");
+                return Err(anyhow!("Receiver dropped during final FASTA parsing, data loss detected"));
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
     Ok(rx)
 }
@@ -594,12 +600,11 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 Ok(n) => {
                     let chunk = buffer[..n].to_vec();
                     if tx.send(ParseOutput::Bytes(chunk)).await.is_err() {
-                        eprintln!("No active receivers for byte chunk, continuing to drain");
+                        return Err(anyhow!("Receiver dropped during byte parsing, data loss detected"));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading bytes: {}", e);
-                    break;
+                    return Err(anyhow!("Error reading bytes: {}", e));
                 }
             }
         }
@@ -629,7 +634,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     tokio::spawn(async move {
         while reader.read_line(&mut line).await? > 0 {
             if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
-                eprintln!("No active receivers for line, continuing to drain");
+                return Err(anyhow!("Receiver dropped during line parsing, data loss detected"));
             }
             line.clear();
         }
