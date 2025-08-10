@@ -1,6 +1,7 @@
 use std::io;
 use std::fs::File;
 use std::sync::Arc;
+use std::io::Write;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
 use crate::utils::streams::ParseOutput;
@@ -17,6 +18,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
+use crate::utils::sambam::stream_sam_alignment_counter;
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel, SequenceRecord, parse_header, stream_record_counter};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -517,7 +519,58 @@ async fn process_ercc(
         })?;
 
     if !minimap2_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
-        return Err(PipelineError::ToolExecution { tool: MINIMAP2_TAG.to_string(), error: "Non-zero exit".to_string() });
+        return Err(PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: "Non-zero exit".to_string(),
+        });
+    }
+
+    // Check for no ERCC alignments (header-only SAM)
+    let (sam_streams, sam_done_rx) = t_junction(
+        ReceiverStream::new(minimap2_out_stream),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        Some(config.args.stream_sleep_ms),
+        50,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    if sam_streams.len() < 2 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    cleanup_receivers.push(sam_done_rx);
+    let mut sam_streams_iter = sam_streams.into_iter();
+    let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let sam_view_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // Dedicated SAM alignment count task
+    let (count_tx, mut count_rx) = mpsc::channel(1);
+    let count_task = tokio::spawn(async move {
+        let count = stream_sam_alignment_counter(sam_check_stream, true).await?;
+        count_tx.send(count).await
+            .map_err(|e| anyhow!("Failed to send SAM alignment count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(count_task);
+
+    let alignment_count = count_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if alignment_count == 0 {
+        // No ERCC alignments: return zero stats, continue pipeline
+        let zero_stats = HashMap::from([
+            ("ercc_mapped_reads".to_string(), 0),
+            ("ercc_mapped_paired".to_string(), 0),
+        ]);
+        let stats_write_task = tokio::spawn(async move {
+            let mut file = File::create(&ercc_stats_file_path)?;
+            writeln!(file, "ercc_mapped_reads: 0\nercc_mapped_paired: 0")?;
+            Ok(())
+        });
+        cleanup_tasks.push(stats_write_task);
+        return Ok((ReceiverStream::new(bypass_output_stream), Some(tokio::spawn(async { Ok(zero_stats) })), cleanup_tasks, cleanup_receivers));
     }
 
     let samtools_config_view = SamtoolsConfig {
@@ -534,7 +587,7 @@ async fn process_ercc(
 
     let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
         config.clone(),
-        minimap2_out_stream,
+        sam_view_stream,
         SAMTOOLS_TAG,
         samtools_args_view,
         StreamDataType::JustBytes,
@@ -561,12 +614,15 @@ async fn process_ercc(
         })?;
 
     if !samtools_child_view.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
-        return Err(PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: "Non-zero exit".to_string() });
+        return Err(PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: "Non-zero exit".to_string(),
+        });
     }
 
     let stats_samtools_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Stats,
-        subcommand_fields: HashMap::from([("-".to_string(), None)]), // Stdin SAM
+        subcommand_fields: HashMap::from([("-".to_string(), None)]),
     };
     let stats_samtools_args = generate_cli(SAMTOOLS_TAG, &config, Some(&stats_samtools_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -603,7 +659,10 @@ async fn process_ercc(
         })?;
 
     if !stats_samtools_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
-        return Err(PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: "Non-zero exit on ERCC stats".to_string() });
+        return Err(PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: "Non-zero exit on ERCC stats".to_string(),
+        });
     }
 
     let (stats_streams, stats_done_rx) = t_junction(
