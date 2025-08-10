@@ -17,7 +17,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel, SequenceRecord, parse_header};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel, SequenceRecord, parse_header, stream_record_counter};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -290,6 +290,7 @@ async fn align_to_host(
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
             ("-f".to_string(), Some("4".to_string())), // unmapped, since what does not map to host is what we want to filter
+            ("--no-PG".to_string(), None),
             ("-h".to_string(), None),                 // Include header
         ]),
     };
@@ -368,7 +369,7 @@ async fn align_to_host(
 
     let (host_streams, host_done_rx) = t_junction(
         samtools_out_stream_fastq,
-        3,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
@@ -378,15 +379,29 @@ async fn align_to_host(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if host_streams.len() < 3 {
-        return Err(PipelineError::EmptyStream);
-    }
-
     let mut cleanup_receivers = vec![host_done_rx];
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let no_host_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let no_host_count_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let no_host_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // Check task for host-removed empty FASTQ
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let check_task = tokio::spawn(async move {
+        let count = stream_record_counter(no_host_check_stream, true).await?;
+        check_tx.send(count).await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(check_task);
+
+    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if check_count == 0 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    eprintln!("\n\n\n\n******Check count = {}\n********\n\n\n\n", check_count);
 
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)
         .map_err(|e| PipelineError::ToolExecution {

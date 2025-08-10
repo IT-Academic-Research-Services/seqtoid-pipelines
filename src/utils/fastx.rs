@@ -370,7 +370,7 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 /// u64: Number of records in the FASTQ.
 ///
 #[allow(dead_code)]
-pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
+pub fn record_counter_file(path: &PathBuf) -> io::Result<u64> {
     let mut counter = 0;
     match sequence_reader(path)? {
         SequenceReader::Fasta(reader) => {
@@ -680,6 +680,43 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
+pub async fn stream_record_counter(
+    rx: mpsc::Receiver<ParseOutput>,
+    early_exit: bool,
+) -> Result<u64, anyhow::Error> {
+    let mut stream = ReceiverStream::new(rx);
+    let mut counter: u64 = 0;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Bytes(chunk) => {
+                let chunk_str = String::from_utf8_lossy(&chunk);
+                for line in chunk_str.lines() {
+                    if line.starts_with('@') || line.starts_with('>') {
+                        counter += 1;
+                        if early_exit {
+                            return Ok(1); // Early exit: Not empty
+                        }
+                    }
+                }
+            }
+            ParseOutput::Fastq(_) => {
+                counter += 1;
+                if early_exit {
+                    return Ok(1);
+                }
+            }
+            ParseOutput::Fasta(_) => {
+                counter += 1;
+                if early_exit {
+                    return Ok(1);
+                }
+            }
+        }
+    }
+
+    Ok(counter)
+}
 
 /// Filters a stream of FASTQ records based on a predicate applied to the ID line.
 ///
@@ -778,4 +815,60 @@ mod tests {
             Err(e) => Err(e),
         }
     }
+    #[tokio::test]
+    async fn test_stream_record_counter_fastq() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let fastq_data = vec![
+            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec()),
+            ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "read2".to_string(),
+                desc: None,
+                seq: b"GCTA".to_vec(),
+                qual: b"HHHH".to_vec(),
+            }),
+        ];
+
+        tokio::spawn(async move {
+            for item in fastq_data {
+                tx.send(item).await.unwrap();
+            }
+        });
+
+        let count = stream_record_counter(rx, false).await?;
+        assert_eq!(count, 2, "Should count 2 FASTQ records");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_record_counter_fasta_early_exit() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let fasta_data = vec![
+            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec()),
+            ParseOutput::Fasta(SequenceRecord::Fasta {
+                id: "seq2".to_string(),
+                desc: None,
+                seq: b"GCTA".to_vec(),
+            }),
+        ];
+
+        tokio::spawn(async move {
+            for item in fasta_data {
+                tx.send(item).await.unwrap();
+            }
+        });
+
+        let count = stream_record_counter(rx, true).await?;
+        assert_eq!(count, 1, "Should stop at first FASTA record with early_exit");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_record_counter_empty() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        drop(tx); // Close immediately
+        let count = stream_record_counter(rx, false).await?;
+        assert_eq!(count, 0, "Should count 0 for empty stream");
+        Ok(())
+    }
+
 }
