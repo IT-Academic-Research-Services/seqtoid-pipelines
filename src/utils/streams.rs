@@ -112,13 +112,14 @@ pub async fn t_junction<S, T>(
     stream_sleep_ms: Option<u64>,
     backpressure_pause_ms: u64,
     data_type: StreamDataType,
+    label: String,
 ) -> Result<(Vec<mpsc::Receiver<T>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
 where
     S: Stream<Item = T> + Unpin + Send + 'static,
     T: Clone + Send + Sync + 'static,
 {
     if n_outputs == 0 {
-        return Err(anyhow!("No subscribers: cannot process stream"));
+        return Err(anyhow!("No subscribers: cannot process stream in {}", label));
     }
 
     let mut system = System::new_all();
@@ -137,7 +138,7 @@ where
     let max_buffer_size = if available_ram > 0 {
         ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / record_size as f64) as usize
     } else {
-        eprintln!("Warning: Failed to detect available RAM, using fallback buffer size");
+        eprintln!("Warning: Failed to detect available RAM in {}, using fallback buffer size", label);
         base_buffer_size * n_outputs.max(1) * 2
     };
 
@@ -171,7 +172,7 @@ where
             }
             output_txs = active_txs;
             if output_txs.is_empty() {
-                let _ = done_tx.send(Err(anyhow!("All receivers dropped at item {}, data loss occurred", count + 1)));
+                let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, count + 1)));
                 return;
             }
 
@@ -184,7 +185,7 @@ where
         }
 
         if dropped_count > 0 {
-            let _ = done_tx.send(Err(anyhow!("{} receivers dropped mid-stream, potential data loss", dropped_count)));
+            let _ = done_tx.send(Err(anyhow!("{}: {} receivers dropped mid-stream, potential data loss", label, dropped_count)));
         } else {
             let _ = done_tx.send(Ok(()));
         }
