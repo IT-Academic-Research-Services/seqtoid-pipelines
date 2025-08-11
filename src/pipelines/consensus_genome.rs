@@ -403,8 +403,6 @@ async fn align_to_host(
         return Err(PipelineError::EmptyStream);
     }
 
-    eprintln!("\n\n\n\n******Check count = {}\n********\n\n\n\n", check_count);
-
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)
         .map_err(|e| PipelineError::ToolExecution {
             tool: PIGZ_TAG.to_string(),
@@ -1326,6 +1324,16 @@ async fn realign_consensus_to_ref(
             error: e.to_string(),
         })?;
 
+    // keep alive task
+    let mafft_wait_task = tokio::spawn(async move {
+        let status = realign_consensus_mafft_child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("MAFFT exited with non-zero status: {}", status));
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(mafft_wait_task);
+
     let realign_consensus_write_task = tokio::spawn(stream_to_file(
         consensus_samtools_out_stream,
         realign_consensus_path,
@@ -1519,7 +1527,8 @@ async fn evaluate_assembly(
     target_ref_fasta_path: PathBuf,
     align_bam_path: PathBuf,
     consensus_file_path: PathBuf,
-) -> Result<(), PipelineError> {
+) -> Result<(Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+    let mut cleanup_tasks = vec![];
     let quast_config = QuastConfig {
         ref_fasta: target_ref_fasta_path.to_string_lossy().into_owned(),
         ref_bam: align_bam_path.to_string_lossy().into_owned(),
@@ -1535,7 +1544,7 @@ async fn evaluate_assembly(
         error: e.to_string(),
     })?;
 
-    let (_, assembly_eval_quast_err_task) = spawn_cmd(
+    let (mut assembly_eval_quast_child, assembly_eval_quast_err_task) = spawn_cmd(
         config.clone(),
         QUAST_TAG,
         assembly_eval_quast_args,
@@ -1544,12 +1553,20 @@ async fn evaluate_assembly(
         tool: QUAST_TAG.to_string(),
         error: e.to_string(),
     })?;
+    cleanup_tasks.push(assembly_eval_quast_err_task);
 
-    assembly_eval_quast_err_task.await
-        .map_err(|e| PipelineError::Other(e.into()))?
-        .map_err(|e| PipelineError::Other(e))?;
+    // Await child exit in a task to keep it alive
+    let quast_wait_task = tokio::spawn(async move {
+        let status = assembly_eval_quast_child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("QUAST exited with non-zero status: {}", status));
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(quast_wait_task);
 
-    Ok(())
+
+    Ok((cleanup_tasks))
 }
 
 
