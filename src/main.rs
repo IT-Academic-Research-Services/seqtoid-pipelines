@@ -82,6 +82,11 @@ async fn main() -> Result<()> {
 }
 
 async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+
+    // consensus_genome::old_run(&run_config)
+    //     .await
+    //     .map_err(|e| PipelineError::Other(e.into()))
+
     consensus_genome::run(run_config).await
 }
 
