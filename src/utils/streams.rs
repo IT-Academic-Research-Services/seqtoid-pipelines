@@ -13,6 +13,7 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
@@ -113,6 +114,7 @@ pub async fn t_junction<S, T>(
     backpressure_pause_ms: u64,
     data_type: StreamDataType,
     label: String,
+    notify: Option<Arc<Notify>>,
 ) -> Result<(Vec<mpsc::Receiver<T>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
 where
     S: Stream<Item = T> + Unpin + Send + 'static,
@@ -124,7 +126,11 @@ where
 
     let mut system = System::new_all();
     system.refresh_memory();
-    let available_ram = system.available_memory();
+    let mut available_ram = system.available_memory();
+    if available_ram == 0 {
+        available_ram = system.total_memory().max(8_000_000) / 4; // Assume 8GB min if total=0
+    }
+
     const MAX_PROCESSES: usize = 4;
     const RAM_FRACTION: f64 = 0.25;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
@@ -149,9 +155,11 @@ where
     let mut output_txs = Vec::with_capacity(n_outputs);
     let mut output_rxs = Vec::with_capacity(n_outputs);
 
-    for _ in 0..n_outputs {
+    // Track channels with IDs
+    let mut channel_status = vec![true; n_outputs]; // true = active, false = dropped
+    for i in 0..n_outputs {
         let (tx, rx) = mpsc::channel(buffer_size);
-        output_txs.push(tx);
+        output_txs.push((i, tx)); // Store ID with tx
         output_rxs.push(rx);
     }
 
@@ -162,16 +170,21 @@ where
 
         while let Some(item) = input.next().await {
             let mut active_txs = Vec::new();
-            for tx in output_txs.into_iter() {
+            for (id, tx) in output_txs.iter() {
                 match tx.send(item.clone()).await {
-                    Ok(()) => active_txs.push(tx),
+                    Ok(()) => active_txs.push((*id, tx.clone())),
                     Err(_) => {
-                        dropped_count += 1;
+                        if channel_status[*id] {
+                            eprintln!("{}: Receiver {} dropped at item {}", label, id, count + 1);
+                            channel_status[*id] = false;
+                            dropped_count += 1;
+                        }
                     }
                 }
             }
             output_txs = active_txs;
             if output_txs.is_empty() {
+                eprintln!("{}: All receivers dropped at item {}. Channel status: {:?}", label, count + 1, channel_status);
                 let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, count + 1)));
                 return;
             }
@@ -184,6 +197,10 @@ where
             }
         }
 
+        //eprintln!("{}: Producer finished after {} items. Channel status: {:?}", label, count, channel_status);
+        if let Some(n) = notify {
+            n.notify_waiters();
+        }
         if dropped_count > 0 {
             let _ = done_tx.send(Err(anyhow!("{}: {} receivers dropped mid-stream, potential data loss", label, dropped_count)));
         } else {
