@@ -594,6 +594,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::IlluminaFastq,
+            "test_create_db_illumina_small".to_string(),
+            None,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -633,6 +635,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::OntFastq,
+            "test_create_db_ont_small".to_string(),
+            None,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -756,6 +760,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::IlluminaFastq,
+            "test_load_index".to_string(),
+            None,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;

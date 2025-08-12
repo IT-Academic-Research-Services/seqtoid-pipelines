@@ -436,7 +436,7 @@ pub async fn parse_child_output(
 /// # Arguments
 ///
 /// * `reader` - reading stream
-/// * `buffer_size` - stream buffer size 
+/// * `buffer_size` - stream buffer size
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
@@ -467,7 +467,7 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 eprintln!("Invalid FASTQ format: expected '@', got '{}'", id_line);
                 return;
             }
-            
+
             let id = id_line[1..].to_string();
             let desc = None;
 
@@ -526,7 +526,7 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
-        
+
     });
 
     Ok(rx)
@@ -599,7 +599,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
 /// # Arguments
 ///
 /// * `reader` - reading stream
-/// * `buffer_size` - stream buffer size 
+/// * `buffer_size` - stream buffer size
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
@@ -897,11 +897,16 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_zero_streams".to_string(),
+            None,
         )
             .await;
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert_eq!(error.to_string(), "No subscribers: cannot process stream");
+        assert_eq!(
+            error.to_string(),
+            "No subscribers: cannot process stream in test_t_junction_zero_streams"
+        );
         Ok(())
     }
 
@@ -930,6 +935,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_two_records".to_string(),
+            None,
         )
             .await?;
         let mut output1 = ReceiverStream::new(outputs.pop().unwrap());
@@ -961,6 +968,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_long_stream".to_string(),
+            None,
         )
             .await?;
         let mut output1 = ReceiverStream::new(outputs.pop().unwrap());
@@ -990,6 +999,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_ten_streams".to_string(),
+            None,
         )
             .await?;
         let mut records = vec![Vec::new(); outputs.len()];
@@ -1030,6 +1041,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_empty_stream".to_string(),
+            None,
         )
             .await?;
         for rx in outputs {
@@ -1051,6 +1064,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_single_record".to_string(),
+            None,
         )
             .await?;
         let mut handles = Vec::new();
@@ -1091,6 +1106,8 @@ mod tests {
             Some(100),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_slow_consumer".to_string(),
+            None,
         )
             .await?;
         let mut handles = Vec::new();
@@ -1150,6 +1167,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_million_records_ten_streams".to_string(),
+            None,
         )
             .await?;
 
@@ -1222,6 +1241,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_stream_to_cmd_valid".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1255,6 +1276,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_valid_cat".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1292,6 +1315,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_valid_parse_output".to_string(),
+            None,
         )
             .await?;
         let rx = outputs.pop().unwrap();
@@ -1340,6 +1365,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_invalid_cmd".to_string(),
+            None,
         )
             .await?;
         let result = stream_to_cmd(
@@ -1372,6 +1399,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_empty_stream".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1407,6 +1436,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_large_stream".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1464,6 +1495,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_premature_exit".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1501,6 +1534,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_resource_cleanup".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
