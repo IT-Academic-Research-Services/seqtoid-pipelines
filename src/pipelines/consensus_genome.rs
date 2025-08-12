@@ -1,4 +1,3 @@
-use std::io;
 use std::fs::File;
 use std::sync::Arc;
 use std::io::Write;
@@ -15,13 +14,11 @@ use std::time::Instant;
 use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::Notify;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
-use crate::utils::sambam::stream_sam_alignment_counter;
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, validate_sequence_parallel, SequenceRecord, parse_header, stream_record_counter};
-use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, bytes_to_lines};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
+use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
@@ -31,7 +28,6 @@ use crate::utils::db::{get_index, retrieve_h5_seq};
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
 use fxhash::FxHashMap as FxHashMap;
-use crate::utils::streams::ToBytes;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
@@ -1713,14 +1709,17 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let sample_base: String;
     let file1_r1r2 = r1r2_base(&file1_path);
-    sample_base = match file1_r1r2.file_name {
+    eprintln!("file_r1r2 {:?}", file1_r1r2.file_name);
+    eprintln!("r1 tag {:?}", file1_r1r2.r1_tag);
+    eprintln!("prefix {:?}", file1_r1r2.prefix);
+    sample_base = match file1_r1r2.prefix {
         Some(prefix) => prefix,
         None => {
             eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
             file1_path.to_string_lossy().into_owned()
         }
     };
-
+    eprintln!("base {:?}", sample_base);
     if !file1_path.exists() {
         return Err(PipelineError::FileNotFound(file1_path));
     }
@@ -1728,6 +1727,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
     let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
     let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+    eprintln!("no_ext_sample_base {:?}", no_ext_sample_base);
 
     let file2_path: Option<PathBuf> = match &config.args.file2 {
         Some(file) => {
