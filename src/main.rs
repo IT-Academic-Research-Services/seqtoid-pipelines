@@ -4,6 +4,7 @@ mod config;
 
 use std::time::{Instant, SystemTime};
 use std::{env, fs};
+use chrono::{DateTime, Utc};
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,6 @@ use clap::Parser;
 use num_cpus;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
-use tokio::runtime::Builder;
 use rayon::ThreadPoolBuilder;
 
 use crate::cli::parse;
@@ -124,7 +124,8 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .map(|secs| {
-                    let dt = chrono::NaiveDateTime::from_timestamp_opt(secs as i64, 0).unwrap();
+                    let dt = DateTime::from_timestamp(secs as i64, 0)
+                        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
                     dt.format("%Y%m%d").to_string()
                 })
                 .unwrap_or_else(|_| "19700101".to_string());
