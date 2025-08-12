@@ -263,6 +263,7 @@ pub struct R1R2Result {
     pub r1_tag: Option<String>,
     pub file_name: Option<String>,
     pub index: Option<usize>,
+    pub prefix: Option<String>,
     
 }
 
@@ -304,6 +305,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                                     r1_tag: Some(r1_tag),
                                     file_name: Some(new_file),
                                     index: Some(index),
+                                    prefix: Some(prefix),
                                 };
                             }
                         }
@@ -315,6 +317,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                         r1_tag: None,
                         file_name: None,
                         index: None,
+                        prefix: None,
                     };
                 }
             }
@@ -325,6 +328,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                 r1_tag: None,
                 file_name: None,
                 index: None,
+                prefix: None,
             };
         }
     }
@@ -334,6 +338,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
         r1_tag: None,
         file_name: None,
         index: None,
+        prefix: None,
     };
     
 }
