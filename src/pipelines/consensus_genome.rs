@@ -473,7 +473,18 @@ async fn process_ercc(
     ercc_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
-) -> Result<(ReceiverStream<ParseOutput>, Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
     let ercc_stats_file_path = file_path_manipulator(
         &PathBuf::from(no_ext_sample_base),
         Some(out_dir),
@@ -484,34 +495,36 @@ async fn process_ercc(
 
     let (ercc_streams, ercc_done_rx) = t_junction(
         input_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
         50,
         StreamDataType::IlluminaFastq,
         "process_ercc_bypass".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if ercc_streams.len() < 2 {
+    if ercc_streams.len() < 3 {
         return Err(PipelineError::EmptyStream);
     }
 
-    let mut cleanup_receivers = vec![ercc_done_rx];
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    cleanup_receivers.push(ercc_done_rx);
 
+    // Process alignment stream for ERCC mapping
     let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(
         ReceiverStream::new(alignment_stream),
         None,
     )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
-    let mut cleanup_tasks = vec![ercc_query_write_task];
+    cleanup_tasks.push(ercc_query_write_task);
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(ercc_path, ercc_query_pipe_path)))
         .map_err(|e| PipelineError::ToolExecution {
@@ -550,7 +563,7 @@ async fn process_ercc(
         });
     }
 
-    // Check for no ERCC alignments (header-only SAM)
+    // Split SAM stream for check and further processing
     let (sam_streams, sam_done_rx) = t_junction(
         ReceiverStream::new(minimap2_out_stream),
         2,
@@ -560,7 +573,7 @@ async fn process_ercc(
         50,
         StreamDataType::JustBytes,
         "process_ercc_empty_check".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -574,25 +587,50 @@ async fn process_ercc(
     let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_view_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Dedicated SAM alignment count task
+    // Check task for empty ERCC alignments
     let (count_tx, mut count_rx) = mpsc::channel(1);
     let count_task = tokio::spawn(async move {
-        let count = stream_sam_alignment_counter(sam_check_stream, true).await?;
-        count_tx.send(count).await
+        let mut stream = ReceiverStream::new(sam_check_stream);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(_) => {
+                    count = 1; // Count only the first SAM alignment
+                    // Continue consuming to keep receiver alive
+                }
+                _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
+            }
+        }
+        count_tx
+            .send(count)
+            .await
             .map_err(|e| anyhow!("Failed to send SAM alignment count: {}", e))?;
         Ok(())
     });
     cleanup_tasks.push(count_task);
 
-    let alignment_count = count_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
-    if alignment_count == 0 {  // Case where there were no ERCC spike ins
+    let alignment_count = count_rx
+        .recv()
+        .await
+        .ok_or(PipelineError::EmptyStream)?;
 
+    if alignment_count == 0 {  // Case of no ERCC spike ins
+        // Create a dummy stream for the return value
+        let (dummy_tx, dummy_rx) = mpsc::channel(config.base_buffer_size);
+        drop(dummy_tx); // Ensure stream is empty but valid
+        // Drain the bypass and stats streams
         let drain_task = tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(sam_view_stream);
+            let mut stream = ReceiverStream::new(bypass_output_stream);
+            while stream.next().await.is_some() {}
+            Ok(())
+        });
+        let stats_drain_task = tokio::spawn(async move {
+            let mut stream = ReceiverStream::new(stats_stream);
             while stream.next().await.is_some() {}
             Ok(())
         });
         cleanup_tasks.push(drain_task);
+        cleanup_tasks.push(stats_drain_task);
         let zero_stats = HashMap::from([
             ("ercc_mapped_reads".to_string(), 0),
             ("ercc_mapped_paired".to_string(), 0),
@@ -603,14 +641,18 @@ async fn process_ercc(
             Ok(())
         });
         cleanup_tasks.push(stats_write_task);
-        return Ok((ReceiverStream::new(bypass_output_stream), Some(tokio::spawn(async { Ok(zero_stats) })), cleanup_tasks, cleanup_receivers));
+        return Ok((
+            ReceiverStream::new(dummy_rx),
+            Some(tokio::spawn(async { Ok(zero_stats) })),
+            cleanup_tasks,
+            cleanup_receivers,
+        ));
     }
 
+    // Non-zero case: process stats
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("--no-PG".to_string(), None),
-        ]),
+        subcommand_fields: HashMap::from([("--no-PG".to_string(), None)]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
         .map_err(|e| PipelineError::ToolExecution {
@@ -646,7 +688,12 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
-    if !samtools_child_view.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
+    if !samtools_child_view
+        .wait()
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .success()
+    {
         return Err(PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: "Non-zero exit".to_string(),
@@ -691,7 +738,12 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
-    if !stats_samtools_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?.success() {
+    if !stats_samtools_child
+        .wait()
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .success()
+    {
         return Err(PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: "Non-zero exit on ERCC stats".to_string(),
@@ -707,7 +759,7 @@ async fn process_ercc(
         50,
         StreamDataType::JustBytes,
         "process_ercc_stats".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -721,15 +773,17 @@ async fn process_ercc(
     let stats_file_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let stats_parse_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let stats_write_task = tokio::spawn(stream_to_file(
-        stats_file_stream,
-        ercc_stats_file_path,
-    ));
+    let stats_write_task = tokio::spawn(stream_to_file(stats_file_stream, ercc_stats_file_path));
     cleanup_tasks.push(stats_write_task);
 
     let ercc_stats_task = Some(tokio::spawn(parse_ercc_stats(stats_parse_stream)));
 
-    Ok((ReceiverStream::new(bypass_output_stream), ercc_stats_task, cleanup_tasks, cleanup_receivers))
+    Ok((
+        ReceiverStream::new(bypass_output_stream),
+        ercc_stats_task,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 
