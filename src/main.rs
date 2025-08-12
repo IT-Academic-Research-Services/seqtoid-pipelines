@@ -4,7 +4,7 @@ mod config;
 
 use std::time::{Instant, SystemTime};
 use std::{env, fs};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime};
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
