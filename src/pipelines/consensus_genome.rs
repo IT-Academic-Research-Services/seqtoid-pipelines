@@ -1709,9 +1709,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let sample_base: String;
     let file1_r1r2 = r1r2_base(&file1_path);
-    eprintln!("file_r1r2 {:?}", file1_r1r2.file_name);
-    eprintln!("r1 tag {:?}", file1_r1r2.r1_tag);
-    eprintln!("prefix {:?}", file1_r1r2.prefix);
     sample_base = match file1_r1r2.prefix {
         Some(prefix) => prefix,
         None => {
@@ -1719,7 +1716,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             file1_path.to_string_lossy().into_owned()
         }
     };
-    eprintln!("base {:?}", sample_base);
+
     if !file1_path.exists() {
         return Err(PipelineError::FileNotFound(file1_path));
     }
@@ -1727,7 +1724,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
     let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
     let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-    eprintln!("no_ext_sample_base {:?}", no_ext_sample_base);
 
     let file2_path: Option<PathBuf> = match &config.args.file2 {
         Some(file) => {
