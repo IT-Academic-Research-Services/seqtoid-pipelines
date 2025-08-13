@@ -11,8 +11,7 @@ use futures::StreamExt;
 use crate::cli::{Arguments, Technology};
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
-use crate::utils::file::{extension_remover, file_path_manipulator};
-use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
+use crate::utils::file::file_path_manipulator;
 use tokio::time::{timeout, Duration};
 
 const CHUNK_SIZE: usize = 1000;
@@ -448,13 +447,12 @@ pub async fn lookup_sequence(h5_path: &PathBuf, index_map: &HashMap<[u8; 24], u6
 /// # Arguments
 ///
 /// * `seq` - The retrieved FASTA record (header + sequence + newline).
-/// * `accession` - Accession ID (not used for writing, kept for compatibility).
 /// * `fifo_path` - Path to the named pipe for passing.
 ///
 /// # Returns
 /// Result<()>
 ///
-pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, accession: &str, fifo_path: &PathBuf) -> Result<()> {
+pub async fn write_hdf5_seq_to_fifo(seq: &Vec<u8>, fifo_path: &PathBuf) -> Result<()> {
     let mut fifo_file = timeout(Duration::from_secs(10), TokioFile::create(fifo_path)).await??;
     
     if seq.is_empty() {
@@ -594,6 +592,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::IlluminaFastq,
+            "test_create_db_illumina_small".to_string(),
+            None,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -633,6 +633,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::OntFastq,
+            "test_create_db_ont_small".to_string(),
+            None,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -756,6 +758,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::IlluminaFastq,
+            "test_load_index".to_string(),
+            None,
         ).await?;
 
         let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;

@@ -13,6 +13,7 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
@@ -112,18 +113,24 @@ pub async fn t_junction<S, T>(
     stream_sleep_ms: Option<u64>,
     backpressure_pause_ms: u64,
     data_type: StreamDataType,
+    label: String,
+    notify: Option<Arc<Notify>>,
 ) -> Result<(Vec<mpsc::Receiver<T>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
 where
     S: Stream<Item = T> + Unpin + Send + 'static,
     T: Clone + Send + Sync + 'static,
 {
     if n_outputs == 0 {
-        return Err(anyhow!("No subscribers: cannot process stream"));
+        return Err(anyhow!("No subscribers: cannot process stream in {}", label));
     }
 
     let mut system = System::new_all();
     system.refresh_memory();
-    let available_ram = system.available_memory();
+    let mut available_ram = system.available_memory();
+    if available_ram == 0 {
+        available_ram = system.total_memory().max(8_000_000) / 4; // Assume 8GB min if total=0
+    }
+
     const MAX_PROCESSES: usize = 4;
     const RAM_FRACTION: f64 = 0.25;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
@@ -137,39 +144,48 @@ where
     let max_buffer_size = if available_ram > 0 {
         ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / record_size as f64) as usize
     } else {
-        eprintln!("Warning: Failed to detect available RAM, using fallback buffer size");
+        eprintln!("Warning: Failed to detect available RAM in {}, using fallback buffer size", label);
         base_buffer_size * n_outputs.max(1) * 2
     };
 
     let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
     let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size);
 
-
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let mut output_txs = Vec::with_capacity(n_outputs);
     let mut output_rxs = Vec::with_capacity(n_outputs);
 
-    for _ in 0..n_outputs {
+    // Track channels with IDs
+    let mut channel_status = vec![true; n_outputs]; // true = active, false = dropped
+    for i in 0..n_outputs {
         let (tx, rx) = mpsc::channel(buffer_size);
-        output_txs.push(tx);
+        output_txs.push((i, tx)); // Store ID with tx
         output_rxs.push(rx);
     }
 
     tokio::spawn(async move {
         let mut input = Box::pin(input);
         let mut count = 0;
+        let mut dropped_count = 0;
 
         while let Some(item) = input.next().await {
             let mut active_txs = Vec::new();
-            for tx in output_txs.into_iter() {
+            for (id, tx) in output_txs.iter() {
                 match tx.send(item.clone()).await {
-                    Ok(()) => active_txs.push(tx),
-                    Err(_) => eprintln!("Receiver dropped at item {}, continuing for remaining receivers", count + 1),
+                    Ok(()) => active_txs.push((*id, tx.clone())),
+                    Err(_) => {
+                        if channel_status[*id] {
+                            eprintln!("{}: Receiver {} dropped at item {}", label, id, count + 1);
+                            channel_status[*id] = false;
+                            dropped_count += 1;
+                        }
+                    }
                 }
             }
             output_txs = active_txs;
             if output_txs.is_empty() {
-                let _ = done_tx.send(Err(anyhow!("All receivers dropped at item {}, data loss occurred", count + 1)));
+                eprintln!("{}: All receivers dropped at item {}. Channel status: {:?}", label, count + 1, channel_status);
+                let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, count + 1)));
                 return;
             }
 
@@ -181,7 +197,15 @@ where
             }
         }
 
-        let _ = done_tx.send(Ok(()));
+        //eprintln!("{}: Producer finished after {} items. Channel status: {:?}", label, count, channel_status);
+        if let Some(n) = notify {
+            n.notify_waiters();
+        }
+        if dropped_count > 0 {
+            let _ = done_tx.send(Err(anyhow!("{}: {} receivers dropped mid-stream, potential data loss", label, dropped_count)));
+        } else {
+            let _ = done_tx.send(Ok(()));
+        }
     });
 
     Ok((output_rxs, done_rx))
@@ -412,7 +436,7 @@ pub async fn parse_child_output(
 /// # Arguments
 ///
 /// * `reader` - reading stream
-/// * `buffer_size` - stream buffer size 
+/// * `buffer_size` - stream buffer size
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
@@ -443,7 +467,7 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 eprintln!("Invalid FASTQ format: expected '@', got '{}'", id_line);
                 return;
             }
-            
+
             let id = id_line[1..].to_string();
             let desc = None;
 
@@ -502,7 +526,7 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
-        
+
     });
 
     Ok(rx)
@@ -543,8 +567,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                         seq: current_seq.clone(),
                     };
                     if tx.send(ParseOutput::Fasta(record)).await.is_err() {
-                        eprintln!("No active receivers for FASTA record");
-                        break;
+                        return Err(anyhow!("Receiver dropped during FASTA parsing, data loss detected"));
                     }
                     current_seq.clear();
                 }
@@ -563,9 +586,10 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                 seq: current_seq,
             };
             if tx.send(ParseOutput::Fasta(record)).await.is_err() {
-                eprintln!("No active receivers for FASTA record");
+                return Err(anyhow!("Receiver dropped during final FASTA parsing, data loss detected"));
             }
         }
+        Ok::<(), anyhow::Error>(())
     });
     Ok(rx)
 }
@@ -575,7 +599,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
 /// # Arguments
 ///
 /// * `reader` - reading stream
-/// * `buffer_size` - stream buffer size 
+/// * `buffer_size` - stream buffer size
 ///
 /// # Returns
 /// Result<mpsc::Receiver<ParseOutput>>
@@ -594,12 +618,11 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
                 Ok(n) => {
                     let chunk = buffer[..n].to_vec();
                     if tx.send(ParseOutput::Bytes(chunk)).await.is_err() {
-                        eprintln!("No active receivers for byte chunk, continuing to drain");
+                        return Err(anyhow!("Receiver dropped during byte parsing, data loss detected"));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading bytes: {}", e);
-                    break;
+                    return Err(anyhow!("Error reading bytes: {}", e));
                 }
             }
         }
@@ -629,7 +652,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     tokio::spawn(async move {
         while reader.read_line(&mut line).await? > 0 {
             if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
-                eprintln!("No active receivers for line, continuing to drain");
+                return Err(anyhow!("Receiver dropped during line parsing, data loss detected"));
             }
             line.clear();
         }
@@ -874,11 +897,16 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_zero_streams".to_string(),
+            None,
         )
             .await;
         assert!(result.is_err());
         let error = result.unwrap_err();
-        assert_eq!(error.to_string(), "No subscribers: cannot process stream");
+        assert_eq!(
+            error.to_string(),
+            "No subscribers: cannot process stream in test_t_junction_zero_streams"
+        );
         Ok(())
     }
 
@@ -907,6 +935,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_two_records".to_string(),
+            None,
         )
             .await?;
         let mut output1 = ReceiverStream::new(outputs.pop().unwrap());
@@ -938,6 +968,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_long_stream".to_string(),
+            None,
         )
             .await?;
         let mut output1 = ReceiverStream::new(outputs.pop().unwrap());
@@ -967,6 +999,8 @@ mod tests {
             Some(0),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_ten_streams".to_string(),
+            None,
         )
             .await?;
         let mut records = vec![Vec::new(); outputs.len()];
@@ -1007,6 +1041,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_empty_stream".to_string(),
+            None,
         )
             .await?;
         for rx in outputs {
@@ -1028,6 +1064,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_single_record".to_string(),
+            None,
         )
             .await?;
         let mut handles = Vec::new();
@@ -1068,6 +1106,8 @@ mod tests {
             Some(100),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_slow_consumer".to_string(),
+            None,
         )
             .await?;
         let mut handles = Vec::new();
@@ -1127,6 +1167,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_million_records_ten_streams".to_string(),
+            None,
         )
             .await?;
 
@@ -1199,6 +1241,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_t_junction_stream_to_cmd_valid".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1232,6 +1276,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_valid_cat".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1269,6 +1315,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_valid_parse_output".to_string(),
+            None,
         )
             .await?;
         let rx = outputs.pop().unwrap();
@@ -1317,6 +1365,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_invalid_cmd".to_string(),
+            None,
         )
             .await?;
         let result = stream_to_cmd(
@@ -1349,6 +1399,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_empty_stream".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1384,6 +1436,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_large_stream".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1441,6 +1495,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_premature_exit".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(
@@ -1478,6 +1534,8 @@ mod tests {
             Some(1),
             50,
             StreamDataType::IlluminaFastq,
+            "test_stream_to_cmd_resource_cleanup".to_string(),
+            None,
         )
             .await?;
         let (mut child, task, _err_task) = stream_to_cmd(

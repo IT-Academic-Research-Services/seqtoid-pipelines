@@ -4,6 +4,7 @@ mod config;
 
 use std::time::{Instant, SystemTime};
 use std::{env, fs};
+use chrono::{DateTime};
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,15 +15,15 @@ use clap::Parser;
 use num_cpus;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
-use tokio::runtime::Builder;
 use rayon::ThreadPoolBuilder;
 
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
-use crate::utils::file::extension_remover;
+use crate::utils::file::file_path_manipulator;
 use pipelines::consensus_genome;
 use pipelines::db;
+use crate::utils::fastx::r1r2_base;
 
 mod cli;
 
@@ -110,20 +111,38 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
                 cwd.join(path)
             }
         }
-        None => {
-            let file1_path = args.file1.as_ref().ok_or_else(|| anyhow::anyhow!("File1 path required"))?;
-            let sample_base_buf = PathBuf::from(file1_path);
-            let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-            let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+        None => {  // Always places out dir in subdir of cwd regardless of location of file 1
+            let file1_path: PathBuf = match &args.file1 {
+                Some(file) => {
+                    let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
+                    if file1_full_path.exists() {
+                        file1_full_path
+                    } else {
+                        return Err(anyhow::anyhow!("Cannot find file 1 (-i)"));
+                    }
+                }
+                None => return Err(anyhow::anyhow!("File1 path required")),
+            };
+            let file1_r1r2 = r1r2_base(&file1_path);
+
+            let dir_base = match file1_r1r2.prefix {
+                Some(prefix) => prefix,
+                None => {
+                    eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
+                    file1_r1r2.file_name.unwrap()
+                }
+            };
+
             let timestamp = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .map(|secs| {
-                    let dt = chrono::NaiveDateTime::from_timestamp_opt(secs as i64, 0).unwrap();
+                    let dt = DateTime::from_timestamp(secs as i64, 0)
+                        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
                     dt.format("%Y%m%d").to_string()
                 })
                 .unwrap_or_else(|_| "19700101".to_string());
-            cwd.join(format!("{}_{}", no_ext_sample_base, timestamp))
+            cwd.join(format!("{}_{}", dir_base.clone(), timestamp))
         }
     };
     fs::create_dir_all(&out_dir)?;

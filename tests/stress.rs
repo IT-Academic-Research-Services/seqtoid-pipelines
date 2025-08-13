@@ -193,6 +193,8 @@ async fn test_t_junction_stress() -> Result<()> {
                         sleep_ms,
                         backpressure_pause_ms,
                         StreamDataType::IlluminaFastq,
+                        "t_junction_stress".to_string(),
+                        None
                     )
                         .await?;
 
@@ -288,6 +290,8 @@ async fn test_t_junction_count() -> Result<()> {
         sleep_ms,
         backpressure_pause_ms,
         StreamDataType::IlluminaFastq,
+        "t_junction_count".to_string(),
+        None
     ).await?;
     let mut counts = vec![0usize; 2];
     let mut handles = Vec::new();
@@ -353,6 +357,8 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         Some(1),
         500,
         StreamDataType::IlluminaFastq,
+        "test_stream_to_cmd_direct".to_string(),
+        None
     ).await?;
 
     let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
@@ -453,6 +459,9 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     if *sleep == 0 { None } else { Some(*sleep) },
                                     backpressure_pause_ms,
                                     StreamDataType::IlluminaFastq,
+                                    "test_stream_to_cmd_stress".to_string(),
+                                    None
+
                                 )
                                     .await {
                                     Ok(result) => result,
