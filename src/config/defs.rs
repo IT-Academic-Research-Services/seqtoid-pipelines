@@ -151,6 +151,8 @@ pub enum PipelineError {
     ReferenceRetrievalFailed(String),
     #[error("Empty stream encountered")]
     EmptyStream,
+    #[error("No sequences matched target taxonomy ID: {0}")]
+    NoTargetSequences(String),
     #[error("Other error: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
 }
