@@ -851,7 +851,7 @@ async fn filter_with_kraken(
     };
     let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))?;
 
-    let (mut _kraken2_child, kraken2_err_task) = spawn_cmd(
+    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(
         config.clone(),
         KRAKEN2_TAG,
         kraken2_args,
@@ -863,6 +863,15 @@ async fn filter_with_kraken(
             error: e.to_string(),
         })?;
     cleanup_tasks.push(kraken2_err_task);
+
+    let kraken2_wait_task = tokio::spawn(async move {
+        let status = kraken2_child.wait().await.map_err(|e| anyhow!("Failed to wait on kraken2: {}", e))?;
+        if !status.success() {
+            return Err(anyhow!("kraken2 exited with non-zero status"));
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(kraken2_wait_task);
 
     // Stream classified FASTQ from named pipe using parse_fastq
     let kraken2_file = tokio::fs::File::open(&kraken2_pipe_path)
@@ -901,7 +910,7 @@ async fn filter_with_kraken(
     // split stream for output and compression
     let (kraken_streams, kraken_done_rx) = t_junction(
         filtered_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
@@ -913,14 +922,44 @@ async fn filter_with_kraken(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if kraken_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
-
     let mut cleanup_receivers = vec![kraken_done_rx];
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let kraken_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(kraken_check_stream);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Fastq(_) => {
+                    count = 1;
+                }
+                _ => return Err(anyhow!("Unexpected item type in kraken_check_stream")),
+            }
+        }
+        check_tx.send(count).await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(check_task);
+
+    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if check_count == 0 {
+        let drain_rxs = vec![kraken_output_stream, kraken_file_stream];
+        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs.into_iter().map(|rx| {
+            tokio::spawn(async move {
+                let mut stream = ReceiverStream::new(rx);
+                while stream.next().await.is_some() {}
+                Ok(())
+            })
+        }).collect();
+        cleanup_tasks.extend(drain_tasks);
+
+        return Err(PipelineError::EmptyStream);
+    }
 
     // Run pigz to compress filtered output
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
@@ -1174,10 +1213,10 @@ async fn generate_consensus(
     cleanup_tasks.push(samtools_consensus_err_task);
 
     let samtools_consensus_out_stream = parse_child_output(  // FASTQ output
-        &mut samtools_consensus_child,
-        ChildStream::Stdout,
-        ParseMode::Fasta,
-        config.base_buffer_size,
+                                                             &mut samtools_consensus_child,
+                                                             ChildStream::Stdout,
+                                                             ParseMode::Fasta,
+                                                             config.base_buffer_size,
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -2010,4 +2049,3 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     println!("Finished generating consensus genome");
     Ok(())
 }
-
