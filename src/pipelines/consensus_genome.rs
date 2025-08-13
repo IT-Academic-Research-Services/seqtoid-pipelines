@@ -958,7 +958,7 @@ async fn filter_with_kraken(
         }).collect();
         cleanup_tasks.extend(drain_tasks);
 
-        return Err(PipelineError::EmptyStream);
+        return Err(PipelineError::NoTargetSequences(target_taxid.to_string()));
     }
 
     // Run pigz to compress filtered output
