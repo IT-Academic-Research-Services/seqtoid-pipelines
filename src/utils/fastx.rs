@@ -760,10 +760,6 @@ pub fn parse_and_filter_fastq_id(
                 continue; // Skip non-FASTQ items
             }
 
-            // Periodic sleep to prevent tight loops
-            if count % 1000 == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
         }
 
         eprintln!("Filtered {} FASTQ records from Kraken2 classified stream", count);

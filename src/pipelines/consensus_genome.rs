@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -252,8 +252,12 @@ async fn align_to_host(
     host_ref_path: PathBuf,
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
-        .await
+    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp_fifo(
+        input_stream,
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     let mut cleanup_tasks = vec![host_query_write_task];
 
@@ -503,10 +507,6 @@ async fn process_ercc(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if ercc_streams.len() < 3 {
-        return Err(PipelineError::EmptyStream);
-    }
-
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -514,11 +514,12 @@ async fn process_ercc(
     cleanup_receivers.push(ercc_done_rx);
 
     // Process alignment stream for ERCC mapping
-    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(
+    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp_fifo(
         ReceiverStream::new(alignment_stream),
-        None,
-    )
-        .await
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     cleanup_tasks.push(ercc_query_write_task);
 
@@ -820,28 +821,34 @@ async fn filter_with_kraken(
         Some("classified_filtered.fq.gz"),
         "_",
     );
-    let kraken2_pipe_path = file_path_manipulator(
-        no_ext_sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("kraken2_classified_pipe.fq"),
-        "_",
-    );
 
-    // Remove existing pipe if exists to avoid errors
-    let _ = tokio::fs::remove_file(&kraken2_pipe_path).await;
-
-    // Create named pipe for Kraken2 classified output
-    Command::new("mkfifo")
-        .arg(&kraken2_pipe_path)
-        .status()
-        .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to create named pipe: {}", e)))?;
-
-    // Write input stream to temp file for Kraken2
-    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+    // Write input stream to temp FIFO for Kraken2
+    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(
+        input_stream,
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     cleanup_tasks.push(kraken_query_write_task);
+
+    // Create temp FIFO for Kraken2 classified output
+    let mut builder = tempfile::Builder::new();
+    builder.suffix(".fq");
+    let temp_name = builder.tempfile_in(&config.ram_temp_dir)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file in {}: {}", config.ram_temp_dir.display(), e)))?;
+    let kraken2_pipe_path = temp_name.path().to_path_buf();
+    temp_name.close()
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to close temp file: {}", e)))?;
+
+    // Remove existing pipe if exists and create new FIFO
+    let _ = tokio::fs::remove_file(&kraken2_pipe_path).await;
+    tokio::process::Command::new("mkfifo")
+        .arg(&kraken2_pipe_path)
+        .status()
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create named pipe: {}", e)))?;
 
     // Run Kraken2 with named pipe for classified output
     let kraken2_config = Kraken2Config {
@@ -851,7 +858,7 @@ async fn filter_with_kraken(
     };
     let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))?;
 
-    let (mut _kraken2_child, kraken2_err_task) = spawn_cmd(
+    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(
         config.clone(),
         KRAKEN2_TAG,
         kraken2_args,
@@ -863,6 +870,15 @@ async fn filter_with_kraken(
             error: e.to_string(),
         })?;
     cleanup_tasks.push(kraken2_err_task);
+
+    let kraken2_wait_task = tokio::spawn(async move {
+        let status = kraken2_child.wait().await.map_err(|e| anyhow!("Failed to wait on kraken2: {}", e))?;
+        if !status.success() {
+            return Err(anyhow!("kraken2 exited with non-zero status"));
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(kraken2_wait_task);
 
     // Stream classified FASTQ from named pipe using parse_fastq
     let kraken2_file = tokio::fs::File::open(&kraken2_pipe_path)
@@ -895,32 +911,61 @@ async fn filter_with_kraken(
     });
     cleanup_tasks.push(conversion_task);
 
-
     let filtered_stream = ReceiverStream::new(parse_output_rx);
 
-    // split stream for output and compression
+    // Split stream for output and compression
     let (kraken_streams, kraken_done_rx) = t_junction(
         filtered_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
         50,
         StreamDataType::IlluminaFastq,
         "filter_reads_output".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
-
-    if kraken_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
 
     let mut cleanup_receivers = vec![kraken_done_rx];
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let kraken_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(kraken_check_stream);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Fastq(_) => {
+                    count = 1;
+                }
+                _ => return Err(anyhow!("Unexpected item type in kraken_check_stream")),
+            }
+        }
+        check_tx.send(count).await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(check_task);
+
+    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if check_count == 0 {
+        let drain_rxs = vec![kraken_output_stream, kraken_file_stream];
+        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs.into_iter().map(|rx| {
+            tokio::spawn(async move {
+                let mut stream = ReceiverStream::new(rx);
+                while stream.next().await.is_some() {}
+                Ok(())
+            })
+        }).collect();
+        cleanup_tasks.extend(drain_tasks);
+
+        return Err(PipelineError::NoTargetSequences(target_taxid.to_string()));
+    }
 
     // Run pigz to compress filtered output
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
@@ -954,10 +999,11 @@ async fn filter_with_kraken(
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, final_compressed_path));
     cleanup_tasks.push(pigz_write_task);
 
+    // Cleanup Kraken2 FIFO
     let cleanup_pipe_task = tokio::spawn(async move {
         tokio::fs::remove_file(&kraken2_pipe_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to remove named pipe: {}", e))?;
+            .map_err(|e| anyhow!("Failed to remove named pipe: {}", e))?;
         Ok(())
     });
     cleanup_tasks.push(cleanup_pipe_task);
@@ -984,15 +1030,18 @@ async fn align_to_target(
     input_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf
-) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, PathBuf), PipelineError> {
-
+    no_ext_sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, PathBuf), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
-    let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
-        .await
+    let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp_fifo(
+        input_stream,
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     quast_write_tasks.push(align_query_write_task);
 
@@ -1079,7 +1128,7 @@ async fn align_to_target(
 
     let (sam_streams, sam_done_rx) = t_junction(
         samtools_sort_out_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
@@ -1095,6 +1144,40 @@ async fn align_to_target(
     let mut streams_iter = sam_streams.into_iter();
     let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let sam_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(sam_check_stream);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(_) => {
+                    count = 1; // Count only the first SAM alignment
+                    // Continue consuming to keep receiver alive
+                }
+                _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
+            }
+        }
+        check_tx.send(count).await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(check_task);
+
+    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if check_count == 0 {
+        let drain_rxs = vec![sam_output_stream, sam_file_stream];
+        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs.into_iter().map(|rx| {
+            tokio::spawn(async move {
+                let mut stream = ReceiverStream::new(rx);
+                while stream.next().await.is_some() {}
+                Ok(())
+            })
+        }).collect();
+        cleanup_tasks.extend(drain_tasks);
+        return Err(PipelineError::EmptyStream);
+    }
 
     let align_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
@@ -1120,12 +1203,11 @@ async fn align_to_target(
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
-            tool:  SAMTOOLS_TAG.to_string(),
+            tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
     quast_write_tasks.push(align_samtools_view_stream_task);
     cleanup_tasks.push(align_samtools_view_err_task);
-
 
     Ok((
         ReceiverStream::new(sam_output_stream),
@@ -1174,10 +1256,10 @@ async fn generate_consensus(
     cleanup_tasks.push(samtools_consensus_err_task);
 
     let samtools_consensus_out_stream = parse_child_output(  // FASTQ output
-        &mut samtools_consensus_child,
-        ChildStream::Stdout,
-        ParseMode::Fasta,
-        config.base_buffer_size,
+                                                             &mut samtools_consensus_child,
+                                                             ChildStream::Stdout,
+                                                             ParseMode::Fasta,
+                                                             config.base_buffer_size,
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -2010,4 +2092,3 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     println!("Finished generating consensus genome");
     Ok(())
 }
-
