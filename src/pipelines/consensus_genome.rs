@@ -507,10 +507,6 @@ async fn process_ercc(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if ercc_streams.len() < 3 {
-        return Err(PipelineError::EmptyStream);
-    }
-
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1034,13 +1030,11 @@ async fn align_to_target(
     input_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf
-) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, PathBuf), PipelineError> {
-
+    no_ext_sample_base_buf: &PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, PathBuf), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
-
 
     let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp_fifo(
         input_stream,
@@ -1134,7 +1128,7 @@ async fn align_to_target(
 
     let (sam_streams, sam_done_rx) = t_junction(
         samtools_sort_out_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         Some(config.args.stream_sleep_ms),
@@ -1150,6 +1144,40 @@ async fn align_to_target(
     let mut streams_iter = sam_streams.into_iter();
     let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let sam_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(sam_check_stream);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(_) => {
+                    count = 1; // Count only the first SAM alignment
+                    // Continue consuming to keep receiver alive
+                }
+                _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
+            }
+        }
+        check_tx.send(count).await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(check_task);
+
+    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if check_count == 0 {
+        let drain_rxs = vec![sam_output_stream, sam_file_stream];
+        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs.into_iter().map(|rx| {
+            tokio::spawn(async move {
+                let mut stream = ReceiverStream::new(rx);
+                while stream.next().await.is_some() {}
+                Ok(())
+            })
+        }).collect();
+        cleanup_tasks.extend(drain_tasks);
+        return Err(PipelineError::EmptyStream);
+    }
 
     let align_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
@@ -1175,12 +1203,11 @@ async fn align_to_target(
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
-            tool:  SAMTOOLS_TAG.to_string(),
+            tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
     quast_write_tasks.push(align_samtools_view_stream_task);
     cleanup_tasks.push(align_samtools_view_err_task);
-
 
     Ok((
         ReceiverStream::new(sam_output_stream),
