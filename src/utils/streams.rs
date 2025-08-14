@@ -242,7 +242,7 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
     let (batch_size_bytes, writer_capacity) = match data_type {
         StreamDataType::JustBytes => (65_536, 65_536),
-        StreamDataType::IlluminaFastq => (131_072, 131_072),
+        StreamDataType::IlluminaFastq => (4_194_304, 4_194_304),
         StreamDataType::OntFastq => (524_288, 524_288),
     };
 

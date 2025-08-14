@@ -114,7 +114,7 @@ pub struct RunConfig {
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
-            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) => CoreAllocation::Maximal,  // Moved FASTP and PIGZ here for full cores
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
@@ -128,16 +128,16 @@ impl RunConfig {
         let max_cores = min(num_cpus::get(), self.args.threads);
         let mut allocation = match self.get_core_allocation(tag, subcommand) {
             CoreAllocation::Maximal => max_cores,
-            CoreAllocation::High => ((max_cores as f32 * 0.75) as usize).max(1),
-            CoreAllocation::Low => (max_cores / 3).max(1), 
+            CoreAllocation::High => ((max_cores as f32 * 0.75) as usize).max(1),  // Unchanged
+            CoreAllocation::Low => (max_cores / 3).max(1),  // Unchanged
             CoreAllocation::Minimal => 1,
         };
 
-        // Per-tool caps to optimize scaling (pigz/fastp don't benefit beyond ~32; minimap2 can use more)
+
         match tag {
-            PIGZ_TAG => allocation.min(32),
-            FASTP_TAG => allocation.min(32),
-            MINIMAP2_TAG => allocation.min(64),  // Allow up to 64 for alignment on EPYC
+            PIGZ_TAG => allocation.min(16),  // Cap at 16: Compression scales poorly >16 due to I/O
+            FASTP_TAG => allocation.min(16),  // Cap at 16: QC/filtering I/O-bound on large FASTQ
+            MINIMAP2_TAG => allocation.min(32),  // Cap at 32: Indexing/chaining memory-bound on hg38
             _ => allocation,
         }
     }
