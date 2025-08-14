@@ -33,7 +33,7 @@ def find_fastq_pairs(directory, sample_order):
 
     return fastq_pairs
 
-def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, db_h5, db_index, aligner, ref_sequence, log_file, max_reads):
+def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, ref_sequence, log_file, max_reads, ercc_sequence, host_sequence, ref_taxid):
     """
     Run the seqtoid-pipelines command for a single sample and extract runtime from console output.
     """
@@ -45,12 +45,11 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '--quality', str(quality),
         '-i', os.path.join(fastq_dir, r1_file),
         '-I', os.path.join(fastq_dir, r2_file),
-        '-d', db_h5,
-        '--index', db_index,
-        '-a', aligner,
         '--ref-sequence', ref_sequence,
-        '--log-file', log_file,
         '--max-reads', str(max_reads),
+        '--ercc-sequences', ercc_sequence,
+        '--host-sequence', host_sequence,
+        '--ref-taxid', ref_taxid,
     ]
 
     # Format the command for logging
@@ -97,12 +96,12 @@ def main():
     parser.add_argument('--kraken_db', default='/home/ubuntu/refs/kraken_db', help="Path to Kraken database")
     parser.add_argument('--adapter_fasta', default='/home/ubuntu/refs/TruSeq3-PE.fa', help="Adapter FASTA file")
     parser.add_argument('--quality', default=1, type=int, help="Quality threshold")
-    parser.add_argument('--db_h5', default='/home/ubuntu/refs/db.h5', help="Database H5 file")
-    parser.add_argument('--db_index', default='/home/ubuntu/refs/db.index.bin', help="Database index file")
-    parser.add_argument('--aligner', default='hg38', help="Aligner reference")
     parser.add_argument('--ref_sequence', default='/home/ubuntu/refs/covid-wuhan-test.fa', help="Reference sequence FASTA file")
     parser.add_argument('--log_file', default='seqtoid_run.log', help="Log file to store run information")
     parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
+    parser.add_argument('--ercc-sequences', default='/home/ubuntu/refs/ercc_sequences.fasta')
+    parser.add_argument('--host-sequence', default='/home/ubuntu/refs/hg38.fa')
+    parser.add_argument('--ref-taxid', default='2697049')
 
     args = parser.parse_args()
 
@@ -124,12 +123,12 @@ def main():
             args.kraken_db,
             args.adapter_fasta,
             args.quality,
-            args.db_h5,
-            args.db_index,
-            args.aligner,
             args.ref_sequence,
             args.log_file,
-            args.max_reads
+            args.max_reads,
+            args.ercc_sequences,
+            args.host_sequence,
+            args.ref_taxid,
         )
         print(f"Completed {sample}: Status={status}, Runtime={runtime:.2f} seconds" if runtime is not None else f"Completed {sample}: Status={status}, Runtime=Not found")
 
