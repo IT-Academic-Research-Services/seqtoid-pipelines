@@ -28,8 +28,8 @@ pub const SEQKIT_TAG: &str = "seqkit";
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();
-        m.insert(SAMTOOLS_TAG, 1.20);
-        m.insert(BCFTOOLS_TAG, 1.20);
+        m.insert(SAMTOOLS_TAG, 1.19);
+        m.insert(BCFTOOLS_TAG, 1.19);
         m.insert(MINIMAP2_TAG, 2.24);
         m.insert(KRAKEN2_TAG, 2.1);
         m.insert(PIGZ_TAG, 2.8);
