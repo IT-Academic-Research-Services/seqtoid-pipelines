@@ -196,9 +196,9 @@ fn compute_base_buffer_size(available_ram: u64, num_cores: usize, data_type: Str
         StreamDataType::OntFastq => 10_000,
         StreamDataType::JustBytes => 500,
     };
-    let ram_fraction = 0.25;
-    let min_buffer = 10_000;
-    let max_buffer = 1_000_000;
+    let ram_fraction = 0.5;
+    let min_buffer = 100_000;
+    let max_buffer = 10_000_000;
     ((available_ram as f64 * ram_fraction / num_cores as f64) / record_size as f64)
         .clamp(min_buffer as f64, max_buffer as f64) as usize
 }

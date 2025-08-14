@@ -132,7 +132,7 @@ where
     }
 
     const MAX_PROCESSES: usize = 4;
-    const RAM_FRACTION: f64 = 0.25;
+    const RAM_FRACTION: f64 = 0.5;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
 
     let record_size = match data_type {
