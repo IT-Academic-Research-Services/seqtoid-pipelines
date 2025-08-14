@@ -825,29 +825,34 @@ async fn filter_with_kraken(
         Some("classified_filtered.fq.gz"),
         "_",
     );
-    let kraken2_pipe_path = file_path_manipulator(
-        no_ext_sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("kraken2_classified_pipe.fq"),
-        "_",
-    );
 
-    // Remove existing pipe if exists to avoid errors
-    let _ = tokio::fs::remove_file(&kraken2_pipe_path).await;
-
-    // Create named pipe for Kraken2 classified output
-    Command::new("mkfifo")
-        .arg(&kraken2_pipe_path)
-        .status()
-        .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to create named pipe: {}", e)))?;
-
-    // Write input stream to temp file for Kraken2
-    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(input_stream, None, Some(".fq"),
-                                                                                            Some(&config.ram_temp_dir))
+    // Write input stream to temp FIFO for Kraken2
+    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(
+        input_stream,
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     cleanup_tasks.push(kraken_query_write_task);
+
+    // Create temp FIFO for Kraken2 classified output
+    let mut builder = tempfile::Builder::new();
+    builder.suffix(".fq");
+    let temp_name = builder.tempfile_in(&config.ram_temp_dir)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file in {}: {}", config.ram_temp_dir.display(), e)))?;
+    let kraken2_pipe_path = temp_name.path().to_path_buf();
+    temp_name.close()
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to close temp file: {}", e)))?;
+
+    // Remove existing pipe if exists and create new FIFO
+    let _ = tokio::fs::remove_file(&kraken2_pipe_path).await;
+    tokio::process::Command::new("mkfifo")
+        .arg(&kraken2_pipe_path)
+        .status()
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create named pipe: {}", e)))?;
 
     // Run Kraken2 with named pipe for classified output
     let kraken2_config = Kraken2Config {
@@ -998,10 +1003,11 @@ async fn filter_with_kraken(
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, final_compressed_path));
     cleanup_tasks.push(pigz_write_task);
 
+    // Cleanup Kraken2 FIFO
     let cleanup_pipe_task = tokio::spawn(async move {
         tokio::fs::remove_file(&kraken2_pipe_path)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to remove named pipe: {}", e))?;
+            .map_err(|e| anyhow!("Failed to remove named pipe: {}", e))?;
         Ok(())
     });
     cleanup_tasks.push(cleanup_pipe_task);
