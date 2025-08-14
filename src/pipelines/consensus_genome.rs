@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp, write_vecu8_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
 use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -252,8 +252,12 @@ async fn align_to_host(
     host_ref_path: PathBuf,
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
-        .await
+    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp_fifo(
+        input_stream,
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     let mut cleanup_tasks = vec![host_query_write_task];
 
@@ -514,11 +518,12 @@ async fn process_ercc(
     cleanup_receivers.push(ercc_done_rx);
 
     // Process alignment stream for ERCC mapping
-    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp(
+    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp_fifo(
         ReceiverStream::new(alignment_stream),
-        None,
-    )
-        .await
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     cleanup_tasks.push(ercc_query_write_task);
 
@@ -838,7 +843,8 @@ async fn filter_with_kraken(
         .map_err(|e| PipelineError::Other(anyhow::anyhow!("Failed to create named pipe: {}", e)))?;
 
     // Write input stream to temp file for Kraken2
-    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
+    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(input_stream, None, Some(".fq"),
+                                                                                            Some(&config.ram_temp_dir))
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     cleanup_tasks.push(kraken_query_write_task);
@@ -904,10 +910,9 @@ async fn filter_with_kraken(
     });
     cleanup_tasks.push(conversion_task);
 
-
     let filtered_stream = ReceiverStream::new(parse_output_rx);
 
-    // split stream for output and compression
+    // Split stream for output and compression
     let (kraken_streams, kraken_done_rx) = t_junction(
         filtered_stream,
         3,
@@ -917,7 +922,7 @@ async fn filter_with_kraken(
         50,
         StreamDataType::IlluminaFastq,
         "filter_reads_output".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -1030,8 +1035,13 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
-    let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp(input_stream, None)
-        .await
+
+    let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp_fifo(
+        input_stream,
+        Some(config.base_buffer_size),
+        Some(".fq"),
+        Some(&config.ram_temp_dir),
+    ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     quast_write_tasks.push(align_query_write_task);
 

@@ -98,7 +98,7 @@ pub fn file_name_manipulator(path: &PathBuf, prefix: Option<&str>, postfix:Optio
     } else {
         format!("{}.{}", new_base, extensions.join("."))
     };
-    
+
     new_file_name
 }
 
@@ -180,7 +180,7 @@ pub fn scan_files_with_extensions(dir: &PathBuf, valid_extensions: &[&str]) -> R
         let entry = entry?;
         let path = entry.path();
         let (_, extensions) = extension_remover(&path);
-        
+
         if path.is_file() && has_any_extension_from_path(&extensions, valid_extensions) {
             let full_path = file_path_manipulator(&path, Some(dir), None, None, "");
             matching_files.push(full_path);
@@ -282,19 +282,31 @@ pub async fn write_parse_output_to_fifo(
 ///
 /// - `input_stream`: A `ReceiverStream` yielding `ParseOutput` items (expects `Bytes` variant).
 /// - `buffer_size`: Optional buffer size for the writer (defaults to 4MB if not provided).
+/// - `suffix`: Optional suffix for the temporary FIFO file name.
+/// - `temp_dir`: Optional directory for the temporary FIFO (if provided, uses this directory; otherwise, uses system temp dir).
 ///
 /// # Returns
 ///
 /// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
-pub async fn write_parse_output_to_temp(
+pub async fn write_parse_output_to_temp_fifo(
     input_stream: ReceiverStream<ParseOutput>,
     buffer_size: Option<usize>,
+    suffix: Option<&str>,
+    temp_dir: Option<impl AsRef<Path>>,
 ) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf)> {
 
-    let temp_name = NamedTempFile::new()?;
+    let mut builder = TempfileBuilder::new();
+    if let Some(suf) = suffix {
+        builder.suffix(suf);
+    }
+    let temp_name = if let Some(dir) = temp_dir {
+        builder.tempfile_in(dir.as_ref())?
+    } else {
+        builder.tempfile()?
+    };
     let temp_path = temp_name.path().to_path_buf();
     temp_name.close()?;     // Immediately close the regular file to avoid conflicts with mkfifo
-    
+
     let task = write_parse_output_to_fifo(&temp_path, input_stream, buffer_size).await?;
 
     Ok((task, temp_path))
@@ -443,7 +455,7 @@ mod tests {
         let test_data: Vec<u8> = vec![1, 2, 3, 4];
         let temp_name = NamedTempFile::new()?;
         let temp_path = temp_name.into_temp_path();
-        
+
         let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -453,14 +465,14 @@ mod tests {
             .and_then(|result| {
                 result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
             })?;
-        
+
         let mut read_file = std::fs::File::open(&temp_path)?;
         let mut chk_buffer = Vec::new();
         read_file.read_to_end(&mut chk_buffer)?;
         eprintln!("chk_buffer: {:?}", chk_buffer);
         assert_eq!(chk_buffer.len(), test_data.len());
-        assert_eq!(chk_buffer, test_data); 
-        
+        assert_eq!(chk_buffer, test_data);
+
         std::fs::remove_file(&temp_path)?;
         Ok(())
     }
