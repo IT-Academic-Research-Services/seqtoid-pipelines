@@ -116,8 +116,8 @@ impl RunConfig {
         match (tag, subcommand) {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) => CoreAllocation::Maximal,
             (FASTP_TAG, _) | (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
-            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
-            (PIGZ_TAG, _) | (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
+            (PIGZ_TAG, _) | (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
+            (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
             (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
             _ => CoreAllocation::Minimal,
