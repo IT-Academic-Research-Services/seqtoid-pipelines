@@ -210,7 +210,6 @@ pub async fn write_parse_output_to_fifo(
     mut input_stream: ReceiverStream<ParseOutput>,
     buffer_size: Option<usize>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    eprintln!("Writing to {}", fifo_path.display());
     if fifo_path.exists() {
         std::fs::remove_file(fifo_path)?;
     }
@@ -331,7 +330,6 @@ pub async fn write_vecu8_to_file<P: AsRef<Path>>(
     buffer_size: usize,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     let temp_path = temp_path.as_ref().to_path_buf(); // Convert to PathBuf for display
-    eprintln!("Writing to {}", temp_path.display());
     let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
     let task = tokio::spawn(async move {
         let file = TokioFile::create(&temp_path)
