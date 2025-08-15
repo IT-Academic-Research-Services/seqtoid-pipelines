@@ -1340,6 +1340,7 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+    eprintln!("Bcftools mpileup aargs: {:?}", bcftools_mpileup_args);
 
     let (mut bcftools_mpileup_child, bcftools_mpileup_task, bcftools_mpileup_err_task) = stream_to_cmd(
         config.clone(),
@@ -1442,6 +1443,7 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+    eprintln!("bcftools call args {:?}", bcftools_call_args);
 
     let (mut bcftools_call_child, bcftools_call_task, bcftools_call_err_task) = stream_to_cmd(
         config.clone(),
