@@ -25,6 +25,11 @@ use pipelines::consensus_genome;
 use pipelines::db;
 use crate::utils::fastx::r1r2_base;
 
+// Add these imports for I/O monitoring
+use tokio::process::Command as TokioCommand;
+use tokio::time::{sleep, Duration};
+use std::process::Output;
+
 mod cli;
 
 #[tokio::main]
@@ -69,6 +74,9 @@ async fn main() -> Result<()> {
         base_buffer_size
     });
 
+    // Add I/O monitoring task here (background spawn)
+    let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"
+
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config.clone()).await,
         "create_db" => create_db_run(&run_config).await,
@@ -78,9 +86,57 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // Await monitor task at end (optional, for clean shutdown)
+    io_monitor_handle.await.unwrap_or_else(|e| eprintln!("I/O monitor failed: {}", e));
+
     println!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
     Ok(())
 }
+
+// New function: Async I/O monitor
+async fn monitor_io_utilization(device: String) {
+    loop {
+        match run_iostat(&device).await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(util_line) = parse_iostat_util(&stdout, &device) {
+                    eprintln!("NVMe I/O Util: {}% (device: {})", util_line, device);
+                    if util_line.parse::<f32>().unwrap_or(0.0) > 80.0 {
+                        eprintln!("WARNING: High I/O util (>80%) - Potential stall cause. Consider striping NVMe or more /dev/shm usage.");
+                    }
+                } else {
+                    eprintln!("Failed to parse iostat output: {}", stdout);
+                }
+            }
+            Err(e) => eprintln!("iostat error: {}", e),
+        }
+        sleep(Duration::from_secs(5)).await;  // Check every 5s; adjust for granularity
+    }
+}
+
+// Helper: Run iostat -x -d <device> 1 1 (once, extended disk stats)
+async fn run_iostat(device: &str) -> Result<Output> {
+    TokioCommand::new("iostat")
+        .args(&["-x", "-d", device, "1", "1"])  // Extended, device-specific, 1s interval, count=1
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to run iostat: {}", e))
+}
+
+// Helper: Parse %util from iostat output (e.g., look for line with device and extract last column)
+fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
+    for line in output.lines() {
+        if line.contains(device) && !line.contains("Device") {  // Skip header
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(util) = parts.last() {
+                return Some(util.to_string());
+            }
+        }
+    }
+    None
+}
+
+
 
 async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     consensus_genome::run(run_config).await
