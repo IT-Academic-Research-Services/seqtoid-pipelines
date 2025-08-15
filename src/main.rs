@@ -74,8 +74,8 @@ async fn main() -> Result<()> {
         base_buffer_size
     });
 
-    // Add I/O monitoring task here (background spawn)
-    let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"
+    // // Add I/O monitoring task here (background spawn)
+    // let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config.clone()).await,
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     }
 
     // Await monitor task at end (optional, for clean shutdown)
-    io_monitor_handle.await.unwrap_or_else(|e| eprintln!("I/O monitor failed: {}", e));
+    // io_monitor_handle.await.unwrap_or_else(|e| eprintln!("I/O monitor failed: {}", e));
 
     println!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
     Ok(())

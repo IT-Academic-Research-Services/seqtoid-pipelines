@@ -46,7 +46,6 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '-i', os.path.join(fastq_dir, r1_file),
         '-I', os.path.join(fastq_dir, r2_file),
         '--ref-sequence', ref_sequence,
-        '--max-reads', str(max_reads),
         '--ercc-sequences', ercc_sequence,
         '--host-sequence', host_sequence,
         '--ref-taxid', ref_taxid,
@@ -98,7 +97,7 @@ def main():
     parser.add_argument('--quality', default=1, type=int, help="Quality threshold")
     parser.add_argument('--ref_sequence', default='/home/ubuntu/refs/covid-wuhan-test.fa', help="Reference sequence FASTA file")
     parser.add_argument('--log_file', default='seqtoid_run.log', help="Log file to store run information")
-    parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
+    # parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
     parser.add_argument('--ercc-sequences', default='/home/ubuntu/refs/ercc_sequences.fasta')
     parser.add_argument('--host-sequence', default='/home/ubuntu/refs/hg38.fa')
     parser.add_argument('--ref-taxid', default='2697049')
@@ -125,7 +124,6 @@ def main():
             args.quality,
             args.ref_sequence,
             args.log_file,
-            args.max_reads,
             args.ercc_sequences,
             args.host_sequence,
             args.ref_taxid,
