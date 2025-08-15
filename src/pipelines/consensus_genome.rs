@@ -1776,7 +1776,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut align_bam_path: Option<PathBuf> = None;
     let mut align_sam_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut align_sam_depth_stream: Option<ReceiverStream<ParseOutput>> = None;
-    let mut align_sam_eval_stream: Option<Receiver<ParseOutput>> = None;
     let mut consensus_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
 
@@ -1980,7 +1979,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Split SAM streams for bypass, stats, etc
             let (align_sam_streams, align_sam_done_rx) = t_junction(
                 sam_output_stream,
-                5,
+                4,
                 config.base_buffer_size,
                 config.args.stall_threshold,
                 None,
@@ -1997,7 +1996,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             align_sam_stats_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
             align_sam_depth_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
-            align_sam_eval_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
 
             let mut align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
             let mut align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
