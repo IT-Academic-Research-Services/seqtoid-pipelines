@@ -1357,6 +1357,22 @@ async fn call_variants(
     cleanup_tasks.push(bcftools_mpileup_task);
     cleanup_tasks.push(bcftools_mpileup_err_task);
 
+    // Log stderr for mpileup
+    let mpileup_err_stream = parse_child_output(
+        &mut bcftools_mpileup_child,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let mpileup_err_path = out_dir.join("bcftools_mpileup_err.txt");
+    let mpileup_err_write_task = tokio::spawn(stream_to_file(mpileup_err_stream, mpileup_err_path));
+    cleanup_tasks.push(mpileup_err_write_task);
+
     let bcftools_mpileup_out_stream = parse_child_output(
         &mut bcftools_mpileup_child,
         ChildStream::Stdout,
@@ -1368,6 +1384,47 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+
+    // Check for empty mpileup output
+    let (mpileup_streams, mpileup_done_rx) = t_junction(
+        ReceiverStream::new(bcftools_mpileup_out_stream),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        50,
+        StreamDataType::JustBytes,
+        "mpileup_check".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(mpileup_done_rx);
+
+    let mut mpileup_iter = mpileup_streams.into_iter();
+    let mpileup_continue_stream = mpileup_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mpileup_check_stream = mpileup_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let mpileup_check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(mpileup_check_stream);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Bytes(bytes) = item {
+                if !bytes.is_empty() {
+                    count += 1;
+                }
+            }
+        }
+        check_tx.send(count).await.map_err(|e| anyhow!("Failed to send mpileup count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(mpileup_check_task);
+
+    let mpileup_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if mpileup_count == 0 {
+        return Err(PipelineError::Other(anyhow!("Empty output from bcftools mpileup - check BAM or reference FASTA")));
+    }
 
     let bcftools_call_config = BcftoolsConfig {
         subcommand: BcftoolsSubcommand::Call,
@@ -1388,7 +1445,7 @@ async fn call_variants(
 
     let (mut bcftools_call_child, bcftools_call_task, bcftools_call_err_task) = stream_to_cmd(
         config.clone(),
-        bcftools_mpileup_out_stream,
+        mpileup_continue_stream,
         BCFTOOLS_TAG,
         bcftools_call_args,
         StreamDataType::JustBytes,
@@ -1402,6 +1459,22 @@ async fn call_variants(
     cleanup_tasks.push(bcftools_call_task);
     cleanup_tasks.push(bcftools_call_err_task);
 
+    // Log stderr for call
+    let call_err_stream = parse_child_output(
+        &mut bcftools_call_child,
+        ChildStream::Stderr,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BCFTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let call_err_path = out_dir.join("bcftools_call_err.txt");
+    let call_err_write_task = tokio::spawn(stream_to_file(call_err_stream, call_err_path));
+    cleanup_tasks.push(call_err_write_task);
+
     // Parse the bcftools call output
     let bcftools_call_out_stream = parse_child_output(
         &mut bcftools_call_child,
@@ -1414,7 +1487,60 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let bcftools_call_out_stream = ReceiverStream::new(bcftools_call_out_stream);
+
+    // Check for empty or malformed VCF output
+    let (vcf_check_streams, vcf_check_done_rx) = t_junction(
+        ReceiverStream::new(bcftools_call_out_stream),
+        3, // Extra stream for debug_vcf.txt
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        50,
+        StreamDataType::JustBytes,
+        "vcf_check".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(vcf_check_done_rx);
+
+    let mut vcf_check_iter = vcf_check_streams.into_iter();
+    let vcf_continue_stream = vcf_check_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let vcf_check_stream = vcf_check_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let vcf_debug_stream = vcf_check_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // Write debug VCF output
+    let debug_vcf_path = out_dir.join("debug_vcf.txt");
+    let debug_vcf_write_task = tokio::spawn(stream_to_file(vcf_debug_stream, debug_vcf_path));
+    cleanup_tasks.push(debug_vcf_write_task);
+
+    let (vcf_check_tx, mut vcf_check_rx) = mpsc::channel(1);
+    let vcf_check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(vcf_check_stream);
+        let mut variant_count = 0;
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Bytes(bytes) = item {
+                let line_str = String::from_utf8_lossy(&bytes);
+                if !line_str.starts_with('#') && !line_str.trim().is_empty() {
+                    let fields = line_str.split('\t').count();
+                    if fields < 5 {
+                        return Err(anyhow!("Malformed VCF line in bcftools call output: found {} fields in line: '{}'", fields, line_str));
+                    }
+                    variant_count += 1;
+                }
+            }
+        }
+        vcf_check_tx.send(variant_count).await.map_err(|e| anyhow!("Failed to send VCF count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(vcf_check_task);
+
+    let vcf_variant_count = vcf_check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
+    if vcf_variant_count == 0 {
+        return Err(PipelineError::Other(anyhow!("No valid variant lines in bcftools call output - check mpileup or config")));
+    }
+
+    let bcftools_call_out_stream = ReceiverStream::new(vcf_continue_stream);
 
     let (vcf_streams, vcf_done_rx) = t_junction(
         bcftools_call_out_stream,
@@ -1444,10 +1570,7 @@ async fn call_variants(
         "_",
     );
 
-    let vcf_write_task = tokio::spawn(stream_to_file(
-        vcf_file_stream,
-        vcf_file_path.clone(),
-    ));
+    let vcf_write_task = tokio::spawn(stream_to_file(vcf_file_stream, vcf_file_path.clone()));
     cleanup_tasks.push(vcf_write_task);
 
     Ok((ReceiverStream::new(vcf_output_stream), vcf_file_path, cleanup_tasks, cleanup_receivers))
