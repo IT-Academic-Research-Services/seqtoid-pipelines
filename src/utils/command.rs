@@ -211,6 +211,13 @@ mod minimap2 {
         args_vec.push("-t".to_string());
         args_vec.push(num_cores.to_string());
 
+
+        args_vec.push("-R".to_string());
+        args_vec.push("@RG\\tID:id\\tSM:sample\\tLB:lib".to_string());  // Add read group for better sorting/parallelism downstream
+
+        args_vec.push("-w".to_string());
+        args_vec.push("100000".to_string()); // Larger minibatch for better thread scaling
+
         let technology = args.technology.clone();
         match technology {
             Technology::Illumina => {

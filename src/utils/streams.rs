@@ -242,8 +242,8 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
     let (batch_size_bytes, writer_capacity) = match data_type {
         StreamDataType::JustBytes => (65_536, 65_536),
-        StreamDataType::IlluminaFastq => (4_194_304, 4_194_304),
-        StreamDataType::OntFastq => (524_288, 524_288),
+        StreamDataType::IlluminaFastq => (8_388_608, 8_388_608),
+        StreamDataType::OntFastq => (1_048_576, 1_048_576),
     };
 
     let cmd_tag_owned = cmd_tag.to_string();

@@ -33,7 +33,7 @@ def find_fastq_pairs(directory, sample_order):
 
     return fastq_pairs
 
-def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, ref_sequence, log_file, max_reads, ercc_sequence, host_sequence, ref_taxid):
+def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, ref_sequence, log_file, ercc_sequence, host_sequence, ref_taxid):
     """
     Run the seqtoid-pipelines command for a single sample and extract runtime from console output.
     """
@@ -55,38 +55,39 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
     command_str = ' '.join(command)
     print(f"Running command for {sample_name}: {command_str}")
 
-    # Log start time
-    start_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # Run the command and capture output
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        stdout = result.stdout
-        stderr = result.stderr
-        status = 'SUCCESS'
-
-        # Extract runtime from console output
-        runtime_match = re.search(r'Run complete: (\d+) milliseconds\.', stdout)
-        runtime_ms = int(runtime_match.group(1)) if runtime_match else None
-        runtime = runtime_ms / 1000.0 if runtime_ms is not None else None
-    except subprocess.CalledProcessError as e:
-        stdout = e.stdout
-        stderr = e.stderr
-        status = 'FAILED'
-        runtime = None
-
-    # Log the results
-    with open(log_file, 'a') as f:
-        f.write(f"Sample: {sample_name}\n")
-        f.write(f"Start Time: {start_time_str}\n")
-        f.write(f"Command: {command_str}\n")
-        f.write(f"Status: {status}\n")
-        f.write(f"Runtime: {runtime:.2f} seconds\n" if runtime is not None else "Runtime: Not found in output\n")
-        f.write(f"Stdout:\n{stdout}\n")
-        f.write(f"Stderr:\n{stderr}\n")
-        f.write("-" * 80 + "\n")
-
-    return status, runtime
+    # # Log start time
+    # start_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    #
+    # # Run the command and capture output
+    # try:
+    #     result = subprocess.run(command, capture_output=True, text=True, check=True)
+    #     stdout = result.stdout
+    #     stderr = result.stderr
+    #     status = 'SUCCESS'
+    #
+    #     # Extract runtime from console output
+    #     runtime_match = re.search(r'Run complete: (\d+) milliseconds\.', stdout)
+    #     runtime_ms = int(runtime_match.group(1)) if runtime_match else None
+    #     runtime = runtime_ms / 1000.0 if runtime_ms is not None else None
+    # except subprocess.CalledProcessError as e:
+    #     stdout = e.stdout
+    #     stderr = e.stderr
+    #     status = 'FAILED'
+    #     runtime = None
+    #
+    # # Log the results
+    # with open(log_file, 'a') as f:
+    #     f.write(f"Sample: {sample_name}\n")
+    #     f.write(f"Start Time: {start_time_str}\n")
+    #     f.write(f"Command: {command_str}\n")
+    #     f.write(f"Status: {status}\n")
+    #     f.write(f"Runtime: {runtime:.2f} seconds\n" if runtime is not None else "Runtime: Not found in output\n")
+    #     f.write(f"Stdout:\n{stdout}\n")
+    #     f.write(f"Stderr:\n{stderr}\n")
+    #     f.write("-" * 80 + "\n")
+    #
+    # return status, runtime
+    return None, None
 
 def main():
     parser = argparse.ArgumentParser(description="Run seqtoid-pipelines on paired FASTQ files in specified order")
