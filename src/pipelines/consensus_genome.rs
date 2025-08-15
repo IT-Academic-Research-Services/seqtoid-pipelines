@@ -1126,6 +1126,8 @@ async fn align_to_target(
         "_",
     );
 
+    // ... Inside align_to_target, after samtools_sort_out_stream is created ...
+
     let (sam_streams, sam_done_rx) = t_junction(
         samtools_sort_out_stream,
         3,
@@ -1135,7 +1137,7 @@ async fn align_to_target(
         50,
         StreamDataType::JustBytes,
         "align_to_target".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -1149,36 +1151,47 @@ async fn align_to_target(
     let (check_tx, mut check_rx) = mpsc::channel(1);
     let check_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(sam_check_stream);
-        let mut count = 0;
+        let mut alignment_count = 0;
         while let Some(item) = stream.next().await {
             match item {
-                ParseOutput::Bytes(_) => {
-                    count = 1; // Count only the first SAM alignment
-                    // Continue consuming to keep receiver alive
+                ParseOutput::Bytes(line) => {
+                    let line_str = String::from_utf8_lossy(&line);
+                    if !line_str.starts_with('@') {
+                        alignment_count += 1; // Count only alignment records
+                    }
                 }
                 _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
             }
         }
-        check_tx.send(count).await
-            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        check_tx
+            .send(alignment_count)
+            .await
+            .map_err(|e| anyhow!("Failed to send alignment count: {}", e))?;
         Ok(())
     });
     cleanup_tasks.push(check_task);
 
-    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
-    if check_count == 0 {
+    let alignment_count = check_rx
+        .recv()
+        .await
+        .ok_or(PipelineError::EmptyStream)?;
+    if alignment_count == 0 {
         let drain_rxs = vec![sam_output_stream, sam_file_stream];
-        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs.into_iter().map(|rx| {
-            tokio::spawn(async move {
-                let mut stream = ReceiverStream::new(rx);
-                while stream.next().await.is_some() {}
-                Ok(())
+        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs
+            .into_iter()
+            .map(|rx| {
+                tokio::spawn(async move {
+                    let mut stream = ReceiverStream::new(rx);
+                    while stream.next().await.is_some() {}
+                    Ok(())
+                })
             })
-        }).collect();
+            .collect();
         cleanup_tasks.extend(drain_tasks);
-        return Err(PipelineError::EmptyStream);
+        return Err(PipelineError::NoAlignments);
     }
 
+    // Continue with writing to BAM file
     let align_samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
@@ -1186,13 +1199,9 @@ async fn align_to_target(
             ("-b".to_string(), None),
             ("-o".to_string(), Some(align_bam_path.display().to_string())),
             ("-".to_string(), None),
-        ])
+        ]),
     };
-    let align_samtools_args_view = generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&align_samtools_config_view),
-    )?;
+    let align_samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&align_samtools_config_view))?;
     let (mut _align_samtools_child_view, align_samtools_view_stream_task, align_samtools_view_err_task) = stream_to_cmd(
         config.clone(),
         sam_file_stream,
@@ -1214,7 +1223,7 @@ async fn align_to_target(
         cleanup_tasks,
         cleanup_receivers,
         quast_write_tasks,
-        align_bam_path
+        align_bam_path,
     ))
 }
 
@@ -1393,6 +1402,7 @@ async fn call_variants(
     cleanup_tasks.push(bcftools_call_task);
     cleanup_tasks.push(bcftools_call_err_task);
 
+    // Parse the bcftools call output
     let bcftools_call_out_stream = parse_child_output(
         &mut bcftools_call_child,
         ChildStream::Stdout,
