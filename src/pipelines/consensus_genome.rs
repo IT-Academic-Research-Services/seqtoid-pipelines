@@ -247,7 +247,7 @@ async fn fetch_target_reference<'a>(
 
 async fn align_to_host(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,  // FASTQ raw byte stream from fastp
     host_ref_path: PathBuf,
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
@@ -295,7 +295,9 @@ async fn align_to_host(
         subcommand_fields: HashMap::from([
             ("-f".to_string(), Some("4".to_string())), // unmapped, since what does not map to host is what we want to filter
             ("--no-PG".to_string(), None),
-            ("-h".to_string(), None),                 // Include header
+            ("-h".to_string(), None),   // Include header
+            ("-b".to_string(), None),  //Ensure BAM output
+            ("-u".to_string(), None),  //uncomrpessed BAM
         ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
@@ -344,7 +346,7 @@ async fn align_to_host(
 
     let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
         config.clone(),
-        samtools_out_stream_view,
+        samtools_out_stream_view,  // Uncompressed BAM
         SAMTOOLS_TAG,
         samtools_args_fastq,
         StreamDataType::JustBytes,
