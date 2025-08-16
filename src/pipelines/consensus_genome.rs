@@ -797,7 +797,7 @@ async fn process_ercc(
 ///
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,  // FASTQ SequenceRecord stream
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -1019,13 +1019,13 @@ async fn filter_with_kraken(
 /// * 'targer_ref_path' -
 ///
 /// # Returns
-/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <--- SAM uncompressed
+/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <- uncomrpessed BAM
 /// cleanup_tasks
 /// quast_write_tasks
 ///
 async fn align_to_target(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,  // FASTQ SequenceRecord stream
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -1279,7 +1279,7 @@ async fn generate_consensus(
     cleanup_tasks.push(samtools_consensus_task);
     cleanup_tasks.push(samtools_consensus_err_task);
 
-    let samtools_consensus_out_stream = parse_child_output(  // FASTQ output
+    let samtools_consensus_out_stream = parse_child_output(  // FASTA output
                                                              &mut samtools_consensus_child,
                                                              ChildStream::Stdout,
                                                              ParseMode::Fasta,
@@ -1474,7 +1474,7 @@ async fn call_variants(
 
 async fn realign_consensus_to_ref(
     config: Arc<RunConfig>,
-    consensus_realign_stream: Receiver<ParseOutput>,
+    consensus_realign_stream: Receiver<ParseOutput>,  // FASTA
     target_ref_fasta_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -2004,7 +2004,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Filter Reads
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
-                no_host_ercc_stream,
+                no_host_ercc_stream,  // FASTQ SequenceRecord stream
                 target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
@@ -2083,7 +2083,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Realign Consensus to Ref
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
-                consensus_realign_stream.into_inner(),
+                consensus_realign_stream.into_inner(),  // FASTQ
                 target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
