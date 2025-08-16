@@ -471,7 +471,7 @@ async fn align_to_host(
 
 async fn process_ercc(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>, // FASTQ SequenceRecord stream
     ercc_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
@@ -577,10 +577,6 @@ async fn process_ercc(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if sam_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
-
     cleanup_receivers.push(sam_done_rx);
     let mut sam_streams_iter = sam_streams.into_iter();
     let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -651,7 +647,11 @@ async fn process_ercc(
     // Non-zero case: process stats
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([("--no-PG".to_string(), None)]),
+        subcommand_fields: HashMap::from([
+            ("--no-PG".to_string(), None),
+            ("-b".to_string(), None),  //Ensure BAM output
+            ("-u".to_string(), None),  //Uncompressed BAM
+        ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
         .map_err(|e| PipelineError::ToolExecution {
@@ -762,10 +762,6 @@ async fn process_ercc(
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
-
-    if stats_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
 
     cleanup_receivers.push(stats_done_rx);
     let mut stats_streams_iter = stats_streams.into_iter();
@@ -1988,7 +1984,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // ERCC
             let (no_host_ercc_stream, ercc_stats_out_task, mut ercc_cleanup_tasks, mut ercc_cleanup_receivers) = process_ercc(
                 config.clone(),
-                no_host_output_stream,
+                no_host_output_stream,  // FASTQ SequenceRecord
                 ercc_path,
                 &out_dir,
                 &no_ext_sample_base,
