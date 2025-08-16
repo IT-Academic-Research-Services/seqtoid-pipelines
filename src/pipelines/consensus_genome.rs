@@ -31,7 +31,7 @@ use fxhash::FxHashMap as FxHashMap;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
-use crate::utils::vcf::parse_vcf_stream;
+use crate::utils::vcf::count_variants_from_bcftools_stats;
 use crate::utils::plotting::plot_depths;
 
 
@@ -1353,7 +1353,7 @@ async fn call_variants(
         subcommand: BcftoolsSubcommand::Mpileup,
         subcommand_fields: HashMap::from([
             ("-f".to_string(), Some(target_ref_path.to_string_lossy().into_owned())),
-            ("-O".to_string(), Some("u".to_string())),  // TODO change to u?
+            ("-Ou".to_string(), None),  // Uncompressed BCF
             ("-".to_string(), None),]),
     };
     let bcftools_mpileup_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_mpileup_config))
@@ -1397,7 +1397,7 @@ async fn call_variants(
             ("-m".to_string(), None),
             ("-v".to_string(), None),
             ("-P".to_string(), Some(config.args.bcftools_call_theta.to_string())),
-            ("-Ov".to_string(), None),
+            ("-Ou".to_string(), None),  // Uncompressed BCF
             ("-".to_string(), None),
         ])
     };
@@ -1461,7 +1461,7 @@ async fn call_variants(
         no_ext_sample_base_buf,
         Some(out_dir),
         None,
-        Some("variants.vcf"),
+        Some("variants.bcf"),
         "_",
     );
 
@@ -1562,7 +1562,7 @@ async fn calculate_statistics(
     no_host_seqkit_out_stream_stats: Receiver<ParseOutput>,
     ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
     consensus_stats_stream: Option<ReceiverStream<ParseOutput>>,
-    call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>>,
+    call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>>, // Uncompressed BCF stream (-Ou)
     out_dir: &PathBuf,
     technology: Technology,
 ) -> Result<(), anyhow::Error> {
@@ -1672,11 +1672,45 @@ async fn calculate_statistics(
         HashMap::new()
     };
 
+
     let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
-        parse_vcf_stream(stream.into_inner()).await?
+        let bcftools_stats_args = vec!["stats".to_string(), "-".to_string()];
+        let (mut bcftools_stats_child, bcftools_stats_stream_task, bcftools_stats_err_task) = stream_to_cmd(
+            config.clone(),
+            stream.into_inner(),
+            BCFTOOLS_TAG,
+            bcftools_stats_args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+        ).await?;
+
+        local_cleanup_tasks.push(bcftools_stats_stream_task);
+        local_cleanup_tasks.push(bcftools_stats_err_task);
+
+        // Parse the stdout of bcftools stats as lines
+        let bcftools_stats_out_rx = parse_child_output(
+            &mut bcftools_stats_child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size,
+        ).await?;
+
+        // Await the child process in a separate task to ensure it completes without errors
+        let bcftools_stats_wait_task = tokio::spawn(async move {
+            let status = bcftools_stats_child.wait().await?;
+            if !status.success() {
+                return Err(anyhow!("bcftools stats exited with non-zero status: {}", status));
+            }
+            Ok(())
+        });
+        local_cleanup_tasks.push(bcftools_stats_wait_task);
+
+        count_variants_from_bcftools_stats(bcftools_stats_out_rx).await?
     } else {
         (0, 0, 0)
     };
+
+
 
     let n_actg = allele_counts.iter().filter(|&(k, _)| "ACTGU".contains(*k)).map(|(_, &v)| v).sum::<u64>();
     let n_missing = allele_counts.get(&'N').copied().unwrap_or(0);
