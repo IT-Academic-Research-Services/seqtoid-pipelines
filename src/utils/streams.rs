@@ -522,9 +522,6 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             }
             count += 1;
 
-            if count % 1000 == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
         }
 
     });
