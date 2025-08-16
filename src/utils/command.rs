@@ -376,8 +376,7 @@ pub mod bcftools {
                     args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
                     args_vec.push("-Q".to_string());
                     args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push("-O".to_string());
-                    args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
+
                 }
                 BcftoolsSubcommand::View => {
                     args_vec.push("view".to_string());
