@@ -82,7 +82,7 @@ async fn validate_input(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
         None,
-        Some("validated"),
+        Some("validated.fq.gz"),
         "_",
     );
 
@@ -188,7 +188,6 @@ async fn validate_input(
             tool: FASTP_TAG.to_string(),
             error: e.to_string(),
         })?;
-    // let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
 
     Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks, cleanup_receivers))
 }
