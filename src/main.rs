@@ -246,15 +246,25 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .expect("Failed to create thread pool")
 }
 
-fn compute_base_buffer_size(available_ram: u64, num_cores: usize, data_type: StreamDataType) -> usize {
+fn compute_base_buffer_size(available_ram: u64, _num_cores: usize, data_type: StreamDataType) -> usize {
     let record_size = match data_type {
         StreamDataType::IlluminaFastq => 1_000,
         StreamDataType::OntFastq => 10_000,
         StreamDataType::JustBytes => 500,
     };
-    let ram_fraction = 0.5;
-    let min_buffer = 100_000;
-    let max_buffer = 100_000_000;
-    ((available_ram as f64 * ram_fraction / num_cores as f64) / record_size as f64)
-        .clamp(min_buffer as f64, max_buffer as f64) as usize
+    let ram_fraction = 0.3;
+    let estimated_max_streams = 20; // Max concurrent streams (t-junctions × outputs, e.g., 5 junctions × 4)
+    let min_buffer = 100_000; // ~100MB Illum, ~1GB ONT, ~50MB Bytes
+    let max_buffer = 100_000_000; // ~100GB Illum, ~1TB ONT
+    let total_buffer_bytes = (available_ram as f64 * ram_fraction) as usize;
+    let max_records = (total_buffer_bytes / record_size) / estimated_max_streams.max(1);
+    let buffer_size = max_records.clamp(min_buffer, max_buffer);
+    println!(
+        "Computed base buffer size: {} records (~{} MB/channel, ~{} MB total est. for {} streams)",
+        buffer_size,
+        (buffer_size * record_size) / 1_000_000,
+        (buffer_size * record_size * estimated_max_streams) / 1_000_000,
+        estimated_max_streams
+    );
+    buffer_size
 }

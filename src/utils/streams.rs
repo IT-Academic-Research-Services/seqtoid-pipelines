@@ -879,7 +879,7 @@ mod tests {
             args,
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
-            base_buffer_size: 50_000,
+            base_buffer_size: 5_000_000,
         })
     }
 
