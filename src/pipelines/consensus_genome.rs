@@ -31,7 +31,7 @@ use fxhash::FxHashMap as FxHashMap;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
-use crate::utils::vcf::parse_vcf_stream;
+use crate::utils::vcf::count_variants_from_bcftools_stats;
 use crate::utils::plotting::plot_depths;
 
 
@@ -82,7 +82,7 @@ async fn validate_input(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
         None,
-        Some("validated"),
+        Some("validated.fq.gz"),
         "_",
     );
 
@@ -102,7 +102,7 @@ async fn validate_input(
         2,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::IlluminaFastq,
         "validate_input".to_string(),
@@ -188,7 +188,6 @@ async fn validate_input(
             tool: FASTP_TAG.to_string(),
             error: e.to_string(),
         })?;
-    // let val_fastp_out_stream = ReceiverStream::new(val_fastp_out_stream);
 
     Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks, cleanup_receivers))
 }
@@ -248,7 +247,7 @@ async fn fetch_target_reference<'a>(
 
 async fn align_to_host(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,  // FASTQ raw byte stream from fastp
     host_ref_path: PathBuf,
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
@@ -296,7 +295,9 @@ async fn align_to_host(
         subcommand_fields: HashMap::from([
             ("-f".to_string(), Some("4".to_string())), // unmapped, since what does not map to host is what we want to filter
             ("--no-PG".to_string(), None),
-            ("-h".to_string(), None),                 // Include header
+            ("-h".to_string(), None),   // Include header
+            ("-b".to_string(), None),  //Ensure BAM output
+            ("-u".to_string(), None),  //uncomrpessed BAM
         ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
@@ -345,7 +346,7 @@ async fn align_to_host(
 
     let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
         config.clone(),
-        samtools_out_stream_view,
+        samtools_out_stream_view,  // Uncompressed BAM
         SAMTOOLS_TAG,
         samtools_args_fastq,
         StreamDataType::JustBytes,
@@ -372,12 +373,13 @@ async fn align_to_host(
         })?;
     let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
 
+    // Input: SequenceRecord::Fastq
     let (host_streams, host_done_rx) = t_junction(
         samtools_out_stream_fastq,
         4,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::IlluminaFastq,
         "align_to_host".to_string(),
@@ -469,7 +471,7 @@ async fn align_to_host(
 
 async fn process_ercc(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>, // FASTQ SequenceRecord stream
     ercc_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
@@ -498,7 +500,7 @@ async fn process_ercc(
         3,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::IlluminaFastq,
         "process_ercc_bypass".to_string(),
@@ -566,7 +568,7 @@ async fn process_ercc(
         2,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::JustBytes,
         "process_ercc_empty_check".to_string(),
@@ -574,10 +576,6 @@ async fn process_ercc(
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
-
-    if sam_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
 
     cleanup_receivers.push(sam_done_rx);
     let mut sam_streams_iter = sam_streams.into_iter();
@@ -649,7 +647,11 @@ async fn process_ercc(
     // Non-zero case: process stats
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([("--no-PG".to_string(), None)]),
+        subcommand_fields: HashMap::from([
+            ("--no-PG".to_string(), None),
+            ("-b".to_string(), None),  //Ensure BAM output
+            ("-u".to_string(), None),  //Uncompressed BAM
+        ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
         .map_err(|e| PipelineError::ToolExecution {
@@ -752,7 +754,7 @@ async fn process_ercc(
         2,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::JustBytes,
         "process_ercc_stats".to_string(),
@@ -760,10 +762,6 @@ async fn process_ercc(
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
-
-    if stats_streams.len() < 2 {
-        return Err(PipelineError::EmptyStream);
-    }
 
     cleanup_receivers.push(stats_done_rx);
     let mut stats_streams_iter = stats_streams.into_iter();
@@ -799,7 +797,7 @@ async fn process_ercc(
 ///
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,  // FASTQ SequenceRecord stream
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -919,7 +917,7 @@ async fn filter_with_kraken(
         3,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::IlluminaFastq,
         "filter_reads_output".to_string(),
@@ -1021,13 +1019,13 @@ async fn filter_with_kraken(
 /// * 'targer_ref_path' -
 ///
 /// # Returns
-/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <--- SAM uncompressed
+/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <- uncomrpessed BAM
 /// cleanup_tasks
 /// quast_write_tasks
 ///
 async fn align_to_target(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,  // FASTQ SequenceRecord stream
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -1078,7 +1076,8 @@ async fn align_to_target(
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-O".to_string(), Some("sam".to_string())),
+            ("-u".to_string(), None), // Uncompressed
+            ("-O".to_string(), Some("bam".to_string())), // BAM output
             ("-".to_string(), None)
         ]),
     };
@@ -1131,7 +1130,7 @@ async fn align_to_target(
         3,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::JustBytes,
         "align_to_target".to_string(),
@@ -1146,58 +1145,24 @@ async fn align_to_target(
     let sam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let (check_tx, mut check_rx) = mpsc::channel(1);
-    let check_task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(sam_check_stream);
-        let mut count = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(_) => {
-                    count = 1; // Count only the first SAM alignment
-                    // Continue consuming to keep receiver alive
-                }
-                _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
-            }
-        }
-        check_tx.send(count).await
-            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
-        Ok(())
-    });
-    cleanup_tasks.push(check_task);
-
-    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
-    if check_count == 0 {
-        let drain_rxs = vec![sam_output_stream, sam_file_stream];
-        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs.into_iter().map(|rx| {
-            tokio::spawn(async move {
-                let mut stream = ReceiverStream::new(rx);
-                while stream.next().await.is_some() {}
-                Ok(())
-            })
-        }).collect();
-        cleanup_tasks.extend(drain_tasks);
-        return Err(PipelineError::EmptyStream);
-    }
-
-    let align_samtools_config_view = SamtoolsConfig {
+    //  check stream convert to SAM for non-empty chk
+    let sam_view_args = generate_cli(SAMTOOLS_TAG, &config, Some(&SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
             ("-h".to_string(), None),
-            ("-b".to_string(), None),
-            ("-o".to_string(), Some(align_bam_path.display().to_string())),
             ("-".to_string(), None),
-        ])
-    };
-    let align_samtools_args_view = generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&align_samtools_config_view),
-    )?;
-    let (mut _align_samtools_child_view, align_samtools_view_stream_task, align_samtools_view_err_task) = stream_to_cmd(
+        ]),
+    }))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut sam_view_child, sam_view_task, sam_view_err_task) = stream_to_cmd(
         config.clone(),
-        sam_file_stream,
+        sam_check_stream,
         SAMTOOLS_TAG,
-        align_samtools_args_view,
+        sam_view_args,
         StreamDataType::JustBytes,
         config.args.verbose,
     )
@@ -1206,8 +1171,67 @@ async fn align_to_target(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    quast_write_tasks.push(align_samtools_view_stream_task);
-    cleanup_tasks.push(align_samtools_view_err_task);
+    cleanup_tasks.push(sam_view_task);
+    cleanup_tasks.push(sam_view_err_task);
+
+    let sam_check_stream = parse_child_output(
+        &mut sam_view_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    //check for alignment records (not just ehader)
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let check_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(sam_check_stream);
+        let mut alignment_count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(line) => {
+                    let line_str = String::from_utf8_lossy(&line);
+                    if !line_str.starts_with('@') {
+                        alignment_count += 1; // Count only alignment records
+                    }
+                }
+                _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
+            }
+        }
+        check_tx
+            .send(alignment_count)
+            .await
+            .map_err(|e| anyhow!("Failed to send alignment count: {}", e))?;
+        Ok(())
+    });
+    cleanup_tasks.push(check_task);
+
+    let alignment_count = check_rx
+        .recv()
+        .await
+        .ok_or(PipelineError::EmptyStream)?;
+    if alignment_count == 0 {
+        let drain_rxs = vec![sam_output_stream, sam_file_stream];
+        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs
+            .into_iter()
+            .map(|rx| {
+                tokio::spawn(async move {
+                    let mut stream = ReceiverStream::new(rx);
+                    while stream.next().await.is_some() {}
+                    Ok(())
+                })
+            })
+            .collect();
+        cleanup_tasks.extend(drain_tasks);
+        return Err(PipelineError::Other(anyhow!("No alignment records in BAM stream")));
+    }
+
+    let bam_write_task = tokio::spawn(stream_to_file(sam_file_stream, align_bam_path.clone()));
+    quast_write_tasks.push(bam_write_task);
 
     Ok((
         ReceiverStream::new(sam_output_stream),
@@ -1221,7 +1245,7 @@ async fn align_to_target(
 
 async fn generate_consensus(
     config: Arc<RunConfig>,
-    bam_stream: ReceiverStream<ParseOutput>,
+    bam_stream: ReceiverStream<ParseOutput>,  // Uncompressed BAM byte stream
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
@@ -1255,7 +1279,7 @@ async fn generate_consensus(
     cleanup_tasks.push(samtools_consensus_task);
     cleanup_tasks.push(samtools_consensus_err_task);
 
-    let samtools_consensus_out_stream = parse_child_output(  // FASTQ output
+    let samtools_consensus_out_stream = parse_child_output(  // FASTA output
                                                              &mut samtools_consensus_child,
                                                              ChildStream::Stdout,
                                                              ParseMode::Fasta,
@@ -1273,7 +1297,7 @@ async fn generate_consensus(
         3,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::JustBytes,
         "generate_consensus".to_string(),
@@ -1314,7 +1338,7 @@ async fn generate_consensus(
 
 async fn call_variants(
     config: Arc<RunConfig>,
-    bam_stream: ReceiverStream<ParseOutput>,
+    bam_stream: ReceiverStream<ParseOutput>,  //Uncompressed BAM byte stream
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -1324,7 +1348,10 @@ async fn call_variants(
 
     let bcftools_mpileup_config = BcftoolsConfig {
         subcommand: BcftoolsSubcommand::Mpileup,
-        subcommand_fields: HashMap::from([("-f".to_string(), Some(target_ref_path.to_string_lossy().into_owned())), ("-".to_string(), None),]),
+        subcommand_fields: HashMap::from([
+            ("-f".to_string(), Some(target_ref_path.to_string_lossy().into_owned())),
+            ("-Ou".to_string(), None),  // Uncompressed BCF
+            ("-".to_string(), None),]),
     };
     let bcftools_mpileup_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_mpileup_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -1367,7 +1394,7 @@ async fn call_variants(
             ("-m".to_string(), None),
             ("-v".to_string(), None),
             ("-P".to_string(), Some(config.args.bcftools_call_theta.to_string())),
-            ("-Ov".to_string(), None),
+            ("-Ou".to_string(), None),  // Uncompressed BCF
             ("-".to_string(), None),
         ])
     };
@@ -1393,6 +1420,7 @@ async fn call_variants(
     cleanup_tasks.push(bcftools_call_task);
     cleanup_tasks.push(bcftools_call_err_task);
 
+    // Parse the bcftools call output
     let bcftools_call_out_stream = parse_child_output(
         &mut bcftools_call_child,
         ChildStream::Stdout,
@@ -1411,7 +1439,7 @@ async fn call_variants(
         2,
         config.base_buffer_size,
         config.args.stall_threshold,
-        Some(config.args.stream_sleep_ms),
+        None,
         50,
         StreamDataType::JustBytes,
         "call_variants".to_string(),
@@ -1430,7 +1458,7 @@ async fn call_variants(
         no_ext_sample_base_buf,
         Some(out_dir),
         None,
-        Some("variants.vcf"),
+        Some("variants.bcf"),
         "_",
     );
 
@@ -1446,7 +1474,7 @@ async fn call_variants(
 
 async fn realign_consensus_to_ref(
     config: Arc<RunConfig>,
-    consensus_realign_stream: Receiver<ParseOutput>,
+    consensus_realign_stream: Receiver<ParseOutput>,  // FASTA
     target_ref_fasta_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -1526,12 +1554,12 @@ async fn realign_consensus_to_ref(
 async fn calculate_statistics(
     config: Arc<RunConfig>,
     no_ext_sample_base: &str,
-    consensus_bam_stats_stream: Option<ReceiverStream<ParseOutput>>,
-    consensus_bam_depth_stream: Option<ReceiverStream<ParseOutput>>,
+    consensus_bam_stats_stream: Option<ReceiverStream<ParseOutput>>,  //Uncompressed BAM byte stream
+    consensus_bam_depth_stream: Option<ReceiverStream<ParseOutput>>,  //Uncompressed BAM byte stream
     no_host_seqkit_out_stream_stats: Receiver<ParseOutput>,
     ercc_stats_task: Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
     consensus_stats_stream: Option<ReceiverStream<ParseOutput>>,
-    call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>>,
+    call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>>, // Uncompressed BCF stream (-Ou)
     out_dir: &PathBuf,
     technology: Technology,
 ) -> Result<(), anyhow::Error> {
@@ -1641,11 +1669,45 @@ async fn calculate_statistics(
         HashMap::new()
     };
 
+
     let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
-        parse_vcf_stream(stream.into_inner()).await?
+        let bcftools_stats_args = vec!["stats".to_string(), "-".to_string()];
+        let (mut bcftools_stats_child, bcftools_stats_stream_task, bcftools_stats_err_task) = stream_to_cmd(
+            config.clone(),
+            stream.into_inner(),
+            BCFTOOLS_TAG,
+            bcftools_stats_args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+        ).await?;
+
+        local_cleanup_tasks.push(bcftools_stats_stream_task);
+        local_cleanup_tasks.push(bcftools_stats_err_task);
+
+        // Parse the stdout of bcftools stats as lines
+        let bcftools_stats_out_rx = parse_child_output(
+            &mut bcftools_stats_child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size,
+        ).await?;
+
+        // Await the child process in a separate task to ensure it completes without errors
+        let bcftools_stats_wait_task = tokio::spawn(async move {
+            let status = bcftools_stats_child.wait().await?;
+            if !status.success() {
+                return Err(anyhow!("bcftools stats exited with non-zero status: {}", status));
+            }
+            Ok(())
+        });
+        local_cleanup_tasks.push(bcftools_stats_wait_task);
+
+        count_variants_from_bcftools_stats(bcftools_stats_out_rx).await?
     } else {
         (0, 0, 0)
     };
+
+
 
     let n_actg = allele_counts.iter().filter(|&(k, _)| "ACTGU".contains(*k)).map(|(_, &v)| v).sum::<u64>();
     let n_missing = allele_counts.get(&'N').copied().unwrap_or(0);
@@ -1766,7 +1828,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut align_bam_path: Option<PathBuf> = None;
     let mut align_sam_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut align_sam_depth_stream: Option<ReceiverStream<ParseOutput>> = None;
-    let mut align_sam_eval_stream: Option<Receiver<ParseOutput>> = None;
     let mut consensus_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
 
@@ -1923,7 +1984,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // ERCC
             let (no_host_ercc_stream, ercc_stats_out_task, mut ercc_cleanup_tasks, mut ercc_cleanup_receivers) = process_ercc(
                 config.clone(),
-                no_host_output_stream,
+                no_host_output_stream,  // FASTQ SequenceRecord
                 ercc_path,
                 &out_dir,
                 &no_ext_sample_base,
@@ -1943,7 +2004,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Filter Reads
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
-                no_host_ercc_stream,
+                no_host_ercc_stream,  // FASTQ SequenceRecord stream
                 target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
@@ -1968,12 +2029,13 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             align_bam_path = Some(align_bam_path_inner);
 
             // Split SAM streams for bypass, stats, etc
+            // Input: uncompressed BAM byte stream
             let (align_sam_streams, align_sam_done_rx) = t_junction(
                 sam_output_stream,
-                5,
+                4,
                 config.base_buffer_size,
                 config.args.stall_threshold,
-                Some(config.args.stream_sleep_ms),
+                None,
                 50,
                 StreamDataType::JustBytes,
                 "pipeline_aligned_sam_split".to_string(),
@@ -1987,7 +2049,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             align_sam_stats_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
             align_sam_depth_stream = Some(ReceiverStream::new(align_streams_iter.next().ok_or(PipelineError::EmptyStream)?));
-            align_sam_eval_stream = Some(align_streams_iter.next().ok_or(PipelineError::EmptyStream).unwrap());
 
             let mut align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
             let mut align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
@@ -2022,7 +2083,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             // Realign Consensus to Ref
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
-                consensus_realign_stream.into_inner(),
+                consensus_realign_stream.into_inner(),  // FASTQ
                 target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,

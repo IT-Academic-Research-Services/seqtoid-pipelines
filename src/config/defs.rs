@@ -28,8 +28,8 @@ pub const SEQKIT_TAG: &str = "seqkit";
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();
-        m.insert(SAMTOOLS_TAG, 1.20);
-        m.insert(BCFTOOLS_TAG, 1.20);
+        m.insert(SAMTOOLS_TAG, 1.19);
+        m.insert(BCFTOOLS_TAG, 1.19);
         m.insert(MINIMAP2_TAG, 2.24);
         m.insert(KRAKEN2_TAG, 2.1);
         m.insert(PIGZ_TAG, 2.8);
@@ -114,10 +114,10 @@ pub struct RunConfig {
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
-            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) => CoreAllocation::Maximal,
-            (FASTP_TAG, _) | (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
+            (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
-            (PIGZ_TAG, _) | (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
+            (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
             (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
             _ => CoreAllocation::Minimal,
@@ -126,11 +126,19 @@ impl RunConfig {
 
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
         let max_cores = min(num_cpus::get(), self.args.threads);
-        match self.get_core_allocation(tag, subcommand) {
+        let mut allocation = match self.get_core_allocation(tag, subcommand) {
             CoreAllocation::Maximal => max_cores,
-            CoreAllocation::High => (max_cores / 2).max(1),
-            CoreAllocation::Low => (max_cores / 4).max(1),
+            CoreAllocation::High => ((max_cores as f32 * 0.75) as usize).max(1),  // Unchanged
+            CoreAllocation::Low => (max_cores / 3).max(1),  // Unchanged
             CoreAllocation::Minimal => 1,
+        };
+
+
+        match tag {
+            PIGZ_TAG => allocation.min(16),  // Cap at 16: Compression scales poorly >16 due to I/O
+            FASTP_TAG => allocation.min(16),  // Cap at 16: QC/filtering I/O-bound on large FASTQ
+            MINIMAP2_TAG => allocation.min(64),  // Cap at 64: Indexing/chaining memory-bound on hg38
+            _ => allocation,
         }
     }
 }
@@ -153,6 +161,8 @@ pub enum PipelineError {
     EmptyStream,
     #[error("No sequences matched target taxonomy ID: {0}")]
     NoTargetSequences(String),
+    #[error("No alignments.")]
+    NoAlignments,
     #[error("Other error: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
 }

@@ -149,7 +149,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
         args,
         thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(84).build().unwrap()),
         maximal_semaphore: Arc::new(Semaphore::new(84)),
-        base_buffer_size: 50_000, // Reasonable for 1.5TB RAM
+        base_buffer_size: 5_000_000, // Reasonable for 1.5TB RAM
     })
 }
 

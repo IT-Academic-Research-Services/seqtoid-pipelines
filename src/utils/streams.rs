@@ -132,7 +132,7 @@ where
     }
 
     const MAX_PROCESSES: usize = 4;
-    const RAM_FRACTION: f64 = 0.25;
+    const RAM_FRACTION: f64 = 0.5;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
 
     let record_size = match data_type {
@@ -242,8 +242,8 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
     let (batch_size_bytes, writer_capacity) = match data_type {
         StreamDataType::JustBytes => (65_536, 65_536),
-        StreamDataType::IlluminaFastq => (131_072, 131_072),
-        StreamDataType::OntFastq => (524_288, 524_288),
+        StreamDataType::IlluminaFastq => (8_388_608, 8_388_608),
+        StreamDataType::OntFastq => (1_048_576, 1_048_576),
     };
 
     let cmd_tag_owned = cmd_tag.to_string();
@@ -522,9 +522,6 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             }
             count += 1;
 
-            if count % 1000 == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
         }
 
     });
@@ -882,7 +879,7 @@ mod tests {
             args,
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
-            base_buffer_size: 50_000,
+            base_buffer_size: 5_000_000,
         })
     }
 

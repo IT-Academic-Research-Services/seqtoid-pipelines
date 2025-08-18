@@ -83,11 +83,13 @@ mod fastp {
 
     impl ArgGenerator for FastpArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
             let args = &run_config.args;
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
             args_vec.push("--interleaved_in".to_string());
+            args_vec.push("--dont_eval_duplication".to_string());
             args_vec.push("-q".to_string());
             args_vec.push(args.quality.to_string());
 
@@ -129,6 +131,7 @@ mod pigz {
 
     impl ArgGenerator for PigzArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            eprintln!("Allocating {} threads for pigz", RunConfig::thread_allocation(run_config, PIGZ_TAG, None));
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("-c".to_string());
             args_vec.push("-p".to_string());
@@ -168,6 +171,7 @@ mod minimap2 {
 
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));  // Debug log
             let args = &run_config.args;
             let paths = extra
                 .and_then(|e| e.downcast_ref::<(PathBuf, PathBuf)>())
@@ -206,6 +210,13 @@ mod minimap2 {
         let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
         args_vec.push("-t".to_string());
         args_vec.push(num_cores.to_string());
+
+
+        args_vec.push("-R".to_string());
+        args_vec.push("@RG\\tID:id\\tSM:sample\\tLB:lib".to_string());  // Add read group for better sorting/parallelism downstream
+
+        args_vec.push("-w".to_string());
+        args_vec.push("100000".to_string()); // Larger minibatch for better thread scaling
 
         let technology = args.technology.clone();
         match technology {
@@ -365,8 +376,7 @@ pub mod bcftools {
                     args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
                     args_vec.push("-Q".to_string());
                     args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push("-O".to_string());
-                    args_vec.push("b".to_string());  // Compressed BCF output to save space in stream
+
                 }
                 BcftoolsSubcommand::View => {
                     args_vec.push("view".to_string());

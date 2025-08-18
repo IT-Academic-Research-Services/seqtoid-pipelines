@@ -51,7 +51,7 @@ pub struct Arguments {
     #[arg(short = 'q', long = "quality", default_value_t = 30)]
     pub quality: u8,
 
-    #[arg(long, default_value_t = 10000)]
+    #[arg(long, default_value_t = 10_000_000)]
     pub stall_threshold: u64,
 
     #[arg(long, default_value_t = 0)]
