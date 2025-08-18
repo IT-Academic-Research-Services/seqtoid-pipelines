@@ -44,7 +44,7 @@ mod tests {
     async fn test_stream_sam_alignment_counter() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
         let sam_data = vec![
-            ParseOutput::Bytes(b"@HD\tVN:1.6\n@SQ\tSN:ERCC-00002\tLN:1061\nread1\t77\t*\t0\t0\t*\t*\t0\t0\tATCG\tIIII\n".to_vec()),
+            ParseOutput::Bytes(b"@HD\tVN:1.6\n@SQ\tSN:ERCC-00002\tLN:1061\nread1\t77\t*\t0\t0\t*\t*\t0\t0\tATCG\tIIII\n".to_vec().into()),
         ];
 
         tokio::spawn(async move {
@@ -61,7 +61,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_sam_alignment_counter_empty() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        let sam_data = vec![ParseOutput::Bytes(b"@HD\tVN:1.6\n@SQ\tSN:ERCC-00002\tLN:1061\n".to_vec())];
+        let sam_data = vec![ParseOutput::Bytes(b"@HD\tVN:1.6\n@SQ\tSN:ERCC-00002\tLN:1061\n".to_vec().into())];
 
         tokio::spawn(async move {
             for item in sam_data {

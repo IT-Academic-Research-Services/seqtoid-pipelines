@@ -820,7 +820,7 @@ mod tests {
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
         let fastq_data = vec![
-            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec()),
+            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec().into()),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
@@ -844,7 +844,7 @@ mod tests {
     async fn test_stream_record_counter_fasta_early_exit() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
         let fasta_data = vec![
-            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec()),
+            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec().into()),
             ParseOutput::Fasta(SequenceRecord::Fasta {
                 id: "seq2".to_string(),
                 desc: None,

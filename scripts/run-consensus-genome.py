@@ -33,7 +33,7 @@ def find_fastq_pairs(directory, sample_order):
 
     return fastq_pairs
 
-def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, ref_sequence, log_file, ercc_sequence, host_sequence, ref_taxid):
+def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, ref_sequence, log_file, ercc_sequence, host_sequence, ref_taxid, out_dir):
     """
     Run the seqtoid-pipelines command for a single sample and extract runtime from console output.
     """
@@ -49,6 +49,7 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '--ercc-sequences', ercc_sequence,
         '--host-sequence', host_sequence,
         '--ref-taxid', ref_taxid,
+        '--out-dir', out_dir,
     ]
 
     # Format the command for logging

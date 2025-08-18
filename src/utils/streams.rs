@@ -897,7 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_zero_streams() -> Result<()> {
-        let stream = fastx_generator(10, 143, 35.0, 3.0);
+        let stream = fastx_generator(10, 143, 35.0, 3.0).map(ParseOutput::Fastq);
         let result = t_junction(
             stream,
             0,
@@ -960,11 +960,11 @@ mod tests {
         }
         assert_eq!(records1.len(), 2);
         assert_eq!(records2.len(), 2);
-        if let ParseOutput::Fastq(record) = &records1[0] {
-            assert_eq!(record.id(), "read1");
+        if let ParseOutput::Fastq(rec) = &records1[0] {
+            assert_eq!(rec.id(), "read1");
         }
-        if let ParseOutput::Fastq(record) = &records2[0] {
-            assert_eq!(record.id(), "read1");
+        if let ParseOutput::Fastq(rec) = &records2[0] {
+            assert_eq!(rec.id(), "read1");
         }
         done_rx.await??;
         Ok(())
@@ -972,7 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_long_stream() -> Result<()> {
-        let stream = fastx_generator(10_000, 143, 35.0, 3.0);
+        let stream = fastx_generator(10_000, 143, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             2,
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_ten_thousand_records_ten_streams() -> Result<()> {
-        let stream = fastx_generator(10_000, 143, 35.0, 3.0);
+        let stream = fastx_generator(10_000, 143, 35.0, 3.0).map(ParseOutput::Fastq);
         let (outputs, done_rx) = t_junction(
             stream,
             10,
@@ -1045,7 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_empty_stream() -> Result<()> {
-        let stream = fastx_generator(0, 50, 35.0, 3.0);
+        let stream = fastx_generator(0, 50, 35.0, 3.0).map(ParseOutput::Fastq);
         let (outputs, done_rx) = t_junction(
             stream,
             2,
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_single_record() -> Result<()> {
-        let stream = fastx_generator(1, 50, 35.0, 3.0);
+        let stream = fastx_generator(1, 50, 35.0, 3.0).map(ParseOutput::Fastq);
         let (outputs, done_rx) = t_junction(
             stream,
             2,
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_t_junction_slow_consumer() -> Result<()> {
-        let stream = fastx_generator(1_000, 50, 35.0, 3.0);
+        let stream = fastx_generator(1_000, 50, 35.0, 3.0).map(ParseOutput::Fastq);
         let (outputs, done_rx) = t_junction(
             stream,
             2,
@@ -1171,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn test_t_million_records_ten_streams() -> Result<()> {
         let num_records = 1_000_000;
-        let stream = fastx_generator(num_records, 143, 35.0, 3.0);
+        let stream = fastx_generator(num_records, 143, 35.0, 3.0).map(ParseOutput::Fastq);
         let (outputs, done_rx) = t_junction(
             stream,
             2,
@@ -1247,7 +1247,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_valid() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(100, 50, 35.0, 3.0);
+        let stream = fastx_generator(100, 50, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1282,7 +1282,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_valid_cat() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let stream = fastx_generator(2, 10, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1321,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_valid_parseoutput() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let stream = fastx_generator(2, 10, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1339,7 +1339,7 @@ mod tests {
         tokio::spawn(async move {
             let mut stream = ReceiverStream::new(rx);
             while let Some(record) = stream.next().await {
-                if tx.send(ParseOutput::Fastq(record)).await.is_err() {
+                if tx.send(record).await.is_err() {
                     eprintln!("Failed to send ParseOutput");
                     break;
                 }
@@ -1371,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_invalid_command() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(2, 10, 35.0, 3.0);
+        let stream = fastx_generator(2, 10, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, _done_rx) = t_junction(
             stream,
             1,
@@ -1405,7 +1405,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_empty_stream() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(0, 10, 35.0, 3.0);
+        let stream = fastx_generator(0, 10, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1442,7 +1442,7 @@ mod tests {
     async fn test_stream_to_cmd_large_stream() -> Result<()> {
         let config = create_test_run_config();
         let num_records = 10_000;
-        let stream = fastx_generator(num_records, 50, 35.0, 3.0);
+        let stream = fastx_generator(num_records, 50, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1501,7 +1501,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_premature_exit() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(10, 10, 35.0, 3.0);
+        let stream = fastx_generator(10, 10, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1540,7 +1540,7 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_cmd_resource_cleanup() -> Result<()> {
         let config = create_test_run_config();
-        let stream = fastx_generator(5, 10, 35.0, 3.0);
+        let stream = fastx_generator(5, 10, 35.0, 3.0).map(ParseOutput::Fastq);
         let (mut outputs, done_rx) = t_junction(
             stream,
             1,
@@ -1597,7 +1597,7 @@ mod tests {
         let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, 100).await?;
         let mut stream = ReceiverStream::new(rx);
         while let Some(ParseOutput::Bytes(chunk)) = stream.next().await {
-            assert!(String::from_utf8_lossy(&chunk).contains("test data"));
+            assert!(String::from_utf8_lossy(&*chunk).contains("test data"));
             break;
         }
         Ok(())
@@ -1607,12 +1607,12 @@ mod tests {
     async fn test_stream_to_file_fastq() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_test_illumina.fq");
         let num_records = 2;
-        let mut records = fastx_generator(num_records, 150, 30.0, 8.0);
+        let mut records = fastx_generator(num_records, 150, 30.0, 8.0).map(ParseOutput::Fastq);
         let (tx, rx) = mpsc::channel(1024);
 
         tokio::spawn(async move {
             while let Some(record) = records.next().await {
-                if tx.send(ParseOutput::Fastq(record)).await.is_err() {
+                if tx.send(record).await.is_err() {
                     eprintln!("Failed to send record");
                     break;
                 }
@@ -1655,11 +1655,11 @@ mod tests {
     async fn test_stream_to_file_no_records() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_norecord_test.fq");
         let (tx, rx) = mpsc::channel(1024);
-        let mut records = fastx_generator(0, 10, 35.0, 3.0);
+        let mut records = fastx_generator(0, 10, 35.0, 3.0).map(ParseOutput::Fastq);
 
         tokio::spawn(async move {
             while let Some(record) = records.next().await {
-                if tx.send(ParseOutput::Fastq(record)).await.is_err() {
+                if tx.send(record).await.is_err() {
                     eprintln!("Failed to send record");
                     break;
                 }
