@@ -203,36 +203,7 @@ mod minimap2 {
         }
     }
 
-    pub fn arg_generator(run_config: &RunConfig, ref_pipe_path: &PathBuf, query_pipe_path: &PathBuf) -> Vec<String> {
-        let args = &run_config.args;
-        let mut args_vec: Vec<String> = Vec::new();
-
-        let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
-        args_vec.push("-t".to_string());
-        args_vec.push(num_cores.to_string());
-
-
-        args_vec.push("-R".to_string());
-        args_vec.push("@RG\\tID:id\\tSM:sample\\tLB:lib".to_string());  // Add read group for better sorting/parallelism downstream
-
-        args_vec.push("-w".to_string());
-        args_vec.push("100000".to_string()); // Larger minibatch for better thread scaling
-
-        let technology = args.technology.clone();
-        match technology {
-            Technology::Illumina => {
-                args_vec.push("-ax sr".to_string());
-            }
-            Technology::ONT => {
-                args_vec.push("-ax map-ont".to_string());
-            }
-        }
-
-        args_vec.push(ref_pipe_path.to_string_lossy().to_string());
-        args_vec.push(query_pipe_path.to_string_lossy().to_string());
-
-        args_vec
-    }
+ 
 }
 
 pub mod samtools {
