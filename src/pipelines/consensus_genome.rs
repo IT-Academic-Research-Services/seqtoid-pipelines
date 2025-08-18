@@ -96,7 +96,9 @@ async fn validate_input(
     )
         .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
 
-    let val_rx_stream = ReceiverStream::new(rx);
+    // Convert ReceiverStream<SequenceRecord> to ReceiverStream<ParseOutput>
+    let val_rx_stream = ReceiverStream::new(rx).map(|record| ParseOutput::Fastq(record));
+
     let (val_streams, val_done_rx) = t_junction(
         val_rx_stream,
         2,

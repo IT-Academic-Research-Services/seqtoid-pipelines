@@ -65,7 +65,7 @@ impl ToBytes for ParseOutput {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
             ParseOutput::Fasta(record) => record.to_bytes(),
-            ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
+            ParseOutput::Bytes(bytes) => Ok(bytes.as_ref().clone()),
         }
     }
 }
@@ -88,7 +88,7 @@ pub enum ParseMode {
 pub enum ParseOutput {
     Fastq(SequenceRecord),
     Fasta(SequenceRecord),
-    Bytes(Vec<u8>),
+    Bytes(Arc<Vec<u8>>),
 }
 
 /// Generates any number of output streams from a single input stream.
@@ -105,7 +105,7 @@ pub enum ParseOutput {
 /// A `Result` containing a tuple of:
 /// - A vector of `mpsc::Receiver<T>` for downstream processing.
 /// - A `oneshot::Receiver<()>` to await task completion.
-pub async fn t_junction<S, T>(
+pub async fn t_junction<S>(
     input: S,
     n_outputs: usize,
     base_buffer_size: usize,
@@ -115,10 +115,9 @@ pub async fn t_junction<S, T>(
     data_type: StreamDataType,
     label: String,
     notify: Option<Arc<Notify>>,
-) -> Result<(Vec<mpsc::Receiver<T>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
+) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, oneshot::Receiver<Result<(), anyhow::Error>>)>
 where
-    S: Stream<Item = T> + Unpin + Send + 'static,
-    T: Clone + Send + Sync + 'static,
+    S: Stream<Item = ParseOutput> + Unpin + Send + 'static,
 {
     if n_outputs == 0 {
         return Err(anyhow!("No subscribers: cannot process stream in {}", label));
@@ -197,7 +196,6 @@ where
             }
         }
 
-        //eprintln!("{}: Producer finished after {} items. Channel status: {:?}", label, count, channel_status);
         if let Some(n) = notify {
             n.notify_waiters();
         }
@@ -224,15 +222,14 @@ where
 /// # Returns
 /// tokio::process::Command containing stdout and stderr
 
-pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
+pub async fn stream_to_cmd(
     config: Arc<RunConfig>,
-    rx: mpsc::Receiver<T>,
+    rx: mpsc::Receiver<ParseOutput>,
     cmd_tag: &str,
     args: Vec<String>,
     data_type: StreamDataType,
     verbose: bool,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
-
     let core_allocation = config.get_core_allocation(cmd_tag, None);
     let _permit = if core_allocation == CoreAllocation::Maximal {
         Some(config.maximal_semaphore.clone().acquire_owned().await?)
@@ -273,8 +270,13 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
 
         let mut stream = ReceiverStream::new(rx);
         while let Some(item) = stream.next().await {
-            let bytes = item.to_bytes()?;
-            batch.extend_from_slice(&bytes);
+            match &item {
+                ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&*arc_bytes),
+                _ => {
+                    let bytes = item.to_bytes()?;
+                    batch.extend_from_slice(&bytes);
+                }
+            }
 
             if batch.len() >= batch_size_bytes {
                 writer.write_all(&batch).await?;
@@ -318,7 +320,6 @@ pub async fn stream_to_cmd<T: ToBytes + Clone + Send + Sync + 'static>(
         Ok(())
     });
 
-    // Permit is automatically dropped when the function exits, releasing it
     Ok((child, stdin_task, stderr_task))
 }
 
@@ -499,13 +500,8 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 return;
             }
             let qual = buffer.trim_end().as_bytes().to_vec();
-            if qual.is_empty() {
-                eprintln!("Missing quality");
-                return;
-            }
-
-            if seq.len() != qual.len() {
-                eprintln!("Sequence length ({}) != quality length ({})", seq.len(), qual.len());
+            if qual.len() != seq.len() {
+                eprintln!("Sequence and quality lengths do not match");
                 return;
             }
 
@@ -517,13 +513,11 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             };
 
             if tx.send(ParseOutput::Fastq(record)).await.is_err() {
-                eprintln!("No active receivers for FASTQ record {}", count + 1);
+                eprintln!("Receiver dropped while sending FASTQ record");
                 break;
             }
             count += 1;
-
         }
-
     });
 
     Ok(rx)
@@ -605,25 +599,26 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
     buffer_size: usize,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
     let (tx, rx) = mpsc::channel(buffer_size);
-    let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
     tokio::spawn(async move {
-        let mut buffer = vec![0u8; 256 * 1024];
+        let mut reader = BufReader::with_capacity(1024 * 1024, reader);
+        let mut buffer = vec![0u8; 8192];
         loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = buffer[..n].to_vec();
-                    if tx.send(ParseOutput::Bytes(chunk)).await.is_err() {
-                        return Err(anyhow!("Receiver dropped during byte parsing, data loss detected"));
-                    }
-                }
+            let bytes_read = match reader.read(&mut buffer).await {
+                Ok(n) => n,
                 Err(e) => {
-                    return Err(anyhow!("Error reading bytes: {}", e));
+                    eprintln!("Error reading bytes: {}", e);
+                    return;
                 }
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            if tx.send(ParseOutput::Bytes(Arc::new(buffer[..bytes_read].to_vec()))).await.is_err() {
+                eprintln!("Receiver dropped while sending bytes");
+                break;
             }
         }
-        Ok::<(), anyhow::Error>(())
     });
 
     Ok(rx)
@@ -644,16 +639,29 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
 ) -> Result<mpsc::Receiver<ParseOutput>> {
     let (tx, rx) = mpsc::channel(buffer_size);
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
-    let mut line = String::new();
 
     tokio::spawn(async move {
-        while reader.read_line(&mut line).await? > 0 {
-            if tx.send(ParseOutput::Bytes(line.clone().into_bytes())).await.is_err() {
-                return Err(anyhow!("Receiver dropped during line parsing, data loss detected"));
-            }
+        let mut line = String::new();
+        loop {
             line.clear();
+            let bytes_read = match reader.read_line(&mut line).await {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Error reading line: {}", e);
+                    return;
+                }
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            let trimmed = line.trim_end().to_string();
+            if !trimmed.is_empty() {
+                if tx.send(ParseOutput::Bytes(Arc::new(trimmed.into_bytes()))).await.is_err() {
+                    eprintln!("Receiver dropped while sending line");
+                    break;
+                }
+            }
         }
-        Ok::<(), anyhow::Error>(())
     });
 
     Ok(rx)
@@ -668,28 +676,30 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
 ///
 /// # Returns
 /// Result<()>
-pub async fn stream_to_file(rx: mpsc::Receiver<ParseOutput>, path: PathBuf) -> Result<()> {
-    let file = File::create(&path).await?;
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+pub async fn stream_to_file(
+    rx: mpsc::Receiver<ParseOutput>,
+    path: PathBuf,
+) -> Result<(), anyhow::Error> {
+    let mut file = BufWriter::with_capacity(4 * 1024 * 1024, tokio::fs::File::create(path).await?);
     let mut stream = ReceiverStream::new(rx);
 
     while let Some(item) = stream.next().await {
-        match item {
+        match &item {
             ParseOutput::Fastq(record) => {
                 let bytes = record.to_bytes()?;
-                writer.write_all(&bytes).await?;
+                file.write_all(&bytes).await?;
             }
             ParseOutput::Fasta(record) => {
                 let bytes = record.to_bytes()?;
-                writer.write_all(&bytes).await?;
+                file.write_all(&bytes).await?;
             }
-            ParseOutput::Bytes(bytes) => {
-                writer.write_all(&bytes).await?;
+            ParseOutput::Bytes(arc_bytes) => {
+                file.write_all(&*arc_bytes).await?;
             }
         }
     }
 
-    writer.flush().await?;
+    file.flush().await?;
     Ok(())
 }
 
@@ -808,7 +818,8 @@ pub async fn bytes_to_lines(
         let mut stream = ReceiverStream::new(rx);
         while let Some(item) = stream.next().await {
             match item {
-                ParseOutput::Bytes(mut bytes) => {
+                ParseOutput::Bytes(arc_bytes) => {
+                    let mut bytes = arc_bytes.as_ref().to_vec();
                     if !leftover.is_empty() {
                         leftover.append(&mut bytes);
                         bytes = leftover;
@@ -818,7 +829,7 @@ pub async fn bytes_to_lines(
                     let mut start = 0;
                     for i in 0..bytes.len() {
                         if bytes[i] == b'\n' {
-                            let line = bytes[start..=i].to_vec();
+                            let line = Arc::new(bytes[start..=i].to_vec());
                             if tx.send(ParseOutput::Bytes(line)).await.is_err() {
                                 eprintln!("Warning: Receiver dropped in bytes_to_lines, stopping line processing");
                                 break;
@@ -838,7 +849,7 @@ pub async fn bytes_to_lines(
         }
 
         if !leftover.is_empty() {
-            if tx.send(ParseOutput::Bytes(leftover)).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Arc::new(leftover))).await.is_err() {
                 eprintln!("Warning: Receiver dropped when sending final leftover line");
             }
         }
@@ -848,6 +859,8 @@ pub async fn bytes_to_lines(
 
     Ok((output_rx, task))
 }
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,7 +877,6 @@ mod tests {
     use tokio::sync::Semaphore;
     use std::path::PathBuf;
     use crate::cli::Arguments;
-
 
     // Helper function to create a RunConfig for tests
     fn create_test_run_config() -> Arc<RunConfig> {
@@ -910,18 +922,18 @@ mod tests {
     #[tokio::test]
     async fn test_t_junction_two_records() -> Result<()> {
         let records = vec![
-            SequenceRecord::Fastq {
+            ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
                 seq: b"ATCG".to_vec(),
                 qual: b"IIII".to_vec(),
-            },
-            SequenceRecord::Fastq {
+            }),
+            ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
                 seq: b"GCTA".to_vec(),
                 qual: b"HHHH".to_vec(),
-            },
+            }),
         ];
         let stream = tokio_stream::iter(records);
         let (mut outputs, done_rx) = t_junction(
@@ -948,8 +960,12 @@ mod tests {
         }
         assert_eq!(records1.len(), 2);
         assert_eq!(records2.len(), 2);
-        assert_eq!(records1[0].id(), "read1");
-        assert_eq!(records2[0].id(), "read1");
+        if let ParseOutput::Fastq(record) = &records1[0] {
+            assert_eq!(record.id(), "read1");
+        }
+        if let ParseOutput::Fastq(record) = &records2[0] {
+            assert_eq!(record.id(), "read1");
+        }
         done_rx.await??;
         Ok(())
     }
@@ -1202,24 +1218,26 @@ mod tests {
         }
 
         for i in 0..num_records {
-            assert_eq!(
-                all_records[0][i].id(),
-                all_records[1][i].id(),
-                "Record {} IDs should match",
-                i
-            );
-            assert_eq!(
-                all_records[0][i].seq(),
-                all_records[1][i].seq(),
-                "Record {} sequences should match",
-                i
-            );
-            assert_eq!(
-                all_records[0][i].qual(),
-                all_records[1][i].qual(),
-                "Record {} quality scores should match",
-                i
-            );
+            if let (ParseOutput::Fastq(rec0), ParseOutput::Fastq(rec1)) = (&all_records[0][i], &all_records[1][i]) {
+                assert_eq!(
+                    rec0.id(),
+                    rec1.id(),
+                    "Record {} IDs should match",
+                    i
+                );
+                assert_eq!(
+                    rec0.seq(),
+                    rec1.seq(),
+                    "Record {} sequences should match",
+                    i
+                );
+                assert_eq!(
+                    rec0.qual(),
+                    rec1.qual(),
+                    "Record {} quality scores should match",
+                    i
+                );
+            }
         }
 
         done_rx.await??;
@@ -1585,7 +1603,6 @@ mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn test_stream_to_file_fastq() -> Result<()> {
         let _ = fs::remove_file("stream_to_file_test_illumina.fq");
@@ -1611,8 +1628,7 @@ mod tests {
 
         assert!(output_path.exists(), "Output file was not created");
 
-        // Parse the output file back into SequenceRecords using parse_fastq
-        let file = TokioFile::open(&output_path).await?;
+        let file = File::open(&output_path).await?;
         let rx = parse_fastq(file, 1024).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut parsed_records = Vec::new();
@@ -1631,7 +1647,6 @@ mod tests {
             parsed_records.len()
         );
 
-        // Clean up
         fs::remove_file(output_path)?;
         Ok(())
     }
@@ -1663,8 +1678,7 @@ mod tests {
             "Output file was not created"
         );
 
-        // Parse the output file using parse_fastq
-        let file = TokioFile::open(&output_path).await?;
+        let file = File::open(&output_path).await?;
         let rx = parse_fastq(file, 1024).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut parsed_records = Vec::new();
@@ -1682,7 +1696,6 @@ mod tests {
             parsed_records.len()
         );
 
-        // Clean up
         fs::remove_file(output_path)?;
         Ok(())
     }

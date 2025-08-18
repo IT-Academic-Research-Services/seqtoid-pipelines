@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io;
+use std::sync::Arc;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -386,8 +387,7 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
     buffer_size: Option<usize>,
     suffix: Option<&str>,
     ram_temp_dir: P,
-) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf, NamedTempFile)> {
-
+) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf, tempfile::NamedTempFile)> {
     let mut temp_name = match suffix {
         Some(s) => TempfileBuilder::new()
             .suffix(s)
@@ -414,9 +414,8 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
         while let Some(item) = input_stream.next().await {
             let data = match item {
                 ParseOutput::Bytes(data) => data,
-                ParseOutput::Fasta(record) => record.to_bytes()?,
-                ParseOutput::Fastq(record) => record.to_bytes()?,
-                _ => return Err(anyhow!("Unexpected data in stream at {}", temp_path_clone.display())),
+                ParseOutput::Fasta(record) => Arc::new(record.to_bytes()?),
+                ParseOutput::Fastq(record) => Arc::new(record.to_bytes()?),
             };
             writer
                 .write_all(&data)
