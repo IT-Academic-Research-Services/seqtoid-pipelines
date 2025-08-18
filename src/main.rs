@@ -55,12 +55,15 @@ async fn main() -> Result<()> {
     let mut system = System::new_all();
     system.refresh_memory();
     let available_ram = system.available_memory();
+    eprintln!("Available RAM: {} bytes", available_ram);
+    let total_ram = system.total_memory();
+    eprintln!("Total RAM: {} bytes", total_ram);
 
     let sdt = match args.technology {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-    let base_buffer_size = compute_base_buffer_size(available_ram, max_cores, sdt);
+    let base_buffer_size = compute_base_buffer_size(available_ram, total_ram, sdt);
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
@@ -246,17 +249,38 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .expect("Failed to create thread pool")
 }
 
-fn compute_base_buffer_size(available_ram: u64, _num_cores: usize, data_type: StreamDataType) -> usize {
+fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: StreamDataType) -> usize {
     let record_size = match data_type {
         StreamDataType::IlluminaFastq => 1_000,
         StreamDataType::OntFastq => 10_000,
         StreamDataType::JustBytes => 500,
     };
     let ram_fraction = 0.3;
-    let estimated_max_streams = 20; // Max concurrent streams (t-junctions × outputs, e.g., 5 junctions × 4)
+    let estimated_max_streams = 20; // Max concurrent streams (tune based on pipeline)
     let min_buffer = 100_000; // ~100MB Illum, ~1GB ONT, ~50MB Bytes
     let max_buffer = 100_000_000; // ~100GB Illum, ~1TB ONT
-    let total_buffer_bytes = (available_ram as f64 * ram_fraction) as usize;
+    // Use total_ram if available_ram is <20% of total (macOS UMA issue)
+    let effective_ram = if available_ram < total_ram / 5 {
+        println!(
+            "Warning: Low available RAM ({} MB) vs total ({} MB); using total RAM for buffer calc",
+            available_ram / 1_000_000,
+            total_ram / 1_000_000
+        );
+        total_ram
+    } else {
+        available_ram
+    };
+    let total_buffer_bytes = (effective_ram as f64 * ram_fraction) as usize;
+
+    let low_ram_threshold = (min_buffer * record_size * estimated_max_streams) as usize;
+    if total_buffer_bytes < low_ram_threshold {
+        println!(
+            "Low RAM ({} MB); capping at minimal buffer: {} records",
+            effective_ram / 1_000_000,
+            min_buffer
+        );
+        return min_buffer;
+    }
     let max_records = (total_buffer_bytes / record_size) / estimated_max_streams.max(1);
     let buffer_size = max_records.clamp(min_buffer, max_buffer);
     println!(
