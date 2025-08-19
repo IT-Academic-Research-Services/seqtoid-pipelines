@@ -253,24 +253,22 @@ async fn align_to_host(
     host_ref_path: PathBuf,
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let (host_query_write_task, host_query_pipe_path) = write_parse_output_to_temp_fifo(
-        input_stream,
-        Some(config.base_buffer_size),
-        Some(".fq"),
-        Some(&config.ram_temp_dir),
-    ).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let mut cleanup_tasks = vec![host_query_write_task];
 
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_ref_path, host_query_pipe_path)))
+    let mut cleanup_tasks = Vec::new();
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_ref_path)))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+    eprintln!("minimap2 args: {:?}", minimap2_args);
+
+    let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
+        input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
         minimap2_args,
+        StreamDataType::JustBytes,  // FASTQ bytes, not structured records
         config.args.verbose,
     )
         .await
@@ -278,6 +276,7 @@ async fn align_to_host(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
+    cleanup_tasks.push(minimap2_stream_task);
     cleanup_tasks.push(minimap2_err_task);
 
     let minimap2_out_stream = parse_child_output(
@@ -522,25 +521,18 @@ async fn process_ercc(
     let stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     cleanup_receivers.push(ercc_done_rx);
 
-    // Process alignment stream for ERCC mapping
-    let (ercc_query_write_task, ercc_query_pipe_path) = write_parse_output_to_temp_fifo(
-        ReceiverStream::new(alignment_stream),
-        Some(config.base_buffer_size),
-        Some(".fq"),
-        Some(&config.ram_temp_dir),
-    ).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    cleanup_tasks.push(ercc_query_write_task);
-
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(ercc_path, ercc_query_pipe_path)))
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&ercc_path))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+
+    let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
+        alignment_stream, // Use alignment_stream, not input_stream
         MINIMAP2_TAG,
         minimap2_args,
+        StreamDataType::JustBytes, // FASTQ bytes
         config.args.verbose,
     )
         .await
@@ -548,6 +540,7 @@ async fn process_ercc(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
+    cleanup_tasks.push(minimap2_stream_task);
     cleanup_tasks.push(minimap2_err_task);
 
     let minimap2_out_stream = parse_child_output(
@@ -1048,24 +1041,21 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
-    let (align_query_write_task, align_query_pipe_path) = write_parse_output_to_temp_fifo(
-        input_stream,
-        Some(config.base_buffer_size),
-        Some(".fq"),
-        Some(&config.ram_temp_dir),
-    ).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    quast_write_tasks.push(align_query_write_task);
 
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_ref_path, align_query_pipe_path)))
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_ref_path)))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+
+    eprintln!("minimap2 target args: {:?}", minimap2_args);
+
+    let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
+        input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
         minimap2_args,
+        StreamDataType::JustBytes,  // FASTQ bytes, not structured records
         config.args.verbose,
     )
         .await

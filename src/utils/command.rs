@@ -158,26 +158,26 @@ mod minimap2 {
     use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::cli::{Technology};
+    use crate::cli::Technology;
     use crate::config::defs::{MINIMAP2_TAG, RunConfig};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
 
     pub struct Minimap2ArgGenerator;
+
     pub async fn minimap2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MINIMAP2_TAG,vec!["--version"], 0, 0 , ChildStream::Stdout).await?;
+        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout).await?;
         Ok(version)
     }
 
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));  // Debug log
+            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
             let args = &run_config.args;
-            let paths = extra
-                .and_then(|e| e.downcast_ref::<(PathBuf, PathBuf)>())
-                .ok_or_else(|| anyhow!("Minimap2 requires (ref_pipe_path, query_pipe_path) as extra arguments"))?;
-
-            let (ref_pipe_path, query_pipe_path) = paths;
+            // Expect a single PathBuf for the reference
+            let ref_path = extra
+                .and_then(|e| e.downcast_ref::<PathBuf>()) // Changed from (PathBuf) to PathBuf
+                .ok_or_else(|| anyhow!("Minimap2 requires a reference path as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
 
@@ -196,14 +196,12 @@ mod minimap2 {
                 }
             }
 
-            args_vec.push(ref_pipe_path.to_string_lossy().to_string());
-            args_vec.push(query_pipe_path.to_string_lossy().to_string());
+            args_vec.push(ref_path.to_string_lossy().to_string());
+            args_vec.push("-".to_string()); // Query from stdin
 
             Ok(args_vec)
         }
     }
-
- 
 }
 
 pub mod samtools {
