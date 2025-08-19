@@ -2097,19 +2097,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
-
-            let ercc_path = file_path_manipulator(&PathBuf::from(&config.args.ercc_sequence), Some(&cwd), None, None, ""); // TODO this has to be optional b/c the ont side wont use it
-            if !ercc_path.exists() {
-                return Err(PipelineError::FileNotFound(ercc_path));
-            }
-
+            
             let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = prepare_reference_and_index(
                 &config,
                 None, // No HDF5 for ERCC
                 &ram_temp_dir,
                 None, // No HDF5 index
                 None, // No accession
-                Some(config.args.ercc_sequence.clone()), // Use ercc_sequences as sequence path
+                config.args.ercc_sequence.clone(), // Use ercc_sequences as sequence path
                 config.args.ercc_index.clone(),
                 "ercc",
             )

@@ -97,7 +97,7 @@ pub struct Arguments {
     pub adapter_fasta : Option<String>,
 
     #[arg(long, default_value = "ercc_sequences.fasta")]
-    pub ercc_sequence : String,
+    pub ercc_sequence : Option<String>,
 
     #[arg(long, help = "Optional path to pre-built minimap2 index for ERCC reference (e.g., ercc.mmi)")]
     pub ercc_index: Option<String>,

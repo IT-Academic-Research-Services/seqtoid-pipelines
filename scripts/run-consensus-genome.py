@@ -55,41 +55,43 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
     # Format the command for logging
     command_str = ' '.join(command)
     # print(f"Running command for {sample_name}: {command_str}")
-    # print(command_str)
-    # print()
+    print(command_str)
+    print()
 
     # Log start time
-    start_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # start_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    #
+    # # Run the command and capture output
+    # try:
+    #     result = subprocess.run(command, capture_output=True, text=True, check=True)
+    #     stdout = result.stdout
+    #     stderr = result.stderr
+    #     status = 'SUCCESS'
+    #
+    #     # Extract runtime from console output
+    #     runtime_match = re.search(r'Run complete: (\d+) milliseconds\.', stdout)
+    #     runtime_ms = int(runtime_match.group(1)) if runtime_match else None
+    #     runtime = runtime_ms / 1000.0 if runtime_ms is not None else None
+    # except subprocess.CalledProcessError as e:
+    #     stdout = e.stdout
+    #     stderr = e.stderr
+    #     status = 'FAILED'
+    #     runtime = None
+    #
+    # # Log the results
+    # with open(log_file, 'a') as f:
+    #     f.write(f"Sample: {sample_name}\n")
+    #     f.write(f"Start Time: {start_time_str}\n")
+    #     f.write(f"Command: {command_str}\n")
+    #     f.write(f"Status: {status}\n")
+    #     f.write(f"Runtime: {runtime:.2f} seconds\n" if runtime is not None else "Runtime: Not found in output\n")
+    #     f.write(f"Stdout:\n{stdout}\n")
+    #     f.write(f"Stderr:\n{stderr}\n")
+    #     f.write("-" * 80 + "\n")
+    #
+    # return status, runtime
+    return None, None
 
-    # Run the command and capture output
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        stdout = result.stdout
-        stderr = result.stderr
-        status = 'SUCCESS'
-
-        # Extract runtime from console output
-        runtime_match = re.search(r'Run complete: (\d+) milliseconds\.', stdout)
-        runtime_ms = int(runtime_match.group(1)) if runtime_match else None
-        runtime = runtime_ms / 1000.0 if runtime_ms is not None else None
-    except subprocess.CalledProcessError as e:
-        stdout = e.stdout
-        stderr = e.stderr
-        status = 'FAILED'
-        runtime = None
-
-    # Log the results
-    with open(log_file, 'a') as f:
-        f.write(f"Sample: {sample_name}\n")
-        f.write(f"Start Time: {start_time_str}\n")
-        f.write(f"Command: {command_str}\n")
-        f.write(f"Status: {status}\n")
-        f.write(f"Runtime: {runtime:.2f} seconds\n" if runtime is not None else "Runtime: Not found in output\n")
-        f.write(f"Stdout:\n{stdout}\n")
-        f.write(f"Stderr:\n{stderr}\n")
-        f.write("-" * 80 + "\n")
-
-    return status, runtime
 
 
 def main():
@@ -104,6 +106,7 @@ def main():
     # parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
     parser.add_argument('--ercc-sequence', default='/home/ubuntu/refs/ercc_sequences.fasta')
     parser.add_argument('--host-sequence', default='/home/ubuntu/refs/hg38.fa')
+    parser.add_argument('--host-index', default='/home/ubuntu/refs/hg38.mmi')
     parser.add_argument('--ref-taxid', default='2697049')
     parser.add_argument('--out', default='/home/ubuntu/data/seqtoid')
 
