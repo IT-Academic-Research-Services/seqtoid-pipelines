@@ -210,7 +210,7 @@ async fn fetch_host_reference<'a>(
         .await
         .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
 
-    let host_ref_temp = NamedTempFile::new_in(ram_temp_dir)
+    let host_ref_temp = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
         .map_err(|e| PipelineError::Other(e.into()))?;
     let host_ref_fasta_path = host_ref_temp.path().to_path_buf();
 
@@ -261,7 +261,6 @@ async fn align_to_host(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    eprintln!("minimap2 args: {:?}", minimap2_args);
 
     let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
@@ -1047,9 +1046,7 @@ async fn align_to_target(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
-
-    eprintln!("minimap2 target args: {:?}", minimap2_args);
-
+    
     let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
