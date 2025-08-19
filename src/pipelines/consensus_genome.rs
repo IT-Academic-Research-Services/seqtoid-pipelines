@@ -82,9 +82,9 @@ async fn prepare_reference_and_index<'a>(
     ref_type: &str,
 ) -> Result<
     (
-        PathBuf,                     // FASTA path
+        Option<PathBuf>,             // FASTA path (None if only index provided)
         PathBuf,                     // Index path (.mmi)
-        NamedTempFile,               // FASTA temp file
+        Option<NamedTempFile>,       // FASTA temp file (None if only index)
         Option<NamedTempFile>,       // Index temp file (if created/copied)
         Vec<JoinHandle<Result<(), anyhow::Error>>>, // Tasks
     ),
@@ -92,39 +92,29 @@ async fn prepare_reference_and_index<'a>(
 > {
     let start = Instant::now();
     let mut tasks = Vec::new();
+    let mut ref_fasta_path: Option<PathBuf> = None;
+    let mut ref_temp: Option<NamedTempFile> = None;
 
-    // Retrieve sequence and write to temp FASTA
-    let (_accession, seq) = retrieve_h5_seq(
-        accession.clone(),
-        sequence.clone(),
-        ref_db_path.as_ref(),
-        h5_index,
-    )
-        .await
-        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
-
-    let ref_temp = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let ref_fasta_path = ref_temp.path().to_path_buf();
-    let ref_write_task = write_vecu8_to_file(seq.clone(), &ref_fasta_path, config.base_buffer_size)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    tasks.push(ref_write_task);
-
-    // Determine index path
+    // Check if only index is provided
     let (index_path, index_temp) = match index_path {
         Some(index) => {
-            // User provided an index via CLI
             let index_path = PathBuf::from(&index);
             if !index_path.exists() {
                 return Err(PipelineError::FileNotFound(index_path));
             }
-
+            if index_path.extension().map_or(true, |ext| ext != "mmi") {
+                return Err(PipelineError::InvalidConfig(format!(
+                    "{} index must have .mmi extension: {}",
+                    ref_type,
+                    index_path.display()
+                )));
+            }
+            // Copy index to ram_temp_dir
             let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
                 .map_err(|e| PipelineError::Other(e.into()))?;
             let index_temp_path = index_temp.path().to_path_buf();
-            let index_temp_path_clone = index_temp_path.clone(); // Clone for closure
-            let ref_type_owned = ref_type.to_string(); // Clone for 'static lifetime
+            let index_temp_path_clone = index_temp_path.clone();
+            let ref_type_owned = ref_type.to_string();
             let copy_task = tokio::spawn(async move {
                 fs::copy(&index_path, &index_temp_path_clone)
                     .await
@@ -135,27 +125,43 @@ async fn prepare_reference_and_index<'a>(
             (index_temp_path, Some(index_temp))
         }
         None => {
-            // No index provided; check for .mmi in sequence directory
-            // If no index is given, then for now we must assume the FASTA sequence is given as a file
-            // In future, we will store indexes in the hdf5 file
-            let cwd = std::env::current_dir().unwrap();
-            let sequence_path_buf = file_path_manipulator(&PathBuf::from(&ref_fasta_path), Some(&cwd), None, None, "");
+            // Require sequence or accession for FASTA
+            let (_accession, seq) = retrieve_h5_seq(
+                accession.clone(),
+                sequence.clone(),
+                ref_db_path.as_ref(),
+                h5_index,
+            )
+                .await
+                .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
+
+            let ref_temp_file = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            ref_fasta_path = Some(ref_temp_file.path().to_path_buf());
+            ref_temp = Some(ref_temp_file);
+            let ref_write_task = write_vecu8_to_file(seq.clone(), ref_fasta_path.as_ref().unwrap(), config.base_buffer_size)
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            tasks.push(ref_write_task);
+
+            // Check for .mmi in sequence directory
+            let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+            let sequence_path_buf = file_path_manipulator(&PathBuf::from(ref_fasta_path.as_ref().unwrap()), Some(&cwd), None, None, "");
             let (no_ext_sequence_path, _) = extension_remover(&sequence_path_buf);
             let mut index_path = no_ext_sequence_path.with_extension("mmi");
-            //eprintln!("index path searched for: {:?}", index_path);
             if !index_path.exists() {
                 // No .mmi found; create one
-                //eprintln!("No {} index found at {}; creating new index", ref_type, index_path.display());
+                eprintln!("No {} index found at {}; creating new index", ref_type, index_path.display());
                 let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
                     .map_err(|e| PipelineError::Other(e.into()))?;
                 index_path = index_temp.path().to_path_buf();
                 let minimap2_args = vec![
                     "-d".to_string(),
                     index_path.to_string_lossy().to_string(),
-                    ref_fasta_path.to_string_lossy().to_string(),
+                    ref_fasta_path.as_ref().unwrap().to_string_lossy().to_string(),
                 ];
                 let (mut child, err_task) = spawn_cmd(
-                    Arc::new(config.clone()), // Wrap config in Arc
+                    Arc::new(config.clone()),
                     MINIMAP2_TAG,
                     minimap2_args,
                     config.args.verbose,
@@ -177,12 +183,12 @@ async fn prepare_reference_and_index<'a>(
                 (index_path, Some(index_temp))
             } else {
                 // Found .mmi; copy to ram_temp_dir
-                //eprintln!("Found {} index at {}; copying to temp dir", ref_type, index_path.display());
+                eprintln!("Found {} index at {}; copying to temp dir", ref_type, index_path.display());
                 let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
                     .map_err(|e| PipelineError::Other(e.into()))?;
                 let index_temp_path = index_temp.path().to_path_buf();
-                let index_temp_path_clone = index_temp_path.clone(); // Clone for closure
-                let ref_type_owned = ref_type.to_string(); // Clone for 'static lifetime
+                let index_temp_path_clone = index_temp_path.clone();
+                let ref_type_owned = ref_type.to_string();
                 let copy_task = tokio::spawn(async move {
                     fs::copy(&index_path, &index_temp_path_clone)
                         .await
@@ -198,7 +204,6 @@ async fn prepare_reference_and_index<'a>(
     eprintln!("{} index preparation took {:?}", ref_type, start.elapsed());
     Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
 }
-
 
 async fn validate_input(
     config: Arc<RunConfig>,
@@ -1996,7 +2001,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     )
         .await?;
     cleanup_tasks.extend(host_ref_tasks);
-    temp_files.push(host_ref_temp);
+    if let Some(temp) = host_ref_temp {
+        temp_files.push(temp);
+    }
     if let Some(index_temp) = host_index_temp {
         temp_files.push(index_temp);
     }
@@ -2013,11 +2020,16 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     )
         .await?;
     cleanup_tasks.extend(target_ref_tasks);
-    temp_files.push(target_ref_temp);
+    if let Some(temp) = target_ref_temp {
+        temp_files.push(temp);
+    }
     if let Some(index_temp) = target_index_temp {
         temp_files.push(index_temp);
     }
-    target_ref_fasta_path = Some(target_ref_fasta_path_inner.clone());
+    let target_fasta = target_ref_fasta_path_inner.ok_or_else(|| {
+        PipelineError::InvalidConfig("Target FASTA required for filter_with_kraken, call_variants, and evaluate_assembly".to_string())
+    })?;
+    target_ref_fasta_path = Some(target_fasta.clone());
 
 
 
@@ -2103,7 +2115,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             )
                 .await?;
             cleanup_tasks.extend(ercc_ref_tasks);
-            temp_files.push(ercc_ref_temp);
+            if let Some(temp) = ercc_ref_temp {
+                temp_files.push(temp);
+            }
             if let Some(index_temp) = ercc_index_temp {
                 temp_files.push(index_temp);
             }
@@ -2126,7 +2140,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
                 no_host_ercc_stream,
-                target_ref_fasta_path_inner.clone(),
+                target_fasta.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
                 config.args.target_taxid.as_ref().expect("target_taxid must be set"),
@@ -2184,7 +2198,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             // Call Variants
             let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) =
-                call_variants(config.clone(), align_sam_call_stream, target_ref_fasta_path_inner.clone(), &out_dir, &no_ext_sample_base_buf).await?;
+                call_variants(config.clone(), align_sam_call_stream, target_fasta.clone(), &out_dir, &no_ext_sample_base_buf).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
             call_bcftools_stats_stream = Some(call_bcftools_stats_stream_out);
@@ -2193,7 +2207,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
                 consensus_realign_stream.into_inner(),
-                target_ref_fasta_path_inner.clone(),
+                target_fasta.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
             )

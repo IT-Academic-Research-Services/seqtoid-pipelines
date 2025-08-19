@@ -99,7 +99,7 @@ def main():
     parser.add_argument('--kraken_db', default='/home/ubuntu/refs/kraken_db', help="Path to Kraken database")
     parser.add_argument('--adapter_fasta', default='/home/ubuntu/refs/TruSeq3-PE.fa', help="Adapter FASTA file")
     parser.add_argument('--quality', default=1, type=int, help="Quality threshold")
-    parser.add_argument('--ref_sequence', default='/home/ubuntu/refs/covid-wuhan-1.fa', help="Reference sequence FASTA file")
+    parser.add_argument('--target_sequence', default='/home/ubuntu/refs/covid-wuhan-1.fa', help="Reference sequence FASTA file")
     parser.add_argument('--log_file', default='seqtoid_run.log', help="Log file to store run information")
     # parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
     parser.add_argument('--ercc-sequence', default='/home/ubuntu/refs/ercc_sequences.fasta')
