@@ -72,6 +72,9 @@ pub struct Arguments {
     #[arg(short = 't', long)] // For target aligning
     pub target_sequence : Option<String>,
 
+    #[arg(long, help = "Optional path to pre-built minimap2 index for target reference (e.g., covid.mmi)")]
+    pub target_index: Option<String>,
+
     #[arg(long)]
     pub target_taxid : Option<String>,
 
@@ -94,7 +97,10 @@ pub struct Arguments {
     pub adapter_fasta : Option<String>,
 
     #[arg(long, default_value = "ercc_sequences.fasta")]
-    pub ercc_sequences : String,
+    pub ercc_sequence : String,
+
+    #[arg(long, help = "Optional path to pre-built minimap2 index for ERCC reference (e.g., ercc.mmi)")]
+    pub ercc_index: Option<String>,
 
     #[arg( long = "target_type", default_value = "viral", value_enum)]
     pub target_type: TargetType,

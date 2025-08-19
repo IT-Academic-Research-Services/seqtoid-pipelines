@@ -83,7 +83,7 @@ mod fastp {
 
     impl ArgGenerator for FastpArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
+            // eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
             let args = &run_config.args;
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
@@ -131,7 +131,7 @@ mod pigz {
 
     impl ArgGenerator for PigzArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for pigz", RunConfig::thread_allocation(run_config, PIGZ_TAG, None));
+            // eprintln!("Allocating {} threads for pigz", RunConfig::thread_allocation(run_config, PIGZ_TAG, None));
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("-c".to_string());
             args_vec.push("-p".to_string());
@@ -157,10 +157,9 @@ mod h5dump {
 mod minimap2 {
     use std::path::PathBuf;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::cli::Technology;
     use crate::config::defs::{MINIMAP2_TAG, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
     use crate::utils::command::{version_check, ArgGenerator};
 
     pub struct Minimap2ArgGenerator;
@@ -172,12 +171,26 @@ mod minimap2 {
 
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
+            // eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
             let args = &run_config.args;
-            // Expect a single PathBuf for the reference
-            let ref_path = extra
-                .and_then(|e| e.downcast_ref::<PathBuf>()) // Changed from (PathBuf) to PathBuf
-                .ok_or_else(|| anyhow!("Minimap2 requires a reference path as extra argument"))?;
+
+            // Expect a single PathBuf for the minimap2 index (.mmi)
+            let index_path = extra
+                .and_then(|e| e.downcast_ref::<PathBuf>())
+                .ok_or_else(|| anyhow!("Minimap2 requires an index path (.mmi) as extra argument"))?;
+
+            // Validate that the path exists and has .mmi extension
+            if !index_path.exists() {
+                return Err(anyhow!("Minimap2 index file does not exist: {}", index_path.display()));
+            }
+            if index_path.extension().map_or(true, |ext| ext != "mmi") {
+                return Err(anyhow!("Minimap2 index must have .mmi extension, got: {}", index_path.display()));
+            }
+
+            eprintln!("Using minimap2 index for {}: {}", match args.technology {
+                Technology::Illumina => "Illumina",
+                Technology::ONT => "ONT",
+            }, index_path.display());
 
             let mut args_vec: Vec<String> = Vec::new();
 
@@ -186,17 +199,12 @@ mod minimap2 {
             args_vec.push(num_cores.to_string());
 
             args_vec.push("-ax".to_string());
-            let technology = args.technology.clone();
-            match technology {
-                Technology::Illumina => {
-                    args_vec.push("sr".to_string());
-                }
-                Technology::ONT => {
-                    args_vec.push("map-ont".to_string());
-                }
+            match args.technology {
+                Technology::Illumina => args_vec.push("sr".to_string()),
+                Technology::ONT => args_vec.push("map-ont".to_string()),
             }
 
-            args_vec.push(ref_path.to_string_lossy().to_string());
+            args_vec.push(index_path.to_string_lossy().to_string());
             args_vec.push("-".to_string()); // Query from stdin
 
             Ok(args_vec)
