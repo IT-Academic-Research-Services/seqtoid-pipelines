@@ -229,8 +229,8 @@ async fn fetch_target_reference<'a>(
 ) -> Result<(PathBuf, NamedTempFile,JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
 
     let (_target_accession, target_seq) = retrieve_h5_seq(
-        config.args.ref_accession.clone(),
-        config.args.ref_sequence.clone(),
+        config.args.target_accession.clone(),
+        config.args.target_sequence.clone(),
         ref_db_path.as_ref(),
         h5_index,
     )
@@ -1046,7 +1046,7 @@ async fn align_to_target(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    
+
     let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
@@ -2021,7 +2021,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 target_ref_fasta_path_inner.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
-                config.args.ref_taxid.as_ref().expect("ref_taxid must be set"),
+                config.args.target_taxid.as_ref().expect("target_taxid must be set"),
             )
                 .await?;
             cleanup_tasks.extend(filter_reads_cleanup_tasks);
