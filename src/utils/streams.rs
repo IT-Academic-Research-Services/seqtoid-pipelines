@@ -25,14 +25,6 @@ pub trait ToBytes {
     fn to_bytes(&self) -> Result<Vec<u8>>;
 }
 
-impl ToBytes for Vec<u8> {
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        // Note: This is a fallback! Avoid using for large Vec<u8> to prevent deep cloning.
-        // Prefer ParseOutput::Bytes(Arc<Vec<u8>>) for zero-copy streaming.
-        Ok(self.clone())
-    }
-}
-
 impl ToBytes for SequenceRecord {
     fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();  // Alloc only when needed (e.g., for stdin pipes)
@@ -892,6 +884,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::io::Read;
     use tokio::process::Command;
     use tokio::task;
     use tokio::fs::File as TokioFile;
@@ -1771,4 +1764,22 @@ mod tests {
         assert!(status.success(), "Child process should exit successfully");
         Ok(())
     }
+
+
+    #[tokio::test]
+    async fn test_stream_to_file_bytes_no_clone() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let data = Arc::new(vec![b'A'; 1_000_000]); // 1MB chunk
+        tokio::spawn(async move { tx.send(ParseOutput::Bytes(data)).await.unwrap(); });
+        let path = PathBuf::from("test_bytes.fq");
+        let task = tokio::spawn(stream_to_file(rx, path.clone())); // Pass raw Receiver
+        task.await??;
+        let file = std::fs::File::open(&path)?;
+        let mut contents = Vec::new();
+        std::io::BufReader::new(file).read_to_end(&mut contents)?; // Use std::io::Read
+        assert_eq!(contents.len(), 1_000_000);
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
 }
