@@ -65,7 +65,7 @@ impl ToBytes for ParseOutput {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
             ParseOutput::Fasta(record) => record.to_bytes(),
-            ParseOutput::Bytes(bytes) => Ok(bytes.as_ref().clone()),
+            ParseOutput::Bytes(bytes) => Ok((**bytes).clone()),
         }
     }
 }
