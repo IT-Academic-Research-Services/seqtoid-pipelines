@@ -141,6 +141,14 @@ impl RunConfig {
             _ => allocation,
         }
     }
+
+    pub fn get_buffer_size(&self, file_size_mb: u64) -> usize {
+        if file_size_mb > 10_000 { // >10GB
+            (self.base_buffer_size / 10).max(5_000) // ~5k-50k records (~5-50MB for Illumina)
+        } else {
+            self.base_buffer_size // ~100k-1M records (~100MB-1GB)
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
