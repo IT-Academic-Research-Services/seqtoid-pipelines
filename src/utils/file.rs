@@ -335,44 +335,38 @@ pub async fn write_parse_output_to_temp_fifo(
 ///
 /// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
 pub async fn write_vecu8_to_file<P: AsRef<Path>>(
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>, // Accept Arc to avoid cloning
     temp_path: P,
     buffer_size: usize,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    let temp_path = temp_path.as_ref().to_path_buf(); // Convert to PathBuf for display
-    let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
+    let temp_path = temp_path.as_ref().to_path_buf();
+    let buffer_capacity = buffer_size.max(16 * 1024 * 1024);
     let task = tokio::spawn(async move {
         let file = TokioFile::create(&temp_path)
             .await
             .map_err(|e| anyhow!("Failed to create file at {}: {}", temp_path.display(), e))?;
         let mut writer = BufWriter::with_capacity(buffer_capacity, file);
 
-        let mut byte_count = 0;
-        const CHUNK_SIZE: usize = 1024 * 1024;
-        for chunk in data.chunks(CHUNK_SIZE) {
-            writer
-                .write_all(chunk)
-                .await
-                .map_err(|e| anyhow!("Failed to write to file at {}: {}", temp_path.display(), e))?;
-            byte_count += chunk.len();
-        }
+        let byte_count = if data.len() <= 4 * 1024 * 1024 { // Write small data in one go
+            writer.write_all(&**data).await?;
+            data.len()
+        } else {
+            const CHUNK_SIZE: usize = 16 * 1024 * 1024; // Larger chunks for big data
+            let mut byte_count = 0;
+            for chunk in data.chunks(CHUNK_SIZE) {
+                writer.write_all(chunk).await?;
+                byte_count += chunk.len();
+            }
+            byte_count
+        };
 
-        writer
-            .flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush file at {}: {}", temp_path.display(), e))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown file at {}: {}", temp_path.display(), e))?;
-
+        writer.flush().await?;
+        writer.shutdown().await?;
         if byte_count == 0 {
             return Err(anyhow!("No data written to file at {}", temp_path.display()));
         }
-
         Ok(())
     });
-
     Ok(task)
 }
 

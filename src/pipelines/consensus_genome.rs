@@ -139,7 +139,7 @@ async fn prepare_reference_and_index<'a>(
                 .map_err(|e| PipelineError::Other(e.into()))?;
             ref_fasta_path = Some(ref_temp_file.path().to_path_buf());
             ref_temp = Some(ref_temp_file);
-            let ref_write_task = write_vecu8_to_file(seq.clone(), ref_fasta_path.as_ref().unwrap(), config.base_buffer_size)
+            let ref_write_task = write_vecu8_to_file(Arc::new(seq.clone()), ref_fasta_path.as_ref().unwrap(), config.base_buffer_size)
                 .await
                 .map_err(|e| PipelineError::Other(e.into()))?;
             tasks.push(ref_write_task);
