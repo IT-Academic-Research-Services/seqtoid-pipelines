@@ -211,7 +211,7 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
 
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
@@ -253,7 +253,6 @@ async fn validate_input(
     }
 
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = vec![val_done_rx];
     let mut streams_iter = val_streams.into_iter();
     let val_fastp_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let val_pigz_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -326,7 +325,12 @@ async fn validate_input(
             error: e.to_string(),
         })?;
 
-    Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks, cleanup_receivers))
+    val_done_rx
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+    Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks))
 }
 
 
@@ -335,7 +339,7 @@ async fn align_to_host(
     input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from fastp
     host_index_path: PathBuf,  // minimap2 .mmi index file
     no_host_file_path: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
 
@@ -471,7 +475,6 @@ async fn align_to_host(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    let mut cleanup_receivers = vec![host_done_rx];
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let no_host_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -553,7 +556,12 @@ async fn align_to_host(
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, no_host_file_path));
     cleanup_tasks.push(pigz_write_task);
 
-    Ok((ReceiverStream::new(no_host_output_stream), ReceiverStream::new(no_host_count_stream), cleanup_tasks, cleanup_receivers))
+    host_done_rx
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+    Ok((ReceiverStream::new(no_host_output_stream), ReceiverStream::new(no_host_count_stream), cleanup_tasks))
 }
 
 
@@ -568,12 +576,15 @@ async fn process_ercc(
         ReceiverStream<ParseOutput>,
         Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
-        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
     ),
     PipelineError,
 > {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+
+    let file_size_mb = fs::metadata(&ercc_index_path)
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to get file metadata: {}", e)))?
+        .len() / 1_048_576;
 
     let ercc_stats_file_path = file_path_manipulator(
         &PathBuf::from(no_ext_sample_base),
@@ -586,7 +597,7 @@ async fn process_ercc(
     let (ercc_streams, ercc_done_rx) = t_junction(
         input_stream,
         3,
-        config.base_buffer_size,
+        config.get_buffer_size(file_size_mb),
         config.args.stall_threshold,
         None,
         100,
@@ -601,7 +612,6 @@ async fn process_ercc(
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    cleanup_receivers.push(ercc_done_rx);
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&ercc_index_path))
         .map_err(|e| PipelineError::ToolExecution {
@@ -629,7 +639,7 @@ async fn process_ercc(
         &mut minimap2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
-        config.base_buffer_size,
+        config.get_buffer_size(file_size_mb),
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -653,7 +663,7 @@ async fn process_ercc(
     let (sam_streams, sam_done_rx) = t_junction(
         ReceiverStream::new(minimap2_out_stream),
         2,
-        config.base_buffer_size,
+        config.get_buffer_size(file_size_mb),
         config.args.stall_threshold,
         None,
         100,
@@ -664,7 +674,6 @@ async fn process_ercc(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_receivers.push(sam_done_rx);
     let mut sam_streams_iter = sam_streams.into_iter();
     let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_view_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -725,7 +734,6 @@ async fn process_ercc(
             ReceiverStream::new(dummy_rx),
             Some(tokio::spawn(async { Ok(zero_stats) })),
             cleanup_tasks,
-            cleanup_receivers,
         ));
     }
 
@@ -848,7 +856,6 @@ async fn process_ercc(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_receivers.push(stats_done_rx);
     let mut stats_streams_iter = stats_streams.into_iter();
     let stats_file_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let stats_parse_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -858,11 +865,28 @@ async fn process_ercc(
 
     let ercc_stats_task = Some(tokio::spawn(parse_ercc_stats(stats_parse_stream)));
 
+
+    ercc_done_rx
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+
+    sam_done_rx
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+
+    stats_done_rx
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
     Ok((
         ReceiverStream::new(bypass_output_stream),
         ercc_stats_task,
         cleanup_tasks,
-        cleanup_receivers,
     ))
 }
 
@@ -891,7 +915,6 @@ async fn filter_with_kraken(
     (
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
-        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
     ),
     PipelineError,
 > {
@@ -1018,7 +1041,7 @@ async fn filter_with_kraken(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    let mut cleanup_receivers = vec![kraken_done_rx];
+
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1095,7 +1118,12 @@ async fn filter_with_kraken(
     });
     cleanup_tasks.push(cleanup_pipe_task);
 
-    Ok((ReceiverStream::new(kraken_output_stream), cleanup_tasks, cleanup_receivers))
+    kraken_done_rx
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .map_err(|e| PipelineError::Other(e))?;
+
+    Ok((ReceiverStream::new(kraken_output_stream), cleanup_tasks))
 }
 
 
@@ -1532,7 +1560,6 @@ async fn call_variants(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_receivers.push(vcf_done_rx);
 
     let mut streams_iter = vcf_streams.into_iter();
     let vcf_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -2035,7 +2062,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
     // Input Validation
-    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
+    let (val_fastp_out_stream, validate_cleanup_tasks) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
@@ -2044,7 +2071,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     )
         .await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
-    cleanup_receivers.extend(validate_cleanup_receivers);
+
 
 
 
@@ -2057,7 +2084,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         "_",
     );
 
-    let (no_host_output_stream, no_host_seqkit_out_stream_stats, no_host_cleanup_tasks, no_host_cleanup_receivers) = align_to_host(
+    let (no_host_output_stream, no_host_seqkit_out_stream_stats, no_host_cleanup_tasks) = align_to_host(
         config.clone(),
         val_fastp_out_stream,
         host_ref_index_path,
@@ -2065,7 +2092,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     )
         .await?;
     cleanup_tasks.extend(no_host_cleanup_tasks);
-    cleanup_receivers.extend(no_host_cleanup_receivers);
 
     // Counting stats for the host-removed reads
     let stats_seqkit_config_stats = SeqkitConfig {
@@ -2097,7 +2123,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
-            
+
             let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = prepare_reference_and_index(
                 &config,
                 None, // No HDF5 for ERCC
@@ -2118,7 +2144,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             }
 
             // ERCC
-            let (no_host_ercc_stream, ercc_stats_out_task, mut ercc_cleanup_tasks, mut ercc_cleanup_receivers) = process_ercc(
+            let (no_host_ercc_stream, ercc_stats_out_task, mut ercc_cleanup_tasks) = process_ercc(
                 config.clone(),
                 no_host_output_stream,
                 ercc_index_path,
@@ -2128,11 +2154,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 .await?;
             ercc_stats_task = ercc_stats_out_task;
             cleanup_tasks.append(&mut ercc_cleanup_tasks);
-            cleanup_receivers.append(&mut ercc_cleanup_receivers);
 
 
             // Filter Reads
-            let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
+            let (filter_reads_out_stream, filter_reads_cleanup_tasks) = filter_with_kraken(
                 config.clone(),
                 no_host_ercc_stream,
                 target_fasta.clone(),
@@ -2142,7 +2167,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             )
                 .await?;
             cleanup_tasks.extend(filter_reads_cleanup_tasks);
-            cleanup_receivers.extend(filter_reads_cleanup_receivers);
 
             // Align Reads to Target
             let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks, align_bam_path_inner) = align_to_target(
@@ -2154,7 +2178,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             )
                 .await?;
             cleanup_tasks.extend(align_cleanup_tasks);
-            cleanup_receivers.extend(align_cleanup_receivers);
             quast_write_tasks.extend(align_quast_tasks);
             align_bam_path = Some(align_bam_path_inner);
 
@@ -2187,7 +2210,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 generate_consensus(config.clone(), align_sam_output_stream, &out_dir, &no_ext_sample_base_buf).await?;
             consensus_file_path = Some(consensus_file_path_x);
             cleanup_tasks.extend(consensus_cleanup_tasks);
-            cleanup_receivers.extend(consensus_cleanup_receivers);
             quast_write_tasks.extend(consensus_quast_tasks);
             consensus_stats_stream = Some(consensus_stats_stream_rx);
 
