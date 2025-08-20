@@ -519,10 +519,9 @@ pub fn read_and_interleave_sequences(
                                 eprintln!("Processed {} read pairs, throttling for 5ms", read_counter);
                             }
 
-
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break;
                             }
                         }
                         (Err(e), _) => {
@@ -535,7 +534,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-
             });
         }
         (None, SequenceReader::Fastq(reader)) => {
@@ -568,7 +566,7 @@ pub fn read_and_interleave_sequences(
                             read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break;
                             }
                         }
                         Err(e) => {
@@ -609,7 +607,7 @@ pub fn read_and_interleave_sequences(
                             read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break; // Exit loop cleanly, sender dropped after
                             }
                         }
                         Err(e) => {
