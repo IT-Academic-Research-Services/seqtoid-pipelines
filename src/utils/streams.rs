@@ -275,10 +275,30 @@ pub async fn stream_to_cmd(
         let mut stream = ReceiverStream::new(rx);
         while let Some(item) = stream.next().await {
             match &item {
-                ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&*arc_bytes),
-                _ => {
-                    let bytes = item.to_bytes()?;
-                    batch.extend_from_slice(&bytes);
+                ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&**arc_bytes),
+                ParseOutput::Fastq(record) => {  // Direct match on inner enum
+                    if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
+                        if let Some(d) = desc {
+                            batch.extend_from_slice(format!("@{} {}\n", id, d).as_bytes());
+                        } else {
+                            batch.extend_from_slice(format!("@{}\n", id).as_bytes());
+                        }
+                        batch.extend_from_slice(&**seq);
+                        batch.extend_from_slice(b"\n+\n");
+                        batch.extend_from_slice(&**qual);
+                        batch.push(b'\n');
+                    }
+                }
+                ParseOutput::Fasta(record) => {
+                    if let SequenceRecord::Fasta { id, desc, seq } = record {
+                        if let Some(d) = desc {
+                            batch.extend_from_slice(format!(">{} {}\n", id, d).as_bytes());
+                        } else {
+                            batch.extend_from_slice(format!(">{}\n", id).as_bytes());
+                        }
+                        batch.extend_from_slice(&**seq);
+                        batch.push(b'\n');
+                    }
                 }
             }
 
