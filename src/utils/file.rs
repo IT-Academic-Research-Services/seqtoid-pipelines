@@ -17,6 +17,7 @@ use tokio::process::Command;
 use tokio_stream::StreamExt;
 use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
+use crate::utils::fastx::SequenceRecord;
 
 
 
@@ -212,7 +213,8 @@ pub async fn write_parse_output_to_fifo(
     buffer_size: Option<usize>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     if fifo_path.exists() {
-        std::fs::remove_file(fifo_path)?;
+        tokio::fs::remove_file(fifo_path).await // Async remove
+            .map_err(|e| anyhow!("Failed to remove existing FIFO at {}: {}", fifo_path.display(), e))?;
     }
     let status = Command::new("mkfifo")
         .arg(fifo_path)
@@ -222,7 +224,7 @@ pub async fn write_parse_output_to_fifo(
     if !status.success() {
         return Err(anyhow!("mkfifo failed with status: {}", status));
     }
-    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024);
+    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024); // Default to 16MB for large files
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
         let mut writer_file = TokioFile::create(&fifo_path)
@@ -240,23 +242,30 @@ pub async fn write_parse_output_to_fifo(
                     byte_count += data.len();
                 }
                 ParseOutput::Fasta(record) => {
-                    let bytes = record.to_bytes()?;
-                    writer
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|e| anyhow!("Failed to write FASTA to FIFO at {}: {}", fifo_path.display(), e))?;
-                    byte_count += bytes.len();
+                    if let SequenceRecord::Fasta { id, desc, seq } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!(">{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!(">{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + id.len() + 2 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
                 }
                 ParseOutput::Fastq(record) => {
-                    let bytes = record.to_bytes()?;
-                    writer
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|e| anyhow!("Failed to write FASTQ to FIFO at {}: {}", fifo_path.display(), e))?;
-                    byte_count += bytes.len();
-                }
-                _ => {
-                    return Err(anyhow!("Unexpected data in stream at {}", fifo_path.display()));
+                    if let SequenceRecord::Fastq { id, desc, seq, qual } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!("@{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!("@{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n+\n").await?;
+                        writer.write_all(&**qual).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + qual.len() + id.len() + 4 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
                 }
             }
         }
