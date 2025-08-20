@@ -55,17 +55,16 @@ pub enum SequenceRecord {
     Fasta {
         id: String,
         desc: Option<String>,
-        seq: Vec<u8>,
+        seq: Arc<Vec<u8>>,
     },
     Fastq {
         id: String,
         desc: Option<String>,
-        seq: Vec<u8>,
-        qual: Vec<u8>,
+        seq: Arc<Vec<u8>>,
+        qual: Arc<Vec<u8>>,
     },
 }
 
-/// Maps id and seq to the correct file type.
 impl SequenceRecord {
     pub fn id(&self) -> &str {
         match self {
@@ -76,15 +75,16 @@ impl SequenceRecord {
 
     pub fn seq(&self) -> &[u8] {
         match self {
-            SequenceRecord::Fasta { seq, .. } => seq,
-            SequenceRecord::Fastq { seq, .. } => seq,
+            SequenceRecord::Fasta { seq, .. } => &**seq,
+            SequenceRecord::Fastq { seq, .. } => &**seq,
         }
     }
+
     #[allow(dead_code)]
     pub fn qual(&self) -> &[u8] {
         match self {
             SequenceRecord::Fasta { .. } => &[],
-            SequenceRecord::Fastq { qual, .. } => qual,
+            SequenceRecord::Fastq { qual, .. } => &**qual,
         }
     }
 
@@ -97,13 +97,14 @@ impl SequenceRecord {
     }
 }
 
+// Update From impls to wrap in Arc
 impl From<FastaOwnedRecord> for SequenceRecord {
     fn from(record: FastaOwnedRecord) -> Self {
         let (id, desc) = parse_header(&record.head, '>');
         SequenceRecord::Fasta {
             id,
             desc,
-            seq: record.seq,
+            seq: Arc::new(record.seq),
         }
     }
 }
@@ -114,8 +115,8 @@ impl From<FastqOwnedRecord> for SequenceRecord {
         SequenceRecord::Fastq {
             id,
             desc,
-            seq: record.seq,
-            qual: record.qual,
+            seq: Arc::new(record.seq),
+            qual: Arc::new(record.qual),
         }
     }
 }
@@ -414,8 +415,8 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
                 SequenceRecord::Fastq {
                     id: format!("read{}", i + 1),
                     desc: None,
-                    seq: seq.into_bytes(),
-                    qual: qual.into_bytes(),
+                    seq: Arc::new(seq.into_bytes()),
+                    qual: Arc::new(qual.into_bytes()),
                 }
             })
             .collect()

@@ -33,7 +33,7 @@ impl ToBytes for Vec<u8> {
 
 impl ToBytes for SequenceRecord {
     fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::new();  // Alloc only when needed (e.g., for stdin pipes)
         match self {
             SequenceRecord::Fastq { id, desc, seq, qual } => {
                 if let Some(desc) = desc {
@@ -41,9 +41,9 @@ impl ToBytes for SequenceRecord {
                 } else {
                     buffer.extend_from_slice(format!("@{}\n", id).as_bytes());
                 }
-                buffer.extend_from_slice(seq);
+                buffer.extend_from_slice(&**seq);
                 buffer.extend_from_slice(b"\n+\n");
-                buffer.extend_from_slice(qual);
+                buffer.extend_from_slice(&**qual);
                 buffer.push(b'\n');
             }
             SequenceRecord::Fasta { id, desc, seq } => {
@@ -52,7 +52,7 @@ impl ToBytes for SequenceRecord {
                 } else {
                     buffer.extend_from_slice(format!(">{}\n", id).as_bytes());
                 }
-                buffer.extend_from_slice(seq);
+                buffer.extend_from_slice(&**seq);
                 buffer.push(b'\n');
             }
         }
@@ -512,8 +512,8 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fastq {
                 id,
                 desc,
-                seq,
-                qual,
+                seq: Arc::new(seq),
+                qual: Arc::new(qual),
             };
 
             if tx.send(ParseOutput::Fastq(record)).await.is_err() {
@@ -559,12 +559,12 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                     let record = SequenceRecord::Fasta {
                         id,
                         desc: current_desc.take(),
-                        seq: current_seq.clone(),
+                        seq: Arc::new(current_seq),
                     };
                     if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                         return Err(anyhow!("Receiver dropped during FASTA parsing, data loss detected"));
                     }
-                    current_seq.clear();
+                    current_seq = Vec::new();
                 }
                 let (id, desc) = parse_header(line.as_bytes(), '>');
                 current_id = Some(id);
@@ -578,7 +578,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fasta {
                 id,
                 desc: current_desc.take(),
-                seq: current_seq,
+                seq: Arc::new(current_seq), // Move final current_seq
             };
             if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                 return Err(anyhow!("Receiver dropped during final FASTA parsing, data loss detected"));
