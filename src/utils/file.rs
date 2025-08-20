@@ -480,4 +480,20 @@ mod tests {
         std::fs::remove_file(&temp_path)?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_write_vecu8_to_file_empty() -> std::io::Result<()> {
+        let test_data: Arc<Vec<u8>> = Arc::new(vec![]);
+        let temp_name = NamedTempFile::new()?;
+        let temp_path = temp_name.into_temp_path();
+        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let result = write_task
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        assert!(result.is_err(), "Expected error for empty data");
+        assert_eq!(result.unwrap_err().to_string(), format!("No data written to file at {}", temp_path.display()));
+        Ok(())
+    }
 }
