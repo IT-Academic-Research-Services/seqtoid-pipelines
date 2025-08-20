@@ -304,7 +304,6 @@ pub async fn write_parse_output_to_temp_fifo(
     suffix: Option<&str>,
     temp_dir: Option<impl AsRef<Path>>,
 ) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf)> {
-
     let mut builder = TempfileBuilder::new();
     if let Some(suf) = suffix {
         builder.suffix(suf);
@@ -315,9 +314,10 @@ pub async fn write_parse_output_to_temp_fifo(
         builder.tempfile()?
     };
     let temp_path = temp_name.path().to_path_buf();
-    temp_name.close()?;     // Immediately close the regular file to avoid conflicts with mkfifo
+    tokio::fs::remove_file(&temp_path).await?; // Async remove to replace with FIFO
+    drop(temp_name); // Explicitly drop to avoid holding file
 
-    let task = write_parse_output_to_fifo(&temp_path, input_stream, buffer_size).await?;
+    let task = write_parse_output_to_fifo(&temp_path, input_stream, buffer_size.or(Some(16 * 1024 * 1024))).await?;
 
     Ok((task, temp_path))
 }
