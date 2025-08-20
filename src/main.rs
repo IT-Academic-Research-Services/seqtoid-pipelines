@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
         eprintln!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
+        println!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
         std::process::exit(1);
     }
 

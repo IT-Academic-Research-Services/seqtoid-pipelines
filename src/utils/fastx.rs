@@ -511,6 +511,14 @@ pub fn read_and_interleave_sequences(
                             r2_count += 1;
 
                             read_counter += 1;
+
+                            // Throttle every 100,000 pairs
+                            if read_counter % 100_000 == 0 {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                eprintln!("Processed {} read pairs, throttling for 5ms", read_counter);
+                            }
+
+
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
                                 return;

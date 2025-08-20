@@ -33,7 +33,7 @@ def find_fastq_pairs(directory, sample_order):
 
     return fastq_pairs
 
-def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, ref_sequence, log_file, ercc_sequence, host_sequence, ref_taxid, out):
+def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, target_sequence, log_file, ercc_sequence, host_sequence, target_taxid, out, host_index):
     """
     Run the seqtoid-pipelines command for a single sample and extract runtime from console output.
     """
@@ -45,11 +45,12 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '--quality', str(quality),
         '-i', os.path.join(fastq_dir, r1_file),
         '-I', os.path.join(fastq_dir, r2_file),
-        '--ref-sequence', ref_sequence,
-        '--ercc-sequences', ercc_sequence,
+        '--target-sequence', target_sequence,
+        '--ercc-sequence', ercc_sequence,
         '--host-sequence', host_sequence,
-        '--ref-taxid', ref_taxid,
+        '--target-taxid', target_taxid,
         '--out', out,
+        '--host-index', host_index,
     ]
 
     # Format the command for logging
@@ -131,12 +132,13 @@ def main():
             args.kraken_db,
             args.adapter_fasta,
             args.quality,
-            args.ref_sequence,
+            args.target_sequence,
             args.log_file,
             args.ercc_sequence,
             args.host_sequence,
             args.ref_taxid,
-            out_dir
+            out_dir,
+            args.host_index
         )
         print(f"Completed {sample}: Status={status}, Runtime={runtime:.2f} seconds" if runtime is not None else f"Completed {sample}: Status={status}, Runtime=Not found")
 
