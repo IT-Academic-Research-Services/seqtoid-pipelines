@@ -27,6 +27,8 @@ pub trait ToBytes {
 
 impl ToBytes for Vec<u8> {
     fn to_bytes(&self) -> Result<Vec<u8>> {
+        // Note: This is a fallback! Avoid using for large Vec<u8> to prevent deep cloning.
+        // Prefer ParseOutput::Bytes(Arc<Vec<u8>>) for zero-copy streaming.
         Ok(self.clone())
     }
 }
