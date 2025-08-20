@@ -105,7 +105,7 @@ def main():
     parser.add_argument('--target_sequence', default='/home/ubuntu/refs/covid-wuhan-1.fa', help="Reference sequence FASTA file")
     parser.add_argument('--log_file', default='seqtoid_run.log', help="Log file to store run information")
     # parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
-    parser.add_argument('--ercc-sequence', default='/home/ubuntu/refs/ercc_sequences.fasta')
+    parser.add_argument('--ercc-index', default='/home/ubuntu/refs/ercc_sequences.mmi')
     parser.add_argument('--host-sequence', default='/home/ubuntu/refs/hg38.fa')
     parser.add_argument('--host-index', default='/home/ubuntu/refs/hg38.mmi')
     parser.add_argument('--ref-taxid', default='2697049')

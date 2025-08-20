@@ -3,6 +3,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
@@ -131,6 +132,7 @@ where
     const MAX_PROCESSES: usize = 4;
     const RAM_FRACTION: f64 = 0.5;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
+    const MAX_BUFFER_PER_STREAM: usize = 1_000_000; // Cap at ~1M records to limit RAM
 
     let record_size = match data_type {
         StreamDataType::IlluminaFastq => 1_000, // ~1KB per FASTQ record
@@ -146,59 +148,93 @@ where
     };
 
     let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
-    let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size);
+    let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size.min(MAX_BUFFER_PER_STREAM));
 
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
-    let mut output_txs = Vec::with_capacity(n_outputs);
+    let mut output_txs: Vec<(usize, mpsc::Sender<ParseOutput>)> = Vec::with_capacity(n_outputs);
     let mut output_rxs = Vec::with_capacity(n_outputs);
 
-    // Track channels with IDs
-    let mut channel_status = vec![true; n_outputs]; // true = active, false = dropped
+    // Use bounded channels with adaptive capacity
     for i in 0..n_outputs {
         let (tx, rx) = mpsc::channel(buffer_size);
-        output_txs.push((i, tx)); // Store ID with tx
+        output_txs.push((i, tx));
         output_rxs.push(rx);
     }
 
     tokio::spawn(async move {
         let mut input = Box::pin(input);
-        let mut count = 0;
-        let mut dropped_count = 0;
+        let mut item_count = 0;
+        let mut last_progress_time = Instant::now();
+        let mut dropped_receivers = Vec::new();
 
         while let Some(item) = input.next().await {
+            item_count += 1;
             let mut active_txs = Vec::new();
-            for (id, tx) in output_txs.iter() {
-                match tx.send(item.clone()).await {
-                    Ok(()) => active_txs.push((*id, tx.clone())),
-                    Err(_) => {
-                        if channel_status[*id] {
-                            eprintln!("{}: Receiver {} dropped at item {}", label, id, count + 1);
-                            channel_status[*id] = false;
-                            dropped_count += 1;
+            let mut backpressure_detected = false;
+
+            for (i, tx) in output_txs.into_iter() {
+                // Check buffer fullness for backpressure
+                if tx.capacity() < buffer_size / 10 { // <10% capacity left
+                    backpressure_detected = true;
+                    eprintln!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
+                }
+                match tx.try_send(item.clone()) {
+                    Ok(()) => active_txs.push((i, tx)),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        eprintln!("{}: Receiver {} full at item {}, retrying after pause", label, i, item_count);
+                        sleep(Duration::from_millis(backpressure_pause_ms)).await;
+                        if tx.send(item.clone()).await.is_err() {
+                            eprintln!("{}: Receiver {} dropped at item {}", label, i, item_count);
+                            dropped_receivers.push(i);
+                        } else {
+                            active_txs.push((i, tx));
                         }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        eprintln!("{}: Receiver {} dropped at item {}", label, i, item_count);
+                        dropped_receivers.push(i);
                     }
                 }
             }
+
             output_txs = active_txs;
             if output_txs.is_empty() {
-                eprintln!("{}: All receivers dropped at item {}. Channel status: {:?}", label, count + 1, channel_status);
-                let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, count + 1)));
+                eprintln!("{}: All receivers dropped at item {}. Receivers dropped: {:?}", label, item_count, dropped_receivers);
+                let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, item_count)));
                 return;
             }
 
-            count += 1;
-            if count % stall_threshold == 0 {
+            // Adaptive throttling on backpressure
+            if backpressure_detected {
+                let pause_ms = backpressure_pause_ms.max(stream_sleep_ms.unwrap_or(0) * 2);
+                eprintln!("{}: Pausing for {}ms due to backpressure at item {}", label, pause_ms, item_count);
+                sleep(Duration::from_millis(pause_ms)).await;
+            } else if item_count % stall_threshold == 0 {
+                eprintln!("{}: Processed {} items, checking for stalls", label, item_count);
                 if let Some(sleep_ms) = stream_sleep_ms {
                     sleep(Duration::from_millis(sleep_ms)).await;
                 }
             }
+
+            // Periodic stall check
+            if last_progress_time.elapsed() > Duration::from_secs(stall_threshold) {
+                eprintln!("{}: Stall detected at item {}", label, item_count);
+                last_progress_time = Instant::now();
+            }
+        }
+
+        // Ensure all receivers process remaining data
+        for (i, tx) in output_txs.into_iter() {
+            let _ = tx; // Move Sender to drop it, signaling EOF
+            eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
         }
 
         if let Some(n) = notify {
             n.notify_waiters();
         }
-        if dropped_count > 0 {
-            let _ = done_tx.send(Err(anyhow!("{}: {} receivers dropped mid-stream, potential data loss", label, dropped_count)));
+
+        if !dropped_receivers.is_empty() {
+            let _ = done_tx.send(Err(anyhow!("{}: {} receivers dropped mid-stream: {:?}", label, dropped_receivers.len(), dropped_receivers)));
         } else {
             let _ = done_tx.send(Ok(()));
         }
