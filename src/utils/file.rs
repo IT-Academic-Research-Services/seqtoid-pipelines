@@ -460,6 +460,7 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::NamedTempFile;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_write_vecu8_to_file() -> std::io::Result<()> {
@@ -494,6 +495,25 @@ mod tests {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         assert!(result.is_err(), "Expected error for empty data");
         assert_eq!(result.unwrap_err().to_string(), format!("No data written to file at {}", temp_path.display()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_parse_output_to_temp_file_fastq() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let fastq = SequenceRecord::Fastq {
+            id: "read1".to_string(),
+            desc: None,
+            seq: Arc::new(b"ATCG".to_vec()),
+            qual: Arc::new(b"IIII".to_vec()),
+        };
+        tokio::spawn(async move { tx.send(ParseOutput::Fastq(fastq)).await.unwrap(); });
+        let (task, path, _temp) = write_parse_output_to_temp_file(ReceiverStream::new(rx), None, Some(".fq"), std::env::temp_dir()).await?;
+        task.await??;
+        let file = std::fs::File::open(&path)?;
+        let mut contents = String::new();
+        std::io::BufReader::new(file).read_to_string(&mut contents)?;
+        assert_eq!(contents, "@read1\nATCG\n+\nIIII\n");
         Ok(())
     }
 }
