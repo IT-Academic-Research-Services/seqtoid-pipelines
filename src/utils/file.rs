@@ -463,27 +463,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_vecu8_to_file() -> std::io::Result<()> {
-        let test_data: Vec<u8> = vec![1, 2, 3, 4];
+        let test_data: Arc<Vec<u8>> = Arc::new(vec![1, 2, 3, 4]);
         let temp_name = NamedTempFile::new()?;
         let temp_path = temp_name.into_temp_path();
-
-        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        write_task
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            .and_then(|result| {
-                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-
+        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000).await?;
+        write_task.await??;
         let mut read_file = std::fs::File::open(&temp_path)?;
         let mut chk_buffer = Vec::new();
         read_file.read_to_end(&mut chk_buffer)?;
-        eprintln!("chk_buffer: {:?}", chk_buffer);
-        assert_eq!(chk_buffer.len(), test_data.len());
-        assert_eq!(chk_buffer, test_data);
-
+        assert_eq!(chk_buffer, *test_data);
         std::fs::remove_file(&temp_path)?;
         Ok(())
     }
