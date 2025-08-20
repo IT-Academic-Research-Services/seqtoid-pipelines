@@ -466,8 +466,13 @@ mod tests {
         let test_data: Arc<Vec<u8>> = Arc::new(vec![1, 2, 3, 4]);
         let temp_name = NamedTempFile::new()?;
         let temp_path = temp_name.into_temp_path();
-        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000).await?;
-        write_task.await??;
+        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        write_task
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let mut read_file = std::fs::File::open(&temp_path)?;
         let mut chk_buffer = Vec::new();
         read_file.read_to_end(&mut chk_buffer)?;

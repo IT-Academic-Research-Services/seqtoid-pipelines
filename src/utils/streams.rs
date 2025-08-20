@@ -951,14 +951,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: b"ATCG".to_vec(),
-                qual: b"IIII".to_vec(),
+                seq: Arc::new(b"ATCG".to_vec()),
+                qual: Arc::new(b"IIII".to_vec()),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: b"GCTA".to_vec(),
-                qual: b"HHHH".to_vec(),
+                seq: Arc::new(b"GCTA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
             }),
         ];
         let stream = tokio_stream::iter(records);
