@@ -400,46 +400,55 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
         .map_err(|e| anyhow!("Failed to create temp file in {}: {}", ram_temp_dir.as_ref().display(), e))?;
     let temp_path = temp_name.path().to_path_buf();
 
-    // Clone the file handle for async writing (original remains in temp_name for auto-delete)
-    let std_file = temp_name.as_file().try_clone()?;
-
-    // Convert to TokioFile for async I/O
-    let writer_file = TokioFile::from_std(std_file);
-
-    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB default, tunable for cluster perf
-    let temp_path_clone = temp_path.clone(); // For error messages in task
+    let writer_file = TokioFile::create(&temp_path).await?;
+    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
+    let temp_path_clone = temp_path.clone();
 
     let task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
-        let mut input_stream = input_stream; // Take ownership
+        let mut input_stream = input_stream;
         let mut byte_count = 0;
 
         while let Some(item) = input_stream.next().await {
-            let data = match item {
-                ParseOutput::Bytes(data) => data,
-                ParseOutput::Fasta(record) => Arc::new(record.to_bytes()?),
-                ParseOutput::Fastq(record) => Arc::new(record.to_bytes()?),
-            };
-            writer
-                .write_all(&data)
-                .await
-                .map_err(|e| anyhow!("Failed to write to temp file at {}: {}", temp_path_clone.display(), e))?;
-            byte_count += data.len();
+            match item {
+                ParseOutput::Bytes(data) => {
+                    writer.write_all(&data).await?;
+                    byte_count += data.len();
+                }
+                ParseOutput::Fasta(record) => {
+                    if let SequenceRecord::Fasta { id, desc, seq } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!(">{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!(">{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + id.len() + 2 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
+                }
+                ParseOutput::Fastq(record) => {
+                    if let SequenceRecord::Fastq { id, desc, seq, qual } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!("@{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!("@{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n+\n").await?;
+                        writer.write_all(&**qual).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + qual.len() + id.len() + 4 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
+                }
+            }
         }
 
-        writer
-            .flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush temp file at {}: {}", temp_path_clone.display(), e))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown temp file at {}: {}", temp_path_clone.display(), e))?;
-
+        writer.flush().await?;
+        writer.shutdown().await?;
         if byte_count == 0 {
             return Err(anyhow!("No data written to temp file at {}", temp_path_clone.display()));
         }
-
         Ok(())
     });
 
