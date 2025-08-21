@@ -166,6 +166,7 @@ where
         let mut item_count = 0;
         let mut last_progress_time = Instant::now();
         let mut dropped_receivers = Vec::new();
+        let mut input_ended = false;
 
         while let Some(item) = input.next().await {
             item_count += 1;
@@ -178,23 +179,16 @@ where
                     backpressure_detected = true;
                     // eprintln!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
                 }
-                match tx.try_send(item.clone()) {
-                    Ok(()) => active_txs.push((i, tx)),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        eprintln!("{}: Receiver {} full at item {}, retrying after pause", label, i, item_count);
-                        sleep(Duration::from_millis(backpressure_pause_ms)).await;
-                        if tx.send(item.clone()).await.is_err() {
-                            eprintln!("{}: Receiver {} dropped at item {}", label, i, item_count);
-                            dropped_receivers.push(i);
-                        } else {
-                            active_txs.push((i, tx));
-                        }
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                let permit = match tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
                         eprintln!("{}: Receiver {} dropped at item {}", label, i, item_count);
                         dropped_receivers.push(i);
+                        continue;
                     }
-                }
+                };
+                permit.send(item.clone());
+                active_txs.push((i, tx));
             }
 
             output_txs = active_txs;
@@ -226,6 +220,8 @@ where
                 last_progress_time = Instant::now();
             }
         }
+
+        input_ended = true;
 
         // Ensure all receivers process remaining data
         for (i, tx) in output_txs.into_iter() {
