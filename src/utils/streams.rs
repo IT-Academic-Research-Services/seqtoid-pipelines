@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
-use crate::config::defs::{CoreAllocation, RunConfig, PIGZ_TAG, FASTP_TAG};
+use crate::config::defs::{CoreAllocation, RunConfig, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
 
 
 
@@ -198,9 +198,13 @@ where
             }
 
             output_txs = active_txs;
+            if !dropped_receivers.is_empty() {
+                let _ = done_tx.send(Err(anyhow!("{}: Early receiver drops ({:?}) before input end at item {}. Potential data loss in branches.", label, dropped_receivers, item_count)));
+                return;
+            }
             if output_txs.is_empty() {
                 eprintln!("{}: All receivers dropped at item {}. Receivers dropped: {:?}", label, item_count, dropped_receivers);
-                let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, item_count)));
+                let _ = done_tx.send(Err(anyhow!("{}: StreamDataDropped", label)));
                 return;
             }
 
@@ -225,7 +229,7 @@ where
 
         // Ensure all receivers process remaining data
         for (i, tx) in output_txs.into_iter() {
-            let _ = tx; // Move Sender to drop it, signaling EOF
+            drop(tx); // Drop Sender to signal EOF
             eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
         }
 
@@ -371,8 +375,8 @@ pub async fn stream_to_cmd(
         let status = guard.wait().await?;
         if !status.success() {
             // Allow non-zero exit for pigz/fastp on partial input (e.g., max reads)
-            if (cmd_tag_owned == PIGZ_TAG || cmd_tag_owned == FASTP_TAG) && total_written > 0 {
-                eprintln!("Warning: {} exited non-zero (code {:?}) after writing {} bytes; likely benign due to max reads", cmd_tag_owned, status.code(), total_written);
+            if (cmd_tag_owned == PIGZ_TAG || cmd_tag_owned == FASTP_TAG || cmd_tag_owned == MINIMAP2_TAG) && total_written > 0 {
+                eprintln!("Warning: {} exited non-zero (code {:?}) after writing {} bytes; likely benign due to max reads or partial input", cmd_tag_owned, status.code(), total_written);
             } else {
                 return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
             }
