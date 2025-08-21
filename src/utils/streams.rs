@@ -333,7 +333,14 @@ pub async fn stream_to_cmd(
             }
 
             if batch.len() >= batch_size_bytes {
-                writer.write_all(&batch).await?;
+                if let Err(e) = writer.write_all(&batch).await {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        eprintln!("Ignoring BrokenPipe in {} writer; assuming child exited", cmd_tag_owned);
+                        break;
+                    } else {
+                        return Err(anyhow!("Write error in {}: {}", cmd_tag_owned, e));
+                    }
+                }
                 writer.flush().await?;
                 total_written += batch.len();
                 batch.clear();
@@ -341,13 +348,20 @@ pub async fn stream_to_cmd(
         }
 
         if !batch.is_empty() {
-            writer.write_all(&batch).await?;
-            writer.flush().await?;
-            total_written += batch.len();
+            if let Err(e) = writer.write_all(&batch).await {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    eprintln!("Ignoring BrokenPipe in {} writer; assuming child exited", cmd_tag_owned);
+                } else {
+                    return Err(anyhow!("Final write error in {}: {}", cmd_tag_owned, e));
+                }
+            } else {
+                writer.flush().await?;
+                total_written += batch.len();
+            }
         }
 
         writer.flush().await?;
-        writer.shutdown().await?;
+        drop(writer); // Explicitly drop to close stdin and signal EOF to child
         Ok(())
     });
 
