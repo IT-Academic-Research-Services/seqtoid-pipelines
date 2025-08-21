@@ -338,19 +338,8 @@ pub async fn stream_to_cmd(
             if batch.len() >= batch_size_bytes {
                 if let Err(e) = writer.write_all(&batch).await {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        // Check status before ignoring (non-blocking)
-                        let mut guard = child_clone.lock().await;
-                        if let Ok(Some(status)) = guard.try_wait() {
-                            if status.success() {
-                                eprintln!("Ignoring BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
-                                break; // Safe: No loss, child done
-                            } else {
-                                return Err(anyhow!("BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
-                            }
-                        } else {
-                            // Child not exited yet; treat as error (potential loss)
-                            return Err(anyhow!("BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
-                        }
+                        eprintln!("Ignoring BrokenPipe in {} write loop; checking final exit", cmd_tag_owned);
+                        break; // Benign; let final wait catch failures
                     } else {
                         return Err(anyhow!("Write error in {}: {}", cmd_tag_owned, e));
                     }
@@ -364,16 +353,7 @@ pub async fn stream_to_cmd(
         if !batch.is_empty() {
             if let Err(e) = writer.write_all(&batch).await {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    let mut guard = child_clone.lock().await;
-                    if let Ok(Some(status)) = guard.try_wait() {
-                        if status.success() {
-                            eprintln!("Ignoring final BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
-                        } else {
-                            return Err(anyhow!("Final BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
-                        }
-                    } else {
-                        return Err(anyhow!("Final BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
-                    }
+                    eprintln!("Ignoring final BrokenPipe in {} write loop; checking final exit", cmd_tag_owned);
                 } else {
                     return Err(anyhow!("Final write error in {}: {}", cmd_tag_owned, e));
                 }
