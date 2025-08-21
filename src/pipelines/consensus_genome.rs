@@ -212,7 +212,6 @@ async fn validate_input(
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -279,17 +278,21 @@ async fn validate_input(
     cleanup_tasks.push(val_pigz_stream_task);
     cleanup_tasks.push(val_pigz_err_task);
 
-    let val_pigz_out_stream = parse_child_output(
-        &mut val_pigz_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let val_pigz_out_stream = {
+        let mut guard = val_pigz_child.lock().await;
+        parse_child_output(
+            &mut guard, // Pass locked Child
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
     let val_pigz_write_task = tokio::spawn(stream_to_file(val_pigz_out_stream, validated_interleaved_file_path));
     cleanup_tasks.push(val_pigz_write_task);
 
@@ -314,8 +317,10 @@ async fn validate_input(
     cleanup_tasks.push(val_fastp_stream_task);
     cleanup_tasks.push(val_fastp_err_task);
 
-    let val_fastp_out_stream = parse_child_output(
-        &mut val_fastp_child,
+    let val_fastp_out_stream ={
+        let mut guard = val_fastp_child.lock().await;
+        parse_child_output(
+        &mut guard,
         ChildStream::Stdout,
         ParseMode::Bytes,
         config.base_buffer_size,
@@ -324,7 +329,9 @@ async fn validate_input(
         .map_err(|e| PipelineError::ToolExecution {
             tool: FASTP_TAG.to_string(),
             error: e.to_string(),
-        })?;
+        })?
+};
+
 
     Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks, cleanup_receivers))
 }
@@ -336,7 +343,6 @@ async fn align_to_host(
     host_index_path: PathBuf,  // minimap2 .mmi index file
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-
     let mut cleanup_tasks = Vec::new();
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_index_path)))
@@ -361,17 +367,20 @@ async fn align_to_host(
     cleanup_tasks.push(minimap2_stream_task);
     cleanup_tasks.push(minimap2_err_task);
 
-    let minimap2_out_stream = parse_child_output(
-        &mut minimap2_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MINIMAP2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let minimap2_out_stream = {
+        let mut guard = minimap2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
@@ -405,17 +414,20 @@ async fn align_to_host(
     cleanup_tasks.push(samtools_task_view);
     cleanup_tasks.push(samtools_err_task_view);
 
-    let samtools_out_stream_view = parse_child_output(
-        &mut samtools_child_view,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_out_stream_view = {
+        let mut guard = samtools_child_view.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     let samtools_config_fastq = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
@@ -443,17 +455,20 @@ async fn align_to_host(
     cleanup_tasks.push(samtools_task_fastq);
     cleanup_tasks.push(samtools_err_task_fastq);
 
-    let samtools_out_stream_fastq = parse_child_output(
-        &mut samtools_child_fastq,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_out_stream_fastq = {
+        let mut guard = samtools_child_fastq.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
     let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
 
     // Input: ParseOutput::Bytes
@@ -539,8 +554,10 @@ async fn align_to_host(
     cleanup_tasks.push(pigz_stream_task);
     cleanup_tasks.push(pigz_err_task);
 
-    let pigz_out_stream = parse_child_output(
-        &mut pigz_child,
+    let pigz_out_stream = {
+        let mut guard = pigz_child.lock().await;
+        parse_child_output(
+        &mut guard,
         ChildStream::Stdout,
         ParseMode::Bytes,
         config.base_buffer_size,
@@ -549,7 +566,8 @@ async fn align_to_host(
         .map_err(|e| PipelineError::ToolExecution {
             tool: PIGZ_TAG.to_string(),
             error: e.to_string(),
-        })?;
+        })?
+    };
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, no_host_file_path));
     cleanup_tasks.push(pigz_write_task);
 
@@ -625,29 +643,21 @@ async fn process_ercc(
     cleanup_tasks.push(minimap2_stream_task);
     cleanup_tasks.push(minimap2_err_task);
 
-    let minimap2_out_stream = parse_child_output(
-        &mut minimap2_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MINIMAP2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let minimap2_out_stream = {
+        let mut guard = minimap2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
-    if !minimap2_child
-        .wait()
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?
-        .success()
-    {
-        return Err(PipelineError::ToolExecution {
-            tool: MINIMAP2_TAG.to_string(),
-            error: "Non-zero exit".to_string(),
-        });
-    }
 
     // Split SAM stream for check and further processing
     let (sam_streams, sam_done_rx) = t_junction(
@@ -760,29 +770,21 @@ async fn process_ercc(
     cleanup_tasks.push(samtools_task_view);
     cleanup_tasks.push(samtools_err_task_view);
 
-    let samtools_out_stream_view = parse_child_output(
-        &mut samtools_child_view,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_out_stream_view = {
+        let mut guard = samtools_child_view.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
-    if !samtools_child_view
-        .wait()
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?
-        .success()
-    {
-        return Err(PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: "Non-zero exit".to_string(),
-        });
-    }
 
     let stats_samtools_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Stats,
@@ -810,29 +812,21 @@ async fn process_ercc(
     cleanup_tasks.push(stats_samtools_task);
     cleanup_tasks.push(stats_samtools_err_task);
 
-    let stats_samtools_out_stream = parse_child_output(
-        &mut stats_samtools_child,
-        ChildStream::Stdout,
-        ParseMode::Lines,
-        config.base_buffer_size / 2,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let stats_samtools_out_stream = {
+        let mut guard = stats_samtools_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size / 2,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
-    if !stats_samtools_child
-        .wait()
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?
-        .success()
-    {
-        return Err(PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: "Non-zero exit on ERCC stats".to_string(),
-        });
-    }
 
     let (stats_streams, stats_done_rx) = t_junction(
         ReceiverStream::new(stats_samtools_out_stream),
@@ -1078,12 +1072,17 @@ async fn filter_with_kraken(
     cleanup_tasks.push(pigz_stream_task);
     cleanup_tasks.push(pigz_err_task);
 
-    let pigz_out_stream = parse_child_output(&mut pigz_child, ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size)
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let pigz_out_stream = {
+        let mut guard = pigz_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size)
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, final_compressed_path));
     cleanup_tasks.push(pigz_write_task);
 
@@ -1145,17 +1144,20 @@ async fn align_to_target(
         })?;
     cleanup_tasks.push(minimap2_err_task);
 
-    let minimap2_out_stream = parse_child_output(
-        &mut minimap2_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MINIMAP2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let minimap2_out_stream = {
+        let mut guard = minimap2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -1187,17 +1189,20 @@ async fn align_to_target(
     cleanup_tasks.push(samtools_sort_task);
     cleanup_tasks.push(samtools_sort_err_task);
 
-    let samtools_sort_out_stream = parse_child_output(
-        &mut samtools_sort_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_sort_out_stream = {
+        let mut guard = samtools_sort_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     let samtools_sort_out_stream = ReceiverStream::new(samtools_sort_out_stream);
 
@@ -1258,17 +1263,20 @@ async fn align_to_target(
     cleanup_tasks.push(sam_view_task);
     cleanup_tasks.push(sam_view_err_task);
 
-    let sam_check_stream = parse_child_output(
-        &mut sam_view_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let sam_check_stream = {
+        let mut guard = sam_view_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     //check for alignment records (not just ehader)
     let (check_tx, mut check_rx) = mpsc::channel(1);
@@ -1363,17 +1371,20 @@ async fn generate_consensus(
     cleanup_tasks.push(samtools_consensus_task);
     cleanup_tasks.push(samtools_consensus_err_task);
 
-    let samtools_consensus_out_stream = parse_child_output(  // FASTA output
-                                                             &mut samtools_consensus_child,
-                                                             ChildStream::Stdout,
-                                                             ParseMode::Fasta,
-                                                             config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_consensus_out_stream = {
+        let mut guard = samtools_consensus_child.lock().await;
+        parse_child_output(  // FASTA output
+                             &mut guard,
+                             ChildStream::Stdout,
+                             ParseMode::Fasta,
+                             config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
     let samtools_consensus_out_stream = ReceiverStream::new(samtools_consensus_out_stream);
 
     let (consensus_streams, consensus_done_rx) = t_junction(
@@ -1459,17 +1470,20 @@ async fn call_variants(
     cleanup_tasks.push(bcftools_mpileup_task);
     cleanup_tasks.push(bcftools_mpileup_err_task);
 
-    let bcftools_mpileup_out_stream = parse_child_output(
-        &mut bcftools_mpileup_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: BCFTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let bcftools_mpileup_out_stream = {
+        let mut guard = bcftools_mpileup_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BCFTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     let bcftools_call_config = BcftoolsConfig {
         subcommand: BcftoolsSubcommand::Call,
@@ -1505,17 +1519,20 @@ async fn call_variants(
     cleanup_tasks.push(bcftools_call_err_task);
 
     // Parse the bcftools call output
-    let bcftools_call_out_stream = parse_child_output(
-        &mut bcftools_call_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: BCFTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let bcftools_call_out_stream = {
+        let mut guard = bcftools_call_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BCFTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
     let bcftools_call_out_stream = ReceiverStream::new(bcftools_call_out_stream);
 
     let (vcf_streams, vcf_done_rx) = t_junction(
@@ -1602,26 +1619,20 @@ async fn realign_consensus_to_ref(
 
     let mut cleanup_tasks = vec![combined_task, realign_consensus_mafft_task, realign_consensus_mafft_err_task];
 
-    let consensus_samtools_out_stream = parse_child_output(
-        &mut realign_consensus_mafft_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    ).await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAFFT_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let consensus_samtools_out_stream = {
+        let mut guard = realign_consensus_mafft_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        ).await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MAFFT_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
-    // keep alive task
-    let mafft_wait_task = tokio::spawn(async move {
-        let status = realign_consensus_mafft_child.wait().await?;
-        if !status.success() {
-            return Err(anyhow!("MAFFT exited with non-zero status: {}", status));
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(mafft_wait_task);
 
     let realign_consensus_write_task = tokio::spawn(stream_to_file(
         consensus_samtools_out_stream,
@@ -1671,7 +1682,10 @@ async fn calculate_statistics(
             ).await?;
             local_cleanup_tasks.push(stats_samtools_task_stats);
             local_cleanup_tasks.push(stats_samtools_err_task_stats);
-            parse_child_output(&mut stats_samtools_child_stats, ChildStream::Stdout, ParseMode::Lines, config.base_buffer_size / 2).await?
+            {
+                let mut guard = stats_samtools_child_stats.lock().await;
+                parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Lines, config.base_buffer_size / 2).await?
+            }
         }
         None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
     };
@@ -1702,12 +1716,15 @@ async fn calculate_statistics(
             ).await?;
             local_cleanup_tasks.push(depth_samtools_task);
             local_cleanup_tasks.push(depth_samtools_err_task);
-            parse_child_output(
-                &mut depth_samtools_child,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                config.base_buffer_size / 2,
-            ).await?
+            {
+                let mut guard = depth_samtools_child.lock().await;
+                parse_child_output(
+                    &mut guard,
+                    ChildStream::Stdout,
+                    ParseMode::Lines,
+                    config.base_buffer_size / 2,
+                ).await?
+            }
         }
         None => {
             return Err(anyhow!("consensus_bam_depth_stream is not available"));
@@ -1769,22 +1786,15 @@ async fn calculate_statistics(
         local_cleanup_tasks.push(bcftools_stats_err_task);
 
         // Parse the stdout of bcftools stats as lines
-        let bcftools_stats_out_rx = parse_child_output(
-            &mut bcftools_stats_child,
-            ChildStream::Stdout,
-            ParseMode::Lines,
-            config.base_buffer_size,
-        ).await?;
-
-        // Await the child process in a separate task to ensure it completes without errors
-        let bcftools_stats_wait_task = tokio::spawn(async move {
-            let status = bcftools_stats_child.wait().await?;
-            if !status.success() {
-                return Err(anyhow!("bcftools stats exited with non-zero status: {}", status));
-            }
-            Ok(())
-        });
-        local_cleanup_tasks.push(bcftools_stats_wait_task);
+        let bcftools_stats_out_rx = {
+            let mut guard = bcftools_stats_child.lock().await;
+            parse_child_output(
+                &mut guard,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config.base_buffer_size,
+            ).await?
+        };
 
         count_variants_from_bcftools_stats(bcftools_stats_out_rx).await?
     } else {
@@ -2083,13 +2093,16 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         config.args.verbose,
     )
         .await?;
-    let no_host_seqkit_out_stream_stats = parse_child_output(
-        &mut no_host_seqkit_child_stats,
-        ChildStream::Stdout,
-        ParseMode::Lines,
-        config.base_buffer_size / 2,
-    )
-        .await?;
+    let no_host_seqkit_out_stream_stats = {
+        let mut guard = no_host_seqkit_child_stats.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size / 2,
+        )
+            .await?
+    };
     stats_tasks.push(no_host_seqkit_task_stats);
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
 

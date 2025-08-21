@@ -263,7 +263,7 @@ pub async fn stream_to_cmd(
     args: Vec<String>,
     data_type: StreamDataType,
     verbose: bool,
-) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
+) -> Result<(Arc<tokio::sync::Mutex<Child>>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
     let core_allocation = config.get_core_allocation(cmd_tag, None);
     let _permit = if core_allocation == CoreAllocation::Maximal {
         Some(config.maximal_semaphore.clone().acquire_owned().await?)
@@ -296,6 +296,9 @@ pub async fn stream_to_cmd(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+
+    let child = Arc::new(tokio::sync::Mutex::new(child));
+    let child_clone = child.clone();
 
     let stdin_task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(writer_capacity, stdin);
@@ -335,8 +338,19 @@ pub async fn stream_to_cmd(
             if batch.len() >= batch_size_bytes {
                 if let Err(e) = writer.write_all(&batch).await {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        eprintln!("Ignoring BrokenPipe in {} writer; assuming child exited", cmd_tag_owned);
-                        break;
+                        // Check status before ignoring (non-blocking)
+                        let mut guard = child_clone.lock().await;
+                        if let Ok(Some(status)) = guard.try_wait() {
+                            if status.success() {
+                                eprintln!("Ignoring BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
+                                break; // Safe: No loss, child done
+                            } else {
+                                return Err(anyhow!("BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                            }
+                        } else {
+                            // Child not exited yet; treat as error (potential loss)
+                            return Err(anyhow!("BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                        }
                     } else {
                         return Err(anyhow!("Write error in {}: {}", cmd_tag_owned, e));
                     }
@@ -350,7 +364,16 @@ pub async fn stream_to_cmd(
         if !batch.is_empty() {
             if let Err(e) = writer.write_all(&batch).await {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    eprintln!("Ignoring BrokenPipe in {} writer; assuming child exited", cmd_tag_owned);
+                    let mut guard = child_clone.lock().await;
+                    if let Ok(Some(status)) = guard.try_wait() {
+                        if status.success() {
+                            eprintln!("Ignoring final BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
+                        } else {
+                            return Err(anyhow!("Final BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                        }
+                    } else {
+                        return Err(anyhow!("Final BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                    }
                 } else {
                     return Err(anyhow!("Final write error in {}: {}", cmd_tag_owned, e));
                 }
@@ -361,7 +384,14 @@ pub async fn stream_to_cmd(
         }
 
         writer.flush().await?;
-        drop(writer); // Explicitly drop to close stdin and signal EOF to child
+        drop(writer); // Close stdin, signal EOF
+
+        // Final check: Await child completion and verify success
+        let mut guard = child_clone.lock().await;
+        let status = guard.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
+        }
         Ok(())
     });
 
@@ -943,7 +973,7 @@ mod tests {
     use crate::config::defs::{RunConfig, StreamDataType};
     use std::sync::Arc;
     use rayon::ThreadPoolBuilder;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Semaphore, Mutex};
     use std::path::PathBuf;
     use crate::cli::Arguments;
 
@@ -1329,7 +1359,7 @@ mod tests {
             None,
         )
             .await?;
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             outputs.pop().unwrap(),
             "cat",
@@ -1338,12 +1368,14 @@ mod tests {
             false,
         )
             .await?;
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = {
+            let mut guard = child.lock().await;
+            guard.stdout.take().unwrap()
+        };
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
         task.await??;
         done_rx.await??;
-        child.wait().await?;
         assert!(!output.is_empty(), "Output should contain data");
         Ok(())
     }
@@ -1364,7 +1396,7 @@ mod tests {
             None,
         )
             .await?;
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             outputs.pop().unwrap(),
             "cat",
@@ -1373,13 +1405,14 @@ mod tests {
             false,
         )
             .await?;
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = {
+            let mut guard = child.lock().await;
+            guard.stdout.take().unwrap()
+        };
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
         task.await??;
         done_rx.await??;
-        let status = child.wait().await?;
-        assert!(status.success(), "Child process should exit successfully");
         assert!(!output.is_empty(), "Output should contain FASTQ data");
         let output_str = String::from_utf8_lossy(&output);
         assert!(output_str.contains("@read1"), "Output should contain first read ID");
@@ -1414,7 +1447,7 @@ mod tests {
                 }
             }
         });
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             rx_parse,
             "cat",
@@ -1423,13 +1456,14 @@ mod tests {
             false,
         )
             .await?;
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = {
+            let mut guard = child.lock().await;
+            guard.stdout.take().unwrap()
+        };
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
         task.await??;
         done_rx.await??;
-        let status = child.wait().await?;
-        assert!(status.success(), "Child process should exit successfully");
         assert!(!output.is_empty(), "Output should contain FASTQ data");
         let output_str = String::from_utf8_lossy(&output);
         assert!(output_str.contains("@read1"), "Output should contain first read ID");
@@ -1487,7 +1521,7 @@ mod tests {
             None,
         )
             .await?;
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             outputs.pop().unwrap(),
             "cat",
@@ -1496,13 +1530,14 @@ mod tests {
             false,
         )
             .await?;
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = {
+            let mut guard = child.lock().await;
+            guard.stdout.take().unwrap()
+        };
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
         task.await??;
         done_rx.await??;
-        let status = child.wait().await?;
-        assert!(status.success(), "Child process should exit successfully");
         assert!(output.is_empty(), "Output should be empty for empty stream");
         Ok(())
     }
@@ -1524,7 +1559,7 @@ mod tests {
             None,
         )
             .await?;
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             outputs.pop().unwrap(),
             "cat",
@@ -1533,13 +1568,14 @@ mod tests {
             false,
         )
             .await?;
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = {
+            let mut guard = child.lock().await;
+            guard.stdout.take().unwrap()
+        };
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
         task.await??;
         done_rx.await??;
-        let status = child.wait().await?;
-        assert!(status.success(), "Child process should exit successfully");
 
         let output_str = String::from_utf8_lossy(&output);
         let mut lines = output_str.lines().peekable();
@@ -1583,7 +1619,7 @@ mod tests {
             None,
         )
             .await?;
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             outputs.pop().unwrap(),
             "head",
@@ -1592,17 +1628,17 @@ mod tests {
             false,
         )
             .await?;
-        let mut stdout = child.stdout.take().unwrap();
+        let mut stdout = {
+            let mut guard = child.lock().await;
+            guard.stdout.take().unwrap()
+        };
         let mut output = Vec::new();
         tokio::io::copy(&mut stdout, &mut output).await?;
-        let task_result = task.await?;
-        let status = child.wait().await?;
+        task.await??; // Task may error due to BrokenPipe, which is expected for "head -n 1"
         done_rx.await??;
-        assert!(status.success(), "Child process should exit successfully");
         let output_str = String::from_utf8_lossy(&output);
         assert!(output_str.contains("@read1"), "Output should contain first read ID");
         assert!(!output_str.contains("@read2"), "Output should not contain second read ID");
-        assert!(task_result.is_ok() || task_result.is_err(), "Task may error due to broken pipe");
         Ok(())
     }
 
@@ -1622,7 +1658,7 @@ mod tests {
             None,
         )
             .await?;
-        let (mut child, task, _err_task) = stream_to_cmd(
+        let (child, task, _err_task) = stream_to_cmd(
             config,
             outputs.pop().unwrap(),
             "cat",
@@ -1633,9 +1669,11 @@ mod tests {
             .await?;
         task.await??;
         done_rx.await??;
-        let status = child.wait().await?;
-        assert!(status.success(), "Child process should exit successfully");
-        assert!(child.stdin.is_none(), "Stdin should be closed");
+        let stdin_closed = {
+            let guard = child.lock().await;
+            guard.stdin.is_none()
+        };
+        assert!(stdin_closed, "Stdin should be closed");
         Ok(())
     }
 
@@ -1815,7 +1853,6 @@ mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn test_stream_to_file_bytes_no_clone() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
@@ -1831,5 +1868,4 @@ mod tests {
         std::fs::remove_file(&path)?;
         Ok(())
     }
-
 }
