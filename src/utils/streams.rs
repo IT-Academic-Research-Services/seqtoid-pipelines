@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
-use crate::config::defs::{CoreAllocation, RunConfig, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG};
+use crate::config::defs::{CoreAllocation, RunConfig, PIGZ_TAG, FASTP_TAG};
 
 
 
@@ -166,7 +166,6 @@ where
         let mut item_count = 0;
         let mut last_progress_time = Instant::now();
         let mut dropped_receivers = Vec::new();
-        let mut input_ended = false;
 
         while let Some(item) = input.next().await {
             item_count += 1;
@@ -179,26 +178,29 @@ where
                     backpressure_detected = true;
                     // eprintln!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
                 }
-                let permit = match tx.reserve().await {
-                    Ok(permit) => permit,
-                    Err(_) => {
+                match tx.try_send(item.clone()) {
+                    Ok(()) => active_txs.push((i, tx)),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        eprintln!("{}: Receiver {} full at item {}, retrying after pause", label, i, item_count);
+                        sleep(Duration::from_millis(backpressure_pause_ms)).await;
+                        if tx.send(item.clone()).await.is_err() {
+                            eprintln!("{}: Receiver {} dropped at item {}", label, i, item_count);
+                            dropped_receivers.push(i);
+                        } else {
+                            active_txs.push((i, tx));
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
                         eprintln!("{}: Receiver {} dropped at item {}", label, i, item_count);
                         dropped_receivers.push(i);
-                        continue;
                     }
-                };
-                permit.send(item.clone());
-                active_txs.push((i, tx));
+                }
             }
 
             output_txs = active_txs;
-            if !dropped_receivers.is_empty() {
-                let _ = done_tx.send(Err(anyhow!("{}: Early receiver drops ({:?}) before input end at item {}. Potential data loss in branches.", label, dropped_receivers, item_count)));
-                return;
-            }
             if output_txs.is_empty() {
                 eprintln!("{}: All receivers dropped at item {}. Receivers dropped: {:?}", label, item_count, dropped_receivers);
-                let _ = done_tx.send(Err(anyhow!("{}: StreamDataDropped", label)));
+                let _ = done_tx.send(Err(anyhow!("{}: All receivers dropped at item {}, data loss occurred", label, item_count)));
                 return;
             }
 
@@ -221,11 +223,9 @@ where
             }
         }
 
-        input_ended = true;
-
         // Ensure all receivers process remaining data
         for (i, tx) in output_txs.into_iter() {
-            drop(tx); // Drop Sender to signal EOF
+            let _ = tx; // Move Sender to drop it, signaling EOF
             eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
         }
 
@@ -371,8 +371,8 @@ pub async fn stream_to_cmd(
         let status = guard.wait().await?;
         if !status.success() {
             // Allow non-zero exit for pigz/fastp on partial input (e.g., max reads)
-            if (cmd_tag_owned == PIGZ_TAG || cmd_tag_owned == FASTP_TAG || cmd_tag_owned == MINIMAP2_TAG) && total_written > 0 {
-                eprintln!("Warning: {} exited non-zero (code {:?}) after writing {} bytes; likely benign due to max reads or partial input", cmd_tag_owned, status.code(), total_written);
+            if (cmd_tag_owned == PIGZ_TAG || cmd_tag_owned == FASTP_TAG) && total_written > 0 {
+                eprintln!("Warning: {} exited non-zero (code {:?}) after writing {} bytes; likely benign due to max reads", cmd_tag_owned, status.code(), total_written);
             } else {
                 return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
             }
