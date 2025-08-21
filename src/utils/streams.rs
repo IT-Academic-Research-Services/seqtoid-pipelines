@@ -130,9 +130,9 @@ where
     }
 
     const MAX_PROCESSES: usize = 4;
-    const RAM_FRACTION: f64 = 0.5;
+    const RAM_FRACTION: f64 = 0.75;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
-    const MAX_BUFFER_PER_STREAM: usize = 1_000_000; // Cap at ~1M records to limit RAM
+    const MAX_BUFFER_PER_STREAM: usize = 50_000_000; // 50M records (~50GB for IlluminaFastq)
 
     let record_size = match data_type {
         StreamDataType::IlluminaFastq => 1_000, // ~1KB per FASTQ record
