@@ -136,8 +136,7 @@ impl RunConfig {
 
         match tag {
             PIGZ_TAG => allocation.min(16),  // Cap at 16: Compression scales poorly >16 due to I/O
-            FASTP_TAG => allocation.min(16),  // Cap at 16: QC/filtering I/O-bound on large FASTQ
-            MINIMAP2_TAG => allocation.min(32),  // Cap at 32: Indexing/chaining memory-bound on hg38
+            FASTP_TAG => allocation.min(32),  // Cap at 32: QC/filtering I/O-bound on large FASTQ
             _ => allocation,
         }
     }
