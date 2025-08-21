@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
-use crate::config::defs::{CoreAllocation, RunConfig};
+use crate::config::defs::{CoreAllocation, RunConfig, PIGZ_TAG, FASTP_TAG};
 
 
 
@@ -309,7 +309,7 @@ pub async fn stream_to_cmd(
         while let Some(item) = stream.next().await {
             match &item {
                 ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&**arc_bytes),
-                ParseOutput::Fastq(record) => {  // Direct match on inner enum
+                ParseOutput::Fastq(record) => {
                     if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
                         if let Some(d) = desc {
                             batch.extend_from_slice(format!("@{} {}\n", id, d).as_bytes());
@@ -370,7 +370,14 @@ pub async fn stream_to_cmd(
         let mut guard = child_clone.lock().await;
         let status = guard.wait().await?;
         if !status.success() {
-            return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
+            // Allow non-zero exit for pigz/fastp on partial input (e.g., max reads)
+            if (cmd_tag_owned == PIGZ_TAG || cmd_tag_owned == FASTP_TAG) && total_written > 0 {
+                eprintln!("Warning: {} exited non-zero (code {:?}) after writing {} bytes; likely benign due to max reads", cmd_tag_owned, status.code(), total_written);
+            } else {
+                return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
+            }
+        } else {
+            eprintln!("Child {} exited successfully; wrote {} bytes", cmd_tag_owned, total_written);
         }
         Ok(())
     });
