@@ -176,7 +176,7 @@ where
                 // Check buffer fullness for backpressure
                 if tx.capacity() < buffer_size / 10 { // <10% capacity left
                     backpressure_detected = true;
-                    eprintln!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
+                    // eprintln!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
                 }
                 match tx.try_send(item.clone()) {
                     Ok(()) => active_txs.push((i, tx)),
@@ -207,7 +207,7 @@ where
             // Adaptive throttling on backpressure
             if backpressure_detected {
                 let pause_ms = backpressure_pause_ms.max(stream_sleep_ms.unwrap_or(0) * 2);
-                eprintln!("{}: Pausing for {}ms due to backpressure at item {}", label, pause_ms, item_count);
+                // eprintln!("{}: Pausing for {}ms due to backpressure at item {}", label, pause_ms, item_count);
                 sleep(Duration::from_millis(pause_ms)).await;
             } else if item_count % stall_threshold == 0 {
                 eprintln!("{}: Processed {} items, checking for stalls", label, item_count);
