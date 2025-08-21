@@ -264,6 +264,8 @@ pub mod samtools {
                     args_vec.push("sort".to_string());
                     args_vec.push("-@".to_string());
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("sort")).to_string());
+                    args_vec.push("-m".to_string());
+                    args_vec.push("2G".to_string());
                 }
                 SamtoolsSubcommand::Index => {
                     args_vec.push("index".to_string());
