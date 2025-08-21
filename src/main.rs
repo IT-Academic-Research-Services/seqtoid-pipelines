@@ -85,8 +85,8 @@ async fn main() -> Result<()> {
         "create_db" => create_db_run(&run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
-        // eprintln!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
-        eprintln!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
+        eprintln!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
+        // eprintln!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
         std::process::exit(1);
     }
 
