@@ -91,7 +91,7 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         f.write("-" * 80 + "\n")
 
     return status, runtime
-    return None, None
+    # return None, None
 
 
 
@@ -112,13 +112,19 @@ def main():
     parser.add_argument('--out', default='/home/ubuntu/data/seqtoid')
 
     args = parser.parse_args()
-
+    fastq_pairs = []
     # Read sample order from file
     with open(args.sample_list, 'r') as f:
-        sample_order = [line.strip() for line in f if line.strip()]
+        for fline in f:
+            ff = fline.strip()
+            fcols = fline.strip().split()
+            if len(fcols) < 2:
+                continue
+            fastq_pairs.append((fcols[0], fcols[1], fcols[2]))
+        # sample_order = [line.strip() for line in f if line.strip()]
 
     # Find paired FASTQ files
-    fastq_pairs = find_fastq_pairs(args.fastq_dir, sample_order)
+
 
     # Run seqtoid-pipelines for each pair
     for sample, r1_file, r2_file in fastq_pairs:
