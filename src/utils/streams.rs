@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::StreamDataType;
-use crate::config::defs::{CoreAllocation, RunConfig, PIGZ_TAG, FASTP_TAG};
+use crate::config::defs::{CoreAllocation, RunConfig};
 
 
 
@@ -130,9 +130,9 @@ where
     }
 
     const MAX_PROCESSES: usize = 4;
-    const RAM_FRACTION: f64 = 0.75;
+    const RAM_FRACTION: f64 = 0.5;
     const MIN_BUFFER_PER_STREAM: usize = 5_000;
-    const MAX_BUFFER_PER_STREAM: usize = 50_000_000; // 50M records (~50GB for IlluminaFastq)
+    const MAX_BUFFER_PER_STREAM: usize = 1_000_000; // Cap at ~1M records to limit RAM
 
     let record_size = match data_type {
         StreamDataType::IlluminaFastq => 1_000, // ~1KB per FASTQ record
@@ -309,7 +309,7 @@ pub async fn stream_to_cmd(
         while let Some(item) = stream.next().await {
             match &item {
                 ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&**arc_bytes),
-                ParseOutput::Fastq(record) => {
+                ParseOutput::Fastq(record) => {  // Direct match on inner enum
                     if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
                         if let Some(d) = desc {
                             batch.extend_from_slice(format!("@{} {}\n", id, d).as_bytes());
@@ -338,8 +338,19 @@ pub async fn stream_to_cmd(
             if batch.len() >= batch_size_bytes {
                 if let Err(e) = writer.write_all(&batch).await {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        eprintln!("Ignoring BrokenPipe in {} write loop; checking final exit", cmd_tag_owned);
-                        break; // Benign; let final wait catch failures
+                        // Check status before ignoring (non-blocking)
+                        let mut guard = child_clone.lock().await;
+                        if let Ok(Some(status)) = guard.try_wait() {
+                            if status.success() {
+                                eprintln!("Ignoring BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
+                                break; // Safe: No loss, child done
+                            } else {
+                                return Err(anyhow!("BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                            }
+                        } else {
+                            // Child not exited yet; treat as error (potential loss)
+                            return Err(anyhow!("BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                        }
                     } else {
                         return Err(anyhow!("Write error in {}: {}", cmd_tag_owned, e));
                     }
@@ -353,7 +364,16 @@ pub async fn stream_to_cmd(
         if !batch.is_empty() {
             if let Err(e) = writer.write_all(&batch).await {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    eprintln!("Ignoring final BrokenPipe in {} write loop; checking final exit", cmd_tag_owned);
+                    let mut guard = child_clone.lock().await;
+                    if let Ok(Some(status)) = guard.try_wait() {
+                        if status.success() {
+                            eprintln!("Ignoring final BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
+                        } else {
+                            return Err(anyhow!("Final BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                        }
+                    } else {
+                        return Err(anyhow!("Final BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                    }
                 } else {
                     return Err(anyhow!("Final write error in {}: {}", cmd_tag_owned, e));
                 }
@@ -370,14 +390,7 @@ pub async fn stream_to_cmd(
         let mut guard = child_clone.lock().await;
         let status = guard.wait().await?;
         if !status.success() {
-            // Allow non-zero exit for pigz/fastp on partial input (e.g., max reads)
-            if (cmd_tag_owned == PIGZ_TAG || cmd_tag_owned == FASTP_TAG) && total_written > 0 {
-                eprintln!("Warning: {} exited non-zero (code {:?}) after writing {} bytes; likely benign due to max reads", cmd_tag_owned, status.code(), total_written);
-            } else {
-                return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
-            }
-        } else {
-            eprintln!("Child {} exited successfully; wrote {} bytes", cmd_tag_owned, total_written);
+            return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
         }
         Ok(())
     });
