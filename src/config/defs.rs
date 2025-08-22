@@ -136,9 +136,16 @@ impl RunConfig {
 
         match tag {
             PIGZ_TAG => allocation.min(16),  // Cap at 16: Compression scales poorly >16 due to I/O
-            FASTP_TAG => allocation.min(16),  // Cap at 16: QC/filtering I/O-bound on large FASTQ
-            MINIMAP2_TAG => allocation.min(64),  // Cap at 64: Indexing/chaining memory-bound on hg38
+            FASTP_TAG => allocation.min(32),  // Cap at 32: QC/filtering I/O-bound on large FASTQ
             _ => allocation,
+        }
+    }
+
+    pub fn get_buffer_size(&self, file_size_mb: u64) -> usize {
+        if file_size_mb > 10_000 { // >10GB
+            (self.base_buffer_size / 10).max(5_000) // ~5k-50k records (~5-50MB for Illumina)
+        } else {
+            self.base_buffer_size // ~100k-1M records (~100MB-1GB)
         }
     }
 }

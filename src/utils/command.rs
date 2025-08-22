@@ -157,27 +157,40 @@ mod h5dump {
 mod minimap2 {
     use std::path::PathBuf;
     use anyhow::anyhow;
-    use tokio::process::Command;
-    use crate::cli::{Technology};
+    use crate::cli::Technology;
     use crate::config::defs::{MINIMAP2_TAG, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
     use crate::utils::command::{version_check, ArgGenerator};
 
     pub struct Minimap2ArgGenerator;
+
     pub async fn minimap2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MINIMAP2_TAG,vec!["--version"], 0, 0 , ChildStream::Stdout).await?;
+        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout).await?;
         Ok(version)
     }
 
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));  // Debug log
+            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
             let args = &run_config.args;
-            let paths = extra
-                .and_then(|e| e.downcast_ref::<(PathBuf, PathBuf)>())
-                .ok_or_else(|| anyhow!("Minimap2 requires (ref_pipe_path, query_pipe_path) as extra arguments"))?;
 
-            let (ref_pipe_path, query_pipe_path) = paths;
+            // Expect a single PathBuf for the minimap2 index (.mmi)
+            let index_path = extra
+                .and_then(|e| e.downcast_ref::<PathBuf>())
+                .ok_or_else(|| anyhow!("Minimap2 requires an index path (.mmi) as extra argument"))?;
+
+            // Validate that the path exists and has .mmi extension
+            if !index_path.exists() {
+                return Err(anyhow!("Minimap2 index file does not exist: {}", index_path.display()));
+            }
+            if index_path.extension().map_or(true, |ext| ext != "mmi") {
+                return Err(anyhow!("Minimap2 index must have .mmi extension, got: {}", index_path.display()));
+            }
+
+            eprintln!("Using minimap2 index for {}: {}", match args.technology {
+                Technology::Illumina => "Illumina",
+                Technology::ONT => "ONT",
+            }, index_path.display());
 
             let mut args_vec: Vec<String> = Vec::new();
 
@@ -186,52 +199,16 @@ mod minimap2 {
             args_vec.push(num_cores.to_string());
 
             args_vec.push("-ax".to_string());
-            let technology = args.technology.clone();
-            match technology {
-                Technology::Illumina => {
-                    args_vec.push("sr".to_string());
-                }
-                Technology::ONT => {
-                    args_vec.push("map-ont".to_string());
-                }
+            match args.technology {
+                Technology::Illumina => args_vec.push("sr".to_string()),
+                Technology::ONT => args_vec.push("map-ont".to_string()),
             }
 
-            args_vec.push(ref_pipe_path.to_string_lossy().to_string());
-            args_vec.push(query_pipe_path.to_string_lossy().to_string());
+            args_vec.push(index_path.to_string_lossy().to_string());
+            args_vec.push("-".to_string()); // Query from stdin
 
             Ok(args_vec)
         }
-    }
-
-    pub fn arg_generator(run_config: &RunConfig, ref_pipe_path: &PathBuf, query_pipe_path: &PathBuf) -> Vec<String> {
-        let args = &run_config.args;
-        let mut args_vec: Vec<String> = Vec::new();
-
-        let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
-        args_vec.push("-t".to_string());
-        args_vec.push(num_cores.to_string());
-
-
-        args_vec.push("-R".to_string());
-        args_vec.push("@RG\\tID:id\\tSM:sample\\tLB:lib".to_string());  // Add read group for better sorting/parallelism downstream
-
-        args_vec.push("-w".to_string());
-        args_vec.push("100000".to_string()); // Larger minibatch for better thread scaling
-
-        let technology = args.technology.clone();
-        match technology {
-            Technology::Illumina => {
-                args_vec.push("-ax sr".to_string());
-            }
-            Technology::ONT => {
-                args_vec.push("-ax map-ont".to_string());
-            }
-        }
-
-        args_vec.push(ref_pipe_path.to_string_lossy().to_string());
-        args_vec.push(query_pipe_path.to_string_lossy().to_string());
-
-        args_vec
     }
 }
 
@@ -287,6 +264,8 @@ pub mod samtools {
                     args_vec.push("sort".to_string());
                     args_vec.push("-@".to_string());
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("sort")).to_string());
+                    args_vec.push("-m".to_string());
+                    args_vec.push("2G".to_string());
                 }
                 SamtoolsSubcommand::Index => {
                     args_vec.push("index".to_string());

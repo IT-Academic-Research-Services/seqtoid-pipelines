@@ -36,7 +36,7 @@ pub struct Arguments {
     #[arg(long, default_value_t = 50000000)]
     pub max_reads: usize,
 
-    #[arg(short = 't', long = "technology", default_value = "illumina", value_enum)]
+    #[arg(long = "technology", default_value = "illumina", value_enum)]
     pub technology: Technology,
 
     #[arg(long)]
@@ -57,20 +57,26 @@ pub struct Arguments {
     #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
 
-    #[arg(short = 'a', long = "host_accession")]  // For host removal
+    #[arg(long)]  // For host removal
     pub host_accession : Option<String>,
 
-    #[arg(long)]  // For host removal
+    #[arg(short = 'a', long)]  // For host removal
     pub host_sequence : Option<String>,
 
-    #[arg(short = 'r', long = "ref_accession")]  // For target aligning
-    pub ref_accession : Option<String>,
+    #[arg(long, help = "Optional path to pre-built minimap2 index for host reference (e.g., hg38.mmi)")]
+    pub host_index: Option<String>,
 
-    #[arg(long)] // For target aligning
-    pub ref_sequence : Option<String>,
+    #[arg(long)]  // For target aligning
+    pub target_accession : Option<String>,
+
+    #[arg(short = 't', long)] // For target aligning
+    pub target_sequence : Option<String>,
+
+    #[arg(long, help = "Optional path to pre-built minimap2 index for target reference (e.g., covid.mmi)")]
+    pub target_index: Option<String>,
 
     #[arg(long)]
-    pub ref_taxid : Option<String>,
+    pub target_taxid : Option<String>,
 
     #[arg(short = 'd', long = "db")]
     pub ref_db : Option<String>,
@@ -91,7 +97,10 @@ pub struct Arguments {
     pub adapter_fasta : Option<String>,
 
     #[arg(long, default_value = "ercc_sequences.fasta")]
-    pub ercc_sequences : String,
+    pub ercc_sequence : Option<String>,
+
+    #[arg(long, help = "Optional path to pre-built minimap2 index for ERCC reference (e.g., ercc.mmi)")]
+    pub ercc_index: Option<String>,
 
     #[arg( long = "target_type", default_value = "viral", value_enum)]
     pub target_type: TargetType,

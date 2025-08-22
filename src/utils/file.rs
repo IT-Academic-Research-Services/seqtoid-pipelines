@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io;
+use std::sync::Arc;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -16,6 +17,7 @@ use tokio::process::Command;
 use tokio_stream::StreamExt;
 use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
+use crate::utils::fastx::SequenceRecord;
 
 
 
@@ -211,7 +213,8 @@ pub async fn write_parse_output_to_fifo(
     buffer_size: Option<usize>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     if fifo_path.exists() {
-        std::fs::remove_file(fifo_path)?;
+        tokio::fs::remove_file(fifo_path).await // Async remove
+            .map_err(|e| anyhow!("Failed to remove existing FIFO at {}: {}", fifo_path.display(), e))?;
     }
     let status = Command::new("mkfifo")
         .arg(fifo_path)
@@ -221,7 +224,7 @@ pub async fn write_parse_output_to_fifo(
     if !status.success() {
         return Err(anyhow!("mkfifo failed with status: {}", status));
     }
-    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024);
+    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024); // Default to 16MB for large files
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
         let mut writer_file = TokioFile::create(&fifo_path)
@@ -239,23 +242,30 @@ pub async fn write_parse_output_to_fifo(
                     byte_count += data.len();
                 }
                 ParseOutput::Fasta(record) => {
-                    let bytes = record.to_bytes()?;
-                    writer
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|e| anyhow!("Failed to write FASTA to FIFO at {}: {}", fifo_path.display(), e))?;
-                    byte_count += bytes.len();
+                    if let SequenceRecord::Fasta { id, desc, seq } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!(">{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!(">{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + id.len() + 2 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
                 }
                 ParseOutput::Fastq(record) => {
-                    let bytes = record.to_bytes()?;
-                    writer
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|e| anyhow!("Failed to write FASTQ to FIFO at {}: {}", fifo_path.display(), e))?;
-                    byte_count += bytes.len();
-                }
-                _ => {
-                    return Err(anyhow!("Unexpected data in stream at {}", fifo_path.display()));
+                    if let SequenceRecord::Fastq { id, desc, seq, qual } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!("@{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!("@{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n+\n").await?;
+                        writer.write_all(&**qual).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + qual.len() + id.len() + 4 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
                 }
             }
         }
@@ -294,7 +304,6 @@ pub async fn write_parse_output_to_temp_fifo(
     suffix: Option<&str>,
     temp_dir: Option<impl AsRef<Path>>,
 ) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf)> {
-
     let mut builder = TempfileBuilder::new();
     if let Some(suf) = suffix {
         builder.suffix(suf);
@@ -305,9 +314,10 @@ pub async fn write_parse_output_to_temp_fifo(
         builder.tempfile()?
     };
     let temp_path = temp_name.path().to_path_buf();
-    temp_name.close()?;     // Immediately close the regular file to avoid conflicts with mkfifo
+    tokio::fs::remove_file(&temp_path).await?; // Async remove to replace with FIFO
+    drop(temp_name); // Explicitly drop to avoid holding file
 
-    let task = write_parse_output_to_fifo(&temp_path, input_stream, buffer_size).await?;
+    let task = write_parse_output_to_fifo(&temp_path, input_stream, buffer_size.or(Some(16 * 1024 * 1024))).await?;
 
     Ok((task, temp_path))
 }
@@ -325,44 +335,38 @@ pub async fn write_parse_output_to_temp_fifo(
 ///
 /// A `Result` containing a `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
 pub async fn write_vecu8_to_file<P: AsRef<Path>>(
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>, // Accept Arc to avoid cloning
     temp_path: P,
     buffer_size: usize,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    let temp_path = temp_path.as_ref().to_path_buf(); // Convert to PathBuf for display
-    let buffer_capacity = buffer_size.max(4 * 1024 * 1024);
+    let temp_path = temp_path.as_ref().to_path_buf();
+    let buffer_capacity = buffer_size.max(16 * 1024 * 1024);
     let task = tokio::spawn(async move {
         let file = TokioFile::create(&temp_path)
             .await
             .map_err(|e| anyhow!("Failed to create file at {}: {}", temp_path.display(), e))?;
         let mut writer = BufWriter::with_capacity(buffer_capacity, file);
 
-        let mut byte_count = 0;
-        const CHUNK_SIZE: usize = 1024 * 1024;
-        for chunk in data.chunks(CHUNK_SIZE) {
-            writer
-                .write_all(chunk)
-                .await
-                .map_err(|e| anyhow!("Failed to write to file at {}: {}", temp_path.display(), e))?;
-            byte_count += chunk.len();
-        }
+        let byte_count = if data.len() <= 4 * 1024 * 1024 { // Write small data in one go
+            writer.write_all(&**data).await?;
+            data.len()
+        } else {
+            const CHUNK_SIZE: usize = 16 * 1024 * 1024; // Larger chunks for big data
+            let mut byte_count = 0;
+            for chunk in data.chunks(CHUNK_SIZE) {
+                writer.write_all(chunk).await?;
+                byte_count += chunk.len();
+            }
+            byte_count
+        };
 
-        writer
-            .flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush file at {}: {}", temp_path.display(), e))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown file at {}: {}", temp_path.display(), e))?;
-
+        writer.flush().await?;
+        writer.shutdown().await?;
         if byte_count == 0 {
             return Err(anyhow!("No data written to file at {}", temp_path.display()));
         }
-
         Ok(())
     });
-
     Ok(task)
 }
 
@@ -386,8 +390,7 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
     buffer_size: Option<usize>,
     suffix: Option<&str>,
     ram_temp_dir: P,
-) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf, NamedTempFile)> {
-
+) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf, tempfile::NamedTempFile)> {
     let mut temp_name = match suffix {
         Some(s) => TempfileBuilder::new()
             .suffix(s)
@@ -397,47 +400,55 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
         .map_err(|e| anyhow!("Failed to create temp file in {}: {}", ram_temp_dir.as_ref().display(), e))?;
     let temp_path = temp_name.path().to_path_buf();
 
-    // Clone the file handle for async writing (original remains in temp_name for auto-delete)
-    let std_file = temp_name.as_file().try_clone()?;
-
-    // Convert to TokioFile for async I/O
-    let writer_file = TokioFile::from_std(std_file);
-
-    let buffer_capacity = buffer_size.unwrap_or(4 * 1024 * 1024); // 4MB default, tunable for cluster perf
-    let temp_path_clone = temp_path.clone(); // For error messages in task
+    let writer_file = TokioFile::create(&temp_path).await?;
+    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
+    let temp_path_clone = temp_path.clone();
 
     let task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
-        let mut input_stream = input_stream; // Take ownership
+        let mut input_stream = input_stream;
         let mut byte_count = 0;
 
         while let Some(item) = input_stream.next().await {
-            let data = match item {
-                ParseOutput::Bytes(data) => data,
-                ParseOutput::Fasta(record) => record.to_bytes()?,
-                ParseOutput::Fastq(record) => record.to_bytes()?,
-                _ => return Err(anyhow!("Unexpected data in stream at {}", temp_path_clone.display())),
-            };
-            writer
-                .write_all(&data)
-                .await
-                .map_err(|e| anyhow!("Failed to write to temp file at {}: {}", temp_path_clone.display(), e))?;
-            byte_count += data.len();
+            match item {
+                ParseOutput::Bytes(data) => {
+                    writer.write_all(&data).await?;
+                    byte_count += data.len();
+                }
+                ParseOutput::Fasta(record) => {
+                    if let SequenceRecord::Fasta { id, desc, seq } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!(">{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!(">{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + id.len() + 2 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
+                }
+                ParseOutput::Fastq(record) => {
+                    if let SequenceRecord::Fastq { id, desc, seq, qual } = &record {
+                        if let Some(d) = desc {
+                            writer.write_all(format!("@{} {}\n", id, d).as_bytes()).await?;
+                        } else {
+                            writer.write_all(format!("@{}\n", id).as_bytes()).await?;
+                        }
+                        writer.write_all(&**seq).await?;
+                        writer.write_all(b"\n+\n").await?;
+                        writer.write_all(&**qual).await?;
+                        writer.write_all(b"\n").await?;
+                        byte_count += seq.len() + qual.len() + id.len() + 4 + desc.as_ref().map_or(0, |d| d.len() + 1);
+                    }
+                }
+            }
         }
 
-        writer
-            .flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush temp file at {}: {}", temp_path_clone.display(), e))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown temp file at {}: {}", temp_path_clone.display(), e))?;
-
+        writer.flush().await?;
+        writer.shutdown().await?;
         if byte_count == 0 {
             return Err(anyhow!("No data written to temp file at {}", temp_path_clone.display()));
         }
-
         Ok(())
     });
 
@@ -449,31 +460,60 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::NamedTempFile;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_write_vecu8_to_file() -> std::io::Result<()> {
-        let test_data: Vec<u8> = vec![1, 2, 3, 4];
+        let test_data: Arc<Vec<u8>> = Arc::new(vec![1, 2, 3, 4]);
         let temp_name = NamedTempFile::new()?;
         let temp_path = temp_name.into_temp_path();
-
         let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         write_task
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            .and_then(|result| {
-                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            })?;
-
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let mut read_file = std::fs::File::open(&temp_path)?;
         let mut chk_buffer = Vec::new();
         read_file.read_to_end(&mut chk_buffer)?;
-        eprintln!("chk_buffer: {:?}", chk_buffer);
-        assert_eq!(chk_buffer.len(), test_data.len());
-        assert_eq!(chk_buffer, test_data);
-
+        assert_eq!(chk_buffer, *test_data);
         std::fs::remove_file(&temp_path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_vecu8_to_file_empty() -> std::io::Result<()> {
+        let test_data: Arc<Vec<u8>> = Arc::new(vec![]);
+        let temp_name = NamedTempFile::new()?;
+        let temp_path = temp_name.into_temp_path();
+        let write_task = write_vecu8_to_file(test_data.clone(), &temp_path, 10000)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let result = write_task
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        assert!(result.is_err(), "Expected error for empty data");
+        assert_eq!(result.unwrap_err().to_string(), format!("No data written to file at {}", temp_path.display()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_write_parse_output_to_temp_file_fastq() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let fastq = SequenceRecord::Fastq {
+            id: "read1".to_string(),
+            desc: None,
+            seq: Arc::new(b"ATCG".to_vec()),
+            qual: Arc::new(b"IIII".to_vec()),
+        };
+        tokio::spawn(async move { tx.send(ParseOutput::Fastq(fastq)).await.unwrap(); });
+        let (task, path, _temp) = write_parse_output_to_temp_file(ReceiverStream::new(rx), None, Some(".fq"), std::env::temp_dir()).await?;
+        task.await??;
+        let file = std::fs::File::open(&path)?;
+        let mut contents = String::new();
+        std::io::BufReader::new(file).read_to_string(&mut contents)?;
+        assert_eq!(contents, "@read1\nATCG\n+\nIIII\n");
         Ok(())
     }
 }

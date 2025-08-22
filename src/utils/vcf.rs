@@ -67,7 +67,7 @@ pub async fn parse_vcf_stream(rx: Receiver<ParseOutput>) -> anyhow::Result<(u64,
     while let Some(item) = stream.next().await {
         match item {
             ParseOutput::Bytes(bytes) => {
-                let lines_str = match String::from_utf8(bytes) {
+                let lines_str = match String::from_utf8(bytes.as_ref().to_vec()) {
                     Ok(s) => s,
                     Err(e) => return Err(anyhow!("Invalid UTF-8 in VCF stream: {}", e)),
                 };

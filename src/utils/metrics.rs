@@ -181,7 +181,7 @@ async fn compute_unaligned_metrics(
 
     while let Some(parse_output) = stdout_stream.recv().await {
         let line = match parse_output {
-            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)
+            ParseOutput::Bytes(bytes) => String::from_utf8(bytes.as_ref().to_vec())
                 .map_err(|e| anyhow!("Invalid UTF-8: {}", e))?,
             _ => {
                 eprintln!("Skipping non-bytes output");
@@ -241,7 +241,7 @@ pub async fn compute_duplication_ratio(
 
     while let Some(parse_output) = stdout_stream.recv().await {
         let line = match parse_output {
-            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
+            ParseOutput::Bytes(bytes) => String::from_utf8(bytes.as_ref().to_vec())?,
             _ => continue,
         };
         if line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
@@ -401,7 +401,7 @@ pub async fn parse_show_coords(
 
     while let Some(parse_output) = stdout_stream.recv().await {
         let line = match parse_output {
-            ParseOutput::Bytes(bytes) => String::from_utf8(bytes)?,
+            ParseOutput::Bytes(bytes) => String::from_utf8(bytes.as_ref().to_vec())?,
             _ => continue,
         };
         if line.is_empty() || line.starts_with("NUCMER") || line.starts_with('[') || line.trim() == "(END)" {
@@ -503,7 +503,7 @@ pub async fn compute_bam_metrics(
             _ => continue,
         };
 
-        let sam_line = String::from_utf8(record_bytes)
+        let sam_line = String::from_utf8(record_bytes.as_ref().to_vec())
             .map_err(|e| anyhow!("Invalid UTF-8 in SAM line: {}", e))?;
         let record = Record::from_sam(&header_view, sam_line.as_bytes())
             .map_err(|e| anyhow!("Failed to parse SAM record: {}", e))?;

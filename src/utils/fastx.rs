@@ -55,17 +55,16 @@ pub enum SequenceRecord {
     Fasta {
         id: String,
         desc: Option<String>,
-        seq: Vec<u8>,
+        seq: Arc<Vec<u8>>,
     },
     Fastq {
         id: String,
         desc: Option<String>,
-        seq: Vec<u8>,
-        qual: Vec<u8>,
+        seq: Arc<Vec<u8>>,
+        qual: Arc<Vec<u8>>,
     },
 }
 
-/// Maps id and seq to the correct file type.
 impl SequenceRecord {
     pub fn id(&self) -> &str {
         match self {
@@ -76,15 +75,16 @@ impl SequenceRecord {
 
     pub fn seq(&self) -> &[u8] {
         match self {
-            SequenceRecord::Fasta { seq, .. } => seq,
-            SequenceRecord::Fastq { seq, .. } => seq,
+            SequenceRecord::Fasta { seq, .. } => &**seq,
+            SequenceRecord::Fastq { seq, .. } => &**seq,
         }
     }
+
     #[allow(dead_code)]
     pub fn qual(&self) -> &[u8] {
         match self {
             SequenceRecord::Fasta { .. } => &[],
-            SequenceRecord::Fastq { qual, .. } => qual,
+            SequenceRecord::Fastq { qual, .. } => &**qual,
         }
     }
 
@@ -97,13 +97,14 @@ impl SequenceRecord {
     }
 }
 
+// Update From impls to wrap in Arc
 impl From<FastaOwnedRecord> for SequenceRecord {
     fn from(record: FastaOwnedRecord) -> Self {
         let (id, desc) = parse_header(&record.head, '>');
         SequenceRecord::Fasta {
             id,
             desc,
-            seq: record.seq,
+            seq: Arc::new(record.seq),
         }
     }
 }
@@ -114,8 +115,8 @@ impl From<FastqOwnedRecord> for SequenceRecord {
         SequenceRecord::Fastq {
             id,
             desc,
-            seq: record.seq,
-            qual: record.qual,
+            seq: Arc::new(record.seq),
+            qual: Arc::new(record.qual),
         }
     }
 }
@@ -414,8 +415,8 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
                 SequenceRecord::Fastq {
                     id: format!("read{}", i + 1),
                     desc: None,
-                    seq: seq.into_bytes(),
-                    qual: qual.into_bytes(),
+                    seq: Arc::new(seq.into_bytes()),
+                    qual: Arc::new(qual.into_bytes()),
                 }
             })
             .collect()
@@ -511,9 +512,16 @@ pub fn read_and_interleave_sequences(
                             r2_count += 1;
 
                             read_counter += 1;
+
+                            // Throttle every 100,000 pairs
+                            if read_counter % 100_000 == 0 {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                // eprintln!("Processed {} read pairs, throttling for 5ms", read_counter);
+                            }
+
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break;
                             }
                         }
                         (Err(e), _) => {
@@ -526,7 +534,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-
             });
         }
         (None, SequenceReader::Fastq(reader)) => {
@@ -559,7 +566,7 @@ pub fn read_and_interleave_sequences(
                             read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break;
                             }
                         }
                         Err(e) => {
@@ -600,7 +607,7 @@ pub fn read_and_interleave_sequences(
                             read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break; // Exit loop cleanly, sender dropped after
                             }
                         }
                         Err(e) => {
@@ -820,12 +827,12 @@ mod tests {
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
         let fastq_data = vec![
-            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec()),
+            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec().into()),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: b"GCTA".to_vec(),
-                qual: b"HHHH".to_vec(),
+                seq: Arc::new(b"GCTA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
             }),
         ];
 
@@ -844,11 +851,11 @@ mod tests {
     async fn test_stream_record_counter_fasta_early_exit() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
         let fasta_data = vec![
-            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec()),
+            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec().into()),
             ParseOutput::Fasta(SequenceRecord::Fasta {
                 id: "seq2".to_string(),
                 desc: None,
-                seq: b"GCTA".to_vec(),
+                seq: Arc::new(b"GCTA".to_vec()),
             }),
         ];
 
