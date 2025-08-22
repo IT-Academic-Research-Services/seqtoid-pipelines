@@ -70,7 +70,7 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
     #     status = 'SUCCESS'
     #
     #     # Extract runtime from console output
-    #     runtime_match = re.search(r'Run complete: (\d+) milliseconds\.', stdout)
+    #     runtime_match = re.search(r'(\d+) milliseconds\.', stdout)
     #     runtime_ms = int(runtime_match.group(1)) if runtime_match else None
     #     runtime = runtime_ms / 1000.0 if runtime_ms is not None else None
     # except subprocess.CalledProcessError as e:
