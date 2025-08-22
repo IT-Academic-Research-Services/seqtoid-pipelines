@@ -47,7 +47,7 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '-I', os.path.join(fastq_dir, r2_file),
         '--target-sequence', target_sequence,
         '--ercc-index', ercc_index,
-        '--host-sequence', host_sequence,
+        # '--host-sequence', host_sequence,
         '--target-taxid', target_taxid,
         '--out', out,
         '--host-index', host_index,

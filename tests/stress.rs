@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Instant;
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
-use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode,};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Command;
@@ -101,7 +101,7 @@ async fn test_fastx_generator_count() -> Result<()> {
                     num_read, count
                 )?;
                 return Err(anyhow!(
-                    "fastx_generator produced {} records, expected {}", 
+                    "fastx_generator produced {} records, expected {}",
                     count, num_read
                 ));
             }
@@ -183,7 +183,7 @@ async fn test_t_junction_stress() -> Result<()> {
                         seq_len
                     );
 
-                    let stream = fastx_generator(num_reads, seq_len, 30.0, 5.0);
+                    let stream = fastx_generator(num_reads, seq_len, 30.0, 5.0).map(ParseOutput::Fastq);
                     let start = Instant::now();
                     let (outputs, done_rx) = t_junction(
                         stream,
@@ -281,7 +281,7 @@ async fn test_t_junction_count() -> Result<()> {
         num_read, read_size, buffer_size, sleep_ms
     );
     stderr().flush()?;
-    let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
+    let stream = fastx_generator(num_read, read_size, 35.0, 3.0).map(ParseOutput::Fastq);
     let (outputs, done_rx) = t_junction(
         stream,
         2,
@@ -327,8 +327,8 @@ async fn test_t_junction_count() -> Result<()> {
     stderr().flush()?;
     if counts != vec![num_read, num_read] {
         return Err(anyhow!(
-            "t_junction produced [{:}], expected [{}, {}]", 
-            counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "), 
+            "t_junction produced [{:}], expected [{}, {}]",
+            counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
             num_read, num_read
         ));
     }
@@ -348,7 +348,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     );
     stderr().flush()?;
 
-    let stream = fastx_generator(num_read, read_size, 35.0, 3.0);
+    let stream = fastx_generator(num_read, read_size, 35.0, 3.0).map(ParseOutput::Fastq);
     let (mut outputs, done_rx) = t_junction(
         stream,
         1,
@@ -362,7 +362,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     ).await?;
 
     let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
-    let (mut child, inner_task, _inner_err_task) = stream_to_cmd(
+    let (child, inner_task, _inner_err_task) = stream_to_cmd(
         config,
         rx,
         cmd_tag,
@@ -389,6 +389,10 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
 
     done_rx.await??;
 
+    let child = Arc::try_unwrap(child)
+        .map_err(|_| anyhow!("Multiple references to child remain"))?
+        .into_inner();
+
     let output = child.wait_with_output().await?;
     let stderr_output = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -397,7 +401,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
             output.status, stderr_output
         );
         return Err(anyhow!(
-            "Child process failed: status: {}, stderr: {}", 
+            "Child process failed: status: {}, stderr: {}",
             output.status, stderr_output
         ));
     }
@@ -446,7 +450,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 stderr().flush()?;
 
                                 // Generate stream and split with t_junction
-                                let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0);
+                                let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0).map(ParseOutput::Fastq);
                                 let mut gen_count = 0;
                                 let stream = stream.inspect(move |_result| {
                                     gen_count += 1;
@@ -488,7 +492,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     let cmd_tag = cmd_tag.to_string();
                                     let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-                                    let (mut child, stream_task, _stream_err_task) = match stream_to_cmd(
+                                    let (child, stream_task, _stream_err_task) = match stream_to_cmd(
                                         config.clone(),
                                         rx,
                                         &cmd_tag,
@@ -505,12 +509,15 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         }
                                     };
 
+                                    let mut child_guard = child.lock().await;
                                     let out_stream = parse_child_output(
-                                        &mut child,
+                                        &mut *child_guard,
                                         ChildStream::Stdout,
                                         ParseMode::Fastq,
                                         *buffer_size,
                                     ).await?;
+                                    drop(child_guard);
+
                                     let write_task = tokio::spawn(stream_to_file(
                                         out_stream,
                                         Path::new(&stream_outfile).to_path_buf(),
