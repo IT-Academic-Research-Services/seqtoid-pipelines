@@ -13,7 +13,13 @@ cluster nodes running Rocky Linux.
 POSIX-compatible OS's should be able to compile and run these workflows. Windows is not supported.
 
 ### Software requirements
-* Python3
+
+| Software | Minimum Version |
+|:---------|:---------------:|
+| fastp    |       1.0       |
+| htslib   |      1.19       |
+| bcftools |      1.19       |
+| python3  |       3.8       |
 
 ### Quick Setup
 
