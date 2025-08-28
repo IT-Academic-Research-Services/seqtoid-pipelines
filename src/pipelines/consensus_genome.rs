@@ -1000,6 +1000,8 @@ async fn filter_with_kraken(
     );
     cleanup_tasks.push(filter_task);
 
+    eprintln!("parse_and_filter_fastq_id done");
+
     let (parse_output_tx, parse_output_rx) = mpsc::channel(config.base_buffer_size);
     let conversion_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(filtered_rx);
@@ -1013,6 +1015,7 @@ async fn filter_with_kraken(
     });
 
     cleanup_tasks.push(conversion_task);
+    eprintln!("conversion tasks in cleanup");
 
     let filtered_stream = ReceiverStream::new(parse_output_rx);
 
@@ -1036,7 +1039,7 @@ async fn filter_with_kraken(
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
+    eprintln!("streams split");
     let (check_tx, mut check_rx) = mpsc::channel(1);
     let check_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(kraken_check_stream);
@@ -1073,6 +1076,7 @@ async fn filter_with_kraken(
         cleanup_tasks.extend(drain_tasks);
         return Err(PipelineError::NoTargetSequences(target_taxid.to_string()));
     }
+    eprintln!("check count: {}", check_count);
 
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
     let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
