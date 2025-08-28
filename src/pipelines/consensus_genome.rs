@@ -1152,35 +1152,7 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
-
-    let (count_streams, count_done_rx) = t_junction(
-        input_stream,
-        2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        100,
-        StreamDataType::JustBytes,
-        "align_to_target".to_string(),
-        None
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-
-    cleanup_receivers.push(count_done_rx);
-    let mut streams_iter = count_streams.into_iter();
-    let input_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let count_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-
-    let count_task = tokio::spawn(async move {
-        let count = stream_record_counter(count_stream, false).await?;
-        eprintln!("\n\n******\nalign_to_target: Input stream contains {} FASTQ records\n\n******\n", count);
-        Ok(())
-    });
-    cleanup_tasks.push(count_task);
-
-
+    
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_index_path)))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
@@ -1189,7 +1161,7 @@ async fn align_to_target(
 
     let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
-        input_stream,  // Convert to Receiver<ParseOutput> for streaming
+        input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
         minimap2_args,
         StreamDataType::JustBytes,  // FASTQ bytes, not structured records
