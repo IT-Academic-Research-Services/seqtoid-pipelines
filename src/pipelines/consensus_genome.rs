@@ -18,7 +18,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -1146,6 +1146,34 @@ async fn align_to_target(
     let mut quast_write_tasks = vec![];
 
 
+    let (count_streams, count_done_rx) = t_junction(
+        input_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "align_to_target".to_string(),
+        None
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(count_done_rx);
+    let mut streams_iter = count_streams.into_iter();
+    let input_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let count_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let count_task = tokio::spawn(async move {
+        let count = stream_record_counter(count_stream, false).await?;
+        eprintln!("\n\n******\nalign_to_target: Input stream contains {} FASTQ records\n\n******\n", count);
+        Ok(())
+    });
+    cleanup_tasks.push(count_task);
+
+
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_index_path)))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
@@ -1154,7 +1182,7 @@ async fn align_to_target(
 
     let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
-        input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
+        input_stream,  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
         minimap2_args,
         StreamDataType::JustBytes,  // FASTQ bytes, not structured records
