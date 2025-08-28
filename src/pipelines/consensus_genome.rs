@@ -1017,12 +1017,50 @@ async fn filter_with_kraken(
     cleanup_tasks.push(conversion_task);
     eprintln!("conversion tasks in cleanup");
 
+
+
     let filtered_stream = ReceiverStream::new(parse_output_rx);
+
+    // Before t_junction, split for check
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let (forward_tx, forward_rx) = mpsc::channel(config.base_buffer_size);
+    let check_split_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(filtered_stream.into_inner());
+        let mut found = false;
+        while let Some(item) = stream.next().await {
+            if matches!(item, ParseOutput::Fastq(_)) {
+                found = true;
+            }
+            forward_tx
+                .send(item)
+                .await
+                .map_err(|e| anyhow!("Failed to forward item: {}", e))?;
+            if found {
+                break; // Exit after first Fastq record
+            }
+        }
+        eprintln!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
+        check_tx
+            .send(if found { 1 } else { 0 })
+            .await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        // Continue forwarding remaining records
+        while let Some(item) = stream.next().await {
+            forward_tx
+                .send(item)
+                .await
+                .map_err(|e| anyhow!("Failed to forward item: {}", e))?;
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(check_split_task);
+
+    let filtered_stream = ReceiverStream::new(forward_rx);
 
     // Split stream for output and compression
     let (kraken_streams, kraken_done_rx) = t_junction(
         filtered_stream,
-        3,
+        2, // Only two streams now
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -1038,45 +1076,14 @@ async fn filter_with_kraken(
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let kraken_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     eprintln!("streams split");
-    let (check_tx, mut check_rx) = mpsc::channel(1);
-    let check_task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(kraken_check_stream);
-        let mut count = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Fastq(_) => {
-                    count = 1;
-                }
-                _ => return Err(anyhow!("Unexpected item type in kraken_check_stream")),
-            }
-        }
-        check_tx
-            .send(count)
-            .await
-            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
-        Ok(())
-    });
-    cleanup_tasks.push(check_task);
 
-    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
-    if check_count == 0 {
-        let drain_rxs = vec![kraken_output_stream, kraken_file_stream];
-        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs
-            .into_iter()
-            .map(|rx| {
-                tokio::spawn(async move {
-                    let mut stream = ReceiverStream::new(rx);
-                    while stream.next().await.is_some() {}
-                    Ok(())
-                })
-            })
-            .collect();
-        cleanup_tasks.extend(drain_tasks);
-        return Err(PipelineError::NoTargetSequences(target_taxid.to_string()));
-    }
+    let check_count = check_rx.recv().await.ok_or_else(|| {
+        eprintln!("check_rx.recv failed");
+        PipelineError::EmptyStream
+    })?;
     eprintln!("check count: {}", check_count);
+
 
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
     let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
