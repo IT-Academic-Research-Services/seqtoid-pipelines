@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Write;
+use std::io::Cursor;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -777,6 +778,199 @@ pub fn parse_and_filter_fastq_id(
 }
 
 
+
+pub async fn parse_byte_stream_to_fastq(
+    input_rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+    stall_threshold_secs: u64,
+) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(input_rx);
+        let mut full_buffer: Vec<u8> = Vec::new(); // Accumulate all bytes (RAM-efficient for filtered streams)
+        let mut record_count = 0;
+        let mut last_progress = tokio::time::Instant::now();
+
+        while let Some(item) = stream.next().await {
+            if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
+                eprintln!("parse_byte_stream_to_fastq: Stall detected at {} records", record_count);
+                last_progress = tokio::time::Instant::now();
+            }
+
+            match item {
+                ParseOutput::Bytes(bytes) => {
+                    // eprintln!("parse_byte_stream_to_fastq: Received {} bytes chunk", bytes.len());
+                    full_buffer.extend_from_slice(&*bytes);
+                }
+                _ => {
+                    eprintln!("parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}", record_count + 1);
+                    continue;
+                }
+            }
+        }
+
+        if full_buffer.is_empty() {
+            eprintln!("parse_byte_stream_to_fastq: Empty byte buffer received");
+            return Err(anyhow!("Empty byte buffer for FASTQ parsing"));
+        }
+
+        // eprintln!("parse_byte_stream_to_fastq: Accumulated {} total bytes for parsing", full_buffer.len());
+
+        // Parse accumulated bytes into FASTQ records
+        let cursor = Cursor::new(full_buffer);
+        let mut reader = FastqReader::new(cursor);
+        while let Some(result) = reader.next() {
+            match result {
+                Ok(record) => {
+                    let owned_record: SequenceRecord = record.to_owned_record().into();
+                    if tx.send(ParseOutput::Fastq(owned_record)).await.is_err() {
+                        eprintln!("parse_byte_stream_to_fastq: Failed to send FASTQ record at count {}", record_count + 1);
+                        return Err(anyhow!("Failed to send FASTQ record at count {}", record_count + 1));
+                    }
+                    record_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("parse_byte_stream_to_fastq: Error parsing FASTQ at count {}: {}", record_count + 1, e);
+                    return Err(anyhow!("FASTQ parsing error at count {}: {}", record_count + 1, e));
+                }
+            }
+        }
+
+        eprintln!("parse_byte_stream_to_fastq: Parsed {} FASTQ records", record_count);
+        Ok(())
+    });
+
+    Ok((rx, task))
+}
+
+/// Concatenates paired-end FASTQ records by joining R1 and R2 sequences with an 'N' and
+/// corresponding quality scores with a '!' (low-quality score).
+///
+/// # Arguments
+/// * `input_stream` - ReceiverStream of ParseOutput containing interleaved FASTQ records (R1, R2, ...).
+/// * `buffer_size` - Size of the output channel buffer.
+/// * `stall_threshold_secs` - Seconds before logging a stall warning.
+///
+/// # Returns
+/// A tuple of:
+/// - `ReceiverStream<ParseOutput>`: Stream of concatenated FASTQ records.
+/// - `JoinHandle<Result<(), anyhow::Error>>`: Task handle for the concatenation process.
+pub async fn concatenate_paired_reads(
+    input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: usize,
+    stall_threshold_secs: u64,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    ),
+    anyhow::Error,
+> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    let mut stream = input_stream;
+    let mut last_progress = tokio::time::Instant::now();
+    let mut pair_count = 0;
+
+    let task = tokio::spawn(async move {
+        let mut r1: Option<SequenceRecord> = None;
+
+        while let Some(item) = stream.next().await {
+            if last_progress.elapsed() > tokio::time::Duration::from_secs(stall_threshold_secs) {
+                eprintln!("concatenate_paired_reads: Stall detected at {} read pairs", pair_count);
+                last_progress = tokio::time::Instant::now();
+            }
+
+            match item {
+                ParseOutput::Fastq(record) => {
+                    if let Some(prev_r1) = r1.take() {
+                        // This is R2; process the pair
+                        if !compare_read_ids(prev_r1.id(), record.id()) {
+                            eprintln!(
+                                "Read ID mismatch at pair {}: {} vs {}",
+                                pair_count + 1,
+                                prev_r1.id(),
+                                record.id()
+                            );
+                            return Err(anyhow!(
+                                "Read ID mismatch at pair {}: {} vs {}",
+                                pair_count + 1,
+                                prev_r1.id(),
+                                record.id()
+                            ));
+                        }
+
+                        if let (
+                            SequenceRecord::Fastq {
+                                id: r1_id,
+                                desc: r1_desc,
+                                seq: r1_seq,
+                                qual: r1_qual,
+                            },
+                            SequenceRecord::Fastq {
+                                seq: r2_seq,
+                                qual: r2_qual,
+                                ..
+                            },
+                        ) = (&prev_r1, &record)
+                        {
+                            // Concatenate sequences: R1 + N + R2
+                            let mut new_seq = Vec::with_capacity(r1_seq.len() + r2_seq.len() + 1);
+                            new_seq.extend_from_slice(&r1_seq);
+                            new_seq.push(b'N');
+                            new_seq.extend_from_slice(&r2_seq);
+
+                            // Concatenate quality scores: R1 + ! + R2
+                            let mut new_qual = Vec::with_capacity(r1_qual.len() + r2_qual.len() + 1);
+                            new_qual.extend_from_slice(&r1_qual);
+                            new_qual.push(b'!'); // Low quality for 'N'
+                            new_qual.extend_from_slice(&r2_qual);
+
+
+                            let new_record = SequenceRecord::Fastq {
+                                id: r1_id.clone(),
+                                desc: r1_desc.clone(),
+                                seq: Arc::new(new_seq),
+                                qual: Arc::new(new_qual),
+                            };
+
+                            if tx.send(ParseOutput::Fastq(new_record)).await.is_err() {
+                                eprintln!("Failed to send concatenated FASTQ record at pair {}", pair_count + 1);
+                                return Err(anyhow!(
+                                    "Failed to send concatenated FASTQ record at pair {}",
+                                    pair_count + 1
+                                ));
+                            }
+                            pair_count += 1;
+                        } else {
+                            return Err(anyhow!("Non-FASTQ record in pair at count {}", pair_count + 1));
+                        }
+                    } else {
+                        // This is R1; store and wait for R2
+                        r1 = Some(record);
+                    }
+                }
+                _ => {
+                    eprintln!("Unexpected ParseOutput at pair count {}", pair_count + 1);
+                    continue;
+                }
+            }
+        }
+
+        // Check for unpaired R1
+        if r1.is_some() {
+            eprintln!("Unpaired R1 record at end of stream");
+            return Err(anyhow!("Unpaired R1 record at end of stream"));
+        }
+
+        eprintln!("concatenate_paired_reads: Processed {} read pairs", pair_count);
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(rx), task))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,6 +1070,42 @@ mod tests {
         drop(tx); // Close immediately
         let count = stream_record_counter(rx, false).await?;
         assert_eq!(count, 0, "Should count 0 for empty stream");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concatenate_paired_reads() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let records = vec![
+            ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "read1/1".to_string(),
+                desc: None,
+                seq: Arc::new(b"ATCG".to_vec()),
+                qual: Arc::new(b"IIII".to_vec()),
+            }),
+            ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "read1/2".to_string(),
+                desc: None,
+                seq: Arc::new(b"GCTA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
+            }),
+        ];
+        tokio::spawn(async move {
+            for record in records {
+                tx.send(record).await.unwrap();
+            }
+        });
+        let (concat_rx, task) = concatenate_paired_reads(ReceiverStream::new(rx), 10, 10).await?;
+        let mut concat_records = Vec::new();
+        let mut stream = concat_rx;  // Directly use concat_rx (already a ReceiverStream)
+        while let Some(ParseOutput::Fastq(record)) = stream.next().await {
+            concat_records.push(record);
+        }
+        task.await??;
+        assert_eq!(concat_records.len(), 1);
+        assert_eq!(concat_records[0].id(), "read1/1");
+        assert_eq!(concat_records[0].seq(), b"ATCGNGCTA");
+        assert_eq!(concat_records[0].qual(), b"IIII!HHHH");
         Ok(())
     }
 

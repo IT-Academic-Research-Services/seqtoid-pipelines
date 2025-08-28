@@ -18,7 +18,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -876,7 +876,7 @@ async fn process_ercc(
 ///
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ byte stream
+    input_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -891,13 +891,27 @@ async fn filter_with_kraken(
 > {
     let mut cleanup_tasks = vec![];
 
-    let kraken2_report_path = file_path_manipulator(
-        no_ext_sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("kraken2_report.txt"),
-        "_",
-    );
+    // Parse the byte stream into Fastq records
+    let (parse_rx, parse_task) = parse_byte_stream_to_fastq(
+        input_stream.into_inner(), // Convert ReceiverStream to Receiver
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    cleanup_tasks.push(parse_task);
+
+    // Concatenate paired-end reads
+    let (concat_stream, concat_task) = concatenate_paired_reads(
+        ReceiverStream::new(parse_rx),
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    cleanup_tasks.push(concat_task);
+
+
     let final_compressed_path = file_path_manipulator(
         no_ext_sample_base_buf,
         Some(out_dir),
@@ -908,7 +922,7 @@ async fn filter_with_kraken(
 
     // Write input stream to temp FIFO for Kraken2
     let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(
-        input_stream,
+        concat_stream,
         Some(config.base_buffer_size),
         Some(".fq"),
         Some(&config.ram_temp_dir),
@@ -935,9 +949,15 @@ async fn filter_with_kraken(
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create named pipe: {}", e)))?;
 
-    // Run Kraken2 with named pipe for classified output
+    // Run Kraken2 in single-end mode
     let kraken2_config = Kraken2Config {
-        report_path: kraken2_report_path.clone(),
+        report_path: file_path_manipulator(
+            no_ext_sample_base_buf,
+            Some(out_dir),
+            None,
+            Some("kraken2_report.txt"),
+            "_",
+        ),
         classified_path: kraken2_pipe_path.clone(),
         fastq_path: kraken_query_pipe_path.clone(),
     };
