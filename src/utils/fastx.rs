@@ -24,6 +24,7 @@ use crate::utils::streams::{ParseOutput};
 use tokio::time::Duration;
 use futures::future::try_join_all;
 use tokio::task::JoinHandle;
+use memchr::memmem;
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -736,44 +737,43 @@ pub async fn stream_record_counter(
 /// # Arguments
 /// * `input_rx` - Receiver of parsed FASTQ records (from `parse_fastq` or similar).
 /// * `buffer_size` - Size of the output channel buffer.
-/// * `filter_fn` - Function to filter records based on their ID.
+/// * `pattern` - // e.g., "kraken:taxid|123"
 ///
 /// # Returns
 /// Tuple of (mpsc of sequence records, task join handle result)
 pub fn parse_and_filter_fastq_id(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
-    filter_fn: impl Fn(&str) -> bool + Send + 'static,
+    pattern: String,
 ) -> (mpsc::Receiver<SequenceRecord>, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+    let pattern_bytes = pattern.into_bytes();
     let (filtered_tx, filtered_rx) = mpsc::channel(buffer_size);
-
     let task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(input_rx);
         let mut count = 0;
-
         while let Some(item) = stream.next().await {
-            if let ParseOutput::Fastq(record) = item {
-                if filter_fn(record.id()) {
-                    if filtered_tx.send(record).await.is_err() {
-                        eprintln!("Failed to send filtered FASTQ record at count {}", count + 1);
-                        return Err(anyhow::anyhow!(
-                            "Failed to send filtered FASTQ record at count {}",
-                            count + 1
-                        ));
+            match item {
+                ParseOutput::Fastq(record) => {
+                    if memmem::find(record.id().as_bytes(), &pattern_bytes).is_some() {
+                        if filtered_tx.send(record).await.is_err() {
+                            eprintln!("Failed to send filtered FASTQ record at count {}", count + 1);
+                            return Err(anyhow!(
+                                "Failed to send filtered FASTQ record at count {}",
+                                count + 1
+                            ));
+                        }
+                        count += 1;
                     }
-                    count += 1;
                 }
-            } else {
-                eprintln!("Unexpected ParseOutput::Bytes at count {}", count + 1);
-                continue; // Skip non-FASTQ items
+                _ => {
+                    eprintln!("Unexpected ParseOutput at count {}", count + 1);
+                    continue; // Skip non-FASTQ items
+                }
             }
-
         }
-
         eprintln!("Filtered {} FASTQ records from Kraken2 classified stream", count);
         Ok(())
     });
-
     (filtered_rx, task)
 }
 

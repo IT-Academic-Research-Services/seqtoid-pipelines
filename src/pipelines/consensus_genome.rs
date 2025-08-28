@@ -993,8 +993,11 @@ async fn filter_with_kraken(
 
     // Filter using parse_and_filter_fastq_id
     let pattern = format!("kraken:taxid|{}", target_taxid);
-    let filter_fn = move |id: &str| id.contains(&pattern);
-    let (filtered_rx, filter_task) = parse_and_filter_fastq_id(parse_rx, config.base_buffer_size, filter_fn.clone());
+    let (filtered_rx, filter_task) = parse_and_filter_fastq_id(
+        parse_rx,
+        config.base_buffer_size,
+        pattern,
+    );
     cleanup_tasks.push(filter_task);
 
     // Convert SequenceRecord back to ParseOutput::Fastq

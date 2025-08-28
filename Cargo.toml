@@ -29,6 +29,7 @@ plotters = "0.3.7"
 rayon = "1.10.0"
 chrono = "0.4.41"
 thiserror = "2.0.12"
+memchr = "2.7.5"
 
 [dev-dependencies]
 sysinfo = "0.35.0"
