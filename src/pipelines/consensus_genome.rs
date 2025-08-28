@@ -1000,6 +1000,8 @@ async fn filter_with_kraken(
     );
     cleanup_tasks.push(filter_task);
 
+    eprintln!("start comversion");
+
     // Convert SequenceRecord back to ParseOutput::Fastq
     let (parse_output_tx, parse_output_rx) = mpsc::channel(config.base_buffer_size);
     let conversion_task = tokio::spawn(async move {
@@ -1013,9 +1015,11 @@ async fn filter_with_kraken(
                 .await
                 .map_err(|e| anyhow!("Failed to send ParseOutput at record {}: {}", count + 1, e))?;
             count += 1;
+            eprintln!("sequence validated {}", count);
         }
         Ok(())
     });
+    eprintln!("end comversion");
     cleanup_tasks.push(conversion_task);
 
     let filtered_stream = ReceiverStream::new(parse_output_rx);
