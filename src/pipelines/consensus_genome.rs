@@ -2019,7 +2019,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(PathBuf::from);
 
 
-
+    let ref_start = Instant::now();
     // Retrieve Index
     let index_start = Instant::now();
     let h5_index = get_index(&config.args)
@@ -2070,10 +2070,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         PipelineError::InvalidConfig("Target FASTA required for filter_with_kraken, call_variants, and evaluate_assembly".to_string())
     })?;
     target_ref_fasta_path = Some(target_fasta.clone());
+    println!("Reference retrieval complete: {} milliseconds.", ref_start.elapsed().as_millis());
 
 
-
-
+    let val_start = Instant::now();
     // Input Validation
     let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
         config.clone(),
@@ -2085,9 +2085,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
+    println!("Input validation complete: {} milliseconds.", val_start.elapsed().as_millis());
 
 
-
+    let host_start = Instant::now();
     // Host Removal
     let no_host_file_path = file_path_manipulator(
         &no_ext_sample_base_buf,
@@ -2135,12 +2136,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     };
     stats_tasks.push(no_host_seqkit_task_stats);
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
+    println!("Host removal complete: {} milliseconds.", host_start.elapsed().as_millis());
+
 
     // Split by Technology
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
-            
+            let ercc_start = Instant::now();
             let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = prepare_reference_and_index(
                 &config,
                 None, // No HDF5 for ERCC
@@ -2172,8 +2175,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             ercc_stats_task = ercc_stats_out_task;
             cleanup_tasks.append(&mut ercc_cleanup_tasks);
             cleanup_receivers.append(&mut ercc_cleanup_receivers);
+            println!("ERCC complete: {} milliseconds.", ercc_start.elapsed().as_millis());
 
-
+            let filter_start = Instant::now();
             // Filter Reads
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
@@ -2186,7 +2190,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 .await?;
             cleanup_tasks.extend(filter_reads_cleanup_tasks);
             cleanup_receivers.extend(filter_reads_cleanup_receivers);
+            println!("Kraken filtering complete: {} milliseconds.", filter_start.elapsed().as_millis());
 
+            let target_start = Instant::now();
             // Align Reads to Target
             let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks, align_bam_path_inner) = align_to_target(
                 config.clone(),
@@ -2224,7 +2230,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             let align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
             let align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
+            println!("Target alignment complete: {} milliseconds.", target_start.elapsed().as_millis());
 
+            let consensus_start = Instant::now();
             // Make Consensus
             let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path_x, consensus_cleanup_tasks, consensus_cleanup_receivers, consensus_quast_tasks) =
                 generate_consensus(config.clone(), align_sam_output_stream, &out_dir, &no_ext_sample_base_buf).await?;
@@ -2233,14 +2241,18 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.extend(consensus_cleanup_receivers);
             quast_write_tasks.extend(consensus_quast_tasks);
             consensus_stats_stream = Some(consensus_stats_stream_rx);
+            println!("consensus complete: {} milliseconds.", consensus_start.elapsed().as_millis());
 
+            let call_start = Instant::now();
             // Call Variants
             let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) =
                 call_variants(config.clone(), align_sam_call_stream, target_fasta.clone(), &out_dir, &no_ext_sample_base_buf).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
             call_bcftools_stats_stream = Some(call_bcftools_stats_stream_out);
+            println!("call complete: {} milliseconds.", call_start.elapsed().as_millis());
 
+            let realign_start = Instant::now();
             // Realign Consensus to Ref
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
@@ -2251,12 +2263,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             )
                 .await?;
             cleanup_tasks.extend(realign_cleanup_tasks);
+            println!("realign complete: {} milliseconds.", realign_start.elapsed().as_millis());
         }
         Technology::ONT => {
             eprintln!("Technology: ONT not ready");
         }
     }
 
+    let stats_start = Instant::now();
     // Join stats tasks
     let results = try_join_all(stats_tasks)
         .await
@@ -2279,7 +2293,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         technology,
     )
         .await?;
+    println!("stats complete: {} milliseconds.", stats_start.elapsed().as_millis());
 
+    let quast_start = Instant::now();
     // Assembly Evaluation
     let results = try_join_all(quast_write_tasks)
         .await
@@ -2291,6 +2307,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     if let (Some(target_ref_fasta_path), Some(align_bam_path), Some(consensus_file_path)) = (target_ref_fasta_path, align_bam_path, consensus_file_path) {
         evaluate_assembly(config, target_ref_fasta_path, align_bam_path, consensus_file_path).await?;
     }
+    println!("quast complete: {} milliseconds.", quast_start.elapsed().as_millis());
+
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
