@@ -609,7 +609,7 @@ async fn process_ercc(
 
     let (ercc_streams, ercc_done_rx) = t_junction(
         input_stream,
-        3,
+        2,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
