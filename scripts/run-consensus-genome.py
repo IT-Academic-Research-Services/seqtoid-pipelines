@@ -33,7 +33,7 @@ def find_fastq_pairs(directory, sample_order):
 
     return fastq_pairs
 
-def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, target_sequence, log_file, ercc_index, host_sequence, target_taxid, out, host_index):
+def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, target_sequence, log_file, ercc_sequence, host_sequence, target_taxid, out):
     """
     Run the seqtoid-pipelines command for a single sample and extract runtime from console output.
     """
@@ -46,11 +46,11 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '-i', os.path.join(fastq_dir, r1_file),
         '-I', os.path.join(fastq_dir, r2_file),
         '--target-sequence', target_sequence,
-        '--ercc-index', ercc_index,
-        # '--host-sequence', host_sequence,
+        '--ercc-sequence', ercc_sequence,
+        '--host-sequence', host_sequence,
         '--target-taxid', target_taxid,
         '--out', out,
-        '--host-index', host_index,
+
     ]
 
     # Format the command for logging
@@ -105,9 +105,8 @@ def main():
     parser.add_argument('--target_sequence', default='/home/ubuntu/refs/covid-wuhan-1.fa', help="Reference sequence FASTA file")
     parser.add_argument('--log_file', default='seqtoid_run.log', help="Log file to store run information")
     # parser.add_argument('--max_reads', default='5000000000', help="Log file to store run information")
-    parser.add_argument('--ercc-index', default='/home/ubuntu/refs/ercc_sequences.mmi')
+    parser.add_argument('--ercc-sequence', default='/home/ubuntu/refs/ercc_sequences.fasta')
     parser.add_argument('--host-sequence', default='/home/ubuntu/refs/hg38.fa')
-    parser.add_argument('--host-index', default='/home/ubuntu/refs/hg38.mmi')
     parser.add_argument('--ref-taxid', default='2697049')
     parser.add_argument('--out', default='/home/ubuntu/data/seqtoid')
 
@@ -140,13 +139,12 @@ def main():
             args.quality,
             args.target_sequence,
             args.log_file,
-            args.ercc_index,
+            args.ercc_sequence,
             args.host_sequence,
             args.ref_taxid,
             out_dir,
-            args.host_index
         )
-        print(f"Completed {sample}: Status={status}, Runtime={runtime:.2f} seconds" if runtime is not None else f"Completed {sample}: Status={status}, Runtime=Not found")
+        # print(f"Completed {sample}: Status={status}, Runtime={runtime:.2f} seconds" if runtime is not None else f"Completed {sample}: Status={status}, Runtime=Not found")
 
 if __name__ == "__main__":
     main()
