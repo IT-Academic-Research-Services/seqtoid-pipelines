@@ -624,7 +624,6 @@ async fn process_ercc(
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     cleanup_receivers.push(ercc_done_rx);
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&ercc_index_path))
@@ -727,13 +726,8 @@ async fn process_ercc(
             while stream.next().await.is_some() {}
             Ok(())
         });
-        let stats_drain_task = tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(stats_stream);
-            while stream.next().await.is_some() {}
-            Ok(())
-        });
         cleanup_tasks.push(drain_task);
-        cleanup_tasks.push(stats_drain_task);
+
         let zero_stats = HashMap::from([
             ("ercc_mapped_reads".to_string(), 0),
             ("ercc_mapped_paired".to_string(), 0),
