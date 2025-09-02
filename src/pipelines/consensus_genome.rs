@@ -695,7 +695,14 @@ async fn process_ercc(
                 ParseOutput::Bytes(bytes) => {
                     let line_str = String::from_utf8_lossy(&bytes);
                     if !line_str.starts_with('@') && !line_str.trim().is_empty() {
-                        count = 1; // Non-empty alignment
+                        count = 1;
+                        // Spawn background drain to avoid blocking
+                        tokio::spawn(async move {
+                            while stream.next().await.is_some() {}
+
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        break; // Exit early to unblock sender
                     }
                 }
                 _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
@@ -705,7 +712,7 @@ async fn process_ercc(
             .send(count)
             .await
             .map_err(|e| anyhow!("Failed to send SAM alignment count: {}", e))?;
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     cleanup_tasks.push(count_task);
 
