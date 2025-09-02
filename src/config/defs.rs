@@ -109,6 +109,7 @@ pub struct RunConfig {
     pub thread_pool: Arc<ThreadPool>,
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
+    pub input_size_mb: u64,
 }
 
 impl RunConfig {
