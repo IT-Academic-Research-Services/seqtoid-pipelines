@@ -1330,8 +1330,14 @@ async fn align_to_target(
             match item {
                 ParseOutput::Bytes(line) => {
                     let line_str = String::from_utf8_lossy(&line);
-                    if !line_str.starts_with('@') {
-                        alignment_count += 1; // Count only alignment records
+                    if !line_str.starts_with('@') && !line_str.trim().is_empty() {
+                        alignment_count = 1;
+                        // Spawn background drain to avoid blocking
+                        tokio::spawn(async move {
+                            while stream.next().await.is_some() {}
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        break; // Exit early to unblock sender
                     }
                 }
                 _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
@@ -1341,7 +1347,7 @@ async fn align_to_target(
             .send(alignment_count)
             .await
             .map_err(|e| anyhow!("Failed to send alignment count: {}", e))?;
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     cleanup_tasks.push(check_task);
 
