@@ -18,7 +18,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence};
+use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -876,7 +876,7 @@ async fn process_ercc(
 ///
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ byte stream
+    input_stream: ReceiverStream<ParseOutput>,
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
@@ -891,13 +891,27 @@ async fn filter_with_kraken(
 > {
     let mut cleanup_tasks = vec![];
 
-    let kraken2_report_path = file_path_manipulator(
-        no_ext_sample_base_buf,
-        Some(out_dir),
-        None,
-        Some("kraken2_report.txt"),
-        "_",
-    );
+    // Parse the byte stream into Fastq records
+    let (parse_rx, parse_task) = parse_byte_stream_to_fastq(
+        input_stream.into_inner(), // Convert ReceiverStream to Receiver
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    cleanup_tasks.push(parse_task);
+
+    // Concatenate paired-end reads
+    let (concat_stream, concat_task) = concatenate_paired_reads(
+        ReceiverStream::new(parse_rx),
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    cleanup_tasks.push(concat_task);
+
+
     let final_compressed_path = file_path_manipulator(
         no_ext_sample_base_buf,
         Some(out_dir),
@@ -908,7 +922,7 @@ async fn filter_with_kraken(
 
     // Write input stream to temp FIFO for Kraken2
     let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(
-        input_stream,
+        concat_stream,
         Some(config.base_buffer_size),
         Some(".fq"),
         Some(&config.ram_temp_dir),
@@ -935,9 +949,15 @@ async fn filter_with_kraken(
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create named pipe: {}", e)))?;
 
-    // Run Kraken2 with named pipe for classified output
+    // Run Kraken2 in single-end mode
     let kraken2_config = Kraken2Config {
-        report_path: kraken2_report_path.clone(),
+        report_path: file_path_manipulator(
+            no_ext_sample_base_buf,
+            Some(out_dir),
+            None,
+            Some("kraken2_report.txt"),
+            "_",
+        ),
         classified_path: kraken2_pipe_path.clone(),
         fastq_path: kraken_query_pipe_path.clone(),
     };
@@ -973,34 +993,74 @@ async fn filter_with_kraken(
 
     // Filter using parse_and_filter_fastq_id
     let pattern = format!("kraken:taxid|{}", target_taxid);
-    let filter_fn = move |id: &str| id.contains(&pattern);
-    let (filtered_rx, filter_task) = parse_and_filter_fastq_id(parse_rx, config.base_buffer_size, filter_fn.clone());
+    let (filtered_rx, filter_task) = parse_and_filter_fastq_id(
+        parse_rx,
+        config.base_buffer_size,
+        pattern,
+    );
     cleanup_tasks.push(filter_task);
 
-    // Convert SequenceRecord back to ParseOutput::Fastq
+    eprintln!("parse_and_filter_fastq_id done");
+
     let (parse_output_tx, parse_output_rx) = mpsc::channel(config.base_buffer_size);
     let conversion_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(filtered_rx);
-        let mut count = 0;
         while let Some(record) = stream.next().await {
-            validate_sequence(&Arc::new(record.seq().to_vec()), b"ACGTN")
-                .map_err(|e| anyhow!("Sequence validation failed at record {}: {}", count + 1, e))?;
             parse_output_tx
                 .send(ParseOutput::Fastq(record))
                 .await
-                .map_err(|e| anyhow!("Failed to send ParseOutput at record {}: {}", count + 1, e))?;
-            count += 1;
+                .map_err(|e| anyhow!("Failed to send ParseOutput: {}", e))?;
         }
         Ok(())
     });
+
     cleanup_tasks.push(conversion_task);
+    eprintln!("conversion tasks in cleanup");
+
+
 
     let filtered_stream = ReceiverStream::new(parse_output_rx);
+
+    // Before t_junction, split for check
+    let (check_tx, mut check_rx) = mpsc::channel(1);
+    let (forward_tx, forward_rx) = mpsc::channel(config.base_buffer_size);
+    let check_split_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(filtered_stream.into_inner());
+        let mut found = false;
+        while let Some(item) = stream.next().await {
+            if matches!(item, ParseOutput::Fastq(_)) {
+                found = true;
+            }
+            forward_tx
+                .send(item)
+                .await
+                .map_err(|e| anyhow!("Failed to forward item: {}", e))?;
+            if found {
+                break; // Exit after first Fastq record
+            }
+        }
+        eprintln!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
+        check_tx
+            .send(if found { 1 } else { 0 })
+            .await
+            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
+        // Continue forwarding remaining records
+        while let Some(item) = stream.next().await {
+            forward_tx
+                .send(item)
+                .await
+                .map_err(|e| anyhow!("Failed to forward item: {}", e))?;
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(check_split_task);
+
+    let filtered_stream = ReceiverStream::new(forward_rx);
 
     // Split stream for output and compression
     let (kraken_streams, kraken_done_rx) = t_junction(
         filtered_stream,
-        3,
+        2, // Only two streams now
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -1016,44 +1076,14 @@ async fn filter_with_kraken(
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let kraken_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    eprintln!("streams split");
 
-    let (check_tx, mut check_rx) = mpsc::channel(1);
-    let check_task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(kraken_check_stream);
-        let mut count = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Fastq(_) => {
-                    count = 1;
-                }
-                _ => return Err(anyhow!("Unexpected item type in kraken_check_stream")),
-            }
-        }
-        check_tx
-            .send(count)
-            .await
-            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
-        Ok(())
-    });
-    cleanup_tasks.push(check_task);
+    let check_count = check_rx.recv().await.ok_or_else(|| {
+        eprintln!("check_rx.recv failed");
+        PipelineError::EmptyStream
+    })?;
+    eprintln!("check count: {}", check_count);
 
-    let check_count = check_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
-    if check_count == 0 {
-        let drain_rxs = vec![kraken_output_stream, kraken_file_stream];
-        let drain_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = drain_rxs
-            .into_iter()
-            .map(|rx| {
-                tokio::spawn(async move {
-                    let mut stream = ReceiverStream::new(rx);
-                    while stream.next().await.is_some() {}
-                    Ok(())
-                })
-            })
-            .collect();
-        cleanup_tasks.extend(drain_tasks);
-        return Err(PipelineError::NoTargetSequences(target_taxid.to_string()));
-    }
 
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
     let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
@@ -1122,7 +1152,7 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
-
+    
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_index_path)))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
@@ -1989,7 +2019,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(PathBuf::from);
 
 
-
+    let ref_start = Instant::now();
     // Retrieve Index
     let index_start = Instant::now();
     let h5_index = get_index(&config.args)
@@ -2040,10 +2070,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         PipelineError::InvalidConfig("Target FASTA required for filter_with_kraken, call_variants, and evaluate_assembly".to_string())
     })?;
     target_ref_fasta_path = Some(target_fasta.clone());
+    println!("Reference retrieval complete: {} milliseconds.", ref_start.elapsed().as_millis());
 
 
-
-
+    let val_start = Instant::now();
     // Input Validation
     let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
         config.clone(),
@@ -2055,9 +2085,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
+    println!("Input validation complete: {} milliseconds.", val_start.elapsed().as_millis());
 
 
-
+    let host_start = Instant::now();
     // Host Removal
     let no_host_file_path = file_path_manipulator(
         &no_ext_sample_base_buf,
@@ -2105,12 +2136,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     };
     stats_tasks.push(no_host_seqkit_task_stats);
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
+    println!("Host removal complete: {} milliseconds.", host_start.elapsed().as_millis());
+
 
     // Split by Technology
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
-            
+            let ercc_start = Instant::now();
             let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = prepare_reference_and_index(
                 &config,
                 None, // No HDF5 for ERCC
@@ -2142,8 +2175,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             ercc_stats_task = ercc_stats_out_task;
             cleanup_tasks.append(&mut ercc_cleanup_tasks);
             cleanup_receivers.append(&mut ercc_cleanup_receivers);
+            println!("ERCC complete: {} milliseconds.", ercc_start.elapsed().as_millis());
 
-
+            let filter_start = Instant::now();
             // Filter Reads
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
@@ -2156,7 +2190,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 .await?;
             cleanup_tasks.extend(filter_reads_cleanup_tasks);
             cleanup_receivers.extend(filter_reads_cleanup_receivers);
+            println!("Kraken filtering complete: {} milliseconds.", filter_start.elapsed().as_millis());
 
+            let target_start = Instant::now();
             // Align Reads to Target
             let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks, align_bam_path_inner) = align_to_target(
                 config.clone(),
@@ -2194,7 +2230,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             let align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
             let align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
+            println!("Target alignment complete: {} milliseconds.", target_start.elapsed().as_millis());
 
+            let consensus_start = Instant::now();
             // Make Consensus
             let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path_x, consensus_cleanup_tasks, consensus_cleanup_receivers, consensus_quast_tasks) =
                 generate_consensus(config.clone(), align_sam_output_stream, &out_dir, &no_ext_sample_base_buf).await?;
@@ -2203,14 +2241,18 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.extend(consensus_cleanup_receivers);
             quast_write_tasks.extend(consensus_quast_tasks);
             consensus_stats_stream = Some(consensus_stats_stream_rx);
+            println!("consensus complete: {} milliseconds.", consensus_start.elapsed().as_millis());
 
+            let call_start = Instant::now();
             // Call Variants
             let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) =
                 call_variants(config.clone(), align_sam_call_stream, target_fasta.clone(), &out_dir, &no_ext_sample_base_buf).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
             call_bcftools_stats_stream = Some(call_bcftools_stats_stream_out);
+            println!("call complete: {} milliseconds.", call_start.elapsed().as_millis());
 
+            let realign_start = Instant::now();
             // Realign Consensus to Ref
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
@@ -2221,12 +2263,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             )
                 .await?;
             cleanup_tasks.extend(realign_cleanup_tasks);
+            println!("realign complete: {} milliseconds.", realign_start.elapsed().as_millis());
         }
         Technology::ONT => {
             eprintln!("Technology: ONT not ready");
         }
     }
 
+    let stats_start = Instant::now();
     // Join stats tasks
     let results = try_join_all(stats_tasks)
         .await
@@ -2249,7 +2293,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         technology,
     )
         .await?;
+    println!("stats complete: {} milliseconds.", stats_start.elapsed().as_millis());
 
+    let quast_start = Instant::now();
     // Assembly Evaluation
     let results = try_join_all(quast_write_tasks)
         .await
@@ -2261,6 +2307,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     if let (Some(target_ref_fasta_path), Some(align_bam_path), Some(consensus_file_path)) = (target_ref_fasta_path, align_bam_path, consensus_file_path) {
         evaluate_assembly(config, target_ref_fasta_path, align_bam_path, consensus_file_path).await?;
     }
+    println!("quast complete: {} milliseconds.", quast_start.elapsed().as_millis());
+
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
