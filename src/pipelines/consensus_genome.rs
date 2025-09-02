@@ -503,6 +503,12 @@ async fn align_to_host(
                 ParseOutput::Bytes(bytes) => {
                     if !bytes.is_empty() {
                         count = 1;
+                        // Spawn background drain for remaining items to avoid blocking
+                        tokio::spawn(async move {
+                            while stream.next().await.is_some() {}
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        break; // Exit loop early to unblock sender
                     }
                 }
                 _ => return Err(anyhow!("Unexpected item type in no_host_check_stream")),
