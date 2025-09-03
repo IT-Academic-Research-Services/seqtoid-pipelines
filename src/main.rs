@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
     let total_ram = system.total_memory();
     eprintln!("Total RAM: {} bytes", total_ram);
 
+    let input_size_mb = get_input_size_mb(&args.file1, &args.file2).unwrap_or(0);
+    eprintln!("Total input file size: {} MB", input_size_mb);
+
     let sdt = match args.technology {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
@@ -74,7 +77,8 @@ async fn main() -> Result<()> {
         args,
         thread_pool,
         maximal_semaphore,
-        base_buffer_size
+        base_buffer_size,
+        input_size_mb
     });
 
     // // Add I/O monitoring task here (background spawn)
@@ -291,4 +295,23 @@ fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: Strea
         estimated_max_streams
     );
     buffer_size
+}
+
+/// Gets the file size(s) of the input file(s) from metadata
+///
+/// # Arguments
+/// # 'file1' : First (probably not optional) input.
+/// # 'file2' : Second input.
+///
+/// # Returns
+/// size in MB
+fn get_input_size_mb(file1: &Option<String>, file2: &Option<String>) -> Result<u64> {
+    let mut total_size = 0u64;
+    if let Some(f1) = file1 {
+        total_size += fs::metadata(f1)?.len();
+    }
+    if let Some(f2) = file2 {
+        total_size += fs::metadata(f2)?.len();
+    }
+    Ok(total_size / 1_048_576) // Bytes -> MB
 }

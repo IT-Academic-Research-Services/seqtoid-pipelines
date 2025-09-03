@@ -503,6 +503,12 @@ async fn align_to_host(
                 ParseOutput::Bytes(bytes) => {
                     if !bytes.is_empty() {
                         count = 1;
+                        // Spawn background drain for remaining items to avoid blocking
+                        tokio::spawn(async move {
+                            while stream.next().await.is_some() {}
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        break; // Exit loop early to unblock sender
                     }
                 }
                 _ => return Err(anyhow!("Unexpected item type in no_host_check_stream")),
@@ -603,7 +609,7 @@ async fn process_ercc(
 
     let (ercc_streams, ercc_done_rx) = t_junction(
         input_stream,
-        3,
+        2,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -618,7 +624,6 @@ async fn process_ercc(
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     cleanup_receivers.push(ercc_done_rx);
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&ercc_index_path))
@@ -689,7 +694,14 @@ async fn process_ercc(
                 ParseOutput::Bytes(bytes) => {
                     let line_str = String::from_utf8_lossy(&bytes);
                     if !line_str.starts_with('@') && !line_str.trim().is_empty() {
-                        count = 1; // Non-empty alignment
+                        count = 1;
+                        // Spawn background drain to avoid blocking
+                        tokio::spawn(async move {
+                            while stream.next().await.is_some() {}
+
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        break; // Exit early to unblock sender
                     }
                 }
                 _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
@@ -699,7 +711,7 @@ async fn process_ercc(
             .send(count)
             .await
             .map_err(|e| anyhow!("Failed to send SAM alignment count: {}", e))?;
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     cleanup_tasks.push(count_task);
 
@@ -714,13 +726,8 @@ async fn process_ercc(
             while stream.next().await.is_some() {}
             Ok(())
         });
-        let stats_drain_task = tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(stats_stream);
-            while stream.next().await.is_some() {}
-            Ok(())
-        });
         cleanup_tasks.push(drain_task);
-        cleanup_tasks.push(stats_drain_task);
+
         let zero_stats = HashMap::from([
             ("ercc_mapped_reads".to_string(), 0),
             ("ercc_mapped_paired".to_string(), 0),
@@ -1317,8 +1324,14 @@ async fn align_to_target(
             match item {
                 ParseOutput::Bytes(line) => {
                     let line_str = String::from_utf8_lossy(&line);
-                    if !line_str.starts_with('@') {
-                        alignment_count += 1; // Count only alignment records
+                    if !line_str.starts_with('@') && !line_str.trim().is_empty() {
+                        alignment_count = 1;
+                        // Spawn background drain to avoid blocking
+                        tokio::spawn(async move {
+                            while stream.next().await.is_some() {}
+                            Ok::<(), anyhow::Error>(())
+                        });
+                        break; // Exit early to unblock sender
                     }
                 }
                 _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
@@ -1328,7 +1341,7 @@ async fn align_to_target(
             .send(alignment_count)
             .await
             .map_err(|e| anyhow!("Failed to send alignment count: {}", e))?;
-        Ok(())
+        Ok::<(), anyhow::Error>(())
     });
     cleanup_tasks.push(check_task);
 
@@ -1483,7 +1496,7 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-
+    eprintln!("bcftools_mpileup args: {:?}", bcftools_mpileup_args);
     let (mut bcftools_mpileup_child, bcftools_mpileup_task, bcftools_mpileup_err_task) = stream_to_cmd(
         config.clone(),
         bam_stream.into_inner(),

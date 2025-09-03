@@ -140,16 +140,15 @@ where
         StreamDataType::JustBytes => 500,       // ~500B for SAM/BAM/VCF
     };
 
+    let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
     let max_buffer_size = if available_ram > 0 {
-        ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / record_size as f64) as usize
+        let calculated = ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / record_size as f64) as usize;
+        calculated.max(min_buffer_size)
     } else {
         eprintln!("Warning: Failed to detect available RAM in {}, using fallback buffer size", label);
-        base_buffer_size * n_outputs.max(1) * 2
+        (base_buffer_size * n_outputs.max(1) * 2).max(min_buffer_size)
     };
-
-    let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
     let buffer_size = (base_buffer_size * n_outputs.max(1)).clamp(min_buffer_size, max_buffer_size.min(MAX_BUFFER_PER_STREAM));
-
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let mut output_txs: Vec<(usize, mpsc::Sender<ParseOutput>)> = Vec::with_capacity(n_outputs);
     let mut output_rxs = Vec::with_capacity(n_outputs);
@@ -991,6 +990,7 @@ mod tests {
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
             base_buffer_size: 5_000_000,
+            input_size_mb: 100
         })
     }
 

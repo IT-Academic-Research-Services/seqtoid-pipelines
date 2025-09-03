@@ -274,11 +274,9 @@ pub mod samtools {
                 }
                 SamtoolsSubcommand::Mpileup => {
                     args_vec.push("mpileup".to_string());
-                    args_vec.push("-A".to_string()); // do not discard anomalous read pairs
-                    args_vec.push("-d".to_string()); // max depth zero
-                    args_vec.push("0".to_string());
-                    args_vec.push("-Q".to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push("0".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("mpileup")).to_string());
+
                 }
                 SamtoolsSubcommand::Consensus => {
                     args_vec.push("consensus".to_string());
@@ -312,7 +310,7 @@ pub mod bcftools {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig};
+    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig, SAMTOOLS_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -350,11 +348,13 @@ pub mod bcftools {
                     args_vec.push("-a".to_string());
                     args_vec.push("AD".to_string()); // include allele depth (AD) for all positions, including those with zero coverage, mimicking -aa.
                     args_vec.push("-d".to_string());
-                    args_vec.push("100000000".to_string()); // max depth essentially without limit
+                    args_vec.push("10000".to_string()); // max depth essentially without limit
                     args_vec.push("-L".to_string());
                     args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
                     args_vec.push("-Q".to_string());
                     args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
+                    args_vec.push("--threads".to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, BCFTOOLS_TAG, Some("mpileup")).to_string());
 
                 }
                 BcftoolsSubcommand::View => {
