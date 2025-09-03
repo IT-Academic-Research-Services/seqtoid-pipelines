@@ -1,3 +1,4 @@
+use tokio::io::{BufWriter, AsyncWriteExt};
 use std::fs::File;
 use std::sync::Arc;
 use std::io::Write;
@@ -18,7 +19,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_sequences, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
+use crate::utils::fastx::{read_and_interleave_bytes, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -205,6 +206,7 @@ async fn prepare_reference_and_index<'a>(
     Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
 }
 
+
 async fn validate_input(
     config: Arc<RunConfig>,
     file1_path: PathBuf,
@@ -220,19 +222,21 @@ async fn validate_input(
         "_",
     );
 
-    let rx = read_and_interleave_sequences(
+    // Use the new byte-streaming reader
+    let rx = read_and_interleave_bytes(
         file1_path,
         file2_path,
         Some(config.args.technology.clone()),
-        config.args.max_reads,
+        config.args.max_reads as u64,
         config.args.min_read_len,
         config.args.max_read_len,
+        config.base_buffer_size,  // Use as chunk_size
     )
         .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
 
-    // Convert ReceiverStream<SequenceRecord> to ReceiverStream<ParseOutput>
-    let val_rx_stream = ReceiverStream::new(rx).map(|record| ParseOutput::Fastq(record));
+    let val_rx_stream = ReceiverStream::new(rx);
 
+    // Split the byte stream for fastp and quast write
     let (val_streams, val_done_rx) = t_junction(
         val_rx_stream,
         2,
@@ -240,101 +244,54 @@ async fn validate_input(
         config.args.stall_threshold,
         None,
         100,
-        StreamDataType::IlluminaFastq,
+        StreamDataType::IlluminaFastq,  // Semantically FASTQ bytes
         "validate_input".to_string(),
-        None
+        None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    if val_streams.is_empty() {
+    if val_streams.len() < 2 {
         return Err(PipelineError::EmptyStream);
     }
 
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = vec![val_done_rx];
-    let mut streams_iter = val_streams.into_iter();
-    let val_fastp_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let val_pigz_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    // Consume Vec to get Receivers
+    let mut val_streams_iter = val_streams.into_iter();
+    let val_fastp_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_quast_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
-        config.clone(),
-        val_pigz_stream,
-        PIGZ_TAG,
-        val_pigz_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(val_pigz_stream_task);
-    cleanup_tasks.push(val_pigz_err_task);
+    // Write validated interleaved FASTQ to file using byte chunks
+    let val_quast_write_task = tokio::spawn(async move {
+        let mut file = BufWriter::new(
+            TokioFile::create(&validated_interleaved_file_path)
+                .await
+                .map_err(|e| anyhow!("Failed to create validated FASTQ file: {}", e))?,
+        );
+        let mut stream = ReceiverStream::new(val_quast_out_stream);
+        let mut total_bytes = 0;
 
-    let val_pigz_out_stream = {
-        let mut guard = val_pigz_child.lock().await;
-        parse_child_output(
-            &mut guard, // Pass locked Child
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        )
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            total_bytes += bytes.len() as u64;
+            file.write_all(&bytes)
+                .await
+                .map_err(|e| anyhow!("Failed to write to validated FASTQ: {}", e))?;
+        }
+        file.flush()
             .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: PIGZ_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
+            .map_err(|e| anyhow!("Failed to flush validated FASTQ: {}", e))?;
 
-    let val_pigz_write_task = tokio::spawn(stream_to_file(val_pigz_out_stream, validated_interleaved_file_path));
-    cleanup_tasks.push(val_pigz_write_task);
+        // Log for correctness (no silent drops)
+        eprintln!("validate_input: Wrote {} bytes to {}", total_bytes, validated_interleaved_file_path.display());
+        Ok(())
+    });
 
-    let val_fastp_args = generate_cli(FASTP_TAG, &config, None)
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: FASTP_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    let (mut val_fastp_child, val_fastp_stream_task, val_fastp_err_task) = stream_to_cmd(
-        config.clone(),
-        val_fastp_stream,
-        FASTP_TAG,
-        val_fastp_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: FASTP_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(val_fastp_stream_task);
-    cleanup_tasks.push(val_fastp_err_task);
-
-    let val_fastp_out_stream ={
-        let mut guard = val_fastp_child.lock().await;
-        parse_child_output(
-        &mut guard,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: FASTP_TAG.to_string(),
-            error: e.to_string(),
-        })?
-};
-
-
-    Ok((ReceiverStream::new(val_fastp_out_stream), cleanup_tasks, cleanup_receivers))
+    Ok((
+        ReceiverStream::new(val_fastp_out_stream),
+        vec![val_quast_write_task],
+        vec![val_done_rx]
+    ))
 }
+
 
 
 async fn align_to_host(
@@ -344,7 +301,9 @@ async fn align_to_host(
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
+    // Generate minimap2 args for host alignment
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_index_path)))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
@@ -356,7 +315,7 @@ async fn align_to_host(
         input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
         minimap2_args,
-        StreamDataType::JustBytes,  // FASTQ bytes, not structured records
+        StreamDataType::JustBytes,  // FASTQ bytes
         config.args.verbose,
     )
         .await
@@ -382,14 +341,15 @@ async fn align_to_host(
             })?
     };
 
+    // Samtools view to filter unmapped reads (-f 4), output as uncompressed BAM (-b -u)
     let samtools_config_view = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
-            ("-f".to_string(), Some("4".to_string())), // unmapped, since what does not map to host is what we want to filter
+            ("-f".to_string(), Some("4".to_string())), // Unmapped reads
             ("--no-PG".to_string(), None),
             ("-h".to_string(), None),   // Include header
-            ("-b".to_string(), None),  //Ensure BAM output
-            ("-u".to_string(), None),  //uncomrpessed BAM
+            ("-b".to_string(), None),   // BAM output
+            ("-u".to_string(), None),   // Uncompressed BAM
         ]),
     };
     let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
@@ -429,6 +389,7 @@ async fn align_to_host(
             })?
     };
 
+    // Samtools fastq to convert uncompressed BAM to FASTQ bytes
     let samtools_config_fastq = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
         subcommand_fields: HashMap::from([("-".to_string(), None)]),
@@ -441,7 +402,7 @@ async fn align_to_host(
 
     let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
         config.clone(),
-        samtools_out_stream_view,  // Uncompressed BAM
+        samtools_out_stream_view,
         SAMTOOLS_TAG,
         samtools_args_fastq,
         StreamDataType::JustBytes,
@@ -471,7 +432,7 @@ async fn align_to_host(
     };
     let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
 
-    // Input: ParseOutput::Bytes
+    // Split FASTQ byte stream for output, file write, count, and check
     let (host_streams, host_done_rx) = t_junction(
         samtools_out_stream_fastq,
         4,
@@ -486,14 +447,16 @@ async fn align_to_host(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    let mut cleanup_receivers = vec![host_done_rx];
+    cleanup_receivers.push(host_done_rx);
+
+    // Consume Vec to get Receivers
     let mut streams_iter = host_streams.into_iter();
     let no_host_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let no_host_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let no_host_count_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let no_host_check_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Check task for host-removed empty FASTQ
+    // Check task for host-removed empty FASTQ (adapted for bytes)
     let (check_tx, mut check_rx) = mpsc::channel(1);
     let check_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(no_host_check_stream);
@@ -539,6 +502,7 @@ async fn align_to_host(
         return Err(PipelineError::EmptyStream);
     }
 
+    // Pigz for compression
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)
         .map_err(|e| PipelineError::ToolExecution {
             tool: PIGZ_TAG.to_string(),
@@ -563,22 +527,23 @@ async fn align_to_host(
     let pigz_out_stream = {
         let mut guard = pigz_child.lock().await;
         parse_child_output(
-        &mut guard,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
     };
     let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, no_host_file_path));
     cleanup_tasks.push(pigz_write_task);
 
     Ok((ReceiverStream::new(no_host_output_stream), ReceiverStream::new(no_host_count_stream), cleanup_tasks, cleanup_receivers))
 }
+
 
 
 async fn process_ercc(
