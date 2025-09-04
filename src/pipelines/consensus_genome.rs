@@ -1713,6 +1713,14 @@ async fn calculate_statistics(
         Some(&depth_samtools_config),
     )?;
 
+    let depth_file_path = file_path_manipulator(
+        &PathBuf::from(no_ext_sample_base),
+        Some(out_dir),
+        None,
+        Some("depth.txt"),
+        "_"
+    );
+
     let depth_samtools_out_stream = match consensus_bam_depth_stream {
         Some(stream) => {
             let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(config.clone(),
@@ -1739,7 +1747,56 @@ async fn calculate_statistics(
         }
     };
 
-    let depth_map = parse_samtools_depth(depth_samtools_out_stream).await?;
+    // Split the stream for parsing and file writing
+    let (depth_streams, depth_done_rx) = t_junction(
+        ReceiverStream::new(depth_samtools_out_stream),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "depth_output_split".to_string(),
+        None,
+    ).await?;
+    let depth_done_task = tokio::spawn(async move {
+        depth_done_rx.await.map_err(|e| anyhow!("Depth stream done receiver failed: {}", e))??;
+        Ok(())
+    });
+    local_cleanup_tasks.push(depth_done_task);
+
+    let mut depth_streams_iter = depth_streams.into_iter();
+    let depth_parse_stream = depth_streams_iter.next().ok_or(anyhow!("No parse stream from t_junction"))?;
+    let depth_file_stream_rx = depth_streams_iter.next().ok_or(anyhow!("No file stream from t_junction"))?;
+
+    // Process the file stream to extract only depths
+    let (depth_file_tx, depth_file_rx) = mpsc::channel(config.base_buffer_size);
+    let depth_process_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(depth_file_stream_rx);
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Bytes(line_arc) = item {
+                let line = &*line_arc;
+                let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+                if fields.len() == 3 {
+                    let mut depth_bytes = fields[2].to_vec();
+                    depth_bytes.push(b'\n');
+                    if depth_file_tx.send(ParseOutput::Bytes(Arc::new(depth_bytes))).await.is_err() {
+                        return Err(anyhow!("Failed to send depth bytes"));
+                    }
+                } else {
+                    return Err(anyhow!("Invalid depth line format"));
+                }
+            }
+        }
+        Ok(())
+    });
+    local_cleanup_tasks.push(depth_process_task);
+
+    // Write the processed depths to file
+    let depth_write_task = tokio::spawn(stream_to_file(depth_file_rx, depth_file_path.clone()));
+    local_cleanup_tasks.push(depth_write_task);
+
+    let depth_map = parse_samtools_depth(depth_parse_stream).await?;
     if depth_map.is_empty() {
         return Err(anyhow!("No depth data found"));
     }
