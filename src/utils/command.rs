@@ -229,7 +229,7 @@ pub mod samtools {
     pub struct SamtoolsArgGenerator;
 
     pub async fn samtools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SAMTOOLS_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout).await?;
         Ok(version)
     }
 
@@ -276,7 +276,6 @@ pub mod samtools {
                     args_vec.push("mpileup".to_string());
                     args_vec.push("-@".to_string());
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("mpileup")).to_string());
-
                 }
                 SamtoolsSubcommand::Consensus => {
                     args_vec.push("consensus".to_string());
@@ -292,12 +291,16 @@ pub mod samtools {
                 SamtoolsSubcommand::Depth => {
                     args_vec.push("depth".to_string());
                 }
+                SamtoolsSubcommand::Ampliconclip => {
+                    args_vec.push("ampliconclip".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("ampliconclip")).to_string());
+                }
             }
             for (key, value) in config.subcommand_fields.iter() {
-                args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => { },
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
                 }
             }
 
