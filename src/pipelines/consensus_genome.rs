@@ -19,7 +19,7 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
-use crate::utils::fastx::{read_and_interleave_bytes, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
+use crate::utils::fastx::{SequenceRecord, read_and_interleave_bytes, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -1342,16 +1342,58 @@ async fn align_to_target(
     ))
 }
 
-
 async fn generate_consensus(
     config: Arc<RunConfig>,
-    bam_stream: ReceiverStream<ParseOutput>,  // Uncompressed BAM byte stream
+    bam_stream: ReceiverStream<ParseOutput>, // Uncompressed BAM byte stream
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
+
+    // Add primer trimming with samtools ampliconclip
+    let primer_bed_path = config.args.primer_bed_path.clone().ok_or_else(|| PipelineError::InvalidConfig("Primer BED file not provided".to_string()))?;
+    let trim_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Ampliconclip,
+        subcommand_fields: HashMap::from([
+            ("-".to_string(), None),
+            ("-b".to_string(), Some(primer_bed_path)),
+            ("--both-ends".to_string(), None),
+            ("-o".to_string(), Some("-".to_string())),
+        ]),
+    };
+    let trim_args = generate_cli(SAMTOOLS_TAG, &config, Some(&trim_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+
+    let (mut trim_child, trim_task, trim_err_task) = stream_to_cmd(
+        config.clone(),
+        bam_stream.into_inner(),
+        SAMTOOLS_TAG,
+        trim_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(trim_task);
+    cleanup_tasks.push(trim_err_task);
+
+    let trimmed_bam_stream = {
+        let mut guard = trim_child.lock().await;
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size)
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
     let samtools_consensus_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Consensus,
@@ -1365,13 +1407,12 @@ async fn generate_consensus(
 
     let (mut samtools_consensus_child, samtools_consensus_task, samtools_consensus_err_task) = stream_to_cmd(
         config.clone(),
-        bam_stream.into_inner(),
+        ReceiverStream::new(trimmed_bam_stream).into_inner(),
         SAMTOOLS_TAG,
         samtools_consensus_args,
         StreamDataType::JustBytes,
         config.args.verbose,
-    )
-        .await
+    ).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
@@ -1381,18 +1422,14 @@ async fn generate_consensus(
 
     let samtools_consensus_out_stream = {
         let mut guard = samtools_consensus_child.lock().await;
-        parse_child_output(  // FASTA output
-                             &mut guard,
-                             ChildStream::Stdout,
-                             ParseMode::Fasta,
-                             config.base_buffer_size,
-        )
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fasta, config.base_buffer_size)
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: SAMTOOLS_TAG.to_string(),
                 error: e.to_string(),
             })?
     };
+
     let samtools_consensus_out_stream = ReceiverStream::new(samtools_consensus_out_stream);
 
     let (consensus_streams, consensus_done_rx) = t_junction(
@@ -1404,9 +1441,8 @@ async fn generate_consensus(
         100,
         StreamDataType::JustBytes,
         "generate_consensus".to_string(),
-        None
-    )
-        .await
+        None,
+    ).await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
     cleanup_receivers.push(consensus_done_rx);
@@ -1434,10 +1470,10 @@ async fn generate_consensus(
         ReceiverStream::new(consensus_stats_stream),
         consensus_file_path,
         cleanup_tasks,
-        cleanup_receivers, quast_write_tasks,
+        cleanup_receivers,
+        quast_write_tasks,
     ))
 }
-
 
 async fn call_variants(
     config: Arc<RunConfig>,
