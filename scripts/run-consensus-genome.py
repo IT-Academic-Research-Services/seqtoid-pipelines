@@ -33,7 +33,7 @@ def find_fastq_pairs(directory, sample_order):
 
     return fastq_pairs
 
-def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, target_sequence, log_file, ercc_sequence, host_sequence, target_taxid, out):
+def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fasta, quality, target_sequence, log_file, ercc_sequence, host_sequence, target_taxid, out, primer_bed_path):
     """
     Run the seqtoid-pipelines command for a single sample and extract runtime from console output.
     """
@@ -50,6 +50,7 @@ def run_seqtoid(fastq_dir, sample_name, r1_file, r2_file, kraken_db, adapter_fas
         '--host-sequence', host_sequence,
         '--target-taxid', target_taxid,
         '--out', out,
+        '--primer-bed-path', primer_bed_path,
 
     ]
 
@@ -109,6 +110,7 @@ def main():
     parser.add_argument('--host-sequence', default='/home/ubuntu/refs/hg38.fa')
     parser.add_argument('--ref-taxid', default='2697049')
     parser.add_argument('--out', default='/home/ubuntu/data/seqtoid')
+    parser.add_argument('--primer-bed-path', default='/home/ubuntu/refs/artic_v3_primers.bed')
 
     args = parser.parse_args()
     fastq_pairs = []
@@ -143,6 +145,7 @@ def main():
             args.host_sequence,
             args.ref_taxid,
             out_dir,
+            args.primer_bed_path,
         )
         # print(f"Completed {sample}: Status={status}, Runtime={runtime:.2f} seconds" if runtime is not None else f"Completed {sample}: Status={status}, Runtime=Not found")
 
