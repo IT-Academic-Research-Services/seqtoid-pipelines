@@ -17,6 +17,7 @@ use tokio_stream::{self as stream};
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
 use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
 use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
+use needletail::{parse_fastx_file, FastxReader};
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -366,6 +367,258 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 }
 
 
+pub fn read_and_interleave_bytes(
+    path1: PathBuf,
+    path2: Option<PathBuf>,
+    technology: Option<Technology>,
+    max_reads: u64,
+    min_read_len: Option<usize>,
+    max_read_len: Option<usize>,
+    chunk_size: usize, // Bytes per chunk (e.g., 16MB)
+) -> Result<mpsc::Receiver<ParseOutput>> {
+    let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
+
+    tokio::spawn(async move {
+        eprintln!("read_and_interleave_bytes: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
+                  path1, path2, max_reads, min_read_len, max_read_len, chunk_size);
+
+        match path2 {
+            None => {
+                // Single-end: Stream chunks from one file
+                eprintln!("read_and_interleave_bytes: Opening single-end FASTQ: {:?}", path1);
+                let mut reader = parse_fastx_file(&path1)
+                    .map_err(|e| {
+                        anyhow!("Failed to open FASTQ {}: {}", path1.display(), e)
+                    })?;
+                let mut buffer = Vec::with_capacity(chunk_size);
+                let mut read_count: u64 = 0;
+
+                while let Some(result) = reader.next() {
+                    if read_count >= max_reads {
+                        eprintln!("read_and_interleave_bytes: Reached max_reads={}", max_reads);
+                        break;
+                    }
+                    let record = result.map_err(|e| {
+                        anyhow!("Parse error at read {}: {}", read_count + 1, e)
+                    })?;
+
+                    // Ensure FASTQ (not FASTA)
+                    if record.qual().is_none() {
+                        return Err(anyhow!("Expected FASTQ, got FASTA at read {}", read_count + 1));
+                    }
+
+                    // Log read details
+                    let seq_len = record.seq().len();
+                    let id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
+
+                    // Optional length filters
+                    if let Some(min) = min_read_len {
+                        if seq_len < min {
+                            eprintln!("read_and_interleave_bytes: Skipping read {}: seq_len={} < min={}", read_count + 1, seq_len, min);
+                            continue;
+                        }
+                    }
+                    if let Some(max) = max_read_len {
+                        if seq_len > max {
+                            eprintln!("read_and_interleave_bytes: Skipping read {}: seq_len={} > max={}", read_count + 1, seq_len, max);
+                            continue;
+                        }
+                    }
+
+                    // Construct FASTQ record
+                    let mut record_bytes = Vec::new();
+                    record_bytes.push(b'@');
+                    record_bytes.extend_from_slice(record.id());
+                    record_bytes.push(b'\n');
+                    record_bytes.extend_from_slice(&record.seq());
+                    record_bytes.push(b'\n');
+                    record_bytes.push(b'+');
+                    record_bytes.push(b'\n');
+                    record_bytes.extend_from_slice(record.qual().unwrap());
+                    record_bytes.push(b'\n');
+
+                    buffer.extend_from_slice(&record_bytes);
+                    read_count += 1;
+
+                    // Send if chunk full
+                    if buffer.len() >= chunk_size {
+                        // eprintln!("read_and_interleave_bytes: Sending chunk of {} bytes at read {}", buffer.len(), read_count);
+                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                            return Err(anyhow!("Failed to send byte chunk at read {}", read_count));
+                        }
+                    }
+                }
+                // Send remaining
+                if !buffer.is_empty() {
+                    // eprintln!("read_and_interleave_bytes: Sending final chunk of {} bytes", buffer.len());
+                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                        return Err(anyhow!("Failed to send final byte chunk"));
+                    }
+                }
+                eprintln!("read_and_interleave_bytes: Processed {} single-end reads", read_count);
+                if read_count == 0 {
+                    eprintln!("read_and_interleave_bytes: Warning: No reads processed from {:?}", path1);
+                }
+            }
+            Some(path2) => {
+                if let Some(Technology::ONT) = technology {
+                    return Err(anyhow!("Paired-end not supported for ONT"));
+                }
+                // Paired-end: Interleave raw record bytes
+                eprintln!("read_and_interleave_bytes: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
+                let mut reader1 = parse_fastx_file(&path1)
+                    .map_err(|e| {
+                        anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e)
+                    })?;
+                let mut reader2 = parse_fastx_file(&path2)
+                    .map_err(|e| {
+                        anyhow!("Failed to open R2 FASTQ {}: {}", path2.display(), e)
+                    })?;
+                let mut buffer = Vec::with_capacity(chunk_size);
+                let mut read_count: u64 = 0;
+
+                loop {
+                    if read_count >= max_reads {
+                        eprintln!("read_and_interleave_bytes: Reached max_reads={}", max_reads);
+                        break;
+                    }
+                    // Read R1
+                    let r1_opt = reader1.next();
+                    let r1_record = match r1_opt {
+                        Some(Ok(rec)) => rec,
+                        Some(Err(e)) => {
+                            return Err(anyhow!("R1 parse error at read {}: {}", read_count + 1, e));
+                        }
+                        None => {
+                            eprintln!("read_and_interleave_bytes: R1 stream ended at read {}", read_count + 1);
+                            break;
+                        }
+                    };
+                    if r1_record.qual().is_none() {
+                        eprintln!("read_and_interleave_bytes: Expected FASTQ for R1 at read {}", read_count + 1);
+                        return Err(anyhow!("Expected FASTQ for R1 at read {}", read_count + 1));
+                    }
+
+                    // Read R2
+                    let r2_opt = reader2.next();
+                    let r2_record = match r2_opt {
+                        Some(Ok(rec)) => rec,
+                        Some(Err(e)) => {
+                            return Err(anyhow!("R2 parse error at read {}: {}", read_count + 1, e));
+                        }
+                        None => {
+                            return Err(anyhow!("R2 ended before R1 at read {}", read_count + 1));
+                        }
+                    };
+                    if r2_record.qual().is_none() {
+                        return Err(anyhow!("Expected FASTQ for R2 at read {}", read_count + 1));
+                    }
+
+                    // Log read details
+                    let r1_id = std::str::from_utf8(r1_record.id()).unwrap_or("<invalid utf8>");
+                    let r2_id = std::str::from_utf8(r2_record.id()).unwrap_or("<invalid utf8>");
+                    let r1_len = r1_record.seq().len();
+                    let r2_len = r2_record.seq().len();
+                    // eprintln!("read_and_interleave_bytes: Pair {}: r1_id={}, r1_len={}, r2_id={}, r2_len={}",
+                    //           read_count + 1, r1_id, r1_len, r2_id, r2_len);
+
+                    // Relaxed ID check: Strip common suffixes
+                    let r1_head = r1_record.id();
+                    let r2_head = r2_record.id();
+                    if !compare_read_ids_bytes(r1_head, r2_head) {
+                        return Err(anyhow!("ID mismatch at pair {}: {:?} vs {:?}", read_count + 1, r1_id, r2_id));
+                    }
+
+                    // Length filters
+                    if let Some(min) = min_read_len {
+                        if r1_len < min || r2_len < min {
+                            // eprintln!("read_and_interleave_bytes: Skipping pair {}: r1_len={} or r2_len={} < min={}", read_count + 1, r1_len, r2_len, min);
+                            continue;
+                        }
+                    }
+                    if let Some(max) = max_read_len {
+                        if r1_len > max || r2_len > max {
+                            // eprintln!("read_and_interleave_bytes: Skipping pair {}: r1_len={} or r2_len={} > max={}", read_count + 1, r1_len, r2_len, max);
+                            continue;
+                        }
+                    }
+
+                    // Construct R1 FASTQ
+                    let mut r1_bytes = Vec::new();
+                    r1_bytes.push(b'@');
+                    r1_bytes.extend_from_slice(r1_record.id());
+                    r1_bytes.push(b'\n');
+                    r1_bytes.extend_from_slice(&r1_record.seq());
+                    r1_bytes.push(b'\n');
+                    r1_bytes.push(b'+');
+                    r1_bytes.push(b'\n');
+                    r1_bytes.extend_from_slice(r1_record.qual().unwrap());
+                    r1_bytes.push(b'\n');
+
+                    // Construct R2 FASTQ
+                    let mut r2_bytes = Vec::new();
+                    r2_bytes.push(b'@');
+                    r2_bytes.extend_from_slice(r2_record.id());
+                    r2_bytes.push(b'\n');
+                    r2_bytes.extend_from_slice(&r2_record.seq());
+                    r2_bytes.push(b'\n');
+                    r2_bytes.push(b'+');
+                    r2_bytes.push(b'\n');
+                    r2_bytes.extend_from_slice(r2_record.qual().unwrap());
+                    r2_bytes.push(b'\n');
+
+                    // Interleave: R1 then R2
+                    buffer.extend_from_slice(&r1_bytes);
+                    buffer.extend_from_slice(&r2_bytes);
+                    read_count += 1;
+
+                    // Send if chunk full
+                    if buffer.len() >= chunk_size {
+                        // eprintln!("read_and_interleave_bytes: Sending chunk of {} bytes at read {}", buffer.len(), read_count);
+                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                            return Err(anyhow!("Failed to send byte chunk at read {}", read_count));
+                        }
+                    }
+                }
+                // Send remaining
+                if !buffer.is_empty() {
+                    // eprintln!("read_and_interleave_bytes: Sending final chunk of {} bytes", buffer.len());
+                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                        return Err(anyhow!("Failed to send final byte chunk"));
+                    }
+                }
+                // Check for extra R2
+                if reader2.next().is_some() {
+                    return Err(anyhow!("R2 has extra reads after R1 ended"));
+                }
+                // eprintln!("read_and_interleave_bytes: Processed {} paired-end reads", read_count);
+                if read_count == 0 {
+                    eprintln!("read_and_interleave_bytes: Warning: No reads processed from R1={:?}, R2={:?}", path1, path2);
+                }
+            }
+        }
+        Ok(())
+    });
+
+    Ok(rx)
+}
+
+fn compare_read_ids_bytes(head1: &[u8], head2: &[u8]) -> bool {
+    let id1 = extract_id(head1);
+    let id2 = extract_id(head2);
+    let id1_str = std::str::from_utf8(id1).unwrap_or("");
+    let id2_str = std::str::from_utf8(id2).unwrap_or("");
+    let id1_base = id1_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
+    let id2_base = id2_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
+    // eprintln!("read_and_interleave_bytes: Comparing IDs: {} vs {}", id1_base, id2_base);
+    id1_base == id2_base
+}
+
+fn extract_id(head: &[u8]) -> &[u8] {
+    let start = head.iter().position(|&b| b != b'@').unwrap_or(0);
+    let end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
+    &head[start..end]
+}
 
 /// Counts the number of records in a FASTQ.
 ///
