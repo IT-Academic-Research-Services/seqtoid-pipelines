@@ -1,21 +1,31 @@
-use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
-use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
 use std::fs::File;
+use std::io::Write;
+use std::io::Cursor;
 use std::io::{self, BufReader};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::collections::HashSet;
+use anyhow::{Result, anyhow};
 use flate2::read::GzDecoder;
 use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::cli::Technology;
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use crate::utils::sequence::{DNA, normal_phred_qual_string};
+use crate::utils::sequence::{DNA, normal_phred_qual_string}; 
 use futures::Stream;
 use tokio_stream::{self as stream};
-
-const FASTA_TAG : &str = "fasta";
-const FASTQ_TAG : &str = "fastq";
-const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
-const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS};
+use seq_io::fasta::{Reader as FastaReader, OwnedRecord as FastaOwnedRecord};
+use seq_io::fastq::{Reader as FastqReader, OwnedRecord as FastqOwnedRecord};
+use needletail::{parse_fastx_file, FastxReader};
+use futures::stream::StreamExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use crate::utils::streams::{ParseOutput};
+use tokio::time::Duration;
+use futures::future::try_join_all;
+use tokio::task::JoinHandle;
+use memchr::memmem;
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -35,23 +45,29 @@ lazy_static! {
     };
 }
 
+/// Define size of contig thresholds to mimic what Quast does
+lazy_static! {
+    pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
+}
+
+
+
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone, Debug)]
 pub enum SequenceRecord {
     Fasta {
         id: String,
         desc: Option<String>,
-        seq: Vec<u8>,
+        seq: Arc<Vec<u8>>,
     },
     Fastq {
         id: String,
         desc: Option<String>,
-        seq: Vec<u8>,
-        qual: Vec<u8>,
+        seq: Arc<Vec<u8>>,
+        qual: Arc<Vec<u8>>,
     },
 }
 
-/// Maps id and seq to the correct file type.
 impl SequenceRecord {
     pub fn id(&self) -> &str {
         match self {
@@ -62,15 +78,16 @@ impl SequenceRecord {
 
     pub fn seq(&self) -> &[u8] {
         match self {
-            SequenceRecord::Fasta { seq, .. } => seq,
-            SequenceRecord::Fastq { seq, .. } => seq,
+            SequenceRecord::Fasta { seq, .. } => &**seq,
+            SequenceRecord::Fastq { seq, .. } => &**seq,
         }
     }
+
     #[allow(dead_code)]
     pub fn qual(&self) -> &[u8] {
         match self {
             SequenceRecord::Fasta { .. } => &[],
-            SequenceRecord::Fastq { qual, .. } => qual,
+            SequenceRecord::Fastq { qual, .. } => &**qual,
         }
     }
 
@@ -83,13 +100,14 @@ impl SequenceRecord {
     }
 }
 
+// Update From impls to wrap in Arc
 impl From<FastaOwnedRecord> for SequenceRecord {
     fn from(record: FastaOwnedRecord) -> Self {
         let (id, desc) = parse_header(&record.head, '>');
         SequenceRecord::Fasta {
             id,
             desc,
-            seq: record.seq,
+            seq: Arc::new(record.seq),
         }
     }
 }
@@ -100,8 +118,8 @@ impl From<FastqOwnedRecord> for SequenceRecord {
         SequenceRecord::Fastq {
             id,
             desc,
-            seq: record.seq,
-            qual: record.qual,
+            seq: Arc::new(record.seq),
+            qual: Arc::new(record.qual),
         }
     }
 }
@@ -111,6 +129,69 @@ impl From<FastqOwnedRecord> for SequenceRecord {
 pub enum SequenceReader {
     Fasta(FastaReader<FileReader>),
     Fastq(FastqReader<FileReader>),
+}
+
+
+/// HashSet based sequence validator
+///
+///
+/// # Arguments
+///
+/// * `seq`: &[u8] ref to vec of bytes
+/// * 'valid_bases: vec of allowed bases
+///
+/// # Returns
+/// Result<(), String> for error if any
+pub fn validate_sequence(seq: &Arc<Vec<u8>>, valid_bases: &[u8]) -> Result<()> {
+    let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
+    if let Some(&invalid_base) = seq.iter().find(|&&b| !valid_bases_set.contains(&b)) {
+        Err(anyhow::anyhow!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
+    } else {
+        Ok(())
+    }
+}
+
+
+/// PArallel HashSet based sequence validator
+/// for large sequences (probably over 1 billion bases)
+///
+/// # Arguments
+///
+/// * `seq`: &[u8] ref to vec of bytes
+/// * 'valid_bases: vec of allowed bases
+/// * num threads
+///
+/// # Returns
+/// Result<(), String> for error if any
+pub async fn validate_sequence_parallel(seq: Arc<Vec<u8>>, valid_bases: &[u8], num_threads: usize) -> Result<()> {
+    let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
+    let chunk_size = (seq.len() + num_threads - 1) / num_threads;
+    let mut handles: Vec<JoinHandle<Result<(), String>>> = Vec::new();
+
+    for i in 0..num_threads {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(seq.len());
+        if start >= seq.len() {
+            break;
+        }
+        let seq_arc = Arc::clone(&seq);
+        let valid_bases_set = valid_bases_set.clone();
+        let handle = tokio::spawn(async move {
+            let chunk = &seq_arc[start..end];
+            if let Some(&invalid_base) = chunk.iter().find(|&&b| !valid_bases_set.contains(&b)) {
+                Err(format!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
+            } else {
+                Ok(())
+            }
+        });
+        handles.push(handle);
+    }
+
+    let results = try_join_all(handles).await?;
+    for result in results {
+        result.map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
 }
 
 /// Creates a SequenceReader for either FASTA or FASTQ files.
@@ -186,6 +267,7 @@ pub struct R1R2Result {
     pub r1_tag: Option<String>,
     pub file_name: Option<String>,
     pub index: Option<usize>,
+    pub prefix: Option<String>,
     
 }
 
@@ -227,6 +309,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                                     r1_tag: Some(r1_tag),
                                     file_name: Some(new_file),
                                     index: Some(index),
+                                    prefix: Some(prefix),
                                 };
                             }
                         }
@@ -238,6 +321,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                         r1_tag: None,
                         file_name: None,
                         index: None,
+                        prefix: None,
                     };
                 }
             }
@@ -248,6 +332,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
                 r1_tag: None,
                 file_name: None,
                 index: None,
+                prefix: None,
             };
         }
     }
@@ -257,6 +342,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
         r1_tag: None,
         file_name: None,
         index: None,
+        prefix: None,
     };
     
 }
@@ -272,7 +358,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
 /// # Returns
 /// Tuple: (id, desc) split of header on whitespace.
 ///
-fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
+pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     let head_str = String::from_utf8_lossy(head).into_owned();
     let parts: Vec<&str> = head_str.splitn(2, |c: char| c.is_whitespace()).collect();
     let id = parts[0].trim_start_matches(prefix).to_string();
@@ -281,6 +367,258 @@ fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 }
 
 
+pub fn read_and_interleave_bytes(
+    path1: PathBuf,
+    path2: Option<PathBuf>,
+    technology: Option<Technology>,
+    max_reads: u64,
+    min_read_len: Option<usize>,
+    max_read_len: Option<usize>,
+    chunk_size: usize, // Bytes per chunk (e.g., 16MB)
+) -> Result<mpsc::Receiver<ParseOutput>> {
+    let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
+
+    tokio::spawn(async move {
+        eprintln!("read_and_interleave_bytes: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
+                  path1, path2, max_reads, min_read_len, max_read_len, chunk_size);
+
+        match path2 {
+            None => {
+                // Single-end: Stream chunks from one file
+                eprintln!("read_and_interleave_bytes: Opening single-end FASTQ: {:?}", path1);
+                let mut reader = parse_fastx_file(&path1)
+                    .map_err(|e| {
+                        anyhow!("Failed to open FASTQ {}: {}", path1.display(), e)
+                    })?;
+                let mut buffer = Vec::with_capacity(chunk_size);
+                let mut read_count: u64 = 0;
+
+                while let Some(result) = reader.next() {
+                    if read_count >= max_reads {
+                        eprintln!("read_and_interleave_bytes: Reached max_reads={}", max_reads);
+                        break;
+                    }
+                    let record = result.map_err(|e| {
+                        anyhow!("Parse error at read {}: {}", read_count + 1, e)
+                    })?;
+
+                    // Ensure FASTQ (not FASTA)
+                    if record.qual().is_none() {
+                        return Err(anyhow!("Expected FASTQ, got FASTA at read {}", read_count + 1));
+                    }
+
+                    // Log read details
+                    let seq_len = record.seq().len();
+                    let id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
+
+                    // Optional length filters
+                    if let Some(min) = min_read_len {
+                        if seq_len < min {
+                            eprintln!("read_and_interleave_bytes: Skipping read {}: seq_len={} < min={}", read_count + 1, seq_len, min);
+                            continue;
+                        }
+                    }
+                    if let Some(max) = max_read_len {
+                        if seq_len > max {
+                            eprintln!("read_and_interleave_bytes: Skipping read {}: seq_len={} > max={}", read_count + 1, seq_len, max);
+                            continue;
+                        }
+                    }
+
+                    // Construct FASTQ record
+                    let mut record_bytes = Vec::new();
+                    record_bytes.push(b'@');
+                    record_bytes.extend_from_slice(record.id());
+                    record_bytes.push(b'\n');
+                    record_bytes.extend_from_slice(&record.seq());
+                    record_bytes.push(b'\n');
+                    record_bytes.push(b'+');
+                    record_bytes.push(b'\n');
+                    record_bytes.extend_from_slice(record.qual().unwrap());
+                    record_bytes.push(b'\n');
+
+                    buffer.extend_from_slice(&record_bytes);
+                    read_count += 1;
+
+                    // Send if chunk full
+                    if buffer.len() >= chunk_size {
+                        // eprintln!("read_and_interleave_bytes: Sending chunk of {} bytes at read {}", buffer.len(), read_count);
+                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                            return Err(anyhow!("Failed to send byte chunk at read {}", read_count));
+                        }
+                    }
+                }
+                // Send remaining
+                if !buffer.is_empty() {
+                    // eprintln!("read_and_interleave_bytes: Sending final chunk of {} bytes", buffer.len());
+                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                        return Err(anyhow!("Failed to send final byte chunk"));
+                    }
+                }
+                eprintln!("read_and_interleave_bytes: Processed {} single-end reads", read_count);
+                if read_count == 0 {
+                    eprintln!("read_and_interleave_bytes: Warning: No reads processed from {:?}", path1);
+                }
+            }
+            Some(path2) => {
+                if let Some(Technology::ONT) = technology {
+                    return Err(anyhow!("Paired-end not supported for ONT"));
+                }
+                // Paired-end: Interleave raw record bytes
+                eprintln!("read_and_interleave_bytes: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
+                let mut reader1 = parse_fastx_file(&path1)
+                    .map_err(|e| {
+                        anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e)
+                    })?;
+                let mut reader2 = parse_fastx_file(&path2)
+                    .map_err(|e| {
+                        anyhow!("Failed to open R2 FASTQ {}: {}", path2.display(), e)
+                    })?;
+                let mut buffer = Vec::with_capacity(chunk_size);
+                let mut read_count: u64 = 0;
+
+                loop {
+                    if read_count >= max_reads {
+                        eprintln!("read_and_interleave_bytes: Reached max_reads={}", max_reads);
+                        break;
+                    }
+                    // Read R1
+                    let r1_opt = reader1.next();
+                    let r1_record = match r1_opt {
+                        Some(Ok(rec)) => rec,
+                        Some(Err(e)) => {
+                            return Err(anyhow!("R1 parse error at read {}: {}", read_count + 1, e));
+                        }
+                        None => {
+                            eprintln!("read_and_interleave_bytes: R1 stream ended at read {}", read_count + 1);
+                            break;
+                        }
+                    };
+                    if r1_record.qual().is_none() {
+                        eprintln!("read_and_interleave_bytes: Expected FASTQ for R1 at read {}", read_count + 1);
+                        return Err(anyhow!("Expected FASTQ for R1 at read {}", read_count + 1));
+                    }
+
+                    // Read R2
+                    let r2_opt = reader2.next();
+                    let r2_record = match r2_opt {
+                        Some(Ok(rec)) => rec,
+                        Some(Err(e)) => {
+                            return Err(anyhow!("R2 parse error at read {}: {}", read_count + 1, e));
+                        }
+                        None => {
+                            return Err(anyhow!("R2 ended before R1 at read {}", read_count + 1));
+                        }
+                    };
+                    if r2_record.qual().is_none() {
+                        return Err(anyhow!("Expected FASTQ for R2 at read {}", read_count + 1));
+                    }
+
+                    // Log read details
+                    let r1_id = std::str::from_utf8(r1_record.id()).unwrap_or("<invalid utf8>");
+                    let r2_id = std::str::from_utf8(r2_record.id()).unwrap_or("<invalid utf8>");
+                    let r1_len = r1_record.seq().len();
+                    let r2_len = r2_record.seq().len();
+                    // eprintln!("read_and_interleave_bytes: Pair {}: r1_id={}, r1_len={}, r2_id={}, r2_len={}",
+                    //           read_count + 1, r1_id, r1_len, r2_id, r2_len);
+
+                    // Relaxed ID check: Strip common suffixes
+                    let r1_head = r1_record.id();
+                    let r2_head = r2_record.id();
+                    if !compare_read_ids_bytes(r1_head, r2_head) {
+                        return Err(anyhow!("ID mismatch at pair {}: {:?} vs {:?}", read_count + 1, r1_id, r2_id));
+                    }
+
+                    // Length filters
+                    if let Some(min) = min_read_len {
+                        if r1_len < min || r2_len < min {
+                            // eprintln!("read_and_interleave_bytes: Skipping pair {}: r1_len={} or r2_len={} < min={}", read_count + 1, r1_len, r2_len, min);
+                            continue;
+                        }
+                    }
+                    if let Some(max) = max_read_len {
+                        if r1_len > max || r2_len > max {
+                            // eprintln!("read_and_interleave_bytes: Skipping pair {}: r1_len={} or r2_len={} > max={}", read_count + 1, r1_len, r2_len, max);
+                            continue;
+                        }
+                    }
+
+                    // Construct R1 FASTQ
+                    let mut r1_bytes = Vec::new();
+                    r1_bytes.push(b'@');
+                    r1_bytes.extend_from_slice(r1_record.id());
+                    r1_bytes.push(b'\n');
+                    r1_bytes.extend_from_slice(&r1_record.seq());
+                    r1_bytes.push(b'\n');
+                    r1_bytes.push(b'+');
+                    r1_bytes.push(b'\n');
+                    r1_bytes.extend_from_slice(r1_record.qual().unwrap());
+                    r1_bytes.push(b'\n');
+
+                    // Construct R2 FASTQ
+                    let mut r2_bytes = Vec::new();
+                    r2_bytes.push(b'@');
+                    r2_bytes.extend_from_slice(r2_record.id());
+                    r2_bytes.push(b'\n');
+                    r2_bytes.extend_from_slice(&r2_record.seq());
+                    r2_bytes.push(b'\n');
+                    r2_bytes.push(b'+');
+                    r2_bytes.push(b'\n');
+                    r2_bytes.extend_from_slice(r2_record.qual().unwrap());
+                    r2_bytes.push(b'\n');
+
+                    // Interleave: R1 then R2
+                    buffer.extend_from_slice(&r1_bytes);
+                    buffer.extend_from_slice(&r2_bytes);
+                    read_count += 1;
+
+                    // Send if chunk full
+                    if buffer.len() >= chunk_size {
+                        // eprintln!("read_and_interleave_bytes: Sending chunk of {} bytes at read {}", buffer.len(), read_count);
+                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                            return Err(anyhow!("Failed to send byte chunk at read {}", read_count));
+                        }
+                    }
+                }
+                // Send remaining
+                if !buffer.is_empty() {
+                    // eprintln!("read_and_interleave_bytes: Sending final chunk of {} bytes", buffer.len());
+                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                        return Err(anyhow!("Failed to send final byte chunk"));
+                    }
+                }
+                // Check for extra R2
+                if reader2.next().is_some() {
+                    return Err(anyhow!("R2 has extra reads after R1 ended"));
+                }
+                // eprintln!("read_and_interleave_bytes: Processed {} paired-end reads", read_count);
+                if read_count == 0 {
+                    eprintln!("read_and_interleave_bytes: Warning: No reads processed from R1={:?}, R2={:?}", path1, path2);
+                }
+            }
+        }
+        Ok(())
+    });
+
+    Ok(rx)
+}
+
+fn compare_read_ids_bytes(head1: &[u8], head2: &[u8]) -> bool {
+    let id1 = extract_id(head1);
+    let id2 = extract_id(head2);
+    let id1_str = std::str::from_utf8(id1).unwrap_or("");
+    let id2_str = std::str::from_utf8(id2).unwrap_or("");
+    let id1_base = id1_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
+    let id2_base = id2_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
+    // eprintln!("read_and_interleave_bytes: Comparing IDs: {} vs {}", id1_base, id2_base);
+    id1_base == id2_base
+}
+
+fn extract_id(head: &[u8]) -> &[u8] {
+    let start = head.iter().position(|&b| b != b'@').unwrap_or(0);
+    let end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
+    &head[start..end]
+}
 
 /// Counts the number of records in a FASTQ.
 ///
@@ -293,7 +631,7 @@ fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 /// u64: Number of records in the FASTQ.
 ///
 #[allow(dead_code)]
-pub fn record_counter(path: &PathBuf) -> io::Result<u64> {
+pub fn record_counter_file(path: &PathBuf) -> io::Result<u64> {
     let mut counter = 0;
     match sequence_reader(path)? {
         SequenceReader::Fasta(reader) => {
@@ -332,8 +670,8 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
                 SequenceRecord::Fastq {
                     id: format!("read{}", i + 1),
                     desc: None,
-                    seq: seq.into_bytes(),
-                    qual: qual.into_bytes(),
+                    seq: Arc::new(seq.into_bytes()),
+                    qual: Arc::new(qual.into_bytes()),
                 }
             })
             .collect()
@@ -429,9 +767,16 @@ pub fn read_and_interleave_sequences(
                             r2_count += 1;
 
                             read_counter += 1;
+
+                            // Throttle every 100,000 pairs
+                            if read_counter % 100_000 == 0 {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                                // eprintln!("Processed {} read pairs, throttling for 5ms", read_counter);
+                            }
+
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break;
                             }
                         }
                         (Err(e), _) => {
@@ -444,7 +789,6 @@ pub fn read_and_interleave_sequences(
                         }
                     }
                 }
-                
             });
         }
         (None, SequenceReader::Fastq(reader)) => {
@@ -477,7 +821,7 @@ pub fn read_and_interleave_sequences(
                             read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break;
                             }
                         }
                         Err(e) => {
@@ -518,7 +862,7 @@ pub fn read_and_interleave_sequences(
                             read_counter += 1;
                             if read_counter >= max_reads {
                                 eprintln!("Reached max reads: {}", max_reads);
-                                return;
+                                break; // Exit loop cleanly, sender dropped after
                             }
                         }
                         Err(e) => {
@@ -549,47 +893,336 @@ pub fn read_and_interleave_sequences(
 /// # Returns
 /// bool: true if reads are a matched pair.
 ///
-fn compare_read_ids(
-    id1: &str,
-    id2: &str,
-) -> bool {
-    
-    // Try Casava 1.8+ format first (space-separated)
-    let id1_parts: Vec<&str> = id1.splitn(2, ' ').collect();
-    let id2_parts: Vec<&str> = id2.splitn(2, ' ').collect();
+fn compare_read_ids(id1: &str, id2: &str) -> bool {
+    // Extract ID parts without @
+    let id_part1 = id1.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
+    let id_part2 = id2.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
 
-    if id1_parts.len() == 2 && id2_parts.len() == 2 {
-        let read_id1 = id1_parts[0];
-        let read_id2 = id2_parts[0];
-        if read_id1 != read_id2 {
-            return false;
-        }
-        let attr1_parts: Vec<&str> = id1_parts[1].split(':').collect();
-        let attr2_parts: Vec<&str> = id2_parts[1].split(':').collect();
-        if attr1_parts.is_empty() || attr2_parts.is_empty() {
-            eprintln!("Invalid attributes format in R1 or R2");
-            return false;
-        }
-        let read_num1 = attr1_parts[0];
-        let read_num2 = attr2_parts[0];
-        return (read_num1 == "1" && read_num2 == "2") || (read_num1 == "2" && read_num2 == "1");
+    // Check for identical IDs (SRA and some Casava 1.8+ cases)
+    if id_part1 == id_part2 {
+        return true;
     }
 
-    // Fallback to /1 and /2 format
-    if id1.ends_with("/1") && id2.ends_with("/2") {
-        let base_id1 = id1.trim_end_matches("/1");
-        let base_id2 = id2.trim_end_matches("/2");
-        return base_id1 == base_id2;
-    } else if id1.ends_with("/2") && id2.ends_with("/1") {
-        let base_id1 = id1.trim_end_matches("/2");
-        let base_id2 = id2.trim_end_matches("/1");
-        return base_id1 == base_id2;
+    // Check for /1 and /2 format (pre-Casava 1.8 Illumina and custom formats)
+    let full_id_part1 = id1.splitn(2, ' ').next().unwrap_or("");
+    let full_id_part2 = id2.splitn(2, ' ').next().unwrap_or("");
+
+
+    if (full_id_part1.ends_with("/1") && full_id_part2.ends_with("/2")) ||
+        (full_id_part1.ends_with("/2") && full_id_part2.ends_with("/1")) {
+        let base1 = &full_id_part1[..full_id_part1.len() - 2];
+        let base2 = &full_id_part2[..full_id_part2.len() - 2];
+        if base1 == base2 {
+            return true;
+        }
     }
 
-    eprintln!("Unsupported read ID format or mismatched pairs");
     false
-    
 }
+
+/// Writes out a FASTA file to a FIFO pipe.
+///
+/// # Arguments
+///
+/// * `fasta_path` - Valid path to a FASTA file.
+/// * 'fifo_path` - APath used by named FIFO pipe.
+///
+/// # Returns
+/// Result()
+///
+pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<()> {
+    let mut reader = match sequence_reader(fasta_path)? {
+        SequenceReader::Fasta(reader) => reader,
+        _ => return Err(anyhow!("Input file {} is not a FASTA file", fasta_path.display())),
+    };
+
+    let mut fifo_file = std::fs::File::create(fifo_path)?;
+    for record_result in reader.into_records() {
+        let record = record_result.map_err(|e| anyhow!("Error reading FASTA: {}", e))?;
+        let seq_record: SequenceRecord = record.to_owned().into();
+        let fasta_line = format!(">{}\n{}\n", seq_record.id(), String::from_utf8_lossy(seq_record.seq()));
+        fifo_file.write_all(fasta_line.as_bytes())?;
+    }
+    fifo_file.flush()?;
+    Ok(())
+}
+
+pub async fn stream_record_counter(
+    rx: mpsc::Receiver<ParseOutput>,
+    early_exit: bool,
+) -> Result<u64, anyhow::Error> {
+    let mut stream = ReceiverStream::new(rx);
+    let mut counter: u64 = 0;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Bytes(chunk) => {
+                let chunk_str = String::from_utf8_lossy(&chunk);
+                for line in chunk_str.lines() {
+                    if line.starts_with('@') || line.starts_with('>') {
+                        counter += 1;
+                        if early_exit {
+                            return Ok(1); // Early exit: Not empty
+                        }
+                    }
+                }
+            }
+            ParseOutput::Fastq(_) => {
+                counter += 1;
+                if early_exit {
+                    return Ok(1);
+                }
+            }
+            ParseOutput::Fasta(_) => {
+                counter += 1;
+                if early_exit {
+                    return Ok(1);
+                }
+            }
+        }
+    }
+
+    Ok(counter)
+}
+
+/// Filters a stream of FASTQ records based on a predicate applied to the ID line.
+///
+/// # Arguments
+/// * `input_rx` - Receiver of parsed FASTQ records (from `parse_fastq` or similar).
+/// * `buffer_size` - Size of the output channel buffer.
+/// * `pattern` - // e.g., "kraken:taxid|123"
+///
+/// # Returns
+/// Tuple of (mpsc of sequence records, task join handle result)
+pub fn parse_and_filter_fastq_id(
+    input_rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+    pattern: String,
+) -> (mpsc::Receiver<SequenceRecord>, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+    let pattern_bytes = pattern.into_bytes();
+    let (filtered_tx, filtered_rx) = mpsc::channel(buffer_size);
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(input_rx);
+        let mut count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Fastq(record) => {
+                    if memmem::find(record.id().as_bytes(), &pattern_bytes).is_some() {
+                        if filtered_tx.send(record).await.is_err() {
+                            eprintln!("Failed to send filtered FASTQ record at count {}", count + 1);
+                            return Err(anyhow!(
+                                "Failed to send filtered FASTQ record at count {}",
+                                count + 1
+                            ));
+                        }
+                        count += 1;
+                    }
+                }
+                _ => {
+                    eprintln!("Unexpected ParseOutput at count {}", count + 1);
+                    continue; // Skip non-FASTQ items
+                }
+            }
+        }
+        eprintln!("Filtered {} FASTQ records from Kraken2 classified stream", count);
+        Ok(())
+    });
+    (filtered_rx, task)
+}
+
+
+
+pub async fn parse_byte_stream_to_fastq(
+    input_rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+    stall_threshold_secs: u64,
+) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(input_rx);
+        let mut full_buffer: Vec<u8> = Vec::new(); // Accumulate all bytes (RAM-efficient for filtered streams)
+        let mut record_count = 0;
+        let mut last_progress = tokio::time::Instant::now();
+
+        while let Some(item) = stream.next().await {
+            if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
+                eprintln!("parse_byte_stream_to_fastq: Stall detected at {} records", record_count);
+                last_progress = tokio::time::Instant::now();
+            }
+
+            match item {
+                ParseOutput::Bytes(bytes) => {
+                    // eprintln!("parse_byte_stream_to_fastq: Received {} bytes chunk", bytes.len());
+                    full_buffer.extend_from_slice(&*bytes);
+                }
+                _ => {
+                    eprintln!("parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}", record_count + 1);
+                    continue;
+                }
+            }
+        }
+
+        if full_buffer.is_empty() {
+            eprintln!("parse_byte_stream_to_fastq: Empty byte buffer received");
+            return Err(anyhow!("Empty byte buffer for FASTQ parsing"));
+        }
+
+        // eprintln!("parse_byte_stream_to_fastq: Accumulated {} total bytes for parsing", full_buffer.len());
+
+        // Parse accumulated bytes into FASTQ records
+        let cursor = Cursor::new(full_buffer);
+        let mut reader = FastqReader::new(cursor);
+        while let Some(result) = reader.next() {
+            match result {
+                Ok(record) => {
+                    let owned_record: SequenceRecord = record.to_owned_record().into();
+                    if tx.send(ParseOutput::Fastq(owned_record)).await.is_err() {
+                        eprintln!("parse_byte_stream_to_fastq: Failed to send FASTQ record at count {}", record_count + 1);
+                        return Err(anyhow!("Failed to send FASTQ record at count {}", record_count + 1));
+                    }
+                    record_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("parse_byte_stream_to_fastq: Error parsing FASTQ at count {}: {}", record_count + 1, e);
+                    return Err(anyhow!("FASTQ parsing error at count {}: {}", record_count + 1, e));
+                }
+            }
+        }
+
+        eprintln!("parse_byte_stream_to_fastq: Parsed {} FASTQ records", record_count);
+        Ok(())
+    });
+
+    Ok((rx, task))
+}
+
+/// Concatenates paired-end FASTQ records by joining R1 and R2 sequences with an 'N' and
+/// corresponding quality scores with a '!' (low-quality score).
+///
+/// # Arguments
+/// * `input_stream` - ReceiverStream of ParseOutput containing interleaved FASTQ records (R1, R2, ...).
+/// * `buffer_size` - Size of the output channel buffer.
+/// * `stall_threshold_secs` - Seconds before logging a stall warning.
+///
+/// # Returns
+/// A tuple of:
+/// - `ReceiverStream<ParseOutput>`: Stream of concatenated FASTQ records.
+/// - `JoinHandle<Result<(), anyhow::Error>>`: Task handle for the concatenation process.
+pub async fn concatenate_paired_reads(
+    input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: usize,
+    stall_threshold_secs: u64,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    ),
+    anyhow::Error,
+> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+    let mut stream = input_stream;
+    let mut last_progress = tokio::time::Instant::now();
+    let mut pair_count = 0;
+
+    let task = tokio::spawn(async move {
+        let mut r1: Option<SequenceRecord> = None;
+
+        while let Some(item) = stream.next().await {
+            if last_progress.elapsed() > tokio::time::Duration::from_secs(stall_threshold_secs) {
+                eprintln!("concatenate_paired_reads: Stall detected at {} read pairs", pair_count);
+                last_progress = tokio::time::Instant::now();
+            }
+
+            match item {
+                ParseOutput::Fastq(record) => {
+                    if let Some(prev_r1) = r1.take() {
+                        // This is R2; process the pair
+                        if !compare_read_ids(prev_r1.id(), record.id()) {
+                            eprintln!(
+                                "Read ID mismatch at pair {}: {} vs {}",
+                                pair_count + 1,
+                                prev_r1.id(),
+                                record.id()
+                            );
+                            return Err(anyhow!(
+                                "Read ID mismatch at pair {}: {} vs {}",
+                                pair_count + 1,
+                                prev_r1.id(),
+                                record.id()
+                            ));
+                        }
+
+                        if let (
+                            SequenceRecord::Fastq {
+                                id: r1_id,
+                                desc: r1_desc,
+                                seq: r1_seq,
+                                qual: r1_qual,
+                            },
+                            SequenceRecord::Fastq {
+                                seq: r2_seq,
+                                qual: r2_qual,
+                                ..
+                            },
+                        ) = (&prev_r1, &record)
+                        {
+                            // Concatenate sequences: R1 + N + R2
+                            let mut new_seq = Vec::with_capacity(r1_seq.len() + r2_seq.len() + 1);
+                            new_seq.extend_from_slice(&r1_seq);
+                            new_seq.push(b'N');
+                            new_seq.extend_from_slice(&r2_seq);
+
+                            // Concatenate quality scores: R1 + ! + R2
+                            let mut new_qual = Vec::with_capacity(r1_qual.len() + r2_qual.len() + 1);
+                            new_qual.extend_from_slice(&r1_qual);
+                            new_qual.push(b'!'); // Low quality for 'N'
+                            new_qual.extend_from_slice(&r2_qual);
+
+
+                            let new_record = SequenceRecord::Fastq {
+                                id: r1_id.clone(),
+                                desc: r1_desc.clone(),
+                                seq: Arc::new(new_seq),
+                                qual: Arc::new(new_qual),
+                            };
+
+                            if tx.send(ParseOutput::Fastq(new_record)).await.is_err() {
+                                eprintln!("Failed to send concatenated FASTQ record at pair {}", pair_count + 1);
+                                return Err(anyhow!(
+                                    "Failed to send concatenated FASTQ record at pair {}",
+                                    pair_count + 1
+                                ));
+                            }
+                            pair_count += 1;
+                        } else {
+                            return Err(anyhow!("Non-FASTQ record in pair at count {}", pair_count + 1));
+                        }
+                    } else {
+                        // This is R1; store and wait for R2
+                        r1 = Some(record);
+                    }
+                }
+                _ => {
+                    eprintln!("Unexpected ParseOutput at pair count {}", pair_count + 1);
+                    continue;
+                }
+            }
+        }
+
+        // Check for unpaired R1
+        if r1.is_some() {
+            eprintln!("Unpaired R1 record at end of stream");
+            return Err(anyhow!("Unpaired R1 record at end of stream"));
+        }
+
+        eprintln!("concatenate_paired_reads: Processed {} read pairs", pair_count);
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(rx), task))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -637,4 +1270,96 @@ mod tests {
             Err(e) => Err(e),
         }
     }
+    #[tokio::test]
+    async fn test_stream_record_counter_fastq() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let fastq_data = vec![
+            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec().into()),
+            ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "read2".to_string(),
+                desc: None,
+                seq: Arc::new(b"GCTA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
+            }),
+        ];
+
+        tokio::spawn(async move {
+            for item in fastq_data {
+                tx.send(item).await.unwrap();
+            }
+        });
+
+        let count = stream_record_counter(rx, false).await?;
+        assert_eq!(count, 2, "Should count 2 FASTQ records");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_record_counter_fasta_early_exit() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let fasta_data = vec![
+            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec().into()),
+            ParseOutput::Fasta(SequenceRecord::Fasta {
+                id: "seq2".to_string(),
+                desc: None,
+                seq: Arc::new(b"GCTA".to_vec()),
+            }),
+        ];
+
+        tokio::spawn(async move {
+            for item in fasta_data {
+                tx.send(item).await.unwrap();
+            }
+        });
+
+        let count = stream_record_counter(rx, true).await?;
+        assert_eq!(count, 1, "Should stop at first FASTA record with early_exit");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_record_counter_empty() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        drop(tx); // Close immediately
+        let count = stream_record_counter(rx, false).await?;
+        assert_eq!(count, 0, "Should count 0 for empty stream");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_concatenate_paired_reads() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        let records = vec![
+            ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "read1/1".to_string(),
+                desc: None,
+                seq: Arc::new(b"ATCG".to_vec()),
+                qual: Arc::new(b"IIII".to_vec()),
+            }),
+            ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "read1/2".to_string(),
+                desc: None,
+                seq: Arc::new(b"GCTA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
+            }),
+        ];
+        tokio::spawn(async move {
+            for record in records {
+                tx.send(record).await.unwrap();
+            }
+        });
+        let (concat_rx, task) = concatenate_paired_reads(ReceiverStream::new(rx), 10, 10).await?;
+        let mut concat_records = Vec::new();
+        let mut stream = concat_rx;  // Directly use concat_rx (already a ReceiverStream)
+        while let Some(ParseOutput::Fastq(record)) = stream.next().await {
+            concat_records.push(record);
+        }
+        task.await??;
+        assert_eq!(concat_records.len(), 1);
+        assert_eq!(concat_records[0].id(), "read1/1");
+        assert_eq!(concat_records[0].seq(), b"ATCGNGCTA");
+        assert_eq!(concat_records[0].qual(), b"IIII!HHHH");
+        Ok(())
+    }
+
 }
