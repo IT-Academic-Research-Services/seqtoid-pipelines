@@ -50,7 +50,8 @@ pub enum SamtoolsSubcommand {
     Index,
     Mpileup,
     Consensus,
-    Depth
+    Depth,
+    Ampliconclip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
