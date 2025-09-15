@@ -90,7 +90,6 @@ async fn prepare_reference_and_index<'a>(
     ),
     PipelineError,
 > {
-    let start = Instant::now();
     let mut tasks = Vec::new();
     let mut ref_fasta_path: Option<PathBuf> = None;
     let mut ref_temp: Option<NamedTempFile> = None;
@@ -201,7 +200,6 @@ async fn prepare_reference_and_index<'a>(
         }
     };
 
-    // eprintln!("{} index preparation took {:?}", ref_type, start.elapsed());
     Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
 }
 
@@ -1400,7 +1398,7 @@ async fn generate_consensus(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_consensus_child, samtools_consensus_task, samtools_consensus_err_task) = stream_to_cmd(
+    let (samtools_consensus_child, samtools_consensus_task, samtools_consensus_err_task) = stream_to_cmd(
         config.clone(),
         ReceiverStream::new(trimmed_bam_stream).into_inner(),
         SAMTOOLS_TAG,
@@ -1681,7 +1679,7 @@ async fn realign_consensus_to_ref(
 
 
 
-    Ok((cleanup_tasks))
+    Ok(cleanup_tasks)
 }
 
 
@@ -1938,7 +1936,7 @@ async fn evaluate_assembly(
     cleanup_tasks.push(quast_wait_task);
 
 
-    Ok((cleanup_tasks))
+    Ok(cleanup_tasks)
 }
 
 
