@@ -225,7 +225,7 @@ where
         // Ensure all receivers process remaining data
         for (i, tx) in output_txs.into_iter() {
             let _ = tx; // Move Sender to drop it, signaling EOF
-            eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
+            // eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
         }
 
         if let Some(n) = notify {
