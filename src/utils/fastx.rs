@@ -45,7 +45,6 @@ lazy_static! {
     };
 }
 
-/// Define size of contig thresholds to mimic what Quast does
 lazy_static! {
     pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
 }
@@ -142,6 +141,7 @@ pub enum SequenceReader {
 ///
 /// # Returns
 /// Result<(), String> for error if any
+#[allow(dead_code)]
 pub fn validate_sequence(seq: &Arc<Vec<u8>>, valid_bases: &[u8]) -> Result<()> {
     let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
     if let Some(&invalid_base) = seq.iter().find(|&&b| !valid_bases_set.contains(&b)) {
@@ -163,6 +163,7 @@ pub fn validate_sequence(seq: &Arc<Vec<u8>>, valid_bases: &[u8]) -> Result<()> {
 ///
 /// # Returns
 /// Result<(), String> for error if any
+#[allow(dead_code)]
 pub async fn validate_sequence_parallel(seq: Arc<Vec<u8>>, valid_bases: &[u8], num_threads: usize) -> Result<()> {
     let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
     let chunk_size = (seq.len() + num_threads - 1) / num_threads;
@@ -409,7 +410,7 @@ pub fn read_and_interleave_bytes(
 
                     // Log read details
                     let seq_len = record.seq().len();
-                    let id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
+                    let _id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
 
                     // Optional length filters
                     if let Some(min) = min_read_len {
@@ -659,6 +660,7 @@ pub fn record_counter_file(path: &PathBuf) -> io::Result<u64> {
 ///
 /// # Returns
 /// Stream<Item = SequenceRecord>
+#[allow(dead_code)]
 pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32) -> impl Stream<Item = SequenceRecord> {
     let records: Vec<SequenceRecord> = if seq_len == 0 {
         Vec::new() // Empty vector for zero read size
@@ -696,8 +698,8 @@ pub fn read_and_interleave_sequences(
     max_reads: usize,
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
-) -> anyhow::Result<tokio::sync::mpsc::Receiver<SequenceRecord>> {
-    let (tx, rx) = tokio::sync::mpsc::channel(10000);
+) -> Result<mpsc::Receiver<SequenceRecord>> {
+    let (tx, rx) = mpsc::channel(10000);
     let mut read_counter = 0;
 
     match (path2, sequence_reader(&path1)?) {
@@ -724,7 +726,7 @@ pub fn read_and_interleave_sequences(
                 let mut last_progress = tokio::time::Instant::now();
 
                 while let (Some(r1_result), Some(r2_result)) = (records1.next(), records2.next()) {
-                    if last_progress.elapsed() > tokio::time::Duration::from_secs(15) {
+                    if last_progress.elapsed() > Duration::from_secs(15) {
                         eprintln!("Stall detected at {} read pairs", read_counter);
                         last_progress = tokio::time::Instant::now();
                     }
@@ -930,13 +932,14 @@ fn compare_read_ids(id1: &str, id2: &str) -> bool {
 /// # Returns
 /// Result()
 ///
+#[allow(dead_code)]
 pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<()> {
     let mut reader = match sequence_reader(fasta_path)? {
         SequenceReader::Fasta(reader) => reader,
         _ => return Err(anyhow!("Input file {} is not a FASTA file", fasta_path.display())),
     };
 
-    let mut fifo_file = std::fs::File::create(fifo_path)?;
+    let mut fifo_file = File::create(fifo_path)?;
     for record_result in reader.into_records() {
         let record = record_result.map_err(|e| anyhow!("Error reading FASTA: {}", e))?;
         let seq_record: SequenceRecord = record.to_owned().into();
@@ -947,6 +950,7 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn stream_record_counter(
     rx: mpsc::Receiver<ParseOutput>,
     early_exit: bool,
@@ -998,7 +1002,7 @@ pub fn parse_and_filter_fastq_id(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
     pattern: String,
-) -> (mpsc::Receiver<SequenceRecord>, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+) -> (mpsc::Receiver<SequenceRecord>, JoinHandle<Result<(), anyhow::Error>>) {
     let pattern_bytes = pattern.into_bytes();
     let (filtered_tx, filtered_rx) = mpsc::channel(buffer_size);
     let task = tokio::spawn(async move {
@@ -1116,7 +1120,7 @@ pub async fn concatenate_paired_reads(
 ) -> Result<
     (
         ReceiverStream<ParseOutput>,
-        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        JoinHandle<Result<(), anyhow::Error>>,
     ),
     anyhow::Error,
 > {
@@ -1129,7 +1133,7 @@ pub async fn concatenate_paired_reads(
         let mut r1: Option<SequenceRecord> = None;
 
         while let Some(item) = stream.next().await {
-            if last_progress.elapsed() > tokio::time::Duration::from_secs(stall_threshold_secs) {
+            if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
                 eprintln!("concatenate_paired_reads: Stall detected at {} read pairs", pair_count);
                 last_progress = tokio::time::Instant::now();
             }
