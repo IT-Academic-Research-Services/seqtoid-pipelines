@@ -218,8 +218,7 @@ async fn validate_input(
         Some("validated.fq.gz"),
         "_",
     );
-
-    // Use the new byte-streaming reader
+    
     let rx = read_and_interleave_bytes(
         file1_path,
         file2_path,

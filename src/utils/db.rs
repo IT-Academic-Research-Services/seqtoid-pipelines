@@ -551,7 +551,6 @@ pub async fn retrieve_h5_seq(
                 _ => return Err(anyhow!("Sequence file must be FASTA: {}", sequence_path.display())),
             };
             let record = reader
-                .into_records()
                 .next()
                 .ok_or_else(|| anyhow!("No records found in FASTA file: {}", sequence_path.display()))?
                 .map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
@@ -579,15 +578,15 @@ pub async fn retrieve_h5_seq(
     }
 }
 
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use super::*;
-    use anyhow::anyhow;
     use tempfile::NamedTempFile;
     use crate::config::defs::StreamDataType;
-    use crate::utils::fastx::{fastx_generator, read_and_interleave_sequences};
+    use crate::utils::fastx::{fastx_generator, read_and_interleave_bytes};
     use crate::utils::streams::t_junction;
     use tokio_stream::StreamExt;
     use tokio::sync::mpsc;
@@ -682,26 +681,17 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = PathBuf::from(temp_file.path());
 
-        let rx = read_and_interleave_sequences(
+        let rx = read_and_interleave_bytes(
             PathBuf::from(TEST_FASTA_PATH),
             None,
             Some(Technology::Illumina),
             500000000,
             None,
             None,
+            100_000,
         )?;
 
-        let (tx, rx_parse) = mpsc::channel(100_000);
-        tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(rx).map(ParseOutput::Fasta);
-            while let Some(record) = stream.next().await {
-                if tx.send(record).await.is_err() {
-                    eprintln!("Failed to send ParseOutput for test_read_known_file_to_db");
-                    break;
-                }
-            }
-        });
-        let mut rx_stream = ReceiverStream::new(rx_parse);
+        let mut rx_stream = ReceiverStream::new(rx);
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
@@ -733,26 +723,17 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = PathBuf::from(temp_file.path());
 
-        let rx = read_and_interleave_sequences(
+        let rx = read_and_interleave_bytes(
             PathBuf::from(TEST_FASTA_PATH),
             None,
             Some(Technology::Illumina),
             500000000,
             None,
             None,
+            100_000,
         )?;
 
-        let (tx, rx_parse) = mpsc::channel(100_000);
-        tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(rx).map(ParseOutput::Fasta);
-            while let Some(record) = stream.next().await {
-                if tx.send(record).await.is_err() {
-                    eprintln!("Failed to send ParseOutput for test_seq_lookup");
-                    break;
-                }
-            }
-        });
-        let mut rx_stream = ReceiverStream::new(rx_parse);
+        let mut rx_stream = ReceiverStream::new(rx);
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
@@ -830,26 +811,17 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = PathBuf::from(temp_file.path());
 
-        let rx = read_and_interleave_sequences(
-            PathBuf::from(TEST_FASTA_TOOLONG_PATH),
+        let rx = read_and_interleave_bytes(
+            PathBuf::from(TEST_FASTA_TOOLONG_PATH), // Fixed to use TEST_FASTA_TOOLONG_PATH
             None,
             Some(Technology::Illumina),
             500000000,
             None,
             None,
+            100_000,
         )?;
 
-        let (tx, rx_parse) = mpsc::channel(100_000);
-        tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(rx).map(ParseOutput::Fasta);
-            while let Some(record) = stream.next().await {
-                if tx.send(record).await.is_err() {
-                    eprintln!("Failed to send ParseOutput for test_read_too_long_to_db");
-                    break;
-                }
-            }
-        });
-        let mut rx_stream = ReceiverStream::new(rx_parse);
+        let mut rx_stream = ReceiverStream::new(rx);
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
