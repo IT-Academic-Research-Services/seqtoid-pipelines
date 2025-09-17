@@ -1,14 +1,13 @@
-use tokio::io::{BufWriter, AsyncWriteExt};
 use std::fs::File;
 use std::sync::Arc;
 use std::io::Write;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
-use crate::utils::streams::ParseOutput;
+
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
-use crate::cli::Technology;
+
 use tokio::task::JoinHandle;
 use std::time::Instant;
 use tokio::fs;
@@ -19,6 +18,10 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
 use fxhash::FxHashMap as FxHashMap;
+use tokio::io::{BufWriter, AsyncWriteExt};
+
+use crate::cli::Technology;
+use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
@@ -2266,6 +2269,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
     drop(temp_files);
 
-    println!("Finished generating consensus genome");
+    println!("Finished generating consensus genome.");
     Ok(())
 }
