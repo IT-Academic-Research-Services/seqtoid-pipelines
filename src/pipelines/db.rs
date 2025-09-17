@@ -8,9 +8,10 @@ use crate::config::defs::{FASTA_EXTS, H5DUMP_TAG};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use crate::cli::Technology;
 use crate::utils::command::version_check;
 use crate::utils::file::{file_path_manipulator, scan_files_with_extensions, extension_remover};
-use crate::utils::fastx::read_and_interleave_sequences;
+use crate::utils::fastx::read_fastq;
 use crate::utils::db::{write_sequences_to_hdf5, build_new_in_memory_index, check_db};
 use crate::utils::streams::{ChildStream, ParseOutput};
 
@@ -107,25 +108,18 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
 
     for multi_path in all_multis {
         eprintln!("Writing from: {}", multi_path.display());
-        let rx = read_and_interleave_sequences(
+
+        let rx = read_fastq(
             multi_path,
             None,
             technology.clone(),
-            config.args.max_reads,
+            config.args.max_reads as u64,
             config.args.min_read_len,
             config.args.max_read_len,
+            100_000,
         )?;
-        let (tx, rx_parse) = mpsc::channel(config.base_buffer_size);
-        tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(rx).map(ParseOutput::Fasta);
-            while let Some(record) = stream.next().await {
-                if tx.send(record).await.is_err() {
-                    eprintln!("Failed to send ParseOutput for multi_path");
-                    break;
-                }
-            }
-        });
-        let mut rx_stream = ReceiverStream::new(rx_parse);
+
+        let mut rx_stream = ReceiverStream::new(rx);
         write_sequences_to_hdf5(&mut rx_stream, &h5_path, None).await?;
     }
 
@@ -137,25 +131,18 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
         let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
         eprintln!("ID in h5 will be: {}", no_ext_sample_base);
 
-        let rx = read_and_interleave_sequences(
+        let rx = read_fastq(
             single_path,
             None,
             technology.clone(),
-            config.args.max_reads,
+            config.args.max_reads as u64,
             config.args.min_read_len,
             config.args.max_read_len,
+            100_000
         )?;
-        let (tx, rx_parse) = mpsc::channel(config.base_buffer_size);
-        tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(rx).map(ParseOutput::Fasta);
-            while let Some(record) = stream.next().await {
-                if tx.send(record).await.is_err() {
-                    eprintln!("Failed to send ParseOutput for single_path");
-                    break;
-                }
-            }
-        });
-        let mut rx_stream = ReceiverStream::new(rx_parse);
+
+
+        let mut rx_stream = ReceiverStream::new(rx);
         write_sequences_to_hdf5(&mut rx_stream, &h5_path, Some(no_ext_sample_base)).await?;
     }
 
