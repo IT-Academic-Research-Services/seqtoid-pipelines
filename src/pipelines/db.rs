@@ -11,7 +11,7 @@ use tokio_stream::StreamExt;
 use crate::cli::Technology;
 use crate::utils::command::version_check;
 use crate::utils::file::{file_path_manipulator, scan_files_with_extensions, extension_remover};
-use crate::utils::fastx::read_and_interleave_bytes;
+use crate::utils::fastx::read_fastq;
 use crate::utils::db::{write_sequences_to_hdf5, build_new_in_memory_index, check_db};
 use crate::utils::streams::{ChildStream, ParseOutput};
 
@@ -109,7 +109,7 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
     for multi_path in all_multis {
         eprintln!("Writing from: {}", multi_path.display());
 
-        let rx = read_and_interleave_bytes(
+        let rx = read_fastq(
             multi_path,
             None,
             technology.clone(),
@@ -131,7 +131,7 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
         let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
         eprintln!("ID in h5 will be: {}", no_ext_sample_base);
 
-        let rx = read_and_interleave_bytes(
+        let rx = read_fastq(
             single_path,
             None,
             technology.clone(),
