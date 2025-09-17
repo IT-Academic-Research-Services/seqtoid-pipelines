@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
 use fxhash::FxHashMap as FxHashMap;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -1976,49 +1976,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // Arguments and files check
-    let file1_path: PathBuf = match &config.args.file1 {
-        Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
-            if file1_full_path.exists() {
-                file1_full_path
-            } else {
-                return Err(PipelineError::FileNotFound(file1_full_path));
-            }
-        }
-        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
-    };
-
-    let sample_base: String;
-    let file1_r1r2 = r1r2_base(&file1_path);
-    sample_base = match file1_r1r2.prefix {
-        Some(prefix) => prefix,
-        None => {
-            eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
-            file1_path.to_string_lossy().into_owned()
-        }
-    };
-
-    if !file1_path.exists() {
-        return Err(PipelineError::FileNotFound(file1_path));
-    }
-
-    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
-    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-
-    let file2_path: Option<PathBuf> = match &config.args.file2 {
-        Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
-            if file2_full_path.exists() {
-                Some(file2_full_path)
-            } else {
-                eprintln!("File2 path does not exist: {}", file2_full_path.display());
-                None
-            }
-        }
-        None => None,
-    };
+    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
     let technology = config.args.technology.clone();
 
@@ -2082,7 +2040,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         config.clone(),
         file1_path,
         file2_path,
-        sample_base_buf.clone(),
+        no_ext_sample_base_buf.clone(),
         &out_dir,
     )
         .await?;

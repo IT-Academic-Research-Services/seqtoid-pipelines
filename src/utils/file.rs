@@ -17,7 +17,8 @@ use tokio::process::Command;
 use tokio_stream::StreamExt;
 use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
-use crate::utils::fastx::SequenceRecord;
+use crate::utils::fastx::{SequenceRecord, r1r2_base};
+use crate::config::defs::{RunConfig, PipelineError};
 
 
 
@@ -453,6 +454,56 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
     });
 
     Ok((task, temp_path, temp_name))
+}
+
+pub fn validate_file_inputs(
+    config: &RunConfig,
+    cwd: &PathBuf,
+) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
+    let file1_path: PathBuf = match &config.args.file1 {
+        Some(file) => {
+            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
+            if file1_full_path.exists() {
+                file1_full_path
+            } else {
+                return Err(PipelineError::FileNotFound(file1_full_path));
+            }
+        }
+        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
+    };
+
+    let sample_base: String;
+    let file1_r1r2 = r1r2_base(&file1_path);
+    sample_base = match file1_r1r2.prefix {
+        Some(prefix) => prefix,
+        None => {
+            eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
+            file1_path.to_string_lossy().into_owned()
+        }
+    };
+
+    if !file1_path.exists() {
+        return Err(PipelineError::FileNotFound(file1_path));
+    }
+
+    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
+    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
+    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
+
+    let file2_path: Option<PathBuf> = match &config.args.file2 {
+        Some(file) => {
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
+            if file2_full_path.exists() {
+                Some(file2_full_path)
+            } else {
+                eprintln!("File2 path does not exist: {}", file2_full_path.display());
+                None
+            }
+        }
+        None => None,
+    };
+
+    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base))
 }
 
 #[cfg(test)]
