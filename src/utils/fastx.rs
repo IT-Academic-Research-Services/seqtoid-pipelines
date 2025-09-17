@@ -358,7 +358,6 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 
 /// Reads a FASTQ file.
 ///
-///
 /// # Arguments
 ///
 /// * `path1` - Valid path to a FASTQ file.
@@ -369,7 +368,7 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 /// * 'max_seq_length' - Reads over this value are discarded.
 /// * 'chunk_size' - Size of segments of input data to be processed.
 /// # Returns
-///  Result<mpsc::Receiver<ParseOutput>>: Byte stream of FASTQ input.
+///  Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<u64, anyhow::Error>>)> : Byte stream of FASTQ input and task handle with read count.
 ///
 pub fn read_fastq(
     path1: PathBuf,
@@ -379,12 +378,14 @@ pub fn read_fastq(
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
     chunk_size: usize,
-) -> Result<mpsc::Receiver<ParseOutput>> {
+) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<u64, anyhow::Error>>)> {
     let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         eprintln!("read_fastq: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
                   path1, path2, max_reads, min_read_len, max_read_len, chunk_size);
+
+        let mut read_count: u64 = 0;
 
         match path2 {
             None => {
@@ -395,7 +396,6 @@ pub fn read_fastq(
                         anyhow!("Failed to open FASTQ {}: {}", path1.display(), e)
                     })?;
                 let mut buffer = Vec::with_capacity(chunk_size);
-                let mut read_count: u64 = 0;
 
                 while let Some(result) = reader.next() {
                     if read_count >= max_reads {
@@ -463,6 +463,7 @@ pub fn read_fastq(
                 if read_count == 0 {
                     eprintln!("read_fastq: Warning: No reads processed from {:?}", path1);
                 }
+                Ok(read_count)
             }
             Some(path2) => {
                 if let Some(Technology::ONT) = technology {
@@ -479,7 +480,6 @@ pub fn read_fastq(
                         anyhow!("Failed to open R2 FASTQ {}: {}", path2.display(), e)
                     })?;
                 let mut buffer = Vec::with_capacity(chunk_size);
-                let mut read_count: u64 = 0;
 
                 loop {
                     if read_count >= max_reads {
@@ -599,12 +599,12 @@ pub fn read_fastq(
                 if read_count == 0 {
                     eprintln!("read_fastq: Warning: No reads processed from R1={:?}, R2={:?}", path1, path2);
                 }
+                Ok(read_count)
             }
         }
-        Ok(())
     });
 
-    Ok(rx)
+    Ok((rx, task))
 }
 
 

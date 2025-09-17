@@ -221,8 +221,8 @@ async fn validate_input(
         Some("validated.fq.gz"),
         "_",
     );
-    
-    let rx = read_fastq(
+
+    let (rx, count_task) = read_fastq(
         file1_path,
         file2_path,
         Some(config.args.technology.clone()),
@@ -284,9 +284,17 @@ async fn validate_input(
         Ok(())
     });
 
+    let count_cleanup_task = tokio::spawn(async move {
+        // don't care about the count value, just need to ensure the task completes
+        if let Err(e) = count_task.await {
+            eprintln!("validate_input: Warning - read_fastq task failed: {}", e);
+        }
+        Ok(())
+    });
+
     Ok((
         ReceiverStream::new(val_fastp_out_stream),
-        vec![val_quast_write_task],
+        vec![val_quast_write_task, count_cleanup_task],
         vec![val_done_rx]
     ))
 }
