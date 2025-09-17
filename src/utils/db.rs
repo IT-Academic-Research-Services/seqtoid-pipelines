@@ -13,7 +13,7 @@ use tokio::fs::File as TokioFile;
 use tokio::io::AsyncWriteExt;
 use crate::utils::file::file_path_manipulator;
 use tokio::time::{timeout, Duration};
-use crate::utils::streams::ParseOutput;
+use crate::utils::streams::{ParseOutput, parse_fasta};
 
 const CHUNK_SIZE: usize = 1000;
 const TEST_FASTA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt.fa");
@@ -586,8 +586,8 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use crate::config::defs::StreamDataType;
-    use crate::utils::fastx::{fastx_generator, read_and_interleave_bytes};
-    use crate::utils::streams::t_junction;
+    use crate::utils::fastx::{fastx_generator, read_fasta};
+    use crate::utils::streams::{t_junction, parse_fasta, ChannelReader};
     use tokio_stream::StreamExt;
     use tokio::sync::mpsc;
 
@@ -597,7 +597,7 @@ mod tests {
         let hdf5_path = PathBuf::from(temp_file.path());
         let stream = fastx_generator(100, 150, 35.0, 3.0).map(ParseOutput::Fastq);
 
-        let (mut outputs, done_rx) = t_junction(
+        let (mut outputs, _done_rx) = t_junction(
             stream,
             1,
             100_000,
@@ -614,7 +614,7 @@ mod tests {
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
-        let file = File::open(hdf5_path).unwrap();
+        let file = File::open(&hdf5_path).unwrap();
         let group = file.group("db").unwrap();
         let seq_dataset = group.dataset("sequences").unwrap();
         let id_dataset = group.dataset("id").unwrap();
@@ -638,7 +638,7 @@ mod tests {
         let hdf5_path = PathBuf::from(temp_file.path());
         let stream = fastx_generator(100, 5000, 35.0, 3.0).map(ParseOutput::Fastq);
 
-        let (mut outputs, done_rx) = t_junction(
+        let (mut outputs, _done_rx) = t_junction(
             stream,
             1,
             100_000,
@@ -655,7 +655,7 @@ mod tests {
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
-        let file = File::open(hdf5_path).unwrap();
+        let file = File::open(&hdf5_path).unwrap();
         let group = file.group("db").unwrap();
         let seq_dataset = group.dataset("sequences").unwrap();
         let id_dataset = group.dataset("id").unwrap();
@@ -681,21 +681,21 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = PathBuf::from(temp_file.path());
 
-        let rx = read_and_interleave_bytes(
+        let rx = read_fasta(
             PathBuf::from(TEST_FASTA_PATH),
-            None,
-            Some(Technology::Illumina),
             500000000,
             None,
             None,
-            100_000,
+            100_000
         )?;
 
-        let mut rx_stream = ReceiverStream::new(rx);
+        let reader = ChannelReader::new(rx);
+        let parsed_rx = parse_fasta(reader, 100_000).await?;
+        let mut rx_stream = ReceiverStream::new(parsed_rx);
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
-        let file = File::open(hdf5_path).unwrap();
+        let file = File::open(&hdf5_path).unwrap();
         let group = file.group("db").unwrap();
         let seq_dataset = group.dataset("sequences").unwrap();
         let id_dataset = group.dataset("id").unwrap();
@@ -723,17 +723,17 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = PathBuf::from(temp_file.path());
 
-        let rx = read_and_interleave_bytes(
+        let rx = read_fasta(
             PathBuf::from(TEST_FASTA_PATH),
-            None,
-            Some(Technology::Illumina),
             500000000,
             None,
             None,
-            100_000,
+            100_000
         )?;
 
-        let mut rx_stream = ReceiverStream::new(rx);
+        let reader = ChannelReader::new(rx);
+        let parsed_rx = parse_fasta(reader, 100_000).await?;
+        let mut rx_stream = ReceiverStream::new(parsed_rx);
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
@@ -765,7 +765,7 @@ mod tests {
         let hdf5_path = PathBuf::from(temp_file.path());
         let stream = fastx_generator(100, 150, 35.0, 3.0).map(ParseOutput::Fastq);
 
-        let (mut outputs, done_rx) = t_junction(
+        let (mut outputs, _done_rx) = t_junction(
             stream,
             1,
             100_000,
@@ -796,7 +796,7 @@ mod tests {
                 Some(&map2_value) => {
                     assert_eq!(map2_value, *value);
                 }
-                None => assert!(false), // Key missing
+                None => assert!(false, "Key missing"),
             }
         }
 
@@ -811,17 +811,17 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let hdf5_path = PathBuf::from(temp_file.path());
 
-        let rx = read_and_interleave_bytes(
-            PathBuf::from(TEST_FASTA_TOOLONG_PATH), // Fixed to use TEST_FASTA_TOOLONG_PATH
-            None,
-            Some(Technology::Illumina),
+        let rx = read_fasta(
+            PathBuf::from(TEST_FASTA_TOOLONG_PATH),
             500000000,
             None,
             None,
-            100_000,
+            100_000
         )?;
 
-        let mut rx_stream = ReceiverStream::new(rx);
+        let reader = ChannelReader::new(rx);
+        let parsed_rx = parse_fasta(reader, 100_000).await?;
+        let mut rx_stream = ReceiverStream::new(parsed_rx);
         let result = write_sequences_to_hdf5(&mut rx_stream, &hdf5_path, None).await;
         assert!(result.is_ok());
 
