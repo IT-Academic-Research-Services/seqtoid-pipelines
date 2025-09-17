@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use std::io;
 
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
@@ -88,6 +89,67 @@ pub enum ParseOutput {
     Fastq(SequenceRecord),
     Fasta(SequenceRecord),
     Bytes(Arc<Vec<u8>>),
+}
+
+/// Converts mpsc::Receiver<ParseOutput> type output to AsyncRead suitable to parse_fasta. parse_fastq.
+pub struct ChannelReader {
+    rx: mpsc::Receiver<ParseOutput>,
+    buffer: Vec<u8>,
+    closed: bool,
+}
+
+impl ChannelReader {
+    pub fn new(rx: mpsc::Receiver<ParseOutput>) -> Self {
+        Self {
+            rx,
+            buffer: Vec::new(),
+            closed: false,
+        }
+    }
+}
+
+impl AsyncRead for ChannelReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if self.closed {
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        // If buffer has data, copy to output
+        if !self.buffer.is_empty() {
+            let to_copy = std::cmp::min(self.buffer.len(), buf.remaining());
+            buf.put_slice(&self.buffer[0..to_copy]);
+            self.buffer.drain(0..to_copy);
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        // Fetch next chunk from channel
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                match item {
+                    ParseOutput::Bytes(bytes) => {
+                        self.buffer = Arc::try_unwrap(bytes).unwrap_or_else(|arc| (*arc).clone());
+                        let to_copy = std::cmp::min(self.buffer.len(), buf.remaining());
+                        buf.put_slice(&self.buffer[0..to_copy]);
+                        self.buffer.drain(0..to_copy);
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    _ => std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Expected ParseOutput::Bytes, got another variant",
+                    ))),
+                }
+            }
+            std::task::Poll::Ready(None) => {
+                self.closed = true;
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 /// Generates any number of output streams from a single input stream.
@@ -225,7 +287,7 @@ where
         // Ensure all receivers process remaining data
         for (i, tx) in output_txs.into_iter() {
             let _ = tx; // Move Sender to drop it, signaling EOF
-            eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
+            // eprintln!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
         }
 
         if let Some(n) = notify {

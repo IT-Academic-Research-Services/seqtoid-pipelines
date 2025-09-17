@@ -83,7 +83,7 @@ mod fastp {
 
     impl ArgGenerator for FastpArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
+            // eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
             let args = &run_config.args;
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
@@ -131,7 +131,7 @@ mod pigz {
 
     impl ArgGenerator for PigzArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for pigz", RunConfig::thread_allocation(run_config, PIGZ_TAG, None));
+            // eprintln!("Allocating {} threads for pigz", RunConfig::thread_allocation(run_config, PIGZ_TAG, None));
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("-c".to_string());
             args_vec.push("-p".to_string());
@@ -171,7 +171,7 @@ mod minimap2 {
 
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
+            // eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
             let args = &run_config.args;
 
             // Expect a single PathBuf for the minimap2 index (.mmi)

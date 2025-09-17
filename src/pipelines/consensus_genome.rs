@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
 use crate::cli::Technology;
-use std::process::Command;
 use tokio::task::JoinHandle;
 use std::time::Instant;
 use tokio::fs;
@@ -17,9 +16,12 @@ use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
+use tokio::sync::{mpsc, oneshot};
+use futures::future::try_join_all;
+use fxhash::FxHashMap as FxHashMap;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_file, write_parse_output_to_temp_fifo, write_vecu8_to_file};
-use crate::utils::fastx::{SequenceRecord, read_and_interleave_bytes, r1r2_base, parse_and_filter_fastq_id, validate_sequence, concatenate_paired_reads, parse_byte_stream_to_fastq, stream_record_counter};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file};
+use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -27,9 +29,6 @@ use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
-use tokio::sync::{mpsc, oneshot};
-use futures::future::try_join_all;
-use fxhash::FxHashMap as FxHashMap;
 use crate::config::defs::RunConfig;
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
@@ -91,7 +90,6 @@ async fn prepare_reference_and_index<'a>(
     ),
     PipelineError,
 > {
-    let start = Instant::now();
     let mut tasks = Vec::new();
     let mut ref_fasta_path: Option<PathBuf> = None;
     let mut ref_temp: Option<NamedTempFile> = None;
@@ -202,7 +200,6 @@ async fn prepare_reference_and_index<'a>(
         }
     };
 
-    eprintln!("{} index preparation took {:?}", ref_type, start.elapsed());
     Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
 }
 
@@ -221,9 +218,8 @@ async fn validate_input(
         Some("validated.fq.gz"),
         "_",
     );
-
-    // Use the new byte-streaming reader
-    let rx = read_and_interleave_bytes(
+    
+    let rx = read_fastq(
         file1_path,
         file2_path,
         Some(config.args.technology.clone()),
@@ -281,7 +277,7 @@ async fn validate_input(
             .map_err(|e| anyhow!("Failed to flush validated FASTQ: {}", e))?;
 
         // Log for correctness (no silent drops)
-        eprintln!("validate_input: Wrote {} bytes to {}", total_bytes, validated_interleaved_file_path.display());
+        // eprintln!("validate_input: Wrote {} bytes to {}", total_bytes, validated_interleaved_file_path.display());
         Ok(())
     });
 
@@ -972,7 +968,6 @@ async fn filter_with_kraken(
     );
     cleanup_tasks.push(filter_task);
 
-    eprintln!("parse_and_filter_fastq_id done");
 
     let (parse_output_tx, parse_output_rx) = mpsc::channel(config.base_buffer_size);
     let conversion_task = tokio::spawn(async move {
@@ -987,7 +982,6 @@ async fn filter_with_kraken(
     });
 
     cleanup_tasks.push(conversion_task);
-    eprintln!("conversion tasks in cleanup");
 
 
 
@@ -1011,7 +1005,7 @@ async fn filter_with_kraken(
                 break; // Exit after first Fastq record
             }
         }
-        eprintln!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
+        // eprintln!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
         check_tx
             .send(if found { 1 } else { 0 })
             .await
@@ -1048,13 +1042,11 @@ async fn filter_with_kraken(
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    eprintln!("streams split");
 
     let check_count = check_rx.recv().await.ok_or_else(|| {
         eprintln!("check_rx.recv failed");
         PipelineError::EmptyStream
     })?;
-    eprintln!("check count: {}", check_count);
 
 
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
@@ -1405,7 +1397,7 @@ async fn generate_consensus(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_consensus_child, samtools_consensus_task, samtools_consensus_err_task) = stream_to_cmd(
+    let (samtools_consensus_child, samtools_consensus_task, samtools_consensus_err_task) = stream_to_cmd(
         config.clone(),
         ReceiverStream::new(trimmed_bam_stream).into_inner(),
         SAMTOOLS_TAG,
@@ -1497,7 +1489,7 @@ async fn call_variants(
             tool: BCFTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    eprintln!("bcftools_mpileup args: {:?}", bcftools_mpileup_args);
+
     let (mut bcftools_mpileup_child, bcftools_mpileup_task, bcftools_mpileup_err_task) = stream_to_cmd(
         config.clone(),
         bam_stream.into_inner(),
@@ -1686,7 +1678,7 @@ async fn realign_consensus_to_ref(
 
 
 
-    Ok((cleanup_tasks))
+    Ok(cleanup_tasks)
 }
 
 
@@ -1943,7 +1935,7 @@ async fn evaluate_assembly(
     cleanup_tasks.push(quast_wait_task);
 
 
-    Ok((cleanup_tasks))
+    Ok(cleanup_tasks)
 }
 
 
@@ -2033,7 +2025,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(PathBuf::from);
 
 
-    let ref_start = Instant::now();
     // Retrieve Index
     let index_start = Instant::now();
     let h5_index = get_index(&config.args)
@@ -2084,10 +2075,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         PipelineError::InvalidConfig("Target FASTA required for filter_with_kraken, call_variants, and evaluate_assembly".to_string())
     })?;
     target_ref_fasta_path = Some(target_fasta.clone());
-    println!("Reference retrieval complete: {} milliseconds.", ref_start.elapsed().as_millis());
 
 
-    let val_start = Instant::now();
     // Input Validation
     let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
         config.clone(),
@@ -2099,10 +2088,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
-    println!("Input validation complete: {} milliseconds.", val_start.elapsed().as_millis());
 
 
-    let host_start = Instant::now();
     // Host Removal
     let no_host_file_path = file_path_manipulator(
         &no_ext_sample_base_buf,
@@ -2150,14 +2137,11 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     };
     stats_tasks.push(no_host_seqkit_task_stats);
     cleanup_tasks.push(no_host_seqkit_err_task_stats);
-    println!("Host removal complete: {} milliseconds.", host_start.elapsed().as_millis());
-
 
     // Split by Technology
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
-            let ercc_start = Instant::now();
             let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = prepare_reference_and_index(
                 &config,
                 None, // No HDF5 for ERCC
@@ -2189,9 +2173,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             ercc_stats_task = ercc_stats_out_task;
             cleanup_tasks.append(&mut ercc_cleanup_tasks);
             cleanup_receivers.append(&mut ercc_cleanup_receivers);
-            println!("ERCC complete: {} milliseconds.", ercc_start.elapsed().as_millis());
 
-            let filter_start = Instant::now();
             // Filter Reads
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
@@ -2204,9 +2186,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 .await?;
             cleanup_tasks.extend(filter_reads_cleanup_tasks);
             cleanup_receivers.extend(filter_reads_cleanup_receivers);
-            println!("Kraken filtering complete: {} milliseconds.", filter_start.elapsed().as_millis());
 
-            let target_start = Instant::now();
             // Align Reads to Target
             let (sam_output_stream, align_cleanup_tasks, align_cleanup_receivers, align_quast_tasks, align_bam_path_inner) = align_to_target(
                 config.clone(),
@@ -2244,9 +2224,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             let align_sam_output_stream = ReceiverStream::new(align_sam_output_stream);
             let align_sam_call_stream = ReceiverStream::new(align_sam_call_stream);
-            println!("Target alignment complete: {} milliseconds.", target_start.elapsed().as_millis());
 
-            let consensus_start = Instant::now();
             // Make Consensus
             let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path_x, consensus_cleanup_tasks, consensus_cleanup_receivers, consensus_quast_tasks) =
                 generate_consensus(config.clone(), align_sam_output_stream, &out_dir, &no_ext_sample_base_buf).await?;
@@ -2255,18 +2233,14 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_receivers.extend(consensus_cleanup_receivers);
             quast_write_tasks.extend(consensus_quast_tasks);
             consensus_stats_stream = Some(consensus_stats_stream_rx);
-            println!("consensus complete: {} milliseconds.", consensus_start.elapsed().as_millis());
 
-            let call_start = Instant::now();
             // Call Variants
             let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) =
                 call_variants(config.clone(), align_sam_call_stream, target_fasta.clone(), &out_dir, &no_ext_sample_base_buf).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
             call_bcftools_stats_stream = Some(call_bcftools_stats_stream_out);
-            println!("call complete: {} milliseconds.", call_start.elapsed().as_millis());
 
-            let realign_start = Instant::now();
             // Realign Consensus to Ref
             let realign_cleanup_tasks = realign_consensus_to_ref(
                 config.clone(),
@@ -2277,14 +2251,12 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             )
                 .await?;
             cleanup_tasks.extend(realign_cleanup_tasks);
-            println!("realign complete: {} milliseconds.", realign_start.elapsed().as_millis());
         }
         Technology::ONT => {
             eprintln!("Technology: ONT not ready");
         }
     }
 
-    let stats_start = Instant::now();
     // Join stats tasks
     let results = try_join_all(stats_tasks)
         .await
@@ -2307,9 +2279,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         technology,
     )
         .await?;
-    println!("stats complete: {} milliseconds.", stats_start.elapsed().as_millis());
 
-    let quast_start = Instant::now();
     // Assembly Evaluation
     let results = try_join_all(quast_write_tasks)
         .await
@@ -2321,7 +2291,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     if let (Some(target_ref_fasta_path), Some(align_bam_path), Some(consensus_file_path)) = (target_ref_fasta_path, align_bam_path, consensus_file_path) {
         evaluate_assembly(config, target_ref_fasta_path, align_bam_path, consensus_file_path).await?;
     }
-    println!("quast complete: {} milliseconds.", quast_start.elapsed().as_millis());
 
 
     // Cleanup
