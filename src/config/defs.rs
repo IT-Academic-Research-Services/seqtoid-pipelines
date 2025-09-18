@@ -158,6 +158,8 @@ pub enum PipelineError {
     FileNotFound(PathBuf),
     #[error("Invalid FASTQ format in {0}")]
     InvalidFastqFormat(String),
+    #[error("I/O error: {0}")]
+    IOError(String),
     #[error("Tool execution failed: {tool} with error: {error}")]
     ToolExecution { tool: String, error: String },
     #[error("Stream data dropped unexpectedly")]

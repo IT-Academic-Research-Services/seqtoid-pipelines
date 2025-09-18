@@ -17,13 +17,14 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
+use futures::TryFutureExt;
 use fxhash::FxHashMap as FxHashMap;
 use tokio::io::{BufWriter, AsyncWriteExt};
 
 use crate::cli::Technology;
 use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -260,29 +261,13 @@ async fn validate_input(
     let val_quast_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     // Write validated interleaved FASTQ to file using byte chunks
-    let val_quast_write_task = tokio::spawn(async move {
-        let mut file = BufWriter::new(
-            TokioFile::create(&validated_interleaved_file_path)
-                .await
-                .map_err(|e| anyhow!("Failed to create validated FASTQ file: {}", e))?,
-        );
-        let mut stream = ReceiverStream::new(val_quast_out_stream);
-        let mut total_bytes = 0;
-
-        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
-            total_bytes += bytes.len() as u64;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| anyhow!("Failed to write to validated FASTQ: {}", e))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush validated FASTQ: {}", e))?;
-
-        // Log for correctness (no silent drops)
-        // eprintln!("validate_input: Wrote {} bytes to {}", total_bytes, validated_interleaved_file_path.display());
-        Ok(())
-    });
+    let val_quast_write_task = write_byte_stream_to_file(
+        &validated_interleaved_file_path,
+        ReceiverStream::new(val_quast_out_stream),
+        Some(config.base_buffer_size),
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     let count_cleanup_task = tokio::spawn(async move {
         // don't care about the count value, just need to ensure the task completes

@@ -506,6 +506,73 @@ pub fn validate_file_inputs(
     Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base))
 }
 
+
+/// Writes a byte-based ParseOutput stream to a regular file asynchronously.
+///
+/// # Arguments
+/// - `output_path`: Path to the output file.
+/// - `input_stream`: A `ReceiverStream` yielding `ParseOutput` items (expects `Bytes` variant).
+/// - `buffer_size`: Optional buffer size for the writer (defaults to 16MB if not provided).
+///
+/// # Returns
+/// A `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
+pub async fn write_byte_stream_to_file(
+    output_path: &PathBuf,
+    mut input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: Option<usize>,
+) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
+    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
+    let output_path_clone = output_path.clone();
+
+    let task = tokio::spawn(async move {
+        let file = TokioFile::create(&output_path_clone)
+            .await
+            .map_err(|e| anyhow!("Failed to create output file at {}: {}",
+                               output_path_clone.display(), e))?;
+        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
+        let mut stream = input_stream;
+        let mut total_bytes = 0u64;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(bytes) => {
+                    writer.write_all(&bytes)
+                        .await
+                        .map_err(|e| anyhow!("Failed to write to {}: {}",
+                                           output_path_clone.display(), e))?;
+                    total_bytes += bytes.len() as u64;
+                }
+                _ => {
+                    // Log unexpected non-Bytes items but continue
+                    eprintln!("write_byte_stream_to_file: Skipping non-Bytes item for {}",
+                              output_path_clone.display());
+                }
+            }
+        }
+
+        writer.flush()
+            .await
+            .map_err(|e| anyhow!("Failed to flush {}: {}",
+                               output_path_clone.display(), e))?;
+        writer.shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown {}: {}",
+                               output_path_clone.display(), e))?;
+
+        if total_bytes == 0 {
+            return Err(anyhow!("No bytes written to file at {}", output_path_clone.display()));
+        }
+
+        // Log for correctness tracking (no silent drops)
+        eprintln!("write_byte_stream_to_file: Wrote {} bytes to {}",
+                  total_bytes, output_path_clone.display());
+
+        Ok(())
+    });
+
+    Ok(task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

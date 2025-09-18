@@ -368,7 +368,7 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 /// * 'max_seq_length' - Reads over this value are discarded.
 /// * 'chunk_size' - Size of segments of input data to be processed.
 /// # Returns
-///  Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<u64, anyhow::Error>>)> : Byte stream of FASTQ input and task handle with read count.
+///  Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<u64, anyhow::Error>>)> : Byte stream of FASTQ input and task handle with validated read count.
 ///
 pub fn read_fastq(
     path1: PathBuf,
@@ -731,31 +731,59 @@ fn extract_id(head: &[u8]) -> &[u8] {
 ///
 /// # Arguments
 ///
-/// * `fastq_path` - Valid path to a fastq file.
+/// * `path1` - R1 or single ended
+/// * `path2` - R2 optional
 ///
 /// # Returns
-/// u64: Number of records in the FASTQ.
+/// Result<u64>: Number of records in the FASTQ.
 ///
-#[allow(dead_code)]
-pub fn record_counter_file(path: &PathBuf) -> io::Result<u64> {
-    let mut counter = 0;
-    match sequence_reader(path)? {
-        SequenceReader::Fasta(mut reader) => {
-            while let Some(result) = reader.next() {
-                result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Error parsing FASTA record: {}", e)))?;
-                counter += 1;
+pub fn raw_read_count(
+    path1: PathBuf,
+    path2: Option<PathBuf>,
+) -> JoinHandle<Result<u64, anyhow::Error>> {
+    tokio::spawn(async move {
+        let count1 = count_fastx_sequences(&path1).await?;
+
+        if let Some(p2) = path2 {
+            let count2 = count_fastx_sequences(&p2).await?;
+            if count1 != count2 {
+                return Err(anyhow!(
+                    "Mismatched read counts in paired files: {} (R1) vs {} (R2)",
+                    count1, count2
+                ));
             }
+            Ok(count1 * 2)
+        } else {
+            Ok(count1)
         }
-        SequenceReader::Fastq(mut reader) => {
-            while let Some(result) = reader.next() {
-                result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Error parsing FASTQ record: {}", e)))?;
-                counter += 1;
-            }
-        }
-    }
-    Ok(counter)
+    })
 }
 
+/// Helper function to count sequences in a single FASTX file using needletail
+///
+///
+/// # Arguments
+///
+/// * `path1` - R1 or single ended
+/// * `path2` - R2 optional
+///
+/// # Returns
+/// Result<u64>: Number of records in the FASTQ.
+///
+async fn count_fastx_sequences(path: &PathBuf) -> Result<u64> {
+    let path_clone = path.clone();
+    let handle: JoinHandle<Result<u64>> = tokio::spawn(async move {
+        let mut reader = parse_fastx_file(&path_clone)
+            .map_err(|e| anyhow!("Failed to open FASTX file {}: {}", path_clone.display(), e))?;
+        let mut count: u64 = 0;
+        while let Some(record) = reader.next() {
+            record.map_err(|e| anyhow!("Parse error at record {}: {}", count + 1, e))?;
+            count += 1;
+        }
+        Ok(count)
+    });
+    handle.await?
+}
 
 /// Generates FASTQ (not yet FASTA) records
 /// # Arguments
