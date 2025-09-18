@@ -4,20 +4,12 @@ use futures::future::try_join_all;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq};
-use crate::utils::streams::{t_junction, ParseOutput};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling};
 
 
-/// Helper function to allow error handling from the counting functions.
-async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyhow::Error>>) -> anyhow::Result<T, PipelineError> {
-    match task.await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(PipelineError::Other(e.into())),
-        Err(join_err) => Err(PipelineError::Other(anyhow::anyhow!("Task failed: {}", join_err))),
-    }
-}
 
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -28,7 +20,7 @@ async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyhow::
 /// * `file1_path` - Path to R1 or single ended FASTQ.
 /// * `file2_path` - Optional path to R2.
 ///  * `sample_base_buf` - PathBuf of sample basename.
-/// * `out_dir` - Base dir four output files.
+/// * `out_dir` - Base dir for output files.
 ///
 /// # Returns
 /// ParseOutput validated interleaved FASTQ stream, vecs of cleaup takss and recoevers, handle for raw and validated read counts.
@@ -38,7 +30,7 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> anyhow::Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<u64, anyhow::Error>>, JoinHandle<anyhow::Result<u64, anyhow::Error>>), PipelineError> {
+) -> anyhow::Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<u64, anyhow::Error>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -64,8 +56,6 @@ async fn validate_input(
         config.base_buffer_size,
     )
         .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
-
-
 
     let val_rx_stream = ReceiverStream::new(rx);
 
@@ -135,13 +125,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(validate_cleanup_receivers);
 
 
-
-
     let raw_count = join_with_error_handling(raw_count_task).await?;
-    println!("Processed {} raw reads (additive from R1 and R2 if paired", raw_count);
+    println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
 
-    let val_count = join_with_error_handling(val_count_task).await?;
-    println!("Processed {} validated, interleaved reads", val_count);
+    let stats = join_with_error_handling(val_count_task).await?;
+    println!("Processed {} validated, {} undersized, {} oversized reads",
+             stats.validated, stats.undersized, stats.oversized);
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)

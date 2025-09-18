@@ -43,6 +43,9 @@ pub struct Arguments {
     pub min_read_len: Option<usize>,
 
     #[arg(long)]
+    pub med_read_len: Option<usize>,
+
+    #[arg(long)]
     pub max_read_len: Option<usize>,
 
     #[arg(long, default_value_t = 64)]

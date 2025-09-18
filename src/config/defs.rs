@@ -89,6 +89,15 @@ pub enum StreamDataType {
     OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
 }
 
+
+// For specifying which read (or read pairs are validated fore size.
+#[derive(Debug)]
+pub struct ReadStats {
+    pub undersized: u64,
+    pub validated: u64,
+    pub oversized: u64,
+}
+
 // Static Filenames
 pub const NUCMER_DELTA: &str = "alignment.delta";
 

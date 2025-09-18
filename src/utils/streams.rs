@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::sync::Notify;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
-use crate::config::defs::StreamDataType;
+use crate::config::defs::{PipelineError, StreamDataType};
 use crate::config::defs::{CoreAllocation, RunConfig};
 
 
@@ -1017,6 +1017,15 @@ pub async fn bytes_to_lines(
     });
 
     Ok((output_rx, task))
+}
+
+/// Helper function to allow error handling from the counting functions.
+pub async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyhow::Error>>) -> anyhow::Result<T, PipelineError> {
+    match task.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(e)) => Err(PipelineError::Other(e.into())),
+        Err(join_err) => Err(PipelineError::Other(anyhow::anyhow!("Task failed: {}", join_err))),
+    }
 }
 
 

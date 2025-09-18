@@ -26,14 +26,14 @@ use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
-use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
+use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
-use crate::config::defs::RunConfig;
+use crate::config::defs::{RunConfig, ReadStats};
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
 use crate::utils::vcf::count_variants_from_bcftools_stats;
@@ -214,7 +214,7 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -223,7 +223,7 @@ async fn validate_input(
         "_",
     );
 
-    let (rx, count_task) = read_fastq(
+    let (rx, val_count_task) = read_fastq(
         file1_path,
         file2_path,
         Some(config.args.technology.clone()),
@@ -269,18 +269,10 @@ async fn validate_input(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let count_cleanup_task = tokio::spawn(async move {
-        // don't care about the count value, just need to ensure the task completes
-        if let Err(e) = count_task.await {
-            eprintln!("validate_input: Warning - read_fastq task failed: {}", e);
-        }
-        Ok(())
-    });
-
     Ok((
         ReceiverStream::new(val_fastp_out_stream),
-        vec![val_quast_write_task, count_cleanup_task],
-        vec![val_done_rx]
+        vec![val_quast_write_task],
+        vec![val_done_rx], val_count_task
     ))
 }
 
@@ -2032,7 +2024,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
     // Input Validation
-    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
+    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, val_count_task) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
@@ -2260,6 +2252,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?
             .map_err(|e| PipelineError::Other(e))?;
     }
+    let _input_read_stats = join_with_error_handling(val_count_task).await?;
     drop(temp_files);
 
     println!("Finished generating consensus genome.");
