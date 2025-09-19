@@ -729,18 +729,15 @@ pub mod bowtie2 {
 
     pub fn bowtie2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
         let input = input_path.as_ref();
-        eprintln!("Processing input: {}", input.display());
 
         if !input.exists() {
             return Err(anyhow!("Input does not exist: {}", input.display()));
         }
 
-        // Handle TAR files - unpack to working directory
         let target_dir = if input.is_file() {
             let unpack_dir = cwd.join("ercc_bt2_index");
             fs::create_dir_all(&unpack_dir)?;
 
-            // Detect and unpack TAR/TAR.GZ
             unpack_tar_if_needed(input, &unpack_dir)?;
             unpack_dir
         } else if input.is_dir() {
@@ -750,10 +747,8 @@ pub mod bowtie2 {
             return Err(anyhow!("Input must be a file (TAR/TAR.GZ) or directory: {}", input.display()));
         };
 
-        // Find the Bowtie2 basename within the target directory
         let basename_path = find_bowtie2_basename(&target_dir)?;
 
-        eprintln!("Bowtie2 -x argument: {}", basename_path.display());
         Ok(basename_path)
     }
 
@@ -767,7 +762,6 @@ pub mod bowtie2 {
             if path.is_file() && is_bt2_file(path) {
                 let parent_dir = path.parent().unwrap_or(path).to_path_buf();
 
-                // Track the directory containing index files
                 match &index_dir {
                     Some(existing_dir) if existing_dir != &parent_dir => {
                         return Err(anyhow!(
@@ -779,7 +773,6 @@ pub mod bowtie2 {
                     _ => {} // Same directory, do nothing
                 }
 
-                // Extract basename (part before first ".")
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     if let Some((base, _suffix)) = stem.split_once('.') {
                         *basenames.entry(base.to_string()).or_insert(0) += 1;
@@ -815,7 +808,6 @@ pub mod bowtie2 {
         // Final validation
         validate_bowtie2_index(&full_basename)?;
 
-        eprintln!("Found {} index files for basename '{}' in: {}", count, basename, index_dir.display());
         Ok(full_basename)
     }
 
@@ -857,7 +849,6 @@ pub mod bowtie2 {
 
         Ok(())
     }
-
 
     fn is_bt2_file(path: &Path) -> bool {
         path.extension()
@@ -909,7 +900,7 @@ pub mod bowtie2 {
             }
 
             args_vec.push("-x".to_string());
-            args_vec.push(run_config.args.ercc_bowtie2_index.to_string());
+            args_vec.push(config.bt2_index_path.to_string_lossy().to_string());
             args_vec.push("-p".to_string());
             let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
             args_vec.push(num_cores.to_string());
