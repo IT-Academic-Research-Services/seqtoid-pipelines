@@ -29,6 +29,9 @@ chrono = "0.4.41"
 thiserror = "2.0.12"
 memchr = "2.7.5"
 needletail = "0.6.3"
+infer = "0.19.0"
+tar = "0.4.44"
+walkdir = "2.5.0"
 
 [dev-dependencies]
 sysinfo = "0.35.0"

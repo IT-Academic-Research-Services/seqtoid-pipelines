@@ -1,15 +1,17 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use futures::future::try_join_all;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling};
-
-
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file};
+use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
+use crate::utils::command::{check_versions, generate_cli};
+use crate::utils::command::samtools::SamtoolsConfig;
 
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -94,6 +96,70 @@ async fn validate_input(
 }
 
 
+/// Pre-filters ERCC reads from the input stream
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Raw byte FASTQ stream
+///
+/// # Returns
+///
+async fn ercc_bowtie2_filter(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from
+    bt2_index_path: PathBuf,
+
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>), PipelineError>{
+
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let ercc_bt2_config_view = Bowtie2Config{
+        bt2_index_path: bt2_index_path.clone(),
+        option_fields: HashMap::from([]),
+    };
+
+    let ercc_bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&ercc_bt2_config_view))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut ercc_bt2_child, ercc_bt2_stream_task, ercc_bt2_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        BOWTIE2_TAG,
+        ercc_bt2_args,
+        StreamDataType::JustBytes, // FASTQ bytes
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(ercc_bt2_stream_task);
+    cleanup_tasks.push(ercc_bt2_err_task);
+
+    let ercc_bt2_out_stream = {
+        let mut guard = ercc_bt2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BOWTIE2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    Ok((ReceiverStream::new(ercc_bt2_out_stream),  cleanup_tasks, cleanup_receivers))
+}
+
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -109,11 +175,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
 
+    // External tools check
+    check_versions(vec![
+    BOWTIE2_TAG,
+    HISAT2_TAG
+    ])
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
 
     // Input Validation
-    let (val_ercc_bowtie2_filter_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
+    let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
@@ -123,6 +197,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
+
+
+    let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
+
+
+    let (ercc_bt2_out_stream, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = ercc_bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path).await?;
+    cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
+    cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
+
+
+    let test_write_task = tokio::spawn(stream_to_file(
+        ercc_bt2_out_stream.into_inner(),
+        PathBuf::from("test.fq"),
+    ));
+    test_write_task.await;
 
 
     let raw_count = join_with_error_handling(raw_count_task).await?;

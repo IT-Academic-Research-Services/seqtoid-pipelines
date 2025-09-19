@@ -116,5 +116,8 @@ pub struct Arguments {
 
     #[arg(long, default_value = "artic_v3_primers.bed")]
     pub primer_bed_path : Option<String>,
+
+    #[arg(long, default_value = "ercc.bowtie2.tar")]
+    pub ercc_bowtie2_index : String,
     
 }

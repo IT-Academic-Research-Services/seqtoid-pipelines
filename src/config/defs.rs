@@ -25,6 +25,7 @@ pub const NUCMER_TAG: &str = "nucmer";
 pub const SHOW_COORDS_TAG: &str = "show-coords";
 pub const SEQKIT_TAG: &str = "seqkit";
 pub const BOWTIE2_TAG: &str = "bowtie2";
+pub const HISAT2_TAG: &str = "hisat2";
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -38,6 +39,7 @@ lazy_static! {
         m.insert(MAFFT_TAG, 7.5);
         m.insert(QUAST_TAG, 5.20);
         m.insert(SEQKIT_TAG, 2.10);
+        m.insert(BOWTIE2_TAG, 2.50);
         m
     };
 }
