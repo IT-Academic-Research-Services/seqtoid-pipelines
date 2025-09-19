@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG};
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -702,6 +702,60 @@ pub mod seqkit {
     }
 }
 
+pub mod bowtie2 {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use anyhow::anyhow;
+    use crate::config::defs::{RunConfig, BOWTIE2_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    pub struct Bowtie2Config {
+        pub bt2_index: PathBuf,
+        pub option_fields: HashMap<String, Option<String>>
+    }
+
+    pub struct Bowtie2ArgGenerator;
+
+    pub async fn bowtie2_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(BOWTIE2_TAG,vec!["-h"], 0, 3 , ChildStream::Stderr).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for Bowtie2ArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<Bowtie2Config>())
+                .ok_or_else(|| anyhow!("Bowtie requires a Bowtie2Config as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
+
+            args_vec.push("-x".to_string());
+            args_vec.push(config.bt2_index.to_string_lossy().to_string());
+            args_vec.push("-p".to_string());
+            let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--interleaved".to_string());  // NB: set up to only take interleaved stdin
+            args_vec.push("-".to_string());
+
+
+            Ok(args_vec)
+        }
+    }
+
+
+
+
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -737,6 +791,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             QUAST_TAG => quast::quast_presence_check().await,
             NUCMER_TAG => nucmer::nucmer_presence_check().await,
             SEQKIT_TAG => seqkit::seqkit_presence_check().await,
+
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
         Ok((tool.to_string(), version))
