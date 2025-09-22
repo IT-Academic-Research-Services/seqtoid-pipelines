@@ -215,6 +215,8 @@ async fn validate_input(
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -257,22 +259,52 @@ async fn validate_input(
 
     // Consume Vec to get Receivers
     let mut val_streams_iter = val_streams.into_iter();
-    let val_fastp_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let val_quast_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_pigz_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Write validated interleaved FASTQ to file using byte chunks
-    let val_quast_write_task = write_byte_stream_to_file(
-        &validated_interleaved_file_path,
-        ReceiverStream::new(val_quast_out_stream),
-        Some(config.base_buffer_size),
+    let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        val_pigz_stream,
+        PIGZ_TAG,
+        val_pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
     )
         .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(val_pigz_stream_task);
+    cleanup_tasks.push(val_pigz_err_task);
+
+    let val_pigz_out_stream = {
+        let mut guard = val_pigz_child.lock().await;
+        parse_child_output(
+            &mut guard, // Pass locked Child
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    let val_pigz_write_task = tokio::spawn(stream_to_file(val_pigz_out_stream, validated_interleaved_file_path));
+    cleanup_tasks.push(val_pigz_write_task);
 
     Ok((
-        ReceiverStream::new(val_fastp_out_stream),
-        vec![val_quast_write_task],
-        vec![val_done_rx], val_count_task
+        ReceiverStream::new(val_out_stream),
+        cleanup_tasks,
+        cleanup_receivers, val_count_task
     ))
 }
 
