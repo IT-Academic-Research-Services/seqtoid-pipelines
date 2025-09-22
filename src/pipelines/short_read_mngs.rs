@@ -204,6 +204,61 @@ async fn ercc_bowtie2_filter(
     };
 
 
+    let (ercc_bam_streams, ercc_bam_done_rx) = t_junction(
+        ReceiverStream::new(ercc_samtools_sort_out_stream),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,  // Semantically FASTQ bytes
+        "ercc_bam_split".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(ercc_bam_done_rx);
+
+
+    let mut ercc_bam_streams_iter = ercc_bam_streams.into_iter();
+    let ercc_bam_count_stream = ercc_bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let ercc_unmapped_stream = ercc_bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    //Count mapped reads to ERCC index
+    let mapped_count_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
+    let samtools_count_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([
+            ("-c".to_string(), None), // Count reads, don't pass anything else
+            (mapped_count_flag, None),
+            ("-".to_string(), None),
+        ]),
+    };
+    let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut count_child, count_stream_task, count_err_task) = stream_to_cmd(
+        config.clone(),
+        ercc_bam_count_stream,
+        SAMTOOLS_TAG,
+        samtools_count_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(count_stream_task);
+    cleanup_tasks.push(count_err_task);
+
+
+
+
     Ok((ReceiverStream::new(ercc_samtools_sort_out_stream),  cleanup_tasks, cleanup_receivers))
 }
 
