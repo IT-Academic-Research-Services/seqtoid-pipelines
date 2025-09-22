@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
-use crate::utils::fastx::{raw_read_count, read_fastq};
+use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
@@ -316,12 +317,12 @@ async fn ercc_bowtie2_filter(
             })?
     };
 
-    Ok((ReceiverStream::new(ercc_unmapped_fastq_stream), ercc_count_rx , cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(ercc_unmapped_fastq_stream), ercc_count_rx, cleanup_tasks, cleanup_receivers))
 }
 
 
 
-/// Pre-filters ERCC reads from the input stream
+/// QC's input stream using FASTP
 ///
 /// # Arguments
 ///
@@ -333,7 +334,7 @@ async fn ercc_bowtie2_filter(
 async fn fastp_qc(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
-) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError>{
+) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, oneshot::Receiver<Result<u64, anyhow::Error>>), PipelineError>{
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -372,7 +373,7 @@ async fn fastp_qc(
     cleanup_tasks.push(qc_fastp_stream_task);
     cleanup_tasks.push(qc_fastp_err_task);
 
-    let qc_fastp_out_stream ={
+    let qc_fastp_out_stream = {
         let mut guard = qc_fastp_child.lock().await;
         parse_child_output(
             &mut guard,
@@ -387,7 +388,48 @@ async fn fastp_qc(
             })?
     };
 
-    Ok((ReceiverStream::new(qc_fastp_out_stream), cleanup_tasks, cleanup_receivers))
+    // Tee the byte stream for counting
+    let tee_count_input = ReceiverStream::new(qc_fastp_out_stream);
+    let (mut tee_count_streams, tee_count_done_rx) = t_junction(
+        tee_count_input,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "fastp_count".to_string(),
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: "t_junction".to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_receivers.push(tee_count_done_rx);
+
+    let mut tee_count_streams_iter = tee_count_streams.into_iter();
+    let qc_out_stream = tee_count_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let qc_count_stream = tee_count_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (count_tx, count_result_rx) = oneshot::channel::<Result<u64, anyhow::Error>>();
+
+    let count_task = tokio::spawn(async move {
+        match stream_record_counter(qc_count_stream, false).await {
+            Ok(count) => {
+                eprintln!("Fastp output reads: {}", count);
+                let _ = count_tx.send(Ok(count)); // Send the count result
+                Ok(())
+            }
+            Err(e) => {
+                let _ = count_tx.send(Err(e));
+                Err(anyhow!("Failed to count fastp output reads"))
+            },
+        }
+    });
+    cleanup_tasks.push(count_task);
+
+    Ok((ReceiverStream::new(qc_out_stream), cleanup_tasks, cleanup_receivers, count_result_rx))
 }
 
 /// Run function for Short Read mNGS pipelines
@@ -437,7 +479,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
 
 
-    let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers) = fastp_qc(config.clone(), ercc_bt2_out_stream).await?;
+    let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) = fastp_qc(config.clone(), ercc_bt2_out_stream).await?;
     cleanup_tasks.extend(qc_cleanup_tasks);
     cleanup_receivers.extend(qc_cleanup_receivers);
 
@@ -458,6 +500,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let stats = join_with_error_handling(val_count_task).await?;
     println!("Processed {} validated, {} undersized, {} oversized reads",
              stats.validated, stats.undersized, stats.oversized);
+
+
+    let _qc_fastp_read_count = match qc_count_result_rx.await {
+        Ok(Ok(count)) => {
+            eprintln!("Received fastp read count: {}", count);
+            count
+        }
+        Ok(Err(e)) => {
+            eprintln!("Error getting fastp read count: {}", e);
+            0
+        }
+        Err(e) => {
+            eprintln!("Count receiver dropped: {}", e);
+            0
+        }
+    };
+
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
