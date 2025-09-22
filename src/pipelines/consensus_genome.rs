@@ -27,7 +27,7 @@ use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
-use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
+use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
@@ -238,7 +238,7 @@ async fn validate_input(
 
     let val_rx_stream = ReceiverStream::new(rx);
 
-    // Split the byte stream for fastp and quast write
+    // Split the byte stream for output and quast write
     let (val_streams, val_done_rx) = t_junction(
         val_rx_stream,
         2,
@@ -312,7 +312,7 @@ async fn validate_input(
 
 async fn align_to_host(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from fastp
+    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream
     host_index_path: PathBuf,  // minimap2 .mmi index file
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
@@ -1985,7 +1985,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     check_versions(vec![
         SAMTOOLS_TAG,
         MINIMAP2_TAG,
-        FASTP_TAG,
         SAMTOOLS_TAG,
         KRAKEN2_TAG,
         BCFTOOLS_TAG,
@@ -2056,7 +2055,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
     // Input Validation
-    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, val_count_task) = validate_input(
+    let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, val_count_task) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
@@ -2079,7 +2078,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let (no_host_output_stream, no_host_seqkit_out_stream_stats, no_host_cleanup_tasks, no_host_cleanup_receivers) = align_to_host(
         config.clone(),
-        val_fastp_out_stream,
+        val_out_stream,
         host_ref_index_path,
         no_host_file_path,
     )
