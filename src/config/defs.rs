@@ -24,6 +24,8 @@ pub const QUAST_TAG: &str = "quast.py";
 pub const NUCMER_TAG: &str = "nucmer";
 pub const SHOW_COORDS_TAG: &str = "show-coords";
 pub const SEQKIT_TAG: &str = "seqkit";
+pub const BOWTIE2_TAG: &str = "bowtie2";
+pub const HISAT2_TAG: &str = "hisat2";
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -37,6 +39,7 @@ lazy_static! {
         m.insert(MAFFT_TAG, 7.5);
         m.insert(QUAST_TAG, 5.20);
         m.insert(SEQKIT_TAG, 2.10);
+        m.insert(BOWTIE2_TAG, 2.50);
         m
     };
 }
@@ -89,6 +92,15 @@ pub enum StreamDataType {
     OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
 }
 
+
+// For specifying which read (or read pairs are validated fore size.
+#[derive(Debug)]
+pub struct ReadStats {
+    pub undersized: u64,
+    pub validated: u64,
+    pub oversized: u64,
+}
+
 // Static Filenames
 pub const NUCMER_DELTA: &str = "alignment.delta";
 
@@ -116,7 +128,7 @@ pub struct RunConfig {
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
-            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _)  => CoreAllocation::Maximal,  // Keep as-is for full potential
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) | (BOWTIE2_TAG, _)  => CoreAllocation::Maximal,  // Keep as-is for full potential
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _)  => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
@@ -158,6 +170,8 @@ pub enum PipelineError {
     FileNotFound(PathBuf),
     #[error("Invalid FASTQ format in {0}")]
     InvalidFastqFormat(String),
+    #[error("I/O error: {0}")]
+    IOError(String),
     #[error("Tool execution failed: {tool} with error: {error}")]
     ToolExecution { tool: String, error: String },
     #[error("Stream data dropped unexpectedly")]

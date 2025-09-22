@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG};
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -65,15 +65,19 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
     Ok(version)
 }
 
-mod fastp {
+pub mod fastp {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
-    use tokio::process::Command;
-    use crate::config::defs::{FASTP_TAG, KRAKEN2_TAG, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::config::defs::{FASTP_TAG,  RunConfig};
+    use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
+    #[derive(Debug)]
+    pub struct FastpConfig {
+        pub command_fields: HashMap<String, Option<String>>,
+    }
     pub struct FastpArgGenerator;
 
     pub async fn fastp_presence_check() -> Result<f32> {
@@ -82,14 +86,18 @@ mod fastp {
     }
 
     impl ArgGenerator for FastpArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             // eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
+
+            let config = extra
+                .and_then(|e| e.downcast_ref::<FastpConfig>())
+                .ok_or_else(|| anyhow!("FASTP requires a FaspConfig as extra argument"))?;
+
             let args = &run_config.args;
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
             args_vec.push("--interleaved_in".to_string());
-            args_vec.push("--dont_eval_duplication".to_string());
             args_vec.push("-q".to_string());
             args_vec.push(args.quality.to_string());
 
@@ -110,6 +118,13 @@ mod fastp {
                 }
                 args_vec.push("--adapter_fasta".to_string());
                 args_vec.push(adapter_path.to_string_lossy().into_owned());
+            }
+
+            for (key, value) in config.command_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
             }
 
             Ok(args_vec)
@@ -702,6 +717,241 @@ pub mod seqkit {
     }
 }
 
+pub mod bowtie2 {
+    use std::path::{Path, PathBuf};
+    use std::{fs, io::{self, Read, Seek, SeekFrom}, collections::HashMap};
+    use anyhow::{anyhow, Result};
+    use infer;
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+    use walkdir::WalkDir;
+    use crate::config::defs::{RunConfig, BOWTIE2_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    pub struct Bowtie2Config {
+        pub bt2_index_path: PathBuf,
+        pub option_fields: HashMap<String, Option<String>>
+    }
+
+    pub struct Bowtie2ArgGenerator;
+
+    pub async fn bowtie2_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(BOWTIE2_TAG,vec!["-h"], 0, 3 , ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+
+    pub fn bowtie2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+        let input = input_path.as_ref();
+
+        if !input.exists() {
+            return Err(anyhow!("Input does not exist: {}", input.display()));
+        }
+
+        let target_dir = if input.is_file() {
+            let unpack_dir = cwd.join("ercc_bt2_index");
+            fs::create_dir_all(&unpack_dir)?;
+
+            unpack_tar_if_needed(input, &unpack_dir)?;
+            unpack_dir
+        } else if input.is_dir() {
+            // Already a directory - use it directly
+            input.to_path_buf()
+        } else {
+            return Err(anyhow!("Input must be a file (TAR/TAR.GZ) or directory: {}", input.display()));
+        };
+
+        let basename_path = find_bowtie2_basename(&target_dir)?;
+
+        Ok(basename_path)
+    }
+
+    fn find_bowtie2_basename(dir: &Path) -> Result<PathBuf> {
+        let mut basenames: HashMap<String, usize> = HashMap::new();
+        let mut index_dir: Option<PathBuf> = None;
+
+        // Walk up to 2 levels deep to find .bt2 files
+        for entry in WalkDir::new(dir).max_depth(2).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file() && is_bt2_file(path) {
+                let parent_dir = path.parent().unwrap_or(path).to_path_buf();
+
+                match &index_dir {
+                    Some(existing_dir) if existing_dir != &parent_dir => {
+                        return Err(anyhow!(
+                        "Index files found in multiple directories: {} and {}",
+                        existing_dir.display(), parent_dir.display()
+                    ));
+                    }
+                    None => index_dir = Some(parent_dir.clone()),
+                    _ => {} // Same directory, do nothing
+                }
+
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Some((base, _suffix)) = stem.split_once('.') {
+                        *basenames.entry(base.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let index_dir = index_dir.ok_or_else(||
+            anyhow!("No Bowtie2 index files (.bt2/.bt2l) found in: {}", dir.display())
+        )?;
+
+        if basenames.is_empty() {
+            return Err(anyhow!("No valid Bowtie2 index files found"));
+        }
+
+        if basenames.len() > 1 {
+            return Err(anyhow!(
+            "Multiple possible basenames found ({}): {:?}",
+            basenames.len(),
+            basenames.keys().collect::<Vec<_>>()
+        ));
+        }
+
+        let (basename, count) = basenames.into_iter().next().unwrap();
+
+        if count < 2 {
+            return Err(anyhow!("Insufficient index files found for basename '{}': {}", basename, count));
+        }
+
+        let full_basename = index_dir.join(&basename);  // <-- Borrow with &
+
+        // Final validation
+        validate_bowtie2_index(&full_basename)?;
+
+        Ok(full_basename)
+    }
+
+    fn unpack_tar_if_needed(tar_file: &Path, unpack_dir: &Path) -> Result<()> {
+        let kind_opt = infer::get_from_path(tar_file)?;
+
+        match kind_opt.as_ref().map(|k| k.mime_type()) {
+            Some("application/x-tar") => {
+                eprintln!("Unpacking plain TAR: {}", tar_file.display());
+                let file = fs::File::open(tar_file)?;
+                let mut archive = tar::Archive::new(file);
+                archive.unpack(unpack_dir)?;
+            }
+            Some("application/gzip") => {
+                eprintln!("Unpacking GZIP TAR: {}", tar_file.display());
+                // Verify it's a TAR inside GZIP
+                let mut file = fs::File::open(tar_file)?;
+                let mut header = [0u8; 512];
+                let mut decoder = flate2::read::GzDecoder::new(&mut file);
+                if decoder.read_exact(&mut header).is_err() {
+                    return Err(anyhow!("Invalid GZIP file: {}", tar_file.display()));
+                }
+                if &header[257..262] != b"ustar" || (header[262] != b' ' as u8 && header[262] != 0) {
+                    return Err(anyhow!("GZIP file is not a TAR archive: {}", tar_file.display()));
+                }
+
+                // Full unpack
+                drop(decoder);
+                let file = fs::File::open(tar_file)?;
+                let decoder = flate2::read::GzDecoder::new(file);
+                let mut archive = tar::Archive::new(decoder);
+                archive.unpack(unpack_dir)?;
+            }
+            _ => return Err(anyhow!(
+            "Unsupported file type. Expected TAR or TAR.GZ, got: {:?}",
+            kind_opt.map(|k| k.mime_type())
+        )),
+        }
+
+        Ok(())
+    }
+
+    fn is_bt2_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map_or(false, |ext| ext == "bt2" || ext == "bt2l")
+    }
+
+    fn validate_bowtie2_index(basename: &Path) -> Result<()> {
+        let forward1_bt2 = basename.with_extension("1.bt2");
+        let forward1_bt2l = basename.with_extension("1.bt2l");
+        let rev1_bt2 = basename.with_extension("rev.1.bt2");
+        let rev1_bt2l = basename.with_extension("rev.1.bt2l");
+
+        let has_forward = forward1_bt2.exists() || forward1_bt2l.exists();
+        let has_reverse = rev1_bt2.exists() || rev1_bt2l.exists();
+
+        if !has_forward {
+            return Err(anyhow!(
+            "Missing forward index file: {} or {}",
+            forward1_bt2.display(), forward1_bt2l.display()
+        ));
+        }
+        if !has_reverse {
+            return Err(anyhow!(
+            "Missing reverse index file: {} or {}",
+            rev1_bt2.display(), rev1_bt2l.display()
+        ));
+        }
+
+        Ok(())
+    }
+
+
+
+    impl ArgGenerator for Bowtie2ArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<Bowtie2Config>())
+                .ok_or_else(|| anyhow!("Bowtie requires a Bowtie2Config as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(format!("{}", key));
+                match value {
+                    Some(v) => args_vec.push(format!("{}", v)),
+                    None => { },
+                }
+            }
+
+            args_vec.push("-x".to_string());
+            args_vec.push(config.bt2_index_path.to_string_lossy().to_string());
+            args_vec.push("-p".to_string());
+            let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--interleaved".to_string());  // NB: set up to only take interleaved stdin
+            args_vec.push("-".to_string());
+
+
+            Ok(args_vec)
+        }
+    }
+}
+
+pub mod hisat2 {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use crate::config::defs::{RunConfig, HISAT2_TAG};
+    use crate::utils::command::version_check;
+    use crate::utils::streams::ChildStream;
+
+    pub struct Hisat2Config {
+        pub hisat2_index: PathBuf,
+        pub option_fields: HashMap<String, Option<String>>
+    }
+
+    // pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
+    //     let version = version_check(HISAT2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout).await?;
+    //     Ok(version)
+    // }
+    pub async fn hisat2_presence_check() -> anyhow::Result<f32> { // Done because for some insane reason the homebrew version skips reporting version numbers
+        Ok(2.50)
+    }
+
+
+
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -716,6 +966,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         QUAST_TAG => Box::new(quast::QuastArgGenerator),
         SEQKIT_TAG => Box::new(seqkit::SeqkitArgGenerator),
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
+        BOWTIE2_TAG => Box::new(bowtie2::Bowtie2ArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -737,6 +988,9 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             QUAST_TAG => quast::quast_presence_check().await,
             NUCMER_TAG => nucmer::nucmer_presence_check().await,
             SEQKIT_TAG => seqkit::seqkit_presence_check().await,
+            BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
+            HISAT2_TAG => hisat2::hisat2_presence_check().await,
+
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
         Ok((tool.to_string(), version))

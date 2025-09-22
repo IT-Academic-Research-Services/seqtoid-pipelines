@@ -1,6 +1,7 @@
 mod pipelines;
 mod utils;
 mod config;
+mod cli;
 
 use std::time::{Instant, SystemTime};
 use std::{env, fs};
@@ -16,21 +17,19 @@ use num_cpus;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
 use rayon::ThreadPoolBuilder;
+use tokio::process::Command as TokioCommand;
+use tokio::time::{sleep, Duration};
+use std::process::Output;
 
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
 use crate::utils::file::file_path_manipulator;
+use crate::utils::fastx::r1r2_base;
 use pipelines::consensus_genome;
 use pipelines::db;
-use crate::utils::fastx::r1r2_base;
+use pipelines::short_read_mngs;
 
-// Add these imports for I/O monitoring
-use tokio::process::Command as TokioCommand;
-use tokio::time::{sleep, Duration};
-use std::process::Output;
-
-mod cli;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -81,12 +80,12 @@ async fn main() -> Result<()> {
         input_size_mb
     });
 
-    // // Add I/O monitoring task here (background spawn)
     // let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"
 
     if let Err(e) = match module.as_str() {
-        "consensus_genome" => consensus_genome_run(run_config.clone()).await,
+        "consensus_genome" => consensus_genome_run(run_config).await,
         "create_db" => create_db_run(&run_config).await,
+        "short_read_mngs" => short_read_mngs_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
         eprintln!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
@@ -100,7 +99,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// New function: Async I/O monitor
 async fn monitor_io_utilization(device: String) {
     loop {
         match run_iostat(&device).await {
@@ -152,6 +150,10 @@ async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), Pipeline
 async fn create_db_run(run_config: &RunConfig) -> Result<(), PipelineError> {
     db::create_db(run_config).await
         .map_err(|e| PipelineError::Other(e.into()))
+}
+
+async fn short_read_mngs_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    short_read_mngs::run(run_config).await
 }
 
 /// Sets up output directory

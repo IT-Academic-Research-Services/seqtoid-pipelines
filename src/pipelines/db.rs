@@ -3,7 +3,8 @@ use anyhow::anyhow;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Instant;
-use crate::config::defs::RunConfig;
+use futures::future::try_join_all;
+use crate::config::defs::{PipelineError, RunConfig};
 use crate::config::defs::{FASTA_EXTS, H5DUMP_TAG};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -29,6 +30,7 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
     println!("\n-------------\n Create DB\n-------------\n");
     println!("Generating HDF5 DB");
     let start = Instant::now();
+    let mut cleanup_tasks = Vec::new();
 
     let h5v = version_check(H5DUMP_TAG, vec!["-V"], 0, 2, ChildStream::Stdout).await?;
     eprintln!("HDF5 version: {}", h5v);
@@ -109,7 +111,7 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
     for multi_path in all_multis {
         eprintln!("Writing from: {}", multi_path.display());
 
-        let rx = read_fastq(
+        let (rx, count_task) = read_fastq(
             multi_path,
             None,
             technology.clone(),
@@ -119,6 +121,13 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
             100_000,
         )?;
 
+        let multi_count_cleanup_task = tokio::spawn(async move {
+            if let Err(e) = count_task.await {
+                eprintln!("create_db: Warning - read_fastq task failed for multi-sample: {}", e);
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        cleanup_tasks.push(multi_count_cleanup_task);
         let mut rx_stream = ReceiverStream::new(rx);
         write_sequences_to_hdf5(&mut rx_stream, &h5_path, None).await?;
     }
@@ -131,8 +140,8 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
         let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
         eprintln!("ID in h5 will be: {}", no_ext_sample_base);
 
-        let rx = read_fastq(
-            single_path,
+        let (rx, count_task) = read_fastq(
+            single_path.clone(),
             None,
             technology.clone(),
             config.args.max_reads as u64,
@@ -141,6 +150,13 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
             100_000
         )?;
 
+        let single_count_cleanup_task = tokio::spawn(async move {
+            if let Err(e) = count_task.await {
+                eprintln!("create_db: Warning - read_fastq task failed for single-sample {}: {}", single_path.display(), e);
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        cleanup_tasks.push(single_count_cleanup_task);
 
         let mut rx_stream = ReceiverStream::new(rx);
         write_sequences_to_hdf5(&mut rx_stream, &h5_path, Some(no_ext_sample_base)).await?;
@@ -153,6 +169,13 @@ pub async fn create_db(config: &RunConfig) -> anyhow::Result<()> {
 
     println!("Created DB File: {}", h5_path.display());
     println!("Created DB Index: {}", index_path.display());
+
+    // Cleanup
+    for task in cleanup_tasks {
+        if let Err(e) = task.await {
+            eprintln!("create_db: Cleanup task failed: {}", e);
+        }
+    }
 
     let elapsed = start.elapsed();
     let elapsed_secs = elapsed.as_secs_f64();

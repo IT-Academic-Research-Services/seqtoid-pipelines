@@ -1,14 +1,13 @@
-use tokio::io::{BufWriter, AsyncWriteExt};
 use std::fs::File;
 use std::sync::Arc;
 use std::io::Write;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
-use crate::utils::streams::ParseOutput;
+
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
-use crate::cli::Technology;
+
 use tokio::task::JoinHandle;
 use std::time::Instant;
 use tokio::fs;
@@ -18,18 +17,23 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
+use futures::TryFutureExt;
 use fxhash::FxHashMap as FxHashMap;
+use tokio::io::{BufWriter, AsyncWriteExt};
+
+use crate::cli::Technology;
+use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
-use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
-use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
+use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
+use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::db::{get_index, retrieve_h5_seq};
-use crate::config::defs::RunConfig;
+use crate::config::defs::{RunConfig, ReadStats};
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
 use crate::utils::vcf::count_variants_from_bcftools_stats;
@@ -210,7 +214,9 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -218,8 +224,8 @@ async fn validate_input(
         Some("validated.fq.gz"),
         "_",
     );
-    
-    let rx = read_fastq(
+
+    let (rx, val_count_task) = read_fastq(
         file1_path,
         file2_path,
         Some(config.args.technology.clone()),
@@ -232,7 +238,7 @@ async fn validate_input(
 
     let val_rx_stream = ReceiverStream::new(rx);
 
-    // Split the byte stream for fastp and quast write
+    // Split the byte stream for output and quast write
     let (val_streams, val_done_rx) = t_junction(
         val_rx_stream,
         2,
@@ -253,38 +259,52 @@ async fn validate_input(
 
     // Consume Vec to get Receivers
     let mut val_streams_iter = val_streams.into_iter();
-    let val_fastp_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let val_quast_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_pigz_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Write validated interleaved FASTQ to file using byte chunks
-    let val_quast_write_task = tokio::spawn(async move {
-        let mut file = BufWriter::new(
-            TokioFile::create(&validated_interleaved_file_path)
-                .await
-                .map_err(|e| anyhow!("Failed to create validated FASTQ file: {}", e))?,
-        );
-        let mut stream = ReceiverStream::new(val_quast_out_stream);
-        let mut total_bytes = 0;
+    let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        val_pigz_stream,
+        PIGZ_TAG,
+        val_pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(val_pigz_stream_task);
+    cleanup_tasks.push(val_pigz_err_task);
 
-        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
-            total_bytes += bytes.len() as u64;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| anyhow!("Failed to write to validated FASTQ: {}", e))?;
-        }
-        file.flush()
+    let val_pigz_out_stream = {
+        let mut guard = val_pigz_child.lock().await;
+        parse_child_output(
+            &mut guard, // Pass locked Child
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
             .await
-            .map_err(|e| anyhow!("Failed to flush validated FASTQ: {}", e))?;
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
-        // Log for correctness (no silent drops)
-        // eprintln!("validate_input: Wrote {} bytes to {}", total_bytes, validated_interleaved_file_path.display());
-        Ok(())
-    });
+    let val_pigz_write_task = tokio::spawn(stream_to_file(val_pigz_out_stream, validated_interleaved_file_path));
+    cleanup_tasks.push(val_pigz_write_task);
 
     Ok((
-        ReceiverStream::new(val_fastp_out_stream),
-        vec![val_quast_write_task],
-        vec![val_done_rx]
+        ReceiverStream::new(val_out_stream),
+        cleanup_tasks,
+        cleanup_receivers, val_count_task
     ))
 }
 
@@ -292,7 +312,7 @@ async fn validate_input(
 
 async fn align_to_host(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from fastp
+    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream
     host_index_path: PathBuf,  // minimap2 .mmi index file
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
@@ -1965,7 +1985,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     check_versions(vec![
         SAMTOOLS_TAG,
         MINIMAP2_TAG,
-        FASTP_TAG,
         SAMTOOLS_TAG,
         KRAKEN2_TAG,
         BCFTOOLS_TAG,
@@ -1976,49 +1995,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // Arguments and files check
-    let file1_path: PathBuf = match &config.args.file1 {
-        Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
-            if file1_full_path.exists() {
-                file1_full_path
-            } else {
-                return Err(PipelineError::FileNotFound(file1_full_path));
-            }
-        }
-        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
-    };
-
-    let sample_base: String;
-    let file1_r1r2 = r1r2_base(&file1_path);
-    sample_base = match file1_r1r2.prefix {
-        Some(prefix) => prefix,
-        None => {
-            eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
-            file1_path.to_string_lossy().into_owned()
-        }
-    };
-
-    if !file1_path.exists() {
-        return Err(PipelineError::FileNotFound(file1_path));
-    }
-
-    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
-    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-
-    let file2_path: Option<PathBuf> = match &config.args.file2 {
-        Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
-            if file2_full_path.exists() {
-                Some(file2_full_path)
-            } else {
-                eprintln!("File2 path does not exist: {}", file2_full_path.display());
-                None
-            }
-        }
-        None => None,
-    };
+    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
     let technology = config.args.technology.clone();
 
@@ -2078,11 +2055,11 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
     // Input Validation
-    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
+    let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, val_count_task) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
-        sample_base_buf.clone(),
+        no_ext_sample_base_buf.clone(),
         &out_dir,
     )
         .await?;
@@ -2101,7 +2078,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let (no_host_output_stream, no_host_seqkit_out_stream_stats, no_host_cleanup_tasks, no_host_cleanup_receivers) = align_to_host(
         config.clone(),
-        val_fastp_out_stream,
+        val_out_stream,
         host_ref_index_path,
         no_host_file_path,
     )
@@ -2306,8 +2283,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?
             .map_err(|e| PipelineError::Other(e))?;
     }
+    let _input_read_stats = join_with_error_handling(val_count_task).await?;
     drop(temp_files);
 
-    println!("Finished generating consensus genome");
+    println!("Finished generating consensus genome.");
     Ok(())
 }
