@@ -8,7 +8,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -111,7 +111,7 @@ async fn ercc_bowtie2_filter(
     bt2_index_path: PathBuf,
     paired: bool,
 
-) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>), PipelineError>{
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<Result<u64, anyhow::Error>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
@@ -240,7 +240,7 @@ async fn ercc_bowtie2_filter(
             error: e.to_string(),
         })?;
 
-    let (mut count_child, count_stream_task, count_err_task) = stream_to_cmd(
+    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
         config.clone(),
         ercc_bam_count_stream,
         SAMTOOLS_TAG,
@@ -256,10 +256,18 @@ async fn ercc_bowtie2_filter(
     cleanup_tasks.push(count_stream_task);
     cleanup_tasks.push(count_err_task);
 
+    let (ercc_count_tx, ercc_count_rx) = oneshot::channel::<Result<u64, anyhow::Error>>();
+    let count_future = tokio::spawn(async move {
+        let mut count_child = count_child_arc;
+        let mut guard = count_child.lock().await;
+        let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout).await?;
+        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
+        let _ = ercc_count_tx.send(Ok(mapped_count)); // Send result
+        Ok(())
+    });
+    cleanup_tasks.push(count_future);
 
-
-
-    Ok((ReceiverStream::new(ercc_samtools_sort_out_stream),  cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(ercc_samtools_sort_out_stream),  ercc_count_rx , cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -305,7 +313,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
 
 
-    let (ercc_bt2_out_stream, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = ercc_bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path, paired).await?;
+    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = ercc_bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path, paired).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
 
@@ -316,6 +324,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ));
     test_write_task.await;
 
+
+    let ercc_mapped_count = ercc_count_rx.await?;
 
     let raw_count = join_with_error_handling(raw_count_task).await?;
     println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
