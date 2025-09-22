@@ -65,15 +65,19 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
     Ok(version)
 }
 
-mod fastp {
+pub mod fastp {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
-    use tokio::process::Command;
-    use crate::config::defs::{FASTP_TAG, KRAKEN2_TAG, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::config::defs::{FASTP_TAG,  RunConfig};
+    use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
+    #[derive(Debug)]
+    pub struct FastpConfig {
+        pub command_fields: HashMap<String, Option<String>>,
+    }
     pub struct FastpArgGenerator;
 
     pub async fn fastp_presence_check() -> Result<f32> {
@@ -82,14 +86,18 @@ mod fastp {
     }
 
     impl ArgGenerator for FastpArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             // eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
+
+            let config = extra
+                .and_then(|e| e.downcast_ref::<FastpConfig>())
+                .ok_or_else(|| anyhow!("FASTP requires a FaspConfig as extra argument"))?;
+
             let args = &run_config.args;
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
             args_vec.push("--interleaved_in".to_string());
-            args_vec.push("--dont_eval_duplication".to_string());
             args_vec.push("-q".to_string());
             args_vec.push(args.quality.to_string());
 
@@ -110,6 +118,13 @@ mod fastp {
                 }
                 args_vec.push("--adapter_fasta".to_string());
                 args_vec.push(adapter_path.to_string_lossy().into_owned());
+            }
+
+            for (key, value) in config.command_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
             }
 
             Ok(args_vec)

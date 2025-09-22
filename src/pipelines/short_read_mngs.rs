@@ -12,7 +12,7 @@ use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, s
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
-
+use crate::utils::command::fastp::FastpConfig;
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
@@ -320,6 +320,76 @@ async fn ercc_bowtie2_filter(
 }
 
 
+
+/// Pre-filters ERCC reads from the input stream
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Raw byte FASTQ stream
+///
+/// # Returns
+///
+async fn fastp_qc(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError>{
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let qc_fastp_config_view = FastpConfig {
+
+        //These default QC thresholds are loosely based on the pre-2022 CZI pipeline using PriceSeq & LZW
+        command_fields: HashMap::from([
+            ("--dont_eval_duplication".to_string(), None),
+            ("--length_required".to_string(), Some("35".to_string())),
+            ("--qualified_quality_phred".to_string(), Some("17".to_string())),
+            ("--unqualified_percent_limit".to_string(), Some("15".to_string())),
+            ("--n_base_limit".to_string(), Some("15".to_string())),
+            ("--complexity_threshold".to_string(), Some("60".to_string())),
+        ]),
+    };
+
+    let qc_fastp_args = generate_cli(FASTP_TAG, &config, Some(&qc_fastp_config_view))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut qc_fastp_child, qc_fastp_stream_task, qc_fastp_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        FASTP_TAG,
+        qc_fastp_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(qc_fastp_stream_task);
+    cleanup_tasks.push(qc_fastp_err_task);
+
+    let qc_fastp_out_stream ={
+        let mut guard = qc_fastp_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FASTP_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    Ok((ReceiverStream::new(qc_fastp_out_stream), cleanup_tasks, cleanup_receivers))
+}
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -367,9 +437,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
 
 
+    let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers) = fastp_qc(config.clone(), ercc_bt2_out_stream).await?;
+    cleanup_tasks.extend(qc_cleanup_tasks);
+    cleanup_receivers.extend(qc_cleanup_receivers);
+
+    // Test write out for the main stream until pipeline construction complete
     let test_write_task = tokio::spawn(stream_to_file(
-        ercc_bt2_out_stream.into_inner(),
-        PathBuf::from("ercc-test.fq"),
+        qc_fastp_out_stream.into_inner(),
+        PathBuf::from("qc-test.fq"),
     ));
     test_write_task.await;
 
