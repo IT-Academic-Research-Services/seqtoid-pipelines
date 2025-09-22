@@ -109,6 +109,7 @@ async fn ercc_bowtie2_filter(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from
     bt2_index_path: PathBuf,
+    paired: bool,
 
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>), PipelineError>{
 
@@ -117,7 +118,7 @@ async fn ercc_bowtie2_filter(
 
     let ercc_bt2_config_view = Bowtie2Config{
         bt2_index_path: bt2_index_path.clone(),
-        option_fields: HashMap::from([]),
+        option_fields: HashMap::from([("--very-sensitive-local" .to_string(), None)]),
     };
 
     let ercc_bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&ercc_bt2_config_view))
@@ -157,7 +158,53 @@ async fn ercc_bowtie2_filter(
             })?
     };
 
-    Ok((ReceiverStream::new(ercc_bt2_out_stream),  cleanup_tasks, cleanup_receivers))
+    let ercc_samtools_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-u".to_string(), None), // Uncompressed
+            ("-O".to_string(), Some("bam".to_string())), // BAM output
+            ("-".to_string(), None)
+        ]),
+    };
+    let ercc_samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&ercc_samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut ercc_samtools_sort_child, ercc_samtools_sort_task, ercc_samtools_sort_err_task) = stream_to_cmd(
+        config.clone(),
+        ercc_bt2_out_stream,
+        SAMTOOLS_TAG,
+        ercc_samtools_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(ercc_samtools_sort_task);
+    cleanup_tasks.push(ercc_samtools_sort_err_task);
+
+    let ercc_samtools_sort_out_stream = {
+        let mut guard = ercc_samtools_sort_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    Ok((ReceiverStream::new(ercc_samtools_sort_out_stream),  cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -185,6 +232,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
+    let paired = file2_path.is_some();
 
     // Input Validation
     let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
@@ -202,14 +250,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
 
 
-    let (ercc_bt2_out_stream, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = ercc_bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path).await?;
+    let (ercc_bt2_out_stream, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = ercc_bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path, paired).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
 
 
     let test_write_task = tokio::spawn(stream_to_file(
         ercc_bt2_out_stream.into_inner(),
-        PathBuf::from("test.fq"),
+        PathBuf::from("ercc-test.bam"),
     ));
     test_write_task.await;
 
