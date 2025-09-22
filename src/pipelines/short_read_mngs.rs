@@ -111,7 +111,7 @@ async fn ercc_bowtie2_filter(
     bt2_index_path: PathBuf,
     paired: bool,
 
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<Result<u64, anyhow::Error>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
@@ -256,18 +256,67 @@ async fn ercc_bowtie2_filter(
     cleanup_tasks.push(count_stream_task);
     cleanup_tasks.push(count_err_task);
 
-    let (ercc_count_tx, ercc_count_rx) = oneshot::channel::<Result<u64, anyhow::Error>>();
+    let (ercc_count_tx, ercc_count_rx) = oneshot::channel::<u64>();
+
     let count_future = tokio::spawn(async move {
         let mut count_child = count_child_arc;
         let mut guard = count_child.lock().await;
         let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout).await?;
         let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        let _ = ercc_count_tx.send(Ok(mapped_count)); // Send result
+        let _ = ercc_count_tx.send(mapped_count); // Send just u64
         Ok(())
     });
     cleanup_tasks.push(count_future);
 
-    Ok((ReceiverStream::new(ercc_samtools_sort_out_stream),  ercc_count_rx , cleanup_tasks, cleanup_receivers))
+
+    //Unmapped goes to samtools fastq for output stream,
+    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
+    let samtools_fastq_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([
+            (unmapped_flag, None),  // Filter unmapped directly
+            ("-".to_string(), None), // stdin/stdout
+            // Add "-n" for name sorting if needed; "-1/-2" for paired FASTQ output
+        ]),
+    };
+    let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
+        config.clone(),
+        ercc_unmapped_stream,
+        SAMTOOLS_TAG,
+        samtools_fastq_args,
+        StreamDataType::JustBytes,  // Input: sorted BAM bytes
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(fastq_stream_task);
+    cleanup_tasks.push(fastq_err_task);
+
+    let ercc_unmapped_fastq_stream= {
+        let mut guard = fastq_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Fastq,  // Output: FASTQ records
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    Ok((ReceiverStream::new(ercc_unmapped_fastq_stream), ercc_count_rx , cleanup_tasks, cleanup_receivers))
 }
 
 
@@ -320,12 +369,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let test_write_task = tokio::spawn(stream_to_file(
         ercc_bt2_out_stream.into_inner(),
-        PathBuf::from("ercc-test.bam"),
+        PathBuf::from("ercc-test.fq"),
     ));
     test_write_task.await;
 
 
-    let ercc_mapped_count = ercc_count_rx.await?;
+    let ercc_mapped_count = ercc_count_rx.await.map_err(|e| PipelineError::Other(anyhow::anyhow!("ERCC count receiver failed: {}", e)))?;
+
 
     let raw_count = join_with_error_handling(raw_count_task).await?;
     println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
