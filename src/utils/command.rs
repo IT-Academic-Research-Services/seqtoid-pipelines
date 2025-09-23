@@ -998,6 +998,7 @@ pub mod hisat2 {
 
 pub mod kallisto{
     use std::collections::HashMap;
+    use std::path::PathBuf; // Add this import
     use anyhow::anyhow;
     use crate::config::defs::{RunConfig, KALLISTO_TAG, KallistoSubcommand};
     use crate::utils::command::{version_check, ArgGenerator};
@@ -1006,8 +1007,9 @@ pub mod kallisto{
     pub struct KallistoConfig {
         pub subcommand: KallistoSubcommand,
         pub subcommand_fields: HashMap<String, Option<String>>,
+        pub output_dir: PathBuf, // New field for -o
         pub paired: bool,
-        pub reprodicible: bool
+        pub reproducible: bool // Fixed typo
     }
 
     pub struct KallistoArgGenerator;
@@ -1026,42 +1028,36 @@ pub mod kallisto{
 
             let mut args_vec: Vec<String> = Vec::new();
 
-
             match config.subcommand {
                 KallistoSubcommand::Index => {
                     args_vec.push("index".to_string());
-
                 }
                 KallistoSubcommand::Quant => {
                     args_vec.push("quant".to_string());
                     args_vec.push("-i".to_string());
                     args_vec.push(args.kallisto_index.clone().expect("Must provide kallisto index with --kallisto-index arg.").to_string());
-                    args_vec.push("--plaintext".to_string());
-                    if config.reprodicible {
+                    args_vec.push("--plaintext".to_string()); // Outputs abundances to stdout
+                    args_vec.push("-o".to_string());
+                    args_vec.push(config.output_dir.to_string_lossy().to_string());
+                    if config.reproducible {
                         args_vec.push("--threads".to_string());
                         args_vec.push("1".to_string());  // reproducibility
                         args_vec.push("--seed".to_string());
-                        args_vec.push("42".to_string());  // reproducibility, also kek
-                    }
-                    else {
+                        args_vec.push("42".to_string());  // reproducibility
+                    } else {
                         args_vec.push("--threads".to_string());
                         let num_cores: usize = RunConfig::thread_allocation(run_config, KALLISTO_TAG, None);
                         args_vec.push(num_cores.to_string());
                     }
-
-                    if config.paired {
-
-                    }
-                    else {
+                    if !config.paired {
                         args_vec.push("--single".to_string());
                         args_vec.push("-l".to_string());
                         args_vec.push("200".to_string());
                         args_vec.push("-s".to_string());
                         args_vec.push("20".to_string());
                     }
-                    args_vec.push("-".to_string());  //stdin
+                    args_vec.push("-".to_string());  // stdin
                 }
-
             }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(key.clone());
@@ -1073,7 +1069,6 @@ pub mod kallisto{
             Ok(args_vec)
         }
     }
-
 }
 
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
