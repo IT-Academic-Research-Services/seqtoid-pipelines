@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG};
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -996,6 +996,86 @@ pub mod hisat2 {
     }
 }
 
+pub mod kallisto{
+    use std::collections::HashMap;
+    use anyhow::anyhow;
+    use crate::config::defs::{RunConfig, KALLISTO_TAG, KallistoSubcommand};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    pub struct KallistoConfig {
+        pub subcommand: KallistoSubcommand,
+        pub subcommand_fields: HashMap<String, Option<String>>,
+        pub paired: bool,
+        pub reprodicible: bool
+    }
+
+    pub struct KallistoArgGenerator;
+
+    pub async fn kallisto_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(KALLISTO_TAG,vec!["-h"], 0, 1 , ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for KallistoArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
+            let config = extra
+                .and_then(|e| e.downcast_ref::<KallistoConfig>())
+                .ok_or_else(|| anyhow!("Kallisto requires a KallistoConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+
+            match config.subcommand {
+                KallistoSubcommand::Index => {
+                    args_vec.push("index".to_string());
+
+                }
+                KallistoSubcommand::Quant => {
+                    args_vec.push("quant".to_string());
+                    args_vec.push("-i".to_string());
+                    args_vec.push(args.kallisto_index.clone().expect("Must provide kallisto index with --kallisto-index arg.").to_string());
+                    args_vec.push("--plaintext".to_string());
+                    if config.reprodicible {
+                        args_vec.push("--threads".to_string());
+                        args_vec.push("1".to_string());  // reproducibility
+                        args_vec.push("--seed".to_string());
+                        args_vec.push("42".to_string());  // reproducibility, also kek
+                    }
+                    else {
+                        args_vec.push("--threads".to_string());
+                        let num_cores: usize = RunConfig::thread_allocation(run_config, KALLISTO_TAG, None);
+                        args_vec.push(num_cores.to_string());
+                    }
+
+                    if config.paired {
+
+                    }
+                    else {
+                        args_vec.push("--single".to_string());
+                        args_vec.push("-l".to_string());
+                        args_vec.push("200".to_string());
+                        args_vec.push("-s".to_string());
+                        args_vec.push("20".to_string());
+                    }
+                    args_vec.push("-".to_string());  //stdin
+                }
+
+            }
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -1012,6 +1092,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         H5DUMP_TAG => return Err(anyhow!("h5dump argument generation not implemented")),
         BOWTIE2_TAG => Box::new(bowtie2::Bowtie2ArgGenerator),
         HISAT2_TAG => Box::new(hisat2::Hisat2ArgGenerator),
+        KALLISTO_TAG => Box::new(kallisto::KallistoArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -1035,6 +1116,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             SEQKIT_TAG => seqkit::seqkit_presence_check().await,
             BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
             HISAT2_TAG => hisat2::hisat2_presence_check().await,
+            KALLISTO_TAG => kallisto::kallisto_presence_check().await,
 
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
