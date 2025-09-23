@@ -1191,7 +1191,6 @@ pub async fn deinterleave_fastq_to_fifos(
     buffer_size: usize,
     stall_threshold_secs: u64,
 ) -> Result<(PathBuf, PathBuf, JoinHandle<Result<()>>)> {
-    // Create FIFO paths in ram_temp_dir
     let r1_fifo_path = ram_temp_dir.join(format!("{}_kallisto_r1.fifo", sample_base));
     let r2_fifo_path = ram_temp_dir.join(format!("{}_kallisto_r2.fifo", sample_base));
 
