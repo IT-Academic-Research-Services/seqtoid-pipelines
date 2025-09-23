@@ -1009,11 +1009,8 @@ pub mod kallisto {
     pub struct KallistoConfig {
         pub subcommand: KallistoSubcommand,
         pub subcommand_fields: HashMap<String, Option<String>>,
-        pub output_dir: PathBuf, // For -o (run_info.json, abundance.h5)
-        pub paired: bool,
+        pub output_dir: PathBuf,
         pub reproducible: bool,
-        pub r1_fifo_path: Option<PathBuf>, // Path to R1 FIFO (paired-end only)
-        pub r2_fifo_path: Option<PathBuf>, // Path to R2 FIFO (paired-end only)
     }
 
     pub struct KallistoArgGenerator;
@@ -1053,22 +1050,12 @@ pub mod kallisto {
                         let num_cores: usize = RunConfig::thread_allocation(run_config, KALLISTO_TAG, None);
                         args_vec.push(num_cores.to_string());
                     }
-                    if config.paired {
-                        let r1_path = config.r1_fifo_path.as_ref()
-                            .ok_or_else(|| anyhow!("R1 FIFO path required for paired-end mode"))?;
-                        let r2_path = config.r2_fifo_path.as_ref()
-                            .ok_or_else(|| anyhow!("R2 FIFO path required for paired-end mode"))?;
-                        args_vec.push(r1_path.to_string_lossy().to_string());
-                        args_vec.push(r2_path.to_string_lossy().to_string());
-                    } else {
-                        // Single-end: Use stdin
-                        args_vec.push("--single".to_string());
-                        args_vec.push("-l".to_string());
-                        args_vec.push("200".to_string());
-                        args_vec.push("-s".to_string());
-                        args_vec.push("20".to_string());
-                        args_vec.push("-".to_string());
-                    }
+                    args_vec.push("--single".to_string());
+                    args_vec.push("-l".to_string());
+                    args_vec.push("200".to_string());
+                    args_vec.push("-s".to_string());
+                    args_vec.push("20".to_string());
+                    args_vec.push("-".to_string()); // stdin
                 }
             }
             for (key, value) in config.subcommand_fields.iter() {
