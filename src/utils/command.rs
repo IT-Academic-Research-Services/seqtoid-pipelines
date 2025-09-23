@@ -27,6 +27,7 @@ pub trait ArgGenerator {
 /// Result<f32>major/minor version number
 pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_line: usize, version_column: usize, child_stream: ChildStream) -> Result<f32> {
     let cmd_tag_owned = command_tag.to_string();
+    eprintln!("Running command: {}", &cmd_tag_owned);
     let args: Vec<&str> = version_args;
 
     let mut child = Command::new(&cmd_tag_owned)
@@ -41,6 +42,7 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
     let line_w_version = lines
         .get(version_line)
         .ok_or_else(|| anyhow!("No line {} in {} version output", version_line, cmd_tag_owned.clone()))?;
+    eprintln!("Line number {}: {}", version_line, line_w_version);
 
     let version_string = line_w_version
         .split_whitespace()
@@ -1015,7 +1017,7 @@ pub mod kallisto {
     pub struct KallistoArgGenerator;
 
     pub async fn kallisto_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KALLISTO_TAG, vec!["-h"], 0, 1, ChildStream::Stdout).await?;
+        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout).await?;
         Ok(version)
     }
 
@@ -1038,7 +1040,7 @@ pub mod kallisto {
                     args_vec.push(args.kallisto_index.clone().expect("Must provide kallisto index with --kallisto-index arg.").to_string());
                     args_vec.push("-o".to_string());
                     args_vec.push(config.output_dir.to_string_lossy().to_string());
-                    args_vec.push("--plaintext".to_string()); 
+                    args_vec.push("--plaintext".to_string());
                     if config.reproducible {
                         args_vec.push("--threads".to_string());
                         args_vec.push("1".to_string());
