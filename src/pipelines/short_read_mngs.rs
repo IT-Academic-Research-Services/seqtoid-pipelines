@@ -456,7 +456,7 @@ async fn kallisto_quant(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
     output_dir: PathBuf,
-    paired: bool,
+    paired: bool, // Ignored since we force single-end mode
     sample_base_buf: PathBuf,
 ) -> Result<
     (
@@ -469,22 +469,25 @@ async fn kallisto_quant(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
+    let sample_base = sample_base_buf.file_stem().unwrap_or_default().to_string_lossy().to_string();
+
+    // Prepare KallistoConfig (always single-end mode)
     let kallisto_config = KallistoConfig {
         subcommand: KallistoSubcommand::Quant,
         subcommand_fields: HashMap::from([]),
         output_dir: output_dir.clone(),
-        paired,
         reproducible: false,
     };
 
-    let kallisto_args = generate_cli(KALLISTO_TAG, &config, Some(&kallisto_config))
+    let kallisto_args = generate_cli(KALLISTO_TAG, &*config, Some(&kallisto_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: KALLISTO_TAG.to_string(),
             error: e.to_string(),
         })?;
     eprintln!("Kallisto QUANT: {:?}", kallisto_args);
 
-    let (mut kallisto_child, kallisto_stream_task, kallisto_err_task) = stream_to_cmd(
+    // Use stream_to_cmd for stdin streaming (treats interleaved as single-end)
+    let (kallisto_child, stream_task, err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),
         KALLISTO_TAG,
@@ -497,14 +500,15 @@ async fn kallisto_quant(
             tool: KALLISTO_TAG.to_string(),
             error: e.to_string(),
         })?;
-    cleanup_tasks.push(kallisto_stream_task);
-    cleanup_tasks.push(kallisto_err_task);
+    cleanup_tasks.push(stream_task);
+    cleanup_tasks.push(err_task);
+    let kallisto_child_arc = kallisto_child;
 
     // Capture kallisto stdout (plaintext abundance.tsv)
     let kallisto_out_stream = {
-        let mut guard = kallisto_child.lock().await;
+        let mut guard = kallisto_child_arc.lock().await;
         parse_child_output(
-            &mut guard,
+            &mut *guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
             config.base_buffer_size,
@@ -516,7 +520,7 @@ async fn kallisto_quant(
             })?
     };
 
-    // Split abundancstream for saving and ERCC filtering
+    // Split abundance stream for saving and ERCC filtering
     let (abundance_streams, abundance_done_rx) = t_junction(
         ReceiverStream::new(kallisto_out_stream),
         2,
@@ -543,10 +547,14 @@ async fn kallisto_quant(
         Some("reads_per_transcript.kallisto.tsv"),
         "_",
     );
-    let save_task = tokio::spawn(stream_to_file(
-        save_stream,
-        abundance_tsv_path.clone(),
-    ));
+    let save_task = tokio::spawn(async move {
+        stream_to_file(save_stream, abundance_tsv_path.clone()).await?;
+        // Verify output file exists
+        if !abundance_tsv_path.exists() {
+            return Err(anyhow!("Kallisto failed to produce abundance.tsv"));
+        }
+        Ok(())
+    });
     cleanup_tasks.push(save_task);
 
     // Process ERCC counts
@@ -566,7 +574,7 @@ async fn kallisto_quant(
             .map_err(|e| anyhow!("Failed to create ERCC_counts.tsv: {}", e))?;
         writeln!(ercc_file, "target_id\test_counts")
             .map_err(|e| anyhow!("Failed to write ERCC_counts.tsv header: {}", e))?;
-        let header = "target_id\tlength\teff_length\test_counts\ttpm";
+        let header = r"target_id\tlength\teff_length\est_counts\ttpm";
         let mut ercc_stream = ReceiverStream::new(ercc_stream);
         while let Some(ParseOutput::Bytes(line)) = ercc_stream.next().await {
             let line = String::from_utf8_lossy(&line).to_string();
