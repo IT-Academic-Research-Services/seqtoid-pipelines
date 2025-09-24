@@ -19,7 +19,7 @@ use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::kallisto::KallistoConfig;
-use crate::utils::command::hisat2::Hisat2Config;
+use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -914,12 +914,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     eprintln!("end");
 
     //Check for necessary files listed as optional in the args mod (so i dont have to supply them to other pipelines)
-    if config.args.host_bowtie2_index.is_none() {
-        return Err(PipelineError::MissingArgument("host_bowtie2_index is required".to_string()));
-    }
-    if config.args.host_hisat2_index.is_none() {
-        return Err(PipelineError::MissingArgument("host_hisat2_index is required".to_string()));
-    }
+
+    let host_bowtie2_index: String = config.args.host_bowtie2_index.clone()
+        .ok_or_else(|| PipelineError::MissingArgument("host_bowtie2_index is required".to_string()))?;
+    let host_hisat2_index: String = config.args.host_hisat2_index.clone()
+        .ok_or_else(|| PipelineError::MissingArgument("host_hisat2_index is required".to_string()))?;
 
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
@@ -991,17 +990,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     //Host filtering: bt2
-
-    let host_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
+    let host_bt2_index_path = bowtie2_index_prep(host_bowtie2_index, &cwd)?;
     let host_bt2_options = HashMap::from([("--very-sensitive-local" .to_string(), None)]);
-    let (host_bt2_out_stream, host_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers) = bowtie2_filter(config.clone(), ReceiverStream::new(kallisto_bypass_stream), host_bt2_index_path, paired, host_bt2_options, None).await?;
+    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers) = bowtie2_filter(config.clone(), ReceiverStream::new(kallisto_bypass_stream), host_bt2_index_path, paired, host_bt2_options, None).await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
+
+    //Host filtering: hisat2
+    let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
+    let host_hisat2_options = HashMap::from([]);
+    let (host_hisat2_out_stream, host_hisat2_count_rx, host_hisat2_cleanup_tasks, host_hisat2_cleanup_receivers) = hisat2_filter(config.clone(), host_bt2_out_stream, host_hisat2_index_path, paired, host_hisat2_options, None).await?;
+    cleanup_tasks.extend(host_hisat2_cleanup_tasks);
+    cleanup_receivers.extend(host_hisat2_cleanup_receivers);
 
 
     // Test write out for the main stream until pipeline construction complete
     let test_write_task = tokio::spawn(stream_to_file(
-        host_bt2_out_stream.into_inner(),
+        host_hisat2_out_stream.into_inner(),
         PathBuf::from("test.fq"),
     ));
     test_write_task.await;
@@ -1041,10 +1046,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let ercc_mapped_count = ercc_count_rx.await.map_err(|e| PipelineError::Other(anyhow::anyhow!("ERCC count receiver failed: {}", e)))?;
 
 
-    let host_bt2_counts = host_count_rx
+    let host_bt2_counts = host_bt2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
     eprintln!("Host bt2 counts: {:?}", host_bt2_counts);
+
+    let host_hisat2_counts = host_hisat2_count_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
+    eprintln!("Host hisat2 counts: {:?}", host_hisat2_counts);
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
