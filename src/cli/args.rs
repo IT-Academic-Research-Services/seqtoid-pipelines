@@ -128,5 +128,11 @@ pub struct Arguments {
 
     #[arg(long, default_value = "human.bowtie2.tar")]
     pub human_bowtie2_index : String,
+
+    #[arg(long)]
+    pub host_hisat2_index : Option<String>,
+
+    #[arg(long, default_value = "human.hisat2.tar")]
+    pub human_hisat2_index : String,
     
 }
