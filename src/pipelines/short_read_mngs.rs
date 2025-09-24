@@ -107,43 +107,51 @@ async fn validate_input(
     Ok((ReceiverStream::new(val_ercc_bowtie2_filter_out_stream),  cleanup_tasks, cleanup_receivers, raw_count_task, val_count_task))
 }
 
-
-/// Pre-filters ERCC reads from the input stream
+/// bowtie2 filter function where the passing stream contains the unmapped reads
 ///
 /// # Arguments
 ///
 /// * `config` - RunConfig struct from main.
 /// * `input_stream` - Raw byte FASTQ stream
+/// * `bt2_index_path` - Path to Bowtie2 index.
+/// * `paired` - Whether the input is paired-end.
+/// * `bowtie2_options` - Additional Bowtie2 options as a HashMap (e.g., HashMap::from([("--very-sensitive-local".to_string(), None)])).
+/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
 ///
 /// # Returns
-///
-async fn ercc_bowtie2_filter(
+/// Tuple:
+/// - unmapped FASTQ stream.
+/// - Optional receiver for the total mapped count (u64) if `count_mapped` is true.
+/// - Vector of cleanup tasks.
+/// - Vector of cleanup receivers.
+async fn bowtie2_filter(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from
+    input_stream: ReceiverStream<ParseOutput>,
     bt2_index_path: PathBuf,
     paired: bool,
-
+    bowtie2_options: HashMap<String, Option<String>>,
+    output_bam_path: Option<PathBuf>,
 ) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let ercc_bt2_config_view = Bowtie2Config{
+    // BT2
+    let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
-        option_fields: HashMap::from([("--very-sensitive-local" .to_string(), None)]),
+        option_fields: bowtie2_options,
     };
 
-    let ercc_bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&ercc_bt2_config_view))
+    let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view))
         .map_err(|e| PipelineError::ToolExecution {
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
 
-    let (mut ercc_bt2_child, ercc_bt2_stream_task, ercc_bt2_err_task) = stream_to_cmd(
+    let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),
         BOWTIE2_TAG,
-        ercc_bt2_args,
+        bt2_args,
         StreamDataType::JustBytes, // FASTQ bytes
         config.args.verbose,
     )
@@ -152,11 +160,11 @@ async fn ercc_bowtie2_filter(
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    cleanup_tasks.push(ercc_bt2_stream_task);
-    cleanup_tasks.push(ercc_bt2_err_task);
+    cleanup_tasks.push(bt2_stream_task);
+    cleanup_tasks.push(bt2_err_task);
 
-    let ercc_bt2_out_stream = {
-        let mut guard = ercc_bt2_child.lock().await;
+    let bt2_out_stream = {
+        let mut guard = bt2_child.lock().await;
         parse_child_output(
             &mut guard,
             ChildStream::Stdout,
@@ -170,25 +178,27 @@ async fn ercc_bowtie2_filter(
             })?
     };
 
-    let ercc_samtools_sort_config = SamtoolsConfig {
+    // Sort, output uncompressed BAM
+    let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-u".to_string(), None), // Uncompressed
-            ("-O".to_string(), Some("bam".to_string())), // BAM output
-            ("-".to_string(), None)
+            ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
+            ("-u".to_string(), None),
+            ("-O".to_string(), Some("bam".to_string())),
+            ("-".to_string(), None),
         ]),
     };
-    let ercc_samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&ercc_samtools_sort_config))
+    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
 
-    let (mut ercc_samtools_sort_child, ercc_samtools_sort_task, ercc_samtools_sort_err_task) = stream_to_cmd(
+    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
         config.clone(),
-        ercc_bt2_out_stream,
+        bt2_out_stream,
         SAMTOOLS_TAG,
-        ercc_samtools_sort_args,
+        samtools_sort_args,
         StreamDataType::JustBytes,
         config.args.verbose,
     )
@@ -197,11 +207,11 @@ async fn ercc_bowtie2_filter(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    cleanup_tasks.push(ercc_samtools_sort_task);
-    cleanup_tasks.push(ercc_samtools_sort_err_task);
+    cleanup_tasks.push(samtools_sort_task);
+    cleanup_tasks.push(samtools_sort_err_task);
 
-    let ercc_samtools_sort_out_stream = {
-        let mut guard = ercc_samtools_sort_child.lock().await;
+    let samtools_sort_out_stream = {
+        let mut guard = samtools_sort_child.lock().await;
         parse_child_output(
             &mut guard,
             ChildStream::Stdout,
@@ -215,34 +225,54 @@ async fn ercc_bowtie2_filter(
             })?
     };
 
+    // Determine number of streams for t_junction (unmapped + optional BAM output + mapped count)
+    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 }; // Unmapped + count + optional BAM
 
-    let (ercc_bam_streams, ercc_bam_done_rx) = t_junction(
-        ReceiverStream::new(ercc_samtools_sort_out_stream),
-        2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        100,
-        StreamDataType::IlluminaFastq,  // Semantically FASTQ bytes
-        "ercc_bam_split".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(ercc_bam_done_rx);
+    let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
 
+    let (bam_streams, bam_done_rx) = if num_tees > 1 {
+        t_junction(
+            bam_rx_stream,
+            num_tees,
+            config.base_buffer_size,
+            config.args.stall_threshold,
+            None,
+            100,
+            StreamDataType::JustBytes, // BAM bytes
+            "bowtie2_bam_split".to_string(),
+            None,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?
+    } else {
+        // Single stream case (shouldn't happen since we always need unmapped + count)
+        (vec![bam_rx_stream.into_inner()], oneshot::channel::<Result<(), anyhow::Error>>().1)
+    };
+    cleanup_receivers.push(bam_done_rx);
 
-    let mut ercc_bam_streams_iter = ercc_bam_streams.into_iter();
-    let ercc_bam_count_stream = ercc_bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let ercc_unmapped_stream = ercc_bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mut bam_streams_iter = bam_streams.into_iter();
 
-    //Count mapped reads to ERCC index
-    let mapped_count_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
+    // Optional: Write BAM to file
+    if let Some(bam_path) = output_bam_path {
+        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+        let bam_write_task = write_byte_stream_to_file(
+            &bam_path,
+            ReceiverStream::new(stream),
+            Some(config.base_buffer_size),
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        cleanup_tasks.push(bam_write_task);
+    }
+
+    // Count total mapped reads (always performed)
+    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
     let samtools_count_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
-            ("-c".to_string(), None), // Count reads, don't pass anything else
-            (mapped_count_flag, None),
+            ("-c".to_string(), None), // Count
+            (mapped_flag, None),
             ("-".to_string(), None),
         ]),
     };
@@ -254,7 +284,7 @@ async fn ercc_bowtie2_filter(
 
     let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
         config.clone(),
-        ercc_bam_count_stream,
+        bam_count_stream,
         SAMTOOLS_TAG,
         samtools_count_args,
         StreamDataType::JustBytes,
@@ -268,27 +298,28 @@ async fn ercc_bowtie2_filter(
     cleanup_tasks.push(count_stream_task);
     cleanup_tasks.push(count_err_task);
 
-    let (ercc_count_tx, ercc_count_rx) = oneshot::channel::<u64>();
+    let (count_tx, count_rx) = oneshot::channel::<u64>();
 
     let count_future = tokio::spawn(async move {
         let mut count_child = count_child_arc;
         let mut guard = count_child.lock().await;
         let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout).await?;
         let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        let _ = ercc_count_tx.send(mapped_count); // Send just u64
+        let _ = count_tx.send(mapped_count);
         Ok(())
     });
     cleanup_tasks.push(count_future);
 
+    // Unmapped stream
+    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    //Unmapped goes to samtools fastq for output stream,
+    // Extract unmapped FASTQ
     let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
         subcommand_fields: HashMap::from([
-            (unmapped_flag, None),  // Filter unmapped directly
-            ("-".to_string(), None), // stdin/stdout
-            // Add "-n" for name sorting if needed; "-1/-2" for paired FASTQ output
+            (unmapped_flag, None),
+            ("-".to_string(), None), // Output to stdout (interleaved for paired)
         ]),
     };
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
@@ -299,10 +330,10 @@ async fn ercc_bowtie2_filter(
 
     let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
         config.clone(),
-        ercc_unmapped_stream,
+        unmapped_stream,
         SAMTOOLS_TAG,
         samtools_fastq_args,
-        StreamDataType::JustBytes,  // Input: sorted BAM bytes
+        StreamDataType::JustBytes,
         config.args.verbose,
     )
         .await
@@ -313,12 +344,12 @@ async fn ercc_bowtie2_filter(
     cleanup_tasks.push(fastq_stream_task);
     cleanup_tasks.push(fastq_err_task);
 
-    let ercc_unmapped_fastq_stream= {
+    let unmapped_fastq_stream = {
         let mut guard = fastq_child.lock().await;
         parse_child_output(
             &mut guard,
             ChildStream::Stdout,
-            ParseMode::Fastq,  // Output: FASTQ records
+            ParseMode::Fastq,
             config.base_buffer_size,
         )
             .await
@@ -328,9 +359,8 @@ async fn ercc_bowtie2_filter(
             })?
     };
 
-    Ok((ReceiverStream::new(ercc_unmapped_fastq_stream), ercc_count_rx, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
 }
-
 
 
 /// QC's input stream using FASTP
@@ -645,11 +675,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
+    let ercc_bt2_options = HashMap::from([("--very-sensitive-local" .to_string(), None)]);
 
 
-    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = ercc_bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path, paired).await?;
+    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path, paired, ercc_bt2_options, None).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
+
 
 
     let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) = fastp_qc(config.clone(), ercc_bt2_out_stream).await?;
@@ -710,7 +742,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let ercc_mapped_count = ercc_count_rx.await.map_err(|e| PipelineError::Other(anyhow::anyhow!("ERCC count receiver failed: {}", e)))?;
-
 
     let raw_count = join_with_error_handling(raw_count_task).await?;
     println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);

@@ -122,5 +122,11 @@ pub struct Arguments {
 
     #[arg(long)]
     pub kallisto_index : Option<String>,
+
+    #[arg(long)]
+    pub host_bowtie2_index : Option<String>,
+
+    #[arg(long, default_value = "human.bowtie2.tar")]
+    pub human_bowtie2_index : String,
     
 }
