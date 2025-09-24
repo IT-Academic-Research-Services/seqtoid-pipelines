@@ -32,6 +32,7 @@ needletail = "0.6.3"
 infer = "0.19.0"
 tar = "0.4.44"
 walkdir = "2.5.0"
+regex = "1.11.1"
 
 [dev-dependencies]
 sysinfo = "0.35.0"

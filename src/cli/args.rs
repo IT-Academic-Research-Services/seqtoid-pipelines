@@ -119,5 +119,8 @@ pub struct Arguments {
 
     #[arg(long, default_value = "ercc.bowtie2.tar")]
     pub ercc_bowtie2_index : String,
+
+    #[arg(long)]
+    pub kallisto_index : Option<String>,
     
 }

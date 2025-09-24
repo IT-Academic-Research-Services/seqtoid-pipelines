@@ -20,11 +20,16 @@ use needletail::{parse_fastx_file, FastxReader, parser::{SequenceRecord as Needl
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::streams::{ParseOutput};
-use tokio::time::Duration;
+use crate::utils::streams::ParseOutput;
+use tokio::fs::File as TokioFile;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::process::Command as TokioCommand;
+use tokio::sync::mpsc::Receiver;
+use tokio::time::{Duration, Instant};
 use futures::future::try_join_all;
 use tokio::task::JoinHandle;
 use memchr::memmem;
+use memchr::memchr;
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -1164,7 +1169,6 @@ pub async fn concatenate_paired_reads(
 
     Ok((ReceiverStream::new(rx), task))
 }
-
 
 #[cfg(test)]
 mod tests {
