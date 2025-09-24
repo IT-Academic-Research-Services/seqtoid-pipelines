@@ -657,6 +657,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("end");
 
+    //Check for necessary files listed as optional in the args mod (so i dont have to supply them to other pipelines)
+    if config.args.host_bowtie2_index.is_none() {
+        return Err(PipelineError::MissingArgument("host_bowtie2_index is required".to_string()));
+    }
+
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
     let paired = file2_path.is_some();
@@ -673,11 +678,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
 
-
+    // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
     let ercc_bt2_options = HashMap::from([("--very-sensitive-local" .to_string(), None)]);
-
-
     let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = bowtie2_filter(config.clone(), val_out_stream, ercc_bt2_index_path, paired, ercc_bt2_options, None).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
@@ -726,25 +729,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(kallisto_cleanup_tasks);
     cleanup_receivers.extend(kallisto_cleanup_receivers);
 
+
+
+    //Host filtering: bt2
+
+    let host_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
+    let host_bt2_options = HashMap::from([("--very-sensitive-local" .to_string(), None)]);
+    let (host_bt2_out_stream, host_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers) = bowtie2_filter(config.clone(), ReceiverStream::new(kallisto_bypass_stream), host_bt2_index_path, paired, host_bt2_options, None).await?;
+    cleanup_tasks.extend(host_bt2_cleanup_tasks);
+    cleanup_receivers.extend(host_bt2_cleanup_receivers);
+
+
     // Test write out for the main stream until pipeline construction complete
     let test_write_task = tokio::spawn(stream_to_file(
-        kallisto_bypass_stream,
-        PathBuf::from("qc-test.fq"),
+        host_bt2_out_stream.into_inner(),
+        PathBuf::from("test.fq"),
     ));
     test_write_task.await;
 
-
-    // Retrieve ERCC counts
-    let kallisto_ercc_counts = kallisto_ercc_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
-    eprintln!("ERCC counts: {:?}", kallisto_ercc_counts);
-
-
-    let ercc_mapped_count = ercc_count_rx.await.map_err(|e| PipelineError::Other(anyhow::anyhow!("ERCC count receiver failed: {}", e)))?;
-
+    // Results retrieval
     let raw_count = join_with_error_handling(raw_count_task).await?;
     println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
+
 
     let stats = join_with_error_handling(val_count_task).await?;
     println!("Processed {} validated, {} undersized, {} oversized reads",
@@ -766,6 +772,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     };
 
+
+
+    let kallisto_ercc_counts = kallisto_ercc_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
+    eprintln!("ERCC counts: {:?}", kallisto_ercc_counts);
+
+    let ercc_mapped_count = ercc_count_rx.await.map_err(|e| PipelineError::Other(anyhow::anyhow!("ERCC count receiver failed: {}", e)))?;
+
+
+    let host_bt2_counts = host_count_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
+    eprintln!("Host bt2 counts: {:?}", host_bt2_counts);
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
