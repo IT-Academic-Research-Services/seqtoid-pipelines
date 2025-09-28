@@ -1080,7 +1080,7 @@ pub mod kallisto {
                     args_vec.push("200".to_string());
                     args_vec.push("-s".to_string());
                     args_vec.push("20".to_string());
-                    // args_vec.push("-".to_string()); // stdin
+                    args_vec.push("-".to_string()); // stdin
                 }
             }
             for (key, value) in config.subcommand_fields.iter() {
