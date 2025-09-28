@@ -1005,11 +1005,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Test write out for the main stream until pipeline construction complete
-    // let test_write_task = tokio::spawn(stream_to_file(
-    //     host_hisat2_out_stream.into_inner(),
-    //     PathBuf::from("test.fq"),
-    // ));
-    // test_write_task.await;
+    let test_write_task = tokio::spawn(stream_to_file(
+        host_bt2_out_stream.into_inner(),
+        PathBuf::from("test.fq"),
+    ));
+    test_write_task.await;
 
     // Results retrieval
     let raw_count = join_with_error_handling(raw_count_task).await?;
