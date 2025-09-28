@@ -728,7 +728,6 @@ pub mod index_prep {
     use flate2::read::GzDecoder;
     use tar::Archive;
     use walkdir::WalkDir;
-    use std::ffi::OsStr;
 
     #[derive(Debug, Clone)]
     pub struct IndexConfig {
@@ -736,7 +735,7 @@ pub mod index_prep {
         pub required_suffixes: Vec<String>,
     }
 
-    pub fn prepare_index(input_path: impl AsRef<Path>, cwd: &PathBuf, config: &IndexConfig) -> Result<PathBuf> {
+    pub fn prepare_index(input_path: impl AsRef<Path>, _cwd: &PathBuf, config: &IndexConfig, unpack_dir: &PathBuf) -> Result<PathBuf> {
         let input = input_path.as_ref();
 
         if !input.exists() {
@@ -744,13 +743,14 @@ pub mod index_prep {
         }
 
         let target_dir = if input.is_file() {
-            let unpack_dir = cwd.join(format!("unpacked_index_{}", config.extensions[0]));
-            fs::create_dir_all(&unpack_dir)?;
-
-            unpack_tar_if_needed(input, &unpack_dir)?;
-            unpack_dir
+            fs::create_dir_all(unpack_dir)?;
+            unpack_tar_if_needed(input, unpack_dir)?;
+            unpack_dir.clone()
         } else if input.is_dir() {
-            input.to_path_buf()
+            // Copy directory to unique unpack_dir for isolation
+            fs::create_dir_all(unpack_dir)?;
+            copy_dir::copy_dir(input, unpack_dir)?;
+            unpack_dir.clone()
         } else {
             return Err(anyhow!("Input must be a file (TAR/TAR.GZ) or directory: {}", input.display()));
         };
@@ -772,9 +772,9 @@ pub mod index_prep {
                 match &index_dir {
                     Some(existing_dir) if existing_dir != &parent_dir => {
                         return Err(anyhow!(
-                            "Index files found in multiple directories: {} and {}",
-                            existing_dir.display(), parent_dir.display()
-                        ));
+                        "Index files found in multiple directories: {} and {}",
+                        existing_dir.display(), parent_dir.display()
+                    ));
                     }
                     None => index_dir = Some(parent_dir.clone()),
                     _ => {} // Same directory
@@ -798,10 +798,10 @@ pub mod index_prep {
 
         if basenames.len() > 1 {
             return Err(anyhow!(
-                "Multiple possible basenames found ({}): {:?}",
-                basenames.len(),
-                basenames.keys().collect::<Vec<_>>()
-            ));
+            "Multiple possible basenames found ({}): {:?}",
+            basenames.len(),
+            basenames.keys().collect::<Vec<_>>()
+        ));
         }
 
         let (basename, count) = basenames.into_iter().next().unwrap();
@@ -853,9 +853,9 @@ pub mod index_prep {
                 archive.unpack(unpack_dir)?;
             }
             _ => return Err(anyhow!(
-                "Unsupported file type. Expected TAR or TAR.GZ, got: {:?}",
-                kind_opt.map(|k| k.mime_type())
-            )),
+            "Unsupported file type. Expected TAR or TAR.GZ, got: {:?}",
+            kind_opt.map(|k| k.mime_type())
+        )),
         }
 
         Ok(())
@@ -895,7 +895,22 @@ pub mod bowtie2 {
                 "rev.2.".to_string(),
             ],
         };
-        prepare_index(input_path, cwd, &config)
+
+        // Generate a unique unpack directory based on the input filename or directory
+        let input_ref = input_path.as_ref();
+        let unique_id = if input_ref.is_file() {
+            input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
+        } else {
+            input_ref.file_name().unwrap_or_default().to_string_lossy().to_string()
+        };
+        let unpack_dir = cwd.join(format!("unpacked_index_bt2_{}", unique_id));
+
+        // Clean the unpack_dir to ensure no stale data
+        if unpack_dir.exists() {
+            std::fs::remove_dir_all(&unpack_dir)?;
+        }
+
+        prepare_index(input_path, cwd, &config, &unpack_dir)
     }
 
     impl ArgGenerator for Bowtie2ArgGenerator {
@@ -930,8 +945,7 @@ pub mod bowtie2 {
 
 pub mod hisat2 {
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use anyhow::{anyhow, Result};
     use crate::config::defs::{RunConfig, HISAT2_TAG};
     use crate::utils::command::{version_check, ArgGenerator, index_prep::{IndexConfig, prepare_index}};
@@ -944,12 +958,8 @@ pub mod hisat2 {
 
     pub struct Hisat2ArgGenerator;
 
-    // pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
-    //     let version = version_check(HISAT2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout).await?;
-    //     Ok(version)
-    // }
-    pub async fn hisat2_presence_check() -> anyhow::Result<f32> { // Done because for some insane reason the homebrew version skips reporting version numbers
-        Ok(2.50)
+    pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
+        Ok(2.50) // Hardcoded due to Homebrew version reporting issue
     }
 
     pub fn hisat2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
@@ -966,7 +976,22 @@ pub mod hisat2 {
                 "8.".to_string(),
             ],
         };
-        prepare_index(input_path, cwd, &config)
+
+        // Generate a unique unpack directory based on the input filename or directory
+        let input_ref = input_path.as_ref();
+        let unique_id = if input_ref.is_file() {
+            input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
+        } else {
+            input_ref.file_name().unwrap_or_default().to_string_lossy().to_string()
+        };
+        let unpack_dir = cwd.join(format!("unpacked_index_ht2_{}", unique_id));
+
+        // Clean the unpack_dir to ensure no stale data
+        if unpack_dir.exists() {
+            std::fs::remove_dir_all(&unpack_dir)?;
+        }
+
+        prepare_index(input_path, cwd, &config, &unpack_dir)
     }
 
     impl ArgGenerator for Hisat2ArgGenerator {
@@ -990,7 +1015,7 @@ pub mod hisat2 {
             args_vec.push("-p".to_string());
             let num_cores: usize = RunConfig::thread_allocation(run_config, HISAT2_TAG, None);
             args_vec.push(num_cores.to_string());
-            args_vec.push("--interleaved".to_string());  // NB: set up to only take interleaved stdin; adjust if needed
+            args_vec.push("--interleaved".to_string());
             args_vec.push("-".to_string());
 
             Ok(args_vec)

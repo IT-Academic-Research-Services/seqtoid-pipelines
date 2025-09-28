@@ -194,6 +194,8 @@ pub enum PipelineError {
     NoTargetSequences(String),
     #[error("No alignments.")]
     NoAlignments,
+    #[error("Argument missing: {0}")]
+    MissingArgument(String),
     #[error("Other error: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
 }
