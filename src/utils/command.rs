@@ -1075,18 +1075,24 @@ pub mod kallisto {
                         let num_cores: usize = RunConfig::thread_allocation(run_config, KALLISTO_TAG, None);
                         args_vec.push(num_cores.to_string());
                     }
-                    args_vec.push("--single".to_string());
-                    args_vec.push("-l".to_string());
-                    args_vec.push("200".to_string());
-                    args_vec.push("-s".to_string());
-                    args_vec.push("20".to_string());
-                    args_vec.push("-".to_string()); // stdin
-                }
-            }
-            for (key, value) in config.subcommand_fields.iter() {
-                args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                    // Add non-file options from subcommand_fields (e.g., --single, -l, -s)
+                    for (key, value) in config.subcommand_fields.iter() {
+                        if key != "R1" && key != "R2" {
+                            args_vec.push(key.clone());
+                            if let Some(v) = value {
+                                args_vec.push(v.clone());
+                            }
+                        }
+                    }
+
+                    // Add R1 and R2 paths in order as positional arguments
+                    if let Some(r1_path) = config.subcommand_fields.get("R1").and_then(|v| v.as_ref()) {
+                        args_vec.push(r1_path.clone());
+                    }
+                    if let Some(r2_path) = config.subcommand_fields.get("R2").and_then(|v| v.as_ref()) {
+                        args_vec.push(r2_path.clone());
+                    }
                 }
             }
 
