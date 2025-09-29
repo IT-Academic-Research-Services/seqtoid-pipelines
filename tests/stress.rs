@@ -1,24 +1,26 @@
 use std::fs;
 use anyhow::anyhow;
-use seqtoid_pipelines::utils::fastx::fastx_generator;
+use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord};
 use anyhow::Result;
 use std::io::{stderr, Write};
 use std::path::Path;
 use std::time::Instant;
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
-use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput, deinterleave_fastq_stream_to_fifos};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Command;
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
+use tokio::fs::File as TokioFile;
 use futures::future::join_all;
 use seqtoid_pipelines::config::defs::{RunConfig, StreamDataType};
 use std::path::PathBuf;
 use rayon::ThreadPoolBuilder;
-use tokio::sync::Semaphore;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, Semaphore};
 use seqtoid_pipelines::cli::Arguments;
 
 #[tokio::test]
@@ -618,5 +620,126 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_deinterleave_fastq_stream_to_fifos_stress() -> Result<()> {
+    let config = create_test_run_config();
+    let (tx, rx) = mpsc::channel::<ParseOutput>(1000);
+    let stream = ReceiverStream::new(rx);
+
+    // Generate 10,000 interleaved records
+    let num_pairs = 5_000; // 10,000 records total (5,000 R1 + 5,000 R2)
+    tokio::spawn(async move {
+        for i in 0..num_pairs {
+            let r1_id = format!("read{}/1", i);
+            let r2_id = format!("read{}/2", i);
+            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: r1_id,
+                desc: None,
+                seq: Arc::new(b"ATCGATCG".to_vec()), // 8bp for simplicity
+                qual: Arc::new(b"IIIIIIII".to_vec()),
+            }))
+                .await
+                .unwrap();
+            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: r2_id,
+                desc: None,
+                seq: Arc::new(b"GCTAGCTA".to_vec()),
+                qual: Arc::new(b"HHHHHHHH".to_vec()),
+            }))
+                .await
+                .unwrap();
+        }
+    });
+
+    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        config.clone(),
+        stream,
+        "test_stress",
+        true,
+    )
+        .await?;
+
+    // Clone FIFOs for use in closures
+    let r1_fifo_clone = r1_fifo.clone();
+    let r2_fifo_clone = r2_fifo.clone();
+
+    // Spawn readers
+    let mut r1_reader = Command::new("cat")
+        .arg(&r1_fifo)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn cat for R1: {}", e))?;
+    let mut r2_reader = Command::new("cat")
+        .arg(&r2_fifo)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn cat for R2: {}", e))?;
+
+    // Count records by parsing output
+    let mut r1_count = 0;
+    let mut r2_count = 0;
+    let r1_handle = tokio::spawn(async move {
+        let mut reader = TokioFile::open(&r1_fifo_clone).await?;
+        let mut buffer = String::new();
+        reader.read_to_string(&mut buffer).await?;
+        let lines = buffer.lines().collect::<Vec<_>>();
+        for line in lines {
+            if line.starts_with('@') {
+                r1_count += 1;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    let r2_handle = tokio::spawn(async move {
+        let mut reader = TokioFile::open(&r2_fifo_clone).await?;
+        let mut buffer = String::new();
+        reader.read_to_string(&mut buffer).await?;
+        let lines = buffer.lines().collect::<Vec<_>>();
+        for line in lines {
+            if line.starts_with('@') {
+                r2_count += 1;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    // Await all with timeout to prevent hangs
+    let timeout_duration = Duration::from_secs(30); // 30s for 10,000 records
+    tokio::time::timeout(timeout_duration, deinterleave_handle).await???;
+    tokio::time::timeout(timeout_duration, r1_write_handle).await???;
+    tokio::time::timeout(timeout_duration, r2_write_handle).await???;
+    tokio::time::timeout(timeout_duration, r1_handle).await???;
+    tokio::time::timeout(timeout_duration, r2_handle).await???;
+
+    // Read outputs from cat (for completeness)
+    let mut r1_output = Vec::new();
+    let mut r2_output = Vec::new();
+    r1_reader.stdout.take().unwrap().read_to_end(&mut r1_output).await?;
+    r2_reader.stdout.take().unwrap().read_to_end(&mut r2_output).await?;
+
+    // Verify counts
+    assert_eq!(r1_count, num_pairs, "R1 should have {} records", num_pairs);
+    assert_eq!(r2_count, num_pairs, "R2 should have {} records", num_pairs);
+
+    // Spot-check a few records
+    let r1_reader = Command::new("head")
+        .args(&["-n", "4", r1_fifo.to_str().unwrap()])
+        .output()
+        .await?;
+    let r2_reader = Command::new("head")
+        .args(&["-n", "4", r2_fifo.to_str().unwrap()])
+        .output()
+        .await?;
+    let r1_str = String::from_utf8_lossy(&r1_reader.stdout);
+    let r2_str = String::from_utf8_lossy(&r2_reader.stdout);
+    assert!(r1_str.contains("@read0/1\nATCGATCG\n+\nIIIIIIII\n"), "R1 should contain first record");
+    assert!(r2_str.contains("@read0/2\nGCTAGCTA\n+\nHHHHHHHH\n"), "R2 should contain first record");
+
+    // Cleanup
+    tokio::fs::remove_file(&r1_fifo).await.ok();
+    tokio::fs::remove_file(&r2_fifo).await.ok();
     Ok(())
 }
