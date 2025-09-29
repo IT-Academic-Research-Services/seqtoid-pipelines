@@ -616,16 +616,17 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             let bytes_read = match reader.read_line(&mut buffer).await {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("Error reading FASTQ: {}", e);
+                    eprintln!("parse_fastq: Error reading FASTQ line: {}", e);
                     return;
                 }
             };
             if bytes_read == 0 {
+                eprintln!("parse_fastq: Reached end of input, processed {} records", count);
                 break;
             }
             let id_line = buffer.trim_end();
             if !id_line.starts_with('@') {
-                eprintln!("Invalid FASTQ format: expected '@', got '{}'", id_line);
+                eprintln!("parse_fastq: Invalid FASTQ format: expected '@', got '{}'", id_line);
                 return;
             }
 
@@ -634,34 +635,34 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
 
             buffer.clear();
             if reader.read_line(&mut buffer).await.is_err() {
-                eprintln!("Error reading sequence line");
+                eprintln!("parse_fastq: Error reading sequence line");
                 return;
             }
             let seq = buffer.trim_end().as_bytes().to_vec();
             if seq.is_empty() {
-                eprintln!("Missing sequence");
+                eprintln!("parse_fastq: Missing sequence");
                 return;
             }
 
             buffer.clear();
             if reader.read_line(&mut buffer).await.is_err() {
-                eprintln!("Error reading plus line");
+                eprintln!("parse_fastq: Error reading plus line");
                 return;
             }
             let plus = buffer.trim_end();
             if plus != "+" {
-                eprintln!("Invalid FASTQ format: expected '+', got '{}'", plus);
+                eprintln!("parse_fastq: Invalid FASTQ format: expected '+', got '{}'", plus);
                 return;
             }
 
             buffer.clear();
             if reader.read_line(&mut buffer).await.is_err() {
-                eprintln!("Error reading quality line");
+                eprintln!("parse_fastq: Error reading quality line");
                 return;
             }
             let qual = buffer.trim_end().as_bytes().to_vec();
             if qual.len() != seq.len() {
-                eprintln!("Sequence and quality lengths do not match");
+                eprintln!("parse_fastq: Sequence and quality lengths do not match: seq_len={}, qual_len={}", seq.len(), qual.len());
                 return;
             }
 
@@ -673,11 +674,12 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             };
 
             if tx.send(ParseOutput::Fastq(record)).await.is_err() {
-                eprintln!("Receiver dropped while sending FASTQ record");
+                eprintln!("parse_fastq: Receiver dropped after {} records", count);
                 break;
             }
             count += 1;
         }
+        eprintln!("parse_fastq: Completed parsing, sent {} FASTQ records", count);
     });
 
     Ok(rx)
@@ -938,20 +940,25 @@ pub async fn create_fifo(path: &PathBuf) -> Result<()> {
 async fn write_to_fifo(
     mut rx: mpsc::Receiver<ParseOutput>,
     fifo_path: PathBuf,
-    writers_ready: Arc<Notify>,
 ) -> Result<()> {
     let file = TokioFile::create(&fifo_path).await
         .map_err(|e| anyhow!("Failed to open FIFO for write {}: {}", fifo_path.display(), e))?;
     let mut writer = BufWriter::new(file);
     eprintln!("Opened FIFO for writing: {}", fifo_path.display());
-    writers_ready.notify_one(); // Signal that FIFO is opened for writing
+    let mut bytes_written = 0;
     while let Some(item) = rx.recv().await {
         let bytes = item.to_bytes()?;
+        // Log first few bytes to check FASTQ format
+        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(100)]).to_string();
+        eprintln!("Writing to FIFO {}: {} bytes, preview: {}", fifo_path.display(), bytes.len(), preview);
         writer.write_all(&bytes).await
             .map_err(|e| anyhow!("Write to FIFO failed: {}", e))?;
+        bytes_written += bytes.len();
+        eprintln!("Wrote {} bytes to FIFO: {}", bytes.len(), fifo_path.display());
     }
     writer.flush().await
         .map_err(|e| anyhow!("Flush to FIFO failed: {}", e))?;
+    eprintln!("Finished writing {} bytes to FIFO: {}", bytes_written, fifo_path.display());
     Ok(())
 }
 
@@ -968,6 +975,7 @@ async fn write_to_fifo(
 /// # Returns
 /// Tuple:
 /// (r1_fifo_path, r2_fifo_path, deinterleave_handle, r1_write_handle, r2_write_handle)
+
 pub async fn deinterleave_fastq_stream_to_fifos(
     config: Arc<RunConfig>,
     mut input_stream: ReceiverStream<ParseOutput>,
@@ -978,6 +986,11 @@ pub async fn deinterleave_fastq_stream_to_fifos(
     let r1_fifo = ram_temp_dir.join(format!("{}_R1.fq", sample_base));
     let r2_fifo = ram_temp_dir.join(format!("{}_R2.fq", sample_base));
 
+    // Prophylactic cleanup
+    eprintln!("Cleaning up existing FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
+    tokio::fs::remove_file(&r1_fifo).await.ok();
+    tokio::fs::remove_file(&r2_fifo).await.ok();
+
     eprintln!("Creating FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
     create_fifo(&r1_fifo).await?;
     create_fifo(&r2_fifo).await?;
@@ -985,9 +998,7 @@ pub async fn deinterleave_fastq_stream_to_fifos(
     let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
-    let writers_ready = Arc::new(Notify::new());
-
-    // Deinterleave task: Consume input, alternate sends (or all to R1 if !paired)
+    // Deinterleave task
     let deinterleave_handle = tokio::spawn(async move {
         let mut is_r1 = true;
         while let Some(item) = input_stream.next().await {
@@ -1007,18 +1018,18 @@ pub async fn deinterleave_fastq_stream_to_fifos(
                 _ => return Err(anyhow!("Non-FASTQ in deinterleave stream")),
             }
         }
+        eprintln!("deinterleave_fastq_stream_to_fifos: Completed deinterleaving");
         Ok(())
     });
 
     // R1 writer task
-    let r1_write_handle = tokio::spawn(write_to_fifo(r1_rx, r1_fifo.clone(), writers_ready.clone()));
+    let r1_write_handle = tokio::spawn(write_to_fifo(r1_rx, r1_fifo.clone()));
 
-    // R2 writer task (even if !paired, but it will just recv nothing and close)
-    let r2_write_handle = tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone(), writers_ready.clone()));
+    // R2 writer task
+    let r2_write_handle = tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone()));
 
     Ok((r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle))
 }
-
 
 /// Combines multiple streams into one
 ///
