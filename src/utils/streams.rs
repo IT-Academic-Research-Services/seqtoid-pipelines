@@ -905,6 +905,27 @@ pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) ->
 }
 
 
+/// Creates an async FIFO pipe using Tokio command.
+///
+/// # Arguments
+///
+/// * `path` - PathBuf to to the new FIFO
+///
+/// # Returns
+/// Result(): whether the fifo was created successfully.
+pub async fn create_fifo(path: &PathBuf) -> Result<()> {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .await
+        .map_err(|e| anyhow!("Failed to execute mkfifo: {}", e))?;
+    if !status.success() {
+        return Err(anyhow!("mkfifo failed with exit code: {:?}", status.code()));
+    }
+    Ok(())
+}
+
+
 /// Combines multiple streams into one
 ///
 /// # Arguments
@@ -1046,6 +1067,9 @@ mod tests {
     use tokio::sync::{Semaphore, Mutex};
     use std::path::PathBuf;
     use crate::cli::Arguments;
+    use tempfile::tempdir;
+    use tokio::fs::metadata;
+    use std::os::unix::fs::FileTypeExt;
 
     // Helper function to create a RunConfig for tests
     fn create_test_run_config() -> Arc<RunConfig> {
@@ -1939,4 +1963,56 @@ mod tests {
         std::fs::remove_file(&path)?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_create_fifo_success() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test_fifo").to_path_buf();
+        create_fifo(&path).await?;
+        let meta = metadata(&path).await?;
+        assert!(meta.file_type().is_fifo(), "Created file should be a FIFO");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_fifo_already_exists_as_file() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("test_fifo").to_path_buf();
+        // Create as regular file first
+        tokio::fs::File::create(&path).await?;
+        let result = create_fifo(&path).await;
+        assert!(result.is_err(), "Should error if path exists as non-FIFO");
+        if let Err(e) = result {
+            assert!(e.to_string().contains("mkfifo failed"), "Error should mention mkfifo failure");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_fifo_invalid_path() -> Result<()> {
+        let invalid_path = PathBuf::from("/invalid/nonexistent/dir/test_fifo");
+        let result = create_fifo(&invalid_path).await;
+        assert!(result.is_err(), "Should error on invalid path");
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("Failed to execute mkfifo") || e.to_string().contains("mkfifo failed"),
+                "Error should mention mkfifo execution failure"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_fifo_with_ram_temp_dir() -> Result<()> {
+        let config = create_test_run_config();
+        let fifo_path = config.ram_temp_dir.join("test_ram_fifo").to_path_buf();
+        create_fifo(&fifo_path).await?;
+        let meta = metadata(&fifo_path).await?;
+        assert!(meta.file_type().is_fifo(), "Created file in ram_temp_dir should be a FIFO");
+        // Cleanup
+        tokio::fs::remove_file(&fifo_path).await.ok();
+        Ok(())
+    }
+
+
 }
