@@ -1,24 +1,26 @@
 use std::fs;
 use anyhow::anyhow;
-use seqtoid_pipelines::utils::fastx::fastx_generator;
+use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord};
 use anyhow::Result;
 use std::io::{stderr, Write};
 use std::path::Path;
 use std::time::Instant;
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
-use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput, deinterleave_fastq_stream_to_fifos};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::Command;
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
+use tokio::fs::File as TokioFile;
 use futures::future::join_all;
 use seqtoid_pipelines::config::defs::{RunConfig, StreamDataType};
 use std::path::PathBuf;
 use rayon::ThreadPoolBuilder;
-use tokio::sync::Semaphore;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, Semaphore};
 use seqtoid_pipelines::cli::Arguments;
 
 #[tokio::test]
