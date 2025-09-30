@@ -1073,10 +1073,6 @@ pub async fn deinterleave_fastq_stream_to_fifos(
                                 .map_err(Into::<anyhow::Error>::into)?;
                         }
                         is_r1 = !is_r1;
-                        // Validate strict alternation for paired-end
-                        if record_count % 2 == 0 && is_r1 {
-                            eprintln!("Processed {} paired-end records", record_count / 2);
-                        }
                     } else {
                         r1_tx.send(ParseOutput::Fastq(record)).await
                             .map_err(|_| PipelineError::StreamDataDropped)
