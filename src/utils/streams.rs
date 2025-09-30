@@ -2198,7 +2198,6 @@ mod tests {
         let fifo_path = dir.path().join("test_fifo").to_path_buf();
         create_fifo(&fifo_path).await?;
 
-        let writers_ready = Arc::new(Notify::new());
         let (tx, rx) = mpsc::channel::<ParseOutput>(10);
         let test_records = vec![
             ParseOutput::Fastq(SequenceRecord::Fastq {
@@ -2228,9 +2227,8 @@ mod tests {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat: {}", e))?;
 
-        // Wait for writer to be ready
-        let write_handle = tokio::spawn(write_to_fifo(rx, fifo_path.clone(), writers_ready.clone()));
-        writers_ready.notified().await; // Wait for FIFO to be opened
+        // Write to FIFO
+        let write_handle = tokio::spawn(write_to_fifo(rx, fifo_path.clone()));
         let mut output = Vec::new();
         reader.stdout.take().unwrap().read_to_end(&mut output).await?;
         write_handle.await??;
@@ -2248,7 +2246,6 @@ mod tests {
         let fifo_path = dir.path().join("test_fifo").to_path_buf();
         create_fifo(&fifo_path).await?;
 
-        let writers_ready = Arc::new(Notify::new());
         let (tx, rx) = mpsc::channel::<ParseOutput>(10);
         drop(tx); // Simulate empty stream
 
@@ -2260,8 +2257,7 @@ mod tests {
             .map_err(|e| anyhow!("Failed to spawn cat: {}", e))?;
 
         // Write (should complete immediately)
-        let write_handle = tokio::spawn(write_to_fifo(rx, fifo_path.clone(), writers_ready.clone()));
-        writers_ready.notified().await; // Wait for FIFO to be opened
+        let write_handle = tokio::spawn(write_to_fifo(rx, fifo_path.clone()));
         let mut output = Vec::new();
         reader.stdout.take().unwrap().read_to_end(&mut output).await?;
         write_handle.await??;
@@ -2275,9 +2271,8 @@ mod tests {
     #[tokio::test]
     async fn test_write_to_fifo_invalid_path() -> Result<()> {
         let invalid_path = PathBuf::from("/blah/blah/flibiddy/blah");
-        let writers_ready = Arc::new(Notify::new());
         let (tx, rx) = mpsc::channel::<ParseOutput>(10);
-        let write_handle = tokio::spawn(write_to_fifo(rx, invalid_path.clone(), writers_ready));
+        let write_handle = tokio::spawn(write_to_fifo(rx, invalid_path.clone()));
         let result = write_handle.await?;
         assert!(result.is_err(), "Should error on invalid FIFO path");
         if let Err(e) = result {
@@ -2295,7 +2290,6 @@ mod tests {
         let fifo_path = config.ram_temp_dir.join("test_ram_fifo").to_path_buf();
         create_fifo(&fifo_path).await?;
 
-        let writers_ready = Arc::new(Notify::new());
         let (tx, rx) = mpsc::channel::<ParseOutput>(10);
         let test_record = ParseOutput::Fastq(SequenceRecord::Fastq {
             id: "read1".to_string(),
@@ -2316,8 +2310,7 @@ mod tests {
             .map_err(|e| anyhow!("Failed to spawn cat: {}", e))?;
 
         // Write to FIFO
-        let write_handle = tokio::spawn(write_to_fifo(rx, fifo_path.clone(), writers_ready.clone()));
-        writers_ready.notified().await; // Wait for FIFO to be opened
+        let write_handle = tokio::spawn(write_to_fifo(rx, fifo_path.clone()));
         let mut output = Vec::new();
         reader.stdout.take().unwrap().read_to_end(&mut output).await?;
         write_handle.await??;
@@ -2325,7 +2318,6 @@ mod tests {
         // Verify
         let output_str = String::from_utf8_lossy(&output);
         assert!(output_str.contains("@read1\nATCG\n+\nIIII\n"), "Should contain read1 in ram_temp_dir");
-        // Cleanup
         tokio::fs::remove_file(&fifo_path).await.ok();
         Ok(())
     }
