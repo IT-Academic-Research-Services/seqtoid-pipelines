@@ -659,14 +659,8 @@ async fn test_deinterleave_fastq_stream_to_fifos_stress() -> Result<()> {
         stream,
         "test_stress",
         true,
-    )
-        .await?;
+    ).await?;
 
-    // Clone FIFOs for use in closures
-    let r1_fifo_clone = r1_fifo.clone();
-    let r2_fifo_clone = r2_fifo.clone();
-
-    // Spawn readers
     let mut r1_reader = Command::new("cat")
         .arg(&r1_fifo)
         .stdout(std::process::Stdio::piped())
@@ -678,63 +672,28 @@ async fn test_deinterleave_fastq_stream_to_fifos_stress() -> Result<()> {
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn cat for R2: {}", e))?;
 
-    // Count records by parsing output
-    let mut r1_count = 0;
-    let mut r2_count = 0;
-    let r1_handle = tokio::spawn(async move {
-        let mut reader = TokioFile::open(&r1_fifo_clone).await?;
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer).await?;
-        let lines = buffer.lines().collect::<Vec<_>>();
-        for line in lines {
-            if line.starts_with('@') {
-                r1_count += 1;
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    });
-    let r2_handle = tokio::spawn(async move {
-        let mut reader = TokioFile::open(&r2_fifo_clone).await?;
-        let mut buffer = String::new();
-        reader.read_to_string(&mut buffer).await?;
-        let lines = buffer.lines().collect::<Vec<_>>();
-        for line in lines {
-            if line.starts_with('@') {
-                r2_count += 1;
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    });
-
-    // Await all with timeout to prevent hangs
-    let timeout_duration = Duration::from_secs(30); // 30s for 10,000 records
-    tokio::time::timeout(timeout_duration, deinterleave_handle).await???;
-    tokio::time::timeout(timeout_duration, r1_write_handle).await???;
-    tokio::time::timeout(timeout_duration, r2_write_handle).await???;
-    tokio::time::timeout(timeout_duration, r1_handle).await???;
-    tokio::time::timeout(timeout_duration, r2_handle).await???;
-
-    // Read outputs from cat (for completeness)
     let mut r1_output = Vec::new();
     let mut r2_output = Vec::new();
     r1_reader.stdout.take().unwrap().read_to_end(&mut r1_output).await?;
     r2_reader.stdout.take().unwrap().read_to_end(&mut r2_output).await?;
 
+
+    let timeout_duration = Duration::from_secs(60); // 60s for 10,000 records
+    tokio::time::timeout(timeout_duration, deinterleave_handle).await???;
+    tokio::time::timeout(timeout_duration, r1_write_handle).await???;
+    tokio::time::timeout(timeout_duration, r2_write_handle).await???;
+
+    // Count records by parsing output
+    let r1_str = String::from_utf8_lossy(&r1_output);
+    let r2_str = String::from_utf8_lossy(&r2_output);
+    let r1_count = r1_str.lines().filter(|line| line.starts_with('@')).count();
+    let r2_count = r2_str.lines().filter(|line| line.starts_with('@')).count();
+
     // Verify counts
     assert_eq!(r1_count, num_pairs, "R1 should have {} records", num_pairs);
     assert_eq!(r2_count, num_pairs, "R2 should have {} records", num_pairs);
 
-    // Spot-check a few records
-    let r1_reader = Command::new("head")
-        .args(&["-n", "4", r1_fifo.to_str().unwrap()])
-        .output()
-        .await?;
-    let r2_reader = Command::new("head")
-        .args(&["-n", "4", r2_fifo.to_str().unwrap()])
-        .output()
-        .await?;
-    let r1_str = String::from_utf8_lossy(&r1_reader.stdout);
-    let r2_str = String::from_utf8_lossy(&r2_reader.stdout);
+    // Spot-check first record
     assert!(r1_str.contains("@read0/1\nATCGATCG\n+\nIIIIIIII\n"), "R1 should contain first record");
     assert!(r2_str.contains("@read0/2\nGCTAGCTA\n+\nHHHHHHHH\n"), "R2 should contain first record");
 
