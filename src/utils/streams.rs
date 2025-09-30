@@ -17,6 +17,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::sync::Notify;
 use tokio::fs::File as TokioFile;
+use tokio::fs::{metadata, remove_file};
+use std::os::unix::fs::FileTypeExt;
+use futures::TryFutureExt;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType};
@@ -937,27 +940,49 @@ pub async fn create_fifo(path: &PathBuf) -> Result<()> {
 ///
 /// # Returns
 /// Result(): whether the fifo wrote successfully
-async fn write_to_fifo(
+pub async fn write_to_fifo(
     mut rx: mpsc::Receiver<ParseOutput>,
     fifo_path: PathBuf,
 ) -> Result<()> {
-    let file = TokioFile::create(&fifo_path).await
-        .map_err(|e| anyhow!("Failed to open FIFO for write {}: {}", fifo_path.display(), e))?;
-    let mut writer = BufWriter::new(file);
+    // Open FIFO in write mode (blocks until reader opens)
+    let file = TokioFile::options()
+        .write(true)
+        .open(&fifo_path)
+        .await
+        .map_err(|e| PipelineError::IOError(format!("Failed to open FIFO {} for write: {}", fifo_path.display(), e)))
+        .map_err(Into::<anyhow::Error>::into)?;
+
+    // Use larger buffer (e.g., 16MB) given 1.5TB RAM and NVMe scratch
+    let mut writer = BufWriter::with_capacity(16_777_216, file);
     eprintln!("Opened FIFO for writing: {}", fifo_path.display());
+
     let mut bytes_written = 0;
     while let Some(item) = rx.recv().await {
-        let bytes = item.to_bytes()?;
-        // Log first few bytes to check FASTQ format
-        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(100)]).to_string();
-        eprintln!("Writing to FIFO {}: {} bytes, preview: {}", fifo_path.display(), bytes.len(), preview);
+        let bytes = item.to_bytes()
+            .map_err(|e| PipelineError::InvalidFastqFormat(format!("Failed to convert item to bytes: {}", e)))
+            .map_err(Into::<anyhow::Error>::into)?;
+
+        // Write to FIFO with error handling
         writer.write_all(&bytes).await
-            .map_err(|e| anyhow!("Write to FIFO failed: {}", e))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    PipelineError::StreamDataDropped
+                } else {
+                    PipelineError::IOError(format!("Write to FIFO {} failed: {}", fifo_path.display(), e))
+                }
+            })
+            .map_err(Into::<anyhow::Error>::into)?;
         bytes_written += bytes.len();
-        eprintln!("Wrote {} bytes to FIFO: {}", bytes.len(), fifo_path.display());
+
+        // Log every 10MB for high-throughput runs
+        if bytes_written % 10_485_760 == 0 {
+            eprintln!("Wrote {} bytes to FIFO: {}", bytes_written, fifo_path.display());
+        }
     }
+
     writer.flush().await
-        .map_err(|e| anyhow!("Flush to FIFO failed: {}", e))?;
+        .map_err(|e| PipelineError::IOError(format!("Flush to FIFO {} failed: {}", fifo_path.display(), e)))
+        .map_err(Into::<anyhow::Error>::into)?;
     eprintln!("Finished writing {} bytes to FIFO: {}", bytes_written, fifo_path.display());
     Ok(())
 }
@@ -975,59 +1000,108 @@ async fn write_to_fifo(
 /// # Returns
 /// Tuple:
 /// (r1_fifo_path, r2_fifo_path, deinterleave_handle, r1_write_handle, r2_write_handle)
-
 pub async fn deinterleave_fastq_stream_to_fifos(
     config: Arc<RunConfig>,
     mut input_stream: ReceiverStream<ParseOutput>,
     sample_base: &str,
     paired: bool,
-) -> Result<(PathBuf, PathBuf, JoinHandle<Result<()>>, JoinHandle<Result<()>>, JoinHandle<Result<()>>)> {
+) -> Result<(PathBuf, PathBuf, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
     let ram_temp_dir = config.ram_temp_dir.clone();
     let r1_fifo = ram_temp_dir.join(format!("{}_R1.fq", sample_base));
     let r2_fifo = ram_temp_dir.join(format!("{}_R2.fq", sample_base));
 
-    // Prophylactic cleanup
+    // Proactively remove existing FIFOs with retry
     eprintln!("Cleaning up existing FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
-    tokio::fs::remove_file(&r1_fifo).await.ok();
-    tokio::fs::remove_file(&r2_fifo).await.ok();
+    for fifo in [&r1_fifo, &r2_fifo] {
+        for attempt in 1..=3 {
+            if metadata(fifo).await.is_ok() {
+                eprintln!("Attempt {} to remove existing FIFO: {}", attempt, fifo.display());
+                match remove_file(fifo).await {
+                    Ok(_) => eprintln!("Successfully removed FIFO: {}", fifo.display()),
+                    Err(e) => {
+                        eprintln!("Failed to remove FIFO {} on attempt {}: {}", fifo.display(), attempt, e);
+                        if attempt < 3 {
+                            sleep(Duration::from_millis(100)).await; // Brief delay before retry
+                            continue;
+                        }
+                        return Err(PipelineError::IOError(format!("Failed to remove existing FIFO {} after {} attempts: {}", fifo.display(), attempt, e)));
+                    }
+                }
+            } else {
+                eprintln!("No existing FIFO found: {}", fifo.display());
+                break;
+            }
+        }
+    }
 
+    // Create FIFOs
     eprintln!("Creating FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
-    create_fifo(&r1_fifo).await?;
-    create_fifo(&r2_fifo).await?;
+    create_fifo(&r1_fifo).await
+        .map_err(|e| PipelineError::IOError(format!("Failed to create R1 FIFO {}: {}", r1_fifo.display(), e)))?;
+    create_fifo(&r2_fifo).await
+        .map_err(|e| PipelineError::IOError(format!("Failed to create R2 FIFO {}: {}", r2_fifo.display(), e)))?;
 
-    let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
-    let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+    // Verify FIFOs
+    if !metadata(&r1_fifo).await.map_err(|e| PipelineError::IOError(format!("R1 FIFO check failed: {}", e)))?.file_type().is_fifo() {
+        return Err(PipelineError::IOError(format!("R1 path {} is not a FIFO", r1_fifo.display())));
+    }
+    if !metadata(&r2_fifo).await.map_err(|e| PipelineError::IOError(format!("R2 FIFO check failed: {}", e)))?.file_type().is_fifo() {
+        return Err(PipelineError::IOError(format!("R2 path {} is not a FIFO", r2_fifo.display())));
+    }
+
+    // Use larger buffer (e.g., 100K records) for high-performance cluster
+    let buffer_size = (config.base_buffer_size * 10).min(100_000);
+    let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(buffer_size);
+    let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(buffer_size);
 
     // Deinterleave task
     let deinterleave_handle = tokio::spawn(async move {
         let mut is_r1 = true;
+        let mut record_count = 0;
         while let Some(item) = input_stream.next().await {
+            record_count += 1;
             match item {
                 ParseOutput::Fastq(record) => {
-                    if !paired || is_r1 {
-                        if r1_tx.send(ParseOutput::Fastq(record)).await.is_err() {
-                            return Err(anyhow!("R1 channel closed prematurely - data drop risk"));
+                    if paired {
+                        if is_r1 {
+                            r1_tx.send(ParseOutput::Fastq(record)).await
+                                .map_err(|_| PipelineError::StreamDataDropped)
+                                .map_err(Into::<anyhow::Error>::into)?;
+                        } else {
+                            r2_tx.send(ParseOutput::Fastq(record)).await
+                                .map_err(|_| PipelineError::StreamDataDropped)
+                                .map_err(Into::<anyhow::Error>::into)?;
+                        }
+                        is_r1 = !is_r1;
+                        // Validate strict alternation for paired-end
+                        if record_count % 2 == 0 && is_r1 {
+                            eprintln!("Processed {} paired-end records", record_count / 2);
                         }
                     } else {
-                        if r2_tx.send(ParseOutput::Fastq(record)).await.is_err() {
-                            return Err(anyhow!("R2 channel closed prematurely - data drop risk"));
-                        }
+                        r1_tx.send(ParseOutput::Fastq(record)).await
+                            .map_err(|_| PipelineError::StreamDataDropped)
+                            .map_err(Into::<anyhow::Error>::into)?;
                     }
-                    is_r1 = !is_r1;
                 }
-                _ => return Err(anyhow!("Non-FASTQ in deinterleave stream")),
+                _ => return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in deinterleave stream".to_string()))
+                    .map_err(Into::<anyhow::Error>::into),
             }
         }
-        eprintln!("deinterleave_fastq_stream_to_fifos: Completed deinterleaving");
+        if paired && !is_r1 {
+            return Err(PipelineError::InvalidFastqFormat(format!(
+                "Incomplete paired-end stream: {} records, expected even number", record_count
+            )))
+                .map_err(Into::<anyhow::Error>::into);
+        }
+        eprintln!("deinterleave_fastq_stream_to_fifos: Completed deinterleaving {} records", record_count);
         Ok(())
     });
 
-    // R1 writer task
+    // Writer tasks
     let r1_write_handle = tokio::spawn(write_to_fifo(r1_rx, r1_fifo.clone()));
-
-    // R2 writer task
     let r2_write_handle = tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone()));
 
+    // Defer cleanup to pipeline completion (handled in run cleanup_tasks)
     Ok((r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle))
 }
 

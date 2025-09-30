@@ -494,101 +494,42 @@ async fn kallisto_quant(
     out_dir: PathBuf,
     paired: bool,
     sample_base_buf: PathBuf,
-) -> Result<(oneshot::Receiver<KallistoResults>, Vec<JoinHandle<Result<()>>>, Vec<oneshot::Receiver<Result<()>>>), PipelineError> {
+) -> Result<(oneshot::Receiver<KallistoResults>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
     let sample_base = sample_base_buf.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let kallisto_out_dir = out_dir.join("kallisto");
-    fs::create_dir_all(&kallisto_out_dir).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    fs::create_dir_all(&kallisto_out_dir).await
+        .map_err(|e| PipelineError::IOError(format!("Failed to create Kallisto output directory: {}", e)))?;
 
-    let kallisto_index = config.args.kallisto_index.clone().ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?;
+    let kallisto_index = config.args.kallisto_index.clone()
+        .ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?;
     let (ercc_tx, ercc_rx) = oneshot::channel::<KallistoResults>();
-
-    // Convert raw byte stream to Fastq
-    eprintln!("Converting byte stream to FASTQ for sample: {}", sample_base);
-    let byte_rx = input_stream.into_inner();
-    let byte_reader = ChannelReader::new(byte_rx);
-    let fastq_rx = parse_fastq(byte_reader, config.base_buffer_size).await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: "parse_fastq".to_string(),
-            error: e.to_string(),
-        })?;
-    let mut fastq_stream = ReceiverStream::new(fastq_rx);
 
     if paired {
         // Paired-end: Deinterleave to FIFOs
         eprintln!("Deinterleaving FASTQ stream for sample: {}", sample_base);
-        // Log and validate stream items
-        let (tx, rx) = tokio::sync::mpsc::channel(config.base_buffer_size);
-        let log_task = tokio::spawn(async move {
-            let mut count = 0;
-            while let Some(item) = fastq_stream.next().await {
-                count += 1;
-                match &item {
-                    ParseOutput::Fastq(SequenceRecord::Fastq { id, seq, qual, .. }) => {
-                        if seq.is_empty() || qual.is_empty() {
-                            eprintln!("kallisto_quant invalid FASTQ item {}: empty seq or qual", count);
-                            return Err(anyhow!("Invalid FASTQ record: empty sequence or quality"));
-                        }
-                        eprintln!(
-                            "kallisto_quant input item {}: Fastq(id: {}, seq_len: {}, qual_len: {})",
-                            count, id, seq.len(), qual.len()
-                        );
-                    }
-                    _ => {
-                        eprintln!("kallisto_quant invalid item {}: {:?}", count, item);
-                        return Err(anyhow!("Non-FASTQ item in stream"));
-                    }
-                }
-                if tx.send(item).await.is_err() {
-                    eprintln!("kallisto_quant forwarding channel closed prematurely after {} items", count);
-                    return Err(anyhow!("Forwarding channel closed"));
-                }
-            }
-            eprintln!("kallisto_quant processed {} FASTQ items", count);
-            Ok(())
-        });
-        cleanup_tasks.push(log_task);
-        let fastq_stream = ReceiverStream::new(rx);
-
         let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
             config.clone(),
-            fastq_stream,
+            input_stream,
             &sample_base,
             paired,
-        ).await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: "deinterleave_fastq_stream_to_fifos".to_string(),
-                error: e.to_string(),
-            })?;
+        ).await?;
 
         cleanup_tasks.push(deinterleave_handle);
         cleanup_tasks.push(r1_write_handle);
         cleanup_tasks.push(r2_write_handle);
 
-        // Verify FIFOs exist
-        if !fs::metadata(&r1_fifo).await.is_ok() || !fs::metadata(&r2_fifo).await.is_ok() {
-            return Err(PipelineError::IOError(format!(
-                "FIFOs not found: R1={}, R2={}",
-                r1_fifo.display(),
-                r2_fifo.display()
-            )));
-        }
-
-        // Brief sleep to allow writers to start
-        sleep(Duration::from_millis(500)).await;
-
         // Kallisto config for paired-end
-        let mut subcommand_fields = HashMap::new();
-        subcommand_fields.insert("R1".to_string(), Some(r1_fifo.to_string_lossy().to_string()));
-        subcommand_fields.insert("R2".to_string(), Some(r2_fifo.to_string_lossy().to_string()));
-
         let kallisto_config = KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
-            subcommand_fields,
+            subcommand_fields: HashMap::from([
+                ("R1".to_string(), Some(r1_fifo.to_string_lossy().to_string())),
+                ("R2".to_string(), Some(r2_fifo.to_string_lossy().to_string())),
+            ]),
             output_dir: kallisto_out_dir.clone(),
-            reproducible: false, // Hardcoded as requested
+            reproducible: false
         };
 
         let kallisto_args = generate_cli(KALLISTO_TAG, &config, Some(&kallisto_config))
@@ -599,7 +540,7 @@ async fn kallisto_quant(
 
         eprintln!("Spawning Kallisto with args: {:?}", kallisto_args);
 
-        // Spawn Kallisto after sleep to ensure writers are ready
+        // Spawn Kallisto
         let (mut kallisto_child, kallisto_err_task) = spawn_cmd(
             config.clone(),
             KALLISTO_TAG,
@@ -616,37 +557,33 @@ async fn kallisto_quant(
         cleanup_tasks.push(kallisto_err_task);
 
         // Await Kallisto exit
+        let r1_fifo_clone = r1_fifo.clone();
+        let r2_fifo_clone = r2_fifo.clone();
         let kallisto_exit_task = tokio::spawn(async move {
             let status = kallisto_child.wait().await
                 .map_err(|e| anyhow!("Kallisto wait failed: {}", e))?;
             if !status.success() {
                 return Err(anyhow!("Kallisto exited with code: {:?}", status.code()));
             }
+            // Clean up FIFOs after Kallisto exits
+            tokio::fs::remove_file(&r1_fifo_clone).await
+                .map_err(|e| anyhow!("Failed to remove R1 FIFO {}: {}", r1_fifo_clone.display(), e))?;
+            tokio::fs::remove_file(&r2_fifo_clone).await
+                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo_clone.display(), e))?;
             Ok(())
         });
         cleanup_tasks.push(kallisto_exit_task);
-
-        // FIFO cleanup task
-        let r1_fifo_clone = r1_fifo.clone();
-        let r2_fifo_clone = r2_fifo.clone();
-        let fifo_cleanup_task = tokio::spawn(async move {
-            tokio::fs::remove_file(&r1_fifo_clone).await.ok();
-            tokio::fs::remove_file(&r2_fifo_clone).await.ok();
-            Ok(())
-        });
-        cleanup_tasks.push(fifo_cleanup_task);
     } else {
-        // Single-end: Use stdin
-        let mut subcommand_fields = HashMap::new();
-        subcommand_fields.insert("--single".to_string(), None);
-        subcommand_fields.insert("-l".to_string(), Some("200".to_string()));
-        subcommand_fields.insert("-s".to_string(), Some("20".to_string()));
-
+        // Single-end: Pipe stream to Kallisto stdin
         let kallisto_config = KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
-            subcommand_fields,
+            subcommand_fields: HashMap::from([
+                ("--single".to_string(), None),
+                ("-l".to_string(), Some("200".to_string())),
+                ("-s".to_string(), Some("20".to_string())),
+            ]),
             output_dir: kallisto_out_dir.clone(),
-            reproducible: false, // Hardcoded as requested
+            reproducible: false
         };
 
         let kallisto_args = generate_cli(KALLISTO_TAG, &config, Some(&kallisto_config))
@@ -660,7 +597,7 @@ async fn kallisto_quant(
         // Pipe stream to Kallisto stdin
         let (mut kallisto_child, kallisto_stream_task, kallisto_err_task) = stream_to_cmd(
             config.clone(),
-            fastq_stream.into_inner(),
+            input_stream.into_inner(),
             KALLISTO_TAG,
             kallisto_args,
             StreamDataType::IlluminaFastq,
@@ -693,7 +630,7 @@ async fn kallisto_quant(
                 let est_counts = fields[4].parse::<f64>()
                     .map_err(|e| anyhow!("Failed to parse est_counts: {}", e))?;
                 ercc_counts.push((target_id.clone(), est_counts));
-                // Example: Assume target_id is transcript, gene_id is derived (adjust as needed)
+                // Adjust gene ID mapping based on your reference (e.g., ERCC or SARS-CoV-2)
                 transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
             }
         }
@@ -718,7 +655,6 @@ async fn kallisto_quant(
 
     Ok((ercc_rx, cleanup_tasks, cleanup_receivers))
 }
-
 /// HISAT2 filter
 ///
 /// # Arguments
