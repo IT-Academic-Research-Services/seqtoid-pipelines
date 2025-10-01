@@ -685,7 +685,7 @@ async fn hisat2_filter(
     cleanup_tasks.push(deinterleave_handle);
     cleanup_tasks.push(r1_write_handle);
     if let Some(r2_handle) = r2_write_handle {
-        cleanup_tasks.push(r2_handle); // Push r2_write_handle for paired-end
+        cleanup_tasks.push(r2_handle);
     }
 
     // HISAT2 configuration with FIFOs
@@ -702,7 +702,8 @@ async fn hisat2_filter(
             error: e.to_string(),
         })?;
 
-    // Use spawn_cmd since HISAT2 reads from FIFOs
+    eprintln!("hisat2 args {:?}", hisat2_args);
+
     let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
         config.clone(),
         HISAT2_TAG,
@@ -1027,9 +1028,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
 
+
+    // Host filtering: hisat2
+    let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
+    let host_hisat2_options = HashMap::from([]);
+    let (host_hisat2_out_stream, host_hisat2_count_rx, host_hisat2_cleanup_tasks, host_hisat2_cleanup_receivers) = hisat2_filter(
+        config.clone(),
+        host_bt2_out_stream,
+        host_hisat2_index_path,
+        paired,
+        host_hisat2_options,
+        None,
+    ).await?;
+    cleanup_tasks.extend(host_hisat2_cleanup_tasks);
+    cleanup_receivers.extend(host_hisat2_cleanup_receivers);
+
     // Test write out for the main stream until pipeline construction complete
     let test_write_task = tokio::spawn(stream_to_file(
-        host_bt2_out_stream.into_inner(),
+        host_hisat2_out_stream.into_inner(),
         PathBuf::from("test.fq"),
     ));
     test_write_task.await;
@@ -1069,6 +1085,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
     eprintln!("Host bt2 counts: {:?}", host_bt2_counts);
+
+    let host_hisat2_counts = host_hisat2_count_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
+    eprintln!("Host hisat2 counts: {:?}", host_hisat2_counts);
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
