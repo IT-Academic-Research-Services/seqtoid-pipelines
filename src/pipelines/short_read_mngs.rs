@@ -530,7 +530,9 @@ async fn kallisto_quant(
 
         cleanup_tasks.push(deinterleave_handle);
         cleanup_tasks.push(r1_write_handle);
-        cleanup_tasks.push(r2_write_handle);
+        if let Some(r2_handle) = r2_write_handle {
+            cleanup_tasks.push(r2_handle);
+        }
 
         // Kallisto config for paired-end
         let kallisto_config = KallistoConfig {
@@ -697,10 +699,26 @@ async fn hisat2_filter(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
+    // Create FIFOs for input (deinterleaved for paired, single FIFO for single-end)
+    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        config.clone(),
+        input_stream,
+        "hisat2_input",
+        paired,
+    ).await?;
 
+    cleanup_tasks.push(deinterleave_handle);
+    cleanup_tasks.push(r1_write_handle);
+    if let Some(r2_handle) = r2_write_handle {
+        cleanup_tasks.push(r2_handle); // Push r2_write_handle for paired-end
+    }
+
+    // HISAT2 configuration with FIFOs
     let hisat2_config = Hisat2Config {
         hisat2_index_path: hisat2_index_path.clone(),
         option_fields: hisat2_options,
+        r1_fifo: r1_fifo.clone(),
+        r2_fifo: if paired { Some(r2_fifo.clone()) } else { None },
     };
 
     let hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config))
@@ -709,12 +727,11 @@ async fn hisat2_filter(
             error: e.to_string(),
         })?;
 
-    let (mut hisat2_child, hisat2_stream_task, hisat2_err_task) = stream_to_cmd(
+    // Use spawn_cmd since HISAT2 reads from FIFOs
+    let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
         config.clone(),
-        input_stream.into_inner(),
         HISAT2_TAG,
         hisat2_args,
-        StreamDataType::JustBytes, // FASTQ bytes
         config.args.verbose,
     )
         .await
@@ -722,23 +739,19 @@ async fn hisat2_filter(
             tool: HISAT2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    cleanup_tasks.push(hisat2_stream_task);
     cleanup_tasks.push(hisat2_err_task);
 
-    let hisat2_out_stream = {
-        let mut guard = hisat2_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: HISAT2_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
+    let hisat2_out_stream = parse_child_output(
+        &mut hisat2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: HISAT2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     // Sort output to BAM (name-sorted for fastq extraction)
     let samtools_sort_config = SamtoolsConfig {
@@ -747,7 +760,7 @@ async fn hisat2_filter(
             ("-n".to_string(), None), // Name-sorted
             ("-u".to_string(), None), // Uncompressed BAM
             ("-O".to_string(), Some("bam".to_string())),
-            ("-".to_string(), None),  // Output to stdout
+            ("-".to_string(), None), // Output to stdout
         ]),
     };
     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
@@ -919,6 +932,18 @@ async fn hisat2_filter(
                 error: e.to_string(),
             })?
     };
+
+    // Cleanup FIFOs
+    let r1_fifo_cleanup = r1_fifo.clone();
+    let r2_fifo_cleanup = r2_fifo.clone();
+    let fifo_cleanup_task = tokio::spawn(async move {
+        tokio::fs::remove_file(&r1_fifo_cleanup).await.ok();
+        if paired {
+            tokio::fs::remove_file(&r2_fifo_cleanup).await.ok();
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(fifo_cleanup_task);
 
     Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
 }

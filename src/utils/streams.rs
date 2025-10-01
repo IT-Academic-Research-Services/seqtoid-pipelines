@@ -1005,7 +1005,7 @@ pub async fn deinterleave_fastq_stream_to_fifos(
     mut input_stream: ReceiverStream<ParseOutput>,
     sample_base: &str,
     paired: bool,
-) -> Result<(PathBuf, PathBuf, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+) -> Result<(PathBuf, PathBuf, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>, Option<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let ram_temp_dir = config.ram_temp_dir.clone();
     let r1_fifo = ram_temp_dir.join(format!("{}_R1.fq", sample_base));
     let r2_fifo = ram_temp_dir.join(format!("{}_R2.fq", sample_base));
@@ -1038,18 +1038,19 @@ pub async fn deinterleave_fastq_stream_to_fifos(
     eprintln!("Creating FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
     create_fifo(&r1_fifo).await
         .map_err(|e| PipelineError::IOError(format!("Failed to create R1 FIFO {}: {}", r1_fifo.display(), e)))?;
-    create_fifo(&r2_fifo).await
-        .map_err(|e| PipelineError::IOError(format!("Failed to create R2 FIFO {}: {}", r2_fifo.display(), e)))?;
-
-    // Verify FIFOs
     if !metadata(&r1_fifo).await.map_err(|e| PipelineError::IOError(format!("R1 FIFO check failed: {}", e)))?.file_type().is_fifo() {
         return Err(PipelineError::IOError(format!("R1 path {} is not a FIFO", r1_fifo.display())));
     }
-    if !metadata(&r2_fifo).await.map_err(|e| PipelineError::IOError(format!("R2 FIFO check failed: {}", e)))?.file_type().is_fifo() {
-        return Err(PipelineError::IOError(format!("R2 path {} is not a FIFO", r2_fifo.display())));
+
+    if paired {
+        create_fifo(&r2_fifo).await
+            .map_err(|e| PipelineError::IOError(format!("Failed to create R2 FIFO {}: {}", r2_fifo.display(), e)))?;
+        if !metadata(&r2_fifo).await.map_err(|e| PipelineError::IOError(format!("R2 FIFO check failed: {}", e)))?.file_type().is_fifo() {
+            return Err(PipelineError::IOError(format!("R2 path {} is not a FIFO", r2_fifo.display())));
+        }
     }
 
-    // Use larger buffer (e.g., 100K records) for high-performance cluster
+
     let buffer_size = (config.base_buffer_size * 10).min(100_000);
     let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(buffer_size);
     let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(buffer_size);
@@ -1095,7 +1096,12 @@ pub async fn deinterleave_fastq_stream_to_fifos(
 
     // Writer tasks
     let r1_write_handle = tokio::spawn(write_to_fifo(r1_rx, r1_fifo.clone()));
-    let r2_write_handle = tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone()));
+    let r2_write_handle = if paired {
+        Some(tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone())))
+    }
+    else {
+        None
+    };
 
     // Defer cleanup to pipeline completion (handled in run cleanup_tasks)
     Ok((r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle))
