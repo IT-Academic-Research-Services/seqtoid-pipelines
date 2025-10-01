@@ -42,6 +42,7 @@ lazy_static! {
         m.insert(SEQKIT_TAG, 2.10);
         m.insert(BOWTIE2_TAG, 2.50);
         m.insert(KALLISTO_TAG, 0.5);
+        m.insert(HISAT2_TAG, 2.20);
         m
     };
 }

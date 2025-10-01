@@ -944,6 +944,7 @@ pub mod bowtie2 {
 }
 
 pub mod hisat2 {
+
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use anyhow::{anyhow, Result};
@@ -953,13 +954,15 @@ pub mod hisat2 {
 
     pub struct Hisat2Config {
         pub hisat2_index_path: PathBuf,
-        pub option_fields: HashMap<String, Option<String>>
+        pub option_fields: HashMap<String, Option<String>>,
+        pub r1_fifo: PathBuf,
+        pub r2_fifo: Option<PathBuf>,
     }
 
     pub struct Hisat2ArgGenerator;
 
     pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
-        Ok(2.50) // Hardcoded due to Homebrew version reporting issue
+        Ok(2.21) // Hardcoded due to Homebrew version reporting issue
     }
 
     pub fn hisat2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
@@ -977,7 +980,6 @@ pub mod hisat2 {
             ],
         };
 
-        // Generate a unique unpack directory based on the input filename or directory
         let input_ref = input_path.as_ref();
         let unique_id = if input_ref.is_file() {
             input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
@@ -986,7 +988,6 @@ pub mod hisat2 {
         };
         let unpack_dir = cwd.join(format!("unpacked_index_ht2_{}", unique_id));
 
-        // Clean the unpack_dir to ensure no stale data
         if unpack_dir.exists() {
             std::fs::remove_dir_all(&unpack_dir)?;
         }
@@ -1000,23 +1001,43 @@ pub mod hisat2 {
                 .and_then(|e| e.downcast_ref::<Hisat2Config>())
                 .ok_or_else(|| anyhow!("HISAT2 requires a Hisat2Config as extra argument"))?;
 
+            // Validate FIFO paths
+            if !config.r1_fifo.exists() {
+                return Err(anyhow!("R1 FIFO does not exist: {}", config.r1_fifo.display()));
+            }
+            if let Some(r2_fifo) = &config.r2_fifo {
+                if !r2_fifo.exists() {
+                    return Err(anyhow!("R2 FIFO does not exist: {}", r2_fifo.display()));
+                }
+            }
+
             let mut args_vec: Vec<String> = Vec::new();
 
             for (key, value) in config.option_fields.iter() {
                 args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => { },
+                if let Some(v) = value {
+                    args_vec.push(format!("{}", v));
                 }
             }
 
             args_vec.push("-x".to_string());
             args_vec.push(config.hisat2_index_path.to_string_lossy().to_string());
+
             args_vec.push("-p".to_string());
             let num_cores: usize = RunConfig::thread_allocation(run_config, HISAT2_TAG, None);
             args_vec.push(num_cores.to_string());
-            args_vec.push("--interleaved".to_string());
-            args_vec.push("-".to_string());
+
+            if let Some(r2_fifo) = &config.r2_fifo {
+                // Paired-end
+                args_vec.push("-1".to_string());
+                args_vec.push(config.r1_fifo.to_string_lossy().to_string());
+                args_vec.push("-2".to_string());
+                args_vec.push(r2_fifo.to_string_lossy().to_string());
+            } else {
+                // Single
+                args_vec.push("-U".to_string());
+                args_vec.push(config.r1_fifo.to_string_lossy().to_string());
+            }
 
             Ok(args_vec)
         }
