@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec,spawn_cmd, parse_fastq, ChannelReader};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -518,24 +518,23 @@ async fn kallisto_quant(
         })?;
     let fastq_stream = ReceiverStream::new(fastq_rx);
 
-    if paired {
-        // Paired-end: Deinterleave to FIFOs
-        eprintln!("Deinterleaving FASTQ stream for sample: {}", sample_base);
-        let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
-            config.clone(),
-            fastq_stream,
-            &sample_base,
-            paired,
-        ).await?;
+    eprintln!("Deinterleaving FASTQ stream for sample: {}", sample_base);
+    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        config.clone(),
+        fastq_stream,
+        &sample_base,
+        paired,
+    ).await?;
 
-        cleanup_tasks.push(deinterleave_handle);
-        cleanup_tasks.push(r1_write_handle);
-        if let Some(r2_handle) = r2_write_handle {
-            cleanup_tasks.push(r2_handle);
-        }
+    cleanup_tasks.push(deinterleave_handle);
+    cleanup_tasks.push(r1_write_handle);
+    if let Some(r2_handle) = r2_write_handle {
+        cleanup_tasks.push(r2_handle);
+    }
 
-        // Kallisto config for paired-end
-        let kallisto_config = KallistoConfig {
+
+    let kallisto_config = if paired {
+        KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
             subcommand_fields: HashMap::from([
                 ("R1".to_string(), Some(r1_fifo.to_string_lossy().to_string())),
@@ -543,86 +542,62 @@ async fn kallisto_quant(
             ]),
             output_dir: kallisto_out_dir.clone(),
             reproducible: false
-        };
-
-        let kallisto_args = generate_cli(KALLISTO_TAG, &config, Some(&kallisto_config))
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: KALLISTO_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-
-        eprintln!("Spawning Kallisto with args: {:?}", kallisto_args);
-
-        // Spawn Kallisto
-        let (mut kallisto_child, kallisto_err_task) = spawn_cmd(
-            config.clone(),
-            KALLISTO_TAG,
-            kallisto_args,
-            config.args.verbose,
-        ).await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: KALLISTO_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-
-        eprintln!("Kallisto spawned: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
-
-        cleanup_tasks.push(kallisto_err_task);
-
-        // Await Kallisto exit
-        let r1_fifo_clone = r1_fifo.clone();
-        let r2_fifo_clone = r2_fifo.clone();
-        let kallisto_exit_task = tokio::spawn(async move {
-            let status = kallisto_child.wait().await
-                .map_err(|e| anyhow!("Kallisto wait failed: {}", e))?;
-            if !status.success() {
-                return Err(anyhow!("Kallisto exited with code: {:?}", status.code()));
-            }
-            // Clean up FIFOs after Kallisto exits
-            tokio::fs::remove_file(&r1_fifo_clone).await
-                .map_err(|e| anyhow!("Failed to remove R1 FIFO {}: {}", r1_fifo_clone.display(), e))?;
-            tokio::fs::remove_file(&r2_fifo_clone).await
-                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo_clone.display(), e))?;
-            Ok(())
-        });
-        cleanup_tasks.push(kallisto_exit_task);
-    } else {
-        // Single-end: Pipe stream to Kallisto stdin
-        let kallisto_config = KallistoConfig {
+        }
+    }
+    else {
+        KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
             subcommand_fields: HashMap::from([
                 ("--single".to_string(), None),
                 ("-l".to_string(), Some("200".to_string())),
                 ("-s".to_string(), Some("20".to_string())),
+                ("R1".to_string(), Some(r1_fifo.to_string_lossy().to_string())),
             ]),
             output_dir: kallisto_out_dir.clone(),
             reproducible: false
-        };
+        }
+    };
 
-        let kallisto_args = generate_cli(KALLISTO_TAG, &config, Some(&kallisto_config))
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: KALLISTO_TAG.to_string(),
-                error: e.to_string(),
-            })?;
+    let kallisto_args = generate_cli(KALLISTO_TAG, &config, Some(&kallisto_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: KALLISTO_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-        eprintln!("Spawning Kallisto with args: {:?}", kallisto_args);
+    eprintln!("Spawning Kallisto with args: {:?}", kallisto_args);
 
-        let (mut _kallisto_child, kallisto_stream_task, kallisto_err_task) = stream_to_cmd(
-            config.clone(),
-            fastq_stream.into_inner(),
-            KALLISTO_TAG,
-            kallisto_args,
-            StreamDataType::IlluminaFastq,
-            config.args.verbose,
-        ).await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: KALLISTO_TAG.to_string(),
-                error: e.to_string(),
-            })?;
+    let (mut kallisto_child, kallisto_err_task) = spawn_cmd(
+        config.clone(),
+        KALLISTO_TAG,
+        kallisto_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: KALLISTO_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-        cleanup_tasks.push(kallisto_stream_task);
-        cleanup_tasks.push(kallisto_err_task);
-    }
+    cleanup_tasks.push(kallisto_err_task);
+
+    // Await Kallisto exit
+    let r1_fifo_clone = r1_fifo.clone();
+    let r2_fifo_clone = r2_fifo.clone();
+    let kallisto_exit_task = tokio::spawn(async move {
+        let status = kallisto_child.wait().await
+            .map_err(|e| anyhow!("Kallisto wait failed: {}", e))?;
+        if !status.success() {
+            return Err(anyhow!("Kallisto exited with code: {:?}", status.code()));
+        }
+        // Clean up FIFOs after Kallisto exits
+        tokio::fs::remove_file(&r1_fifo_clone).await
+            .map_err(|e| anyhow!("Failed to remove R1 FIFO {}: {}", r1_fifo_clone.display(), e))?;
+        if paired {
+            tokio::fs::remove_file(&r2_fifo_clone).await
+                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo_clone.display(), e))?;
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(kallisto_exit_task);
 
     // Process Kallisto output (abundance.tsv)
     let kallisto_results_task = tokio::spawn(async move {
