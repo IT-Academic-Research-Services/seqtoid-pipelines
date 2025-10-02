@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG};
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
@@ -1122,6 +1122,111 @@ pub mod kallisto {
     }
 }
 
+pub mod star {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{RunConfig, STAR_TAG};
+    use crate::utils::command::{version_check, ArgGenerator, index_prep::{IndexConfig, prepare_index}};
+    use crate::utils::streams::ChildStream;
+
+    pub struct StarConfig {
+        pub star_index_dir: PathBuf,
+        pub option_fields: HashMap<String, Option<String>>,
+        pub r1_fifo: PathBuf,
+        pub r2_fifo: Option<PathBuf>,
+    }
+
+    pub struct StarArgGenerator;
+
+    pub async fn star_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    pub fn star_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+        let config = IndexConfig {
+            extensions: vec!["".to_string()], // No specific extension for STAR files
+            required_suffixes: vec![
+                "SA".to_string(),
+                "SAindex".to_string(),
+                "Genome".to_string(),
+                "genomeParameters.txt".to_string(),
+            ],
+        };
+
+        let input_ref = input_path.as_ref();
+        let unique_id = if input_ref.is_file() {
+            input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
+        } else {
+            input_ref.file_name().unwrap_or_default().to_string_lossy().to_string()
+        };
+        let unpack_dir = cwd.join(format!("unpacked_index_star_{}", unique_id));
+
+        if unpack_dir.exists() {
+            std::fs::remove_dir_all(&unpack_dir)?;
+        }
+
+        // For STAR, return the directory path instead of basename
+        let index_dir = prepare_index(input_path, cwd, &config, &unpack_dir)?;
+        Ok(index_dir.parent().unwrap_or(&index_dir).to_path_buf())
+    }
+
+    impl ArgGenerator for StarArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<StarConfig>())
+                .ok_or_else(|| anyhow!("STAR requires a StarConfig as extra argument"))?;
+
+            // Validate FIFO paths
+            if !config.r1_fifo.exists() {
+                return Err(anyhow!("R1 FIFO does not exist: {}", config.r1_fifo.display()));
+            }
+            if let Some(r2_fifo) = &config.r2_fifo {
+                if !r2_fifo.exists() {
+                    return Err(anyhow!("R2 FIFO does not exist: {}", r2_fifo.display()));
+                }
+            }
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            args_vec.push("--genomeDir".to_string());
+            args_vec.push(config.star_index_dir.to_string_lossy().to_string());
+
+            args_vec.push("--runThreadN".to_string());
+            let num_cores: usize = RunConfig::thread_allocation(run_config, STAR_TAG, None);
+            args_vec.push(num_cores.to_string());
+
+            args_vec.push("--readFilesIn".to_string());
+            args_vec.push(config.r1_fifo.to_string_lossy().to_string());
+            if let Some(r2_fifo) = &config.r2_fifo {
+                args_vec.push(r2_fifo.to_string_lossy().to_string());
+            }
+
+            args_vec.push("--readFilesCommand".to_string());
+            args_vec.push("cat".to_string());
+
+            args_vec.push("--outSAMtype".to_string());
+            args_vec.push("SAM".to_string());
+
+            args_vec.push("--outStd".to_string());
+            args_vec.push("SAM".to_string());
+
+            args_vec.push("--outFileNamePrefix".to_string());
+            args_vec.push("/tmp/star_".to_string());
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(format!("{}", key));
+                if let Some(v) = value {
+                    args_vec.push(format!("{}", v));
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -1139,6 +1244,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         BOWTIE2_TAG => Box::new(bowtie2::Bowtie2ArgGenerator),
         HISAT2_TAG => Box::new(hisat2::Hisat2ArgGenerator),
         KALLISTO_TAG => Box::new(kallisto::KallistoArgGenerator),
+        STAR_TAG => Box::new(star::StarArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -1163,6 +1269,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
             HISAT2_TAG => hisat2::hisat2_presence_check().await,
             KALLISTO_TAG => kallisto::kallisto_presence_check().await,
+            STAR_TAG => star::star_presence_check().await,
 
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
