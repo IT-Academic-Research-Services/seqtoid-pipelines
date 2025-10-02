@@ -134,5 +134,8 @@ pub struct Arguments {
 
     #[arg(long, default_value = "human.hisat2.tar")]
     pub human_hisat2_index : String,
+
+    #[arg(long)]
+    pub host_star_index : Option<String>,
     
 }
