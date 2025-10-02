@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::sync::Notify;
 use tokio::fs::File as TokioFile;
 use tokio::fs::{metadata, remove_file};
+use tokio::fs::OpenOptions as TokioOpenOptions;
 use std::os::unix::fs::FileTypeExt;
 use futures::TryFutureExt;
 
@@ -940,49 +941,40 @@ pub async fn create_fifo(path: &PathBuf) -> Result<()> {
 ///
 /// # Returns
 /// Result(): whether the fifo wrote successfully
-pub async fn write_to_fifo(
-    mut rx: mpsc::Receiver<ParseOutput>,
-    fifo_path: PathBuf,
-) -> Result<()> {
-    // Open FIFO in write mode (blocks until reader opens)
-    let file = TokioFile::options()
+pub async fn write_to_fifo(mut rx: mpsc::Receiver<ParseOutput>, fifo_path: PathBuf) -> Result<()> {
+    // Open for write-only, without create/truncate to avoid issues with existing FIFOs
+    let file = TokioOpenOptions::new()
         .write(true)
         .open(&fifo_path)
         .await
-        .map_err(|e| PipelineError::IOError(format!("Failed to open FIFO {} for write: {}", fifo_path.display(), e)))
-        .map_err(Into::<anyhow::Error>::into)?;
+        .map_err(|e| anyhow!("Failed to open FIFO {} for write: {}", fifo_path.display(), e))?;
 
-    // Use larger buffer (e.g., 16MB) given 1.5TB RAM and NVMe scratch
+    // Use 16MB buffer for high-throughput runs on 1.5TB RAM nodes
     let mut writer = BufWriter::with_capacity(16_777_216, file);
     eprintln!("Opened FIFO for writing: {}", fifo_path.display());
 
     let mut bytes_written = 0;
     while let Some(item) = rx.recv().await {
         let bytes = item.to_bytes()
-            .map_err(|e| PipelineError::InvalidFastqFormat(format!("Failed to convert item to bytes: {}", e)))
-            .map_err(Into::<anyhow::Error>::into)?;
-
-        // Write to FIFO with error handling
+            .map_err(|e| anyhow!("Failed to convert item to bytes: {}", e))?;
         writer.write_all(&bytes).await
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    PipelineError::StreamDataDropped
+                    anyhow!("Broken pipe writing to FIFO {}: possible early reader exit", fifo_path.display())
                 } else {
-                    PipelineError::IOError(format!("Write to FIFO {} failed: {}", fifo_path.display(), e))
+                    anyhow!("Write to FIFO {} failed: {}", fifo_path.display(), e)
                 }
-            })
-            .map_err(Into::<anyhow::Error>::into)?;
+            })?;
         bytes_written += bytes.len();
 
-        // Log every 10MB for high-throughput runs
+        // Log every 10MB for monitoring high-throughput runs
         if bytes_written % 10_485_760 == 0 {
             eprintln!("Wrote {} bytes to FIFO: {}", bytes_written, fifo_path.display());
         }
     }
 
     writer.flush().await
-        .map_err(|e| PipelineError::IOError(format!("Flush to FIFO {} failed: {}", fifo_path.display(), e)))
-        .map_err(Into::<anyhow::Error>::into)?;
+        .map_err(|e| anyhow!("Flush to FIFO {} failed: {}", fifo_path.display(), e))?;
     eprintln!("Finished writing {} bytes to FIFO: {}", bytes_written, fifo_path.display());
     Ok(())
 }
@@ -2396,7 +2388,9 @@ mod tests {
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        r2_write_handle.await??;
+        if let Some(handle) = r2_write_handle {
+            handle.await??;
+        }
 
         let r1_str = String::from_utf8_lossy(&r1_output);
         let r2_str = String::from_utf8_lossy(&r2_output);
@@ -2464,7 +2458,9 @@ mod tests {
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        r2_write_handle.await??;
+        if let Some(handle) = r2_write_handle {
+            handle.await??;
+        }
 
         let r1_str = String::from_utf8_lossy(&r1_output);
         let r2_str = String::from_utf8_lossy(&r2_output);
@@ -2512,7 +2508,9 @@ mod tests {
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        r2_write_handle.await??;
+        if let Some(handle) = r2_write_handle {
+            handle.await??;
+        }
 
         assert!(r1_output.is_empty(), "R1 should be empty for empty stream");
         assert!(r2_output.is_empty(), "R2 should be empty for empty stream");
@@ -2559,7 +2557,9 @@ mod tests {
             );
         }
         r1_write_handle.await??;
-        r2_write_handle.await??;
+        if let Some(handle) = r2_write_handle {
+            handle.await??;
+        }
 
         tokio::fs::remove_file(&r1_fifo).await.ok();
         tokio::fs::remove_file(&r2_fifo).await.ok();
@@ -2629,7 +2629,9 @@ mod tests {
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        r2_write_handle.await??;
+        if let Some(handle) = r2_write_handle {
+            handle.await??;
+        }
 
         let r1_str = String::from_utf8_lossy(&r1_output);
         let r2_str = String::from_utf8_lossy(&r2_output);
