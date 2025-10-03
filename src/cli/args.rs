@@ -137,5 +137,11 @@ pub struct Arguments {
 
     #[arg(long)]
     pub host_star_index : Option<String>,
+
+    #[arg(long, default_value = "human.star.tar.gz")]
+    pub human_star_index : String,
+
+    #[arg(long, default_value_t = true)]
+    pub human_host: bool,
     
 }

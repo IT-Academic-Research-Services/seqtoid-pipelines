@@ -718,298 +718,152 @@ pub mod seqkit {
     }
 }
 
-pub mod index_prep {
-    use std::collections::HashMap;
-    use std::fs;
-    use std::io::Read;
-    use std::path::{Path, PathBuf};
-    use anyhow::{anyhow, Result};
-    use infer;
-    use flate2::read::GzDecoder;
-    use tar::Archive;
-    use walkdir::WalkDir;
-
-    #[derive(Debug, Clone)]
-    pub struct IndexConfig {
-        pub extensions: Vec<String>,
-        pub required_suffixes: Vec<String>,
-    }
-
-    pub fn prepare_index(input_path: impl AsRef<Path>, _cwd: &PathBuf, config: &IndexConfig, unpack_dir: &PathBuf) -> Result<PathBuf> {
-        let input = input_path.as_ref();
-
-        if !input.exists() {
-            return Err(anyhow!("Input does not exist: {}", input.display()));
-        }
-
-        let target_dir = if input.is_file() {
-            fs::create_dir_all(unpack_dir)?;
-            unpack_tar_if_needed(input, unpack_dir)?;
-            unpack_dir.clone()
-        } else if input.is_dir() {
-            // Copy directory to unique unpack_dir for isolation
-            fs::create_dir_all(unpack_dir)?;
-            copy_dir::copy_dir(input, unpack_dir)?;
-            unpack_dir.clone()
-        } else {
-            return Err(anyhow!("Input must be a file (TAR/TAR.GZ) or directory: {}", input.display()));
-        };
-
-        let basename_path = find_index_basename(&target_dir, config)?;
-
-        Ok(basename_path)
-    }
-
-    fn find_index_basename(dir: &Path, config: &IndexConfig) -> Result<PathBuf> {
-        let mut basenames: HashMap<String, usize> = HashMap::new();
-        let mut index_dir: Option<PathBuf> = None;
-
-        for entry in WalkDir::new(dir).max_depth(2).into_iter().filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.is_file() && config.extensions.iter().any(|ext| path.extension().and_then(|e| e.to_str()) == Some(ext.as_str())) {
-                let parent_dir = path.parent().unwrap_or(path).to_path_buf();
-
-                match &index_dir {
-                    Some(existing_dir) if existing_dir != &parent_dir => {
-                        return Err(anyhow!(
-                        "Index files found in multiple directories: {} and {}",
-                        existing_dir.display(), parent_dir.display()
-                    ));
-                    }
-                    None => index_dir = Some(parent_dir.clone()),
-                    _ => {} // Same directory
-                }
-
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Some((base, _suffix)) = stem.split_once('.') {
-                        *basenames.entry(base.to_string()).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-
-        let index_dir = index_dir.ok_or_else(||
-            anyhow!("No index files ({}) found in: {}", config.extensions.join("/"), dir.display())
-        )?;
-
-        if basenames.is_empty() {
-            return Err(anyhow!("No valid index files found"));
-        }
-
-        if basenames.len() > 1 {
-            return Err(anyhow!(
-            "Multiple possible basenames found ({}): {:?}",
-            basenames.len(),
-            basenames.keys().collect::<Vec<_>>()
-        ));
-        }
-
-        let (basename, count) = basenames.into_iter().next().unwrap();
-
-        if count < config.required_suffixes.len() {
-            return Err(anyhow!("Insufficient index files found for basename '{}': {} (expected at least {})", basename, count, config.required_suffixes.len()));
-        }
-
-        let full_basename = index_dir.join(&basename);
-
-        validate_index(&full_basename, config)?;
-
-        Ok(full_basename)
-    }
-
-    fn validate_index(basename: &Path, config: &IndexConfig) -> Result<()> {
-        for suffix in &config.required_suffixes {
-            let mut found = false;
-            for ext in &config.extensions {
-                let file_path = basename.with_extension(format!("{}{}", suffix, ext));
-                if file_path.exists() {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                let possible = config.extensions.iter().map(|e| format!("{}.{}", suffix, e)).collect::<Vec<_>>().join(" or ");
-                return Err(anyhow!("Missing required index file for {}: {}", basename.display(), possible));
-            }
-        }
-        Ok(())
-    }
-
-    fn unpack_tar_if_needed(tar_file: &Path, unpack_dir: &Path) -> Result<()> {
-        let kind_opt = infer::get_from_path(tar_file)?;
-
-        match kind_opt.as_ref().map(|k| k.mime_type()) {
-            Some("application/x-tar") => {
-                eprintln!("Unpacking plain TAR: {}", tar_file.display());
-                let file = fs::File::open(tar_file)?;
-                let mut archive = Archive::new(file);
-                archive.unpack(unpack_dir)?;
-            }
-            Some("application/gzip") => {
-                eprintln!("Unpacking GZIP TAR: {}", tar_file.display());
-                let file = fs::File::open(tar_file)?;
-                let decoder = GzDecoder::new(file);
-                let mut archive = Archive::new(decoder);
-                archive.unpack(unpack_dir)?;
-            }
-            _ => return Err(anyhow!(
-            "Unsupported file type. Expected TAR or TAR.GZ, got: {:?}",
-            kind_opt.map(|k| k.mime_type())
-        )),
-        }
-
-        Ok(())
-    }
-}
-
 pub mod bowtie2 {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use anyhow::{anyhow, Result};
+    use std::fs::{self, DirEntry};
+    use std::process::Command;
     use crate::config::defs::{RunConfig, BOWTIE2_TAG};
-    use crate::utils::command::{version_check, ArgGenerator, index_prep::{IndexConfig, prepare_index}};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct Bowtie2Config {
         pub bt2_index_path: PathBuf,
-        pub option_fields: HashMap<String, Option<String>>
+        pub option_fields: HashMap<String, Option<String>>,
     }
 
     pub struct Bowtie2ArgGenerator;
 
     pub async fn bowtie2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BOWTIE2_TAG,vec!["-h"], 0, 3 , ChildStream::Stdout).await?;
+        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout).await?;
         Ok(version)
     }
 
+    /// Prepares the Bowtie2 index by handling directory, tar, or tar.gz inputs.
+    /// Returns the PathBuf to the basename (e.g., /path/to/ercc for files ercc.1.bt2, etc.).
     pub fn bowtie2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
-        let config = IndexConfig {
-            extensions: vec!["bt2".to_string(), "bt2l".to_string()],
-            required_suffixes: vec![
-                "1.".to_string(),
-                "2.".to_string(),
-                "3.".to_string(),
-                "4.".to_string(),
-                "rev.1.".to_string(),
-                "rev.2.".to_string(),
-            ],
-        };
+        let input = input_path.as_ref();
 
-        // Generate a unique unpack directory based on the input filename or directory
-        let input_ref = input_path.as_ref();
-        let unique_id = if input_ref.is_file() {
-            input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
+        // Generate unique unpack directory
+        let unique_id = if input.is_file() {
+            input.file_stem().unwrap_or_default().to_string_lossy().to_string()
         } else {
-            input_ref.file_name().unwrap_or_default().to_string_lossy().to_string()
+            input.file_name().unwrap_or_default().to_string_lossy().to_string()
         };
         let unpack_dir = cwd.join(format!("unpacked_index_bt2_{}", unique_id));
 
-        // Clean the unpack_dir to ensure no stale data
         if unpack_dir.exists() {
-            std::fs::remove_dir_all(&unpack_dir)?;
+            fs::remove_dir_all(&unpack_dir)?;
+        }
+        fs::create_dir_all(&unpack_dir)?;
+        // eprintln!("Bowtie2: Created unpack directory: {}", unpack_dir.display());
+
+        let mut index_dir = unpack_dir.clone();
+
+        if input.is_dir() {
+            index_dir = input.to_path_buf();
+        } else if input.exists() {
+            let ext = input.extension().map(|s| s.to_str().unwrap_or("")).unwrap_or("");
+            let stem_ext = input.file_stem().and_then(|s| Path::new(s).extension()).map(|s| s.to_str().unwrap_or("")).unwrap_or("");
+
+            let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
+                eprintln!("Bowtie2: Unpacking GZIP TAR: {}", input.display());
+                Command::new("tar")
+                    .arg("xzf")
+                    .arg(input)
+                    .arg("-C")
+                    .arg(&unpack_dir)
+                    .output()?
+            } else if ext == "tar" {
+                eprintln!("Bowtie2: Unpacking TAR: {}", input.display());
+                Command::new("tar")
+                    .arg("xf")
+                    .arg(input)
+                    .arg("-C")
+                    .arg(&unpack_dir)
+                    .output()?
+            } else {
+                return Err(anyhow!("Unsupported Bowtie2 index file format: {}", input.display()));
+            };
+
+            if !unpack_cmd.status.success() {
+                return Err(anyhow!("Failed to unpack Bowtie2 index: {:?}", String::from_utf8_lossy(&unpack_cmd.stderr)));
+            }
+        } else {
+            return Err(anyhow!("Bowtie2 index input not found: {}", input.display()));
         }
 
-        prepare_index(input_path, cwd, &config, &unpack_dir)
+        // Strip single top-level subdir (e.g., "ercc/")
+        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let dirs: Vec<DirEntry> = entries.into_iter().filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)).collect();
+
+        if dirs.len() == 1 {
+            let subdir = dirs[0].path();
+            if fs::read_dir(&subdir)?.next().is_some() {
+                eprintln!("Bowtie2: Stripped to subdir: {}", subdir.display());
+                index_dir = subdir;
+            }
+        }
+        // eprintln!("Bowtie2 index directory: {}", index_dir.display());
+
+        // Validate
+        let extensions = vec!["bt2".to_string(), "bt2l".to_string()];
+        let required_suffixes = vec!["1", "2", "3", "4", "rev.1", "rev.2"];
+
+        for suffix in &required_suffixes {
+            let mut found = false;
+            for ext in &extensions {
+                let pattern = format!("{}.{}", suffix, ext);
+                let mut candidates = Vec::new();
+                for entry in fs::read_dir(&index_dir)? {
+                    let path = entry?.path();
+                    if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+                        candidates.push(path);
+                    }
+                }
+                if !candidates.is_empty() {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(anyhow!("Missing Bowtie2 index file for suffix '{}' in: {}", suffix, index_dir.display()));
+            }
+        }
+
+        // Derive basename using suffix "1", avoiding "rev"
+        let pattern_suffix = "1";
+        let mut basename = None;
+        for ext in &extensions {
+            let pattern = format!("{}.{}", pattern_suffix, ext);
+            let mut candidates = Vec::new();
+            for entry in fs::read_dir(&index_dir)? {
+                let path = entry?.path();
+                if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) && !path.to_str().unwrap_or("").contains("rev") {
+                    candidates.push(path);
+                }
+            }
+            if let Some(file) = candidates.first() {
+                let file_name = file.file_name().ok_or(anyhow!("Invalid file path"))?.to_str().ok_or(anyhow!("Invalid UTF-8"))?;
+                let stripped = file_name.strip_suffix(&pattern).ok_or(anyhow!("Suffix mismatch in Bowtie2 file: {}", file_name))?;
+                basename = Some(stripped.trim_end_matches('.').to_string());
+                break;
+            }
+        }
+        let basename = basename.ok_or(anyhow!("No Bowtie2 index file with suffix '1' avoiding 'rev' found in: {}", index_dir.display()))?;
+        eprintln!("Bowtie2 derived basename: {}", basename);
+
+        let final_path = index_dir.join(&basename);
+        eprintln!("Final Bowtie2 index path: {}", final_path.display());
+        Ok(final_path)
     }
 
     impl ArgGenerator for Bowtie2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<Bowtie2Config>())
-                .ok_or_else(|| anyhow!("Bowtie requires a Bowtie2Config as extra argument"))?;
-
-            let mut args_vec: Vec<String> = Vec::new();
-
-            for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => { },
-                }
-            }
-
-            args_vec.push("-x".to_string());
-            args_vec.push(config.bt2_index_path.to_string_lossy().to_string());
-            args_vec.push("-p".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
-            args_vec.push(num_cores.to_string());
-            args_vec.push("--interleaved".to_string());  // NB: set up to only take interleaved stdin
-            args_vec.push("-".to_string());
-
-
-            Ok(args_vec)
-        }
-    }
-}
-
-pub mod hisat2 {
-
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use anyhow::{anyhow, Result};
-    use crate::config::defs::{RunConfig, HISAT2_TAG};
-    use crate::utils::command::{version_check, ArgGenerator, index_prep::{IndexConfig, prepare_index}};
-    use crate::utils::streams::ChildStream;
-
-    pub struct Hisat2Config {
-        pub hisat2_index_path: PathBuf,
-        pub option_fields: HashMap<String, Option<String>>,
-        pub r1_fifo: PathBuf,
-        pub r2_fifo: Option<PathBuf>,
-    }
-
-    pub struct Hisat2ArgGenerator;
-
-    pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
-        Ok(2.21) // Hardcoded due to Homebrew version reporting issue
-    }
-
-    pub fn hisat2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
-        let config = IndexConfig {
-            extensions: vec!["ht2".to_string()],
-            required_suffixes: vec![
-                "1.".to_string(),
-                "2.".to_string(),
-                "3.".to_string(),
-                "4.".to_string(),
-                "5.".to_string(),
-                "6.".to_string(),
-                "7.".to_string(),
-                "8.".to_string(),
-            ],
-        };
-
-        let input_ref = input_path.as_ref();
-        let unique_id = if input_ref.is_file() {
-            input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
-        } else {
-            input_ref.file_name().unwrap_or_default().to_string_lossy().to_string()
-        };
-        let unpack_dir = cwd.join(format!("unpacked_index_ht2_{}", unique_id));
-
-        if unpack_dir.exists() {
-            std::fs::remove_dir_all(&unpack_dir)?;
-        }
-
-        prepare_index(input_path, cwd, &config, &unpack_dir)
-    }
-
-    impl ArgGenerator for Hisat2ArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            let config = extra
-                .and_then(|e| e.downcast_ref::<Hisat2Config>())
-                .ok_or_else(|| anyhow!("HISAT2 requires a Hisat2Config as extra argument"))?;
-
-            // Validate FIFO paths
-            if !config.r1_fifo.exists() {
-                return Err(anyhow!("R1 FIFO does not exist: {}", config.r1_fifo.display()));
-            }
-            if let Some(r2_fifo) = &config.r2_fifo {
-                if !r2_fifo.exists() {
-                    return Err(anyhow!("R2 FIFO does not exist: {}", r2_fifo.display()));
-                }
-            }
+                .ok_or_else(|| anyhow!("Bowtie2 requires a Bowtie2Config as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
 
@@ -1021,23 +875,183 @@ pub mod hisat2 {
             }
 
             args_vec.push("-x".to_string());
-            args_vec.push(config.hisat2_index_path.to_string_lossy().to_string());
-
+            args_vec.push(config.bt2_index_path.to_string_lossy().to_string());
             args_vec.push("-p".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, HISAT2_TAG, None);
+            let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
             args_vec.push(num_cores.to_string());
+            args_vec.push("--interleaved".to_string());
+            args_vec.push("-".to_string());
 
-            if let Some(r2_fifo) = &config.r2_fifo {
-                // Paired-end
-                args_vec.push("-1".to_string());
-                args_vec.push(config.r1_fifo.to_string_lossy().to_string());
-                args_vec.push("-2".to_string());
-                args_vec.push(r2_fifo.to_string_lossy().to_string());
+            Ok(args_vec)
+        }
+    }
+}
+
+pub mod hisat2 {
+    use std::path::{Path, PathBuf};
+    use std::collections::HashMap;
+    use anyhow::{anyhow, Result};
+    use std::fs::{self, DirEntry};
+    use std::process::Command;
+    use crate::config::defs::{RunConfig, HISAT2_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    pub struct Hisat2Config {
+        pub ht2_index_path: PathBuf,
+        pub option_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct Hisat2ArgGenerator;
+
+    pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    /// Prepares the HISAT2 index by handling directory, tar, or tar.gz inputs.
+    /// Returns the PathBuf to the basename (e.g., /path/to/human for files human.1.ht2, etc.).
+    pub fn hisat2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+        let input = input_path.as_ref();
+
+        // Generate unique unpack directory
+        let unique_id = if input.is_file() {
+            input.file_stem().unwrap_or_default().to_string_lossy().to_string()
+        } else {
+            input.file_name().unwrap_or_default().to_string_lossy().to_string()
+        };
+        let unpack_dir = cwd.join(format!("unpacked_index_ht2_{}", unique_id));
+
+        // Clean unpack_dir
+        if unpack_dir.exists() {
+            fs::remove_dir_all(&unpack_dir)?;
+        }
+        fs::create_dir_all(&unpack_dir)?;
+        eprintln!("HISAT2: Created unpack directory: {}", unpack_dir.display());
+
+        let mut index_dir = unpack_dir.clone();
+
+        // Handle input type
+        if input.is_dir() {
+            index_dir = input.to_path_buf();
+        } else if input.exists() {
+            let ext = input.extension().map(|s| s.to_str().unwrap_or("")).unwrap_or("");
+            let stem_ext = input.file_stem().and_then(|s| Path::new(s).extension()).map(|s| s.to_str().unwrap_or("")).unwrap_or("");
+
+            let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
+                eprintln!("HISAT2: Unpacking GZIP TAR: {}", input.display());
+                Command::new("tar")
+                    .arg("xzf")
+                    .arg(input)
+                    .arg("-C")
+                    .arg(&unpack_dir)
+                    .output()?
+            } else if ext == "tar" {
+                eprintln!("HISAT2: Unpacking TAR: {}", input.display());
+                Command::new("tar")
+                    .arg("xf")
+                    .arg(input)
+                    .arg("-C")
+                    .arg(&unpack_dir)
+                    .output()?
             } else {
-                // Single
-                args_vec.push("-U".to_string());
-                args_vec.push(config.r1_fifo.to_string_lossy().to_string());
+                return Err(anyhow!("Unsupported HISAT2 index file format: {}", input.display()));
+            };
+
+            if !unpack_cmd.status.success() {
+                return Err(anyhow!("Failed to unpack HISAT2 index: {:?}", String::from_utf8_lossy(&unpack_cmd.stderr)));
             }
+        } else {
+            return Err(anyhow!("HISAT2 index input not found: {}", input.display()));
+        }
+
+        // Strip single top-level subdir (e.g., "human/")
+        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let dirs: Vec<DirEntry> = entries.into_iter().filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)).collect();
+
+        if dirs.len() == 1 {
+            let subdir = dirs[0].path();
+            if fs::read_dir(&subdir)?.next().is_some() {
+                eprintln!("HISAT2: Stripped to subdir: {}", subdir.display());
+                index_dir = subdir;
+            }
+        }
+        eprintln!("HISAT2 index directory: {}", index_dir.display());
+
+        // Validate required files
+        let extensions = vec!["ht2".to_string(), "ht2l".to_string()];
+        let required_suffixes = vec!["1", "2", "3", "4", "5", "6", "7", "8"];
+
+        for suffix in &required_suffixes {
+            let mut found = false;
+            for ext in &extensions {
+                let pattern = format!("{}.{}", suffix, ext);
+                let mut candidates = Vec::new();
+                for entry in fs::read_dir(&index_dir)? {
+                    let path = entry?.path();
+                    if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+                        candidates.push(path);
+                    }
+                }
+                if !candidates.is_empty() {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(anyhow!("Missing HISAT2 index file for suffix '{}' in: {}", suffix, index_dir.display()));
+            }
+        }
+
+        // Derive basename using suffix "1", avoiding any unexpected patterns
+        let pattern_suffix = "1";
+        let mut basename = None;
+        for ext in &extensions {
+            let pattern = format!("{}.{}", pattern_suffix, ext);
+            let mut candidates = Vec::new();
+            for entry in fs::read_dir(&index_dir)? {
+                let path = entry?.path();
+                if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+                    candidates.push(path);
+                }
+            }
+            if let Some(file) = candidates.first() {
+                let file_name = file.file_name().ok_or(anyhow!("Invalid file path"))?.to_str().ok_or(anyhow!("Invalid UTF-8"))?;
+                let stripped = file_name.strip_suffix(&pattern).ok_or(anyhow!("Suffix mismatch in HISAT2 file: {}", file_name))?;
+                basename = Some(stripped.trim_end_matches('.').to_string());
+                break;
+            }
+        }
+        let basename = basename.ok_or(anyhow!("No HISAT2 index file with suffix '1' found in: {}", index_dir.display()))?;
+        eprintln!("HISAT2 derived basename: {}", basename);
+
+        let final_path = index_dir.join(&basename);
+        eprintln!("Final HISAT2 index path: {}", final_path.display());
+        Ok(final_path)
+    }
+
+    impl ArgGenerator for Hisat2ArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<Hisat2Config>())
+                .ok_or_else(|| anyhow!("HISAT2 requires a Hisat2Config as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(format!("{}", key));
+                if let Some(v) = value {
+                    args_vec.push(format!("{}", v));
+                }
+            }
+
+            args_vec.push("-x".to_string());
+            args_vec.push(config.ht2_index_path.to_string_lossy().to_string());
+            args_vec.push("-p".to_string());
+            let num_cores: usize = std::cmp::min(128, RunConfig::thread_allocation(run_config, HISAT2_TAG, None));
+            args_vec.push(num_cores.to_string());
+            args_vec.push("--interleaved".to_string());
+            args_vec.push("-".to_string());
 
             Ok(args_vec)
         }
@@ -1126,8 +1140,10 @@ pub mod star {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use anyhow::{anyhow, Result};
+    use std::fs::{self, DirEntry};
+    use std::process::Command;
     use crate::config::defs::{RunConfig, STAR_TAG};
-    use crate::utils::command::{version_check, ArgGenerator, index_prep::{IndexConfig, prepare_index}};
+    use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct StarConfig {
@@ -1144,32 +1160,91 @@ pub mod star {
         Ok(version)
     }
 
+    /// Prepares the STAR index by handling directory, tar, or tar.gz inputs.
+    /// Returns the PathBuf to the index directory (e.g., /path/to/star_human).
     pub fn star_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
-        let config = IndexConfig {
-            extensions: vec!["".to_string()], // No specific extension for STAR files
-            required_suffixes: vec![
-                "SA".to_string(),
-                "SAindex".to_string(),
-                "Genome".to_string(),
-                "genomeParameters.txt".to_string(),
-            ],
-        };
+        let input = input_path.as_ref();
 
-        let input_ref = input_path.as_ref();
-        let unique_id = if input_ref.is_file() {
-            input_ref.file_stem().unwrap_or_default().to_string_lossy().to_string()
+        // Generate unique unpack directory
+        let unique_id = if input.is_file() {
+            input.file_stem().unwrap_or_default().to_string_lossy().to_string()
         } else {
-            input_ref.file_name().unwrap_or_default().to_string_lossy().to_string()
+            input.file_name().unwrap_or_default().to_string_lossy().to_string()
         };
         let unpack_dir = cwd.join(format!("unpacked_index_star_{}", unique_id));
 
+        // Clean unpack_dir
         if unpack_dir.exists() {
-            std::fs::remove_dir_all(&unpack_dir)?;
+            fs::remove_dir_all(&unpack_dir)?;
+        }
+        fs::create_dir_all(&unpack_dir)?;
+        eprintln!("STAR: Created unpack directory: {}", unpack_dir.display());
+
+        let mut index_dir = unpack_dir.clone();
+
+        // Handle input type
+        if input.is_dir() {
+            index_dir = input.to_path_buf();
+        } else if input.exists() {
+            let ext = input.extension().map(|s| s.to_str().unwrap_or("")).unwrap_or("");
+            let stem_ext = input.file_stem().and_then(|s| Path::new(s).extension()).map(|s| s.to_str().unwrap_or("")).unwrap_or("");
+
+            let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
+                eprintln!("STAR: Unpacking GZIP TAR: {}", input.display());
+                Command::new("tar")
+                    .arg("xzf")
+                    .arg(input)
+                    .arg("-C")
+                    .arg(&unpack_dir)
+                    .output()?
+            } else if ext == "tar" {
+                eprintln!("STAR: Unpacking TAR: {}", input.display());
+                Command::new("tar")
+                    .arg("xf")
+                    .arg(input)
+                    .arg("-C")
+                    .arg(&unpack_dir)
+                    .output()?
+            } else {
+                return Err(anyhow!("Unsupported STAR index file format: {}", input.display()));
+            };
+
+            if !unpack_cmd.status.success() {
+                return Err(anyhow!("Failed to unpack STAR index: {:?}", String::from_utf8_lossy(&unpack_cmd.stderr)));
+            }
+        } else {
+            return Err(anyhow!("STAR index input not found: {}", input.display()));
         }
 
-        // For STAR, return the directory path instead of basename
-        let index_dir = prepare_index(input_path, cwd, &config, &unpack_dir)?;
-        Ok(index_dir.parent().unwrap_or(&index_dir).to_path_buf())
+        // Strip single top-level subdir (e.g., "star_human/")
+        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let dirs: Vec<DirEntry> = entries.into_iter().filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)).collect();
+
+        if dirs.len() == 1 {
+            let subdir = dirs[0].path();
+            if fs::read_dir(&subdir)?.next().is_some() {
+                eprintln!("STAR: Stripped to subdir: {}", subdir.display());
+                index_dir = subdir;
+            }
+        }
+        eprintln!("STAR index directory: {}", index_dir.display());
+
+        // Validate required files
+        let required_files = vec![
+            "SA".to_string(),
+            "SAindex".to_string(),
+            "Genome".to_string(),
+            "genomeParameters.txt".to_string(),
+        ];
+
+        for file in &required_files {
+            let path = index_dir.join(file);
+            if !path.exists() {
+                return Err(anyhow!("Missing STAR index file '{}' in: {}", file, index_dir.display()));
+            }
+        }
+
+        Ok(index_dir)
     }
 
     impl ArgGenerator for StarArgGenerator {
@@ -1194,7 +1269,7 @@ pub mod star {
             args_vec.push(config.star_index_dir.to_string_lossy().to_string());
 
             args_vec.push("--runThreadN".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, STAR_TAG, None);
+            let num_cores: usize = std::cmp::min(128, RunConfig::thread_allocation(run_config, STAR_TAG, None));
             args_vec.push(num_cores.to_string());
 
             args_vec.push("--readFilesIn".to_string());
