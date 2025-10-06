@@ -897,9 +897,12 @@ pub mod hisat2 {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
+    #[derive(Debug)]
     pub struct Hisat2Config {
-        pub ht2_index_path: PathBuf,
+        pub hisat2_index_path: PathBuf,
         pub option_fields: HashMap<String, Option<String>>,
+        pub r1_path: String,
+        pub r2_path: Option<String>,
     }
 
     pub struct Hisat2ArgGenerator;
@@ -1039,24 +1042,38 @@ pub mod hisat2 {
             let mut args_vec: Vec<String> = Vec::new();
 
             for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
+                args_vec.push(key.clone());
                 if let Some(v) = value {
-                    args_vec.push(format!("{}", v));
+                    args_vec.push(v.clone());
                 }
             }
 
             args_vec.push("-x".to_string());
-            args_vec.push(config.ht2_index_path.to_string_lossy().to_string());
+            args_vec.push(config.hisat2_index_path.to_string_lossy().to_string());
             args_vec.push("-p".to_string());
-            let num_cores: usize = std::cmp::min(128, RunConfig::thread_allocation(run_config, HISAT2_TAG, None));
+            let num_cores: usize = RunConfig::thread_allocation(run_config, HISAT2_TAG, None);
             args_vec.push(num_cores.to_string());
-            args_vec.push("--interleaved".to_string());
+
+            if config.r2_path.is_some() {
+                args_vec.push("-1".to_string());
+                args_vec.push(config.r1_path.clone());
+                args_vec.push("-2".to_string());
+                args_vec.push(config.r2_path.clone().unwrap());
+            } else {
+                args_vec.push("-U".to_string());
+                args_vec.push(config.r1_path.clone());
+            }
+
+            args_vec.push("-S".to_string());
             args_vec.push("-".to_string());
 
             Ok(args_vec)
         }
     }
 }
+
+
+
 
 pub mod kallisto {
     use std::collections::HashMap;

@@ -29,11 +29,8 @@ chrono = "0.4.41"
 thiserror = "2.0.12"
 memchr = "2.7.5"
 needletail = "0.6.3"
-infer = "0.19.0"
-tar = "0.4.44"
-walkdir = "2.5.0"
 regex = "1.11.1"
-copy_dir = "0.1"
+uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]
 sysinfo = "0.35.0"
