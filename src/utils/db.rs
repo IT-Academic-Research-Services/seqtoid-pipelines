@@ -550,16 +550,23 @@ pub async fn retrieve_h5_seq(
                 SequenceReader::Fasta(reader) => reader,
                 _ => return Err(anyhow!("Sequence file must be FASTA: {}", sequence_path.display())),
             };
-            let record = reader
-                .next()
-                .ok_or_else(|| anyhow!("No records found in FASTA file: {}", sequence_path.display()))?
-                .map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
-            let seq_record: SequenceRecord = record.to_owned().into();
-            let accession = seq_record.id().to_string();
             let mut fasta_record = Vec::new();
-            fasta_record.extend_from_slice(format!(">{}\n", accession).as_bytes());
-            fasta_record.extend_from_slice(seq_record.seq());
-            fasta_record.push(b'\n');
+            let mut accession = String::new();
+            let mut record_count = 0;
+            while let Some(record) = reader.next() {
+                let record = record.map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
+                let seq_record: SequenceRecord = record.to_owned().into();
+                if record_count == 0 {
+                    accession = seq_record.id().to_string();
+                }
+                fasta_record.extend_from_slice(format!(">{}\n", seq_record.id()).as_bytes());
+                fasta_record.extend_from_slice(seq_record.seq());
+                fasta_record.push(b'\n');
+                record_count += 1;
+            }
+            if record_count == 0 {
+                return Err(anyhow!("No records found in FASTA file: {}", sequence_path.display()));
+            }
             Ok((accession, fasta_record))
         }
         (None, Some(accession)) => {
@@ -577,8 +584,6 @@ pub async fn retrieve_h5_seq(
         }
     }
 }
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
