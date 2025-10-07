@@ -281,7 +281,7 @@ async fn bowtie2_filter(
     }
 
     let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
+    let mapped_flag = if paired { "-F12".to_string() } else { "-F4".to_string() };
     let samtools_count_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
@@ -1352,7 +1352,7 @@ async fn minimap2_filter(
 
     // Count total mapped reads
     let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
+    let mapped_flag = if paired { "-F12".to_string() } else { "-F4".to_string() };
     let samtools_count_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
         subcommand_fields: HashMap::from([
@@ -1560,7 +1560,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
 
-
+    // Host filtering: mm2
     let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
         config.clone(),
         host_bt2_out_stream,
@@ -1571,6 +1571,41 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut host_mm2_cleanup_receivers);
 
+    // If host is no huma, run an additional filter stage using a human reference
+    let post_filter_stream  = if config.args.human_host {
+
+        host_mm2_out_stream
+    }
+    else {
+        let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
+
+        // human filtering: bt2
+        let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
+        let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
+        let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers) = bowtie2_filter(
+            config.clone(),
+            host_mm2_out_stream,
+            human_bt2_index_path,
+            paired,
+            human_bt2_options,
+            None,
+        ).await?;
+        cleanup_receivers.extend(human_bt2_cleanup_receivers);
+
+        // human filtering: mm2
+        let (human_mm2_out_stream, human_mm2_count_rx, mut human_mm2_cleanup_tasks, mut human_mm2_cleanup_receivers, human_ref_temp, human_index_temp) = minimap2_filter(
+            config.clone(),
+            human_bt2_out_stream,
+            paired,
+            None, // No BAM output; set to Some(PathBuf::from("human_mm2.bam")) if needed
+        )
+            .await?;
+        cleanup_tasks.append(&mut human_mm2_cleanup_tasks);
+        cleanup_receivers.append(&mut human_mm2_cleanup_receivers);
+
+        human_mm2_out_stream
+    };
+
     // if let Some(temp) = host_ref_temp { //not sure i actually want these deleted
     //     temp_files.push(temp);
     // }
@@ -1580,7 +1615,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Test write out for the main stream until pipeline construction complete
     let test_write_task = tokio::spawn(stream_to_file(
-        host_mm2_out_stream.into_inner(),
+        post_filter_stream.into_inner(),
         PathBuf::from("test.fq"),
     ));
     cleanup_tasks.push(test_write_task);
@@ -1619,7 +1654,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bt2_counts = host_bt2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
-    eprintln!("Host bt2: -F 13 (properly paired, both reads mapped) counts: {:?}", host_bt2_counts);
+    eprintln!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
     let host_mm2_counts = host_mm2_count_rx
         .await
