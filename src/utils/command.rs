@@ -4,9 +4,19 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::task::JoinHandle;
+use tempfile::NamedTempFile;
+use fxhash::FxHashMap;
+use crate::utils::file::{write_vecu8_to_file, extension_remover};
+use crate::utils::streams::{spawn_cmd};
+use crate::utils::db::retrieve_h5_seq;
+
 
 pub trait ArgGenerator {
     fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>>;
@@ -42,7 +52,6 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
     let line_w_version = lines
         .get(version_line)
         .ok_or_else(|| anyhow!("No line {} in {} version output", version_line, cmd_tag_owned.clone()))?;
-    eprintln!("Line number {}: {}", version_line, line_w_version);
 
     let version_string = line_w_version
         .split_whitespace()
@@ -170,14 +179,16 @@ mod h5dump {
     }
 }
 
-mod minimap2 {
-    use std::path::PathBuf;
-    use anyhow::anyhow;
-    use crate::cli::Technology;
-    use crate::config::defs::{MINIMAP2_TAG, RunConfig};
-    use crate::utils::streams::ChildStream;
-    use crate::utils::command::{version_check, ArgGenerator};
 
+pub mod minimap2 {
+    use std::collections::HashMap;
+    use super::*;
+
+
+    pub struct Minimap2Config {
+        pub minimap2_index_path: PathBuf,
+        pub option_fields: HashMap<String, Option<String>>,
+    }
     pub struct Minimap2ArgGenerator;
 
     pub async fn minimap2_presence_check() -> anyhow::Result<f32> {
@@ -185,17 +196,143 @@ mod minimap2 {
         Ok(version)
     }
 
+    pub async fn minimap2_index_prep(
+        config: &RunConfig,
+        ref_db_path: Option<PathBuf>,
+        ram_temp_dir: &PathBuf,
+        h5_index: Option<&FxHashMap<[u8; 24], u64>>,
+        accession: Option<String>,
+        sequence: Option<String>,
+        index_path: Option<String>,
+        ref_type: &str,
+    ) -> Result<
+        (
+            Option<PathBuf>,             // FASTA path (None if only index provided)
+            PathBuf,                     // Index path (.mmi)
+            Option<NamedTempFile>,       // FASTA temp file (None if only index)
+            Option<NamedTempFile>,       // Index temp file (if created/copied)
+            Vec<JoinHandle<Result<(), anyhow::Error>>>, // Tasks
+        ),
+        PipelineError,
+    > {
+        let mut tasks = Vec::new();
+        let mut ref_fasta_path: Option<PathBuf> = None;
+        let mut ref_temp: Option<NamedTempFile> = None;
+
+        let (index_path, index_temp) = match index_path {
+            Some(index) => {
+                let index_path = PathBuf::from(&index);
+                if !index_path.exists() {
+                    return Err(PipelineError::FileNotFound(index_path));
+                }
+                if index_path.extension().map_or(true, |ext| ext != "mmi") {
+                    return Err(PipelineError::InvalidConfig(format!(
+                        "{} index must have .mmi extension: {}",
+                        ref_type,
+                        index_path.display()
+                    )));
+                }
+                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                let index_temp_path = index_temp.path().to_path_buf();
+                let index_temp_path_clone = index_temp_path.clone();
+                let ref_type_owned = ref_type.to_string();
+                let copy_task = tokio::spawn(async move {
+                    fs::copy(&index_path, &index_temp_path_clone)
+                        .await
+                        .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_owned, e))?;
+                    Ok(())
+                });
+                tasks.push(copy_task);
+                (index_temp_path, Some(index_temp))
+            }
+            None => {
+                let (_accession, seq) = retrieve_h5_seq(
+                    accession.clone(),
+                    sequence.clone(),
+                    ref_db_path.as_ref(),
+                    h5_index,
+                )
+                    .await
+                    .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
+
+                let ref_temp_file = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                ref_fasta_path = Some(ref_temp_file.path().to_path_buf());
+                ref_temp = Some(ref_temp_file);
+                let ref_write_task = write_vecu8_to_file(
+                    Arc::new(seq.clone()),
+                    ref_fasta_path.as_ref().unwrap(),
+                    config.base_buffer_size,
+                )
+                    .await
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                tasks.push(ref_write_task);
+
+                let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+                let sequence_path_buf = PathBuf::from(ref_fasta_path.as_ref().unwrap());
+                let (no_ext_sequence_path, _) = extension_remover(&sequence_path_buf);
+                let mut index_path = no_ext_sequence_path.with_extension("mmi");
+                if !index_path.exists() {
+                    eprintln!("No {} index found at {}; creating new index", ref_type, index_path.display());
+                    let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
+                        .map_err(|e| PipelineError::Other(e.into()))?;
+                    index_path = index_temp.path().to_path_buf();
+                    let minimap2_args = vec![
+                        "-d".to_string(),
+                        index_path.to_string_lossy().to_string(),
+                        ref_fasta_path.as_ref().unwrap().to_string_lossy().to_string(),
+                    ];
+                    let (mut child, err_task) = spawn_cmd(
+                        Arc::new(config.clone()),
+                        MINIMAP2_TAG,
+                        minimap2_args,
+                        config.args.verbose,
+                    )
+                        .await
+                        .map_err(|e| PipelineError::ToolExecution {
+                            tool: MINIMAP2_TAG.to_string(),
+                            error: e.to_string(),
+                        })?;
+                    let index_task = tokio::spawn(async move {
+                        let status = child.wait().await?;
+                        if !status.success() {
+                            return Err(anyhow!("minimap2 index creation failed with exit code: {:?}", status.code()));
+                        }
+                        Ok(())
+                    });
+                    tasks.push(index_task);
+                    tasks.push(err_task);
+                    (index_path, Some(index_temp))
+                } else {
+                    eprintln!("Found {} index at {}; copying to temp dir", ref_type, index_path.display());
+                    let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
+                        .map_err(|e| PipelineError::Other(e.into()))?;
+                    let index_temp_path = index_temp.path().to_path_buf();
+                    let index_temp_path_clone = index_temp_path.clone();
+                    let ref_type_owned = ref_type.to_string();
+                    let copy_task = tokio::spawn(async move {
+                        fs::copy(&index_path, &index_temp_path_clone)
+                            .await
+                            .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_owned, e))?;
+                        Ok(())
+                    });
+                    tasks.push(copy_task);
+                    (index_temp_path, Some(index_temp))
+                }
+            }
+        };
+
+        Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
+    }
+
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            // eprintln!("Allocating {} threads for minimap2", RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None));
-            let args = &run_config.args;
+            let config = extra
+                .and_then(|e| e.downcast_ref::<Minimap2Config >())
+                .ok_or_else(|| anyhow!("Minimap2 requires a Minimap2Config  as extra argument"))?;
 
-            // Expect a single PathBuf for the minimap2 index (.mmi)
-            let index_path = extra
-                .and_then(|e| e.downcast_ref::<PathBuf>())
-                .ok_or_else(|| anyhow!("Minimap2 requires an index path (.mmi) as extra argument"))?;
-
-            // Validate that the path exists and has .mmi extension
+            let index_path = config.minimap2_index_path.clone();
             if !index_path.exists() {
                 return Err(anyhow!("Minimap2 index file does not exist: {}", index_path.display()));
             }
@@ -203,23 +340,17 @@ mod minimap2 {
                 return Err(anyhow!("Minimap2 index must have .mmi extension, got: {}", index_path.display()));
             }
 
-            eprintln!("Using minimap2 index for {}: {}", match args.technology {
-                Technology::Illumina => "Illumina",
-                Technology::ONT => "ONT",
-            }, index_path.display());
-
             let mut args_vec: Vec<String> = Vec::new();
-
             let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
-            args_vec.push("-ax".to_string());
-            match args.technology {
-                Technology::Illumina => args_vec.push("sr".to_string()),
-                Technology::ONT => args_vec.push("map-ont".to_string()),
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(format!("{}", key));
+                if let Some(v) = value {
+                    args_vec.push(format!("{}", v));
+                }
             }
-
             args_vec.push(index_path.to_string_lossy().to_string());
             args_vec.push("-".to_string()); // Query from stdin
 
