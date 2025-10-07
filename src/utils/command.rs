@@ -37,7 +37,7 @@ pub trait ArgGenerator {
 /// Result<f32>major/minor version number
 pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_line: usize, version_column: usize, child_stream: ChildStream) -> Result<f32> {
     let cmd_tag_owned = command_tag.to_string();
-    eprintln!("Running command: {}", &cmd_tag_owned);
+    // eprintln!("Running command: {}", &cmd_tag_owned);
     let args: Vec<&str> = version_args;
 
     let mut child = Command::new(&cmd_tag_owned)
@@ -183,7 +183,8 @@ mod h5dump {
 pub mod minimap2 {
     use std::collections::HashMap;
     use super::*;
-
+    use crate::utils::db::retrieve_h5_seq;
+    use tokio::fs;
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
@@ -247,32 +248,26 @@ pub mod minimap2 {
                 (index_temp_path, Some(index_temp))
             }
             None => {
-                let (_accession, seq) = retrieve_h5_seq(
-                    accession.clone(),
-                    sequence.clone(),
-                    ref_db_path.as_ref(),
+                // Call retrieve_h5_seq to get FASTA path
+                let (accession, fasta_path) = retrieve_h5_seq(
+                    ref_db_path.clone(),
+                    ram_temp_dir,
                     h5_index,
+                    accession,
+                    sequence,
+                    ref_type,
                 )
                     .await
                     .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
 
-                let ref_temp_file = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                ref_fasta_path = Some(ref_temp_file.path().to_path_buf());
-                ref_temp = Some(ref_temp_file);
-                let ref_write_task = write_vecu8_to_file(
-                    Arc::new(seq.clone()),
-                    ref_fasta_path.as_ref().unwrap(),
-                    config.base_buffer_size,
-                )
-                    .await
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                tasks.push(ref_write_task);
+                ref_fasta_path = Some(fasta_path.clone());
+                // If retrieve_h5_seq created a temp file, track it
+                if ref_db_path.is_none() || ref_db_path.as_ref() != Some(&fasta_path) {
+                    ref_temp = Some(NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
+                        .map_err(|e| PipelineError::Other(e.into()))?);
+                }
 
-                let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
-                let sequence_path_buf = PathBuf::from(ref_fasta_path.as_ref().unwrap());
-                let (no_ext_sequence_path, _) = extension_remover(&sequence_path_buf);
-                let mut index_path = no_ext_sequence_path.with_extension("mmi");
+                let mut index_path = fasta_path.with_extension("mmi");
                 if !index_path.exists() {
                     eprintln!("No {} index found at {}; creating new index", ref_type, index_path.display());
                     let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
@@ -281,7 +276,7 @@ pub mod minimap2 {
                     let minimap2_args = vec![
                         "-d".to_string(),
                         index_path.to_string_lossy().to_string(),
-                        ref_fasta_path.as_ref().unwrap().to_string_lossy().to_string(),
+                        fasta_path.to_string_lossy().to_string(),
                     ];
                     let (mut child, err_task) = spawn_cmd(
                         Arc::new(config.clone()),
@@ -301,7 +296,8 @@ pub mod minimap2 {
                         }
                         Ok(())
                     });
-                    tasks.push(index_task);
+                    // Await index_task to ensure index is complete before returning
+                    index_task.await.map_err(|e| PipelineError::Other(e.into()))??;
                     tasks.push(err_task);
                     (index_path, Some(index_temp))
                 } else {
@@ -329,8 +325,8 @@ pub mod minimap2 {
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| e.downcast_ref::<Minimap2Config >())
-                .ok_or_else(|| anyhow!("Minimap2 requires a Minimap2Config  as extra argument"))?;
+                .and_then(|e| e.downcast_ref::<Minimap2Config>())
+                .ok_or_else(|| anyhow!("Minimap2 requires a Minimap2Config as extra argument"))?;
 
             let index_path = config.minimap2_index_path.clone();
             if !index_path.exists() {
