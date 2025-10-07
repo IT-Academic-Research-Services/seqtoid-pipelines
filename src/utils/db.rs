@@ -14,6 +14,8 @@ use tokio::io::AsyncWriteExt;
 use crate::utils::file::file_path_manipulator;
 use tokio::time::{timeout, Duration};
 use crate::utils::streams::{ParseOutput, parse_fasta};
+use tokio::fs::copy as async_copy;
+
 
 const CHUNK_SIZE: usize = 1000;
 const TEST_FASTA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/test_7_nt.fa");
@@ -534,56 +536,90 @@ pub async fn get_index(args: &Arguments) -> anyhow::Result<Option<HashMap<[u8; 2
 /// # Returns
 /// anyhow::Result<(String, Vec<u8>)> <accession, FASTA record>
 ///
-pub async fn retrieve_h5_seq(
-    accession: Option<String>,
-    sequence_file: Option<String>,
-    ref_db_path: Option<&PathBuf>,
-    h5_index: Option<&HashMap<[u8; 24], u64>>,
-) -> anyhow::Result<(String, Vec<u8>)> {
-    let cwd = std::env::current_dir()?;
 
-    match (sequence_file, accession) {
-        (Some(sequence_file), None) => {
-            let sequence_path = file_path_manipulator(&PathBuf::from(&sequence_file), Some(&cwd), None, None, "");
-            eprintln!("Reading sequence from FASTA: {}", sequence_path.display());
-            let mut reader = match sequence_reader(&sequence_path)? {
-                SequenceReader::Fasta(reader) => reader,
-                _ => return Err(anyhow!("Sequence file must be FASTA: {}", sequence_path.display())),
-            };
-            let mut fasta_record = Vec::new();
-            let mut accession = String::new();
-            let mut record_count = 0;
-            while let Some(record) = reader.next() {
-                let record = record.map_err(|e| anyhow!("Error reading FASTA record: {}", e))?;
-                let seq_record: SequenceRecord = record.to_owned().into();
-                if record_count == 0 {
-                    accession = seq_record.id().to_string();
+pub async fn retrieve_h5_seq(
+    hdf5_path: Option<PathBuf>,
+    ram_temp_dir: &PathBuf,
+    h5_index: Option<&HashMap<[u8; 24], u64>>,
+    accession: Option<String>,
+    sequence: Option<String>,
+    ref_type: &str,
+) -> Result<(String, PathBuf)> {
+    match (hdf5_path, sequence) {
+        (None, Some(seq_path)) => {
+            // File path case (e.g., --host-sequence "/path/to/hg38.fa")
+            let orig_path = PathBuf::from(seq_path);
+            if !orig_path.exists() {
+                return Err(anyhow!("Reference file not found: {}", orig_path.display()));
+            }
+            // Copy to RAM temp dir for fast access (NVMe scratch)
+            let temp_fasta = ram_temp_dir.join(format!("{}_ref.fasta", ref_type));
+            async_copy(&orig_path, &temp_fasta).await?;
+            let accession = orig_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            Ok((accession, temp_fasta))
+        }
+        (None, None) => Err(anyhow!("No reference path or sequence provided")),
+        (Some(h5_path), None) => {
+            // H5 case: Retrieve and write to temp as multi-FASTA
+            let temp_fasta_path = ram_temp_dir.join(format!("{}_ref.fasta", ref_type));
+            let mut temp_fasta = TokioFile::create(&temp_fasta_path).await?;
+
+            // Load index map if not provided
+            let index_map = match h5_index {
+                Some(map) => map.clone(),
+                None => {
+                    let index_path = h5_path.with_extension("index.bin");
+                    if index_path.exists() {
+                        load_index(&index_path).await?
+                    } else {
+                        build_new_in_memory_index(&h5_path, &index_path).await?
+                    }
                 }
-                fasta_record.extend_from_slice(format!(">{}\n", seq_record.id()).as_bytes());
-                fasta_record.extend_from_slice(seq_record.seq());
-                fasta_record.push(b'\n');
-                record_count += 1;
+            };
+
+            if let Some(accession_str) = accession {
+                // Single accession: lookup specific sequence
+                let seq = lookup_sequence(&h5_path, &index_map, &accession_str).await?;
+                temp_fasta.write_all(&seq).await?;
+                temp_fasta.flush().await?;
+                Ok((accession_str, temp_fasta_path))
+            } else {
+                // No accession: write all sequences as multi-FASTA
+                let file = File::open(&h5_path)?;
+                let group = file.group("db")?;
+                let id_dataset = group.dataset("id")?;
+                let seq_dataset = group.dataset("sequences")?;
+                let num_entries = id_dataset.shape()[0];
+
+                for i in 0..num_entries {
+                    let id: FixedAscii<24> = id_dataset.read_slice(i..i + 1)?.to_vec()[0];
+                    let seq: &VarLenArray<u8> = &seq_dataset.read_slice(i..i + 1)?.to_vec()[0]; // Borrow instead of move
+                    temp_fasta.write_all(&[b'>']).await?;
+                    temp_fasta.write_all(id.as_bytes()).await?;
+                    temp_fasta.write_all(b"\n").await?;
+                    temp_fasta.write_all(seq).await?; // VarLenArray derefs to &[u8]
+                    temp_fasta.write_all(b"\n").await?;
+                }
+                temp_fasta.flush().await?;
+                Ok(("multi".to_string(), temp_fasta_path))
             }
-            if record_count == 0 {
-                return Err(anyhow!("No records found in FASTA file: {}", sequence_path.display()));
-            }
-            Ok((accession, fasta_record))
         }
-        (None, Some(accession)) => {
-            let db_path = ref_db_path.ok_or_else(|| anyhow!("Reference DB path not provided"))?;
-            let index = h5_index.ok_or_else(|| anyhow!("H5 index not provided"))?;
-            eprintln!("Looking up sequence for accession: {}", accession);
-            let seq = lookup_sequence(db_path, index, &accession).await?;
-            Ok((accession, seq))
-        }
-        (Some(_), Some(_)) => {
-            Err(anyhow!("Cannot provide both --host_sequence and --host_accession"))
-        }
-        (None, None) => {
-            Err(anyhow!("Must provide either a host sequence file with --host_sequence or an accession with --host_accession"))
+        (Some(_), Some(seq_str)) => {
+            // Sequence string case: Write to temp
+            let temp_fasta = ram_temp_dir.join(format!("{}_ref.fasta", ref_type));
+            let mut file = TokioFile::create(&temp_fasta).await?;
+            file.write_all(seq_str.as_bytes()).await?;
+            file.flush().await?;
+            let accession = accession.unwrap_or(ref_type.to_string());
+            Ok((accession, temp_fasta))
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
