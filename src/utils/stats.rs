@@ -69,9 +69,12 @@ pub fn compute_lx(lengths: &[u64], fraction: f64) -> u32 {
 ///
 /// # Returns
 ///
-/// Hamshmap <String, String>
-pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
+/// (HashMap<String, String>, Option<Vec<(u32, u64)>>)
+/// - Stats map for summary numbers (SN section)
+/// - Optional insert size histogram (insert_size, count) if IS section present
+pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<(HashMap<String, String>, Option<Vec<(u32, u64)>>)> {
     let mut stats = HashMap::new();
+    let mut insert_sizes: Vec<(u32, u64)> = Vec::new();
     let mut stream = ReceiverStream::new(rx);
 
     while let Some(item) = stream.next().await {
@@ -82,7 +85,6 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
                     continue;
                 }
 
-                // Parse lines starting with "SN" (Summary Numbers)
                 if line.starts_with("SN") {
                     let parts: Vec<&str> = line.split('\t').collect();
                     if parts.len() >= 3 {
@@ -90,8 +92,18 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
                         let value = parts[2].to_string();
                         stats.insert(key, value);
                     }
+                } else if line.starts_with("IS") {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 3 {
+                        let insert_size: u32 = parts[1]
+                            .parse()
+                            .map_err(|e| anyhow!("Failed to parse insert size: {}", e))?;
+                        let count: u64 = parts[2]
+                            .parse()
+                            .map_err(|e| anyhow!("Failed to parse insert size count: {}", e))?;
+                        insert_sizes.push((insert_size, count));
+                    }
                 }
-                // other sections (e.g., FFQ, COV) if needfed in future
             }
             _ => {
                 return Err(anyhow!("Unexpected non-byte data in samtools stats stream"));
@@ -103,7 +115,8 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
         return Err(anyhow!("No valid samtools stats data parsed"));
     }
 
-    Ok(stats)
+    let insert_sizes = if insert_sizes.is_empty() { None } else { Some(insert_sizes) };
+    Ok((stats, insert_sizes))
 }
 
 
