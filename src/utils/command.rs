@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -183,7 +183,6 @@ mod h5dump {
 pub mod minimap2 {
     use std::collections::HashMap;
     use super::*;
-    use crate::utils::db::retrieve_h5_seq;
     use tokio::fs;
 
     pub struct Minimap2Config {
@@ -199,10 +198,7 @@ pub mod minimap2 {
 
     pub async fn minimap2_index_prep(
         config: &RunConfig,
-        ref_db_path: Option<PathBuf>,
         ram_temp_dir: &PathBuf,
-        h5_index: Option<&FxHashMap<[u8; 24], u64>>,
-        accession: Option<String>,
         sequence: Option<String>,
         index_path: Option<String>,
         ref_type: &str,
@@ -248,74 +244,73 @@ pub mod minimap2 {
                 (index_temp_path, Some(index_temp))
             }
             None => {
-                // Call retrieve_h5_seq to get FASTA path
-                let (accession, fasta_path) = retrieve_h5_seq(
-                    ref_db_path.clone(),
-                    ram_temp_dir,
-                    h5_index,
-                    accession,
-                    sequence,
-                    ref_type,
+
+                let sequence_path = sequence.ok_or_else(|| {
+                    PipelineError::InvalidConfig("No FASTA or index provided for minimap2".to_string())
+                })?;
+                let sequence_path = PathBuf::from(&sequence_path);
+                if !sequence_path.exists() {
+                    return Err(PipelineError::FileNotFound(sequence_path));
+                }
+                let is_fasta = sequence_path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| FASTA_EXTS.iter().any(|&fasta_ext| ext.eq_ignore_ascii_case(fasta_ext)))
+                    .unwrap_or(false);
+
+                if !is_fasta {
+                    return Err(PipelineError::InvalidConfig(format!(
+                        "Sequence file must have a FASTA extension ({}): {}",
+                        FASTA_EXTS.join(", "),
+                        sequence_path.display()
+                    )));
+                }
+
+                let temp_fasta = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                let temp_fasta_path = temp_fasta.path().to_path_buf();
+                let temp_fasta_path_clone = temp_fasta_path.clone();
+                let ref_type_owned = ref_type.to_string();
+                let copy_task = tokio::spawn(async move {
+                    fs::copy(&sequence_path, &temp_fasta_path_clone)
+                        .await
+                        .map_err(|e| anyhow!("Failed to copy {} FASTA: {}", ref_type_owned, e))?;
+                    Ok(())
+                });
+                tasks.push(copy_task);
+                ref_fasta_path = Some(temp_fasta_path.clone());
+                ref_temp = Some(temp_fasta);
+
+                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                let index_temp_path = index_temp.path().to_path_buf();
+                let minimap2_args = vec![
+                    "-d".to_string(),
+                    index_temp_path.to_string_lossy().to_string(),
+                    temp_fasta_path.to_string_lossy().to_string(),
+                ];
+                let (mut child, err_task) = spawn_cmd(
+                    Arc::new(config.clone()),
+                    MINIMAP2_TAG,
+                    minimap2_args,
+                    config.args.verbose,
                 )
                     .await
-                    .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
-
-                ref_fasta_path = Some(fasta_path.clone());
-                // If retrieve_h5_seq created a temp file, track it
-                if ref_db_path.is_none() || ref_db_path.as_ref() != Some(&fasta_path) {
-                    ref_temp = Some(NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
-                        .map_err(|e| PipelineError::Other(e.into()))?);
-                }
-
-                let mut index_path = fasta_path.with_extension("mmi");
-                if !index_path.exists() {
-                    eprintln!("No {} index found at {}; creating new index", ref_type, index_path.display());
-                    let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                        .map_err(|e| PipelineError::Other(e.into()))?;
-                    index_path = index_temp.path().to_path_buf();
-                    let minimap2_args = vec![
-                        "-d".to_string(),
-                        index_path.to_string_lossy().to_string(),
-                        fasta_path.to_string_lossy().to_string(),
-                    ];
-                    let (mut child, err_task) = spawn_cmd(
-                        Arc::new(config.clone()),
-                        MINIMAP2_TAG,
-                        minimap2_args,
-                        config.args.verbose,
-                    )
-                        .await
-                        .map_err(|e| PipelineError::ToolExecution {
-                            tool: MINIMAP2_TAG.to_string(),
-                            error: e.to_string(),
-                        })?;
-                    let index_task = tokio::spawn(async move {
-                        let status = child.wait().await?;
-                        if !status.success() {
-                            return Err(anyhow!("minimap2 index creation failed with exit code: {:?}", status.code()));
-                        }
-                        Ok(())
-                    });
-                    // Await index_task to ensure index is complete before returning
-                    index_task.await.map_err(|e| PipelineError::Other(e.into()))??;
-                    tasks.push(err_task);
-                    (index_path, Some(index_temp))
-                } else {
-                    eprintln!("Found {} index at {}; copying to temp dir", ref_type, index_path.display());
-                    let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                        .map_err(|e| PipelineError::Other(e.into()))?;
-                    let index_temp_path = index_temp.path().to_path_buf();
-                    let index_temp_path_clone = index_temp_path.clone();
-                    let ref_type_owned = ref_type.to_string();
-                    let copy_task = tokio::spawn(async move {
-                        fs::copy(&index_path, &index_temp_path_clone)
-                            .await
-                            .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_owned, e))?;
-                        Ok(())
-                    });
-                    tasks.push(copy_task);
-                    (index_temp_path, Some(index_temp))
-                }
+                    .map_err(|e| PipelineError::ToolExecution {
+                        tool: MINIMAP2_TAG.to_string(),
+                        error: e.to_string(),
+                    })?;
+                let index_task = tokio::spawn(async move {
+                    let status = child.wait().await?;
+                    if !status.success() {
+                        return Err(anyhow!("minimap2 index creation failed with exit code: {:?}", status.code()));
+                    }
+                    Ok(())
+                });
+                index_task.await.map_err(|e| PipelineError::Other(e.into()))??;
+                eprintln!("{} mmi created", ref_type);
+                tasks.push(err_task);
+                (index_temp_path, Some(index_temp))
             }
         };
 

@@ -200,5 +200,7 @@ pub enum PipelineError {
     #[error("Argument missing: {0}")]
     MissingArgument(String),
     #[error("Other error: {0}")]
+    WrongExtension(String),
+    #[error("Invalid Extension: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
 }

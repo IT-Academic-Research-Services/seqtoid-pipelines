@@ -1928,10 +1928,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_ref_tasks) = minimap2_index_prep(
         &config,
-        ref_db_path.clone(),
         &ram_temp_dir,
-        h5_index.as_ref(),
-        config.args.host_accession.clone(),
         config.args.host_sequence.clone(),
         config.args.host_index.clone(),
         "host",
@@ -1947,10 +1944,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let (target_ref_fasta_path_inner, target_ref_index_path, target_ref_temp, target_index_temp, target_ref_tasks) = minimap2_index_prep(
         &config,
-        ref_db_path.clone(),
         &ram_temp_dir,
-        h5_index.as_ref(),
-        config.args.target_accession.clone(),
         config.args.target_sequence.clone(),
         config.args.target_index.clone(),
         "target",
@@ -2034,12 +2028,9 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     match technology {
         Technology::Illumina => {
             eprintln!("Technology: Illumina");
-            let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = minimap2_index_prep(
+            let (_ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = minimap2_index_prep(
                 &config,
-                None, // No HDF5 for ERCC
                 &ram_temp_dir,
-                None, // No HDF5 index
-                None, // No accession
                 config.args.ercc_sequence.clone(), // Use ercc_sequences as sequence path
                 config.args.ercc_index.clone(),
                 "ercc",

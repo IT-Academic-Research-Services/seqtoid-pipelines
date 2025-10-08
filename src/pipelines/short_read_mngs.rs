@@ -1211,10 +1211,7 @@ async fn minimap2_filter(
     let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, mut host_ref_tasks) =
         minimap2_index_prep(
             &config,
-            None, // No HDF5 ref_db_path
             &config.ram_temp_dir,
-            None, // No HDF5 index
-            None, // No accession
             config.args.host_sequence.clone(),
             config.args.host_index.clone(),
             "host",
