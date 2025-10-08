@@ -1660,6 +1660,7 @@ async fn calculate_statistics(
         None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
     };
     let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats).await?;
+    let samtools_summary = samtools_stats_out.summary;
 
     let depth_samtools_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Depth,
@@ -1795,11 +1796,11 @@ async fn calculate_statistics(
         depth_frac_above_100x: samtools_depth_stats.get("depth_frac_above_100x").copied().unwrap_or(0.0),
         allele_counts,
         total_reads: seqkit_stats.get("num_seqs").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-        mapped_reads: samtools_stats_out.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-        mapped_paired: samtools_stats_out.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
-        paired_inward: samtools_stats_out.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
-        paired_outward: samtools_stats_out.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
-        paired_other_orientation: samtools_stats_out.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        mapped_reads: samtools_summary.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_paired: samtools_summary.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
+        paired_inward: samtools_summary.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_outward: samtools_summary.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_other_orientation: samtools_summary.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
         ercc_mapped_reads: ercc_stats.get("ercc_mapped_reads").copied(),
         ercc_mapped_paired: ercc_stats.get("ercc_mapped_paired").copied(),
         ref_snps,

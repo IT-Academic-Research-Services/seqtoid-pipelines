@@ -7,6 +7,9 @@ use std::cmp::min;
 use std::sync::Arc;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
+use std::io;
+use tokio::task::JoinError; // Added for JoinError
+use serde_json::Error as SerdeJsonError; // Added for serde_json::Error
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -112,6 +115,13 @@ pub struct ReadStats {
     pub oversized: u64,
 }
 
+/// Samtools stats output
+#[derive(Debug)]
+pub struct SamtoolsStats {
+    pub summary: HashMap<String, String>,
+    pub insert_sizes: Vec<(u32, u64)>,
+}
+
 // Static Filenames
 pub const NUCMER_DELTA: &str = "alignment.delta";
 
@@ -199,8 +209,26 @@ pub enum PipelineError {
     NoAlignments,
     #[error("Argument missing: {0}")]
     MissingArgument(String),
-    #[error("Other error: {0}")]
+    #[error("Wrong extension: {0}")]
     WrongExtension(String),
-    #[error("Invalid Extension: {0}")]
+    #[error("Invalid extension: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
+}
+
+impl From<std::io::Error> for PipelineError {
+    fn from(err: std::io::Error) -> Self {
+        PipelineError::IOError(err.to_string())
+    }
+}
+
+impl From<JoinError> for PipelineError {
+    fn from(err: JoinError) -> Self {
+        PipelineError::Other(anyhow::Error::new(err))
+    }
+}
+
+impl From<SerdeJsonError> for PipelineError {
+    fn from(err: SerdeJsonError) -> Self {
+        PipelineError::Other(anyhow::Error::new(err))
+    }
 }
