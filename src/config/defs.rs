@@ -27,6 +27,7 @@ pub const SEQKIT_TAG: &str = "seqkit";
 pub const BOWTIE2_TAG: &str = "bowtie2";
 pub const HISAT2_TAG: &str = "hisat2";
 pub const KALLISTO_TAG: &str = "kallisto";
+pub const STAR_TAG: &str = "STAR";
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -42,6 +43,8 @@ lazy_static! {
         m.insert(SEQKIT_TAG, 2.10);
         m.insert(BOWTIE2_TAG, 2.50);
         m.insert(KALLISTO_TAG, 0.5);
+        m.insert(HISAT2_TAG, 2.20);
+        m.insert(STAR_TAG, 2.7);
         m
     };
 }
@@ -197,5 +200,7 @@ pub enum PipelineError {
     #[error("Argument missing: {0}")]
     MissingArgument(String),
     #[error("Other error: {0}")]
+    WrongExtension(String),
+    #[error("Invalid Extension: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
 }

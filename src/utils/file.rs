@@ -19,6 +19,8 @@ use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
 use crate::utils::fastx::{SequenceRecord, r1r2_base};
 use crate::config::defs::{RunConfig, PipelineError};
+use sysinfo::{Disks, DiskUsage};
+
 
 
 
@@ -571,6 +573,18 @@ pub async fn write_byte_stream_to_file(
     });
 
     Ok(task)
+}
+
+
+pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
+    let disks = Disks::new_with_refreshed_list();
+    let target = path.as_path();
+    for disk in disks.list() {
+        if target.starts_with(disk.mount_point()) {
+            return Ok(disk.available_space());
+        }
+    }
+    Err(anyhow!("No disk found for path: {}", path.display()))
 }
 
 #[cfg(test)]
