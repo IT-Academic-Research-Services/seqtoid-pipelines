@@ -289,7 +289,7 @@ async fn bowtie2_filter(
         cleanup_tasks.push(bam_write_task);
     }
 
-    // Count mapped reads (fixed)
+    // Count mapped reads
     let (count_tx, count_rx) = oneshot::channel();
     let count_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(count_stream);
@@ -356,106 +356,158 @@ async fn bowtie2_filter(
     let insert_stats_rx = if paired_compute_insert_stats {
         let insert_stats_stream = insert_stats_stream.unwrap();
 
-        // Coordinate-sort BAM for samtools stats
-        let samtools_coord_sort_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Sort,
-            subcommand_fields: HashMap::from([
-                ("-u".to_string(), None),
-                ("-O".to_string(), Some("bam".to_string())),
-                ("-".to_string(), None),
-            ]),
-        };
-        let samtools_coord_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_coord_sort_config))
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-
-        let (mut coord_sort_child, coord_sort_task, coord_sort_err_task) = stream_to_cmd(
-            config.clone(),
-            insert_stats_stream,
-            SAMTOOLS_TAG,
-            samtools_coord_sort_args,
+        // Split insert_stats_stream for counting and processing
+        let (mut stats_streams, stats_done_rx) = t_junction(
+            ReceiverStream::new(insert_stats_stream),
+            2,
+            config.base_buffer_size,
+            config.args.stall_threshold,
+            None,
+            100,
             StreamDataType::JustBytes,
-            config.args.verbose,
+            "insert_stats_split".to_string(),
+            None,
         )
             .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-        cleanup_tasks.push(coord_sort_task);
-        cleanup_tasks.push(coord_sort_err_task);
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+        cleanup_receivers.push(stats_done_rx);
 
-        let coord_sort_out_stream = {
-            let mut guard = coord_sort_child.lock().await;
-            parse_child_output(
-                &mut guard,
-                ChildStream::Stdout,
-                ParseMode::Bytes,
-                config.base_buffer_size,
-            )
-                .await
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?
-        };
+        let mut stats_streams_iter = stats_streams.into_iter();
+        let count_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+        let process_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-        // Run samtools stats
-        let samtools_stats_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Stats,
-            subcommand_fields: HashMap::new(),
-        };
-        let samtools_stats_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_stats_config))
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-
-        let (mut stats_child, stats_stream_task, stats_err_task) = stream_to_cmd(
-            config.clone(),
-            coord_sort_out_stream,
-            SAMTOOLS_TAG,
-            samtools_stats_args,
-            StreamDataType::JustBytes,
-            config.args.verbose,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-        cleanup_tasks.push(stats_stream_task);
-        cleanup_tasks.push(stats_err_task);
-
-        let stats_out_stream = {
-            let mut guard = stats_child.lock().await;
-            parse_child_output(
-                &mut guard,
-                ChildStream::Stdout,
-                ParseMode::Bytes,
-                config.base_buffer_size,
-            )
-                .await
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?
-        };
-
-        // Parse samtools stats
-        let (stats_tx, stats_rx) = oneshot::channel();
-        let stats_task = tokio::spawn(async move {
-            let stats = parse_samtools_stats(stats_out_stream)
-                .await
-                .map_err(|e| anyhow!("Failed to parse samtools stats: {}", e))?;
-            stats_tx.send(stats).map_err(|_| anyhow!("Failed to send samtools stats"))?;
+        // Count mapped reads in BAM
+        let (count_tx, count_rx) = oneshot::channel();
+        let count_task = tokio::spawn(async move {
+            let mut stream = ReceiverStream::new(count_stream);
+            let mut line_count = 0;
+            while let Some(item) = stream.next().await {
+                match item {
+                    ParseOutput::Bytes(line) if !line.is_empty() => line_count += 1,
+                    _ => continue,
+                }
+            }
+            count_tx.send(line_count).map_err(|_| anyhow!("Failed to send BAM line count"))?;
             Ok(())
         });
-        cleanup_tasks.push(stats_task);
+        cleanup_tasks.push(count_task);
 
-        Some(stats_rx)
+        let bam_line_count = count_rx
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("BAM count receiver failed: {}", e)))?;
+
+        if bam_line_count == 0 {
+            eprintln!("No mapped reads in BAM for insert size stats; skipping samtools stats");
+            let (stats_tx, stats_rx) = oneshot::channel();
+            stats_tx
+                .send(SamtoolsStats {
+                    summary: HashMap::new(),
+                    insert_sizes: Vec::new(),
+                })
+                .map_err(|_| PipelineError::Other(anyhow!("Failed to send empty stats")))?;
+            Some(stats_rx)
+        } else {
+            // Coordinate-sort BAM for samtools stats
+            let samtools_coord_sort_config = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::Sort,
+                subcommand_fields: HashMap::from([
+                    ("-u".to_string(), None),
+                    ("-O".to_string(), Some("bam".to_string())),
+                    ("-".to_string(), None),
+                ]),
+            };
+            let samtools_coord_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_coord_sort_config))
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?;
+
+            let (mut coord_sort_child, coord_sort_task, coord_sort_err_task) = stream_to_cmd(
+                config.clone(),
+                process_stream,
+                SAMTOOLS_TAG,
+                samtools_coord_sort_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            )
+                .await
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?;
+            cleanup_tasks.push(coord_sort_task);
+            cleanup_tasks.push(coord_sort_err_task);
+
+            let coord_sort_out_stream = {
+                let mut guard = coord_sort_child.lock().await;
+                parse_child_output(
+                    &mut guard,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    config.base_buffer_size,
+                )
+                    .await
+                    .map_err(|e| PipelineError::ToolExecution {
+                        tool: SAMTOOLS_TAG.to_string(),
+                        error: e.to_string(),
+                    })?
+            };
+
+            // Run samtools stats
+            let samtools_stats_config = SamtoolsConfig {
+                subcommand: SamtoolsSubcommand::Stats,
+                subcommand_fields: HashMap::new(),
+            };
+            let samtools_stats_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_stats_config))
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?;
+
+            let (mut stats_child, stats_stream_task, stats_err_task) = stream_to_cmd(
+                config.clone(),
+                coord_sort_out_stream,
+                SAMTOOLS_TAG,
+                samtools_stats_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+            )
+                .await
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?;
+            cleanup_tasks.push(stats_stream_task);
+            cleanup_tasks.push(stats_err_task);
+
+            let stats_out_stream = {
+                let mut guard = stats_child.lock().await;
+                parse_child_output(
+                    &mut guard,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    config.base_buffer_size,
+                )
+                    .await
+                    .map_err(|e| PipelineError::ToolExecution {
+                        tool: SAMTOOLS_TAG.to_string(),
+                        error: e.to_string(),
+                    })?
+            };
+
+            // Parse samtools stats
+            let (stats_tx, stats_rx) = oneshot::channel();
+            let stats_task = tokio::spawn(async move {
+                let stats = parse_samtools_stats(stats_out_stream)
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse samtools stats: {}", e))?;
+                stats_tx.send(stats).map_err(|_| anyhow!("Failed to send samtools stats"))?;
+                Ok(())
+            });
+            cleanup_tasks.push(stats_task);
+
+            Some(stats_rx)
+        }
     } else {
         None
     };
@@ -1755,25 +1807,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     eprintln!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
     if let Some(insert_stats_rx) = host_bt2_insert_stats_rx {
-        let insert_stats = insert_stats_rx
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("Host bt2 insert stats receiver failed: {}", e)))?;
-        eprintln!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
-
-        let output_path = out_dir.join("insert_size_histogram.png");
-        let sample_name = no_ext_sample_base_buf
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("sample")
-            .to_string();
-
-        let plot_task = tokio::spawn(async move {
-            plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &output_path)
-                .map_err(|e| anyhow!("Failed to plot insert sizes: {}", e))?;
-            Ok(())
-        });
-        cleanup_tasks.push(plot_task);
+        match insert_stats_rx.await {
+            Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
+                eprintln!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
+                let output_path = out_dir.join("insert_size_histogram.png");
+                let sample_name = no_ext_sample_base_buf
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sample")
+                    .to_string();
+                let plot_task = tokio::spawn(async move {
+                    plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &output_path)
+                        .map_err(|e| anyhow!("Failed to plot insert sizes: {}", e))?;
+                    Ok(())
+                });
+                cleanup_tasks.push(plot_task);
+            }
+            Ok(_) => eprintln!("No insert size stats available; skipping plotting"),
+            Err(e) => eprintln!("Host bt2 insert stats receiver failed: {}", e),
+        }
     }
+
     let host_mm2_counts = host_mm2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;
