@@ -32,7 +32,6 @@ use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
-use crate::utils::db::{get_index, retrieve_h5_seq};
 use crate::config::defs::{RunConfig, ReadStats};
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
@@ -1913,19 +1912,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
     let technology = config.args.technology.clone();
-
-    let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(PathBuf::from);
-
-
-    // Retrieve Index
-    let index_start = Instant::now();
-    let h5_index = get_index(&config.args)
-        .await
-        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
-    if h5_index.is_some() {
-        println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
-    }
-
+    
     let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_ref_tasks) = minimap2_index_prep(
         &config,
         &ram_temp_dir,

@@ -15,7 +15,6 @@ use tempfile::NamedTempFile;
 use fxhash::FxHashMap;
 use crate::utils::file::{write_vecu8_to_file, extension_remover};
 use crate::utils::streams::{spawn_cmd};
-use crate::utils::db::retrieve_h5_seq;
 
 
 pub trait ArgGenerator {

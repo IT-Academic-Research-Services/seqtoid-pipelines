@@ -60,17 +60,11 @@ pub struct Arguments {
     #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
 
-    #[arg(long)]  // For host removal
-    pub host_accession : Option<String>,
-
     #[arg(short = 'a', long)]  // For host removal
     pub host_sequence : Option<String>,
 
     #[arg(long, help = "Optional path to pre-built minimap2 index for host reference (e.g., hg38.mmi)")]
     pub host_index: Option<String>,
-
-    #[arg(long)]  // For target aligning
-    pub target_accession : Option<String>,
 
     #[arg(short = 't', long)] // For target aligning
     pub target_sequence : Option<String>,
@@ -80,9 +74,6 @@ pub struct Arguments {
 
     #[arg(long)]
     pub target_taxid : Option<String>,
-
-    #[arg(short = 'd', long = "db")]
-    pub ref_db : Option<String>,
 
     #[arg(long = "index")]
     pub ref_index : Option<String>,

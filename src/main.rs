@@ -27,7 +27,6 @@ use crate::cli::args::Technology;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::r1r2_base;
 use pipelines::consensus_genome;
-use pipelines::db;
 use pipelines::short_read_mngs;
 
 
@@ -84,7 +83,6 @@ async fn main() -> Result<()> {
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config).await,
-        "create_db" => create_db_run(&run_config).await,
         "short_read_mngs" => short_read_mngs_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
@@ -145,11 +143,6 @@ fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
 
 async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     consensus_genome::run(run_config).await
-}
-
-async fn create_db_run(run_config: &RunConfig) -> Result<(), PipelineError> {
-    db::create_db(run_config).await
-        .map_err(|e| PipelineError::Other(e.into()))
 }
 
 async fn short_read_mngs_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
