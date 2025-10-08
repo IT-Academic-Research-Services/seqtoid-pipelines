@@ -307,19 +307,13 @@ async fn bowtie2_filter(
     cleanup_tasks.push(count_task);
 
     // Samtools fastq to extract unmapped reads
+    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: if paired {
-            HashMap::from([
-                ("-f".to_string(), Some("13".to_string())), // Unmapped read or mate
-                ("-1".to_string(), None),
-                ("-2".to_string(), None),
-                ("-0".to_string(), Some("/dev/null".to_string())),
-                ("-s".to_string(), Some("/dev/null".to_string())),
-            ])
-        } else {
-            HashMap::from([("-f".to_string(), Some("4".to_string()))])
-        },
+        subcommand_fields: HashMap::from([
+            (unmapped_flag, None),
+            ("-".to_string(), None), // Output to stdout (interleaved for paired)
+        ]),
     };
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
         .map_err(|e| PipelineError::ToolExecution {
