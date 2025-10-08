@@ -20,7 +20,7 @@ use tokio_stream::StreamExt;
 use tokio::sync::Notify;
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use tempfile::NamedTempFile;
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream};
@@ -33,7 +33,8 @@ use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
 use crate::utils::streams::{deinterleave_fastq_stream_to_fifos};
 use crate::utils::command::star::{StarConfig, star_index_prep};
 use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
-use crate::utils::command::ArgGenerator;
+use crate::utils::stats::parse_samtools_stats;
+use crate::utils::plotting::plot_insert_sizes;
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -139,6 +140,7 @@ async fn validate_input(
 /// - Optional receiver for the total mapped count (u64) if `count_mapped` is true.
 /// - Vector of cleanup tasks.
 /// - Vector of cleanup receivers.
+
 async fn bowtie2_filter(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -146,9 +148,12 @@ async fn bowtie2_filter(
     paired: bool,
     bowtie2_options: HashMap<String, Option<String>>,
     output_bam_path: Option<PathBuf>,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+    compute_insert_stats: bool,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Option<oneshot::Receiver<SamtoolsStats>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
+
+    let paired_compute_insert_stats = paired && compute_insert_stats;
 
     // BT2
     let bt2_config_view = Bowtie2Config {
@@ -167,7 +172,7 @@ async fn bowtie2_filter(
         input_stream.into_inner(),
         BOWTIE2_TAG,
         bt2_args,
-        StreamDataType::JustBytes, // FASTQ bytes
+        StreamDataType::JustBytes,
         config.args.verbose,
     )
         .await
@@ -197,7 +202,7 @@ async fn bowtie2_filter(
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
+            ("-n".to_string(), None), // Name-sorted for fastq extraction
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
             ("-".to_string(), None),
@@ -240,36 +245,40 @@ async fn bowtie2_filter(
             })?
     };
 
-    // Determine number of streams for t_junction (unmapped + optional BAM output + mapped count)
-    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 }; // Unmapped + count + optional BAM
-
+    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 } + if paired_compute_insert_stats { 1 } else { 0 };
     let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
 
-    let (bam_streams, bam_done_rx) = if num_tees > 1 {
-        t_junction(
-            bam_rx_stream,
-            num_tees,
-            config.base_buffer_size,
-            config.args.stall_threshold,
-            None,
-            100,
-            StreamDataType::JustBytes, // BAM bytes
-            "bowtie2_bam_split".to_string(),
-            None,
-        )
-            .await
-            .map_err(|_| PipelineError::StreamDataDropped)?
-    } else {
-        // Single stream case (shouldn't happen since we always need unmapped + count)
-        (vec![bam_rx_stream.into_inner()], oneshot::channel::<Result<(), anyhow::Error>>().1)
-    };
+    let (bam_streams, bam_done_rx) = t_junction(
+        bam_rx_stream,
+        num_tees,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "bowtie2_bam_split".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
     cleanup_receivers.push(bam_done_rx);
 
     let mut bam_streams_iter = bam_streams.into_iter();
+    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_file_stream = if output_bam_path.is_some() {
+        Some(bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?)
+    } else {
+        None
+    };
+    let insert_stats_stream = if paired_compute_insert_stats {
+        Some(bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?)
+    } else {
+        None
+    };
 
-    // Optional: Write BAM to file
-    if let Some(bam_path) = output_bam_path {
-        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    // Handle BAM output if requested
+    if let (Some(bam_path), Some(stream)) = (output_bam_path, bam_file_stream) {
         let bam_write_task = write_byte_stream_to_file(
             &bam_path,
             ReceiverStream::new(stream),
@@ -280,60 +289,37 @@ async fn bowtie2_filter(
         cleanup_tasks.push(bam_write_task);
     }
 
-    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mapped_flag = if paired { "-F12".to_string() } else { "-F4".to_string() };
-    let samtools_count_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-c".to_string(), None), // Count
-            (mapped_flag, None),
-            ("-".to_string(), None),
-        ]),
-    };
-    let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
-        config.clone(),
-        bam_count_stream,
-        SAMTOOLS_TAG,
-        samtools_count_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(count_stream_task);
-
-    let (count_tx, count_rx) = oneshot::channel::<u64>();
-
-    let count_future = tokio::spawn(async move {
-        let mut count_child = count_child_arc;
-        let mut guard = count_child.lock().await;
-        let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout).await?;
-        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        let _ = count_tx.send(mapped_count);
+    // Count mapped reads (fixed)
+    let (count_tx, count_rx) = oneshot::channel();
+    let count_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(count_stream);
+        let mut line_count = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(line) if !line.is_empty() => line_count += 1,
+                _ => continue,
+            }
+        }
+        let count = line_count as u64 / if paired { 8 } else { 4 };
+        count_tx.send(count).map_err(|_| anyhow!("Failed to send count"))?;
         Ok(())
     });
-    cleanup_tasks.push(count_future);
+    cleanup_tasks.push(count_task);
 
-    // Unmapped stream
-    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    // Extract unmapped FASTQ
-    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
+    // Samtools fastq to extract unmapped reads
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            (unmapped_flag, None),
-            ("-".to_string(), None), // Output to stdout (interleaved for paired)
-        ]),
+        subcommand_fields: if paired {
+            HashMap::from([
+                ("-f".to_string(), Some("13".to_string())), // Unmapped read or mate
+                ("-1".to_string(), None),
+                ("-2".to_string(), None),
+                ("-0".to_string(), Some("/dev/null".to_string())),
+                ("-s".to_string(), Some("/dev/null".to_string())),
+            ])
+        } else {
+            HashMap::from([("-f".to_string(), Some("4".to_string()))])
+        },
     };
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -372,7 +358,121 @@ async fn bowtie2_filter(
             })?
     };
 
-    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
+    // Compute insert size metrics if paired and compute_insert_stats is true
+    let insert_stats_rx = if paired_compute_insert_stats {
+        let insert_stats_stream = insert_stats_stream.unwrap();
+
+        // Coordinate-sort BAM for samtools stats
+        let samtools_coord_sort_config = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Sort,
+            subcommand_fields: HashMap::from([
+                ("-u".to_string(), None),
+                ("-O".to_string(), Some("bam".to_string())),
+                ("-".to_string(), None),
+            ]),
+        };
+        let samtools_coord_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_coord_sort_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+        let (mut coord_sort_child, coord_sort_task, coord_sort_err_task) = stream_to_cmd(
+            config.clone(),
+            insert_stats_stream,
+            SAMTOOLS_TAG,
+            samtools_coord_sort_args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+        cleanup_tasks.push(coord_sort_task);
+        cleanup_tasks.push(coord_sort_err_task);
+
+        let coord_sort_out_stream = {
+            let mut guard = coord_sort_child.lock().await;
+            parse_child_output(
+                &mut guard,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.base_buffer_size,
+            )
+                .await
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?
+        };
+
+        // Run samtools stats
+        let samtools_stats_config = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Stats,
+            subcommand_fields: HashMap::new(),
+        };
+        let samtools_stats_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_stats_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+        let (mut stats_child, stats_stream_task, stats_err_task) = stream_to_cmd(
+            config.clone(),
+            coord_sort_out_stream,
+            SAMTOOLS_TAG,
+            samtools_stats_args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+        cleanup_tasks.push(stats_stream_task);
+        cleanup_tasks.push(stats_err_task);
+
+        let stats_out_stream = {
+            let mut guard = stats_child.lock().await;
+            parse_child_output(
+                &mut guard,
+                ChildStream::Stdout,
+                ParseMode::Bytes,
+                config.base_buffer_size,
+            )
+                .await
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?
+        };
+
+        // Parse samtools stats
+        let (stats_tx, stats_rx) = oneshot::channel();
+        let stats_task = tokio::spawn(async move {
+            let stats = parse_samtools_stats(stats_out_stream)
+                .await
+                .map_err(|e| anyhow!("Failed to parse samtools stats: {}", e))?;
+            stats_tx.send(stats).map_err(|_| anyhow!("Failed to send samtools stats"))?;
+            Ok(())
+        });
+        cleanup_tasks.push(stats_task);
+
+        Some(stats_rx)
+    } else {
+        None
+    };
+
+    Ok((
+        ReceiverStream::new(unmapped_fastq_stream),
+        count_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+        insert_stats_rx,
+    ))
 }
 
 
@@ -1495,13 +1595,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
     let ercc_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers) = bowtie2_filter(
+    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, _ercc_bt2_insert_stats_rx) = bowtie2_filter(
         config.clone(),
         val_out_stream,
         ercc_bt2_index_path,
         paired,
         ercc_bt2_options,
         None,
+        false
     ).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
@@ -1547,15 +1648,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Host filtering: bt2
     let host_bt2_index_path = bowtie2_index_prep(host_bowtie2_index, &cwd)?;
     let host_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers) = bowtie2_filter(
+    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers, host_bt2_insert_stats_rx) = bowtie2_filter(
         config.clone(),
         ReceiverStream::new(kallisto_bypass_stream),
         host_bt2_index_path,
         paired,
         host_bt2_options,
         None,
+        true
     ).await?;
+    cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
+
+
+
 
     // Host filtering: mm2
     let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
@@ -1579,13 +1685,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         // human filtering: bt2
         let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
         let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-        let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers) = bowtie2_filter(
+        let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers, _human_bt2_insert_stats_rx) = bowtie2_filter(
             config.clone(),
             host_mm2_out_stream,
             human_bt2_index_path,
             paired,
             human_bt2_options,
             None,
+            false
         ).await?;
         cleanup_receivers.extend(human_bt2_cleanup_receivers);
 
@@ -1653,6 +1760,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
     eprintln!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
+    if let Some(insert_stats_rx) = host_bt2_insert_stats_rx {
+        let insert_stats = insert_stats_rx
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Host bt2 insert stats receiver failed: {}", e)))?;
+        eprintln!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
+
+        let output_path = out_dir.join("insert_size_histogram.png");
+        let sample_name = no_ext_sample_base_buf
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sample")
+            .to_string();
+
+        let plot_task = tokio::spawn(async move {
+            plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &output_path)
+                .map_err(|e| anyhow!("Failed to plot insert sizes: {}", e))?;
+            Ok(())
+        });
+        cleanup_tasks.push(plot_task);
+    }
     let host_mm2_counts = host_mm2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;

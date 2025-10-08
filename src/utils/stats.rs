@@ -84,7 +84,6 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                     continue;
                 }
 
-                // Parse lines starting with "SN" (Summary Numbers)
                 if line.starts_with("SN") {
                     let parts: Vec<&str> = line.split('\t').collect();
                     if parts.len() >= 3 {
@@ -126,18 +125,15 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                         insert_sizes.push((size, inward + outward + other));
                     }
                 }
-                // other sections (e.g., FFQ, COV) if needfed in future
             }
             _ => {
-                return Err(anyhow!("Unexpected non-byte data in samtools stats stream"));
+                eprintln!("Unexpected non-byte data in samtools stats stream");
+                continue;
             }
         }
     }
 
-    if summary.is_empty() {
-        return Err(anyhow!("No valid samtools stats data parsed"));
-    }
-
+    // Return empty stats instead of error if no data
     Ok(SamtoolsStats { summary, insert_sizes })
 }
 
