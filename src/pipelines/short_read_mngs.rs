@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::fs::File;
 use std::io::Write;
-use std::io::BufReader;
+use std::io::BufReader as StdBufReader;
 use std::io::BufRead;
 use regex::Regex;
 use anyhow::{anyhow, Result};
@@ -19,6 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
 use tokio::fs::OpenOptions as TokioOpenOptions;
+use tokio::io::{BufReader, AsyncBufReadExt};
 use tempfile::NamedTempFile;
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
@@ -632,7 +633,7 @@ async fn fastp_qc(
     Ok((ReceiverStream::new(qc_out_stream), cleanup_tasks, cleanup_receivers, count_result_rx))
 }
 
-/// Runs Kallisto
+/// Runs Kallisto quant
 ///
 /// # Arguments
 ///
@@ -646,18 +647,31 @@ async fn kallisto_quant(
     out_dir: PathBuf,
     paired: bool,
     sample_base_buf: PathBuf,
-) -> Result<(oneshot::Receiver<KallistoResults>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(
+    oneshot::Sender<KallistoResults>,
+    oneshot::Receiver<KallistoResults>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let sample_base = sample_base_buf.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    // Convert sample_base_buf to &str
+    let sample_base = sample_base_buf
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| PipelineError::IOError(format!("Invalid sample base path: {}", sample_base_buf.display())))?
+        .to_string();
+
+    // Create Kallisto output dir (idempotent, fast on NVMe)
     let kallisto_out_dir = out_dir.join("kallisto");
     fs::create_dir_all(&kallisto_out_dir).await
         .map_err(|e| PipelineError::IOError(format!("Failed to create Kallisto output directory: {}", e)))?;
+    eprintln!("Kallisto output dir created/confirmed: {}", kallisto_out_dir.display());
 
     let kallisto_index = config.args.kallisto_index.clone()
         .ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?;
-    let (ercc_tx, ercc_rx) = oneshot::channel::<KallistoResults>();
 
     // Convert raw byte stream to FASTQ
     let byte_rx = input_stream.into_inner();
@@ -683,7 +697,6 @@ async fn kallisto_quant(
         cleanup_tasks.push(r2_handle);
     }
 
-
     let kallisto_config = if paired {
         KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
@@ -692,10 +705,9 @@ async fn kallisto_quant(
                 ("R2".to_string(), Some(r2_fifo.to_string_lossy().to_string())),
             ]),
             output_dir: kallisto_out_dir.clone(),
-            reproducible: false
+            reproducible: false,
         }
-    }
-    else {
+    } else {
         KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
             subcommand_fields: HashMap::from([
@@ -705,7 +717,7 @@ async fn kallisto_quant(
                 ("R1".to_string(), Some(r1_fifo.to_string_lossy().to_string())),
             ]),
             output_dir: kallisto_out_dir.clone(),
-            reproducible: false
+            reproducible: false,
         }
     };
 
@@ -714,7 +726,6 @@ async fn kallisto_quant(
             tool: KALLISTO_TAG.to_string(),
             error: e.to_string(),
         })?;
-
     eprintln!("Spawning Kallisto with args: {:?}", kallisto_args);
 
     let (mut kallisto_child, kallisto_err_task) = spawn_cmd(
@@ -727,10 +738,9 @@ async fn kallisto_quant(
             tool: KALLISTO_TAG.to_string(),
             error: e.to_string(),
         })?;
-
     cleanup_tasks.push(kallisto_err_task);
 
-    // Await Kallisto exit
+    // Create Kallisto exit task
     let r1_fifo_clone = r1_fifo.clone();
     let r2_fifo_clone = r2_fifo.clone();
     let kallisto_exit_task = tokio::spawn(async move {
@@ -739,7 +749,7 @@ async fn kallisto_quant(
         if !status.success() {
             return Err(anyhow!("Kallisto exited with code: {:?}", status.code()));
         }
-        // Clean up FIFOs after Kallisto exits
+        // Clean up FIFOs
         tokio::fs::remove_file(&r1_fifo_clone).await
             .map_err(|e| anyhow!("Failed to remove R1 FIFO {}: {}", r1_fifo_clone.display(), e))?;
         if paired {
@@ -748,55 +758,86 @@ async fn kallisto_quant(
         }
         Ok(())
     });
-    cleanup_tasks.push(kallisto_exit_task);
 
-    // Process Kallisto output (abundance.tsv)
-    let kallisto_results_task = tokio::spawn(async move {
-        let abundance_path = kallisto_out_dir.join("abundance.tsv");
-        eprintln!("Starting to read abundance.tsv from: {}", abundance_path.display());
-        let mut ercc_counts = Vec::new();
-        let mut transcript_to_gene = Vec::new();
+    // Create oneshot channel for results
+    let (ercc_tx, ercc_rx) = oneshot::channel::<KallistoResults>();
 
-        match std::fs::File::open(&abundance_path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                for line in reader.lines().skip(1) { // Skip header
-                    let line = line.map_err(|e| anyhow!("Failed to read abundance.tsv: {}", e))?;
-                    let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() >= 5 {
-                        let target_id = fields[0].to_string();
-                        let est_counts = fields[4].parse::<f64>()
-                            .map_err(|e| anyhow!("Failed to parse est_counts: {}", e))?;
-                        ercc_counts.push((target_id.clone(), est_counts));
-                        transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
-                    }
+    Ok((ercc_tx, ercc_rx, cleanup_tasks, cleanup_receivers, kallisto_exit_task))
+}
+
+/// Parses results of kallisto
+///
+/// # Arguments
+///
+/// * 'kallisto_out_dir': PathBuf to output dir of kallisto
+/// *  'ercc_tx': oneshot::Sender<KallistoResults>,
+///
+/// # Returns
+async fn kallisto_results(
+    kallisto_out_dir: PathBuf,
+    ercc_tx: oneshot::Sender<KallistoResults>,
+) -> Result<JoinHandle<Result<(), anyhow::Error>>, PipelineError> {
+    let abundance_path = kallisto_out_dir.join("abundance.tsv");
+    let parse_task = tokio::spawn(async move {
+        // Retry reading abundance.tsv (handles NVMe flush delays)
+        let mut retries = 5;
+        loop {
+            match fs::metadata(&abundance_path).await {
+                Ok(meta) if meta.len() > 0 => {
+                    eprintln!("Found abundance.tsv: {} bytes", meta.len());
+                    break;
                 }
-                eprintln!("Finished reading abundance.tsv: {} transcripts", ercc_counts.len());
-            }
-            Err(e) => {
-                eprintln!("No abundance.tsv found at {}: {}, returning empty results", abundance_path.display(), e);
+                _ => {
+                    if retries == 0 {
+                        return Err(anyhow!("No abundance.tsv found at {}", abundance_path.display()));
+                    }
+                    eprintln!("abundance.tsv not ready (retry {}); sleeping 2s", retries);
+                    sleep(Duration::from_secs(2)).await;
+                    retries -= 1;
+                }
             }
         }
 
-        Ok::<KallistoResults, anyhow::Error>(KallistoResults {
+        let abundance_file = tokio::fs::File::open(&abundance_path).await
+            .map_err(|e| anyhow!("Failed to open abundance.tsv: {}", e))?;
+        let reader = tokio::io::BufReader::new(abundance_file);
+        let mut lines = reader.lines();
+        let mut ercc_counts = Vec::new();
+        let mut transcript_to_gene = Vec::new();
+
+        // eprintln!("Starting to read abundance.tsv from: {}", abundance_path.display());
+
+        if lines.next_line().await?.is_none() {
+            return Err(anyhow!("Empty abundance.tsv"));
+        }
+
+        // Parse each line: target_id, length, eff_length, est_counts, tpm
+        while let Some(line) = lines.next_line().await? {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 5 {
+                return Err(anyhow!("Invalid abundance.tsv line: {}", line));
+            }
+            let target_id = fields[0].to_string();
+            let est_counts = fields[3].parse::<f64>()
+                .map_err(|e| anyhow!("Failed to parse est_counts in line {}: {}", line, e))?;
+            ercc_counts.push((target_id.clone(), est_counts));
+            transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
+        }
+
+        eprintln!("Finished reading kallisto's abundance.tsv: {} transcripts", ercc_counts.len());
+        let results = KallistoResults {
             ercc_counts,
             transcript_to_gene,
-        })
-    });
-
-
-    let ercc_send_task = tokio::spawn(async move {
-        let results = kallisto_results_task.await
-            .map_err(|e| anyhow!("Kallisto results task failed: {}", e))??;
+        };
         ercc_tx.send(results)
             .map_err(|_| anyhow!("Failed to send Kallisto results"))?;
         eprintln!("Sent Kallisto results");
         Ok(())
     });
-    cleanup_tasks.push(ercc_send_task);
 
-    Ok((ercc_rx, cleanup_tasks, cleanup_receivers))
+    Ok(parse_task)
 }
+
 /// HISAT2 filter
 ///
 /// # Arguments
@@ -1614,6 +1655,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir = config.out_dir.clone();
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
+    eprintln!("Current dir: {:?}", std::env::current_dir()?);
 
     // External tools check
     check_versions(vec![BOWTIE2_TAG, STAR_TAG, KALLISTO_TAG])
@@ -1681,7 +1723,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let kallisto_stream = ReceiverStream::new(kallisto_stream);
 
-    let (kallisto_ercc_rx, kallisto_cleanup_tasks, kallisto_cleanup_receivers) = kallisto_quant(
+    let (kallisto_ercc_tx, kallisto_ercc_rx, kallisto_cleanup_tasks, kallisto_cleanup_receivers, kallisto_exit_task) = kallisto_quant(
         config.clone(),
         kallisto_stream,
         out_dir.clone(),
@@ -1707,8 +1749,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
 
 
-
-
     // Host filtering: mm2
     let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
         config.clone(),
@@ -1722,7 +1762,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // If host is no huma, run an additional filter stage using a human reference
     let post_filter_stream  = if config.args.human_host {
-
         host_mm2_out_stream
     }
     else {
@@ -1763,6 +1802,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //     temp_files.push(temp);
     // }
 
+
     // Test write out for the main stream until pipeline construction complete
     let test_write_task = tokio::spawn(stream_to_file(
         post_filter_stream.into_inner(),
@@ -1793,10 +1833,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     };
 
-    let kallisto_ercc_counts = kallisto_ercc_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
-    // eprintln!("ERCC counts: {:?}", kallisto_ercc_counts);
 
     let ercc_mapped_count = ercc_count_rx.await
         .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
@@ -1832,6 +1868,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;
     eprintln!("Host minimap2: mapped counts: {:?}", host_mm2_counts);
+
+    // Await Kallisto exit and process results
+    join_with_error_handling(kallisto_exit_task).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let kallisto_results_task = kallisto_results(out_dir.join("kallisto"), kallisto_ercc_tx)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    join_with_error_handling(kallisto_results_task).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // Collect Kallisto results
+    let kallisto_ercc_counts = kallisto_ercc_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
+    // eprintln!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
 
     // Cleanup
     let results = try_join_all(cleanup_tasks)
