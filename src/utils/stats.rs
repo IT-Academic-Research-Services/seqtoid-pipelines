@@ -8,6 +8,7 @@ use tokio_stream::StreamExt;
 use std::collections::HashMap;
 use crate::utils::streams::ParseOutput;
 use crate::utils::fastx::SequenceRecord;
+use crate::config::defs::SamtoolsStats;
 
 
 
@@ -70,8 +71,9 @@ pub fn compute_lx(lengths: &[u64], fraction: f64) -> u32 {
 /// # Returns
 ///
 /// Hamshmap <String, String>
-pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
-    let mut stats = HashMap::new();
+pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<SamtoolsStats> {
+    let mut summary = HashMap::new();
+    let mut insert_sizes = Vec::new();
     let mut stream = ReceiverStream::new(rx);
 
     while let Some(item) = stream.next().await {
@@ -82,28 +84,57 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
                     continue;
                 }
 
-                // Parse lines starting with "SN" (Summary Numbers)
                 if line.starts_with("SN") {
                     let parts: Vec<&str> = line.split('\t').collect();
                     if parts.len() >= 3 {
                         let key = parts[1].trim_end_matches(':').to_string();
                         let value = parts[2].to_string();
-                        stats.insert(key, value);
+                        summary.insert(key, value);
+                    }
+                } else if line.starts_with("IS\t") {
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() == 5 {
+                        let size: u32 = match parts[1].parse() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("Failed to parse insert size: {}", e);
+                                continue;
+                            }
+                        };
+                        let inward: u64 = match parts[2].parse() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("Failed to parse inward count: {}", e);
+                                continue;
+                            }
+                        };
+                        let outward: u64 = match parts[3].parse() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("Failed to parse outward count: {}", e);
+                                continue;
+                            }
+                        };
+                        let other: u64 = match parts[4].parse() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("Failed to parse other count: {}", e);
+                                continue;
+                            }
+                        };
+                        insert_sizes.push((size, inward + outward + other));
                     }
                 }
-                // other sections (e.g., FFQ, COV) if needfed in future
             }
             _ => {
-                return Err(anyhow!("Unexpected non-byte data in samtools stats stream"));
+                eprintln!("Unexpected non-byte data in samtools stats stream");
+                continue;
             }
         }
     }
 
-    if stats.is_empty() {
-        return Err(anyhow!("No valid samtools stats data parsed"));
-    }
-
-    Ok(stats)
+    // Return empty stats instead of error if no data
+    Ok(SamtoolsStats { summary, insert_sizes })
 }
 
 
@@ -417,5 +448,3 @@ pub fn compute_coverage_bins(depths: &[u32], max_num_bins: usize) -> (f64, Vec<(
     }
     (bin_size, coverage)
 }
-
-
