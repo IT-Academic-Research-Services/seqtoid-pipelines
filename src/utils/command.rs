@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -1440,6 +1440,72 @@ pub mod star {
     }
 }
 
+pub mod czid_dedup {
+
+    use std::path::PathBuf;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{RunConfig, CZID_DEDUP_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct CzidDedupConfig {
+        pub input_paths: Vec<PathBuf>,  // FIFOs or files for inputs (1 for single, 2 for paired)
+        pub output_paths: Vec<PathBuf>, // FIFOs or files for outputs (matching inputs)
+        pub prefix_length: Option<u32>,
+        pub cluster_output: Option<PathBuf>,
+        pub cluster_size_output: Option<PathBuf>,
+    }
+
+    pub struct CzidDedupArgGenerator;
+
+    pub async fn czid_dedup_presence_check() -> Result<f32> {
+        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for CzidDedupArgGenerator {
+        fn generate_args(&self, _run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<CzidDedupConfig>())
+                .ok_or_else(|| anyhow!("czid-dedup requires CzidDedupConfig as extra argument"))?;
+
+            if config.input_paths.len() != config.output_paths.len() {
+                return Err(anyhow!("Number of inputs must match outputs for czid-dedup"));
+            }
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            for input in &config.input_paths {
+                args_vec.push("--inputs".to_string());
+                args_vec.push(input.to_string_lossy().to_string());
+            }
+
+            for output in &config.output_paths {
+                args_vec.push("--deduped-outputs".to_string());
+                args_vec.push(output.to_string_lossy().to_string());
+            }
+
+            if let Some(len) = config.prefix_length {
+                args_vec.push("--prefix-length".to_string());
+                args_vec.push(len.to_string());
+            }
+
+            if let Some(cluster) = &config.cluster_output {
+                args_vec.push("--cluster-output".to_string());
+                args_vec.push(cluster.to_string_lossy().to_string());
+            }
+
+            if let Some(size) = &config.cluster_size_output {
+                args_vec.push("--cluster-size-output".to_string());
+                args_vec.push(size.to_string_lossy().to_string());
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -1458,6 +1524,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         HISAT2_TAG => Box::new(hisat2::Hisat2ArgGenerator),
         KALLISTO_TAG => Box::new(kallisto::KallistoArgGenerator),
         STAR_TAG => Box::new(star::StarArgGenerator),
+        CZID_DEDUP_TAG => Box::new(czid_dedup::CzidDedupArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -1483,6 +1550,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             HISAT2_TAG => hisat2::hisat2_presence_check().await,
             KALLISTO_TAG => kallisto::kallisto_presence_check().await,
             STAR_TAG => star::star_presence_check().await,
+            CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
 
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
