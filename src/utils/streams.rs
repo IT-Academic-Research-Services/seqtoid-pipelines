@@ -931,29 +931,56 @@ pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) ->
 
 pub async fn create_fifo(path: &PathBuf) -> Result<(), PipelineError> {
     // Check for and remove existing FIFO with retry
+    let mut exists_as_non_fifo = false;
     for attempt in 1..=3 {
-        if fs::metadata(path).await.is_ok() {
-            eprintln!("Attempt {} to remove existing FIFO: {}", attempt, path.display());
-            match fs::remove_file(path).await {
-                Ok(_) => eprintln!("Successfully removed existing FIFO: {}", path.display()),
-                Err(e) => {
-                    eprintln!("Failed to remove FIFO {} on attempt {}: {}", path.display(), attempt, e);
-                    if attempt < 3 {
-                        sleep(Duration::from_millis(100)).await;
-                        continue;
+        match fs::metadata(path).await {
+            Ok(meta) => {
+                if meta.file_type().is_fifo() {
+                    eprintln!("Attempt {} to remove existing FIFO: {}", attempt, path.display());
+                    match fs::remove_file(path).await {
+                        Ok(_) => {
+                            eprintln!("Successfully removed existing FIFO: {}", path.display());
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to remove FIFO {} on attempt {}: {}", path.display(), attempt, e);
+                            if attempt < 3 {
+                                sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                            return Err(PipelineError::IOError(format!(
+                                "Failed to remove existing FIFO {} after {} attempts: {}",
+                                path.display(),
+                                attempt,
+                                e
+                            )));
+                        }
                     }
-                    return Err(PipelineError::IOError(format!(
-                        "Failed to remove existing FIFO {} after {} attempts: {}",
-                        path.display(),
-                        attempt,
-                        e
-                    )));
+                } else {
+                    exists_as_non_fifo = true;
+                    break;
                 }
             }
-        } else {
-            eprintln!("No existing FIFO found: {}", path.display());
-            break;
+            Err(_) if attempt == 1 => {
+                eprintln!("No existing FIFO found: {}", path.display());
+                break;
+            }
+            Err(e) => {
+                eprintln!("Metadata error on attempt {}: {}", attempt, e);
+                if attempt < 3 {
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                return Err(PipelineError::IOError(e.to_string()));
+            }
         }
+    }
+
+    if exists_as_non_fifo {
+        return Err(PipelineError::IOError(format!(
+            "Path {} exists and is not a FIFO; refusing to remove non-FIFO file",
+            path.display()
+        )));
     }
 
     // Create new FIFO
@@ -2477,7 +2504,11 @@ mod tests {
         let result = create_fifo(&path).await;
         assert!(result.is_err(), "Should error if path exists as non-FIFO");
         if let Err(e) = result {
-            assert!(e.to_string().contains("mkfifo failed"), "Error should mention mkfifo failure");
+            assert!(
+                e.to_string().contains("is not a FIFO"),
+                "Error should mention non-FIFO file, got: {}",
+                e
+            );
         }
         Ok(())
     }
