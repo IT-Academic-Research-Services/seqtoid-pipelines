@@ -31,6 +31,7 @@ pub const BOWTIE2_TAG: &str = "bowtie2";
 pub const HISAT2_TAG: &str = "hisat2";
 pub const KALLISTO_TAG: &str = "kallisto";
 pub const STAR_TAG: &str = "STAR";
+pub const CZID_DEDUP_TAG: &str = "czid-dedup";
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -48,6 +49,7 @@ lazy_static! {
         m.insert(KALLISTO_TAG, 0.5);
         m.insert(HISAT2_TAG, 2.20);
         m.insert(STAR_TAG, 2.7);
+        m.insert(CZID_DEDUP_TAG, 0.1);
         m
     };
 }
@@ -81,7 +83,7 @@ pub enum IvarSubcommand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeqkitSubcommand {
     Stats,
-    Grep
+    Rmdup
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

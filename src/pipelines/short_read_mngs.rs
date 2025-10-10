@@ -1,3 +1,4 @@
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::process::Command;
 use crate::utils::fastx::SequenceRecord;
@@ -21,10 +22,10 @@ use tokio::sync::Notify;
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use tokio::io::{BufReader, AsyncBufReadExt};
 use tempfile::NamedTempFile;
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -36,6 +37,7 @@ use crate::utils::command::star::{StarConfig, star_index_prep};
 use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
+use crate::utils::command::czid_dedup::CzidDedupConfig;
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -1410,12 +1412,16 @@ async fn minimap2_filter(
     let minimap2_config = Minimap2Config {
         minimap2_index_path: host_index_path,
         option_fields: HashMap::from([
-            ("-ax".to_string(), Some("splice".to_string())),
-            ("-k".to_string(), Some("14".to_string())),
-            ("-u".to_string(), Some("f".to_string())),
+            ("-ax".to_string(), Some("sr".to_string())), // Short-read preset
+            ("-k".to_string(), Some("15".to_string())), // Default k-mer
+            ("-w".to_string(), Some("10".to_string())), // Default window
+            ("-s".to_string(), Some("30".to_string())), // Match HISAT2's score threshold
+            ("-A".to_string(), Some("2".to_string())), // Match score
+            ("-B".to_string(), Some("4".to_string())), // Mismatch penalty
+            ("-O".to_string(), Some("4,24".to_string())), // Gap open
+            ("-E".to_string(), Some("2,1".to_string())), // Gap extension
         ]),
     };
-
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
@@ -1634,6 +1640,370 @@ async fn minimap2_filter(
     ))
 }
 
+
+
+// Deduplicate using czid-dedup with FIFOs
+async fn czid_dedup_dedup(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    paired: bool,
+    out_dir: PathBuf,
+    sample_base_buf: PathBuf,
+    prefix_length: u32,
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    oneshot::Receiver<u64>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    eprintln!("top of czid dedup");
+
+    // Check if input stream is empty or near-empty
+    let (pre_tx, pre_rx) = mpsc::channel(config.base_buffer_size);
+    let (t_junc_streams, t_junc_done_rx) = t_junction(
+        input_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "czid_dedup_pre_check".to_string(),
+        None,
+    ).await?;
+    cleanup_receivers.push(t_junc_done_rx);
+    let mut t_junc_iter = t_junc_streams.into_iter();
+    let input_stream = ReceiverStream::new(t_junc_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let pre_count_stream = ReceiverStream::new(t_junc_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let pre_count_task = tokio::spawn(async move {
+        let mut records = Vec::new();
+        let mut pre_count_stream = pre_count_stream;
+        while let Some(record) = pre_count_stream.next().await {
+            records.push(format!("{:?}", record));
+        }
+        let count = records.len() as u64;
+        // eprintln!("czid_dedup_dedup: Pre-count = {}, records = {:?}", count, records);
+        Ok::<u64, anyhow::Error>(count)
+    });
+    let pre_count = pre_count_task.await??; // Unwrap Result<u64, anyhow::Error>
+    if pre_count <= 4 {
+        eprintln!("czid_dedup_dedup: Skipping deduplication due to empty or near-empty input stream ({} records)", pre_count);
+        let (count_tx, count_rx) = oneshot::channel();
+        count_tx.send(0).map_err(|_| anyhow!("Failed to send empty count"))?;
+        drop(pre_tx); // Close sender to signal empty stream
+        return Ok((ReceiverStream::new(pre_rx), count_rx, cleanup_tasks, cleanup_receivers));
+    }
+    eprintln!("b4 create out fifops");
+    // Create output FIFOs
+    let num_files = if paired { 2 } else { 1 };
+    let mut output_fifos = Vec::with_capacity(num_files);
+    for i in 0..num_files {
+        let suffix = if paired { if i == 0 { "r1" } else { "r2" } } else { "se" };
+        let output_fifo = config.ram_temp_dir.join(format!("czid_output_{}_{}.fq", sample_base_buf.file_stem().unwrap().to_string_lossy(), suffix));
+        create_fifo(&output_fifo).await?;
+        output_fifos.push(output_fifo);
+    }
+
+    // Synchronization for FIFO writers
+    let notify = Arc::new(Notify::new());
+
+    // Deinterleave input stream to input FIFOs
+    let sample_base = sample_base_buf.file_stem().unwrap().to_string_lossy();
+    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        config.clone(),
+        input_stream,
+        &sample_base,
+        paired,
+    ).await?;
+    cleanup_tasks.push(deinterleave_handle);
+    cleanup_tasks.push(r1_write_handle);
+    if let Some(handle) = r2_write_handle {
+        cleanup_tasks.push(handle);
+    }
+
+    // Input FIFOs for czid-dedup
+    let input_fifos = if paired {
+        vec![r1_fifo.clone(), r2_fifo.clone()]
+    } else {
+        vec![r1_fifo.clone()]
+    };
+
+    // Debug FIFO contents
+    let r1_fifo_debug = r1_fifo.clone();
+    let r2_fifo_debug = r2_fifo.clone();
+    let debug_fifo_task = tokio::spawn(async move {
+        for fifo in [&r1_fifo_debug, &r2_fifo_debug] {
+            if let Ok(data) = fs::read(fifo).await {
+                eprintln!("FIFO {} ok", fifo.display());
+                // eprintln!("FIFO {} contents: {:?}", fifo.display(), String::from_utf8_lossy(&data));
+            } else {
+                eprintln!("FIFO {} is empty or inaccessible", fifo.display());
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(debug_fifo_task);
+
+    // Notify that writers are ready
+    let notify_clone = notify.clone();
+    let writer_ready_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        notify_clone.notify_one();
+        Ok(())
+    });
+    cleanup_tasks.push(writer_ready_task);
+
+    // Optional cluster outputs
+    let cluster_out = out_dir.join("czid_clusters.csv");
+    let cluster_size_out = out_dir.join("czid_cluster_sizes.csv");
+
+    // Config and args
+    let czid_config = CzidDedupConfig {
+        input_paths: input_fifos,
+        output_paths: output_fifos.clone(),
+        prefix_length: Some(prefix_length),
+        cluster_output: Some(cluster_out),
+        cluster_size_output: Some(cluster_size_out),
+    };
+
+    let czid_args = generate_cli(CZID_DEDUP_TAG, &config, Some(&czid_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: CZID_DEDUP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    // Wait for writers to be ready
+    notify.notified().await;
+
+    // Spawn czid-dedup
+    let (mut child, err_task) = spawn_cmd(
+        config.clone(),
+        CZID_DEDUP_TAG,
+        czid_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: CZID_DEDUP_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+    cleanup_tasks.push(err_task);
+
+    let exit_task = tokio::spawn(async move {
+        let status = child.wait().await?;
+        if !status.success() {
+            // Handle empty input case gracefully
+            if status.code() == Some(2) {
+                eprintln!("czid-dedup exited with code 2 (likely empty input); treating as empty output");
+                return Ok(());
+            }
+            return Err(anyhow!("czid-dedup failed with exit code: {:?}", status.code()));
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(exit_task);
+
+    // Read from output FIFOs
+    let (dedup_rx, count_rx) = if paired {
+        let (r1_rx, r1_count_task) = read_fastq(
+            output_fifos[0].clone(),
+            None,
+            None,
+            0, // max_reads
+            None,
+            None,
+            config.base_buffer_size,
+        ).map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+        let (r2_rx, r2_count_task) = read_fastq(
+            output_fifos[1].clone(),
+            None,
+            None,
+            0, // max_reads
+            None,
+            None,
+            config.base_buffer_size,
+        ).map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+        let (inter_rx, inter_task) = interleave_fastq_streams(r1_rx, r2_rx, config.base_buffer_size).await?;
+        cleanup_tasks.push(inter_task);
+        // Validate pair counts and send count
+        let (count_tx, count_rx) = oneshot::channel();
+        let count_validation_task = tokio::spawn(async move {
+            let r1_result = r1_count_task.await.map_err(|e| anyhow!("R1 count task failed: {}", e))?;
+            let r2_result = r2_count_task.await.map_err(|e| anyhow!("R2 count task failed: {}", e))?;
+            let (r1_stats, r2_stats) = match (r1_result, r2_result) {
+                (Ok(r1_stats), Ok(r2_stats)) => (r1_stats, r2_stats),
+                (Err(e), _) | (_, Err(e)) => {
+                    // eprintln!("read_fastq failed for R1 or R2: {}", e);
+                    count_tx.send(0).map_err(|_| anyhow!("Send failed"))?;
+                    return Ok(());
+                }
+            };
+            if r1_stats.validated != r2_stats.validated {
+                eprintln!("Mismatched pair counts: R1={}, R2={}", r1_stats.validated, r2_stats.validated);
+                return Err(anyhow!("Mismatched pair counts: R1={}, R2={}", r1_stats.validated, r2_stats.validated));
+            }
+            count_tx.send(r1_stats.validated / 2)
+                .map_err(|_| anyhow!("Send failed"))?;
+            Ok(())
+        });
+        cleanup_tasks.push(count_validation_task);
+        (inter_rx, count_rx)
+    } else {
+        let (rx, count_task) = read_fastq(
+            output_fifos[0].clone(),
+            None,
+            None,
+            0, // max_reads
+            None,
+            None,
+            config.base_buffer_size,
+        ).map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+        let (count_tx, count_rx) = oneshot::channel();
+        let count_wrap = tokio::spawn(async move {
+            let stats = count_task.await.map_err(|e| anyhow!("Count task failed: {}", e))?;
+            match stats {
+                Ok(stats) => {
+                    count_tx.send(stats.validated)
+                        .map_err(|_| anyhow!("Send failed"))?;
+                    Ok(())
+                }
+                Err(e) => {
+                    // eprintln!("read_fastq failed for single-end: {}", e);
+                    count_tx.send(0).map_err(|_| anyhow!("Send failed"))?;
+                    Ok(())
+                }
+            }
+        });
+        cleanup_tasks.push(count_wrap);
+        (rx, count_rx)
+    };
+
+    // FIFO cleanup with logging
+    let fifo_cleanup = tokio::spawn(async move {
+        for path in output_fifos.iter() {
+            if let Err(e) = fs::remove_file(path).await {
+                eprintln!("Failed to remove FIFO {}: {}", path.display(), e);
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(fifo_cleanup);
+
+    Ok((ReceiverStream::new(dedup_rx), count_rx, cleanup_tasks, cleanup_receivers))
+}
+
+async fn fastp_dedup(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    paired: bool,
+    out_dir: PathBuf,
+    sample_base_buf: PathBuf,
+    prefix_length: Option<u32>,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        oneshot::Receiver<u64>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    // Configure fastp for deduplication only
+    let mut command_fields = HashMap::from([
+        ("--stdin".to_string(), None), // Input from stdin
+        ("--stdout".to_string(), None), // Output to stdout
+        ("--dedup".to_string(), None), // Enable deduplication
+        ("--dup_calc_accuracy".to_string(), Some("3".to_string())), // Low memory (~1-2GB)
+        ("-w".to_string(), Some(RunConfig::thread_allocation(&config, FASTP_TAG, None).to_string())),
+        ("-j".to_string(), Some(out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy())).to_string_lossy().to_string())), // JSON report
+    ]);
+
+    // Handle paired-end
+    if paired {
+        command_fields.insert("--interleaved_in".to_string(), None);
+    }
+
+    // Handle prefix-length by trimming (if specified)
+    if let Some(len) = prefix_length {
+        command_fields.insert("--cut_tail".to_string(), Some(len.to_string()));
+        command_fields.insert("--cut_front".to_string(), Some("0".to_string()));
+        eprintln!("Trimming reads to {}bp for prefix-based deduplication", len);
+    }
+
+    let fastp_config = FastpConfig { command_fields };
+    let fastp_args = generate_cli(FASTP_TAG, &config, Some(&fastp_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    // Stream to fastp
+    let (mut fastp_child, fastp_stream_task, fastp_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        FASTP_TAG,
+        fastp_args,
+        StreamDataType::JustBytes, // Or IlluminaFastq if parsing FASTQ records
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(fastp_stream_task);
+    cleanup_tasks.push(fastp_err_task);
+
+    // Parse output stream
+    let dedup_stream = {
+        let mut guard = fastp_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FASTP_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // Count unique reads from JSON report
+    let json_path = out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy()));
+    let (count_tx, count_rx) = oneshot::channel();
+    let count_task = tokio::spawn(async move {
+        // Wait for fastp to finish writing JSON
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let json_content = fs::read_to_string(&json_path)
+            .await
+            .map_err(|e| anyhow!("Failed to read fastp JSON: {}", e))?;
+        let parsed: Value = serde_json::from_str(&json_content)
+            .map_err(|e| anyhow!("Failed to parse fastp JSON: {}", e))?;
+        let uniques = parsed["duplication"]["unique_reads"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing unique_reads in fastp JSON"))?;
+        count_tx
+            .send(uniques / if paired { 2 } else { 1 }) // Divide by 2 for paired-end to get pairs
+            .map_err(|_| anyhow!("Failed to send unique read count"))?;
+        Ok(())
+    });
+    cleanup_tasks.push(count_task);
+
+    Ok((
+        ReceiverStream::new(dedup_stream),
+        count_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -1658,7 +2028,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     eprintln!("Current dir: {:?}", std::env::current_dir()?);
 
     // External tools check
-    check_versions(vec![BOWTIE2_TAG, STAR_TAG, KALLISTO_TAG])
+    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, CZID_DEDUP_TAG])
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -1802,13 +2172,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //     temp_files.push(temp);
     // }
 
+    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = fastp_dedup(
+        config.clone(),
+        post_filter_stream,
+        paired,
+        out_dir.clone(),
+        no_ext_sample_base_buf.clone(),
+        Some(75), // prefix_length, trims to 75bp if set
+    )
+        .await?;
+    cleanup_tasks.extend(dedup_cleanup_tasks);
+    cleanup_receivers.extend(dedup_cleanup_receivers);
 
-    // Test write out for the main stream until pipeline construction complete
-    let test_write_task = tokio::spawn(stream_to_file(
-        post_filter_stream.into_inner(),
-        PathBuf::from("test.fq"),
+    // Write deduped stream
+    let dedup_write_task = tokio::spawn(stream_to_file(
+        dedup_stream.into_inner(),
+        out_dir.join("deduped.fq"),
     ));
-    cleanup_tasks.push(test_write_task);
+    cleanup_tasks.push(dedup_write_task);
 
     // Results retrieval
     let raw_count = join_with_error_handling(raw_count_task).await?;
@@ -1868,6 +2249,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;
     eprintln!("Host minimap2: mapped counts: {:?}", host_mm2_counts);
+
+    let dedup_count = dedup_count_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
+    eprintln!("dedup: unique reads/pairs: {}", dedup_count);
 
     // Await Kallisto exit and process results
     join_with_error_handling(kallisto_exit_task).await

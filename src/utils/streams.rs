@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 
 
 use tokio::fs::File;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -24,6 +25,10 @@ use tokio::fs::OpenOptions as TokioOpenOptions;
 use std::os::unix::fs::FileTypeExt;
 use futures::TryFutureExt;
 use uuid::Uuid;
+use std::os::unix::fs::PermissionsExt;
+use tokio::fs::{self, set_permissions};
+use std::fs::Permissions;
+
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType};
@@ -923,15 +928,76 @@ pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) ->
 ///
 /// # Returns
 /// Result(): whether the fifo was created successfully.
-pub async fn create_fifo(path: &PathBuf) -> Result<()> {
+
+pub async fn create_fifo(path: &PathBuf) -> Result<(), PipelineError> {
+    // Check for and remove existing FIFO with retry
+    let mut exists_as_non_fifo = false;
+    for attempt in 1..=3 {
+        match fs::metadata(path).await {
+            Ok(meta) => {
+                if meta.file_type().is_fifo() {
+                    eprintln!("Attempt {} to remove existing FIFO: {}", attempt, path.display());
+                    match fs::remove_file(path).await {
+                        Ok(_) => {
+                            eprintln!("Successfully removed existing FIFO: {}", path.display());
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to remove FIFO {} on attempt {}: {}", path.display(), attempt, e);
+                            if attempt < 3 {
+                                sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                            return Err(PipelineError::IOError(format!(
+                                "Failed to remove existing FIFO {} after {} attempts: {}",
+                                path.display(),
+                                attempt,
+                                e
+                            )));
+                        }
+                    }
+                } else {
+                    exists_as_non_fifo = true;
+                    break;
+                }
+            }
+            Err(_) if attempt == 1 => {
+                eprintln!("No existing FIFO found: {}", path.display());
+                break;
+            }
+            Err(e) => {
+                eprintln!("Metadata error on attempt {}: {}", attempt, e);
+                if attempt < 3 {
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                return Err(PipelineError::IOError(e.to_string()));
+            }
+        }
+    }
+
+    if exists_as_non_fifo {
+        return Err(PipelineError::IOError(format!(
+            "Path {} exists and is not a FIFO; refusing to remove non-FIFO file",
+            path.display()
+        )));
+    }
+
+    // Create new FIFO
     let status = Command::new("mkfifo")
         .arg(path)
         .status()
         .await
-        .map_err(|e| anyhow!("Failed to execute mkfifo: {}", e))?;
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     if !status.success() {
-        return Err(anyhow!("mkfifo failed with exit code: {:?}", status.code()));
+        return Err(PipelineError::IOError(format!("mkfifo failed for {}", path.display())));
     }
+
+    // Set permissions
+    set_permissions(path, Permissions::from_mode(0o666))
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
     Ok(())
 }
 
@@ -1340,6 +1406,43 @@ where
     Ok((r1_fd_str, r2_fd_str, combined_handle, None, writers_ready, r1_fifo, r2_fifo))
 }
 
+pub async fn interleave_fastq_streams(
+    r1_rx: mpsc::Receiver<ParseOutput>,
+    r2_rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let (inter_tx, inter_rx) = mpsc::channel(buffer_size);
+    let inter_task = tokio::spawn(async move {
+        let mut r1_stream = ReceiverStream::new(r1_rx);
+        let mut r2_stream = ReceiverStream::new(r2_rx);
+        let mut record_count = 0;
+        while let (Some(r1), Some(r2)) = (r1_stream.next().await, r2_stream.next().await) {
+            record_count += 2;
+            match (&r1, &r2) {
+                (ParseOutput::Fastq(_), ParseOutput::Fastq(_)) => {
+                    inter_tx.send(r1).await
+                        .map_err(|_| PipelineError::StreamDataDropped)
+                        .map_err(Into::<anyhow::Error>::into)?;
+                    inter_tx.send(r2).await
+                        .map_err(|_| PipelineError::StreamDataDropped)
+                        .map_err(Into::<anyhow::Error>::into)?;
+                }
+                _ => return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in interleave stream".to_string()))
+                    .map_err(Into::<anyhow::Error>::into),
+            }
+        }
+        // Check if one stream ended early
+        if r1_stream.next().await.is_some() || r2_stream.next().await.is_some() {
+            return Err(PipelineError::InvalidFastqFormat(format!(
+                "Uneven paired-end streams: {} records", record_count
+            )))
+                .map_err(Into::<anyhow::Error>::into);
+        }
+        eprintln!("interleave_fastq_streams: Interleaved {} records", record_count);
+        Ok(())
+    });
+    Ok((inter_rx, inter_task))
+}
 
 /// Combines multiple streams into one
 ///
@@ -2401,7 +2504,11 @@ mod tests {
         let result = create_fifo(&path).await;
         assert!(result.is_err(), "Should error if path exists as non-FIFO");
         if let Err(e) = result {
-            assert!(e.to_string().contains("mkfifo failed"), "Error should mention mkfifo failure");
+            assert!(
+                e.to_string().contains("is not a FIFO"),
+                "Error should mention non-FIFO file, got: {}",
+                e
+            );
         }
         Ok(())
     }
