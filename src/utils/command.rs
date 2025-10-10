@@ -816,14 +816,17 @@ pub mod seqkit {
 
             let mut args_vec: Vec<String> = Vec::new();
 
-            match config.subcommand {
+            match config.subcommand { 
                 SeqkitSubcommand::Stats => {
                     args_vec.push("stats".to_string());
-                    args_vec.push("-".to_string());
+
                 }
-                SeqkitSubcommand::Grep => {
-                    args_vec.push("grep".to_string());
+                
+                SeqkitSubcommand::Rmdup => {
+                    args_vec.push("rmdup".to_string());
+
                 }
+                
             }
 
             for (key, value) in config.subcommand_fields.iter() {
@@ -833,6 +836,8 @@ pub mod seqkit {
                     None => { },
                 }
             }
+
+            args_vec.push("-".to_string());
 
             Ok(args_vec)
         }

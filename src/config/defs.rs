@@ -83,7 +83,7 @@ pub enum IvarSubcommand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeqkitSubcommand {
     Stats,
-    Grep
+    Rmdup
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

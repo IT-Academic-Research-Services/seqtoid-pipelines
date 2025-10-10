@@ -1,3 +1,4 @@
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::process::Command;
 use crate::utils::fastx::SequenceRecord;
@@ -1892,7 +1893,116 @@ async fn czid_dedup_dedup(
     Ok((ReceiverStream::new(dedup_rx), count_rx, cleanup_tasks, cleanup_receivers))
 }
 
+async fn fastp_dedup(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    paired: bool,
+    out_dir: PathBuf,
+    sample_base_buf: PathBuf,
+    prefix_length: Option<u32>,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        oneshot::Receiver<u64>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
+    // Configure fastp for deduplication only
+    let mut command_fields = HashMap::from([
+        ("--stdin".to_string(), None), // Input from stdin
+        ("--stdout".to_string(), None), // Output to stdout
+        ("--dedup".to_string(), None), // Enable deduplication
+        ("--dup_calc_accuracy".to_string(), Some("3".to_string())), // Low memory (~1-2GB)
+        ("-w".to_string(), Some(RunConfig::thread_allocation(&config, FASTP_TAG, None).to_string())),
+        ("-j".to_string(), Some(out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy())).to_string_lossy().to_string())), // JSON report
+    ]);
+
+    // Handle paired-end
+    if paired {
+        command_fields.insert("--interleaved_in".to_string(), None);
+    }
+
+    // Handle prefix-length by trimming (if specified)
+    if let Some(len) = prefix_length {
+        command_fields.insert("--cut_tail".to_string(), Some(len.to_string()));
+        command_fields.insert("--cut_front".to_string(), Some("0".to_string()));
+        eprintln!("Trimming reads to {}bp for prefix-based deduplication", len);
+    }
+
+    let fastp_config = FastpConfig { command_fields };
+    let fastp_args = generate_cli(FASTP_TAG, &config, Some(&fastp_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    // Stream to fastp
+    let (mut fastp_child, fastp_stream_task, fastp_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        FASTP_TAG,
+        fastp_args,
+        StreamDataType::JustBytes, // Or IlluminaFastq if parsing FASTQ records
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(fastp_stream_task);
+    cleanup_tasks.push(fastp_err_task);
+
+    // Parse output stream
+    let dedup_stream = {
+        let mut guard = fastp_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FASTP_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // Count unique reads from JSON report
+    let json_path = out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy()));
+    let (count_tx, count_rx) = oneshot::channel();
+    let count_task = tokio::spawn(async move {
+        // Wait for fastp to finish writing JSON
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let json_content = fs::read_to_string(&json_path)
+            .await
+            .map_err(|e| anyhow!("Failed to read fastp JSON: {}", e))?;
+        let parsed: Value = serde_json::from_str(&json_content)
+            .map_err(|e| anyhow!("Failed to parse fastp JSON: {}", e))?;
+        let uniques = parsed["duplication"]["unique_reads"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Missing unique_reads in fastp JSON"))?;
+        count_tx
+            .send(uniques / if paired { 2 } else { 1 }) // Divide by 2 for paired-end to get pairs
+            .map_err(|_| anyhow!("Failed to send unique read count"))?;
+        Ok(())
+    });
+    cleanup_tasks.push(count_task);
+
+    Ok((
+        ReceiverStream::new(dedup_stream),
+        count_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2062,14 +2172,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //     temp_files.push(temp);
     // }
 
-    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = czid_dedup_dedup(
+    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = fastp_dedup(
         config.clone(),
         post_filter_stream,
         paired,
         out_dir.clone(),
         no_ext_sample_base_buf.clone(),
-        75, // prefix_length, tune as needed
-    ).await?;
+        Some(75), // prefix_length, trims to 75bp if set
+    )
+        .await?;
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
@@ -2141,8 +2252,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let dedup_count = dedup_count_rx
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("czid-dedup count receiver failed: {}", e)))?;
-    eprintln!("czid-dedup: unique reads/pairs: {}", dedup_count);
+        .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
+    eprintln!("dedup: unique reads/pairs: {}", dedup_count);
 
     // Await Kallisto exit and process results
     join_with_error_handling(kallisto_exit_task).await
