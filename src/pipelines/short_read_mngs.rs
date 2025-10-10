@@ -1914,6 +1914,9 @@ async fn fastp_dedup(
 
     // Configure fastp for deduplication only
     let mut command_fields = HashMap::from([
+        ("-q".to_string(), Some("20".to_string())),
+        ("--qualified_quality_phred".to_string(), Some("15".to_string())),
+        ("--complexity_threshold".to_string(), Some("30".to_string())),
         ("--stdin".to_string(), None), // Input from stdin
         ("--stdout".to_string(), None), // Output to stdout
         ("--dedup".to_string(), None), // Enable deduplication
@@ -1979,19 +1982,29 @@ async fn fastp_dedup(
     let json_path = out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy()));
     let (count_tx, count_rx) = oneshot::channel();
     let count_task = tokio::spawn(async move {
-        // Wait for fastp to finish writing JSON
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let json_content = fs::read_to_string(&json_path)
-            .await
-            .map_err(|e| anyhow!("Failed to read fastp JSON: {}", e))?;
-        let parsed: Value = serde_json::from_str(&json_content)
-            .map_err(|e| anyhow!("Failed to parse fastp JSON: {}", e))?;
-        let uniques = parsed["duplication"]["unique_reads"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("Missing unique_reads in fastp JSON"))?;
-        count_tx
-            .send(uniques / if paired { 2 } else { 1 }) // Divide by 2 for paired-end to get pairs
-            .map_err(|_| anyhow!("Failed to send unique read count"))?;
+        let json_content = match fs::read_to_string(&json_path).await {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Failed to read fastp JSON: {}", e);
+                return Err(anyhow!("JSON read error"));
+            }
+        };
+        // eprintln!("Fastp dedup JSON: {}", json_content); // Log for debug
+        let parsed: Value = match serde_json::from_str(&json_content) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("JSON parse error: {}", e);
+                count_tx.send(0).map_err(|_| anyhow!("Send failed"))?; // Fallback
+                return Ok(());
+            }
+        };
+
+        let uniques = parsed["duplication"]["unique_reads"].as_u64().unwrap_or_else(|| {
+            eprintln!("Missing unique_reads; falling back to 0");
+            0
+        });
+        let unique_pairs = uniques / if paired { 2 } else { 1 };
+        count_tx.send(unique_pairs).map_err(|_| anyhow!("Send failed"))?;
         Ok(())
     });
     cleanup_tasks.push(count_task);
