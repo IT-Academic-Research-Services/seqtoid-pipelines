@@ -15,10 +15,7 @@ rand = "0.9.1"
 rand_distr = "0.5.1"
 futures = "0.3.31"
 sysinfo = "0.35.0"
-hdf5-metno = { version = "0.10.1", features = ["blosc", "lzf"] }
 fxhash = "0.2.1"
-bincode = { version = "2.0.1", features = ["serde"] }
-ndarray = "0.16.1"
 num_cpus = "1.16"
 bio = "2.3.0"
 serde = { version = "1.0.219", features = ["derive"] }
