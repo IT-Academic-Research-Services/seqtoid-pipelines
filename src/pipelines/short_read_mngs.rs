@@ -1,29 +1,28 @@
-use serde_json::Value;
-use tokio::sync::mpsc;
-use tokio::process::Command;
-use crate::utils::fastx::SequenceRecord;
+
+
+
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::fs::File;
-use std::io::Write;
-use std::io::BufReader as StdBufReader;
 use std::io::BufRead;
-use regex::Regex;
+
+
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
-use plotters::prelude::LogScalable;
 use rand::{random, random_range, rng, Rng};
 use tokio::fs;
 use tokio::time::{sleep, Duration, timeout};
 use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
-use tokio::fs::OpenOptions as TokioOpenOptions;
-use tokio::io::{BufReader, AsyncBufReadExt};
+use tokio::io::{AsyncBufReadExt};
 use tempfile::NamedTempFile;
+use serde_json::Value;
+
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
@@ -46,6 +45,10 @@ pub struct KallistoResults {
     pub ercc_counts: Vec<(String, f64)>, // (target_id, est_counts)
     pub transcript_to_gene: Vec<(String, String)>, // (transcript_id, gene_id)
 }
+
+//Memory estimates for dedup_and_subsample, for switching between RAM and disk based
+const EST_BYTES_PER_UNIQUE: u64 = 1024;  // ~0.5–1KB for SequenceRecord pair + overhead
+const RAM_BUFFER_GB: u64 = 10;  // Min available RAM to stay in-memory
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
