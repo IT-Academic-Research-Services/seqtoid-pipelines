@@ -12,6 +12,8 @@ use std::io::BufRead;
 use regex::Regex;
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
+use plotters::prelude::LogScalable;
+use rand::{random, random_range, rng, Rng};
 use tokio::fs;
 use tokio::time::{sleep, Duration, timeout};
 use tokio::sync::oneshot;
@@ -2040,6 +2042,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     eprintln!("Current dir: {:?}", std::env::current_dir()?);
 
+    // *******************
+    // Setup and Validation
+    // *******************
+
     // External tools check
     check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, CZID_DEDUP_TAG])
         .await
@@ -2062,6 +2068,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
+
+    // *******************
+    // Host Filtering Stage
+    // *******************
 
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
@@ -2204,7 +2214,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ));
     cleanup_tasks.push(dedup_write_task);
 
+
+    // *******************
+    // Target Alignment
+    // *******************
+
+    // Minimap2 target alignment
+
+    // let (target_mm2_out_stream, target_mm2_count_rx, mut target_mm2_cleanup_tasks, mut target_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
+    //     config.clone(),
+    //     subsample_stream,
+    //     paired,
+    //     None,
+    // )
+    //     .await?;
+    // cleanup_tasks.append(&mut target_mm2_cleanup_tasks);
+    // cleanup_receivers.append(&mut target_mm2_cleanup_receivers);
+    //
+
+    // *******************
     // Results retrieval
+    // *******************
+
     let raw_count = join_with_error_handling(raw_count_task).await?;
     println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
 
@@ -2284,7 +2315,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
     // eprintln!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
 
+    // *******************
     // Cleanup
+    // *******************
     let results = try_join_all(cleanup_tasks)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
