@@ -9,7 +9,7 @@ use chrono::{DateTime};
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
-use sysinfo::System;
+use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 
 use anyhow::Result;
 use clap::Parser;
@@ -50,12 +50,40 @@ async fn main() -> Result<()> {
     let thread_pool = Arc::new(create_thread_pool(max_cores));
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
-    let mut system = System::new_all();
-    system.refresh_memory();
-    let available_ram = system.available_memory();
-    eprintln!("Available RAM: {} bytes", available_ram);
-    let total_ram = system.total_memory();
-    eprintln!("Total RAM: {} bytes", total_ram);
+
+    let total_ram: u64;
+    let available_ram: u64;
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut system = System::new_all();
+        system.refresh_memory();
+        available_ram = system.available_memory();
+        total_ram = system.total_memory();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let refresh_kind = RefreshKind::nothing().with_memory(Default::default());
+        let mut system = System::new_with_specifics(refresh_kind);
+        system.refresh_memory_specifics(MemoryRefreshKind::everything());
+        total_ram = system.total_memory();
+        let used_ram = system.used_memory();
+        available_ram = total_ram.saturating_sub(used_ram);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Fallback: unknown platform — be conservative, maybe someone's trying to run this on Solaris or something....
+        let mut system = System::new_all();
+        system.refresh_memory();
+        available_ram = system.available_memory();
+        total_ram = system.total_memory();
+        eprintln!("Unknown OS: using sysinfo defaults");
+    }
+
+    eprintln!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
+    eprintln!("Total RAM: {} bytes (~{} GiB)", total_ram, total_ram / 1_073_741_824);
 
     let input_size_mb = get_input_size_mb(&args.file1, &args.file2).unwrap_or(0);
     eprintln!("Total input file size: {} MB", input_size_mb);
