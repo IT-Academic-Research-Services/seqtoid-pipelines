@@ -7,14 +7,11 @@ use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
 use std::collections::{HashMap, BinaryHeap};
 use std::cmp::Reverse;
 
-
-
-
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
 use rand::prelude::*;
-use rand::{random, random_range, rng, Rng};
 use rand::distr::uniform::Uniform;
+use rand_core::{RngCore, OsRng};
 use tokio::fs;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::oneshot;
@@ -28,10 +25,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBuf
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use serde_json::Value;
-use sysinfo::{System, RefreshKind, MemoryRefreshKind};
+use sysinfo::{System, RefreshKind};
 use uuid::Uuid;
 use twox_hash::XxHash64;
-
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
@@ -2093,6 +2089,7 @@ async fn dedup_and_subsample(
 ) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>) , PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
     let unit = if paired { "pairs" } else { "reads" };
 
     //  setup sysinfpo
@@ -2367,6 +2364,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir = config.out_dir.clone();
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
     eprintln!("Current dir: {:?}", std::env::current_dir()?);
 
     // *******************
@@ -2384,6 +2382,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
     let paired = file2_path.is_some();
+
+    let seed = config.args.seed.unwrap_or_else(|| {
+        let mut bytes = [0u8; 8];
+        OsRng.fill_bytes(&mut bytes);
+        let random_seed = u64::from_le_bytes(bytes);
+        random_seed
+    });
 
     // Input Validation
     let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
@@ -2515,22 +2520,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         human_mm2_out_stream
     };
 
-    // if let Some(temp) = host_ref_temp { //not sure i actually want these deleted
-    //     temp_files.push(temp);
-    // }
-    // if let Some(temp) = host_index_temp {
-    //     temp_files.push(temp);
-    // }
+    if let Some(temp) = host_ref_temp {
+        temp_files.push(temp);
+    }
+    if let Some(temp) = host_index_temp {
+        temp_files.push(temp);
+    }
 
-    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = fastp_dedup(
+    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream,
         paired,
+        seed,
+        config.args.max_subsample,
+        Some(75), // Prefix length for deduplication. Hardcoded fior now
         out_dir.clone(),
-        no_ext_sample_base_buf.clone(),
-        Some(75), // prefix_length, trims to 75bp if set
-    )
-        .await?;
+    ).await?;
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
@@ -2657,6 +2662,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?
             .map_err(|e| PipelineError::Other(e))?;
     }
+
+    drop(temp_files);
 
     println!("Finished short read mNGS.");
     Ok(())

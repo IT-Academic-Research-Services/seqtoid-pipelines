@@ -36,6 +36,9 @@ pub struct Arguments {
     #[arg(long, default_value_t = 50000000)]
     pub max_reads: usize,
 
+    #[clap(long, help = "Optional fixed seed for reproducibility; defaults to OS entropy")]
+    pub seed: Option<u64>,
+
     #[arg(long = "technology", default_value = "illumina", value_enum)]
     pub technology: Technology,
 
@@ -134,5 +137,8 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = true)]
     pub human_host: bool,
+
+    #[arg(long, default_value_t = 1000000)]
+    pub max_subsample: usize,
     
 }
