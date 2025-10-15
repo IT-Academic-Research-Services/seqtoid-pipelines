@@ -3,6 +3,7 @@ mod utils;
 mod config;
 mod cli;
 
+use sysinfo::CpuRefreshKind;
 use std::time::{Instant, SystemTime};
 use std::{env, fs};
 use chrono::{DateTime};
@@ -13,7 +14,6 @@ use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 
 use anyhow::Result;
 use clap::Parser;
-use num_cpus;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
 use rayon::ThreadPoolBuilder;
@@ -46,10 +46,35 @@ async fn main() -> Result<()> {
 
     let args = parse();
 
-    let max_cores = min(num_cpus::get(), args.threads);
-    let thread_pool = Arc::new(create_thread_pool(max_cores));
-    let maximal_semaphore = Arc::new(Semaphore::new(2));
+    let refresh_kind = RefreshKind::nothing().with_cpu(Default::default());
+    let mut system = System::new_with_specifics(refresh_kind);
+    system.refresh_cpu_all();
+    let physical_cores = System::physical_core_count().unwrap_or(1);
+    system.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Allow usage to settle, bake until a golden brown
+    let cpu_load = system.global_cpu_usage();
 
+    // Dynamic thread scaling: I/O-bound -> 2x cores; cap for safety
+    let stream_threads = if cfg!(target_os = "linux") && physical_cores > 50 {
+        let max_threads = if cpu_load > 50.0 { physical_cores } else { physical_cores * 2 };
+        max_threads.min(args.threads).min(256) // Cap for safety
+    } else {
+        20 // msmall systems
+    };
+
+    let max_cores = physical_cores.min(args.threads);
+    eprintln!("Detected {} physical cores; CPU load {}%; using {} threads for pool, {} for streams",
+              physical_cores, cpu_load, max_cores, stream_threads);
+
+    // let max_cores = min(num_cpus::get(), args.threads);
+
+    // Thread pool: NUMA NUMA hey
+    let thread_pool = Arc::new(ThreadPoolBuilder::new()
+        .num_threads(max_cores)
+        .build()
+        .expect("Failed to create thread pool"));
+
+    let maximal_semaphore = Arc::new(Semaphore::new(2));
 
     let total_ram: u64;
     let available_ram: u64;
@@ -92,7 +117,7 @@ async fn main() -> Result<()> {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-    let base_buffer_size = compute_base_buffer_size(available_ram, total_ram, sdt);
+    let base_buffer_size = compute_base_buffer_size(available_ram, total_ram, sdt, stream_threads);
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
@@ -276,46 +301,57 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .expect("Failed to create thread pool")
 }
 
-fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: StreamDataType) -> usize {
+fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: StreamDataType, stream_threads: usize) -> usize {
     let record_size = match data_type {
-        StreamDataType::IlluminaFastq => 1_000,
-        StreamDataType::OntFastq => 10_000,
-        StreamDataType::JustBytes => 500,
+        StreamDataType::IlluminaFastq => 1_000,    // ~1KB per FASTQ record
+        StreamDataType::OntFastq => 10_000,        // ~10KB for ONT
+        StreamDataType::JustBytes => 500,          // Generic
     };
-    let ram_fraction = 0.3;
-    let estimated_max_streams = 20; // Max concurrent streams (tune based on pipeline)
-    let min_buffer = 100_000; // ~100MB Illum, ~1GB ONT, ~50MB Bytes
-    let max_buffer = 100_000_000; // ~100GB Illum, ~1TB ONT
-    // Use total_ram if available_ram is <20% of total (macOS UMA issue)
-    let effective_ram = if available_ram < total_ram / 5 {
+
+    let ram_fraction = if cfg!(target_os = "linux") { 0.5 } else { 0.3 };
+    let min_buffer = 100_000;  // ~100 MB Illumina, ~1 GB ONT
+    let max_buffer = 100_000_000;  // ~100 GB Illumina, ~1 TB ONT
+
+    // linux trust available unless <10 GiB; macOS: fallback if <20% total
+    let effective_ram = if cfg!(target_os = "linux") && available_ram < 10 * 1_073_741_824 {
         println!(
-            "Warning: Low available RAM ({} MB) vs total ({} MB); using total RAM for buffer calc",
-            available_ram / 1_000_000,
-            total_ram / 1_000_000
+            "Warning: Critically low available RAM ({} GiB); using 50% total RAM",
+            available_ram / 1_073_741_824
+        );
+        total_ram / 2
+    } else if cfg!(target_os = "macos") && available_ram < total_ram / 5 {
+        println!(
+            "Warning: Low available RAM ({} GiB) vs total ({} GiB); using total RAM",
+            available_ram / 1_073_741_824,
+            total_ram / 1_073_741_824
         );
         total_ram
     } else {
         available_ram
     };
+
     let total_buffer_bytes = (effective_ram as f64 * ram_fraction) as usize;
 
-    let low_ram_threshold = (min_buffer * record_size * estimated_max_streams) as usize;
+    // OOM guard: Cap if buffers exceed input size or minimum threshold
+    let low_ram_threshold = (min_buffer * record_size * stream_threads) as usize;
     if total_buffer_bytes < low_ram_threshold {
         println!(
-            "Low RAM ({} MB); capping at minimal buffer: {} records",
-            effective_ram / 1_000_000,
+            "Low RAM ({} GiB); capping at minimal buffer: {} records",
+            effective_ram / 1_073_741_824,
             min_buffer
         );
         return min_buffer;
     }
-    let max_records = (total_buffer_bytes / record_size) / estimated_max_streams.max(1);
+
+    let max_records = (total_buffer_bytes / record_size) / stream_threads.max(1);
     let buffer_size = max_records.clamp(min_buffer, max_buffer);
+
     println!(
         "Computed base buffer size: {} records (~{} MB/channel, ~{} MB total est. for {} streams)",
         buffer_size,
-        (buffer_size * record_size) / 1_000_000,
-        (buffer_size * record_size * estimated_max_streams) / 1_000_000,
-        estimated_max_streams
+        (buffer_size * record_size) / 1_048_576,
+        (buffer_size * record_size * stream_threads) / 1_048_576,
+        stream_threads
     );
     buffer_size
 }
