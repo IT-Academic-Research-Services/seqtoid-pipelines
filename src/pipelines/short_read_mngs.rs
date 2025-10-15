@@ -1,36 +1,42 @@
-use std::collections::HashMap;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::{BufReader, BufRead};
-
-
-
+use std::hash::Hasher;
+use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
+use std::collections::{HashMap, BinaryHeap};
+use std::cmp::Reverse;
 
 
 
 
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
+use rand::prelude::*;
 use rand::{random, random_range, rng, Rng};
+use rand::distr::uniform::Uniform;
 use tokio::fs;
-use tokio::time::{sleep, Duration, timeout};
+use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
+use tokio_stream::wrappers::LinesStream;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBufReader};
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use serde_json::Value;
-use sysinfo::{System, RefreshKind};
+use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 use uuid::Uuid;
+use twox_hash::XxHash64;
+
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams};
+use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -48,6 +54,32 @@ use crate::utils::command::czid_dedup::CzidDedupConfig;
 pub struct KallistoResults {
     pub ercc_counts: Vec<(String, f64)>, // (target_id, est_counts)
     pub transcript_to_gene: Vec<(String, String)>, // (transcript_id, gene_id)
+}
+
+// SampleItem for reservoir sampling
+#[derive(Debug, Clone)]
+struct SampleItem {
+    key: f64, // For A-Res sampling
+    records: Vec<SequenceRecord>, // 1 for SE, 2 for PE
+    weight: u64, // Duplicate count
+    hash_key: Option<u64>, // For disk mode
+}
+
+impl PartialEq for SampleItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl Eq for SampleItem {}
+impl Ord for SampleItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.partial_cmp(&other.key).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for SampleItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 //Memory estimates for dedup_and_subsample, for switching between RAM and disk based
@@ -2025,6 +2057,294 @@ async fn fastp_dedup(
         cleanup_receivers,
     ))
 }
+
+
+/// Combined de-duplication and subsambler.
+/// Uses and A-Res algorithm and hashing to creat a min heap BinaryHeap
+/// Runs in memory when possible, but has a disk option when
+/// file size and memory constraints demand.
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Strucutred FASTQ stream
+/// * 'paired` - Bool controlling single or paired end data
+/// * `seed` - Seed value for rng allowing possibility of deterministic output
+/// * `max_subsample` - Limit of reads for subsampling
+/// * `prefix_len` - Length of prefix subsample of read
+/// * `out_dir` - Output directory for intermediate files
+///
+/// # Returns
+/// Result of:
+/// Tuple of:
+/// Output stream
+/// Count stream
+/// Vec of tkio tasks
+/// Vec of tokio receivers
+/// with Pipeline Error
+
+async fn dedup_and_subsample(
+    config: Arc<RunConfig>,
+    mut input_stream: ReceiverStream<ParseOutput>,
+    paired: bool,
+    seed: u64,
+    max_subsample: usize,
+    prefix_len: Option<usize>,
+    out_dir: PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>) , PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+    let unit = if paired { "pairs" } else { "reads" };
+
+    //  setup sysinfpo
+    let refresh_kind = RefreshKind::nothing().with_memory(Default::default());
+    let mut system = System::new_with_specifics(refresh_kind);
+    system.refresh_memory();
+    let mut available_ram = system.available_memory();
+    let max_uniques_ram = (available_ram / EST_BYTES_PER_UNIQUE).min(100_000_000);
+    let use_disk = available_ram < (RAM_BUFFER_GB * 1_000_000_000);
+    if use_disk {
+        eprintln!("Low RAM ({} bytes)—falling back to disk-based dedup in {:?}", available_ram, config.ram_temp_dir);
+    } else {
+        eprintln!("Using in-memory dedup ({} bytes available)", available_ram);
+    }
+
+    // Dedup storage
+    let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
+    let mut count_map: HashMap<u64, (u64, String)> = HashMap::new();
+    let mut temp_fastq_path = if use_disk {
+        let path = config.ram_temp_dir.join(format!("dedup_temp_{}.fq", Uuid::new_v4()));
+        let file = TokioOpenOptions::new().write(true).create(true).open(&path).await?;
+        let writer = BufWriter::with_capacity(1_000_000, file);
+        Some((path.clone(), writer))
+    } else {
+        None
+    };
+    let temp_path = temp_fastq_path.as_ref().map(|&(ref p, _)| p.clone());
+    let mut item_count = 0u64;
+    let mut last_progress = Instant::now();
+
+    while let Some(item) = input_stream.next().await {
+        if last_progress.elapsed() > Duration::from_secs(config.args.stall_threshold) {
+            eprintln!("dedup_and_subsample: Stall detected at {} {}", item_count, unit);
+            last_progress = Instant::now();
+        }
+        if let ParseOutput::Fastq(mut r1) = item {
+            let mut records = vec![r1];
+            let r1_id = records[0].id().to_string();
+            if paired {
+                if let Some(ParseOutput::Fastq(r2)) = input_stream.next().await {
+                    records.push(r2);
+                } else {
+                    eprintln!("Missing R2 for pair at count {}—skipping", item_count);
+                    continue;
+                }
+                if !compare_read_ids(&r1_id, records[1].id()) {
+                    eprintln!("ID mismatch in pair at count {}: {} vs {}—skipping", item_count, r1_id, records[1].id());
+                    continue;
+                }
+            }
+            let mut hasher = XxHash64::with_seed(seed);
+            let eff_len = prefix_len.unwrap_or(usize::MAX);
+            hasher.write(&records[0].seq()[0..records[0].seq().len().min(eff_len)]);
+            if paired {
+                hasher.write(&records[1].seq()[0..records[1].seq().len().min(eff_len)]);
+            }
+            let hash_key = hasher.finish();
+            if !use_disk {
+                if let Some((count, _)) = dedup_map.get_mut(&hash_key) {
+                    *count += 1;
+                } else {
+                    if dedup_map.len() % 1_000_000 == 0 {
+                        system.refresh_memory();
+                        available_ram = system.available_memory();
+                        if (dedup_map.len() as u64) > max_uniques_ram || available_ram < (RAM_BUFFER_GB * 1_000_000_000) {
+                            eprintln!("RAM low during processing—consider disk fallback");
+                            // TODO: Mid-stream switch if needed
+                        }
+                    }
+                    dedup_map.insert(hash_key, (1, records));
+                }
+            } else {
+                if let Some(entry) = count_map.get_mut(&hash_key) {
+                    entry.0 += 1;
+                } else {
+                    if let Some((_, writer)) = temp_fastq_path.as_mut() {
+                        for record in &records {
+                            let bytes = record.to_bytes()?;
+                            writer.write_all(&bytes).await?;
+                        }
+                    }
+                    count_map.insert(hash_key, (1, r1_id));
+                }
+            }
+            item_count += 1;
+        } else {
+            eprintln!("Non-FASTQ in dedup stream at count {}—skipping", item_count);
+            continue;
+        }
+    }
+
+    eprintln!("Dedup complete: {} unique {} from {} total", if !use_disk { dedup_map.len() } else { count_map.len() }, unit, item_count);
+
+    //  weighted reservoir sampling: a -res algo
+    let mut rng = StdRng::seed_from_u64(seed);
+    let uniform = Uniform::new(0.0, 1.0).expect("Failed to create Uniform distribution");
+    let mut reservoir: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::with_capacity(max_subsample);
+    let mut sampled: Vec<SampleItem> = Vec::new();
+
+    if !use_disk { // RAM in memory case
+        for (hash_key, (weight, records)) in dedup_map.iter() {
+            if *weight == 0 { continue; }
+            let u: f64 = uniform.sample(&mut rng);
+            let key = u.powf(1.0 / (*weight as f64));
+            let item = SampleItem { key, records: records.clone(), weight: *weight, hash_key: Some(*hash_key) };
+            if reservoir.len() < max_subsample {
+                reservoir.push(Reverse(item));
+            } else if let Some(Reverse(min_item)) = reservoir.peek() {
+                if item.key > min_item.key {
+                    reservoir.pop();
+                    reservoir.push(Reverse(item));
+                }
+            }
+        }
+        sampled = reservoir.into_iter().map(|r| r.0).collect();
+        sampled.shuffle(&mut rng);
+    } else {
+        // disk mode: sample from count map not
+        for (hash_key, (weight, _)) in count_map.iter() {
+            if *weight == 0 { continue; }
+            let u: f64 = uniform.sample(&mut rng);
+            let key = u.powf(1.0 / (*weight as f64));
+            let item = SampleItem { key, records: vec![], weight: *weight, hash_key: Some(*hash_key) };
+            if reservoir.len() < max_subsample {
+                reservoir.push(Reverse(item));
+            } else if let Some(Reverse(min_item)) = reservoir.peek() {
+                if item.key > min_item.key {
+                    reservoir.pop();
+                    reservoir.push(Reverse(item));
+                }
+            }
+        }
+
+        // Read back sampled records
+        let file = TokioFile::open(temp_path.as_ref().ok_or_else(|| anyhow!("Missing temp path"))?).await?;
+        let reader = TokioBufReader::with_capacity(1_000_000, file);
+        let mut lines = LinesStream::new(reader.lines());
+        sampled = reservoir.into_iter().map(|r| r.0).collect();
+        sampled.shuffle(&mut rng);
+        let mut new_sampled = Vec::new();
+        while let Some(line) = lines.next().await.transpose()? {
+            if line.starts_with('@') {
+                let (id, desc) = parse_header(line.as_bytes(), '@');
+                let seq = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                let _ = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                let qual = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                let mut hasher = XxHash64::with_seed(seed);
+                hasher.write(seq.as_bytes());
+                let mut records = vec![SequenceRecord::Fastq {
+                    id: id.clone(),
+                    desc,
+                    seq: Arc::new(seq.into_bytes()),
+                    qual: Arc::new(qual.into_bytes()),
+                }];
+                if paired {
+                    let line2 = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                    let (id2, desc2) = parse_header(line2.as_bytes(), '@');
+                    let seq2 = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                    let _ = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                    let qual2 = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                    hasher.write(seq2.as_bytes());
+                    records.push(SequenceRecord::Fastq {
+                        id: id2,
+                        desc: desc2,
+                        seq: Arc::new(seq2.into_bytes()),
+                        qual: Arc::new(qual2.into_bytes()),
+                    });
+                }
+                let hash_key = hasher.finish();
+                if let Some(item) = sampled.iter_mut().find(|item| item.hash_key == Some(hash_key)) {
+                    item.records = records;
+                    new_sampled.push(item.clone());
+                }
+            }
+        }
+        sampled = new_sampled;
+    }
+
+    // write uniques to tsv
+    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
+    let tsv_write_task = tokio::spawn({
+        let tsv_path_clone = tsv_path.clone();
+        let use_disk = use_disk;
+        let temp_path = temp_path.clone();
+        let count_map_clone = count_map.clone();
+        let dedup_map_clone = dedup_map.clone();
+        async move {
+            let mut file = TokioOpenOptions::new().write(true).create(true).open(&tsv_path_clone).await?;
+            if !use_disk {
+                for (_hash_key, (weight, records)) in dedup_map_clone {
+                    file.write_all(format!("{}\t{}\n", records[0].id(), weight).as_bytes()).await?;
+                }
+            } else {
+                let temp_file = TokioFile::open(temp_path.as_ref().ok_or_else(|| anyhow!("Missing temp path"))?).await?;
+                let reader = TokioBufReader::with_capacity(1_000_000, temp_file);
+                let mut lines = LinesStream::new(reader.lines());
+                while let Some(line) = lines.next().await.transpose()? {
+                    if line.starts_with('@') {
+                        let (id, _) = parse_header(line.as_bytes(), '@');
+                        let seq = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                        let _ = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                        let _qual = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                        let mut hasher = XxHash64::with_seed(seed);
+                        hasher.write(seq.as_bytes());
+                        if paired {
+                            let line2 = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                            let seq2 = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                            let _ = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                            let _qual2 = lines.next().await.transpose()?.ok_or_else(|| anyhow!("Incomplete FASTQ"))?;
+                            hasher.write(seq2.as_bytes());
+                        }
+                        let hash_key = hasher.finish();
+                        if let Some((weight, _)) = count_map_clone.get(&hash_key) {
+                            file.write_all(format!("{}\t{}\n", id, weight).as_bytes()).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    });
+    cleanup_tasks.push(tsv_write_task);
+
+    if let Some((_, writer)) = temp_fastq_path.as_mut() {
+        writer.flush().await?;
+        if let Some(temp_path) = temp_path.clone() {
+            let cleanup = tokio::spawn(async move {
+                tokio::fs::remove_file(temp_path).await?;
+                Ok(())
+            });
+            cleanup_tasks.push(cleanup);
+        }
+    }
+
+    let unique_count = sampled.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Failed to send subsample count")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task = tokio::spawn(async move {
+        for item in sampled {
+            for record in item.records {
+                tx.send(ParseOutput::Fastq(record)).await.map_err(|_| anyhow!("Send failed"))?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(send_task);
+
+    Ok((ReceiverStream::new(rx), count_rx, cleanup_tasks, cleanup_receivers))
+}
+
 
 /// Run function for Short Read mNGS pipelines
 ///
