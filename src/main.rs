@@ -20,7 +20,9 @@ use rayon::ThreadPoolBuilder;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{sleep, Duration};
 use std::process::Output;
-
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_core::{RngCore, OsRng};
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
@@ -66,7 +68,6 @@ async fn main() -> Result<()> {
     eprintln!("Detected {} physical cores; CPU load {}%; using {} threads for pool, {} for streams",
               physical_cores, cpu_load, max_cores, stream_threads);
 
-    // let max_cores = min(num_cpus::get(), args.threads);
 
     // Thread pool: NUMA NUMA hey
     let thread_pool = Arc::new(ThreadPoolBuilder::new()
@@ -113,6 +114,15 @@ async fn main() -> Result<()> {
     let input_size_mb = get_input_size_mb(&args.file1, &args.file2).unwrap_or(0);
     eprintln!("Total input file size: {} MB", input_size_mb);
 
+    // Seed from entropy pool if not given a seed, set up program-wide RNG
+    let seed = args.seed.unwrap_or_else(|| {
+        let mut bytes = [0u8; 8];
+        OsRng.fill_bytes(&mut bytes);
+        let random_seed = u64::from_le_bytes(bytes);
+        random_seed
+    });
+    let rng = StdRng::seed_from_u64(seed);
+
     let sdt = match args.technology {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
@@ -129,7 +139,9 @@ async fn main() -> Result<()> {
         thread_pool,
         maximal_semaphore,
         base_buffer_size,
-        input_size_mb
+        input_size_mb,
+        available_ram,
+        rng
     });
 
     // let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"

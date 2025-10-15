@@ -7,9 +7,10 @@ use std::cmp::min;
 use std::sync::Arc;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
+use rand::rngs::StdRng;
 use std::io;
-use tokio::task::JoinError; // Added for JoinError
-use serde_json::Error as SerdeJsonError; // Added for serde_json::Error
+use tokio::task::JoinError;
+use serde_json::Error as SerdeJsonError;
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -146,6 +147,8 @@ pub struct RunConfig {
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
     pub input_size_mb: u64,
+    pub available_ram: u64,
+    pub rng: StdRng,
 }
 
 impl RunConfig {
