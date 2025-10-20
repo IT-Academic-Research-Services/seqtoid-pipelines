@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use crate::config::defs::GZIP_EXT;
+use log::{self, LevelFilter, debug, info, error, warn};
 use anyhow::{Result, anyhow};
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -479,7 +480,7 @@ pub fn validate_file_inputs(
     sample_base = match file1_r1r2.prefix {
         Some(prefix) => prefix,
         None => {
-            eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
+            info!("No R1 tag found. Using bare file 1 stem as sample_base.");
             file1_path.to_string_lossy().into_owned()
         }
     };
@@ -498,7 +499,7 @@ pub fn validate_file_inputs(
             if file2_full_path.exists() {
                 Some(file2_full_path)
             } else {
-                eprintln!("File2 path does not exist: {}", file2_full_path.display());
+                error!("File2 path does not exist: {}", file2_full_path.display());
                 None
             }
         }
@@ -546,7 +547,7 @@ pub async fn write_byte_stream_to_file(
                 }
                 _ => {
                     // Log unexpected non-Bytes items but continue
-                    eprintln!("write_byte_stream_to_file: Skipping non-Bytes item for {}",
+                    warn!("write_byte_stream_to_file: Skipping non-Bytes item for {}",
                               output_path_clone.display());
                 }
             }
@@ -565,8 +566,7 @@ pub async fn write_byte_stream_to_file(
             return Err(anyhow!("No bytes written to file at {}", output_path_clone.display()));
         }
 
-        // Log for correctness tracking (no silent drops)
-        eprintln!("write_byte_stream_to_file: Wrote {} bytes to {}",
+        debug!("write_byte_stream_to_file: Wrote {} bytes to {}",
                   total_bytes, output_path_clone.display());
 
         Ok(())

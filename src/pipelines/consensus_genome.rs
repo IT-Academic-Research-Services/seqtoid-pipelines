@@ -7,7 +7,7 @@ use tokio_stream::StreamExt;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::NamedTempFile;
-
+use log::{self, LevelFilter, debug, info, error, warn};
 use tokio::task::JoinHandle;
 use std::time::Instant;
 use tokio::fs;
@@ -924,7 +924,7 @@ async fn filter_with_kraken(
                 break; // Exit after first Fastq record
             }
         }
-        // eprintln!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
+        debug!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
         check_tx
             .send(if found { 1 } else { 0 })
             .await
@@ -963,7 +963,7 @@ async fn filter_with_kraken(
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let check_count = check_rx.recv().await.ok_or_else(|| {
-        eprintln!("check_rx.recv failed");
+        error!("check_rx.recv failed");
         PipelineError::EmptyStream
     })?;
 
@@ -1896,6 +1896,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut consensus_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
 
+    info!("Starting consensus genome pipeline.");
+
     // External tools check
     check_versions(vec![
         SAMTOOLS_TAG,
@@ -2015,7 +2017,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     // Split by Technology
     match technology {
         Technology::Illumina => {
-            eprintln!("Technology: Illumina");
+            info!("Technology: Illumina");
             let (_ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = minimap2_index_prep(
                 &config,
                 &ram_temp_dir,
@@ -2124,7 +2126,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_tasks.extend(realign_cleanup_tasks);
         }
         Technology::ONT => {
-            eprintln!("Technology: ONT not ready");
+            error!("Technology: ONT not ready");
         }
     }
 
@@ -2180,6 +2182,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let _input_read_stats = join_with_error_handling(val_count_task).await?;
     drop(temp_files);
 
-    println!("Finished generating consensus genome.");
+    info!("Finished consensus genome pipeline.");
     Ok(())
 }

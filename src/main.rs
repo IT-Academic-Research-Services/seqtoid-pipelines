@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
         "short_read_mngs" => short_read_mngs_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
-        eprintln!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
+        error!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
         std::process::exit(1);
     }
 
@@ -175,7 +175,7 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             let dir_base = match file1_r1r2.prefix {
                 Some(prefix) => prefix,
                 None => {
-                    eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
+                    info!("No R1 tag found. Using bare file 1 stem as sample_base.");
                     file1_r1r2.file_name.unwrap()
                 }
             };

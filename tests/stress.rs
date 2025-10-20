@@ -5,6 +5,7 @@ use anyhow::Result;
 use std::io::{stderr, Write};
 use std::path::Path;
 use std::time::Instant;
+use log::{self, LevelFilter, debug, info, error, warn};
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
 use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput, deinterleave_fastq_stream_to_fifos};
@@ -39,7 +40,7 @@ async fn test_fastx_generator_stress() -> Result<()> {
     let mut sys = System::new_all();
     for read_size in &read_sizes {
         for num_read in &num_reads {
-            eprintln!(
+            info!(
                 "Testing: Reads: {}, Size: {}",
                 num_read, read_size
             );
@@ -158,7 +159,8 @@ fn create_test_run_config() -> Arc<RunConfig> {
         base_buffer_size: 5_000_000, // Reasonable for 1.5TB RAM
         input_size_mb: 100,
         available_ram: available_ram,
-        rng: rng
+        rng: rng,
+        log_level: LevelFilter::Debug
     })
 }
 
@@ -181,7 +183,7 @@ async fn test_t_junction_stress() -> Result<()> {
         for &stall_threshold in &stall_thresholds {
             for &sleep_ms in &sleep_ms_options {
                 for &backpressure_pause_ms in &backpressure_pause_ms_options {
-                    eprintln!(
+                    info!(
                         "Buffer size: {}  Stall: {}  Sleep: {}  Pause: {}  Streams: {} Reads: {}  Size: {}",
                         buffer_size,
                         stall_threshold,
@@ -219,7 +221,7 @@ async fn test_t_junction_stress() -> Result<()> {
                                 let mut counts = record_counts.lock().unwrap();
                                 counts[i] += 1;
                                 if counts[i] % 1000 == 0 {
-                                    eprintln!("Stream {} processed {} items", i, counts[i]);
+                                    info!("Stream {} processed {} items", i, counts[i]);
                                 }
                             }
                         });
@@ -230,14 +232,14 @@ async fn test_t_junction_stress() -> Result<()> {
 
                     match done_rx.await {
                         Ok(result) => match result {
-                            Ok(()) => eprintln!("t_junction completed successfully"),
+                            Ok(()) => info!("t_junction completed successfully"),
                             Err(e) => {
-                                eprintln!("t_junction failed: {}", e);
+                                error!("t_junction failed: {}", e);
                                 run_success = false;
                             }
                         },
                         Err(e) => {
-                            eprintln!("t_junction task failed to send: {}", e);
+                            error!("t_junction task failed to send: {}", e);
                             run_success = false;
                         }
                     }
@@ -245,7 +247,7 @@ async fn test_t_junction_stress() -> Result<()> {
                     let duration = start.elapsed();
                     let memory = 0; // Update with sysinfo if enabled
                     let record_counts = record_counts.lock().unwrap();
-                    eprintln!(
+                    info!(
                         "Records: {:?}  Success: {}",
                         *record_counts, run_success
                     );
@@ -285,7 +287,7 @@ async fn test_t_junction_count() -> Result<()> {
     let stall_threshold = 100;
     let sleep_ms = Some(1);
     let backpressure_pause_ms = 500;
-    eprintln!(
+    info!(
         "Testing t_junction: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}",
         num_read, read_size, buffer_size, sleep_ms
     );
@@ -312,11 +314,11 @@ async fn test_t_junction_count() -> Result<()> {
             while let Some(_) = stream.next().await {
                 count += 1;
                 if count % 1000 == 0 {
-                    eprintln!("t_junction stream {} counted {} records", i, count);
+                    info!("t_junction stream {} counted {} records", i, count);
                     stderr().flush().ok();
                 }
             }
-            eprintln!("t_junction stream {} finished: {} records", i, count);
+            info!("t_junction stream {} finished: {} records", i, count);
             Ok::<_, anyhow::Error>(count)
         });
         handles.push((i, handle));
@@ -327,12 +329,12 @@ async fn test_t_junction_count() -> Result<()> {
     }
 
     match done_rx.await {
-        Ok(Ok(())) => eprintln!("t_junction completed successfully"),
-        Ok(Err(e)) => eprintln!("t_junction failed: {}", e),
-        Err(e) => eprintln!("t_junction send error: {}", e),
+        Ok(Ok(())) => info!("t_junction completed successfully"),
+        Ok(Err(e)) => error!("t_junction failed: {}", e),
+        Err(e) => error!("t_junction send error: {}", e),
     }
     stderr().flush()?;
-    eprintln!("t_junction counts: {:?}", counts);
+    info!("t_junction counts: {:?}", counts);
     stderr().flush()?;
     if counts != vec![num_read, num_read] {
         return Err(anyhow!(
@@ -351,7 +353,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     let read_size = 50;
     let cmd_tag = "cat";
     let args = vec!["-".to_string()];
-    eprintln!(
+    info!(
         "Testing stream_to_cmd: Reads: {}, Size: {}, Command: {}",
         num_read, read_size, cmd_tag
     );
@@ -381,17 +383,17 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     ).await?;
 
     match timeout(Duration::from_secs(30), inner_task).await {
-        Ok(Ok(Ok(()))) => eprintln!("stream_to_cmd completed successfully"),
+        Ok(Ok(Ok(()))) => info!("stream_to_cmd completed successfully"),
         Ok(Ok(Err(e))) => {
-            eprintln!("stream_to_cmd failed: {}", e);
+            error!("stream_to_cmd failed: {}", e);
             return Err(e);
         }
         Ok(Err(e)) => {
-            eprintln!("stream_to_cmd join error: {}", e);
+            error!("stream_to_cmd join error: {}", e);
             return Err(anyhow!("Join error: {}", e));
         }
         Err(_) => {
-            eprintln!("stream_to_cmd timed out after 30s");
+            error!("stream_to_cmd timed out after 30s");
             return Err(anyhow!("stream_to_cmd timed out"));
         }
     }
@@ -405,7 +407,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     let output = child.wait_with_output().await?;
     let stderr_output = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        eprintln!(
+        error!(
             "Child process failed: status: {}, stderr: {}",
             output.status, stderr_output
         );
@@ -414,7 +416,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
             output.status, stderr_output
         ));
     }
-    eprintln!("Child process completed successfully");
+    info!("Child process completed successfully");
     stderr().flush()?;
     Ok(())
 }
@@ -452,7 +454,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
                                 let memory_before = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
 
-                                eprintln!(
+                                info!(
                                     "Starting: Command: {}, Buffer: {}, Sleep: {}, Streams: {}, Reads: {}, Size: {}",
                                     cmd_tag, buffer_size, sleep, stream_num, num_read, read_size
                                 );
@@ -479,12 +481,12 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     .await {
                                     Ok(result) => result,
                                     Err(e) => {
-                                        eprintln!("t_junction failed to start: {}", e);
+                                        error!("t_junction failed to start: {}", e);
                                         run_success = false;
                                         return Err(anyhow!("t_junction failed: {}", e));
                                     }
                                 };
-                                eprintln!("t_junction started with {} streams", *stream_num);
+                                info!("t_junction started with {} streams", *stream_num);
                                 stderr().flush()?;
 
                                 let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -512,7 +514,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         .await {
                                         Ok(result) => result,
                                         Err(e) => {
-                                            eprintln!("Stream {} failed to spawn {}: {}", i, cmd_tag, e);
+                                            error!("Stream {} failed to spawn {}: {}", i, cmd_tag, e);
                                             run_success = false;
                                             continue;
                                         }
@@ -606,8 +608,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     run_success
                                 )?;
                                 log.flush()?;
-
-                                eprintln!("done");
+                                
                                 stderr().flush()?;
 
                                 for outfile in outfiles {

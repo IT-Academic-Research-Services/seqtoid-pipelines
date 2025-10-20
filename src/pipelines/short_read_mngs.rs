@@ -1861,7 +1861,7 @@ async fn czid_dedup_dedup(
             let (r1_stats, r2_stats) = match (r1_result, r2_result) {
                 (Ok(r1_stats), Ok(r2_stats)) => (r1_stats, r2_stats),
                 (Err(e), _) | (_, Err(e)) => {
-                    // eprintln!("read_fastq failed for R1 or R2: {}", e);
+                    error!("read_fastq failed for R1 or R2: {}", e);
                     count_tx.send(0).map_err(|_| anyhow!("Send failed"))?;
                     return Ok(());
                 }
@@ -2205,6 +2205,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
+    info!("Starting short read mNGS pipeline.");
+
     // *******************
     // Setup and Validation
     // *******************
@@ -2503,6 +2505,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     drop(temp_files);
 
-    info!("Finished short read mNGS.");
+    info!("Finished short read mNGS pipeline.");
     Ok(())
 }
