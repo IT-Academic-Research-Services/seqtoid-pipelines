@@ -10,7 +10,6 @@ use std::cmp::Reverse;
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
 use rand::prelude::*;
-use rand::distr::uniform::Uniform;
 use rand_core::{RngCore, OsRng};
 use tokio::fs;
 use tokio::time::{sleep, Duration, Instant};
@@ -20,13 +19,10 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
-use tokio_stream::wrappers::LinesStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBufReader};
-use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
+use tokio::fs::{OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use serde_json::Value;
-use sysinfo::{System, RefreshKind};
-use uuid::Uuid;
 use twox_hash::XxHash64;
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
@@ -1465,7 +1461,6 @@ async fn minimap2_filter(
             error: e.to_string(),
         })?;
 
-    eprintln!("minimap2 args: {:?}", minimap2_args);
 
     let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
