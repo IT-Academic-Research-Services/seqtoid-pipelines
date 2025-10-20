@@ -3,29 +3,32 @@ mod utils;
 mod config;
 mod cli;
 
+use sysinfo::CpuRefreshKind;
 use std::time::{Instant, SystemTime};
 use std::{env, fs};
 use chrono::{DateTime};
 use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
-use sysinfo::System;
+use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 
 use anyhow::Result;
 use clap::Parser;
-use num_cpus;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
 use rayon::ThreadPoolBuilder;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{sleep, Duration};
 use std::process::Output;
-
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_core::{RngCore, OsRng};
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::r1r2_base;
+use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 
@@ -46,25 +49,32 @@ async fn main() -> Result<()> {
 
     let args = parse();
 
-    let max_cores = min(num_cpus::get(), args.threads);
-    let thread_pool = Arc::new(create_thread_pool(max_cores));
+    let (max_cores, cpu_load) = detect_cores_and_load(args.threads).await?;
+    let stream_threads = compute_stream_threads(max_cores, cpu_load, args.threads);
+    eprintln!("Detected {} physical cores; CPU load {}%; using {} threads for pool, {} for streams",
+              max_cores, cpu_load, max_cores, stream_threads);
+
+    let thread_pool = Arc::new(ThreadPoolBuilder::new()
+        .num_threads(max_cores)
+        .build()
+        .expect("Failed to create thread pool"));
+
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
-    let mut system = System::new_all();
-    system.refresh_memory();
-    let available_ram = system.available_memory();
-    eprintln!("Available RAM: {} bytes", available_ram);
-    let total_ram = system.total_memory();
-    eprintln!("Total RAM: {} bytes", total_ram);
+    let (total_ram, available_ram) = detect_ram()?;
+    eprintln!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
+    eprintln!("Total RAM: {} bytes (~{} GiB)", total_ram, total_ram / 1_073_741_824);
 
     let input_size_mb = get_input_size_mb(&args.file1, &args.file2).unwrap_or(0);
     eprintln!("Total input file size: {} MB", input_size_mb);
+
+    let rng = generate_rng(args.seed);
 
     let sdt = match args.technology {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-    let base_buffer_size = compute_base_buffer_size(available_ram, total_ram, sdt);
+    let base_buffer_size = compute_base_buffer_size(available_ram, total_ram, sdt, stream_threads);
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
@@ -76,7 +86,9 @@ async fn main() -> Result<()> {
         thread_pool,
         maximal_semaphore,
         base_buffer_size,
-        input_size_mb
+        input_size_mb,
+        available_ram,
+        rng
     });
 
     // let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"
@@ -95,48 +107,6 @@ async fn main() -> Result<()> {
 
     println!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
     Ok(())
-}
-
-async fn monitor_io_utilization(device: String) {
-    loop {
-        match run_iostat(&device).await {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(util_line) = parse_iostat_util(&stdout, &device) {
-                    eprintln!("NVMe I/O Util: {}% (device: {})", util_line, device);
-                    if util_line.parse::<f32>().unwrap_or(0.0) > 80.0 {
-                        eprintln!("WARNING: High I/O util (>80%) - Potential stall cause. Consider striping NVMe or more /dev/shm usage.");
-                    }
-                } else {
-                    eprintln!("Failed to parse iostat output: {}", stdout);
-                }
-            }
-            Err(e) => eprintln!("iostat error: {}", e),
-        }
-        sleep(Duration::from_secs(5)).await;  // Check every 5s; adjust for granularity
-    }
-}
-
-// Helper: Run iostat -x -d <device> 1 1 (once, extended disk stats)
-async fn run_iostat(device: &str) -> Result<Output> {
-    TokioCommand::new("iostat")
-        .args(&["-x", "-d", device, "1", "1"])  // Extended, device-specific, 1s interval, count=1
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to run iostat: {}", e))
-}
-
-// Helper: Parse %util from iostat output (e.g., look for line with device and extract last column)
-fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
-    for line in output.lines() {
-        if line.contains(device) && !line.contains("Device") {  // Skip header
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(util) = parts.last() {
-                return Some(util.to_string());
-            }
-        }
-    }
-    None
 }
 
 
@@ -207,32 +177,6 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
     Ok(out_dir)
 }
 
-/// Searches for a directory for RAM temp files.
-/// Prefers /dev/shm (RAM disk) for linux, otherwise returns the standard temp dir.
-///
-/// # Returns
-/// PathBuf: temp dir for RAM files.
-fn get_ram_temp_dir() -> PathBuf {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        if let Ok(metadata) = fs::metadata("/dev/shm") {
-            if metadata.is_dir() {
-                return PathBuf::from("/dev/shm");
-            }
-        }
-        std::env::temp_dir()
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        std::env::temp_dir()
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        std::env::temp_dir()
-    }
-}
 
 /// Creates a pool of threads for running sub-processes.
 ///
@@ -248,49 +192,6 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .expect("Failed to create thread pool")
 }
 
-fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: StreamDataType) -> usize {
-    let record_size = match data_type {
-        StreamDataType::IlluminaFastq => 1_000,
-        StreamDataType::OntFastq => 10_000,
-        StreamDataType::JustBytes => 500,
-    };
-    let ram_fraction = 0.3;
-    let estimated_max_streams = 20; // Max concurrent streams (tune based on pipeline)
-    let min_buffer = 100_000; // ~100MB Illum, ~1GB ONT, ~50MB Bytes
-    let max_buffer = 100_000_000; // ~100GB Illum, ~1TB ONT
-    // Use total_ram if available_ram is <20% of total (macOS UMA issue)
-    let effective_ram = if available_ram < total_ram / 5 {
-        println!(
-            "Warning: Low available RAM ({} MB) vs total ({} MB); using total RAM for buffer calc",
-            available_ram / 1_000_000,
-            total_ram / 1_000_000
-        );
-        total_ram
-    } else {
-        available_ram
-    };
-    let total_buffer_bytes = (effective_ram as f64 * ram_fraction) as usize;
-
-    let low_ram_threshold = (min_buffer * record_size * estimated_max_streams) as usize;
-    if total_buffer_bytes < low_ram_threshold {
-        println!(
-            "Low RAM ({} MB); capping at minimal buffer: {} records",
-            effective_ram / 1_000_000,
-            min_buffer
-        );
-        return min_buffer;
-    }
-    let max_records = (total_buffer_bytes / record_size) / estimated_max_streams.max(1);
-    let buffer_size = max_records.clamp(min_buffer, max_buffer);
-    println!(
-        "Computed base buffer size: {} records (~{} MB/channel, ~{} MB total est. for {} streams)",
-        buffer_size,
-        (buffer_size * record_size) / 1_000_000,
-        (buffer_size * record_size * estimated_max_streams) / 1_000_000,
-        estimated_max_streams
-    );
-    buffer_size
-}
 
 /// Gets the file size(s) of the input file(s) from metadata
 ///

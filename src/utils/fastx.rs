@@ -840,7 +840,7 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
 /// # Returns
 /// bool: true if reads are a matched pair.
 ///
-fn compare_read_ids(id1: &str, id2: &str) -> bool {
+pub fn compare_read_ids(id1: &str, id2: &str) -> bool {
     // Extract ID parts without @
     let id_part1 = id1.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
     let id_part2 = id2.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");

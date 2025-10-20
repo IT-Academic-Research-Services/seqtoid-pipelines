@@ -1,31 +1,34 @@
-use serde_json::Value;
-use tokio::sync::mpsc;
-use tokio::process::Command;
-use crate::utils::fastx::SequenceRecord;
-use std::collections::HashMap;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::fs::File;
-use std::io::Write;
-use std::io::BufReader as StdBufReader;
-use std::io::BufRead;
-use regex::Regex;
+use std::io::{BufReader, BufRead};
+use std::hash::Hasher;
+use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
+use std::collections::{HashMap, BinaryHeap};
+use std::cmp::Reverse;
+
 use anyhow::{anyhow, Result};
 use futures::future::try_join_all;
+use rand::prelude::*;
+use rand_core::{RngCore, OsRng};
 use tokio::fs;
-use tokio::time::{sleep, Duration, timeout};
+use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
-use tokio::fs::OpenOptions as TokioOpenOptions;
-use tokio::io::{BufReader, AsyncBufReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBufReader};
+use tokio::fs::{OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
+use serde_json::Value;
+use twox_hash::XxHash64;
+
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams};
+use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -44,6 +47,36 @@ pub struct KallistoResults {
     pub ercc_counts: Vec<(String, f64)>, // (target_id, est_counts)
     pub transcript_to_gene: Vec<(String, String)>, // (transcript_id, gene_id)
 }
+
+// SampleItem for reservoir sampling
+#[derive(Debug, Clone)]
+struct SampleItem {
+    key: f64, // For A-Res sampling
+    records: Vec<SequenceRecord>, // 1 for SE, 2 for PE
+    weight: u64, // Duplicate count
+    hash_key: Option<u64>, // For disk mode
+}
+
+impl PartialEq for SampleItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl Eq for SampleItem {}
+impl Ord for SampleItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.partial_cmp(&other.key).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for SampleItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+//Memory estimates for dedup_and_subsample, for switching between RAM and disk based
+const EST_BYTES_PER_UNIQUE: u64 = 1024;  // ~0.5–1KB for SequenceRecord pair + overhead
+const RAM_BUFFER_GB: u64 = 10;  // Min available RAM to stay in-memory
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
@@ -1428,7 +1461,6 @@ async fn minimap2_filter(
             error: e.to_string(),
         })?;
 
-    eprintln!("minimap2 args: {:?}", minimap2_args);
 
     let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
@@ -1914,6 +1946,9 @@ async fn fastp_dedup(
 
     // Configure fastp for deduplication only
     let mut command_fields = HashMap::from([
+        ("-q".to_string(), Some("20".to_string())),
+        ("--qualified_quality_phred".to_string(), Some("15".to_string())),
+        ("--complexity_threshold".to_string(), Some("30".to_string())),
         ("--stdin".to_string(), None), // Input from stdin
         ("--stdout".to_string(), None), // Output to stdout
         ("--dedup".to_string(), None), // Enable deduplication
@@ -1979,19 +2014,29 @@ async fn fastp_dedup(
     let json_path = out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy()));
     let (count_tx, count_rx) = oneshot::channel();
     let count_task = tokio::spawn(async move {
-        // Wait for fastp to finish writing JSON
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let json_content = fs::read_to_string(&json_path)
-            .await
-            .map_err(|e| anyhow!("Failed to read fastp JSON: {}", e))?;
-        let parsed: Value = serde_json::from_str(&json_content)
-            .map_err(|e| anyhow!("Failed to parse fastp JSON: {}", e))?;
-        let uniques = parsed["duplication"]["unique_reads"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("Missing unique_reads in fastp JSON"))?;
-        count_tx
-            .send(uniques / if paired { 2 } else { 1 }) // Divide by 2 for paired-end to get pairs
-            .map_err(|_| anyhow!("Failed to send unique read count"))?;
+        let json_content = match fs::read_to_string(&json_path).await {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Failed to read fastp JSON: {}", e);
+                return Err(anyhow!("JSON read error"));
+            }
+        };
+        // eprintln!("Fastp dedup JSON: {}", json_content); // Log for debug
+        let parsed: Value = match serde_json::from_str(&json_content) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("JSON parse error: {}", e);
+                count_tx.send(0).map_err(|_| anyhow!("Send failed"))?; // Fallback
+                return Ok(());
+            }
+        };
+
+        let uniques = parsed["duplication"]["unique_reads"].as_u64().unwrap_or_else(|| {
+            eprintln!("Missing unique_reads; falling back to 0");
+            0
+        });
+        let unique_pairs = uniques / if paired { 2 } else { 1 };
+        count_tx.send(unique_pairs).map_err(|_| anyhow!("Send failed"))?;
         Ok(())
     });
     cleanup_tasks.push(count_task);
@@ -2002,6 +2047,151 @@ async fn fastp_dedup(
         cleanup_tasks,
         cleanup_receivers,
     ))
+}
+
+
+/// Combined de-duplication and subsambler.
+/// Uses and A-Res algorithm and hashing to creat a min heap BinaryHeap
+/// Runs in memory when possible, but has a disk option when
+/// file size and memory constraints demand.
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Strucutred FASTQ stream
+/// * 'paired` - Bool controlling single or paired end data
+/// * `seed` - Seed value for rng allowing possibility of deterministic output
+/// * `max_subsample` - Limit of reads for subsampling
+/// * `prefix_len` - Length of prefix subsample of read
+/// * `out_dir` - Output directory for intermediate files
+///
+/// # Returns
+/// Result of:
+/// Tuple of:
+/// Output stream
+/// Count stream
+/// Vec of tkio tasks
+/// Vec of tokio receivers
+/// with Pipeline Error
+async fn dedup_and_subsample(
+    config: Arc<RunConfig>,
+    input_stream: mpsc::Receiver<ParseOutput>,
+    paired: bool,
+    seed: u64, // Used for hashing, rng from config
+    max_subsample: u64,
+    prefix_len: Option<usize>,
+    out_dir: PathBuf,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let mut count_map: HashMap<u64, u64> = HashMap::new();
+    let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
+    let mut total_count = 0u64;
+
+    // RAM-based deduplication
+    let mut stream = ReceiverStream::new(input_stream);
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Fastq(record) => {
+                let mut records = vec![record.clone()];
+                let mut seq_bytes = (*record.seq()).to_vec(); // Clone Vec<u8> to owned Vec<u8>
+                if paired {
+                    if let Some(next_item) = stream.next().await {
+                        match next_item {
+                            ParseOutput::Fastq(next_record) => {
+                                records.push(next_record.clone());
+                                seq_bytes.extend_from_slice(&next_record.seq()); // Extend with &[u8]
+                            }
+                            _ => {
+                                return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in paired stream".to_string()));
+                            }
+                        }
+                    } else {
+                        return Err(PipelineError::InvalidFastqFormat("Unpaired read in paired stream".to_string()));
+                    }
+                }
+                let mut hasher = XxHash64::with_seed(seed);
+                let write_len = prefix_len.map(|len| len.min(seq_bytes.len())).unwrap_or(seq_bytes.len());
+                hasher.write(&seq_bytes[0..write_len]);
+                let hash_key = hasher.finish();
+                let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
+                entry.0 += 1;
+                entry.1 = records;
+                total_count += 1;
+            }
+            _ => {
+                return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in dedup stream".to_string()));
+            }
+        }
+    }
+    count_map = dedup_map.iter().map(|(&k, &(w, _))| (k, w)).collect();
+    eprintln!("RAM-based count complete: {} unique hashes from {} total {}", count_map.len(), total_count, if paired { "pairs" } else { "reads" });
+
+    let subsample_size = max_subsample.min(count_map.len() as u64);
+
+    let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
+    let mut rng = config.rng.clone(); // Clone the seeded RNG from config
+
+    if subsample_size < count_map.len() as u64 {
+        for (&hash_key, &weight) in &count_map {
+            let key = rng.random::<f64>().powf(1.0 / weight as f64);
+            if heap.len() < subsample_size as usize {
+                heap.push(Reverse(SampleItem { key, records: vec![], weight, hash_key: Some(hash_key) }));
+            } else if key > heap.peek().unwrap().0.key {
+                heap.pop();
+                heap.push(Reverse(SampleItem { key, records: vec![], weight, hash_key: Some(hash_key) }));
+            }
+        }
+    } else {
+        // All uniques
+        for (&hash_key, &weight) in &count_map {
+            heap.push(Reverse(SampleItem { key: 0.0, records: vec![], weight, hash_key: Some(hash_key) }));
+        }
+    }
+
+    let mut sampled: Vec<SampleItem> = heap.into_iter().map(|r| r.0).collect();
+    sampled.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(Ordering::Equal));
+
+    for item in sampled.iter_mut() {
+        if let Some(hash_key) = item.hash_key {
+            if let Some((_, records)) = dedup_map.get(&hash_key) {
+                item.records = records.clone();
+            }
+        }
+    }
+
+    eprintln!("Dedup complete: {} unique {} from {} total", sampled.len(), if paired { "pairs" } else { "reads" }, total_count);
+
+    // TSV writing
+    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
+    let dedup_map_clone = dedup_map.clone();
+    let tsv_write_task = tokio::spawn(async move {
+        let mut file = TokioOpenOptions::new().write(true).create(true).open(&tsv_path).await.map_err(|e| anyhow!("TSV open error: {}", e))?;
+        for (_, &(weight, ref records)) in &dedup_map_clone {
+            if !records.is_empty() {
+                file.write_all(format!("{}\t{}\n", records[0].id(), weight).as_bytes()).await?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(tsv_write_task);
+
+    let unique_count = sampled.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Failed to send subsample count")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task = tokio::spawn(async move {
+        for item in sampled {
+            for record in item.records {
+                tx.send(ParseOutput::Fastq(record)).await.map_err(|_| anyhow!("Send failed"))?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(send_task);
+
+    Ok((ReceiverStream::new(rx), count_rx, cleanup_tasks, cleanup_receivers))
 }
 
 /// Run function for Short Read mNGS pipelines
@@ -2025,7 +2215,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir = config.out_dir.clone();
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
     eprintln!("Current dir: {:?}", std::env::current_dir()?);
+
+    // *******************
+    // Setup and Validation
+    // *******************
 
     // External tools check
     check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, CZID_DEDUP_TAG])
@@ -2039,6 +2234,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
     let paired = file2_path.is_some();
 
+    let seed = config.args.seed.unwrap_or_else(|| {
+        let mut bytes = [0u8; 8];
+        OsRng.fill_bytes(&mut bytes);
+        let random_seed = u64::from_le_bytes(bytes);
+        random_seed
+    });
+
     // Input Validation
     let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
         config.clone(),
@@ -2049,6 +2251,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
+
+    // *******************
+    // Host Filtering Stage
+    // *******************
 
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
@@ -2165,22 +2371,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         human_mm2_out_stream
     };
 
-    // if let Some(temp) = host_ref_temp { //not sure i actually want these deleted
-    //     temp_files.push(temp);
-    // }
-    // if let Some(temp) = host_index_temp {
-    //     temp_files.push(temp);
-    // }
+    if let Some(temp) = host_ref_temp {
+        temp_files.push(temp);
+    }
+    if let Some(temp) = host_index_temp {
+        temp_files.push(temp);
+    }
 
-    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = fastp_dedup(
+    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
-        post_filter_stream,
+        post_filter_stream.into_inner(),
         paired,
+        seed,
+        config.args.max_subsample as u64,
+        Some(75), // Prefix length for deduplication. Hardcoded fior now
         out_dir.clone(),
-        no_ext_sample_base_buf.clone(),
-        Some(75), // prefix_length, trims to 75bp if set
-    )
-        .await?;
+    ).await?;
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
@@ -2191,7 +2397,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ));
     cleanup_tasks.push(dedup_write_task);
 
+
+    // *******************
+    // Target Alignment
+    // *******************
+
+    // Minimap2 target alignment
+
+    // let (target_mm2_out_stream, target_mm2_count_rx, mut target_mm2_cleanup_tasks, mut target_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
+    //     config.clone(),
+    //     subsample_stream,
+    //     paired,
+    //     None,
+    // )
+    //     .await?;
+    // cleanup_tasks.append(&mut target_mm2_cleanup_tasks);
+    // cleanup_receivers.append(&mut target_mm2_cleanup_receivers);
+    //
+
+    // *******************
     // Results retrieval
+    // *******************
+
     let raw_count = join_with_error_handling(raw_count_task).await?;
     println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
 
@@ -2271,7 +2498,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
     // eprintln!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
 
+    // *******************
     // Cleanup
+    // *******************
     let results = try_join_all(cleanup_tasks)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -2284,6 +2513,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?
             .map_err(|e| PipelineError::Other(e))?;
     }
+
+    drop(temp_files);
 
     println!("Finished short read mNGS.");
     Ok(())

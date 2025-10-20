@@ -33,6 +33,7 @@ use std::fs::Permissions;
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType};
 use crate::config::defs::{CoreAllocation, RunConfig};
+use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 
 
 
@@ -1598,6 +1599,10 @@ mod tests {
             threads: 8, // Laptop
             ..Default::default()
         };
+        let (total_ram, available_ram) = detect_ram()
+            .unwrap_or((16u64 << 30, 8u64 << 30));
+        let rng = generate_rng(Some(42));
+
         Arc::new(RunConfig {
             cwd: PathBuf::from("."),
             ram_temp_dir: std::env::temp_dir(),
@@ -1606,7 +1611,9 @@ mod tests {
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
             base_buffer_size: 5_000_000,
-            input_size_mb: 100
+            input_size_mb: 100,
+            available_ram: available_ram,
+            rng: rng
         })
     }
 

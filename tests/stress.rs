@@ -22,6 +22,7 @@ use rayon::ThreadPoolBuilder;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Semaphore};
 use seqtoid_pipelines::cli::Arguments;
+use seqtoid_pipelines::utils::system::{detect_ram, generate_rng};
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -144,6 +145,9 @@ fn create_test_run_config() -> Arc<RunConfig> {
         threads: 84, // Matches dual socket AMD Epyc 84c
         ..Default::default()
     };
+    let (total_ram, available_ram) = detect_ram()
+        .unwrap_or((16u64 << 30, 8u64 << 30));
+    let rng = generate_rng(Some(42));
     Arc::new(RunConfig {
         cwd: PathBuf::from("."),
         ram_temp_dir: PathBuf::from("/scratch"),
@@ -152,7 +156,9 @@ fn create_test_run_config() -> Arc<RunConfig> {
         thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(84).build().unwrap()),
         maximal_semaphore: Arc::new(Semaphore::new(84)),
         base_buffer_size: 5_000_000, // Reasonable for 1.5TB RAM
-        input_size_mb: 100
+        input_size_mb: 100,
+        available_ram: available_ram,
+        rng: rng
     })
 }
 
