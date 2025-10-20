@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Result, anyhow};
+use log::{self, LevelFilter, debug, info, error, warn};
 use flate2::read::GzDecoder;
 use crate::utils::file::{extension_remover, is_gzipped, FileReader};
 use crate::cli::Technology;
@@ -388,7 +389,7 @@ pub fn read_fastq(
     let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
 
     let task = tokio::spawn(async move {
-        eprintln!("read_fastq: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
+        debug!("read_fastq: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
                   path1, path2, max_reads, min_read_len, max_read_len, chunk_size);
 
         let mut undersized_reads: u64 = 0;
@@ -398,7 +399,7 @@ pub fn read_fastq(
         match path2 {
             None => {
                 // Single-end: Stream chunks from one file
-                eprintln!("read_fastq: Opening single-end FASTQ: {:?}", path1);
+                debug!("read_fastq: Opening single-end FASTQ: {:?}", path1);
                 let mut reader = parse_fastx_file(&path1)
                     .map_err(|e| {
                         anyhow!("Failed to open FASTQ {}: {}", path1.display(), e)
@@ -407,7 +408,7 @@ pub fn read_fastq(
 
                 while let Some(result) = reader.next() {
                     if validated_reads + undersized_reads + oversized_reads >= max_reads {
-                        eprintln!("read_fastq: Reached max_reads={}", max_reads);
+                        debug!("read_fastq: Reached max_reads={}", max_reads);
                         break;
                     }
                     let record = result.map_err(|e| {
@@ -426,14 +427,14 @@ pub fn read_fastq(
                     // Optional length filters
                     if let Some(min) = min_read_len {
                         if seq_len < min {
-                            eprintln!("read_fastq: Skipping read {}: seq_len={} < min={}", validated_reads + undersized_reads + oversized_reads + 1, seq_len, min);
+                            debug!("read_fastq: Skipping read {}: seq_len={} < min={}", validated_reads + undersized_reads + oversized_reads + 1, seq_len, min);
                             undersized_reads += 1;
                             continue;
                         }
                     }
                     if let Some(max) = max_read_len {
                         if seq_len > max {
-                            eprintln!("read_fastq: Skipping read {}: seq_len={} > max={}", validated_reads + undersized_reads + oversized_reads + 1, seq_len, max);
+                            debug!("read_fastq: Skipping read {}: seq_len={} > max={}", validated_reads + undersized_reads + oversized_reads + 1, seq_len, max);
                             oversized_reads += 1;
                             continue;
                         }
@@ -467,10 +468,10 @@ pub fn read_fastq(
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
-                eprintln!("read_fastq: Processed {} single-end reads (undersized: {}, validated: {}, oversized: {})",
+                debug!("read_fastq: Processed {} single-end reads (undersized: {}, validated: {}, oversized: {})",
                           validated_reads + undersized_reads + oversized_reads, undersized_reads, validated_reads, oversized_reads);
                 if validated_reads == 0 {
-                    eprintln!("read_fastq: Warning: No reads processed from {:?}", path1);
+                    warn!("read_fastq: Warning: No reads processed from {:?}", path1);
                 }
                 Ok(ReadStats {
                     undersized: undersized_reads,
@@ -483,7 +484,7 @@ pub fn read_fastq(
                     return Err(anyhow!("Paired-end not supported for ONT"));
                 }
                 // Paired-end: Interleave raw record bytes
-                eprintln!("read_fastq: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
+                debug!("read_fastq: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
                 let mut reader1 = parse_fastx_file(&path1)
                     .map_err(|e| {
                         anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e)
@@ -496,7 +497,7 @@ pub fn read_fastq(
 
                 loop {
                     if validated_reads + undersized_reads + oversized_reads >= max_reads {
-                        eprintln!("read_fastq: Reached max_reads={}", max_reads);
+                        debug!("read_fastq: Reached max_reads={}", max_reads);
                         break;
                     }
                     // Read R1
@@ -507,7 +508,7 @@ pub fn read_fastq(
                             return Err(anyhow!("R1 parse error at read {}: {}", validated_reads + undersized_reads + oversized_reads + 1, e));
                         }
                         None => {
-                            eprintln!("read_fastq: R1 stream ended at read {}", validated_reads + undersized_reads + oversized_reads + 1);
+                            debug!("read_fastq: R1 stream ended at read {}", validated_reads + undersized_reads + oversized_reads + 1);
                             break;
                         }
                     };
@@ -603,10 +604,10 @@ pub fn read_fastq(
                 if reader2.next().is_some() {
                     return Err(anyhow!("R2 has extra reads after R1 ended"));
                 }
-                eprintln!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {})",
+                debug!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {})",
                           validated_reads + undersized_reads + oversized_reads, undersized_reads, validated_reads, oversized_reads);
                 if validated_reads == 0 {
-                    eprintln!("read_fastq: Warning: No reads processed from R1={:?}, R2={:?}", path1, path2);
+                    warn!("read_fastq: Warning: No reads processed from R1={:?}, R2={:?}", path1, path2);
                 }
                 Ok(ReadStats {
                     undersized: undersized_reads,
@@ -643,7 +644,7 @@ pub fn read_fasta(
     let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
 
     tokio::spawn(async move {
-        eprintln!("read_fasta: Starting with path={:?}, max_records={}, min_seq_len={:?}, max_seq_len={:?}, chunk_size={}",
+        debug!("read_fasta: Starting with path={:?}, max_records={}, min_seq_len={:?}, max_seq_len={:?}, chunk_size={}",
                   path, max_records, min_seq_len, max_seq_len, chunk_size);
 
         let mut reader = parse_fastx_file(&path)
@@ -656,7 +657,7 @@ pub fn read_fasta(
 
         while let Some(result) = reader.next() {
             if record_count >= max_records {
-                eprintln!("read_fasta: Reached max_records={}", max_records);
+                debug!("read_fasta: Reached max_records={}", max_records);
                 break;
             }
             let record = result.map_err(|e| {
@@ -675,13 +676,13 @@ pub fn read_fasta(
             // Optional length filters
             if let Some(min) = min_seq_len {
                 if seq_len < min {
-                    eprintln!("read_fasta: Skipping record {}: seq_len={} < min={}", record_count + 1, seq_len, min);
+                    debug!("read_fasta: Skipping record {}: seq_len={} < min={}", record_count + 1, seq_len, min);
                     continue;
                 }
             }
             if let Some(max) = max_seq_len {
                 if seq_len > max {
-                    eprintln!("read_fasta: Skipping record {}: seq_len={} > max={}", record_count + 1, seq_len, max);
+                    debug!("read_fasta: Skipping record {}: seq_len={} > max={}", record_count + 1, seq_len, max);
                     continue;
                 }
             }
@@ -712,9 +713,9 @@ pub fn read_fasta(
             }
         }
 
-        // eprintln!("read_fasta: Processed {} FASTA records", record_count);
+        debug!("read_fasta: Processed {} FASTA records", record_count);
         if record_count == 0 {
-            eprintln!("read_fasta: Warning: No records processed from {:?}", path);
+            warn!("read_fasta: Warning: No records processed from {:?}", path);
         }
         Ok(())
     });
@@ -729,7 +730,6 @@ fn compare_read_ids_bytes(head1: &[u8], head2: &[u8]) -> bool {
     let id2_str = std::str::from_utf8(id2).unwrap_or("");
     let id1_base = id1_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
     let id2_base = id2_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
-    // eprintln!("read_fastq: Comparing IDs: {} vs {}", id1_base, id2_base);
     id1_base == id2_base
 }
 
@@ -957,7 +957,6 @@ pub fn parse_and_filter_fastq_id(
                 ParseOutput::Fastq(record) => {
                     if memmem::find(record.id().as_bytes(), &pattern_bytes).is_some() {
                         if filtered_tx.send(record).await.is_err() {
-                            eprintln!("Failed to send filtered FASTQ record at count {}", count + 1);
                             return Err(anyhow!(
                                 "Failed to send filtered FASTQ record at count {}",
                                 count + 1
@@ -967,12 +966,12 @@ pub fn parse_and_filter_fastq_id(
                     }
                 }
                 _ => {
-                    eprintln!("Unexpected ParseOutput at count {}", count + 1);
+                    warn!("Unexpected ParseOutput at count {}", count + 1);
                     continue; // Skip non-FASTQ items
                 }
             }
         }
-        eprintln!("Filtered {} FASTQ records from Kraken2 classified stream", count);
+        debug!("Filtered {} FASTQ records from Kraken2 classified stream", count);
         Ok(())
     });
     (filtered_rx, task)
@@ -994,28 +993,24 @@ pub async fn parse_byte_stream_to_fastq(
 
         while let Some(item) = stream.next().await {
             if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
-                eprintln!("parse_byte_stream_to_fastq: Stall detected at {} records", record_count);
+                warn!("parse_byte_stream_to_fastq: Stall detected at {} records", record_count);
                 last_progress = tokio::time::Instant::now();
             }
 
             match item {
                 ParseOutput::Bytes(bytes) => {
-                    // eprintln!("parse_byte_stream_to_fastq: Received {} bytes chunk", bytes.len());
                     full_buffer.extend_from_slice(&*bytes);
                 }
                 _ => {
-                    eprintln!("parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}", record_count + 1);
+                    warn!("parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}", record_count + 1);
                     continue;
                 }
             }
         }
 
         if full_buffer.is_empty() {
-            eprintln!("parse_byte_stream_to_fastq: Empty byte buffer received");
             return Err(anyhow!("Empty byte buffer for FASTQ parsing"));
         }
-
-        // eprintln!("parse_byte_stream_to_fastq: Accumulated {} total bytes for parsing", full_buffer.len());
 
         // Parse accumulated bytes into FASTQ records
         let cursor = Cursor::new(full_buffer);
@@ -1025,19 +1020,17 @@ pub async fn parse_byte_stream_to_fastq(
                 Ok(record) => {
                     let owned_record: SequenceRecord = record.to_owned().into();
                     if tx.send(ParseOutput::Fastq(owned_record)).await.is_err() {
-                        eprintln!("parse_byte_stream_to_fastq: Failed to send FASTQ record at count {}", record_count + 1);
                         return Err(anyhow!("Failed to send FASTQ record at count {}", record_count + 1));
                     }
                     record_count += 1;
                 }
                 Err(e) => {
-                    eprintln!("parse_byte_stream_to_fastq: Error parsing FASTQ at count {}: {}", record_count + 1, e);
                     return Err(anyhow!("FASTQ parsing error at count {}: {}", record_count + 1, e));
                 }
             }
         }
 
-        eprintln!("parse_byte_stream_to_fastq: Parsed {} FASTQ records", record_count);
+        debug!("parse_byte_stream_to_fastq: Parsed {} FASTQ records", record_count);
         Ok(())
     });
 
@@ -1077,7 +1070,7 @@ pub async fn concatenate_paired_reads(
 
         while let Some(item) = stream.next().await {
             if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
-                eprintln!("concatenate_paired_reads: Stall detected at {} read pairs", pair_count);
+                warn!("concatenate_paired_reads: Stall detected at {} read pairs", pair_count);
                 last_progress = tokio::time::Instant::now();
             }
 
@@ -1086,12 +1079,6 @@ pub async fn concatenate_paired_reads(
                     if let Some(prev_r1) = r1.take() {
                         // This is R2; process the pair
                         if !compare_read_ids(prev_r1.id(), record.id()) {
-                            eprintln!(
-                                "Read ID mismatch at pair {}: {} vs {}",
-                                pair_count + 1,
-                                prev_r1.id(),
-                                record.id()
-                            );
                             return Err(anyhow!(
                                 "Read ID mismatch at pair {}: {} vs {}",
                                 pair_count + 1,
@@ -1135,7 +1122,6 @@ pub async fn concatenate_paired_reads(
                             };
 
                             if tx.send(ParseOutput::Fastq(new_record)).await.is_err() {
-                                eprintln!("Failed to send concatenated FASTQ record at pair {}", pair_count + 1);
                                 return Err(anyhow!(
                                     "Failed to send concatenated FASTQ record at pair {}",
                                     pair_count + 1
@@ -1151,7 +1137,7 @@ pub async fn concatenate_paired_reads(
                     }
                 }
                 _ => {
-                    eprintln!("Unexpected ParseOutput at pair count {}", pair_count + 1);
+                    warn!("Unexpected ParseOutput at pair count {}", pair_count + 1);
                     continue;
                 }
             }
@@ -1159,11 +1145,10 @@ pub async fn concatenate_paired_reads(
 
         // Check for unpaired R1
         if r1.is_some() {
-            eprintln!("Unpaired R1 record at end of stream");
             return Err(anyhow!("Unpaired R1 record at end of stream"));
         }
 
-        eprintln!("concatenate_paired_reads: Processed {} read pairs", pair_count);
+        debug!("concatenate_paired_reads: Processed {} read pairs", pair_count);
         Ok(())
     });
 

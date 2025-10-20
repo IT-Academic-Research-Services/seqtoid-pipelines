@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
+use log::{self, LevelFilter, debug, info, error, warn};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
 use tokio::time::sleep;
 use tokio::process::Command as TokioCommand;
@@ -143,14 +144,14 @@ pub fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: S
 
     // linux trust available unless <10 GiB; macOS: fallback if <20% total
     let effective_ram = if cfg!(target_os = "linux") && available_ram < 10 * 1_073_741_824 {
-        println!(
-            "Warning: Critically low available RAM ({} GiB); using 50% total RAM",
+        warn!(
+            "Critically low available RAM ({} GiB); using 50% total RAM",
             available_ram / 1_073_741_824
         );
         total_ram / 2
     } else if cfg!(target_os = "macos") && available_ram < total_ram / 5 {
-        println!(
-            "Warning: Low available RAM ({} GiB) vs total ({} GiB); using total RAM",
+        warn!(
+            "Low available RAM ({} GiB) vs total ({} GiB); using total RAM",
             available_ram / 1_073_741_824,
             total_ram / 1_073_741_824
         );
@@ -164,7 +165,7 @@ pub fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: S
     // OOM guard: Cap if buffers exceed input size or minimum threshold
     let low_ram_threshold = (min_buffer * record_size * stream_threads) as usize;
     if total_buffer_bytes < low_ram_threshold {
-        println!(
+        warn!(
             "Low RAM ({} GiB); capping at minimal buffer: {} records",
             effective_ram / 1_073_741_824,
             min_buffer
@@ -175,7 +176,7 @@ pub fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: S
     let max_records = (total_buffer_bytes / record_size) / stream_threads.max(1);
     let buffer_size = max_records.clamp(min_buffer, max_buffer);
 
-    println!(
+    debug!(
         "Computed base buffer size: {} records (~{} MB/channel, ~{} MB total est. for {} streams)",
         buffer_size,
         (buffer_size * record_size) / 1_048_576,
@@ -222,17 +223,17 @@ async fn monitor_io_utilization(device: String) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(util_line) = parse_iostat_util(&stdout, &device) {
-                    eprintln!("NVMe I/O Util: {}% (device: {})", util_line, device);
+                    debug!("NVMe I/O Util: {}% (device: {})", util_line, device);
                     if util_line.parse::<f32>().unwrap_or(0.0) > 80.0 {
-                        eprintln!("WARNING: High I/O util (>80%) - Potential stall cause. Consider striping NVMe or more /dev/shm usage.");
+                        warn!("WARNING: High I/O util (>80%) - Potential stall cause. Consider striping NVMe or more /dev/shm usage.");
                     }
                 } else {
-                    eprintln!("Failed to parse iostat output: {}", stdout);
+                    error!("Failed to parse iostat output: {}", stdout);
                 }
             }
-            Err(e) => eprintln!("iostat error: {}", e),
+            Err(e) => error!("iostat error: {}", e),
         }
-        sleep(Duration::from_secs(5)).await;  // Check every 5s; adjust for granularity
+        sleep(Duration::from_secs(5)).await;
     }
 }
 

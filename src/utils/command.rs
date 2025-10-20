@@ -1,6 +1,7 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
+use log::{self, LevelFilter, debug, info, error, warn};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
@@ -36,7 +37,7 @@ pub trait ArgGenerator {
 /// Result<f32>major/minor version number
 pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_line: usize, version_column: usize, child_stream: ChildStream) -> Result<f32> {
     let cmd_tag_owned = command_tag.to_string();
-    // eprintln!("Running command: {}", &cmd_tag_owned);
+    debug!("Running command: {}", &cmd_tag_owned);
     let args: Vec<&str> = version_args;
 
     let mut child = Command::new(&cmd_tag_owned)
@@ -78,6 +79,7 @@ pub mod fastp {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
+    use log::{self, LevelFilter, debug, info, error, warn};
     use crate::config::defs::{FASTP_TAG,  RunConfig};
     use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
@@ -96,7 +98,7 @@ pub mod fastp {
 
     impl ArgGenerator for FastpArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            // eprintln!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
+            debug!("Allocating {} threads for fastp", RunConfig::thread_allocation(run_config, FASTP_TAG, None));
 
             let config = extra
                 .and_then(|e| e.downcast_ref::<FastpConfig>())
@@ -155,7 +157,6 @@ mod pigz {
 
     impl ArgGenerator for PigzArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            // eprintln!("Allocating {} threads for pigz", RunConfig::thread_allocation(run_config, PIGZ_TAG, None));
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("-c".to_string());
             args_vec.push("-p".to_string());
@@ -183,6 +184,7 @@ pub mod minimap2 {
     use std::collections::HashMap;
     use super::*;
     use tokio::fs;
+    use log::{self, LevelFilter, debug, info, error, warn};
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
@@ -307,7 +309,7 @@ pub mod minimap2 {
                     Ok(())
                 });
                 index_task.await.map_err(|e| PipelineError::Other(e.into()))??;
-                eprintln!("{} mmi created", ref_type);
+                debug!("{} mmi created", ref_type);
                 tasks.push(err_task);
                 (index_temp_path, Some(index_temp))
             }
@@ -850,6 +852,7 @@ pub mod bowtie2 {
     use anyhow::{anyhow, Result};
     use std::fs::{self, DirEntry};
     use std::process::Command;
+    use log::{self, LevelFilter, debug, info, error, warn};
     use crate::config::defs::{RunConfig, BOWTIE2_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
@@ -883,7 +886,7 @@ pub mod bowtie2 {
             fs::remove_dir_all(&unpack_dir)?;
         }
         fs::create_dir_all(&unpack_dir)?;
-        // eprintln!("Bowtie2: Created unpack directory: {}", unpack_dir.display());
+        debug!("Bowtie2: Created unpack directory: {}", unpack_dir.display());
 
         let mut index_dir = unpack_dir.clone();
 
@@ -894,7 +897,7 @@ pub mod bowtie2 {
             let stem_ext = input.file_stem().and_then(|s| Path::new(s).extension()).map(|s| s.to_str().unwrap_or("")).unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                eprintln!("Bowtie2: Unpacking GZIP TAR: {}", input.display());
+                debug!("Bowtie2: Unpacking GZIP TAR: {}", input.display());
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -902,7 +905,7 @@ pub mod bowtie2 {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                eprintln!("Bowtie2: Unpacking TAR: {}", input.display());
+                debug!("Bowtie2: Unpacking TAR: {}", input.display());
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -927,11 +930,10 @@ pub mod bowtie2 {
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
             if fs::read_dir(&subdir)?.next().is_some() {
-                eprintln!("Bowtie2: Stripped to subdir: {}", subdir.display());
                 index_dir = subdir;
             }
         }
-        // eprintln!("Bowtie2 index directory: {}", index_dir.display());
+        debug!("Bowtie2 index directory: {}", index_dir.display());
 
         // Validate
         let extensions = vec!["bt2".to_string(), "bt2l".to_string()];
@@ -978,10 +980,9 @@ pub mod bowtie2 {
             }
         }
         let basename = basename.ok_or(anyhow!("No Bowtie2 index file with suffix '1' avoiding 'rev' found in: {}", index_dir.display()))?;
-        eprintln!("Bowtie2 derived basename: {}", basename);
 
         let final_path = index_dir.join(&basename);
-        eprintln!("Final Bowtie2 index path: {}", final_path.display());
+        debug!("Final Bowtie2 index path: {}", final_path.display());
         Ok(final_path)
     }
 
@@ -1017,6 +1018,7 @@ pub mod hisat2 {
     use std::path::{Path, PathBuf};
     use std::collections::HashMap;
     use anyhow::{anyhow, Result};
+    use log::{self, LevelFilter, debug, info, error, warn};
     use std::fs::{self, DirEntry};
     use std::process::Command;
     use crate::config::defs::{RunConfig, HISAT2_TAG};
@@ -1056,7 +1058,7 @@ pub mod hisat2 {
             fs::remove_dir_all(&unpack_dir)?;
         }
         fs::create_dir_all(&unpack_dir)?;
-        eprintln!("HISAT2: Created unpack directory: {}", unpack_dir.display());
+        debug!("HISAT2: Created unpack directory: {}", unpack_dir.display());
 
         let mut index_dir = unpack_dir.clone();
 
@@ -1068,7 +1070,7 @@ pub mod hisat2 {
             let stem_ext = input.file_stem().and_then(|s| Path::new(s).extension()).map(|s| s.to_str().unwrap_or("")).unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                eprintln!("HISAT2: Unpacking GZIP TAR: {}", input.display());
+                debug!("HISAT2: Unpacking GZIP TAR: {}", input.display());
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -1076,7 +1078,7 @@ pub mod hisat2 {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                eprintln!("HISAT2: Unpacking TAR: {}", input.display());
+                debug!("HISAT2: Unpacking TAR: {}", input.display());
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -1101,11 +1103,9 @@ pub mod hisat2 {
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
             if fs::read_dir(&subdir)?.next().is_some() {
-                eprintln!("HISAT2: Stripped to subdir: {}", subdir.display());
                 index_dir = subdir;
             }
         }
-        eprintln!("HISAT2 index directory: {}", index_dir.display());
 
         // Validate required files
         let extensions = vec!["ht2".to_string(), "ht2l".to_string()];
@@ -1152,10 +1152,9 @@ pub mod hisat2 {
             }
         }
         let basename = basename.ok_or(anyhow!("No HISAT2 index file with suffix '1' found in: {}", index_dir.display()))?;
-        eprintln!("HISAT2 derived basename: {}", basename);
 
         let final_path = index_dir.join(&basename);
-        eprintln!("Final HISAT2 index path: {}", final_path.display());
+        debug!("Final HISAT2 index path: {}", final_path.display());
         Ok(final_path)
     }
 
@@ -1282,6 +1281,7 @@ pub mod kallisto {
 pub mod star {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use log::{self, LevelFilter, debug, info, error, warn};
     use anyhow::{anyhow, Result};
     use std::fs::{self, DirEntry};
     use std::process::Command;
@@ -1321,7 +1321,7 @@ pub mod star {
             fs::remove_dir_all(&unpack_dir)?;
         }
         fs::create_dir_all(&unpack_dir)?;
-        eprintln!("STAR: Created unpack directory: {}", unpack_dir.display());
+        debug!("STAR: Created unpack directory: {}", unpack_dir.display());
 
         let mut index_dir = unpack_dir.clone();
 
@@ -1333,7 +1333,7 @@ pub mod star {
             let stem_ext = input.file_stem().and_then(|s| Path::new(s).extension()).map(|s| s.to_str().unwrap_or("")).unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                eprintln!("STAR: Unpacking GZIP TAR: {}", input.display());
+                debug!("STAR: Unpacking GZIP TAR: {}", input.display());
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -1341,7 +1341,7 @@ pub mod star {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                eprintln!("STAR: Unpacking TAR: {}", input.display());
+                debug!("STAR: Unpacking TAR: {}", input.display());
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -1366,11 +1366,9 @@ pub mod star {
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
             if fs::read_dir(&subdir)?.next().is_some() {
-                eprintln!("STAR: Stripped to subdir: {}", subdir.display());
                 index_dir = subdir;
             }
         }
-        eprintln!("STAR index directory: {}", index_dir.display());
 
         // Validate required files
         let required_files = vec![
@@ -1574,7 +1572,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
                 ));
             }
         } else {
-            println!("Warning: No minimum version specified for tool: {}", tool);
+            warn!("Warning: No minimum version specified for tool: {}", tool);
         }
     }
 

@@ -1,7 +1,6 @@
 /// Analysis of data that does not fit elsewhere (i.e. not FASTX-based)
-use std::path::Path;
-use std::process::Command;
 use anyhow::{Result, anyhow};
+use log::{self, LevelFilter, debug, info, error, warn};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -97,28 +96,28 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                         let size: u32 = match parts[1].parse() {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("Failed to parse insert size: {}", e);
+                                warn!("Failed to parse insert size: {}", e);
                                 continue;
                             }
                         };
                         let inward: u64 = match parts[2].parse() {
                             Ok(c) => c,
                             Err(e) => {
-                                eprintln!("Failed to parse inward count: {}", e);
+                                warn!("Failed to parse inward count: {}", e);
                                 continue;
                             }
                         };
                         let outward: u64 = match parts[3].parse() {
                             Ok(c) => c,
                             Err(e) => {
-                                eprintln!("Failed to parse outward count: {}", e);
+                                warn!("Failed to parse outward count: {}", e);
                                 continue;
                             }
                         };
                         let other: u64 = match parts[4].parse() {
                             Ok(c) => c,
                             Err(e) => {
-                                eprintln!("Failed to parse other count: {}", e);
+                                warn!("Failed to parse other count: {}", e);
                                 continue;
                             }
                         };
@@ -127,7 +126,7 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                 }
             }
             _ => {
-                eprintln!("Unexpected non-byte data in samtools stats stream");
+                warn!("Unexpected non-byte data in samtools stats stream");
                 continue;
             }
         }
@@ -357,13 +356,13 @@ pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap
                                 _ => {}
                             }
                         } else {
-                            // eprintln!(
-                            //     "Warning: Failed to parse value '{}' for key '{}' at line {}",
-                            //     value_str, key, line_count
-                            // );
+                            warn!(
+                                "Warning: Failed to parse value '{}' for key '{}' at line {}",
+                                value_str, key, line_count
+                            );
                         }
                     } else {
-                        eprintln!(
+                        warn!(
                             "Warning: Invalid line format at line {}: {}",
                             line_count, line
                         );
@@ -380,7 +379,7 @@ pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap
     }
 
     if stats.is_empty() {
-        eprintln!("Warning: No valid ERCC stats data parsed");
+        warn!("Warning: No valid ERCC stats data parsed");
     }
 
     Ok(stats)
