@@ -1,16 +1,18 @@
 // src/config/defs.rs
 use std::path::PathBuf;
-use crate::cli::Arguments;
-use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::cmp::min;
 use std::sync::Arc;
+
+use lazy_static::lazy_static;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
 use rand::rngs::StdRng;
-use std::io;
 use tokio::task::JoinError;
 use serde_json::Error as SerdeJsonError;
+use log::LevelFilter;
+
+use crate::cli::Arguments;
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -149,6 +151,7 @@ pub struct RunConfig {
     pub input_size_mb: u64,
     pub available_ram: u64,
     pub rng: StdRng,
+    pub log_level: LevelFilter,
 }
 
 impl RunConfig {

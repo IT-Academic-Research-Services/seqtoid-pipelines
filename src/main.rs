@@ -11,8 +11,11 @@ use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
 use sysinfo::{System, RefreshKind, MemoryRefreshKind};
+use std::io::Write;
 
 use anyhow::Result;
+use log::{self, LevelFilter, debug, info, error, warn};
+use env_logger::Builder;
 use clap::Parser;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
@@ -36,22 +39,42 @@ use pipelines::short_read_mngs;
 #[tokio::main]
 async fn main() -> Result<()> {
     let run_start = Instant::now();
-    println!("\n-------------\n SeqToID\n-------------\n");
 
     #[cfg(not(unix))]
     Err(anyhow!("Named pipes are not supported on non-Unix systems."));
 
+    let args = parse();
+
+    let log_level = if args.verbose {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+
+    Builder::new()
+        .filter_level(log_level)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{}] {}: {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+
+    println!("\n-------------\n SeqToID\n-------------\n");
+
     let dir = env::current_dir()?;
-    println!("The current directory is {:?}\n", dir);
+    info!("The current directory is {:?}\n", dir);
 
     let ram_temp_dir = get_ram_temp_dir();
-    println!("The RAM temp directory is {:?}\n", ram_temp_dir);
-
-    let args = parse();
+    info!("The RAM temp directory is {:?}\n", ram_temp_dir);
 
     let (max_cores, cpu_load) = detect_cores_and_load(args.threads).await?;
     let stream_threads = compute_stream_threads(max_cores, cpu_load, args.threads);
-    eprintln!("Detected {} physical cores; CPU load {}%; using {} threads for pool, {} for streams",
+    debug!("Detected {} physical cores; CPU load {}%; using {} threads for pool, {} for streams",
               max_cores, cpu_load, max_cores, stream_threads);
 
     let thread_pool = Arc::new(ThreadPoolBuilder::new()
@@ -62,11 +85,11 @@ async fn main() -> Result<()> {
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
     let (total_ram, available_ram) = detect_ram()?;
-    eprintln!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
-    eprintln!("Total RAM: {} bytes (~{} GiB)", total_ram, total_ram / 1_073_741_824);
+    debug!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
+    debug!("Total RAM: {} bytes (~{} GiB)", total_ram, total_ram / 1_073_741_824);
 
     let input_size_mb = get_input_size_mb(&args.file1, &args.file2).unwrap_or(0);
-    eprintln!("Total input file size: {} MB", input_size_mb);
+    debug!("Total input file size: {} MB", input_size_mb);
 
     let rng = generate_rng(args.seed);
 
@@ -88,10 +111,9 @@ async fn main() -> Result<()> {
         base_buffer_size,
         input_size_mb,
         available_ram,
-        rng
+        rng,
+        log_level
     });
-
-    // let io_monitor_handle = tokio::spawn(monitor_io_utilization("nvme0n1".to_string()));  // Replace with your NVMe device name, e.g., "nvme0n1"
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config).await,
@@ -101,9 +123,6 @@ async fn main() -> Result<()> {
         eprintln!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
         std::process::exit(1);
     }
-
-    // Await monitor task at end (optional, for clean shutdown)
-    // io_monitor_handle.await.unwrap_or_else(|e| eprintln!("I/O monitor failed: {}", e));
 
     println!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
     Ok(())

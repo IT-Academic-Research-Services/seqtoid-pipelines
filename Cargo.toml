@@ -4,6 +4,8 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+log = "0.4"
+env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 flate2 = "1.1.1"
 tokio = { version = "1.44.2", features = ["full", "io-util", "fs", "process", "rt-multi-thread"] }

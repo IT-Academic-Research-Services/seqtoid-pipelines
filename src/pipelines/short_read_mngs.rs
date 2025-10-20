@@ -8,6 +8,7 @@ use std::collections::{HashMap, BinaryHeap};
 use std::cmp::Reverse;
 
 use anyhow::{anyhow, Result};
+use log::{self, LevelFilter, debug, info, error, warn};
 use futures::future::try_join_all;
 use rand::prelude::*;
 use rand_core::{RngCore, OsRng};
@@ -433,7 +434,7 @@ async fn bowtie2_filter(
             .map_err(|e| PipelineError::Other(anyhow!("BAM count receiver failed: {}", e)))?;
 
         if bam_line_count == 0 {
-            eprintln!("No mapped reads in BAM for insert size stats; skipping samtools stats");
+            warn!("No mapped reads in BAM for insert size stats; skipping samtools stats");
             let (stats_tx, stats_rx) = oneshot::channel();
             stats_tx
                 .send(SamtoolsStats {
@@ -653,7 +654,7 @@ async fn fastp_qc(
     let count_task = tokio::spawn(async move {
         match stream_record_counter(qc_count_stream, false).await {
             Ok(count) => {
-                eprintln!("Fastp output reads: {}", count);
+                debug!("Fastp output reads: {}", count);
                 let _ = count_tx.send(Ok(count)); // Send the count result
                 Ok(())
             }
@@ -703,7 +704,7 @@ async fn kallisto_quant(
     let kallisto_out_dir = out_dir.join("kallisto");
     fs::create_dir_all(&kallisto_out_dir).await
         .map_err(|e| PipelineError::IOError(format!("Failed to create Kallisto output directory: {}", e)))?;
-    eprintln!("Kallisto output dir created/confirmed: {}", kallisto_out_dir.display());
+    debug!("Kallisto output dir created/confirmed: {}", kallisto_out_dir.display());
 
     let kallisto_index = config.args.kallisto_index.clone()
         .ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?;
@@ -718,7 +719,7 @@ async fn kallisto_quant(
         })?;
     let fastq_stream = ReceiverStream::new(fastq_rx);
 
-    eprintln!("Deinterleaving FASTQ stream for sample: {}", sample_base);
+    debug!("Deinterleaving FASTQ stream for sample: {}", sample_base);
     let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
         config.clone(),
         fastq_stream,
@@ -761,7 +762,7 @@ async fn kallisto_quant(
             tool: KALLISTO_TAG.to_string(),
             error: e.to_string(),
         })?;
-    eprintln!("Spawning Kallisto with args: {:?}", kallisto_args);
+    debug!("Spawning Kallisto with args: {:?}", kallisto_args);
 
     let (mut kallisto_child, kallisto_err_task) = spawn_cmd(
         config.clone(),
@@ -819,14 +820,14 @@ async fn kallisto_results(
         loop {
             match fs::metadata(&abundance_path).await {
                 Ok(meta) if meta.len() > 0 => {
-                    eprintln!("Found abundance.tsv: {} bytes", meta.len());
+                    debug!("Found abundance.tsv: {} bytes", meta.len());
                     break;
                 }
                 _ => {
                     if retries == 0 {
                         return Err(anyhow!("No abundance.tsv found at {}", abundance_path.display()));
                     }
-                    eprintln!("abundance.tsv not ready (retry {}); sleeping 2s", retries);
+                    warn!("abundance.tsv not ready (retry {}); sleeping 2s", retries);
                     sleep(Duration::from_secs(2)).await;
                     retries -= 1;
                 }
@@ -840,7 +841,7 @@ async fn kallisto_results(
         let mut ercc_counts = Vec::new();
         let mut transcript_to_gene = Vec::new();
 
-        // eprintln!("Starting to read abundance.tsv from: {}", abundance_path.display());
+        debug!("Starting to read abundance.tsv from: {}", abundance_path.display());
 
         if lines.next_line().await?.is_none() {
             return Err(anyhow!("Empty abundance.tsv"));
@@ -859,14 +860,14 @@ async fn kallisto_results(
             transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
         }
 
-        eprintln!("Finished reading kallisto's abundance.tsv: {} transcripts", ercc_counts.len());
+        debug!("Finished reading kallisto's abundance.tsv: {} transcripts", ercc_counts.len());
         let results = KallistoResults {
             ercc_counts,
             transcript_to_gene,
         };
         ercc_tx.send(results)
             .map_err(|_| anyhow!("Failed to send Kallisto results"))?;
-        eprintln!("Sent Kallisto results");
+        debug!("Sent Kallisto results");
         Ok(())
     });
 
@@ -1440,7 +1441,7 @@ async fn minimap2_filter(
         )
             .await?;
     cleanup_tasks.append(&mut host_ref_tasks);
-    eprintln!("host index : {}", host_index_path.display());
+    debug!("Host index : {}", host_index_path.display());
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: host_index_path,
@@ -1691,8 +1692,6 @@ async fn czid_dedup_dedup(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    eprintln!("top of czid dedup");
-
     // Check if input stream is empty or near-empty
     let (pre_tx, pre_rx) = mpsc::channel(config.base_buffer_size);
     let (t_junc_streams, t_junc_done_rx) = t_junction(
@@ -1717,18 +1716,15 @@ async fn czid_dedup_dedup(
             records.push(format!("{:?}", record));
         }
         let count = records.len() as u64;
-        // eprintln!("czid_dedup_dedup: Pre-count = {}, records = {:?}", count, records);
         Ok::<u64, anyhow::Error>(count)
     });
     let pre_count = pre_count_task.await??; // Unwrap Result<u64, anyhow::Error>
     if pre_count <= 4 {
-        eprintln!("czid_dedup_dedup: Skipping deduplication due to empty or near-empty input stream ({} records)", pre_count);
         let (count_tx, count_rx) = oneshot::channel();
         count_tx.send(0).map_err(|_| anyhow!("Failed to send empty count"))?;
         drop(pre_tx); // Close sender to signal empty stream
         return Ok((ReceiverStream::new(pre_rx), count_rx, cleanup_tasks, cleanup_receivers));
     }
-    eprintln!("b4 create out fifops");
     // Create output FIFOs
     let num_files = if paired { 2 } else { 1 };
     let mut output_fifos = Vec::with_capacity(num_files);
@@ -1769,10 +1765,9 @@ async fn czid_dedup_dedup(
     let debug_fifo_task = tokio::spawn(async move {
         for fifo in [&r1_fifo_debug, &r2_fifo_debug] {
             if let Ok(data) = fs::read(fifo).await {
-                eprintln!("FIFO {} ok", fifo.display());
-                // eprintln!("FIFO {} contents: {:?}", fifo.display(), String::from_utf8_lossy(&data));
+                debug!("FIFO {} ok", fifo.display());
             } else {
-                eprintln!("FIFO {} is empty or inaccessible", fifo.display());
+                warn!("FIFO {} is empty or inaccessible", fifo.display());
             }
         }
         Ok(())
@@ -1827,7 +1822,7 @@ async fn czid_dedup_dedup(
         if !status.success() {
             // Handle empty input case gracefully
             if status.code() == Some(2) {
-                eprintln!("czid-dedup exited with code 2 (likely empty input); treating as empty output");
+                warn!("czid-dedup exited with code 2 (likely empty input); treating as empty output");
                 return Ok(());
             }
             return Err(anyhow!("czid-dedup failed with exit code: {:?}", status.code()));
@@ -1872,7 +1867,6 @@ async fn czid_dedup_dedup(
                 }
             };
             if r1_stats.validated != r2_stats.validated {
-                eprintln!("Mismatched pair counts: R1={}, R2={}", r1_stats.validated, r2_stats.validated);
                 return Err(anyhow!("Mismatched pair counts: R1={}, R2={}", r1_stats.validated, r2_stats.validated));
             }
             count_tx.send(r1_stats.validated / 2)
@@ -1901,7 +1895,6 @@ async fn czid_dedup_dedup(
                     Ok(())
                 }
                 Err(e) => {
-                    // eprintln!("read_fastq failed for single-end: {}", e);
                     count_tx.send(0).map_err(|_| anyhow!("Send failed"))?;
                     Ok(())
                 }
@@ -1915,7 +1908,7 @@ async fn czid_dedup_dedup(
     let fifo_cleanup = tokio::spawn(async move {
         for path in output_fifos.iter() {
             if let Err(e) = fs::remove_file(path).await {
-                eprintln!("Failed to remove FIFO {}: {}", path.display(), e);
+                error!("Failed to remove FIFO {}: {}", path.display(), e);
             }
         }
         Ok(())
@@ -1966,7 +1959,7 @@ async fn fastp_dedup(
     if let Some(len) = prefix_length {
         command_fields.insert("--cut_tail".to_string(), Some(len.to_string()));
         command_fields.insert("--cut_front".to_string(), Some("0".to_string()));
-        eprintln!("Trimming reads to {}bp for prefix-based deduplication", len);
+        debug!("Trimming reads to {}bp for prefix-based deduplication", len);
     }
 
     let fastp_config = FastpConfig { command_fields };
@@ -2017,22 +2010,20 @@ async fn fastp_dedup(
         let json_content = match fs::read_to_string(&json_path).await {
             Ok(content) => content,
             Err(e) => {
-                eprintln!("Failed to read fastp JSON: {}", e);
                 return Err(anyhow!("JSON read error"));
             }
         };
-        // eprintln!("Fastp dedup JSON: {}", json_content); // Log for debug
         let parsed: Value = match serde_json::from_str(&json_content) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("JSON parse error: {}", e);
+                error!("JSON parse error: {}", e);
                 count_tx.send(0).map_err(|_| anyhow!("Send failed"))?; // Fallback
                 return Ok(());
             }
         };
 
         let uniques = parsed["duplication"]["unique_reads"].as_u64().unwrap_or_else(|| {
-            eprintln!("Missing unique_reads; falling back to 0");
+            warn!("Missing unique_reads; falling back to 0");
             0
         });
         let unique_pairs = uniques / if paired { 2 } else { 1 };
@@ -2125,7 +2116,7 @@ async fn dedup_and_subsample(
         }
     }
     count_map = dedup_map.iter().map(|(&k, &(w, _))| (k, w)).collect();
-    eprintln!("RAM-based count complete: {} unique hashes from {} total {}", count_map.len(), total_count, if paired { "pairs" } else { "reads" });
+    debug!("RAM-based count complete: {} unique hashes from {} total {}", count_map.len(), total_count, if paired { "pairs" } else { "reads" });
 
     let subsample_size = max_subsample.min(count_map.len() as u64);
 
@@ -2160,9 +2151,6 @@ async fn dedup_and_subsample(
         }
     }
 
-    eprintln!("Dedup complete: {} unique {} from {} total", sampled.len(), if paired { "pairs" } else { "reads" }, total_count);
-
-    // TSV writing
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
     let dedup_map_clone = dedup_map.clone();
     let tsv_write_task = tokio::spawn(async move {
@@ -2216,7 +2204,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
-    eprintln!("Current dir: {:?}", std::env::current_dir()?);
 
     // *******************
     // Setup and Validation
@@ -2420,23 +2407,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     let raw_count = join_with_error_handling(raw_count_task).await?;
-    println!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
+    info!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
 
     let stats = join_with_error_handling(val_count_task).await?;
-    println!("Processed {} validated, {} undersized, {} oversized reads",
+    info!("Processed {} validated, {} undersized, {} oversized reads",
              stats.validated, stats.undersized, stats.oversized);
 
     let _qc_fastp_read_count = match qc_count_result_rx.await {
         Ok(Ok(count)) => {
-            eprintln!("Received fastp read count: {}", count);
+            info!("Received fastp read count: {}", count);
             count
         }
         Ok(Err(e)) => {
-            eprintln!("Error getting fastp read count: {}", e);
+            error!("Error getting fastp read count: {}", e);
             0
         }
         Err(e) => {
-            eprintln!("Count receiver dropped: {}", e);
+            error!("Count receiver dropped: {}", e);
             0
         }
     };
@@ -2448,12 +2435,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bt2_counts = host_bt2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
-    eprintln!("Host bt2: mapped counts: {:?}", host_bt2_counts);
+    info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
     if let Some(insert_stats_rx) = host_bt2_insert_stats_rx {
         match insert_stats_rx.await {
             Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
-                eprintln!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
+                info!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
                 let output_path = out_dir.join("insert_size_histogram.png");
                 let sample_name = no_ext_sample_base_buf
                     .file_name()
@@ -2467,20 +2454,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 });
                 cleanup_tasks.push(plot_task);
             }
-            Ok(_) => eprintln!("No insert size stats available; skipping plotting"),
-            Err(e) => eprintln!("Host bt2 insert stats receiver failed: {}", e),
+            Ok(_) => warn!("No insert size stats available; skipping plotting"),
+            Err(e) => error!("Host bt2 insert stats receiver failed: {}", e),
         }
     }
 
     let host_mm2_counts = host_mm2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;
-    eprintln!("Host minimap2: mapped counts: {:?}", host_mm2_counts);
+    info!("Host minimap2: mapped counts: {:?}", host_mm2_counts);
 
     let dedup_count = dedup_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
-    eprintln!("dedup: unique reads/pairs: {}", dedup_count);
+    info!("Dedup: unique reads/pairs: {}", dedup_count);
 
     // Await Kallisto exit and process results
     join_with_error_handling(kallisto_exit_task).await
@@ -2496,7 +2483,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let kallisto_ercc_counts = kallisto_ercc_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
-    // eprintln!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
+    // info!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
 
     // *******************
     // Cleanup
@@ -2516,6 +2503,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     drop(temp_files);
 
-    println!("Finished short read mNGS.");
+    info!("Finished short read mNGS.");
     Ok(())
 }
