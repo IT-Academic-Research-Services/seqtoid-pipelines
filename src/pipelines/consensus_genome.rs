@@ -6,7 +6,7 @@ use tokio_stream::StreamExt;
 
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use log::{self, LevelFilter, debug, info, error, warn};
 use tokio::task::JoinHandle;
 use std::time::Instant;
@@ -1882,6 +1882,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let ram_temp_dir = config.ram_temp_dir.clone();
     let out_dir = config.out_dir.clone();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let mut temp_dirs: Vec<TempDir> = Vec::new();
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     let mut quast_write_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -1916,7 +1917,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let technology = config.args.technology.clone();
     
-    let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_ref_tasks) = minimap2_index_prep(
+    let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_temp_dir, host_ref_tasks) = minimap2_index_prep(
         &config,
         &ram_temp_dir,
         config.args.host_sequence.clone(),
@@ -1924,15 +1925,18 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         "host",
     )
         .await?;
-    cleanup_tasks.extend(host_ref_tasks);
+    try_join_all(host_ref_tasks).await?;
     if let Some(temp) = host_ref_temp {
         temp_files.push(temp);
     }
     if let Some(index_temp) = host_index_temp {
         temp_files.push(index_temp);
     }
+    if let Some(index_temp) = host_temp_dir {
+        temp_dirs.push(index_temp);
+    }
 
-    let (target_ref_fasta_path_inner, target_ref_index_path, target_ref_temp, target_index_temp, target_ref_tasks) = minimap2_index_prep(
+    let (target_ref_fasta_path_inner, target_ref_index_path, target_ref_temp, target_index_temp, target_temp_dir, target_ref_tasks) = minimap2_index_prep(
         &config,
         &ram_temp_dir,
         config.args.target_sequence.clone(),
@@ -1940,13 +1944,17 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         "target",
     )
         .await?;
-    cleanup_tasks.extend(target_ref_tasks);
+    try_join_all(target_ref_tasks).await?;
     if let Some(temp) = target_ref_temp {
         temp_files.push(temp);
     }
     if let Some(index_temp) = target_index_temp {
         temp_files.push(index_temp);
     }
+    if let Some(index_temp) = target_temp_dir {
+        temp_dirs.push(index_temp);
+    }
+
     let target_fasta = target_ref_fasta_path_inner.ok_or_else(|| {
         PipelineError::InvalidConfig("Target FASTA required for filter_with_kraken, call_variants, and evaluate_assembly".to_string())
     })?;
@@ -2018,7 +2026,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     match technology {
         Technology::Illumina => {
             info!("Technology: Illumina");
-            let (_ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = minimap2_index_prep(
+            let (_ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_temp_dir, ercc_ref_tasks) = minimap2_index_prep(
                 &config,
                 &ram_temp_dir,
                 config.args.ercc_sequence.clone(), // Use ercc_sequences as sequence path
@@ -2026,12 +2034,15 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 "ercc",
             )
                 .await?;
-            cleanup_tasks.extend(ercc_ref_tasks);
+            try_join_all(ercc_ref_tasks).await?;
             if let Some(temp) = ercc_ref_temp {
                 temp_files.push(temp);
             }
             if let Some(index_temp) = ercc_index_temp {
                 temp_files.push(index_temp);
+            }
+            if let Some(index_temp) = ercc_temp_dir {
+                temp_dirs.push(index_temp);
             }
 
             // ERCC
@@ -2181,6 +2192,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     }
     let _input_read_stats = join_with_error_handling(val_count_task).await?;
     drop(temp_files);
+    drop(temp_dirs);
 
     info!("Finished consensus genome pipeline.");
     Ok(())

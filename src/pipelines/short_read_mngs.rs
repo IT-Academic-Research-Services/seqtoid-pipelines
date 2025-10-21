@@ -23,6 +23,7 @@ use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBufReader};
 use tokio::fs::{OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
+use tempfile::TempDir;
 use serde_json::Value;
 use twox_hash::XxHash64;
 
@@ -1425,13 +1426,14 @@ async fn minimap2_filter(
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
         Option<NamedTempFile>,
         Option<NamedTempFile>,
+        Option<TempDir>,
     ),
     PipelineError,
 > {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, mut host_ref_tasks) =
+    let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, host_temp_dir,  mut host_ref_tasks) =
         minimap2_index_prep(
             &config,
             &config.ram_temp_dir,
@@ -1440,7 +1442,7 @@ async fn minimap2_filter(
             "host",
         )
             .await?;
-    cleanup_tasks.append(&mut host_ref_tasks);
+    try_join_all(host_ref_tasks).await?; // Have to wait on this to make sure index is in place ahead of running minimap2
     debug!("Host index : {}", host_index_path.display());
 
     let minimap2_config = Minimap2Config {
@@ -1494,7 +1496,6 @@ async fn minimap2_filter(
             })?
     };
 
-
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
@@ -1504,6 +1505,7 @@ async fn minimap2_filter(
             ("-".to_string(), None),
         ]),
     };
+    
     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -1670,6 +1672,7 @@ async fn minimap2_filter(
         cleanup_receivers,
         host_ref_temp,
         host_index_temp,
+        host_temp_dir
     ))
 }
 
@@ -2181,6 +2184,105 @@ async fn dedup_and_subsample(
 
     Ok((ReceiverStream::new(rx), count_rx, cleanup_tasks, cleanup_receivers))
 }
+//
+//
+// /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
+// /// for output in PAF format, allowing downstream metagenomic calling.
+// ///
+// /// # Arguments
+// ///
+// /// * `config` - RunConfig struct
+// /// * `input_stream` - Interleaved FASTQ stream (paired or single-end).
+// ///
+// /// # Returns
+// /// Tuple:
+// /// - Interleaved FASTQ stream : unmapped reads.
+// /// - Vec of cleanup tasks
+// /// - Vec of cleanup receivers
+// /// - Optional temporary FASTA file for non-host reference.
+// /// - Optional temporary minimap2 index file.
+// async fn minimap2_non_host_align(
+//     config: Arc<RunConfig>,
+//     input_stream: ReceiverStream<ParseOutput>,
+// ) -> Result<
+//     (
+//         ReceiverStream<ParseOutput>,
+//         Vec<JoinHandle<Result<(), anyhow::Error>>>,
+//         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+//         Option<NamedTempFile>,
+//         Option<NamedTempFile>,
+//     ),
+//     PipelineError,
+// > {
+//     let mut cleanup_tasks = Vec::new();
+//     let mut cleanup_receivers = Vec::new();
+//
+//     let (_non_host_ref_fasta_path, non_host_index_path, non_host_ref_temp, non_host_index_temp, mut non_host_ref_tasks) =
+//         minimap2_index_prep(
+//             &config,
+//             &config.ram_temp_dir,
+//             config.args.target_sequence.clone(),
+//             config.args.target_index.clone(),
+//             "non-host",
+//         )
+//             .await?;
+//     cleanup_tasks.append(&mut non_host_ref_tasks);
+//     debug!("Non-host index : {}", non_host_index_path.display());
+//
+//     let minimap2_config = Minimap2Config {
+//         minimap2_index_path: non_host_index_path,
+//         option_fields: HashMap::from([
+//             ("-cx".to_string(), Some("sr".to_string())), // Short-read preset, PAF out
+//             ("--secondary".to_string(), Some("yes".to_string())), // allow secondary alignments
+//         ]),
+//     };
+//
+//     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: MINIMAP2_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//
+//     let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
+//         config.clone(),
+//         input_stream.into_inner(),
+//         MINIMAP2_TAG,
+//         minimap2_args,
+//         StreamDataType::IlluminaFastq,
+//         config.args.verbose,
+//     )
+//         .await
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: MINIMAP2_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//     cleanup_tasks.push(minimap2_task);
+//     cleanup_tasks.push(minimap2_err_task);
+//
+//     let minimap2_out_stream = {
+//         let mut guard = minimap2_child.lock().await;
+//         parse_child_output(
+//             &mut guard,
+//             ChildStream::Stdout,
+//             ParseMode::Lines,
+//             config.base_buffer_size,
+//         )
+//             .await
+//             .map_err(|e| PipelineError::ToolExecution {
+//                 tool: MINIMAP2_TAG.to_string(),
+//                 error: e.to_string(),
+//             })?
+//     };
+//
+//     Ok((
+//         ReceiverStream::new(minimap2_out_stream),
+//         cleanup_tasks,
+//         cleanup_receivers,
+//         non_host_ref_temp,
+//         non_host_index_temp,
+//     ))
+// }
+
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2204,6 +2306,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let mut temp_dirs: Vec<TempDir> = Vec::new();
 
     info!("Starting short read mNGS pipeline.");
 
@@ -2315,7 +2418,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Host filtering: mm2
-    let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
+    let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp, host_temp_dir) = minimap2_filter(
         config.clone(),
         host_bt2_out_stream,
         paired,
@@ -2324,6 +2427,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await?;
     cleanup_tasks.append(&mut host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut host_mm2_cleanup_receivers);
+
+    if let Some(temp) = host_ref_temp {
+        temp_files.push(temp);
+    }
+    if let Some(temp) = host_index_temp {
+        temp_files.push(temp);
+    }
+    if let Some(temp) = host_temp_dir {
+        temp_dirs.push(temp);
+    }
 
     // If host is no huma, run an additional filter stage using a human reference
     let post_filter_stream  = if config.args.human_host {
@@ -2347,7 +2460,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         cleanup_receivers.extend(human_bt2_cleanup_receivers);
 
         // human filtering: mm2
-        let (human_mm2_out_stream, human_mm2_count_rx, mut human_mm2_cleanup_tasks, mut human_mm2_cleanup_receivers, human_ref_temp, human_index_temp) = minimap2_filter(
+        let (human_mm2_out_stream, human_mm2_count_rx, mut human_mm2_cleanup_tasks, mut human_mm2_cleanup_receivers, human_ref_temp, human_index_temp, human_index_dir) = minimap2_filter(
             config.clone(),
             human_bt2_out_stream,
             paired,
@@ -2357,15 +2470,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         cleanup_tasks.append(&mut human_mm2_cleanup_tasks);
         cleanup_receivers.append(&mut human_mm2_cleanup_receivers);
 
+        if let Some(temp) = human_ref_temp {
+            temp_files.push(temp);
+        }
+        if let Some(temp) = human_index_temp {
+            temp_files.push(temp);
+        }
+        if let Some(temp) = human_index_dir {
+            temp_dirs.push(temp);
+        }
+
         human_mm2_out_stream
+
     };
 
-    if let Some(temp) = host_ref_temp {
-        temp_files.push(temp);
-    }
-    if let Some(temp) = host_index_temp {
-        temp_files.push(temp);
-    }
+
+
 
     let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
@@ -2504,6 +2624,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
 
     drop(temp_files);
+    drop(temp_dirs);
 
     info!("Finished short read mNGS pipeline.");
     Ok(())

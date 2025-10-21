@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::task::JoinHandle;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use fxhash::FxHashMap;
 use crate::utils::file::{write_vecu8_to_file, extension_remover};
 use crate::utils::streams::{spawn_cmd};
@@ -184,7 +184,9 @@ pub mod minimap2 {
     use std::collections::HashMap;
     use super::*;
     use tokio::fs;
+    use tempfile::TempDir;
     use log::{self, LevelFilter, debug, info, error, warn};
+    use crate::utils::file::available_space_for_path;
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
@@ -205,47 +207,135 @@ pub mod minimap2 {
         ref_type: &str,
     ) -> Result<
         (
-            Option<PathBuf>,             // FASTA path (None if only index provided)
-            PathBuf,                     // Index path (.mmi)
-            Option<NamedTempFile>,       // FASTA temp file (None if only index)
-            Option<NamedTempFile>,       // Index temp file (if created/copied)
-            Vec<JoinHandle<Result<(), anyhow::Error>>>, // Tasks
+            Option<PathBuf>,             // FASTa path
+            PathBuf,                     // index path (.mmi)
+            Option<NamedTempFile>,       // FASTA temp
+            Option<NamedTempFile>,       // Index temp
+            Option<TempDir>,             // temp dir for splits
+            Vec<JoinHandle<Result<(), anyhow::Error>>>,
         ),
         PipelineError,
     > {
         let mut tasks = Vec::new();
         let mut ref_fasta_path: Option<PathBuf> = None;
         let mut ref_temp: Option<NamedTempFile> = None;
+        let mut final_index_path: PathBuf = PathBuf::new();
+        let mut index_temp_file: Option<NamedTempFile> = None;
+        let mut index_temp_dir: Option<TempDir> = None;
 
-        let (index_path, index_temp) = match index_path {
+        match index_path {
+            // pre-existing .mmi index , maybe w split parts
             Some(index) => {
-                let index_path = PathBuf::from(&index);
-                if !index_path.exists() {
-                    return Err(PipelineError::FileNotFound(index_path));
+                let orig_index_path = PathBuf::from(&index);
+                if !orig_index_path.exists() {
+                    return Err(PipelineError::FileNotFound(orig_index_path));
                 }
-                if index_path.extension().map_or(true, |ext| ext != "mmi") {
+                if orig_index_path.extension().map_or(true, |ext| ext != "mmi") {
                     return Err(PipelineError::InvalidConfig(format!(
                         "{} index must have .mmi extension: {}",
                         ref_type,
-                        index_path.display()
+                        orig_index_path.display()
                     )));
                 }
-                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                let index_temp_path = index_temp.path().to_path_buf();
-                let index_temp_path_clone = index_temp_path.clone();
-                let ref_type_owned = ref_type.to_string();
-                let copy_task = tokio::spawn(async move {
-                    fs::copy(&index_path, &index_temp_path_clone)
-                        .await
-                        .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_owned, e))?;
-                    Ok(())
-                });
-                tasks.push(copy_task);
-                (index_temp_path, Some(index_temp))
-            }
-            None => {
 
+                let orig_dir = orig_index_path.parent().ok_or_else(|| {
+                    PipelineError::InvalidConfig("Invalid index path".to_string())
+                })?;
+                let basename = orig_index_path.file_stem().ok_or_else(|| {
+                    PipelineError::InvalidConfig("Invalid index filename".to_string())
+                })?.to_str().ok_or_else(|| {
+                    PipelineError::InvalidConfig("Invalid UTF-8 in filename".to_string())
+                })?;
+
+                //find split parts: {basename}.part_001.idx, etc. —
+                let mut split_files: Vec<PathBuf> = Vec::new();
+                let split_prefix = format!("{}.part_", basename);
+                let mut dir_entries = fs::read_dir(orig_dir).await
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                while let Some(entry) = dir_entries.next_entry().await
+                    .map_err(|e| PipelineError::Other(e.into()))? {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if name.starts_with(&split_prefix) && name.ends_with(".idx") {
+                                split_files.push(path);
+                            }
+                        }
+                    }
+                }
+
+                let is_split = !split_files.is_empty();
+
+                let mut files_to_copy: Vec<(PathBuf, String)> = Vec::new();
+                let mmi_name = orig_index_path.file_name().unwrap().to_string_lossy().to_string();
+                files_to_copy.push((orig_index_path.clone(), mmi_name.clone()));
+                for split in &split_files {
+                    let name = split.file_name().unwrap().to_string_lossy().to_string();
+                    files_to_copy.push((split.clone(), name));
+                }
+
+                // calc size of all index files
+                let mut total_size: u64 = 0;
+                for (p, _) in &files_to_copy {
+                    let meta = fs::metadata(p).await
+                        .map_err(|e| PipelineError::Other(e.into()))?;
+                    total_size += meta.len();
+                }
+                
+                let buffer = 10 * 1024 * 1024; // 10 megs buffer
+                let avail = available_space_for_path(ram_temp_dir)
+                    .await
+                    .map_err(|e| PipelineError::Other(e))?;
+                let enough_space = avail >= total_size + buffer;
+
+                if enough_space {
+                    if is_split {
+                        let temp_dir = TempDir::new_in(ram_temp_dir)
+                            .map_err(|e| PipelineError::Other(e.into()))?;
+                        let temp_index_path = temp_dir.path().join(&mmi_name);
+
+                        for (src, name) in files_to_copy {
+                            let dest = temp_dir.path().join(&name);
+                            let src_cl = src.clone();
+                            let dest_cl = dest.clone();
+                            let ref_type_cl = ref_type.to_string();
+                            let task = tokio::spawn(async move {
+                                fs::copy(&src_cl, &dest_cl).await
+                                    .map_err(|e| anyhow!("Failed to copy {} index file {}: {}", ref_type_cl, name, e))?;
+                                Ok(())
+                            });
+                            tasks.push(task);
+                        }
+
+                        final_index_path = temp_index_path;
+                        index_temp_dir = Some(temp_dir);
+                    } else {
+                        let temp_file = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
+                            .map_err(|e| PipelineError::Other(e.into()))?;
+                        let temp_index_path = temp_file.path().to_path_buf();
+                        let temp_index_path_cl = temp_index_path.clone();
+                        let ref_type_cl = ref_type.to_string();
+                        let task = tokio::spawn(async move {
+                            fs::copy(&orig_index_path, &temp_index_path_cl).await
+                                .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_cl, e))?;
+                            Ok(())
+                        });
+                        tasks.push(task);
+                        final_index_path = temp_index_path;
+                        index_temp_file = Some(temp_file);
+                    }
+                } else {
+                    info!(
+                    "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
+                    ref_type, total_size, avail
+                );
+                    final_index_path = orig_index_path;
+                }
+            }
+
+
+            // or build index from FASTA
+            None => {
                 let sequence_path = sequence.ok_or_else(|| {
                     PipelineError::InvalidConfig("No FASTA or index provided for minimap2".to_string())
                 })?;
@@ -256,9 +346,8 @@ pub mod minimap2 {
                 let is_fasta = sequence_path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map(|ext| FASTA_EXTS.iter().any(|&fasta_ext| ext.eq_ignore_ascii_case(fasta_ext)))
+                    .map(|ext| FASTA_EXTS.iter().any(|&f| ext.eq_ignore_ascii_case(f)))
                     .unwrap_or(false);
-
                 if !is_fasta {
                     return Err(PipelineError::InvalidConfig(format!(
                         "Sequence file must have a FASTA extension ({}): {}",
@@ -270,12 +359,11 @@ pub mod minimap2 {
                 let temp_fasta = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
                     .map_err(|e| PipelineError::Other(e.into()))?;
                 let temp_fasta_path = temp_fasta.path().to_path_buf();
-                let temp_fasta_path_clone = temp_fasta_path.clone();
-                let ref_type_owned = ref_type.to_string();
+                let temp_fasta_path_cl = temp_fasta_path.clone();
+                let ref_type_cl = ref_type.to_string();
                 let copy_task = tokio::spawn(async move {
-                    fs::copy(&sequence_path, &temp_fasta_path_clone)
-                        .await
-                        .map_err(|e| anyhow!("Failed to copy {} FASTA: {}", ref_type_owned, e))?;
+                    fs::copy(&sequence_path, &temp_fasta_path_cl).await
+                        .map_err(|e| anyhow!("Failed to copy {} FASTA: {}", ref_type_cl, e))?;
                     Ok(())
                 });
                 tasks.push(copy_task);
@@ -285,11 +373,13 @@ pub mod minimap2 {
                 let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
                     .map_err(|e| PipelineError::Other(e.into()))?;
                 let index_temp_path = index_temp.path().to_path_buf();
+
                 let minimap2_args = vec![
                     "-d".to_string(),
                     index_temp_path.to_string_lossy().to_string(),
                     temp_fasta_path.to_string_lossy().to_string(),
                 ];
+
                 let (mut child, err_task) = spawn_cmd(
                     Arc::new(config.clone()),
                     MINIMAP2_TAG,
@@ -301,6 +391,7 @@ pub mod minimap2 {
                         tool: MINIMAP2_TAG.to_string(),
                         error: e.to_string(),
                     })?;
+
                 let index_task = tokio::spawn(async move {
                     let status = child.wait().await?;
                     if !status.success() {
@@ -309,13 +400,25 @@ pub mod minimap2 {
                     Ok(())
                 });
                 index_task.await.map_err(|e| PipelineError::Other(e.into()))??;
-                debug!("{} mmi created", ref_type);
+                debug!("{} mmi created in RAM", ref_type);
                 tasks.push(err_task);
-                (index_temp_path, Some(index_temp))
-            }
-        };
 
-        Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
+                final_index_path = index_temp_path;
+                index_temp_file = Some(index_temp);
+            }
+        }
+
+        // ————————————————————————————————————————————————————————————————
+        // FINAL RETURN
+        // ————————————————————————————————————————————————————————————————
+        Ok((
+            ref_fasta_path,
+            final_index_path,
+            ref_temp,
+            index_temp_file,
+            index_temp_dir,
+            tasks,
+        ))
     }
 
     impl ArgGenerator for Minimap2ArgGenerator {
