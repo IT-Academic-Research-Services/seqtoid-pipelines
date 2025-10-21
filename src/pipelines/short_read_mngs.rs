@@ -1505,7 +1505,7 @@ async fn minimap2_filter(
             ("-".to_string(), None),
         ]),
     };
-    
+
     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -2184,104 +2184,106 @@ async fn dedup_and_subsample(
 
     Ok((ReceiverStream::new(rx), count_rx, cleanup_tasks, cleanup_receivers))
 }
-//
-//
-// /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
-// /// for output in PAF format, allowing downstream metagenomic calling.
-// ///
-// /// # Arguments
-// ///
-// /// * `config` - RunConfig struct
-// /// * `input_stream` - Interleaved FASTQ stream (paired or single-end).
-// ///
-// /// # Returns
-// /// Tuple:
-// /// - Interleaved FASTQ stream : unmapped reads.
-// /// - Vec of cleanup tasks
-// /// - Vec of cleanup receivers
-// /// - Optional temporary FASTA file for non-host reference.
-// /// - Optional temporary minimap2 index file.
-// async fn minimap2_non_host_align(
-//     config: Arc<RunConfig>,
-//     input_stream: ReceiverStream<ParseOutput>,
-// ) -> Result<
-//     (
-//         ReceiverStream<ParseOutput>,
-//         Vec<JoinHandle<Result<(), anyhow::Error>>>,
-//         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-//         Option<NamedTempFile>,
-//         Option<NamedTempFile>,
-//     ),
-//     PipelineError,
-// > {
-//     let mut cleanup_tasks = Vec::new();
-//     let mut cleanup_receivers = Vec::new();
-//
-//     let (_non_host_ref_fasta_path, non_host_index_path, non_host_ref_temp, non_host_index_temp, mut non_host_ref_tasks) =
-//         minimap2_index_prep(
-//             &config,
-//             &config.ram_temp_dir,
-//             config.args.target_sequence.clone(),
-//             config.args.target_index.clone(),
-//             "non-host",
-//         )
-//             .await?;
-//     cleanup_tasks.append(&mut non_host_ref_tasks);
-//     debug!("Non-host index : {}", non_host_index_path.display());
-//
-//     let minimap2_config = Minimap2Config {
-//         minimap2_index_path: non_host_index_path,
-//         option_fields: HashMap::from([
-//             ("-cx".to_string(), Some("sr".to_string())), // Short-read preset, PAF out
-//             ("--secondary".to_string(), Some("yes".to_string())), // allow secondary alignments
-//         ]),
-//     };
-//
-//     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
-//         .map_err(|e| PipelineError::ToolExecution {
-//             tool: MINIMAP2_TAG.to_string(),
-//             error: e.to_string(),
-//         })?;
-//
-//     let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
-//         config.clone(),
-//         input_stream.into_inner(),
-//         MINIMAP2_TAG,
-//         minimap2_args,
-//         StreamDataType::IlluminaFastq,
-//         config.args.verbose,
-//     )
-//         .await
-//         .map_err(|e| PipelineError::ToolExecution {
-//             tool: MINIMAP2_TAG.to_string(),
-//             error: e.to_string(),
-//         })?;
-//     cleanup_tasks.push(minimap2_task);
-//     cleanup_tasks.push(minimap2_err_task);
-//
-//     let minimap2_out_stream = {
-//         let mut guard = minimap2_child.lock().await;
-//         parse_child_output(
-//             &mut guard,
-//             ChildStream::Stdout,
-//             ParseMode::Lines,
-//             config.base_buffer_size,
-//         )
-//             .await
-//             .map_err(|e| PipelineError::ToolExecution {
-//                 tool: MINIMAP2_TAG.to_string(),
-//                 error: e.to_string(),
-//             })?
-//     };
-//
-//     Ok((
-//         ReceiverStream::new(minimap2_out_stream),
-//         cleanup_tasks,
-//         cleanup_receivers,
-//         non_host_ref_temp,
-//         non_host_index_temp,
-//     ))
-// }
+
+/// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
+/// for output in PAF format, allowing downstream metagenomic calling.
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `input_stream` - Interleaved FASTQ stream (paired or single-end).
+///
+/// # Returns
+/// Tuple:
+/// - Interleaved FASTQ stream : unmapped reads.
+/// - Vec of cleanup tasks
+/// - Vec of cleanup receivers
+/// - Optional temporary FASTA file for non-host reference.
+/// - Optional temporary minimap2 index file.
+async fn minimap2_non_host_align(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Option<NamedTempFile>,
+        Option<NamedTempFile>,
+        Option<TempDir>
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let (_non_host_ref_fasta_path, non_host_index_path, non_host_ref_temp, non_host_index_temp, non_host_temp_dir,mut non_host_ref_tasks) =
+        minimap2_index_prep(
+            &config,
+            &config.ram_temp_dir,
+            config.args.target_sequence.clone(),
+            config.args.target_index.clone(),
+            "non-host",
+        )
+            .await?;
+    try_join_all(non_host_ref_tasks).await?;
+
+    debug!("Non-host index: {}", non_host_index_path.display());
+
+    let minimap2_config = Minimap2Config {
+        minimap2_index_path: non_host_index_path,
+        option_fields: HashMap::from([
+            ("-cx".to_string(), Some("sr".to_string())), // Short-read preset, PAF out
+            ("--secondary".to_string(), Some("yes".to_string())), // allow secondary alignments
+        ]),
+    };
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(minimap2_task);
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_out_stream = {
+        let mut guard = minimap2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    Ok((
+        ReceiverStream::new(minimap2_out_stream),
+        cleanup_tasks,
+        cleanup_receivers,
+        non_host_ref_temp,
+        non_host_index_temp,
+        non_host_temp_dir
+    ))
+}
 
 
 /// Run function for Short Read mNGS pipelines
@@ -2486,7 +2488,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-
     let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
@@ -2499,30 +2500,41 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
+
+
+
+    // *******************
+    // Non host Alignment
+    // *******************
+
+    // Minimap2 non_host alignment
+
+    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_ref_temp, non_host_index_temp, non_host_index_dir) = minimap2_non_host_align(
+        config.clone(),
+        dedup_stream,
+    )
+        .await?;
+    cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
+    cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
+
+
+    if let Some(temp) = non_host_ref_temp {
+        temp_files.push(temp);
+    }
+    if let Some(index_temp) = non_host_index_temp {
+        temp_files.push(index_temp);
+    }
+    if let Some(index_temp) = non_host_index_dir {
+        temp_dirs.push(index_temp);
+    }
+
+
     // Write deduped stream
     let dedup_write_task = tokio::spawn(stream_to_file(
-        dedup_stream.into_inner(),
-        out_dir.join("deduped.fq"),
+        non_host_mm2_out_stream.into_inner(),
+        out_dir.join("non_host.paf"),
     ));
     cleanup_tasks.push(dedup_write_task);
-
-
-    // *******************
-    // Target Alignment
-    // *******************
-
-    // Minimap2 target alignment
-
-    // let (target_mm2_out_stream, target_mm2_count_rx, mut target_mm2_cleanup_tasks, mut target_mm2_cleanup_receivers, host_ref_temp, host_index_temp) = minimap2_filter(
-    //     config.clone(),
-    //     subsample_stream,
-    //     paired,
-    //     None,
-    // )
-    //     .await?;
-    // cleanup_tasks.append(&mut target_mm2_cleanup_tasks);
-    // cleanup_receivers.append(&mut target_mm2_cleanup_receivers);
-    //
 
     // *******************
     // Results retrieval
