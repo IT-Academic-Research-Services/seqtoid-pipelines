@@ -43,6 +43,7 @@ use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, mini
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
+use crate::utils::paf::PafRecord;
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -2285,6 +2286,110 @@ async fn minimap2_non_host_align(
     ))
 }
 
+/// Converts a PAF stream to an m8 stream, splits it with t_junction for file writing,
+/// and returns the main m8 stream along with cleanup handles.
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `input_stream` - Interleaved FASTQ stream (paired or single-end).
+///
+/// # Returns
+/// Tuple:
+/// - m8 stream
+/// - Vec of cleanup tasks
+/// - Vec of cleanup receivers
+pub async fn paf_to_m8(
+    config: Arc<RunConfig>,
+    mut input_stream: ReceiverStream<ParseOutput>,
+    m8_path: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+)> {
+    // Channel for converted m8 lines
+    let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    // Clone config for closure — fixes E0382
+    let config_clone = config.clone();
+
+    // Spawn PAF → m8 conversion task
+    let conversion_handle = tokio::spawn(async move {
+        while let Some(item) = input_stream.next().await {
+            let line_bytes = match item {
+                ParseOutput::Bytes(b) => b,
+                _ => {
+                    debug!("Skipping non-bytes item in PAF stream");
+                    continue;
+                }
+            };
+
+            let line = match String::from_utf8((*line_bytes).clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Invalid UTF-8 in PAF line: {}", e);
+                    continue;
+                }
+            };
+
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let record = match PafRecord::parse_line(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("Failed to parse PAF line: {} — {}", e, line);
+                    continue;
+                }
+            };
+
+            // Use user-provided nt_db_size — no fallback
+            let genome_size = config_clone.args.nt_db_size as f64;
+            let m8_line = record.to_m8_line(genome_size);
+            let m8_bytes = (m8_line + "\n").into_bytes();
+
+            if m8_tx.send(ParseOutput::Bytes(Arc::new(m8_bytes))).await.is_err() {
+                return Err(anyhow!("m8 channel send failed"));
+            }
+        }
+        Ok(())
+    });
+
+    let m8_stream = ReceiverStream::new(m8_rx);
+
+    // Split stream: one for file, one for downstream
+    let (mut streams, done_rx) = t_junction(
+        m8_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "paf_to_m8_stream".to_string(),
+        None,
+    )
+        .await?;
+
+    let main_stream = streams.remove(0);
+    let file_stream = streams.remove(0);
+
+    // Write to file
+    let write_task = write_byte_stream_to_file(
+        &m8_path,
+        ReceiverStream::new(file_stream),
+        Some(config.base_buffer_size),
+    )
+        .await?;
+
+    Ok((
+        ReceiverStream::new(main_stream),
+        vec![conversion_handle, write_task],
+        vec![done_rx],
+    ))
+}
+
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2517,7 +2622,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
 
-
     if let Some(temp) = non_host_ref_temp {
         temp_files.push(temp);
     }
@@ -2528,13 +2632,30 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         temp_dirs.push(index_temp);
     }
 
+    let m8_file_path = file_path_manipulator(
+        &PathBuf::from(&no_ext_sample_base_buf),
+        Some(&out_dir),
+        None,
+        Some(".m8"),
+        "",
+    );
 
-    // Write deduped stream
-    let dedup_write_task = tokio::spawn(stream_to_file(
-        non_host_mm2_out_stream.into_inner(),
-        out_dir.join("non_host.paf"),
+    let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
+        config.clone(),
+        non_host_mm2_out_stream,
+        m8_file_path,
+    )
+        .await?;
+    cleanup_tasks.append(&mut m8_cleanup_tasks);
+    cleanup_receivers.append(&mut m8_cleanup_receivers);
+
+
+    // Write test stream
+    let test_write_task = tokio::spawn(stream_to_file(
+        m8_stream.into_inner(),
+        out_dir.join("non_host.m8"),
     ));
-    cleanup_tasks.push(dedup_write_task);
+    cleanup_tasks.push(test_write_task);
 
     // *******************
     // Results retrieval
