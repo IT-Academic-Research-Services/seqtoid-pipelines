@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
+use std::fs::File as StdFile;
+use std::io::{BufReader as StdBufReader};
 
 use anyhow::{Result, anyhow};
 use log::{info, warn, debug};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use csv::ReaderBuilder;
 use sled::{Db, Tree};
 
 pub type Taxid = u32;  // NCBI taxids fit in u32
@@ -12,11 +15,25 @@ pub type Taxid = u32;  // NCBI taxids fit in u32
 // *******************
 // DB creation functions
 // *******************
+
+/// Builds a taxid-lineages sled DB from taxdump.tar.gz files
+/// Typical location, sourced from NCBI:
+/// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
+///
+/// # Arguments
+///
+///  * `nodes_path` - path to the nodes.dmp file
+/// * `merged_path` - path to the megred.dmp file
+/// * `db_path` -  output db path
+///
+/// # Returns
+///
+/// Result
 pub async fn build_taxid_lineages_db(
-    nodes_path: &Path,  // nodes.dmp file
+    nodes_path: &Path,  //
     merged_path: &Path, // merged.dmp
-    db_path: &Path,     // output .db
-) -> Result<Db> {
+    db_path: &PathBuf,     // output .db
+) -> Result<()> {
 
     // load parent map taxid → parent_taxid
     let mut parent_map: HashMap<Taxid, Taxid> = HashMap::new();
@@ -76,6 +93,45 @@ pub async fn build_taxid_lineages_db(
     }
 
     db.flush_async().await?;
-    info!("Built lineages DB with {} entries", seen.len());
-    Ok(db)
+    info!("Built lineages DB with {} entries at {}", seen.len(), db_path.display());
+    Ok(())
+}
+
+/// Builds a accession2taxid sled DB from a known accession2taxid file
+/// Typical location, sourced from NCBI:
+/// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz
+///
+/// # Arguments
+///
+///  * `gz_path` - accession2taxid.gz
+/// * `db_path` -  output db path
+///
+/// # Returns
+/// Result
+pub async fn build_accession2taxid_db(
+    gz_path: &Path,
+    db_path: &Path,
+) -> Result<()> {
+    let db = sled::open(db_path)?;
+    let tree: Tree = db.open_tree("acc2taxid")?;
+
+    let file = StdFile::open(gz_path)?;
+    let gz = flate2::read::GzDecoder::new(StdBufReader::new(file));
+    let mut rdr = ReaderBuilder::new()
+        .delimiter(b'\t')
+        .from_reader(gz);
+
+    let mut count = 0;
+    for result in rdr.records() {
+        let record = result?;
+        if record.len() < 2 { continue; }
+        let acc = record[0].as_bytes().to_vec();
+        let taxid: Taxid = record[1].parse()?;
+        tree.insert(acc, taxid.to_le_bytes().as_slice())?;
+        count += 1;
+    }
+
+    db.flush_async().await?;
+    info!("Built acc2taxid DB with {} entries at {}", count, db_path.display());
+    Ok(())
 }
