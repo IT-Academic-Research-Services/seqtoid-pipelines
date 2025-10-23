@@ -2,6 +2,8 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
+use tokio::io::AsyncBufReadExt;
+use tokio_stream::StreamExt;
 
 use crate::config::defs::{Taxid, Lineage};
 
@@ -9,23 +11,23 @@ const INVALID_CALL_BASE_ID: i64 = -100;
 
 /// Single BLAST m8 line
 #[derive(Debug, Clone)]
-struct M8Record {
-    qname: String,
-    tname: String,
-    pident: f64,
-    alen: u64,
-    mismatch: u64,
-    gapopen: u64,
-    qstart: u64,
-    qend: u64,
-    tstart: u64,
-    tend: u64,
-    evalue: f64,
-    bitscore: f64,
+pub struct M8Record {
+    pub qname: String,       // Read ID
+    pub tname: String,       // Accession ID
+    pub pident: f64,         // Percent identity
+    pub alen: u64,           // Alignment length
+    pub mismatch: u64,       // Mismatches
+    pub gapopen: u64,        // Gap openings
+    pub qstart: u64,         // Query start
+    pub qend: u64,           // Query end
+    pub tstart: u64,         // Target start
+    pub tend: u64,           // Target end
+    pub evalue: f64,         // E-value
+    pub bitscore: f64,       // Bitscore
 }
 
 impl M8Record {
-    fn parse_line(line: &str) -> Result<Self> {
+    pub fn parse_line(line: &str) -> Result<Self> {
         let mut fields = line.split('\t');
         macro_rules! next {
             () => {
@@ -51,14 +53,13 @@ impl M8Record {
 
 
 // *******************
-// Phylo functions based on m8 records
+// PTaxonomy helper functions based on m8 records
 // *******************
 
 /// Build a negative taxid for “no-specific-call” at a given level.
 fn negative_taxid(level: u8, parent: i64) -> i64 {
     INVALID_CALL_BASE_ID - (level as i64) * 100 - parent
 }
-
 
 
 /// Walk up the lineage until we find a level where all hits agree.
@@ -71,7 +72,7 @@ fn negative_taxid(level: u8, parent: i64) -> i64 {
 /// # Returns
 ///
 /// Tuple ()
-fn consensus_level(
+pub fn consensus_level(
     hits: &[M8Record],
     lineage_map: &HashMap<Taxid, Lineage>,
 ) -> (u8, i64, Vec<M8Record>) {

@@ -11,4 +11,4 @@ pub mod sambam;
 pub mod system;
 pub mod paf;
 pub mod blast;
-mod taxonomy;
+pub mod taxonomy;

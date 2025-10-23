@@ -8,7 +8,7 @@ use log::{info, warn, debug};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use csv::ReaderBuilder;
-use sled::{Db, Tree};
+use sled::{Db, Tree, IVec};
 
 use crate::config::defs::{Taxid, Lineage};
 
@@ -97,6 +97,9 @@ pub async fn build_taxid_lineages_db(
     Ok(())
 }
 
+
+
+
 /// Builds a accession2taxid sled DB from a known accession2taxid file
 /// Typical location, sourced from NCBI:
 /// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz
@@ -134,4 +137,33 @@ pub async fn build_accession2taxid_db(
     db.flush_async().await?;
     info!("Built acc2taxid DB with {} entries at {}", count, db_path.display());
     Ok(())
+}
+
+
+// *******************
+// DB access functions
+// *******************
+
+/// Unpacks the byte arrangement made in the sled DB build_taxid_lineages_db
+/// Typical location, sourced from NCBI:
+/// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz
+///
+/// # Arguments
+///
+///  * `gz_path` - accession2taxid.gz
+/// * `db_path` -  output db path
+///
+/// # Returns
+/// Result
+pub fn unpack_lineage_bytes(ivec: &IVec) -> Result<Vec<Taxid>> {
+    let data = ivec.as_ref();
+    if data.len() < 4 { return Err(anyhow!("short lineage")); }
+    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    if data.len() != 4 + 4 * count { return Err(anyhow!("malformed lineage")); }
+    let mut lineage = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = 4 + 4 * i;
+        lineage.push(u32::from_le_bytes(data[start..start+4].try_into().unwrap()));
+    }
+    Ok(lineage)
 }

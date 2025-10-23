@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::io::{BufReader, BufRead};
 use std::hash::Hasher;
 use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
-use std::collections::{HashMap, BinaryHeap};
+use std::collections::{HashMap, BinaryHeap, HashSet};
 use std::cmp::Reverse;
 
 use anyhow::{anyhow, Result};
@@ -21,13 +21,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBufReader};
-use tokio::fs::{OpenOptions as TokioOpenOptions};
+use tokio::fs::{File, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use serde_json::Value;
 use twox_hash::XxHash64;
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
@@ -44,6 +44,7 @@ use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
+use crate::utils::blast::{M8Record, consensus_level};
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -2391,6 +2392,263 @@ pub async fn paf_to_m8(
 }
 
 
+/// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `m8_inpout` - line-based m8 format input stream
+/// * `taxid_lineages_db_path` - path to sled-backed originally derived from tp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
+/// * `duplicate_cluster_sizes_path` - optinal duplicate cluster sizes for weighting
+/// * `taxon_blacklist_path` - optional list of excluded taxa
+/// * `deuterostome_path` - optional list of excluded taxa
+/// * `taxon_whitelist_path` -optional list of included taxa
+/// * `min_alignment_length` - will not attempt alignment under this threshold
+///
+///
+/// # Returns
+/// Tuple:
+/// - m8 stream
+///  -hit-summary TSV stream
+/// - Vec of cleanup tasks
+/// - Vec of cleanup receivers
+pub async fn call_hits_m8_stream(
+    config: Arc<RunConfig>,
+    mut m8_input: ReceiverStream<ParseOutput>,
+    accession2taxid_db_path: PathBuf,
+    taxid_lineages_db_path: PathBuf,
+    duplicate_cluster_sizes_path: Option<PathBuf>,
+    taxon_blacklist_path: Option<PathBuf>,
+    deuterostome_path: Option<PathBuf>,
+    taxon_whitelist_path: Option<PathBuf>,
+    min_alignment_length: u64,
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+)> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let acc2taxid_db = sled::open(&accession2taxid_db_path)?;
+    let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
+
+    let lineages_db = sled::open(&taxid_lineages_db_path)?;
+    let lineages_tree = lineages_db.open_tree("lineages")?;
+
+    // build in-memory lineage map for faster lookups
+    let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
+    for entry in lineages_tree.iter() {
+        let (key, value) = entry?;
+        let taxid = u32::from_le_bytes(key[..4].try_into().map_err(|_| anyhow!("bad taxid key"))?);
+        let lineage = crate::utils::taxonomy::unpack_lineage_bytes(&value)?;
+        lineage_map.insert(taxid, lineage);
+    }
+
+    let blacklist = load_optional_set(taxon_blacklist_path).await?;
+    let deuterostome = load_optional_set(deuterostome_path).await?;
+    let whitelist = load_optional_set(taxon_whitelist_path).await?;
+
+    // optional, for read weighting
+    let duplicate_cluster_sizes = if let Some(p) = duplicate_cluster_sizes_path {
+        Some(load_duplicate_cluster_sizes(&p).await?)
+    } else {
+        None
+    };
+
+    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    let processing_task = tokio::spawn(async move {
+        let mut read_groups: HashMap<String, Vec<crate::utils::blast::M8Record>> = HashMap::new();
+
+        // Stream m8 input, group by read_id
+        while let Some(item) = m8_input.next().await {
+            let line = match item {
+                ParseOutput::Bytes(b) => String::from_utf8_lossy(&b).to_string(),
+                _ => continue,
+            };
+
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let rec = match crate::utils::blast::M8Record::parse_line(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("m8 parse error: {} – {}", e, line);
+                    continue;
+                }
+            };
+
+            if rec.alen < min_alignment_length {
+                continue;
+            }
+
+            read_groups.entry(rec.qname.clone()).or_default().push(rec);
+        }
+
+        // Process each read group
+        for (read_id, hits) in read_groups {
+            let mut valid_hits = Vec::new();
+            for hit in &hits {
+                // Lookup accession → taxid
+                if let Ok(Some(taxid_ivec)) = acc2taxid_tree.get(hit.tname.as_bytes()) {
+                    let taxid_bytes: [u8; 4] = taxid_ivec[..4].try_into().map_err(|_| anyhow!("corrupt taxid"))?;
+                    let taxid = u32::from_le_bytes(taxid_bytes);
+                    if taxid == 0 { continue; }
+
+                    // Apply filters (blacklist, deuterostome, whitelist)
+                    if is_filtered(taxid as i64, &blacklist, &deuterostome, &whitelist) {
+                        continue;
+                    }
+
+                    valid_hits.push(hit.clone());
+                }
+            }
+
+            if valid_hits.is_empty() {
+                continue;
+            }
+
+            // sort by bitscore  descending
+            valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal));
+            let best = valid_hits[0].clone();
+
+            // Compute consensus taxonomy level
+            let (tax_level, consensus_taxid, consensus_hits) = crate::utils::blast::consensus_level(&valid_hits, &lineage_map);
+
+            // Write deduped m8 line (same format as input)
+            let dedup_line = format!(
+                "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
+                best.qname,
+                best.tname,
+                best.pident,
+                best.alen,
+                best.mismatch,
+                best.gapopen,
+                best.qstart,
+                best.qend,
+                best.tstart,
+                best.tend,
+                best.evalue,
+                best.bitscore
+            );
+            dedup_tx.send(ParseOutput::Bytes(Arc::new((dedup_line + "\n").into_bytes()))).await?;
+
+            // Write hit-summary line (read_id, accession, species, genus, family, tax_level)
+            let species = consensus_hits
+                .first()
+                .and_then(|h| lineage_map.get(&h.tname.parse::<Taxid>().unwrap_or(0)))
+                .and_then(|lin| lin.get(0).copied())
+                .map(|t| t as i64)
+                .unwrap_or(-100);
+            let genus = consensus_hits
+                .first()
+                .and_then(|h| lineage_map.get(&h.tname.parse::<Taxid>().unwrap_or(0)))
+                .and_then(|lin| lin.get(1).copied())
+                .map(|t| t as i64)
+                .unwrap_or(-200);
+            let family = consensus_hits
+                .first()
+                .and_then(|h| lineage_map.get(&h.tname.parse::<Taxid>().unwrap_or(0)))
+                .and_then(|lin| lin.get(2).copied())
+                .map(|t| t as i64)
+                .unwrap_or(-300);
+
+            let summary_line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                read_id, best.tname, species, genus, family, tax_level
+            );
+            summary_tx.send(ParseOutput::Bytes(Arc::new(summary_line.into_bytes()))).await?;
+        }
+
+        Ok(())
+    });
+    cleanup_tasks.push(processing_task);
+
+    let dedup_stream = ReceiverStream::new(dedup_rx);
+    let (mut dedup_branches, dedup_done) = t_junction(
+        dedup_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "call_hits_m8_dedup".to_string(),
+        None,
+    )
+        .await?;
+    cleanup_receivers.push(dedup_done);
+    let dedup_main = dedup_branches.remove(0);
+    let dedup_file = dedup_branches.remove(0);
+
+    let summary_stream = ReceiverStream::new(summary_rx);
+    let (mut summary_branches, summary_done) = t_junction(
+        summary_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "call_hits_m8_summary".to_string(),
+        None,
+    )
+        .await?;
+    cleanup_receivers.push(summary_done);
+    let summary_main = summary_branches.remove(0);
+    let summary_file = summary_branches.remove(0);
+
+    Ok((
+        ReceiverStream::new(dedup_main),
+        ReceiverStream::new(summary_main),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
+
+async fn load_optional_set(path: Option<PathBuf>) -> Result<HashSet<i64>> {
+    let mut set = HashSet::new();
+    if let Some(p) = path {
+        let file = File::open(p).await?;
+        let mut lines = tokio::io::BufReader::new(file).lines();
+        while let Some(l) = lines.next_line().await? {
+            if let Ok(v) = l.parse::<i64>() {
+                set.insert(v);
+            }
+        }
+    }
+    Ok(set)
+}
+
+async fn load_duplicate_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
+    let file = File::open(path).await?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut map = HashMap::new();
+    while let Some(line) = lines.next_line().await? {
+        let mut parts = line.split('\t');
+        let read_id = parts.next().ok_or_else(|| anyhow!("bad dup line"))?.to_string();
+        let size: u64 = parts.next().unwrap_or("1").parse()?;
+        map.insert(read_id, size);
+    }
+    Ok(map)
+}
+
+fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>, whitelist: &HashSet<i64>) -> bool {
+    if blacklist.contains(&taxid) || deuterostome.contains(&taxid) {
+        return true;
+    }
+    if !whitelist.is_empty() && !whitelist.contains(&taxid) {
+        return true;
+    }
+    false
+}
+
+
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -2648,6 +2906,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await?;
     cleanup_tasks.append(&mut m8_cleanup_tasks);
     cleanup_receivers.append(&mut m8_cleanup_receivers);
+
+    // let taxid_lineages_db = sled::open(&config.taxid_lineages_db)?;
+    // let tree = db.open_tree("lineages")?;
 
 
     // Write test stream
