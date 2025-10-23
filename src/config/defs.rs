@@ -36,6 +36,11 @@ pub const KALLISTO_TAG: &str = "kallisto";
 pub const STAR_TAG: &str = "STAR";
 pub const CZID_DEDUP_TAG: &str = "czid-dedup";
 
+
+// Taxonomy defs
+pub type Taxid = u32;  // NCBI taxids fit in u32
+pub type Lineage = Vec<Taxid>;
+
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();

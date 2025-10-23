@@ -143,5 +143,8 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 832400799511)]
     pub nt_db_size: usize,
+
+    #[clap(long, default_value = "taxid-lineages.db")]
+    pub taxid_lineages_db: String,
     
 }

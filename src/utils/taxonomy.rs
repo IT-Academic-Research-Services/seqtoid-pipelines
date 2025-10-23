@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use csv::ReaderBuilder;
 use sled::{Db, Tree};
 
-pub type Taxid = u32;  // NCBI taxids fit in u32
+use crate::config::defs::{Taxid, Lineage};
 
 // *******************
 // DB creation functions
