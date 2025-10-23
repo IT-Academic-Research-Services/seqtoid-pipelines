@@ -10,4 +10,4 @@ pub mod plotting;
 pub mod sambam;
 pub mod system;
 pub mod paf;
-
+pub mod blast;

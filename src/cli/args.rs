@@ -140,5 +140,8 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 1000000)]
     pub max_subsample: usize,
+
+    #[arg(long, default_value_t = 832400799511)]
+    pub nt_db_size: usize,
     
 }
