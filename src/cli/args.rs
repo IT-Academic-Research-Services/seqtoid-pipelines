@@ -141,7 +141,7 @@ pub struct Arguments {
     #[arg(long, default_value_t = 1000000)]
     pub max_subsample: usize,
 
-    #[arg(long, default_value_t = 832400799511)]
+    #[arg(long, default_value_t = 1_528_186_360_278)]
     pub nt_db_size: usize,
 
     #[clap(long, default_value = "taxid-lineages.db")]
