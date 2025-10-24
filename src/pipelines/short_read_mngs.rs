@@ -2414,13 +2414,6 @@ pub async fn paf_to_m8(
 pub async fn call_hits_m8_stream(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
-    accession2taxid_db_path: PathBuf,
-    taxid_lineages_db_path: PathBuf,
-    duplicate_cluster_sizes_path: Option<PathBuf>,
-    taxon_blacklist_path: Option<PathBuf>,
-    deuterostome_path: Option<PathBuf>,
-    taxon_whitelist_path: Option<PathBuf>,
-    min_alignment_length: u64,
 ) -> Result<(
     ReceiverStream<ParseOutput>,
     ReceiverStream<ParseOutput>,
@@ -2430,11 +2423,24 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let acc2taxid_db = sled::open(&accession2taxid_db_path)?;
-    let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
-
-    let lineages_db = sled::open(&taxid_lineages_db_path)?;
+    let lineages_db_path = PathBuf::from(config.args.taxid_lineages_db.clone());
+    let metadata = fs::metadata(lineages_db_path.clone())?;
+    let file_type = metadata.file_type();
+    if !file_type.is_dir() {
+        return Err(PipelineError::NotDirectory(lineages_db_path));
+    }
+    let lineages_db = sled::open(&lineages_db_path)?;
     let lineages_tree = lineages_db.open_tree("lineages")?;
+
+
+    let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
+    let metadata = fs::metadata(acc2taxid_path.clone())?;
+    let file_type = metadata.file_type();
+    if !file_type.is_dir() {
+        return Err(PipelineError::NotDirectory(acc2taxid_path));
+    }
+    let acc2taxid_db = sled::open(&acc2taxid_path)?;
+    let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
 
     // build in-memory lineage map for faster lookups
     let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
@@ -2445,12 +2451,12 @@ pub async fn call_hits_m8_stream(
         lineage_map.insert(taxid, lineage);
     }
 
-    let blacklist = load_optional_set(taxon_blacklist_path).await?;
-    let deuterostome = load_optional_set(deuterostome_path).await?;
-    let whitelist = load_optional_set(taxon_whitelist_path).await?;
+    let blacklist = load_optional_set(config.args.taxon_blacklist).await?;
+    let deuterostome = load_optional_set(config.args.taxon_whitelist).await?;
+    let whitelist = load_optional_set(config.args.taxon_whitelist).await?;
 
     // optional, for read weighting
-    let duplicate_cluster_sizes = if let Some(p) = duplicate_cluster_sizes_path {
+    let duplicate_cluster_sizes = if let Some(p) = config.args.duplicate_cluster_sizes {
         Some(load_duplicate_cluster_sizes(&p).await?)
     } else {
         None
@@ -2481,7 +2487,7 @@ pub async fn call_hits_m8_stream(
                 }
             };
 
-            if rec.alen < min_alignment_length {
+            if rec.alen < config.args.min_alignment_length {
                 continue;
             }
 
@@ -2610,10 +2616,11 @@ pub async fn call_hits_m8_stream(
 }
 
 
-async fn load_optional_set(path: Option<PathBuf>) -> Result<HashSet<i64>> {
+async fn load_optional_set(path: Option<String>) -> Result<HashSet<i64>> {
     let mut set = HashSet::new();
     if let Some(p) = path {
-        let file = File::open(p).await?;
+        let path = PathBuf::from(p);
+        let file = File::open(path).await?;
         let mut lines = tokio::io::BufReader::new(file).lines();
         while let Some(l) = lines.next_line().await? {
             if let Ok(v) = l.parse::<i64>() {
@@ -2624,7 +2631,8 @@ async fn load_optional_set(path: Option<PathBuf>) -> Result<HashSet<i64>> {
     Ok(set)
 }
 
-async fn load_duplicate_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
+async fn load_duplicate_cluster_sizes(file_string: &String) -> Result<HashMap<String, u64>> {
+    let path = PathBuf::from(file_string);
     let file = File::open(path).await?;
     let mut lines = tokio::io::BufReader::new(file).lines();
     let mut map = HashMap::new();
@@ -2864,8 +2872,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
 
-
-
     // *******************
     // Non host Alignment
     // *******************
@@ -2907,8 +2913,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut m8_cleanup_tasks);
     cleanup_receivers.append(&mut m8_cleanup_receivers);
 
-    // let taxid_lineages_db = sled::open(&config.taxid_lineages_db)?;
-    // let tree = db.open_tree("lineages")?;
+
+
+    let (call_stream, call_summary_stream, call_cleanup_tasks, call_cleanup_receivers) = call_hits_m8_stream(
+        config.clone(), m8_stream
+    ).await?;
+
+
 
 
     // Write test stream

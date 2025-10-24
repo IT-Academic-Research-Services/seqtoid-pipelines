@@ -146,5 +146,23 @@ pub struct Arguments {
 
     #[clap(long, default_value = "taxid-lineages.db")]
     pub taxid_lineages_db: String,
+
+    #[clap(long, default_value = "accession2_taxid_sled.db")]
+    pub acc2taxid_db: String,
+
+    #[clap(long, default_value = "taxon_whitelist.txt")]
+    pub taxon_whitelist: String,
+
+    #[clap(long, default_value = "taxon_blacklist.txt")]
+    pub taxon_blacklist: String,
+
+    #[clap(long, default_value = "deuterostome_taxids.txt")]
+    pub deuterostome_list: String,
+
+    #[clap(long, default_value = "duplicate_cluster_sizes.tsv")]
+    pub duplicate_cluster_sizes: String,
+
+    #[arg(long, default_value_t = 36)]
+    pub min_alignment_length: u64,
     
 }
