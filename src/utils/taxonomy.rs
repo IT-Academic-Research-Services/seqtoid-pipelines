@@ -30,9 +30,9 @@ use crate::config::defs::{Taxid, Lineage};
 ///
 /// Result
 pub async fn build_taxid_lineages_db(
-    nodes_path: &Path,  //
-    merged_path: &Path, // merged.dmp
-    db_path: &PathBuf,     // output .db
+    nodes_path: &PathBuf,
+    merged_path: &PathBuf,
+    db_path: &PathBuf,
 ) -> Result<()> {
 
     // load parent map taxid → parent_taxid
@@ -99,7 +99,6 @@ pub async fn build_taxid_lineages_db(
 
 
 
-
 /// Builds a accession2taxid sled DB from a known accession2taxid file
 /// Typical location, sourced from NCBI:
 /// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz
@@ -112,8 +111,8 @@ pub async fn build_taxid_lineages_db(
 /// # Returns
 /// Result
 pub async fn build_accession2taxid_db(
-    gz_path: &Path,
-    db_path: &Path,
+    gz_path: &PathBuf,
+    db_path: &PathBuf,
 ) -> Result<()> {
     let db = sled::open(db_path)?;
     let tree: Tree = db.open_tree("acc2taxid")?;
@@ -127,9 +126,18 @@ pub async fn build_accession2taxid_db(
     let mut count = 0;
     for result in rdr.records() {
         let record = result?;
-        if record.len() < 2 { continue; }
-        let acc = record[0].as_bytes().to_vec();
-        let taxid: Taxid = record[1].parse()?;
+        if record.len() < 3 {
+            warn!("Skipping invalid record: {:?}", record);
+            continue;
+        }
+        let acc = record[0].as_bytes().to_vec(); // Use accession (first column)
+        let taxid: Taxid = match record[2].parse() { // Use taxid (third column)
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to parse taxid from record: {:?}", record);
+                return Err(anyhow!("Failed to parse taxid: {}", e));
+            }
+        };
         tree.insert(acc, taxid.to_le_bytes().as_slice())?;
         count += 1;
     }
