@@ -57,31 +57,34 @@ impl M8Record {
 // *******************
 
 /// Build a negative taxid for “no-specific-call” at a given level.
-fn negative_taxid(level: u8, parent: i64) -> i64 {
-    INVALID_CALL_BASE_ID - (level as i64) * 100 - parent
+///  -100 * level (level 1=species -100, 2=genus -200, 3=family -300)
+fn negative_taxid(level: u8) -> i64 {
+    -100 * (level as i64)
 }
 
 
-/// Walk up the lineage until we find a level where all hits agree.
+/// Computes the common lineage for a set of hits, matching m8.py _common_lineage logic.
+/// Assumes lineages are [species, genus, family] leaf-to-root with possible negatives.
 ///
 /// # Arguments
 ///
 ///  * `hits` - list of m8 records
-/// * `lineage_map` - derived from taxid DB
+/// * `lineage_map` - derived from taxid DB (taxid -> [species, genus, family])
 ///
 /// # Returns
 ///
-/// Tuple ()
+/// (level, consensus_taxid, selected_hits) where level=1 species, 2 genus, 3 family, 0 none;
+/// consensus_taxid is the taxid at that level.
 pub fn consensus_level(
     hits: &[M8Record],
     lineage_map: &HashMap<Taxid, Lineage>,
 ) -> (u8, i64, Vec<M8Record>) {
-    let lineages: Vec<&Lineage> = hits
+    let lineages: Vec<Lineage> = hits
         .iter()
-        // Map accession (tname) → taxid → lineage
+        // Map accession (tname) → taxid → lineage [species, genus, family]
         .filter_map(|r| {
             let taxid: Taxid = r.tname.parse().ok()?;
-            lineage_map.get(&taxid)
+            lineage_map.get(&taxid).cloned()
         })
         .collect();
 
@@ -89,17 +92,25 @@ pub fn consensus_level(
         return (0, 0, Vec::new());
     }
 
-    let max_depth = lineages.iter().map(|v| v.len()).max().unwrap_or(0);
-    for depth in 0..max_depth {
-        let taxids: HashSet<i64> = lineages
+    let mut max_level = 0u8;
+    let mut consensus_taxid = 0i64;
+
+    for level in 0..3 {  // 0=species, 1=genus, 2=family
+        let taxids: HashSet<i32> = lineages
             .iter()
-            .filter_map(|lin| lin.get(depth).copied().map(|t| t as i64))
+            .map(|lin| lin.get(level).copied().unwrap_or(-1))
+            .filter(|&t| t > 0)
             .collect();
 
         if taxids.len() == 1 {
-            let consensus = *taxids.iter().next().unwrap();
-            return (depth as u8 + 1, consensus, hits.to_vec());
+            let agreed = *taxids.iter().next().unwrap() as i64;
+            max_level = (level + 1) as u8;  // Update to this more specific level
+            consensus_taxid = agreed;
+        } else {
+            // No agreement at this level; stop as deeper levels won't agree
+            break;
         }
     }
-    (0, 0, Vec::new())
+
+    (max_level, consensus_taxid, hits.to_vec())
 }

@@ -38,7 +38,7 @@ pub const CZID_DEDUP_TAG: &str = "czid-dedup";
 
 
 // Taxonomy defs
-pub type Taxid = u32;  // NCBI taxids fit in u32
+pub type Taxid = i32;
 pub type Lineage = Vec<Taxid>;
 
 lazy_static! {

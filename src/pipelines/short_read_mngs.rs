@@ -2440,7 +2440,7 @@ pub async fn call_hits_m8_stream(
     let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
     for entry in lineages_tree.iter() {
         let (key, value) = entry?;
-        let taxid = u32::from_le_bytes(key[..4].try_into().map_err(|_| anyhow!("bad taxid key"))?);
+        let taxid = i32::from_le_bytes(key[..4].try_into().map_err(|_| anyhow!("bad taxid key"))?);
         let lineage = crate::utils::taxonomy::unpack_lineage_bytes(&value)?;
         lineage_map.insert(taxid, lineage);
     }
