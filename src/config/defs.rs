@@ -200,32 +200,54 @@ impl RunConfig {
 
 #[derive(thiserror::Error, Debug)]
 pub enum PipelineError {
+
+    // File-related errors
     #[error("File not found: {0}")]
     FileNotFound(PathBuf),
-    #[error("Invalid FASTQ format in {0}")]
-    InvalidFastqFormat(String),
+
+    #[error("Should be a directory: {0}")]
+    NotDirectory(PathBuf),
+
     #[error("I/O error: {0}")]
     IOError(String),
-    #[error("Tool execution failed: {tool} with error: {error}")]
-    ToolExecution { tool: String, error: String },
-    #[error("Stream data dropped unexpectedly")]
-    StreamDataDropped,
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
-    #[error("Reference sequence retrieval failed: {0}")]
-    ReferenceRetrievalFailed(String),
-    #[error("Empty stream encountered")]
-    EmptyStream,
-    #[error("No sequences matched target taxonomy ID: {0}")]
-    NoTargetSequences(String),
-    #[error("No alignments.")]
-    NoAlignments,
-    #[error("Argument missing: {0}")]
-    MissingArgument(String),
+
     #[error("Wrong extension: {0}")]
     WrongExtension(String),
-    #[error("Invalid extension: {0}")]
-    Other(#[from] anyhow::Error), // Wraps external errors
+
+    // Format-related errors
+    #[error("Invalid FASTQ format in {0}")]
+    InvalidFastqFormat(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    // Stream-related errors
+    #[error("Stream data dropped unexpectedly")]
+    StreamDataDropped,
+
+    #[error("Empty stream encountered")]
+    EmptyStream,
+
+    // Tool and execution errors
+    #[error("Tool execution failed: {tool} with error: {error}")]
+    ToolExecution { tool: String, error: String },
+
+    #[error("Argument missing: {0}")]
+    MissingArgument(String),
+
+    // Bioinformatics-specific errors
+    #[error("Reference sequence retrieval failed: {0}")]
+    ReferenceRetrievalFailed(String),
+
+    #[error("No sequences matched target taxonomy ID: {0}")]
+    NoTargetSequences(String),
+
+    #[error("No alignments.")]
+    NoAlignments,
+
+    // ¯\_(ツ)_/¯
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
 }
 
 impl From<std::io::Error> for PipelineError {
