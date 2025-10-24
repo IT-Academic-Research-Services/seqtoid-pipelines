@@ -34,6 +34,7 @@ use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
+use pipelines::db;
 
 
 #[tokio::main]
@@ -118,6 +119,8 @@ async fn main() -> Result<()> {
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config).await,
         "short_read_mngs" => short_read_mngs_run(run_config).await,
+        "build_taxid_lineages" => build_taxid_lineages_run(run_config).await,
+        "build_accession2taxid" => build_accession2taxid_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
         error!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
@@ -136,6 +139,14 @@ async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), Pipeline
 
 async fn short_read_mngs_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     short_read_mngs::run(run_config).await
+}
+
+async fn build_taxid_lineages_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    db::taxid_lineages_db(run_config).await
+}
+
+async fn build_accession2taxid_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    db::accession2taxid_db(run_config).await
 }
 
 /// Sets up output directory
@@ -158,10 +169,10 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
                 cwd.join(path)
             }
         }
-        None => {  // Always places out dir in subdir of cwd regardless of location of file 1
+        None => {
             let file1_path: PathBuf = match &args.file1 {
                 Some(file) => {
-                    let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
+                    let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
                     if file1_full_path.exists() {
                         file1_full_path
                     } else {
@@ -176,7 +187,12 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
                 Some(prefix) => prefix,
                 None => {
                     info!("No R1 tag found. Using bare file 1 stem as sample_base.");
-                    file1_r1r2.file_name.unwrap()
+                    file1_r1r2.file_name.unwrap_or_else(|| {
+                        file1_path
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "default_sample".to_string())
+                    })
                 }
             };
 
@@ -189,7 +205,7 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
                     dt.format("%Y%m%d").to_string()
                 })
                 .unwrap_or_else(|_| "19700101".to_string());
-            cwd.join(format!("{}_{}", dir_base.clone(), timestamp))
+            cwd.join(format!("{}_{}", dir_base, timestamp))
         }
     };
     fs::create_dir_all(&out_dir)?;
