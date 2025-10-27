@@ -2905,17 +2905,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
-        config.clone(), m8_stream
-    ).await?;
-    cleanup_tasks.append(&mut call_cleanup_tasks);
-    cleanup_receivers.append(&mut call_cleanup_receivers);
+    // let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
+    //     config.clone(), m8_stream
+    // ).await?;
+    // cleanup_tasks.append(&mut call_cleanup_tasks);
+    // cleanup_receivers.append(&mut call_cleanup_receivers);
 
 
     // Write test stream
     let test_write_task = tokio::spawn(stream_to_file(
-        call_stream.into_inner(),
-        out_dir.join("called_deduped.m8"),
+        m8_stream.into_inner(),
+        out_dir.join("test.m8"),
     ));
     cleanup_tasks.push(test_write_task);
 

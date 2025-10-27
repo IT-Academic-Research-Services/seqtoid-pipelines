@@ -13,6 +13,7 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
     info!("Building taxid lineages db.");
 
     let (taxid_dir_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
+    eprintln!("base {}", no_ext_sample_base_buf.display());
     let metadata = fs::metadata(taxid_dir_path.clone())?;
     let file_type = metadata.file_type();
     if !file_type.is_dir() {
@@ -29,9 +30,8 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
         return Err(PipelineError::FileNotFound(nodes_dmp_path));
     }
 
-    let db_out_path = file_path_manipulator(&no_ext_sample_base_buf, Some(&cwd), None, Some("taxid_lineage_sled.db"), "_");
+    let db_out_path = file_path_manipulator(&PathBuf::from("taxid_lineage"), Some(&config.out_dir), None, Some("sled.db"), "_");
 
-    eprintln!("Writing to DB {:?}", db_out_path);
     build_taxid_lineages_db(&nodes_dmp_path, &merged_dmp_path, &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -47,7 +47,7 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 
     let (accession2taxid_file_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
-    let db_out_path = file_path_manipulator(&no_ext_sample_base_buf, Some(&cwd), None, Some("accession2_taxid_sled.db"), "_");
+    let db_out_path = file_path_manipulator(&PathBuf::from("accession2_taxid"), Some(&cwd), None, Some("sled.db"), "_");
     eprintln!("Writing to DB {:?}", db_out_path);
 
     build_accession2taxid_db(&accession2taxid_file_path, &db_out_path)
