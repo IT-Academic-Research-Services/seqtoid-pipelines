@@ -34,8 +34,6 @@ pub async fn build_taxid_lineages_db(
     merged_path: &PathBuf,
     db_path: &PathBuf,
 ) -> Result<()> {
-
-    // load parent map taxid → parent_taxid and rank map taxid → rank
     let mut parent_map: HashMap<Taxid, Taxid> = HashMap::new();
     let mut rank_map: HashMap<Taxid, String> = HashMap::new();
     let nodes_file = File::open(nodes_path).await?;
@@ -46,14 +44,13 @@ pub async fn build_taxid_lineages_db(
         let taxid: Taxid = parts[0].parse()?;
         let parent: Taxid = parts[1].parse()?;
         let rank = parts[2].to_string();
-        if taxid != 1 {  // Skip root
+        if taxid != 1 {
             parent_map.insert(taxid, parent);
             rank_map.insert(taxid, rank);
         }
     }
     info!("Loaded {} parents and ranks from nodes.dmp", parent_map.len());
 
-    // load merged: old_taxid → new_taxid
     let mut merged_map: HashMap<Taxid, Taxid> = HashMap::new();
     let merged_file = File::open(merged_path).await?;
     let mut merged_reader = BufReader::new(merged_file).lines();
@@ -68,8 +65,6 @@ pub async fn build_taxid_lineages_db(
 
     let db = sled::open(db_path)?;
     let tree: Tree = db.open_tree("lineages")?;
-
-    // build 3-level lineages for all taxids (species, genus, family; leaf-to-root)
     let mut seen = HashSet::new();
     for (&taxid, _) in &parent_map {
         if seen.contains(&taxid) { continue; }
@@ -78,7 +73,7 @@ pub async fn build_taxid_lineages_db(
         let mut family: Taxid = -300;
         let mut current = taxid;
         let mut depth = 0;
-        while current != 1 && depth < 20 {  // Limit depth to prevent infinite loops
+        while current != 1 && depth < 20 {
             let rank = rank_map.get(&current).cloned().unwrap_or_default();
             if rank == "species" && species == -100 {
                 species = current;
@@ -92,12 +87,18 @@ pub async fn build_taxid_lineages_db(
             }
             current = *parent_map.get(&current).unwrap_or(&1);
             if let Some(merged) = merged_map.get(&current) {
-                current = *merged;  // redirect deprecated using the merge map
+                current = *merged;
+            }
+            // Check parent for family rank if not found
+            if family == -300 {
+                let parent = parent_map.get(&current).copied().unwrap_or(1);
+                if rank_map.get(&parent).map(|r| r == "family").unwrap_or(false) {
+                    family = parent;
+                }
             }
             depth += 1;
         }
 
-        // Pack to bytes: three i32 taxids (little-endian), leaf-to-root: species, genus, family
         let mut bytes = Vec::with_capacity(12);
         bytes.extend_from_slice(&species.to_le_bytes());
         bytes.extend_from_slice(&genus.to_le_bytes());
