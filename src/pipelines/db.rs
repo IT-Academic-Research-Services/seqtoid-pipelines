@@ -73,12 +73,12 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 
     if config.args.verbose {
         let db = sled::open(db_out_path).map_err(|e| PipelineError::Other(e.into()))?;
-        let tree = db.open_tree("acc2taxid")?;
+        let tree = db.open_tree("acc2taxid").map_err(|e| PipelineError::Other(e.into()))?;
         let count = tree.iter().count();
         println!("Total entries: {}", count);
 
-        for acc in config.args.test_accessions {
-            if let Some(ivec) = tree.get(acc.as_bytes())? {
+        for acc in config.args.test_accessions.clone() {
+            if let Some(ivec) = tree.get(acc.as_bytes()).map_err(|e| PipelineError::Other(e.into()))? {
                 let taxid = i32::from_le_bytes(ivec[..4].try_into().map_err(|_| anyhow!("corrupt taxid"))?);
                 println!("Accession {} taxid: {}", acc, taxid);
             } else {
