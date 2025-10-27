@@ -34,46 +34,84 @@ pub async fn build_taxid_lineages_db(
     merged_path: &PathBuf,
     db_path: &PathBuf,
 ) -> Result<()> {
-    let mut parent_map: HashMap<Taxid, Taxid> = HashMap::new();
-    let mut rank_map: HashMap<Taxid, String> = HashMap::new();
+    // Pre-allocate maps for efficiency (NCBI taxonomy ~2.7M entries)
+    let mut parent_map: HashMap<Taxid, Taxid> = HashMap::with_capacity(3_000_000);
+    let mut rank_map: HashMap<Taxid, String> = HashMap::with_capacity(3_000_000);
+
     let nodes_file = File::open(nodes_path).await?;
     let mut nodes_reader = BufReader::new(nodes_file).lines();
     while let Some(line) = nodes_reader.next_line().await? {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        if parts.len() < 3 { continue; }
-        let taxid: Taxid = parts[0].parse()?;
-        let parent: Taxid = parts[1].parse()?;
+        if parts.len() < 3 {
+            warn!("Skipping invalid line in nodes.dmp: {}", line);
+            continue;
+        }
+        let taxid: Taxid = match parts[0].parse() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Invalid taxid in nodes.dmp: {}, error: {}", parts[0], e);
+                continue;
+            }
+        };
+        let parent: Taxid = match parts[1].parse() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Invalid parent taxid in nodes.dmp: {}, error: {}", parts[1], e);
+                continue;
+            }
+        };
         let rank = parts[2].to_string();
-        if taxid != 1 {
+        if taxid != 1 { // Skip root
             parent_map.insert(taxid, parent);
             rank_map.insert(taxid, rank);
         }
     }
     info!("Loaded {} parents and ranks from nodes.dmp", parent_map.len());
 
-    let mut merged_map: HashMap<Taxid, Taxid> = HashMap::new();
+    let mut merged_map: HashMap<Taxid, Taxid> = HashMap::with_capacity(100_000);
     let merged_file = File::open(merged_path).await?;
     let mut merged_reader = BufReader::new(merged_file).lines();
     while let Some(line) = merged_reader.next_line().await? {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        if parts.len() < 2 { continue; }
-        let old: Taxid = parts[0].parse()?;
-        let new: Taxid = parts[1].parse()?;
+        if parts.len() < 2 {
+            warn!("Skipping invalid line in merged.dmp: {}", line);
+            continue;
+        }
+        let old: Taxid = match parts[0].parse() {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Invalid old taxid in merged.dmp: {}, error: {}", parts[0], e);
+                continue;
+            }
+        };
+        let new: Taxid = match parts[1].parse() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Invalid new taxid in merged.dmp: {}, error: {}", parts[1], e);
+                continue;
+            }
+        };
         merged_map.insert(old, new);
     }
     info!("Loaded {} merges from merged.dmp", merged_map.len());
 
     let db = sled::open(db_path)?;
     let tree: Tree = db.open_tree("lineages")?;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(parent_map.len());
+    let mut missing_ranks = 0;
+
     for (&taxid, _) in &parent_map {
-        if seen.contains(&taxid) { continue; }
+        if seen.contains(&taxid) {
+            continue;
+        }
         let mut species: Taxid = -100;
         let mut genus: Taxid = -200;
         let mut family: Taxid = -300;
         let mut current = taxid;
         let mut depth = 0;
-        while current != 1 && depth < 20 {
+        let max_depth = 50; // Increased for complex hierarchies
+
+        while current != 1 && depth < max_depth {
             let rank = rank_map.get(&current).cloned().unwrap_or_default();
             if rank == "species" && species == -100 {
                 species = current;
@@ -82,8 +120,8 @@ pub async fn build_taxid_lineages_db(
             } else if rank == "family" && family == -300 {
                 family = current;
             }
-            if species > -100 && genus > -200 && family > -300 {
-                break;
+            if species != -100 && genus != -200 && family != -300 {
+                break; // All ranks found
             }
             current = *parent_map.get(&current).unwrap_or(&1);
             if let Some(merged) = merged_map.get(&current) {
@@ -91,28 +129,13 @@ pub async fn build_taxid_lineages_db(
             }
             depth += 1;
         }
-        // Additional traversal for genus and family if not found
-        if genus == -200 || family == -300 {
-            let mut temp = taxid;
-            let mut temp_depth = 0;
-            while temp != 1 && temp_depth < 20 {
-                let rank = rank_map.get(&temp).cloned().unwrap_or_default();
-                if rank == "genus" && genus == -200 {
-                    genus = temp;
-                } else if rank == "family" && family == -300 {
-                    family = temp;
-                }
-                if genus > -200 && family > -300 {
-                    break;
-                }
-                temp = *parent_map.get(&temp).unwrap_or(&1);
-                if let Some(merged) = merged_map.get(&temp) {
-                    temp = *merged;
-                }
-                temp_depth += 1;
-            }
+
+        if depth >= max_depth {
+            warn!("Depth limit reached for taxid {}: species={}, genus={}, family={}", taxid, species, genus, family);
+            missing_ranks += 1;
         }
 
+        // Serialize lineage to bytes
         let mut bytes = Vec::with_capacity(12);
         bytes.extend_from_slice(&species.to_le_bytes());
         bytes.extend_from_slice(&genus.to_le_bytes());
@@ -123,7 +146,7 @@ pub async fn build_taxid_lineages_db(
     }
 
     db.flush_async().await?;
-    info!("Built lineages DB with {} entries at {}", seen.len(), db_path.display());
+    info!("Built lineages DB with {} entries at {}. {} taxids reached depth limit.", seen.len(), db_path.display(), missing_ranks);
     Ok(())
 }
 
