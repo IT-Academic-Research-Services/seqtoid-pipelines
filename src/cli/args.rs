@@ -144,23 +144,23 @@ pub struct Arguments {
     #[arg(long, default_value_t = 1_528_186_360_278)]
     pub nt_db_size: usize,
 
-    #[clap(long, default_value = "taxid-lineages.db")]
+    #[arg(long, default_value = "taxid-lineages.db")]
     pub taxid_lineages_db: String,
 
-    #[clap(long, default_value = "accession2_taxid_sled.db")]
+    #[arg(long, default_value = "accession2_taxid_sled.db")]
     pub acc2taxid_db: String,
 
-    #[clap(long, default_value = "taxon_whitelist.txt")]
-    pub taxon_whitelist: String,
+    #[arg(long)]
+    pub taxon_whitelist: Option<String>,
 
-    #[clap(long, default_value = "taxon_blacklist.txt")]
-    pub taxon_blacklist: String,
+    #[arg(long)]
+    pub taxon_blacklist: Option<String>,
 
-    #[clap(long, default_value = "deuterostome_taxids.txt")]
-    pub deuterostome_list: String,
+    #[arg(long)]
+    pub deuterostome_list: Option<String>,
 
-    #[clap(long, default_value = "duplicate_cluster_sizes.tsv")]
-    pub duplicate_cluster_sizes: String,
+    #[clap(long)]
+    pub duplicate_cluster_sizes: Option<String>,
 
     #[arg(long, default_value_t = 36)]
     pub min_alignment_length: u64,

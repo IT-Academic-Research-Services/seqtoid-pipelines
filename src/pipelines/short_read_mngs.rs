@@ -2308,13 +2308,10 @@ pub async fn paf_to_m8(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 )> {
-    // Channel for converted m8 lines
     let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
-    // Clone config for closure — fixes E0382
     let config_clone = config.clone();
 
-    // Spawn PAF → m8 conversion task
     let conversion_handle = tokio::spawn(async move {
         while let Some(item) = input_stream.next().await {
             let line_bytes = match item {
@@ -2345,7 +2342,6 @@ pub async fn paf_to_m8(
                 }
             };
 
-            // Use user-provided nt_db_size — no fallback
             let genome_size = config_clone.args.nt_db_size as f64;
             let m8_line = record.to_m8_line(genome_size);
             let m8_bytes = (m8_line + "\n").into_bytes();
@@ -2359,7 +2355,6 @@ pub async fn paf_to_m8(
 
     let m8_stream = ReceiverStream::new(m8_rx);
 
-    // Split stream: one for file, one for downstream
     let (mut streams, done_rx) = t_junction(
         m8_stream,
         2,
@@ -2376,7 +2371,6 @@ pub async fn paf_to_m8(
     let main_stream = streams.remove(0);
     let file_stream = streams.remove(0);
 
-    // Write to file
     let write_task = write_byte_stream_to_file(
         &m8_path,
         ReceiverStream::new(file_stream),
@@ -2424,25 +2418,23 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_receivers = Vec::new();
 
     let lineages_db_path = PathBuf::from(config.args.taxid_lineages_db.clone());
-    let metadata = fs::metadata(lineages_db_path.clone())?;
+    let metadata = fs::metadata(lineages_db_path.clone()).await?;
     let file_type = metadata.file_type();
     if !file_type.is_dir() {
-        return Err(PipelineError::NotDirectory(lineages_db_path));
+        return Err(PipelineError::NotDirectory(lineages_db_path).into());
     }
     let lineages_db = sled::open(&lineages_db_path)?;
     let lineages_tree = lineages_db.open_tree("lineages")?;
 
-
     let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
-    let metadata = fs::metadata(acc2taxid_path.clone())?;
+    let metadata = fs::metadata(acc2taxid_path.clone()).await?;
     let file_type = metadata.file_type();
     if !file_type.is_dir() {
-        return Err(PipelineError::NotDirectory(acc2taxid_path));
+        return Err(PipelineError::NotDirectory(acc2taxid_path).into());
     }
     let acc2taxid_db = sled::open(&acc2taxid_path)?;
     let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
 
-    // build in-memory lineage map for faster lookups
     let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
     for entry in lineages_tree.iter() {
         let (key, value) = entry?;
@@ -2451,12 +2443,12 @@ pub async fn call_hits_m8_stream(
         lineage_map.insert(taxid, lineage);
     }
 
-    let blacklist = load_optional_set(config.args.taxon_blacklist).await?;
-    let deuterostome = load_optional_set(config.args.taxon_whitelist).await?;
-    let whitelist = load_optional_set(config.args.taxon_whitelist).await?;
+    let blacklist = load_optional_set(config.args.taxon_blacklist.clone()).await?;
+    let deuterostome = load_optional_set(config.args.deuterostome_list.clone()).await?; // Fixed: Use deuterostome_db
+    let whitelist = load_optional_set(config.args.taxon_whitelist.clone()).await?;
 
-    // optional, for read weighting
-    let duplicate_cluster_sizes = if let Some(p) = config.args.duplicate_cluster_sizes {
+    // Optional, for read weighting
+    let duplicate_cluster_sizes = if let Some(p) = config.args.duplicate_cluster_sizes.clone() {
         Some(load_duplicate_cluster_sizes(&p).await?)
     } else {
         None
@@ -2465,6 +2457,7 @@ pub async fn call_hits_m8_stream(
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
+    let config_clone = config.clone();
     let processing_task = tokio::spawn(async move {
         let mut read_groups: HashMap<String, Vec<crate::utils::blast::M8Record>> = HashMap::new();
 
@@ -2487,24 +2480,22 @@ pub async fn call_hits_m8_stream(
                 }
             };
 
-            if rec.alen < config.args.min_alignment_length {
+            if rec.alen < config_clone.args.min_alignment_length {
                 continue;
             }
 
             read_groups.entry(rec.qname.clone()).or_default().push(rec);
         }
 
-        // Process each read group
         for (read_id, hits) in read_groups {
             let mut valid_hits = Vec::new();
             for hit in &hits {
                 // Lookup accession → taxid
                 if let Ok(Some(taxid_ivec)) = acc2taxid_tree.get(hit.tname.as_bytes()) {
                     let taxid_bytes: [u8; 4] = taxid_ivec[..4].try_into().map_err(|_| anyhow!("corrupt taxid"))?;
-                    let taxid = u32::from_le_bytes(taxid_bytes);
+                    let taxid = i32::from_le_bytes(taxid_bytes); // Use i32 to match Taxid
                     if taxid == 0 { continue; }
 
-                    // Apply filters (blacklist, deuterostome, whitelist)
                     if is_filtered(taxid as i64, &blacklist, &deuterostome, &whitelist) {
                         continue;
                     }
@@ -2517,14 +2508,13 @@ pub async fn call_hits_m8_stream(
                 continue;
             }
 
-            // sort by bitscore  descending
+            // Sort by bitscore descending
             valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal));
             let best = valid_hits[0].clone();
 
             // Compute consensus taxonomy level
-            let (tax_level, consensus_taxid, consensus_hits) = crate::utils::blast::consensus_level(&valid_hits, &lineage_map);
+            let (tax_level, consensus_taxid, consensus_hits) = consensus_level(&valid_hits, &lineage_map);
 
-            // Write deduped m8 line (same format as input)
             let dedup_line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
                 best.qname,
@@ -2915,17 +2905,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    let (call_stream, call_summary_stream, call_cleanup_tasks, call_cleanup_receivers) = call_hits_m8_stream(
+    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(), m8_stream
     ).await?;
-
-
+    cleanup_tasks.append(&mut call_cleanup_tasks);
+    cleanup_receivers.append(&mut call_cleanup_receivers);
 
 
     // Write test stream
     let test_write_task = tokio::spawn(stream_to_file(
-        m8_stream.into_inner(),
-        out_dir.join("non_host.m8"),
+        call_stream.into_inner(),
+        out_dir.join("called_deduped.m8"),
     ));
     cleanup_tasks.push(test_write_task);
 
