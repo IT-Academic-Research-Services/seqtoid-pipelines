@@ -13,7 +13,7 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
     info!("Building taxid lineages db.");
 
     let (taxid_dir_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
-    eprintln!("base {}", no_ext_sample_base_buf.display());
+
     let metadata = fs::metadata(taxid_dir_path.clone())?;
     let file_type = metadata.file_type();
     if !file_type.is_dir() {

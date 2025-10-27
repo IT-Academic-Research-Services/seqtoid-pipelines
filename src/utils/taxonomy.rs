@@ -89,14 +89,28 @@ pub async fn build_taxid_lineages_db(
             if let Some(merged) = merged_map.get(&current) {
                 current = *merged;
             }
-            // Check parent for family rank if not found
-            if family == -300 {
-                let parent = parent_map.get(&current).copied().unwrap_or(1);
-                if rank_map.get(&parent).map(|r| r == "family").unwrap_or(false) {
-                    family = parent;
-                }
-            }
             depth += 1;
+        }
+        // Additional traversal for genus and family if not found
+        if genus == -200 || family == -300 {
+            let mut temp = taxid;
+            let mut temp_depth = 0;
+            while temp != 1 && temp_depth < 20 {
+                let rank = rank_map.get(&temp).cloned().unwrap_or_default();
+                if rank == "genus" && genus == -200 {
+                    genus = temp;
+                } else if rank == "family" && family == -300 {
+                    family = temp;
+                }
+                if genus > -200 && family > -300 {
+                    break;
+                }
+                temp = *parent_map.get(&temp).unwrap_or(&1);
+                if let Some(merged) = merged_map.get(&temp) {
+                    temp = *merged;
+                }
+                temp_depth += 1;
+            }
         }
 
         let mut bytes = Vec::with_capacity(12);
