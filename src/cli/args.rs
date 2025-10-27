@@ -173,4 +173,13 @@ pub struct Arguments {
         help = "Comma-separated list of test taxids (e.g., 562,287)"
     )]
     pub test_taxids: Vec<i32>,
+
+    #[clap(
+        long,
+        value_delimiter = ',',
+        value_parser = clap::value_parser!(String),
+        default_value = "A00020,A01121",
+        help = "Comma-separated list of test accessions (e.g., A01121)"
+    )]
+    pub test_accessions: Vec<String>,
 }

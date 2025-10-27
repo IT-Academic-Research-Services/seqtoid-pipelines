@@ -51,7 +51,6 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
             }
         }
 
-
     }
 
     Ok(())
@@ -71,6 +70,22 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     build_accession2taxid_db(&accession2taxid_file_path, &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+
+    if config.args.verbose {
+        let db = sled::open(db_out_path).map_err(|e| PipelineError::Other(e.into()))?;
+        let tree = db.open_tree("acc2taxid")?;
+        let count = tree.iter().count();
+        println!("Total entries: {}", count);
+
+        for acc in config.args.test_accessions {
+            if let Some(ivec) = tree.get(acc.as_bytes())? {
+                let taxid = i32::from_le_bytes(ivec[..4].try_into().map_err(|_| anyhow!("corrupt taxid"))?);
+                println!("Accession {} taxid: {}", acc, taxid);
+            } else {
+                println!("Accession {} not found", acc);
+            }
+        }
+    }
 
     Ok(())
 }
