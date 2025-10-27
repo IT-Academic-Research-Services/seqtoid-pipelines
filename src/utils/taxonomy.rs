@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use csv::ReaderBuilder;
 use sled::{Db, Tree, IVec};
 
-use crate::config::defs::{Taxid, Lineage};
+use crate::config::defs::{Taxid, Lineage, PipelineError};
 
 // *******************
 // DB creation functions
