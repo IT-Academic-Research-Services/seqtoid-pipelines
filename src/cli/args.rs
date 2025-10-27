@@ -169,7 +169,7 @@ pub struct Arguments {
         long,
         value_delimiter = ',',
         value_parser = clap::value_parser!(i32),
-        default_value = "23,760",
+        default_value = "287,562",
         help = "Comma-separated list of test taxids (e.g., 562,287)"
     )]
     pub test_taxids: Vec<i32>,
