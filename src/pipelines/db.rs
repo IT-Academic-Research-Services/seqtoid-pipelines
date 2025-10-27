@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use log::info;
 use crate::config::defs::{PipelineError, RunConfig};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs};
-use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db};
+use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db, unpack_lineage_bytes};
 
 pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
@@ -35,6 +35,24 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
     build_taxid_lineages_db(&nodes_dmp_path, &merged_dmp_path, &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+
+    if config.args.verbose {
+        let db = sled::open(db_out_path).map_err(|e| PipelineError::Other(e.into()))?;
+        let tree = db.open_tree("lineages").map_err(|e| PipelineError::Other(e.into()))?;
+        let count = tree.iter().count();
+        println!("Total entries: {}", count);
+
+        for taxid in config.args.test_taxids.clone() {
+            if let Some(ivec) = tree.get(&taxid.to_le_bytes()).map_err(|e| PipelineError::Other(e.into()))? {
+                let lineage = unpack_lineage_bytes(&ivec)?;
+                println!("Taxid {} lineage: {:?}", taxid, lineage);
+            } else {
+                println!("Taxid {} not found", taxid);
+            }
+        }
+
+
+    }
 
     Ok(())
 }
