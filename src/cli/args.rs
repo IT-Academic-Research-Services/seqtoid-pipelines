@@ -164,12 +164,12 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 36)]
     pub min_alignment_length: u64,
-    
+
     #[clap(
         long,
         value_delimiter = ',',
         value_parser = clap::value_parser!(i32),
-        default_value = "562,287",
+        default_value = "23,760",
         help = "Comma-separated list of test taxids (e.g., 562,287)"
     )]
     pub test_taxids: Vec<i32>,
