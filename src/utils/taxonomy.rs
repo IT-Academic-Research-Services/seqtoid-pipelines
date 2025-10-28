@@ -261,6 +261,72 @@ pub async fn build_accession2taxid_db(
 }
 
 
+/// Builds filter for taxa to keep from the three lists input
+///
+/// # Arguments
+///
+///  * `deuterostome_path` - path to deuterostome filter list
+///  * `taxon_whitelist_path` - Always-keep list
+///  * `taxon_blacklist_path` - Always-discard list
+///
+/// # Returns
+/// RResult<Closure, anyhow::Error> – an Ok that contains a zero-cost, heap-allocated closure
+/// which, when called with a slice of taxonomy IDs, tells you whether those IDs are allowed
+/// to stay in the downstream aggregation step.
+pub async fn build_should_keep_filter(
+    deuterostome_path: Option<PathBuf>,
+    taxon_whitelist_path: Option<PathBuf>,
+    taxon_blacklist_path: Option<PathBuf>,
+) -> Result<impl Fn(&[i32]) -> bool> {
+    let mut taxids_to_remove: HashSet<i32> = HashSet::from([9605, 9606]);
+
+    if let Some(path) = taxon_blacklist_path {
+        taxids_to_remove.extend(read_file_into_set(&path).await?);
+    }
+    if let Some(path) = deuterostome_path {
+        taxids_to_remove.extend(read_file_into_set(&path).await?);
+    }
+
+    let taxids_to_keep: Option<HashSet<i32>> = if let Some(path) = taxon_whitelist_path {
+        Some(read_file_into_set(&path).await?)
+    } else {
+        None
+    };
+
+    Ok(move |hits: &[i32]| {
+        let is_blacklisted = hits.iter().any(|&t| t > 0 && taxids_to_remove.contains(&t));
+        let is_whitelisted = if let Some(keep) = &taxids_to_keep {
+            hits.iter().any(|&t| t > 0 && keep.contains(&t))
+        } else {
+            true
+        };
+        is_whitelisted && !is_blacklisted
+    })
+}
+
+
+///Reading helper function for above filter list files
+///
+/// # Arguments
+///
+///  * `path` - path to  filter list
+///
+/// # Returns
+/// RResult of hash set of taxon id numbers
+pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
+    let file = File::open(path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut set = HashSet::new();
+    while let Some(line) = lines.next_line().await? {
+        if let Ok(taxid) = line.trim().parse::<i32>() {
+            set.insert(taxid);
+        }
+    }
+    Ok(set)
+}
+
+
 // *******************
 // DB access functions
 // *******************
