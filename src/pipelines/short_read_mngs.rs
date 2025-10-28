@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use serde_json::Value;
 use twox_hash::XxHash64;
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
@@ -44,7 +44,8 @@ use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
-use crate::utils::blast::{M8Record, consensus_level};
+use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
+use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage};
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -2448,13 +2449,6 @@ pub async fn call_hits_m8_stream(
     let deuterostome = load_optional_set(config.args.deuterostome_list.clone()).await?; // Fixed: Use deuterostome_db
     let whitelist = load_optional_set(config.args.taxon_whitelist.clone()).await?;
 
-    // Optional, for read weighting
-    let duplicate_cluster_sizes = if let Some(p) = config.args.duplicate_cluster_sizes.clone() {
-        Some(load_duplicate_cluster_sizes(&p).await?)
-    } else {
-        None
-    };
-
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
@@ -2622,8 +2616,7 @@ async fn load_optional_set(path: Option<String>) -> Result<HashSet<i64>> {
     Ok(set)
 }
 
-async fn load_duplicate_cluster_sizes(file_string: &String) -> Result<HashMap<String, u64>> {
-    let path = PathBuf::from(file_string);
+pub async fn load_duplicate_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
     let file = File::open(path).await?;
     let mut lines = tokio::io::BufReader::new(file).lines();
     let mut map = HashMap::new();
@@ -2646,6 +2639,202 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
     false
 }
 
+
+/// Generates ytaxon counts from a called m8 stream
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `m8_stream` - line-based m8 format input stream
+/// * `summary_stream` - stream of summary information from m8
+/// * `duplicate_cluster_sizes_path` - optinal duplicate cluster sizes for weighting
+/// * `taxon_blacklist_path` - optional list of excluded taxa
+/// * `deuterostome_path` - optional list of excluded taxa
+/// * `taxon_whitelist_path` -optional list of included taxa
+/// * `count_type` - e.g. NT , type of DB being refernced
+/// *  `source_count_type` - optional second source, e.g. NR
+///
+///
+/// # Returns
+/// vector of taxon counts
+pub async fn generate_taxon_counts(
+    config: Arc<RunConfig>,
+    mut m8_stream: ReceiverStream<ParseOutput>,
+    mut summary_stream: ReceiverStream<ParseOutput>,
+    duplicate_cluster_sizes_path: Option<PathBuf>,
+    deuterostome_path: Option<PathBuf>,
+    taxon_whitelist_path: Option<PathBuf>,
+    taxon_blacklist_path: Option<PathBuf>,
+    count_type: String,               // e.g. "NT"
+    source_count_type: Option<String>,// e.g. "NR" for the other DB
+) -> Result<Vec<TaxonCount>, PipelineError> {
+
+
+    let duplicate_cluster_sizes = if let Some(path) = duplicate_cluster_sizes_path {
+        load_duplicate_cluster_sizes(&path).await.map_err(|e| PipelineError::Other(e))?
+    } else {
+        HashMap::new()
+    };
+
+    let should_keep = build_should_keep_filter(
+        deuterostome_path,
+        taxon_whitelist_path,
+        taxon_blacklist_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e))?;
+
+
+    // Expected format (tab-separated):
+    // read_id   level   consensus_taxid   accession   species   genus   family
+    let mut read_summaries: HashMap<String, (u8, String, Vec<i32>)> = HashMap::new();
+
+    while let Some(item) = summary_stream.next().await {
+        let line = match item {
+            ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
+                .map_err(|e| anyhow!("summary line not UTF-8: {}", e))?,
+            _ => continue,
+        };
+
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 7 { continue; }
+
+        let read_id          = cols[0].to_string();
+        let level: u8        = cols[1].parse().unwrap_or(0);
+        let _consensus_taxid = cols[2].parse::<i32>().unwrap_or(0);
+        let accession        = cols[3].to_string();
+        let species: i32     = cols[4].parse().unwrap_or(0);
+        let genus:   i32     = cols[5].parse().unwrap_or(0);
+        let family:  i32     = cols[6].parse().unwrap_or(0);
+
+        let raw_lineage = vec![species, genus, family];
+        let cleaned = validate_taxid_lineage(&raw_lineage, _consensus_taxid, level);
+        read_summaries.insert(read_id, (level, accession, cleaned));
+    }
+    info!("Loaded {} read summaries", read_summaries.len());
+
+
+    // consume the **deduped m8** stream (one line per read)
+    // We only need percent-identity, alignment-length and e-value.
+    let mut read_metrics: HashMap<String, (f64, u64, f64)> = HashMap::new();
+
+    while let Some(item) = m8_stream.next().await {
+        let line = match item {
+            ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
+                .map_err(|e| anyhow!("m8 line not UTF-8: {}", e))?,
+            _ => continue,
+        };
+
+        let rec = M8Record::parse_line(&line)
+            .map_err(|e| anyhow!("failed to parse m8 line: {}", e))?;
+        read_metrics.insert(rec.qname, (rec.pident, rec.alen, rec.evalue));
+    }
+    info!("Loaded {} read metrics", read_metrics.len());
+
+
+    let mut aggregation: HashMap<Vec<i32>, AggBucket> = HashMap::new();
+    let mut base_count_per_read: HashMap<String, u64> = HashMap::new();
+
+    for (read_id, (level, _accession, lineage)) in read_summaries {
+        let cluster_size = *duplicate_cluster_sizes.get(&read_id).unwrap_or(&1u64);
+
+        // Metrics are guaranteed to exist because the m8 line came from the same read
+        if let Some((pident, alen, mut evalue)) = read_metrics.get(&read_id).cloned() {
+            if !should_keep(&lineage) {
+                continue;
+            }
+
+            if evalue > 0.0 {
+                evalue = evalue.log10();
+                if evalue < LOG_NORMAL_POSITIVE_DOUBLE {
+                    evalue = LOG_NORMAL_POSITIVE_DOUBLE;
+                }
+            }
+
+            if level == 1 {
+                base_count_per_read.insert(read_id.clone(), alen * cluster_size);
+            }
+
+            // walk the lineagerootward
+            let mut agg_key = lineage.clone();
+            while !agg_key.is_empty() {
+                let bucket = aggregation.entry(agg_key.clone()).or_default();
+
+                bucket.nonunique_count += cluster_size;
+                bucket.unique_count    += 1;
+                bucket.base_count      += *base_count_per_read.get(&read_id).unwrap_or(&0);
+                bucket.sum_percent_identity += pident;
+                bucket.sum_alignment_length += alen as f64;
+                bucket.sum_e_value          += evalue;
+
+                if let Some(src) = &source_count_type {
+                    bucket.source_count_type.insert(src.clone());
+                }
+
+                // chop the leafward rank
+                agg_key.remove(0);
+            }
+        }
+    }
+
+    let mut taxon_counts = Vec::new();
+
+    for (mut agg_key, bucket) in aggregation {
+        if bucket.unique_count == 0 { continue; }
+
+        // Number of ranks we still have in the key (3 = species, 2 = genus, 1 = family)
+        let remaining = agg_key.len() as u8;
+        let tax_level = 4 - remaining;               // 1 = species, 2 = genus, 3 = family
+        let tax_id    = agg_key[0];
+
+        // Helper to pull a rank with a negative fallback
+        macro_rules! rank_or_neg {
+            ($idx:expr, $neg:expr) => {
+                if tax_level <= $idx { agg_key.get($idx as usize - tax_level as usize).copied().unwrap_or($neg) }
+                else { $neg }
+            };
+        }
+        let genus_taxid  = rank_or_neg!(2, -200);
+        let family_taxid = rank_or_neg!(3, -300);
+
+        let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
+            bucket.nonunique_count
+        } else {
+            bucket.unique_count
+        };
+
+        let dcr = bucket.nonunique_count as f64 / bucket.unique_count as f64;
+        let percent_identity = bucket.sum_percent_identity / bucket.unique_count as f64;
+        let alignment_length = bucket.sum_alignment_length / bucket.unique_count as f64;
+        let e_value          = bucket.sum_e_value / bucket.unique_count as f64;
+
+        let source_vec = if bucket.source_count_type.is_empty() {
+            None
+        } else {
+            let mut v: Vec<String> = bucket.source_count_type.into_iter().collect();
+            v.sort_unstable();
+            Some(v)
+        };
+
+        taxon_counts.push(TaxonCount {
+            tax_id,
+            tax_level,
+            genus_taxid,
+            family_taxid,
+            count,
+            nonunique_count: bucket.nonunique_count,
+            unique_count:    bucket.unique_count,
+            dcr,
+            percent_identity,
+            alignment_length,
+            e_value,
+            count_type: count_type.clone(),
+            base_count: bucket.base_count,
+            source_count_type: source_vec,
+        });
+    }
+
+    Ok(taxon_counts)
+}
 
 
 /// Run function for Short Read mNGS pipelines

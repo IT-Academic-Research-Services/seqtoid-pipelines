@@ -11,7 +11,7 @@ use flate2::read::GzDecoder;
 use csv::ReaderBuilder;
 use sled::{Db, Tree, IVec};
 
-use crate::config::defs::{Taxid, Lineage, PipelineError};
+use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
 
 // *******************
 // DB creation functions
@@ -351,4 +351,20 @@ pub fn unpack_lineage_bytes(ivec: &IVec) -> Result<Vec<Taxid>> {
         lineage.push(i32::from_le_bytes(data[start..start+4].try_into().unwrap()));
     }
     Ok(lineage)
+}
+
+
+pub fn validate_taxid_lineage(lineage: &[i32], hit_taxid: Taxid, hit_level: u8) -> Vec<i32> {
+    let mut cleaned = lineage.to_vec();
+    for level in 0..(hit_level as usize - 1) {
+        cleaned[level] = INVALID_CALL_BASE_ID - (level as i32 + 1) * 100;
+    }
+    let mut parent = hit_taxid;
+    for level in (hit_level as usize - 1)..cleaned.len() {
+        if cleaned[level] <= 0 {
+            cleaned[level] = INVALID_CALL_BASE_ID - (level as i32 + 1) * 100 - parent;
+        }
+        parent = cleaned[level];
+    }
+    cleaned
 }
