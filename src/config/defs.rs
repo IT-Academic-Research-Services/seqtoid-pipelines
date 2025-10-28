@@ -1,12 +1,18 @@
 // src/config/defs.rs
 use std::path::PathBuf;
-use crate::cli::Arguments;
-use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::cmp::min;
 use std::sync::Arc;
+
+use lazy_static::lazy_static;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
+use rand::rngs::StdRng;
+use tokio::task::JoinError;
+use serde_json::Error as SerdeJsonError;
+use log::LevelFilter;
+
+use crate::cli::Arguments;
 
 // External software
 pub const GZIP_EXT: &str = "gz";
@@ -24,6 +30,11 @@ pub const QUAST_TAG: &str = "quast.py";
 pub const NUCMER_TAG: &str = "nucmer";
 pub const SHOW_COORDS_TAG: &str = "show-coords";
 pub const SEQKIT_TAG: &str = "seqkit";
+pub const BOWTIE2_TAG: &str = "bowtie2";
+pub const HISAT2_TAG: &str = "hisat2";
+pub const KALLISTO_TAG: &str = "kallisto";
+pub const STAR_TAG: &str = "STAR";
+pub const CZID_DEDUP_TAG: &str = "czid-dedup";
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -37,6 +48,11 @@ lazy_static! {
         m.insert(MAFFT_TAG, 7.5);
         m.insert(QUAST_TAG, 5.20);
         m.insert(SEQKIT_TAG, 2.10);
+        m.insert(BOWTIE2_TAG, 2.50);
+        m.insert(KALLISTO_TAG, 0.5);
+        m.insert(HISAT2_TAG, 2.20);
+        m.insert(STAR_TAG, 2.7);
+        m.insert(CZID_DEDUP_TAG, 0.1);
         m
     };
 }
@@ -70,7 +86,13 @@ pub enum IvarSubcommand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeqkitSubcommand {
     Stats,
-    Grep
+    Rmdup
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KallistoSubcommand {
+    Index,
+    Quant
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,6 +109,22 @@ pub enum StreamDataType {
     JustBytes,        // Streamed Vec<u8> from samtools, minimap2, BWA, etc.
     IlluminaFastq, // SequenceRecord for Illumina FASTQ or FASTA
     OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
+}
+
+
+// For specifying which read (or read pairs are validated fore size.
+#[derive(Debug)]
+pub struct ReadStats {
+    pub undersized: u64,
+    pub validated: u64,
+    pub oversized: u64,
+}
+
+/// Samtools stats output
+#[derive(Debug)]
+pub struct SamtoolsStats {
+    pub summary: HashMap<String, String>,
+    pub insert_sizes: Vec<(u32, u64)>,
 }
 
 // Static Filenames
@@ -111,12 +149,15 @@ pub struct RunConfig {
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
     pub input_size_mb: u64,
+    pub available_ram: u64,
+    pub rng: StdRng,
+    pub log_level: LevelFilter,
 }
 
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
-            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _)  => CoreAllocation::Maximal,  // Keep as-is for full potential
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _)  => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
@@ -158,6 +199,8 @@ pub enum PipelineError {
     FileNotFound(PathBuf),
     #[error("Invalid FASTQ format in {0}")]
     InvalidFastqFormat(String),
+    #[error("I/O error: {0}")]
+    IOError(String),
     #[error("Tool execution failed: {tool} with error: {error}")]
     ToolExecution { tool: String, error: String },
     #[error("Stream data dropped unexpectedly")]
@@ -172,6 +215,28 @@ pub enum PipelineError {
     NoTargetSequences(String),
     #[error("No alignments.")]
     NoAlignments,
-    #[error("Other error: {0}")]
+    #[error("Argument missing: {0}")]
+    MissingArgument(String),
+    #[error("Wrong extension: {0}")]
+    WrongExtension(String),
+    #[error("Invalid extension: {0}")]
     Other(#[from] anyhow::Error), // Wraps external errors
+}
+
+impl From<std::io::Error> for PipelineError {
+    fn from(err: std::io::Error) -> Self {
+        PipelineError::IOError(err.to_string())
+    }
+}
+
+impl From<JoinError> for PipelineError {
+    fn from(err: JoinError) -> Self {
+        PipelineError::Other(anyhow::Error::new(err))
+    }
+}
+
+impl From<SerdeJsonError> for PipelineError {
+    fn from(err: SerdeJsonError) -> Self {
+        PipelineError::Other(anyhow::Error::new(err))
+    }
 }

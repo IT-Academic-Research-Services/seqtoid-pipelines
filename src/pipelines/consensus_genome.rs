@@ -1,14 +1,13 @@
-use tokio::io::{BufWriter, AsyncWriteExt};
 use std::fs::File;
 use std::sync::Arc;
 use std::io::Write;
 use std::collections::HashMap;
 use tokio_stream::StreamExt;
-use crate::utils::streams::ParseOutput;
+
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
-use tempfile::NamedTempFile;
-use crate::cli::Technology;
+use tempfile::{NamedTempFile, TempDir};
+use log::{self, LevelFilter, debug, info, error, warn};
 use tokio::task::JoinHandle;
 use std::time::Instant;
 use tokio::fs;
@@ -18,19 +17,24 @@ use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
+use futures::TryFutureExt;
 use fxhash::FxHashMap as FxHashMap;
+use tokio::io::{BufWriter, AsyncWriteExt};
+
+use crate::cli::Technology;
+use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
-use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction};
-use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, FASTP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
+use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
+use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
-use crate::utils::db::{get_index, retrieve_h5_seq};
-use crate::config::defs::RunConfig;
+use crate::config::defs::{RunConfig, ReadStats};
 use crate::utils::command::quast::QuastConfig;
+use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
 use crate::utils::vcf::count_variants_from_bcftools_stats;
 use crate::utils::plotting::plot_depths;
@@ -71,138 +75,6 @@ struct Stats {
 }
 
 
-async fn prepare_reference_and_index<'a>(
-    config: &RunConfig,
-    ref_db_path: Option<PathBuf>,
-    ram_temp_dir: &PathBuf,
-    h5_index: Option<&'a FxHashMap<[u8; 24], u64>>,
-    accession: Option<String>,
-    sequence: Option<String>,
-    index_path: Option<String>,
-    ref_type: &str,
-) -> Result<
-    (
-        Option<PathBuf>,             // FASTA path (None if only index provided)
-        PathBuf,                     // Index path (.mmi)
-        Option<NamedTempFile>,       // FASTA temp file (None if only index)
-        Option<NamedTempFile>,       // Index temp file (if created/copied)
-        Vec<JoinHandle<Result<(), anyhow::Error>>>, // Tasks
-    ),
-    PipelineError,
-> {
-    let mut tasks = Vec::new();
-    let mut ref_fasta_path: Option<PathBuf> = None;
-    let mut ref_temp: Option<NamedTempFile> = None;
-
-    // Check if only index is provided
-    let (index_path, index_temp) = match index_path {
-        Some(index) => {
-            let index_path = PathBuf::from(&index);
-            if !index_path.exists() {
-                return Err(PipelineError::FileNotFound(index_path));
-            }
-            if index_path.extension().map_or(true, |ext| ext != "mmi") {
-                return Err(PipelineError::InvalidConfig(format!(
-                    "{} index must have .mmi extension: {}",
-                    ref_type,
-                    index_path.display()
-                )));
-            }
-            // Copy index to ram_temp_dir
-            let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                .map_err(|e| PipelineError::Other(e.into()))?;
-            let index_temp_path = index_temp.path().to_path_buf();
-            let index_temp_path_clone = index_temp_path.clone();
-            let ref_type_owned = ref_type.to_string();
-            let copy_task = tokio::spawn(async move {
-                fs::copy(&index_path, &index_temp_path_clone)
-                    .await
-                    .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_owned, e))?;
-                Ok(())
-            });
-            tasks.push(copy_task);
-            (index_temp_path, Some(index_temp))
-        }
-        None => {
-            // Require sequence or accession for FASTA
-            let (_accession, seq) = retrieve_h5_seq(
-                accession.clone(),
-                sequence.clone(),
-                ref_db_path.as_ref(),
-                h5_index,
-            )
-                .await
-                .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
-
-            let ref_temp_file = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
-                .map_err(|e| PipelineError::Other(e.into()))?;
-            ref_fasta_path = Some(ref_temp_file.path().to_path_buf());
-            ref_temp = Some(ref_temp_file);
-            let ref_write_task = write_vecu8_to_file(Arc::new(seq.clone()), ref_fasta_path.as_ref().unwrap(), config.base_buffer_size)
-                .await
-                .map_err(|e| PipelineError::Other(e.into()))?;
-            tasks.push(ref_write_task);
-
-            // Check for .mmi in sequence directory
-            let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
-            let sequence_path_buf = file_path_manipulator(&PathBuf::from(ref_fasta_path.as_ref().unwrap()), Some(&cwd), None, None, "");
-            let (no_ext_sequence_path, _) = extension_remover(&sequence_path_buf);
-            let mut index_path = no_ext_sequence_path.with_extension("mmi");
-            if !index_path.exists() {
-                // No .mmi found; create one
-                eprintln!("No {} index found at {}; creating new index", ref_type, index_path.display());
-                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                index_path = index_temp.path().to_path_buf();
-                let minimap2_args = vec![
-                    "-d".to_string(),
-                    index_path.to_string_lossy().to_string(),
-                    ref_fasta_path.as_ref().unwrap().to_string_lossy().to_string(),
-                ];
-                let (mut child, err_task) = spawn_cmd(
-                    Arc::new(config.clone()),
-                    MINIMAP2_TAG,
-                    minimap2_args,
-                    config.args.verbose,
-                )
-                    .await
-                    .map_err(|e| PipelineError::ToolExecution {
-                        tool: MINIMAP2_TAG.to_string(),
-                        error: e.to_string(),
-                    })?;
-                let index_task = tokio::spawn(async move {
-                    let status = child.wait().await?;
-                    if !status.success() {
-                        return Err(anyhow!("minimap2 index creation failed with exit code: {:?}", status.code()));
-                    }
-                    Ok(())
-                });
-                tasks.push(index_task);
-                tasks.push(err_task);
-                (index_path, Some(index_temp))
-            } else {
-                // Found .mmi; copy to ram_temp_dir
-                eprintln!("Found {} index at {}; copying to temp dir", ref_type, index_path.display());
-                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                let index_temp_path = index_temp.path().to_path_buf();
-                let index_temp_path_clone = index_temp_path.clone();
-                let ref_type_owned = ref_type.to_string();
-                let copy_task = tokio::spawn(async move {
-                    fs::copy(&index_path, &index_temp_path_clone)
-                        .await
-                        .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_owned, e))?;
-                    Ok(())
-                });
-                tasks.push(copy_task);
-                (index_temp_path, Some(index_temp))
-            }
-        }
-    };
-
-    Ok((ref_fasta_path, index_path, ref_temp, index_temp, tasks))
-}
-
 
 async fn validate_input(
     config: Arc<RunConfig>,
@@ -210,7 +82,9 @@ async fn validate_input(
     file2_path: Option<PathBuf>,
     sample_base_buf: PathBuf,
     out_dir: &PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -218,8 +92,8 @@ async fn validate_input(
         Some("validated.fq.gz"),
         "_",
     );
-    
-    let rx = read_fastq(
+
+    let (rx, val_count_task) = read_fastq(
         file1_path,
         file2_path,
         Some(config.args.technology.clone()),
@@ -232,7 +106,7 @@ async fn validate_input(
 
     let val_rx_stream = ReceiverStream::new(rx);
 
-    // Split the byte stream for fastp and quast write
+    // Split the byte stream for output and quast write
     let (val_streams, val_done_rx) = t_junction(
         val_rx_stream,
         2,
@@ -253,38 +127,52 @@ async fn validate_input(
 
     // Consume Vec to get Receivers
     let mut val_streams_iter = val_streams.into_iter();
-    let val_fastp_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let val_quast_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let val_pigz_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Write validated interleaved FASTQ to file using byte chunks
-    let val_quast_write_task = tokio::spawn(async move {
-        let mut file = BufWriter::new(
-            TokioFile::create(&validated_interleaved_file_path)
-                .await
-                .map_err(|e| anyhow!("Failed to create validated FASTQ file: {}", e))?,
-        );
-        let mut stream = ReceiverStream::new(val_quast_out_stream);
-        let mut total_bytes = 0;
+    let val_pigz_args = generate_cli(PIGZ_TAG, &config, None)
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
+        config.clone(),
+        val_pigz_stream,
+        PIGZ_TAG,
+        val_pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(val_pigz_stream_task);
+    cleanup_tasks.push(val_pigz_err_task);
 
-        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
-            total_bytes += bytes.len() as u64;
-            file.write_all(&bytes)
-                .await
-                .map_err(|e| anyhow!("Failed to write to validated FASTQ: {}", e))?;
-        }
-        file.flush()
+    let val_pigz_out_stream = {
+        let mut guard = val_pigz_child.lock().await;
+        parse_child_output(
+            &mut guard, // Pass locked Child
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
             .await
-            .map_err(|e| anyhow!("Failed to flush validated FASTQ: {}", e))?;
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
 
-        // Log for correctness (no silent drops)
-        // eprintln!("validate_input: Wrote {} bytes to {}", total_bytes, validated_interleaved_file_path.display());
-        Ok(())
-    });
+    let val_pigz_write_task = tokio::spawn(stream_to_file(val_pigz_out_stream, validated_interleaved_file_path));
+    cleanup_tasks.push(val_pigz_write_task);
 
     Ok((
-        ReceiverStream::new(val_fastp_out_stream),
-        vec![val_quast_write_task],
-        vec![val_done_rx]
+        ReceiverStream::new(val_out_stream),
+        cleanup_tasks,
+        cleanup_receivers, val_count_task
     ))
 }
 
@@ -292,15 +180,31 @@ async fn validate_input(
 
 async fn align_to_host(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream from fastp
+    input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream
     host_index_path: PathBuf,  // minimap2 .mmi index file
     no_host_file_path: PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    // Generate minimap2 args for host alignment
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(host_index_path)))
+    
+    let mut minimap2_options = HashMap::new();
+    match config.args.technology {
+        Technology::Illumina => {
+            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
+        }
+        Technology::ONT => {
+            minimap2_options.insert("-ax".to_string(), Some("map-ont".to_string()));
+        }
+    }
+
+    let minimap2_config = Minimap2Config {
+        minimap2_index_path: host_index_path,
+        option_fields: minimap2_options.clone(),
+    };
+
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
@@ -587,7 +491,22 @@ async fn process_ercc(
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     cleanup_receivers.push(ercc_done_rx);
 
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&ercc_index_path))
+    let mut minimap2_options = HashMap::new();
+    match config.args.technology {
+        Technology::Illumina => {
+            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
+        }
+        Technology::ONT => {
+            minimap2_options.insert("-ax".to_string(), Some("map-ont".to_string()));
+        }
+    }
+
+    let minimap2_config = Minimap2Config {
+        minimap2_index_path: ercc_index_path,
+        option_fields: minimap2_options.clone(),
+    };
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
@@ -1005,7 +924,7 @@ async fn filter_with_kraken(
                 break; // Exit after first Fastq record
             }
         }
-        // eprintln!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
+        debug!("check_split_task found {} Fastq record", if found { "a" } else { "no" });
         check_tx
             .send(if found { 1 } else { 0 })
             .await
@@ -1044,7 +963,7 @@ async fn filter_with_kraken(
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let check_count = check_rx.recv().await.ok_or_else(|| {
-        eprintln!("check_rx.recv failed");
+        error!("check_rx.recv failed");
         PipelineError::EmptyStream
     })?;
 
@@ -1116,8 +1035,23 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
-    
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&(target_index_path)))
+
+    let mut minimap2_options = HashMap::new();
+    match config.args.technology {
+        Technology::Illumina => {
+            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
+        }
+        Technology::ONT => {
+            minimap2_options.insert("-ax".to_string(), Some("map-ont".to_string()));
+        }
+    }
+
+    let minimap2_config = Minimap2Config {
+        minimap2_index_path: target_index_path,
+        option_fields: minimap2_options.clone(),
+    };
+
+    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
@@ -1726,6 +1660,7 @@ async fn calculate_statistics(
         None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
     };
     let samtools_stats_out = parse_samtools_stats(stats_samtools_out_stream_stats).await?;
+    let samtools_summary = samtools_stats_out.summary;
 
     let depth_samtools_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Depth,
@@ -1861,11 +1796,11 @@ async fn calculate_statistics(
         depth_frac_above_100x: samtools_depth_stats.get("depth_frac_above_100x").copied().unwrap_or(0.0),
         allele_counts,
         total_reads: seqkit_stats.get("num_seqs").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-        mapped_reads: samtools_stats_out.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
-        mapped_paired: samtools_stats_out.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
-        paired_inward: samtools_stats_out.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
-        paired_outward: samtools_stats_out.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
-        paired_other_orientation: samtools_stats_out.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        mapped_reads: samtools_summary.get("reads mapped").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+        mapped_paired: samtools_summary.get("reads mapped and paired").and_then(|s| s.parse::<u64>().ok()),
+        paired_inward: samtools_summary.get("inward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_outward: samtools_summary.get("outward oriented pairs").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
+        paired_other_orientation: samtools_summary.get("pairs with other orientation").and_then(|s| s.parse::<u64>().ok()).map(|v| v * 2),
         ercc_mapped_reads: ercc_stats.get("ercc_mapped_reads").copied(),
         ercc_mapped_paired: ercc_stats.get("ercc_mapped_paired").copied(),
         ref_snps,
@@ -1947,6 +1882,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let ram_temp_dir = config.ram_temp_dir.clone();
     let out_dir = config.out_dir.clone();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let mut temp_dirs: Vec<TempDir> = Vec::new();
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     let mut quast_write_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
@@ -1961,11 +1897,12 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let mut consensus_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
     let mut call_bcftools_stats_stream: Option<ReceiverStream<ParseOutput>> = None;
 
+    info!("Starting consensus genome pipeline.");
+
     // External tools check
     check_versions(vec![
         SAMTOOLS_TAG,
         MINIMAP2_TAG,
-        FASTP_TAG,
         SAMTOOLS_TAG,
         KRAKEN2_TAG,
         BCFTOOLS_TAG,
@@ -1976,101 +1913,48 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // Arguments and files check
-    let file1_path: PathBuf = match &config.args.file1 {
-        Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd), None, None, "");
-            if file1_full_path.exists() {
-                file1_full_path
-            } else {
-                return Err(PipelineError::FileNotFound(file1_full_path));
-            }
-        }
-        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
-    };
-
-    let sample_base: String;
-    let file1_r1r2 = r1r2_base(&file1_path);
-    sample_base = match file1_r1r2.prefix {
-        Some(prefix) => prefix,
-        None => {
-            eprintln!("No R1 tag found. Using bare file 1 stem as sample_base.");
-            file1_path.to_string_lossy().into_owned()
-        }
-    };
-
-    if !file1_path.exists() {
-        return Err(PipelineError::FileNotFound(file1_path));
-    }
-
-    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
-    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-
-    let file2_path: Option<PathBuf> = match &config.args.file2 {
-        Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
-            if file2_full_path.exists() {
-                Some(file2_full_path)
-            } else {
-                eprintln!("File2 path does not exist: {}", file2_full_path.display());
-                None
-            }
-        }
-        None => None,
-    };
+    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
     let technology = config.args.technology.clone();
-
-    let ref_db_path: Option<PathBuf> = config.args.ref_db.as_ref().map(PathBuf::from);
-
-
-    // Retrieve Index
-    let index_start = Instant::now();
-    let h5_index = get_index(&config.args)
-        .await
-        .map_err(|e| PipelineError::ReferenceRetrievalFailed(e.to_string()))?;
-    if h5_index.is_some() {
-        println!("Index retrieve time: {} milliseconds.", index_start.elapsed().as_millis());
-    }
-
-    let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_ref_tasks) = prepare_reference_and_index(
+    
+    let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_temp_dir, host_ref_tasks) = minimap2_index_prep(
         &config,
-        ref_db_path.clone(),
         &ram_temp_dir,
-        h5_index.as_ref(),
-        config.args.host_accession.clone(),
         config.args.host_sequence.clone(),
         config.args.host_index.clone(),
         "host",
     )
         .await?;
-    cleanup_tasks.extend(host_ref_tasks);
+    try_join_all(host_ref_tasks).await?;
     if let Some(temp) = host_ref_temp {
         temp_files.push(temp);
     }
     if let Some(index_temp) = host_index_temp {
         temp_files.push(index_temp);
     }
+    if let Some(index_temp) = host_temp_dir {
+        temp_dirs.push(index_temp);
+    }
 
-    let (target_ref_fasta_path_inner, target_ref_index_path, target_ref_temp, target_index_temp, target_ref_tasks) = prepare_reference_and_index(
+    let (target_ref_fasta_path_inner, target_ref_index_path, target_ref_temp, target_index_temp, target_temp_dir, target_ref_tasks) = minimap2_index_prep(
         &config,
-        ref_db_path.clone(),
         &ram_temp_dir,
-        h5_index.as_ref(),
-        config.args.target_accession.clone(),
         config.args.target_sequence.clone(),
         config.args.target_index.clone(),
         "target",
     )
         .await?;
-    cleanup_tasks.extend(target_ref_tasks);
+    try_join_all(target_ref_tasks).await?;
     if let Some(temp) = target_ref_temp {
         temp_files.push(temp);
     }
     if let Some(index_temp) = target_index_temp {
         temp_files.push(index_temp);
     }
+    if let Some(index_temp) = target_temp_dir {
+        temp_dirs.push(index_temp);
+    }
+
     let target_fasta = target_ref_fasta_path_inner.ok_or_else(|| {
         PipelineError::InvalidConfig("Target FASTA required for filter_with_kraken, call_variants, and evaluate_assembly".to_string())
     })?;
@@ -2078,11 +1962,11 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
 
     // Input Validation
-    let (val_fastp_out_stream, validate_cleanup_tasks, validate_cleanup_receivers) = validate_input(
+    let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, val_count_task) = validate_input(
         config.clone(),
         file1_path,
         file2_path,
-        sample_base_buf.clone(),
+        no_ext_sample_base_buf.clone(),
         &out_dir,
     )
         .await?;
@@ -2101,7 +1985,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let (no_host_output_stream, no_host_seqkit_out_stream_stats, no_host_cleanup_tasks, no_host_cleanup_receivers) = align_to_host(
         config.clone(),
-        val_fastp_out_stream,
+        val_out_stream,
         host_ref_index_path,
         no_host_file_path,
     )
@@ -2141,24 +2025,24 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     // Split by Technology
     match technology {
         Technology::Illumina => {
-            eprintln!("Technology: Illumina");
-            let (ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_ref_tasks) = prepare_reference_and_index(
+            info!("Technology: Illumina");
+            let (_ercc_fasta_path, ercc_index_path, ercc_ref_temp, ercc_index_temp, ercc_temp_dir, ercc_ref_tasks) = minimap2_index_prep(
                 &config,
-                None, // No HDF5 for ERCC
                 &ram_temp_dir,
-                None, // No HDF5 index
-                None, // No accession
                 config.args.ercc_sequence.clone(), // Use ercc_sequences as sequence path
                 config.args.ercc_index.clone(),
                 "ercc",
             )
                 .await?;
-            cleanup_tasks.extend(ercc_ref_tasks);
+            try_join_all(ercc_ref_tasks).await?;
             if let Some(temp) = ercc_ref_temp {
                 temp_files.push(temp);
             }
             if let Some(index_temp) = ercc_index_temp {
                 temp_files.push(index_temp);
+            }
+            if let Some(index_temp) = ercc_temp_dir {
+                temp_dirs.push(index_temp);
             }
 
             // ERCC
@@ -2253,7 +2137,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             cleanup_tasks.extend(realign_cleanup_tasks);
         }
         Technology::ONT => {
-            eprintln!("Technology: ONT not ready");
+            error!("Technology: ONT not ready");
         }
     }
 
@@ -2306,8 +2190,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?
             .map_err(|e| PipelineError::Other(e))?;
     }
+    let _input_read_stats = join_with_error_handling(val_count_task).await?;
     drop(temp_files);
+    drop(temp_dirs);
 
-    println!("Finished generating consensus genome");
+    info!("Finished consensus genome pipeline.");
     Ok(())
 }

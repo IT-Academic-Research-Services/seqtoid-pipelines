@@ -36,11 +36,17 @@ pub struct Arguments {
     #[arg(long, default_value_t = 50000000)]
     pub max_reads: usize,
 
+    #[clap(long, help = "Optional fixed seed for reproducibility; defaults to OS entropy")]
+    pub seed: Option<u64>,
+
     #[arg(long = "technology", default_value = "illumina", value_enum)]
     pub technology: Technology,
 
     #[arg(long)]
     pub min_read_len: Option<usize>,
+
+    #[arg(long)]
+    pub med_read_len: Option<usize>,
 
     #[arg(long)]
     pub max_read_len: Option<usize>,
@@ -57,17 +63,11 @@ pub struct Arguments {
     #[arg(long, default_value_t = 0)]
     pub stream_sleep_ms: u64,
 
-    #[arg(long)]  // For host removal
-    pub host_accession : Option<String>,
-
     #[arg(short = 'a', long)]  // For host removal
     pub host_sequence : Option<String>,
 
     #[arg(long, help = "Optional path to pre-built minimap2 index for host reference (e.g., hg38.mmi)")]
     pub host_index: Option<String>,
-
-    #[arg(long)]  // For target aligning
-    pub target_accession : Option<String>,
 
     #[arg(short = 't', long)] // For target aligning
     pub target_sequence : Option<String>,
@@ -77,9 +77,6 @@ pub struct Arguments {
 
     #[arg(long)]
     pub target_taxid : Option<String>,
-
-    #[arg(short = 'd', long = "db")]
-    pub ref_db : Option<String>,
 
     #[arg(long = "index")]
     pub ref_index : Option<String>,
@@ -113,5 +110,38 @@ pub struct Arguments {
 
     #[arg(long, default_value = "artic_v3_primers.bed")]
     pub primer_bed_path : Option<String>,
+
+    #[arg(long, default_value = "ercc.bowtie2.tar")]
+    pub ercc_bowtie2_index : String,
+
+    #[arg(long)]
+    pub kallisto_index : Option<String>,
+
+    #[arg(long)]
+    pub host_bowtie2_index : Option<String>,
+
+    #[arg(long, default_value = "human.bowtie2.tar")]
+    pub human_bowtie2_index : String,
+
+    #[arg(long)]
+    pub host_hisat2_index : Option<String>,
+
+    #[arg(long, default_value = "human.hisat2.tar")]
+    pub human_hisat2_index : String,
+
+    #[arg(long)]
+    pub host_star_index : Option<String>,
+
+    #[arg(long, default_value = "human.star.tar.gz")]
+    pub human_star_index : String,
+
+    #[arg(long, default_value_t = true)]
+    pub human_host: bool,
+
+    #[arg(long, default_value_t = 1000000)]
+    pub max_subsample: usize,
+
+    #[arg(long, default_value_t = 832400799511)]
+    pub nt_db_size: usize,
     
 }
