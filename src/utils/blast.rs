@@ -7,7 +7,6 @@ use tokio_stream::StreamExt;
 
 use crate::config::defs::{Taxid, Lineage};
 
-const INVALID_CALL_BASE_ID: i64 = -100;
 
 /// Single BLAST m8 line
 #[derive(Debug, Clone)]
@@ -51,9 +50,38 @@ impl M8Record {
     }
 }
 
+#[derive(Default)]
+pub struct AggBucket {
+    pub nonunique_count: u64,
+    pub unique_count: u64,
+    pub base_count: u64,
+    pub sum_percent_identity: f64,
+    pub sum_alignment_length: f64,
+    pub sum_e_value: f64,
+    pub source_count_type: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaxonCount {
+    pub tax_id: i32,
+    pub tax_level: u8,
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
+    pub count: u64,
+    pub nonunique_count: u64,
+    pub unique_count: u64,
+    pub dcr: f64,
+    pub percent_identity: f64,
+    pub alignment_length: f64,
+    pub e_value: f64,
+    pub count_type: String,
+    pub base_count: u64,
+    pub source_count_type: Option<Vec<String>>,
+}
+
 
 // *******************
-// PTaxonomy helper functions based on m8 records
+// Taxonomy helper functions based on m8 records
 // *******************
 
 /// Build a negative taxid for “no-specific-call” at a given level.
