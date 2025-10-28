@@ -182,4 +182,10 @@ pub struct Arguments {
         help = "Comma-separated list of test accessions (e.g., A01121)"
     )]
     pub test_accessions: Vec<String>,
+
+    #[arg(long, default_value = "nt.fa")]
+    pub nt: Option<String>,
+
+    #[arg(long, default_value = "nr.fa")]
+    pub nr: Option<String>,
 }

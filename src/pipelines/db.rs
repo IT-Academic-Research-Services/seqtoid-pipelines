@@ -64,10 +64,13 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 
     let (accession2taxid_file_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
+    let nt_path: Option<PathBuf> = config.args.nt.clone().map(PathBuf::from);
+    let nr_path: Option<PathBuf> = config.args.nr.clone().map(PathBuf::from);
+
     let db_out_path = file_path_manipulator(&PathBuf::from("accession2_taxid"), Some(&cwd), None, Some("sled.db"), "_");
     eprintln!("Writing to DB {:?}", db_out_path);
 
-    build_accession2taxid_db(&accession2taxid_file_path, &db_out_path)
+    build_accession2taxid_db(&accession2taxid_file_path, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
