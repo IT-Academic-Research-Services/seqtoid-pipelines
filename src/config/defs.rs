@@ -40,6 +40,9 @@ pub const CZID_DEDUP_TAG: &str = "czid-dedup";
 // Taxonomy defs
 pub type Taxid = i32;
 pub type Lineage = Vec<Taxid>;
+pub const INVALID_CALL_BASE_ID: i32 = -100;
+
+pub const LOG_NORMAL_POSITIVE_DOUBLE: f64 = 1e-200;
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -115,6 +118,13 @@ pub enum StreamDataType {
     IlluminaFastq, // SequenceRecord for Illumina FASTQ or FASTA
     OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadCountingMode {
+    CountAll,
+    CountUnique,
+}
+pub const READ_COUNTING_MODE: ReadCountingMode = ReadCountingMode::CountUnique;
 
 
 // For specifying which read (or read pairs are validated fore size.
