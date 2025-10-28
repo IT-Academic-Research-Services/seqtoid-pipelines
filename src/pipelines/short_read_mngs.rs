@@ -2426,6 +2426,7 @@ pub async fn call_hits_m8_stream(
     let lineages_db = sled::open(&lineages_db_path)?;
     let lineages_tree = lineages_db.open_tree("lineages")?;
 
+    eprintln!("loading acc2taxid:");
     let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
     let metadata = fs::metadata(acc2taxid_path.clone()).await?;
     let file_type = metadata.file_type();

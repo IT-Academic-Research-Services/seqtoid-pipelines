@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use log::{info, warn, debug};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use flate2::read::GzDecoder;
 use csv::ReaderBuilder;
 use sled::{Db, Tree, IVec};
 
@@ -153,50 +154,109 @@ pub async fn build_taxid_lineages_db(
 
 
 /// Builds a accession2taxid sled DB from a known accession2taxid file
+/// Skips accessions not present in NT/NR
 /// Typical location, sourced from NCBI:
 /// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz
 ///
 /// # Arguments
 ///
 ///  * `gz_path` - accession2taxid.gz
-/// * `db_path` -  output db path
+///  * `nt_file` - Path to NT FASTA file
+///  * `nr_file` - Path to NR FASTA file
+///  * `db_path` -  output db path
 ///
 /// # Returns
 /// Result
 pub async fn build_accession2taxid_db(
     gz_path: &PathBuf,
+    nt_file: Option<&PathBuf>,
+    nr_file: Option<&PathBuf>,
     db_path: &PathBuf,
 ) -> Result<()> {
+    // Collect accession IDs from NT/NR FASTA files
+    let mut accessions = HashSet::with_capacity(50_000_000); // Typical NT/NR size
+    for file_path in [nt_file, nr_file].into_iter().flatten() {
+        let file = File::open(file_path).await?;
+        let mut reader = BufReader::new(file).lines();
+        let mut count = 0;
+        while let Some(line) = reader.next_line().await? {
+            if line.starts_with('>') {
+                let accession = line[1..]
+                    .split_whitespace()
+                    .next()
+                    .ok_or_else(|| anyhow!("Invalid FASTA header: {}", line))?
+                    .split('.')
+                    .next()
+                    .ok_or_else(|| anyhow!("Invalid accession in header: {}", line))?;
+                accessions.insert(accession.to_string());
+                count += 1;
+                if count % 1_000_000 == 0 {
+                    info!("Extracted {}M accession names from {}", count / 1_000_000, file_path.display());
+                }
+            }
+        }
+        info!("Extracted {} accession names from {}", count, file_path.display());
+    }
+    info!("Total unique accessions from NT/NR: {}", accessions.len());
+
+
     let db = sled::open(db_path)?;
     let tree: Tree = db.open_tree("acc2taxid")?;
 
     let file = StdFile::open(gz_path)?;
-    let gz = flate2::read::GzDecoder::new(StdBufReader::new(file));
+    let gz = GzDecoder::new(StdBufReader::new(file));
     let mut rdr = ReaderBuilder::new()
         .delimiter(b'\t')
         .from_reader(gz);
 
     let mut count = 0;
+    let mut skipped = 0;
+    let mut duplicates = 0;
+
     for result in rdr.records() {
-        let record = result?;
-        if record.len() < 3 {
-            warn!("Skipping invalid record: {:?}", record);
-            continue;
-        }
-        let acc = record[0].as_bytes().to_vec(); // Use accession (first column)
-        let taxid: Taxid = match record[2].parse() { // Use taxid (third column)
-            Ok(t) => t,
+        let record = match result {
+            Ok(r) => r,
             Err(e) => {
-                warn!("Failed to parse taxid from record: {:?}", record);
-                return Err(anyhow!("Failed to parse taxid: {}", e));
+                warn!("Failed to read record: {}", e);
+                skipped += 1;
+                continue;
             }
         };
-        tree.insert(acc, taxid.to_le_bytes().as_slice())?;
+        if record.len() < 3 {
+            warn!("Skipping invalid record (too few fields): {:?}", record);
+            skipped += 1;
+            continue;
+        }
+        let acc = record[0].to_string();
+        let acc_no_version = acc.split('.').next().unwrap_or(&acc);
+        if !accessions.contains(acc_no_version) {
+            skipped += 1;
+            continue;
+        }
+        let taxid: Taxid = match record[2].parse() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Skipping record with invalid taxid: {:?}, error: {}", record, e);
+                skipped += 1;
+                continue;
+            }
+        };
+        if tree.contains_key(acc.as_bytes())? {
+            warn!("Duplicate accession found: {}", acc);
+            duplicates += 1;
+        }
+        tree.insert(acc.as_bytes(), taxid.to_le_bytes().as_slice())?;
         count += 1;
+        if count % 1_000_000 == 0 {
+            info!("Processed {}M records", count / 1_000_000);
+        }
     }
 
     db.flush_async().await?;
-    info!("Built acc2taxid DB with {} entries at {}", count, db_path.display());
+    info!(
+        "Built acc2taxid DB with {} entries at {}. Skipped {} records ({} invalid, {} not in NT/NR), found {} duplicates.",
+        count, db_path.display(), skipped, skipped - count, count, duplicates
+    );
     Ok(())
 }
 
