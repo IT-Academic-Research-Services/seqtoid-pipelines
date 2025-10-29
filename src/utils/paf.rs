@@ -107,19 +107,10 @@ impl PafRecord {
         let evalue = self.calc_evalue(genome_size);
 
         format!(
-            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
-            self.qname,
-            self.tname,
-            percent_ident,
-            self.alen,
-            nonmatch,
-            gap_openings,
-            qstart_1,
-            self.qend,
-            tstart_adj,
-            tend_adj,
-            evalue,
-            bitscore
+            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
+            self.qname, self.tname, percent_ident, self.alen,
+            nonmatch, gap_openings, qstart_1, self.qend,
+            tstart_adj, tend_adj, evalue, bitscore
         )
     }
 }

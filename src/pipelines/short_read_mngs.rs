@@ -2427,7 +2427,6 @@ pub async fn call_hits_m8_stream(
     let lineages_db = sled::open(&lineages_db_path)?;
     let lineages_tree = lineages_db.open_tree("lineages")?;
 
-    eprintln!("loading acc2taxid:");
     let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
     let metadata = fs::metadata(acc2taxid_path.clone()).await?;
     let file_type = metadata.file_type();
@@ -2459,7 +2458,17 @@ pub async fn call_hits_m8_stream(
         // Stream m8 input, group by read_id
         while let Some(item) = m8_input.next().await {
             let line = match item {
-                ParseOutput::Bytes(b) => String::from_utf8_lossy(&b).to_string(),
+                ParseOutput::Bytes(b) => {
+                    let bytes = b.to_vec();
+                    let s = match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!("m8 line not UTF-8: {}", e);
+                            continue;
+                        }
+                    };
+                    s.trim_end().to_string()
+                }
                 _ => continue,
             };
 
@@ -2467,10 +2476,10 @@ pub async fn call_hits_m8_stream(
                 continue;
             }
 
-            let rec = match crate::utils::blast::M8Record::parse_line(&line) {
+            let rec = match M8Record::parse_line(&line) {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!("m8 parse error: {} – {}", e, line);
+                    debug!("m8 parse error: {} – {}", e, &line);
                     continue;
                 }
             };
@@ -2691,8 +2700,8 @@ pub async fn generate_taxon_counts(
     while let Some(item) = summary_stream.next().await {
         let line = match item {
             ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
-                .map_err(|e| anyhow!("summary line not UTF-8: {}", e))?,
-            _ => continue,
+                .map_err(|e| PipelineError::Other(anyhow!("UTF-8 error: {}", e)))?,
+            _ => return Err(PipelineError::Other(anyhow!("Invalid stream item"))),
         };
 
         let cols: Vec<&str> = line.split('\t').collect();

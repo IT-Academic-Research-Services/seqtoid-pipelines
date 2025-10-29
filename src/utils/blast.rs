@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
+use lexical::parse as lexical_parse;
 
 use crate::config::defs::{Taxid, Lineage};
 
@@ -29,14 +30,20 @@ impl M8Record {
     pub fn parse_line(line: &str) -> Result<Self> {
         let mut fields = line.split('\t');
         macro_rules! next {
-            () => {
-                fields.next().ok_or_else(|| anyhow!("missing field"))?
-            };
+            () => { fields.next().ok_or_else(|| anyhow!("missing field"))? };
         }
+        macro_rules! parse_float {
+            () => {{
+                let s = next!();
+                lexical_parse::<f64, _>(s.as_bytes())
+                    .map_err(|e| anyhow!("invalid float '{}': {}", s, e))?
+            }};
+        }
+
         Ok(Self {
             qname: next!().to_string(),
             tname: next!().to_string(),
-            pident: next!().parse()?,
+            pident: parse_float!(),
             alen: next!().parse()?,
             mismatch: next!().parse()?,
             gapopen: next!().parse()?,
@@ -44,8 +51,8 @@ impl M8Record {
             qend: next!().parse()?,
             tstart: next!().parse()?,
             tend: next!().parse()?,
-            evalue: next!().parse()?,
-            bitscore: next!().parse()?,
+            evalue: parse_float!(),
+            bitscore: parse_float!(),
         })
     }
 }
