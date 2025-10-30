@@ -62,7 +62,38 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 
     info!("Building accession2taxid db.");
 
-    let (accession2taxid_file_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
+    let (mandatory_path, _file2_path, _no_ext_sample_base_buf, _no_ext_sample_base) =
+        validate_file_inputs(&config, &cwd)?;
+
+    let gz_paths: Vec<PathBuf> = if mandatory_path.is_dir() {
+        // if dir, all files inside assumed to be acc2tax source files
+        let mut entries = tokio::fs::read_dir(&mandatory_path).await
+            .map_err(|e| PipelineError::Other(anyhow!("cannot read directory {}: {}", mandatory_path.display(), e)))?;
+
+        let mut paths = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+        info!("Found {} source files in directory {}", paths.len(), mandatory_path.display());
+        paths
+    } else if mandatory_path.is_file() {
+        info!("Using single source file {}", mandatory_path.display());
+        vec![mandatory_path.clone()]
+    } else {
+        return Err(PipelineError::Other(anyhow!(
+            "mandatory input must be a file or directory: {}",
+            mandatory_path.display()
+        )));
+    };
+
+    if gz_paths.is_empty() {
+        return Err(PipelineError::Other(anyhow!(
+            "no accession2taxid source files found in {}",
+            mandatory_path.display()
+        )));
+    }
 
     let nt_path: Option<PathBuf> = config.args.nt.clone().map(PathBuf::from);
     let nr_path: Option<PathBuf> = config.args.nr.clone().map(PathBuf::from);
@@ -70,7 +101,7 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     let db_out_path = file_path_manipulator(&PathBuf::from("accession2_taxid"), Some(&cwd), None, Some("sled.db"), "_");
     eprintln!("Writing to DB {:?}", db_out_path);
 
-    build_accession2taxid_db(&accession2taxid_file_path, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
+    build_accession2taxid_db(&gz_paths, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 

@@ -168,11 +168,13 @@ pub async fn build_taxid_lineages_db(
 /// # Returns
 /// Result
 pub async fn build_accession2taxid_db(
-    gz_path: &PathBuf,
+    gz_paths: &[PathBuf],
     nt_file: Option<&PathBuf>,
     nr_file: Option<&PathBuf>,
     db_path: &PathBuf,
 ) -> Result<()> {
+
+
     // Collect accession IDs from NT/NR FASTA files
     let mut accessions = HashSet::with_capacity(50_000_000); // Typical NT/NR size
     for file_path in [nt_file, nr_file].into_iter().flatten() {
@@ -203,52 +205,55 @@ pub async fn build_accession2taxid_db(
     let db = sled::open(db_path)?;
     let tree: Tree = db.open_tree("acc2taxid")?;
 
-    let file = StdFile::open(gz_path)?;
-    let gz = GzDecoder::new(StdBufReader::new(file));
-    let mut rdr = ReaderBuilder::new()
-        .delimiter(b'\t')
-        .from_reader(gz);
-
     let mut count = 0;
     let mut skipped = 0;
     let mut duplicates = 0;
 
-    for result in rdr.records() {
-        let record = match result {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Failed to read record: {}", e);
+    for gz_path in gz_paths {
+        info!("Processing {}", gz_path.display());
+        let file = StdFile::open(gz_path)?;
+        let gz = GzDecoder::new(StdBufReader::new(file));
+        let mut rdr = ReaderBuilder::new()
+            .delimiter(b'\t')
+            .from_reader(gz);
+
+        for result in rdr.records() {
+            let record = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to read record: {}", e);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if record.len() < 3 {
+                warn!("Skipping invalid record (too few fields): {:?}", record);
                 skipped += 1;
                 continue;
             }
-        };
-        if record.len() < 3 {
-            warn!("Skipping invalid record (too few fields): {:?}", record);
-            skipped += 1;
-            continue;
-        }
-        let acc = record[0].to_string();
-        let acc_no_version = acc.split('.').next().unwrap_or(&acc);
-        if !accessions.contains(acc_no_version) {
-            skipped += 1;
-            continue;
-        }
-        let taxid: Taxid = match record[2].parse() {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Skipping record with invalid taxid: {:?}, error: {}", record, e);
+            let acc = record[0].to_string();
+            let acc_no_version = acc.split('.').next().unwrap_or(&acc);
+            if !accessions.contains(acc_no_version) {
                 skipped += 1;
                 continue;
             }
-        };
-        if tree.contains_key(acc.as_bytes())? {
-            warn!("Duplicate accession found: {}", acc);
-            duplicates += 1;
-        }
-        tree.insert(acc.as_bytes(), taxid.to_le_bytes().as_slice())?;
-        count += 1;
-        if count % 1_000_000 == 0 {
-            info!("Processed {}M records", count / 1_000_000);
+            let taxid: Taxid = match record[2].parse() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("Skipping record with invalid taxid: {:?}, error: {}", record, e);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if tree.contains_key(acc.as_bytes())? {
+                warn!("Duplicate accession found: {}", acc);
+                duplicates += 1;
+            }
+            tree.insert(acc.as_bytes(), taxid.to_le_bytes().as_slice())?;
+            count += 1;
+            if count % 1_000_000 == 0 {
+                info!("Processed {}M records", count / 1_000_000);
+            }
         }
     }
 
