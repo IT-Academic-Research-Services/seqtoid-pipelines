@@ -1583,6 +1583,7 @@ pub async fn call_hits_m8_stream(
                 }
                 _ => continue,
             };
+            eprintln!("m8 line: {}", line);
 
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
@@ -1619,7 +1620,7 @@ pub async fn call_hits_m8_stream(
                     valid_hits.push(hit.clone());
                 }
             }
-
+            eprintln!("valid hits {:?}", valid_hits);
             if valid_hits.is_empty() {
                 continue;
             }

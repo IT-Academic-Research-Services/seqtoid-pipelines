@@ -168,100 +168,120 @@ pub async fn build_taxid_lineages_db(
 /// # Returns
 /// Result
 pub async fn build_accession2taxid_db(
-    gz_paths: &[PathBuf],
+    mapping_files: &[PathBuf],
     nt_file: Option<&PathBuf>,
     nr_file: Option<&PathBuf>,
     db_path: &PathBuf,
 ) -> Result<()> {
+    // Extract accession bases (no version) from FASTA
+    let mut accession_bases: HashSet<String> = HashSet::new();
 
-
-    // Collect accession IDs from NT/NR FASTA files
-    let mut accessions = HashSet::with_capacity(50_000_000); // Typical NT/NR size
-    for file_path in [nt_file, nr_file].into_iter().flatten() {
-        let file = File::open(file_path).await?;
-        let mut reader = BufReader::new(file).lines();
+    for (path, name) in [(nt_file, "NT"), (nr_file, "NR")].into_iter().flatten() {
+        info!("Extracting accession bases from {}: {}", name, path.display());
+        let file = tokio::fs::File::open(path).await?;
+        let mut reader = tokio::io::BufReader::new(file).lines();
         let mut count = 0;
+
         while let Some(line) = reader.next_line().await? {
             if line.starts_with('>') {
-                let accession = line[1..]
-                    .split_whitespace()
-                    .next()
-                    .ok_or_else(|| anyhow!("Invalid FASTA header: {}", line))?
-                    .split('.')
-                    .next()
-                    .ok_or_else(|| anyhow!("Invalid accession in header: {}", line))?;
-                accessions.insert(accession.to_string());
-                count += 1;
-                if count % 1_000_000 == 0 {
-                    info!("Extracted {}M accession names from {}", count / 1_000_000, file_path.display());
+                if let Some(acc_base) = line[1..].split_whitespace().next()
+                    .and_then(|s| s.split('.').next())
+                {
+                    accession_bases.insert(acc_base.to_string());
+                    count += 1;
+                    if count % 1_000_000 == 0 {
+                        info!("\tExtracted {}M accession bases from {}", count / 1_000_000, name);
+                    }
                 }
             }
         }
-        info!("Extracted {} accession names from {}", count, file_path.display());
+        info!("Extracted {} accession bases from {}", count, name);
     }
-    info!("Total unique accessions from NT/NR: {}", accessions.len());
 
 
     let db = sled::open(db_path)?;
     let tree: Tree = db.open_tree("acc2taxid")?;
 
-    let mut count = 0;
-    let mut skipped = 0;
-    let mut duplicates = 0;
+    let mut total_mapped = 0;
+    let mut total_skipped = 0;
 
-    for gz_path in gz_paths {
-        info!("Processing {}", gz_path.display());
-        let file = StdFile::open(gz_path)?;
+    //  Process each mapping file
+    for mapping_file in mapping_files {
+        let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+        info!("Processing mapping file: {}", filename);
+
+        let file = StdFile::open(mapping_file)?;
         let gz = GzDecoder::new(StdBufReader::new(file));
         let mut rdr = ReaderBuilder::new()
             .delimiter(b'\t')
+            .has_headers(false)
             .from_reader(gz);
+
+        let mut mapped = 0;
+        let mut skipped = 0;
 
         for result in rdr.records() {
             let record = match result {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("Failed to read record: {}", e);
+                    warn!("Parse error in {}: {}", filename, e);
                     skipped += 1;
                     continue;
                 }
             };
-            if record.len() < 3 {
-                warn!("Skipping invalid record (too few fields): {:?}", record);
-                skipped += 1;
-                continue;
-            }
-            let acc = record[0].to_string();
-            let acc_no_version = acc.split('.').next().unwrap_or(&acc);
-            if !accessions.contains(acc_no_version) {
-                skipped += 1;
-                continue;
-            }
-            let taxid: Taxid = match record[2].parse() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("Skipping record with invalid taxid: {:?}, error: {}", record, e);
+
+            // andle prot.accession2taxid.FULL (rare): only 2 fields
+            if record.len() == 2 {
+                let acc_base = record[0].to_string();
+                if !accession_bases.contains(&acc_base) {
                     skipped += 1;
                     continue;
                 }
-            };
-            if tree.contains_key(acc.as_bytes())? {
-                warn!("Duplicate accession found: {}", acc);
-                duplicates += 1;
+                let taxid: Taxid = match record[1].parse() {
+                    Ok(t) => t,
+                    Err(_) => { skipped += 1; continue; }
+                };
+                // Store full accession (no version in this file)
+                tree.insert(acc_base.as_bytes(), taxid.to_le_bytes().as_slice())?;
+                mapped += 1;
             }
-            tree.insert(acc.as_bytes(), taxid.to_le_bytes().as_slice())?;
-            count += 1;
-            if count % 1_000_000 == 0 {
-                info!("Processed {}M records", count / 1_000_000);
+            // Standard case: 3+ fields
+            else if record.len() >= 3 {
+                let full_acc = record[0].to_string(); // e.g., YP_009725295.1
+                let acc_base = full_acc.split('.').next().unwrap_or(&full_acc).to_string();
+
+                if !accession_bases.contains(&acc_base) {
+                    skipped += 1;
+                    continue;
+                }
+
+                let taxid: Taxid = match record[2].parse() {
+                    Ok(t) => t,
+                    Err(_) => { skipped += 1; continue; }
+                };
+
+                // Store FULL accession with version
+                tree.insert(full_acc.as_bytes(), taxid.to_le_bytes().as_slice())?;
+                mapped += 1;
+            } else {
+                skipped += 1;
+            }
+
+            if (mapped + skipped) % 1_000_000 == 0 {
+                info!("\t{}M records processed (mapped: {}, skipped: {})",
+                      (mapped + skipped) / 1_000_000, mapped, skipped);
             }
         }
+
+        info!("Finished {}: mapped={}, skipped={}", filename, mapped, skipped);
+        total_mapped += mapped;
+        total_skipped += skipped;
     }
 
     db.flush_async().await?;
-    info!(
-        "Built acc2taxid DB with {} entries at {}. Skipped {} records ({} invalid, {} not in NT/NR), found {} duplicates.",
-        count, db_path.display(), skipped, skipped - count, count, duplicates
-    );
+    info!("Built acc2taxid DB with {} entries. Skipped {} not in NT/NR.",
+          total_mapped, total_skipped);
+
     Ok(())
 }
 
