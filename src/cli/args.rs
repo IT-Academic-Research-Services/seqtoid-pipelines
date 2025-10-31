@@ -188,4 +188,7 @@ pub struct Arguments {
 
     #[arg(long, default_value = "nr.fa")]
     pub nr: Option<String>,
+
+    #[arg(long, default_value = "nr.dmnd")]
+    pub diamond_db: Option<String>,
 }
