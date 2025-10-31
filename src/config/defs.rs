@@ -35,6 +35,7 @@ pub const HISAT2_TAG: &str = "hisat2";
 pub const KALLISTO_TAG: &str = "kallisto";
 pub const STAR_TAG: &str = "STAR";
 pub const CZID_DEDUP_TAG: &str = "czid-dedup";
+pub const DIAMOND_TAG: &str = "diamond";
 
 
 // Taxonomy defs
@@ -61,6 +62,7 @@ lazy_static! {
         m.insert(HISAT2_TAG, 2.20);
         m.insert(STAR_TAG, 2.7);
         m.insert(CZID_DEDUP_TAG, 0.1);
+        m.insert(DIAMOND_TAG, 2.1);
         m
     };
 }
@@ -101,6 +103,11 @@ pub enum SeqkitSubcommand {
 pub enum KallistoSubcommand {
     Index,
     Quant
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiamondSubcommand {
+    Blastx
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
