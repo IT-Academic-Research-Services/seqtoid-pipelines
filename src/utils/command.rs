@@ -1615,15 +1615,17 @@ pub mod czid_dedup {
 
 pub mod diamond {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig};
+    use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, KALLISTO_TAG};
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
 
     #[derive(Debug)]
     pub struct DiamondConfig {
         pub subcommand: DiamondSubcommand,
+        pub db: PathBuf,
         pub subcommand_fields: HashMap<String, Option<String>>,
     }
 
@@ -1649,6 +1651,14 @@ pub mod diamond {
                 }
 
             }
+
+            args_vec.push("-d".to_string());
+            args_vec.push(config.db.to_string_lossy().to_string());
+
+            args_vec.push("--threads".to_string());
+            let num_cores: usize = RunConfig::thread_allocation(run_config, DIAMOND_TAG, None);
+            args_vec.push(num_cores.to_string());
+
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(key.clone());
                 if let Some(v) = value {
