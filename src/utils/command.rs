@@ -1616,10 +1616,16 @@ pub mod czid_dedup {
 pub mod diamond {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use anyhow::anyhow;
+    use log::{debug, info, error, warn};
+    use tokio::fs;
+    use tokio::task::JoinHandle;
     use tokio::process::Command;
-    use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, KALLISTO_TAG};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use tempfile::{NamedTempFile, TempDir};
+    use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, PipelineError};
+    use crate::utils::file::available_space_for_path;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream, spawn_cmd};
     use crate::utils::command::{version_check, ArgGenerator};
 
     #[derive(Debug)]
@@ -1634,6 +1640,148 @@ pub mod diamond {
     pub async fn diamond_presence_check() -> anyhow::Result<f32> {
         let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout).await?;
         Ok(version)
+    }
+
+    async fn diamond_index_prep(
+        config: &RunConfig,
+        ram_temp_dir: &PathBuf,
+        sequence: Option<String>,
+        index_path: Option<String>,
+        ref_type: &str,
+    ) -> Result<(
+        Option<PathBuf>,             // FASTA path (if built)
+        PathBuf,                     // index path (.dmnd)
+        Option<NamedTempFile>,       // FASTA temp
+        Option<NamedTempFile>,       // Index temp
+        Option<TempDir>,             // temp dir for splits (Diamond may not support splits like minimap2, but included for consistency)
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    ), PipelineError> {
+        let mut tasks = Vec::new();
+        let mut ref_fasta_path: Option<PathBuf> = None;
+        let mut ref_temp: Option<NamedTempFile> = None;
+        let mut final_index_path: PathBuf = PathBuf::new();
+        let mut index_temp_file: Option<NamedTempFile> = None;
+        let mut index_temp_dir: Option<TempDir> = None;
+
+        match index_path {
+            Some(index) => {
+                let orig_index_path = PathBuf::from(&index);
+                if !orig_index_path.exists() {
+                    return Err(PipelineError::FileNotFound(orig_index_path));
+                }
+                if orig_index_path.extension().map_or(true, |ext| ext != "dmnd") {
+                    return Err(PipelineError::InvalidConfig(format!(
+                        "{} index must have .dmnd extension: {}",
+                        ref_type,
+                        orig_index_path.display()
+                    )));
+                }
+
+                let files_to_copy: Vec<(PathBuf, String)> = {
+                    let mmi_name = orig_index_path.file_name().unwrap().to_string_lossy().to_string();
+                    vec![(orig_index_path.clone(), mmi_name)]
+                };
+
+                let mut total_size: u64 = 0;
+                for (p, _) in &files_to_copy {
+                    let meta = fs::metadata(p).await
+                        .map_err(|e| PipelineError::Other(e.into()))?;
+                    total_size += meta.len();
+                }
+
+                let buffer = 10 * 1024 * 1024;
+                let avail = available_space_for_path(ram_temp_dir)
+                    .await
+                    .map_err(|e| PipelineError::Other(e))?;
+                let enough_space = avail >= total_size + buffer;
+
+                if enough_space {
+                    let temp_file = NamedTempFile::with_suffix_in(".dmnd", ram_temp_dir)
+                        .map_err(|e| PipelineError::Other(e.into()))?;
+                    let temp_index_path = temp_file.path().to_path_buf();
+                    let temp_index_path_cl = temp_index_path.clone();
+                    let ref_type_cl = ref_type.to_string();
+                    let task = tokio::spawn(async move {
+                        fs::copy(&orig_index_path, &temp_index_path_cl).await
+                            .map_err(|e| anyhow!("Failed to copy {} index: {}", ref_type_cl, e))?;
+                        Ok(())
+                    });
+                    tasks.push(task);
+                    final_index_path = temp_index_path;
+                    index_temp_file = Some(temp_file);
+                } else {
+                    info!(
+                    "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
+                    ref_type, total_size, avail
+                );
+                    final_index_path = orig_index_path;
+                }
+            }
+            // build index from FASTA
+            None => {
+                let sequence_path = sequence.ok_or_else(|| {
+                    PipelineError::InvalidConfig("No FASTA or index provided for Diamond".to_string())
+                })?;
+                let sequence_path = PathBuf::from(&sequence_path);
+                if !sequence_path.exists() {
+                    return Err(PipelineError::FileNotFound(sequence_path));
+                }
+                // Assume it's protein FASTA
+
+                let temp_fasta = NamedTempFile::with_suffix_in(".faa", ram_temp_dir)
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                let temp_fasta_path = temp_fasta.path().to_path_buf();
+                let temp_fasta_path_cl = temp_fasta_path.clone();
+                let ref_type_cl = ref_type.to_string();
+                let copy_task = tokio::spawn(async move {
+                    fs::copy(&sequence_path, &temp_fasta_path_cl).await
+                        .map_err(|e| anyhow!("Failed to copy {} FASTA: {}", ref_type_cl, e))?;
+                    Ok(())
+                });
+                tasks.push(copy_task);
+                ref_fasta_path = Some(temp_fasta_path.clone());
+                ref_temp = Some(temp_fasta);
+
+                let index_temp = NamedTempFile::with_suffix_in(".dmnd", ram_temp_dir)
+                    .map_err(|e| PipelineError::Other(e.into()))?;
+                let index_temp_path = index_temp.path().to_path_buf();
+
+                let diamond_makedb_args = vec![
+                    "makedb".to_string(),
+                    "--in".to_string(),
+                    temp_fasta_path.to_string_lossy().to_string(),
+                    "-d".to_string(),
+                    index_temp_path.to_string_lossy().to_string(),
+                ];
+
+                let (mut child, err_task) = spawn_cmd(
+                    Arc::new(config.clone()),
+                    DIAMOND_TAG,
+                    diamond_makedb_args,
+                    config.args.verbose,
+                )
+                    .await
+                    .map_err(|e| PipelineError::ToolExecution {
+                        tool: DIAMOND_TAG.to_string(),
+                        error: e.to_string(),
+                    })?;
+
+                let index_task = tokio::spawn(async move {
+                    let status = child.wait().await?;
+                    if !status.success() {
+                        return Err(anyhow!("Diamond makedb failed with exit code: {:?}", status.code()));
+                    }
+                    Ok(())
+                });
+                tasks.push(index_task);
+                tasks.push(err_task);
+
+                final_index_path = index_temp_path;
+                index_temp_file = Some(index_temp);
+            }
+        }
+
+        Ok((ref_fasta_path, final_index_path, ref_temp, index_temp_file, index_temp_dir, tasks))
     }
 
     impl ArgGenerator for DiamondArgGenerator {
