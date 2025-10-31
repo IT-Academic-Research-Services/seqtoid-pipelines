@@ -176,7 +176,10 @@ pub async fn build_accession2taxid_db(
     // Extract accession bases (no version) from FASTA
     let mut accession_bases: HashSet<String> = HashSet::new();
 
-    for (path, name) in [(nt_file, "NT"), (nr_file, "NR")].into_iter().flatten() {
+    for (path, name) in [(nt_file, "NT"), (nr_file, "NR")]
+        .into_iter()
+        .filter_map(|(opt_path, name)| opt_path.map(|p| (p, name)))
+    {
         info!("Extracting accession bases from {}: {}", name, path.display());
         let file = tokio::fs::File::open(path).await?;
         let mut reader = tokio::io::BufReader::new(file).lines();
