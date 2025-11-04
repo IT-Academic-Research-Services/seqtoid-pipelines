@@ -69,6 +69,33 @@ pub fn resolve_to_absolute(path: &str, base_dir: &Path) -> PathBuf {
 }
 
 
+/// Uses resolve_to_absolute to resolve optionmal file paths.
+/// # Arguments
+///
+/// * `cli`optiuonal cli arg string path
+/// * 'basedir': passes to resolve_to_absolute
+///
+/// # Returns
+/// Result of optional resolved PAthBuf
+pub fn resolve_optional_path(
+    cli: &Option<String>,
+    base_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    match cli {
+        Some(s) => {
+            let abs = resolve_to_absolute(s, base_dir);
+            if !abs.exists() {
+                return Err(anyhow!("File not found: {}", abs.display()));
+            }
+            if !abs.is_file() {
+                return Err(anyhow!("Not a file: {}", abs.display()));
+            }
+            Ok(Some(abs))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Allows pre and post-fixes to be appended to a base file name whle preserving its dir.
 /// # Arguments
 ///
