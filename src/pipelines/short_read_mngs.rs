@@ -36,6 +36,7 @@ use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::kallisto::KallistoConfig;
+use crate::utils::command::diamond::{DiamondConfig, DiamondArgGenerator, diamond_index_prep};
 use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
 use crate::utils::streams::{deinterleave_fastq_stream_to_fifos};
 use crate::utils::command::star::{StarConfig, star_index_prep};
@@ -1761,6 +1762,89 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
     false
 }
 
+
+async fn diamond_non_host_align(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+) -> Result<(
+    ReceiverStream<ParseOutput>,  // m8 stream (tabular lines)
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    Option<NamedTempFile>,
+    Option<NamedTempFile>,
+    Option<TempDir>,
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let ram_temp_dir = config.ram_temp_dir.clone();
+
+    let (ref_fasta_path, diamond_index_path, ref_temp, index_temp, index_temp_dir, mut index_tasks) = diamond_index_prep(
+        &config,
+        &ram_temp_dir,
+        config.args.diamond_fasta.clone(),
+        config.args.diamond_db.clone(),
+        "non_host_diamond",
+    ).await?;
+    cleanup_tasks.append(&mut index_tasks);
+
+    let diamond_options: HashMap<String, Option<String>> = HashMap::from([
+        ("--mid-sensitive".to_string(), None),
+        ("--outfmt".to_string(), Some("6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore".to_string())),
+    ]);
+
+    let diamond_config = DiamondConfig {
+        subcommand: DiamondSubcommand::Blastx,
+        db: diamond_index_path.clone(),
+        subcommand_fields: diamond_options,
+    };
+
+    let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: DIAMOND_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut diamond_child, diamond_stream_task, diamond_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        DIAMOND_TAG,
+        diamond_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: DIAMOND_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(diamond_stream_task);
+    cleanup_tasks.push(diamond_err_task);
+
+    let diamond_out_stream = {
+        let mut guard = diamond_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Lines,  // m8 is tab-delimited lines
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: DIAMOND_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    Ok((
+        ReceiverStream::new(diamond_out_stream),
+        cleanup_tasks,
+        cleanup_receivers,
+        ref_temp,
+        index_temp,
+        index_temp_dir,
+    ))
+}
 
 /// Generates ytaxon counts from a called m8 stream
 /// # Arguments
