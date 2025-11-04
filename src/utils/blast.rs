@@ -5,8 +5,10 @@ use anyhow::{anyhow, Result};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
+use sled::Tree;
 
 use crate::config::defs::{Taxid, Lineage};
+use crate::utils::taxonomy::validate_taxid_lineage;
 
 
 /// Single BLAST m8 line
@@ -113,12 +115,38 @@ fn negative_taxid(level: u8) -> i64 {
 pub fn consensus_level(
     hits: &[M8Record],
     lineage_map: &HashMap<Taxid, Lineage>,
+    acc2taxid: &Tree,
+    should_keep: &impl Fn(&[i32]) -> bool
 ) -> (u8, i64, Vec<M8Record>) {
     let lineages: Vec<Lineage> = hits
         .iter()
-        // Map accession (tname) → taxid → lineage [species, genus, family]
         .filter_map(|r| {
-            let taxid: Taxid = r.tname.parse().ok()?;
+            let accession = &r.tname;
+
+            // lookup taxid in acc2taxid DB
+            let taxid_bytes_opt = match acc2taxid.get(accession.as_bytes()).ok().flatten() {
+                Some(b) => Some(b),
+                None => {
+                    // Try base without version (e.g., "MN988668.1" -> "MN988668")
+                    let base_acc = accession.split('.').next().unwrap_or(accession);
+                    if base_acc != accession {
+                        acc2taxid.get(base_acc.as_bytes()).ok().flatten()
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            let taxid_bytes = match taxid_bytes_opt {
+                Some(b) => b,
+                None => return None,  // skip if no taxid found
+            };
+
+            let taxid: Taxid = match i32::from_le_bytes(taxid_bytes.as_ref().try_into().ok()?) {
+                t if t > 0 => t,
+                _ => return None,  // skip invalid taxid incl negative values
+            };
+
             lineage_map.get(&taxid).cloned()
         })
         .collect();
@@ -144,6 +172,17 @@ pub fn consensus_level(
         } else {
             // No agreement at this level; stop as deeper levels won't agree
             break;
+        }
+    }
+
+    if max_level > 0 {
+        // Take a representative lineage (since they agree up to max_level)
+        let rep_lineage = &lineages[0];
+        let validated = validate_taxid_lineage(rep_lineage, consensus_taxid as i32, max_level);
+
+        // Apply filter
+        if !should_keep(&validated) {
+            return (0, 0, Vec::new());  // No consensus if filtered out
         }
     }
 
