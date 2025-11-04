@@ -106,22 +106,29 @@ pub fn resolve_optional_path(
 ///
 /// # Returns
 /// PathBuf
-pub fn rename_file_path(path: &PathBuf, prefix: Option<&str>, postfix: Option<&str>, delimiter: &str) -> PathBuf {
-    let dir = path.parent().unwrap_or(Path::new("."));
+pub fn rename_file_path(
+    path: &Path,  
+    prefix: Option<&str>,
+    postfix: Option<&str>,
+    delimiter: &str,
+) -> PathBuf {
     let (stem, extensions) = extension_remover(path);
-    let base = stem.file_name().and_then(|s| s.to_str()).unwrap_or("");  // Now get just filename from stem
+    let base = stem.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
     let new_base = match (prefix, postfix) {
-        (Some(p), Some(q)) => format!("{}{}{}{}{}", p, delimiter, base, delimiter, q),
-        (Some(p), None) => format!("{}{}{}", p, delimiter, base),
-        (None, Some(q)) => format!("{}{}{}", base, delimiter, q),
+        (Some(p), Some(q)) => format!("{p}{delimiter}{base}{delimiter}{q}"),
+        (Some(p), None) => format!("{p}{delimiter}{base}"),
+        (None, Some(q)) => format!("{base}{delimiter}{q}"),
         (None, None) => base.to_string(),
     };
-    let new_file_name = if extensions.is_empty() {
+
+    let new_name = if extensions.is_empty() {
         new_base
     } else {
         format!("{}.{}", new_base, extensions.join("."))
     };
-    dir.join(new_file_name)
+
+    PathBuf::from(new_name)
 }
 
 /// Calls file_name_manipulator to make alterations to the file name.
@@ -190,14 +197,13 @@ pub fn file_name_manipulator(path: &PathBuf, prefix: Option<&str>, postfix:Optio
 ///
 /// # Returns
 /// PathBuf of stripped file, extensions.
-pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
-    let path = Path::new(path);
+pub fn extension_remover(path: &Path) -> (PathBuf, Vec<String>) {
     let parent = path.parent().unwrap_or(Path::new(""));
     let mut current = path;
     let mut extensions = Vec::new();
 
-    while let Some(ext) = current.extension().and_then(|e| e.to_str()) {
-
+    while let Some(ext_os) = current.extension() {
+        let ext = ext_os.to_str().unwrap_or("");
         match extensions.len() {
             1 => {
                 if extensions[0] == "gz" {
@@ -206,25 +212,15 @@ pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
                     break;
                 }
             }
-            0 => {
-                extensions.push(ext.to_string());
-            }
-            _ => {
-                break;
-            }
+            0 => extensions.push(ext.to_string()),
+            _ => break,
         }
-
         current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
     }
 
-    let stem = current.to_string_lossy().into_owned();
-    let out_path_buf = if parent == Path::new("") {
-        PathBuf::from(stem)
-    } else {
-        parent.join(stem)
-    };
+    let stem_path = parent.join(current);
     extensions.reverse();
-    (out_path_buf, extensions)
+    (stem_path, extensions)
 }
 
 
