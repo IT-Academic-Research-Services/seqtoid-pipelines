@@ -88,18 +88,21 @@ impl PafRecord {
 
 
     fn extract_accession(&self) -> String {
-        //Find the *first* part that looks like an accession.
-        let accession = self.tname
-            .split(|c| c == ':' || c == '|')
-            .find(|part| {
-                let p = part.trim();
-                p.starts_with(char::is_alphabetic) && p.chars().any(char::is_numeric)
+        // Strategy:
+        // 1. Try to find NT: or NR: prefix (CZ ID style)
+        // 2. If not, take first word after '>' or space (NCBI style)
+        self.tname
+            .split(':')
+            .find(|part| part.starts_with("NT:") || part.starts_with("NR:"))
+            .and_then(|s| s.split('|').next())  // strip |kraken:taxid|
+            .or_else(|| {
+                self.tname
+                    .split(|c| c == ' ' || c == '\t')
+                    .next()
+                    .and_then(|s| s.strip_prefix('>'))
             })
             .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| self.tname.clone());
-
-
-        accession
+            .unwrap_or_default()
     }
 
     pub fn to_m8_line(&self, genome_size: f64) -> String {
