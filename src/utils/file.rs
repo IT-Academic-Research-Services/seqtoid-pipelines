@@ -68,6 +68,35 @@ pub fn resolve_to_absolute(path: &str, base_dir: &Path) -> PathBuf {
     abs.canonicalize().unwrap_or(abs)
 }
 
+
+/// Allows pre and post-fixes to be appended to a base file name whle preserving its dir.
+/// # Arguments
+///
+/// * `path`: &PathBuf
+/// * 'prefix': Option<&str> = added ahead of base
+/// * 'postfix': Option<&str> = added after of base
+///  * 'delimiter': &str = added between prefix, postfix and base.
+///
+/// # Returns
+/// PathBuf
+pub fn rename_file_path(path: &PathBuf, prefix: Option<&str>, postfix: Option<&str>, delimiter: &str) -> PathBuf {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let (stem, extensions) = extension_remover(path);
+    let base = stem.file_name().and_then(|s| s.to_str()).unwrap_or("");  // Now get just filename from stem
+    let new_base = match (prefix, postfix) {
+        (Some(p), Some(q)) => format!("{}{}{}{}{}", p, delimiter, base, delimiter, q),
+        (Some(p), None) => format!("{}{}{}", p, delimiter, base),
+        (None, Some(q)) => format!("{}{}{}", base, delimiter, q),
+        (None, None) => base.to_string(),
+    };
+    let new_file_name = if extensions.is_empty() {
+        new_base
+    } else {
+        format!("{}.{}", new_base, extensions.join("."))
+    };
+    dir.join(new_file_name)
+}
+
 /// Calls file_name_manipulator to make alterations to the file name.
 /// Then returns absolute path.
 /// # Arguments
