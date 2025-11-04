@@ -86,38 +86,48 @@ impl PafRecord {
         }
     }
 
+
+    fn extract_accession(&self) -> String {
+        //Find the *first* part that looks like an accession.
+        let accession = self.tname
+            .split(|c| c == ':' || c == '|')
+            .find(|part| {
+                let p = part.trim();
+                p.starts_with(char::is_alphabetic) && p.chars().any(char::is_numeric)
+            })
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| self.tname.clone());
+
+
+        accession
+    }
+
     pub fn to_m8_line(&self, genome_size: f64) -> String {
-        let mut tstart = self.tstart;
-        let mut tend = self.tend;
+        let accession = self.extract_accession();
+
+        if accession.is_empty() {
+            return String::new();
+        }
+
+        let (mut tstart, mut tend) = (self.tstart, self.tend);
         if self.strand == '-' {
             std::mem::swap(&mut tstart, &mut tend);
         }
         let qstart_1 = self.qstart + 1;
-        let mut tstart_adj = tstart;
-        let mut tend_adj = tend;
-        if self.strand == '+' {
-            tstart_adj += 1;
-        } else {
-            tend_adj += 1;
-        }
-        let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let tstart_adj = if self.strand == '+' { tstart + 1 } else { tstart };
+        let tend_adj   = if self.strand == '+' { tend } else { tend + 1 };
+
+        let nonmatch = self.tags.get("NM")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         let gap_openings = self.calc_gap_openings();
         let percent_ident = self.percent_identity();
         let bitscore = self.calc_bitscore();
         let evalue = self.calc_evalue(genome_size);
 
-        let tname = if self.tname.contains("|kraken:taxid|") {
-            self.tname.split("|kraken:taxid|").next().unwrap_or(&self.tname).to_string()
-        } else {
-            self.tname.clone()
-        };
-        if tname.is_empty() {
-            return String::new();
-        }
-
         format!(
             "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-            self.qname, tname, percent_ident, self.alen,
+            self.qname, accession, percent_ident, self.alen,
             nonmatch, gap_openings, qstart_1, self.qend,
             tstart_adj, tend_adj, evalue, bitscore
         )
