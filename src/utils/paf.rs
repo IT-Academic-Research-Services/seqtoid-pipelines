@@ -106,9 +106,18 @@ impl PafRecord {
         let bitscore = self.calc_bitscore();
         let evalue = self.calc_evalue(genome_size);
 
+        let tname = if self.tname.contains("|kraken:taxid|") {
+            self.tname.split("|kraken:taxid|").next().unwrap_or(&self.tname).to_string()
+        } else {
+            self.tname.clone()
+        };
+        if tname.is_empty() {
+            return String::new();
+        }
+
         format!(
             "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-            self.qname, self.tname, percent_ident, self.alen,
+            self.qname, tname, percent_ident, self.alen,
             nonmatch, gap_openings, qstart_1, self.qend,
             tstart_adj, tend_adj, evalue, bitscore
         )
