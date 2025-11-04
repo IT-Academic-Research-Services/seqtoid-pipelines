@@ -25,6 +25,7 @@ use tokio::fs::{File, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use serde_json::Value;
+use sled::Tree;
 use twox_hash::XxHash64;
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand};
@@ -1549,6 +1550,13 @@ pub async fn call_hits_m8_stream(
     let acc2taxid_db = sled::open(&acc2taxid_path)?;
     let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
 
+    // let should_keep = build_should_keep_filter(
+    //     PathBuf::from(config.args.deuterostome_list.clone().ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?),
+    //     PathBuf::from(config.args.taxon_whitelist.clone(),
+    //                   PathBuf::from(config.args.taxon_blacklist.clone(),
+    //
+    // ).await?;
+
     let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
     for entry in lineages_tree.iter() {
         let (key, value) = entry?;
@@ -1566,7 +1574,7 @@ pub async fn call_hits_m8_stream(
 
     let config_clone = config.clone();
     let processing_task = tokio::spawn(async move {
-        let mut read_groups: HashMap<String, Vec<crate::utils::blast::M8Record>> = HashMap::new();
+        let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::new();
 
         // Stream m8 input, group by read_id
         while let Some(item) = m8_input.next().await {
@@ -1632,6 +1640,9 @@ pub async fn call_hits_m8_stream(
 
             // Compute consensus taxonomy level
             let (tax_level, consensus_taxid, consensus_hits) = consensus_level(&valid_hits, &lineage_map);
+
+            acc2taxid: &Tree,
+            should_keep: &impl Fn(&[i32]) -> bool
 
             let dedup_line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
@@ -1762,89 +1773,89 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
     false
 }
 
-
-async fn diamond_non_host_align(
-    config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-) -> Result<(
-    ReceiverStream<ParseOutput>,  // m8 stream (tabular lines)
-    Vec<JoinHandle<Result<(), anyhow::Error>>>,
-    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-    Option<NamedTempFile>,
-    Option<NamedTempFile>,
-    Option<TempDir>,
-), PipelineError> {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
-
-    let ram_temp_dir = config.ram_temp_dir.clone();
-
-    let (ref_fasta_path, diamond_index_path, ref_temp, index_temp, index_temp_dir, mut index_tasks) = diamond_index_prep(
-        &config,
-        &ram_temp_dir,
-        config.args.diamond_fasta.clone(),
-        config.args.diamond_db.clone(),
-        "non_host_diamond",
-    ).await?;
-    cleanup_tasks.append(&mut index_tasks);
-
-    let diamond_options: HashMap<String, Option<String>> = HashMap::from([
-        ("--mid-sensitive".to_string(), None),
-        ("--outfmt".to_string(), Some("6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore".to_string())),
-    ]);
-
-    let diamond_config = DiamondConfig {
-        subcommand: DiamondSubcommand::Blastx,
-        db: diamond_index_path.clone(),
-        subcommand_fields: diamond_options,
-    };
-
-    let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: DIAMOND_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut diamond_child, diamond_stream_task, diamond_err_task) = stream_to_cmd(
-        config.clone(),
-        input_stream.into_inner(),
-        DIAMOND_TAG,
-        diamond_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: DIAMOND_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(diamond_stream_task);
-    cleanup_tasks.push(diamond_err_task);
-
-    let diamond_out_stream = {
-        let mut guard = diamond_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Lines,  // m8 is tab-delimited lines
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: DIAMOND_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
-
-    Ok((
-        ReceiverStream::new(diamond_out_stream),
-        cleanup_tasks,
-        cleanup_receivers,
-        ref_temp,
-        index_temp,
-        index_temp_dir,
-    ))
-}
+//
+// async fn diamond_non_host_align(
+//     config: Arc<RunConfig>,
+//     input_stream: ReceiverStream<ParseOutput>,
+// ) -> Result<(
+//     ReceiverStream<ParseOutput>,  // m8 stream (tabular lines)
+//     Vec<JoinHandle<Result<(), anyhow::Error>>>,
+//     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+//     Option<NamedTempFile>,
+//     Option<NamedTempFile>,
+//     Option<TempDir>,
+// ), PipelineError> {
+//     let mut cleanup_tasks = Vec::new();
+//     let mut cleanup_receivers = Vec::new();
+//
+//     let ram_temp_dir = config.ram_temp_dir.clone();
+//
+//     let (ref_fasta_path, diamond_index_path, ref_temp, index_temp, index_temp_dir, mut index_tasks) = diamond_index_prep(
+//         &config,
+//         &ram_temp_dir,
+//         config.args.diamond_fasta.clone(),
+//         config.args.diamond_db.clone(),
+//         "non_host_diamond",
+//     ).await?;
+//     cleanup_tasks.append(&mut index_tasks);
+//
+//     let diamond_options: HashMap<String, Option<String>> = HashMap::from([
+//         ("--mid-sensitive".to_string(), None),
+//         ("--outfmt".to_string(), Some("6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore".to_string())),
+//     ]);
+//
+//     let diamond_config = DiamondConfig {
+//         subcommand: DiamondSubcommand::Blastx,
+//         db: diamond_index_path.clone(),
+//         subcommand_fields: diamond_options,
+//     };
+//
+//     let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: DIAMOND_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//
+//     let (mut diamond_child, diamond_stream_task, diamond_err_task) = stream_to_cmd(
+//         config.clone(),
+//         input_stream.into_inner(),
+//         DIAMOND_TAG,
+//         diamond_args,
+//         StreamDataType::IlluminaFastq,
+//         config.args.verbose,
+//     )
+//         .await
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: DIAMOND_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//     cleanup_tasks.push(diamond_stream_task);
+//     cleanup_tasks.push(diamond_err_task);
+//
+//     let diamond_out_stream = {
+//         let mut guard = diamond_child.lock().await;
+//         parse_child_output(
+//             &mut guard,
+//             ChildStream::Stdout,
+//             ParseMode::Lines,  // m8 is tab-delimited lines
+//             config.base_buffer_size,
+//         )
+//             .await
+//             .map_err(|e| PipelineError::ToolExecution {
+//                 tool: DIAMOND_TAG.to_string(),
+//                 error: e.to_string(),
+//             })?
+//     };
+//
+//     Ok((
+//         ReceiverStream::new(diamond_out_stream),
+//         cleanup_tasks,
+//         cleanup_receivers,
+//         ref_temp,
+//         index_temp,
+//         index_temp_dir,
+//     ))
+// }
 
 /// Generates ytaxon counts from a called m8 stream
 /// # Arguments
