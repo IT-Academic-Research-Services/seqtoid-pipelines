@@ -100,7 +100,7 @@ fn negative_taxid(level: u8) -> i64 {
 }
 
 
-/// Computes the common lineage for a set of hits, matching m8.py _common_lineage logic.
+/// Computes the common lineage for a set of hits,
 /// Assumes lineages are [species, genus, family] leaf-to-root with possible negatives.
 ///
 /// # Arguments
@@ -117,7 +117,7 @@ pub fn consensus_level(
     lineage_map: &HashMap<Taxid, Lineage>,
     acc2taxid: &Tree,
     should_keep: &impl Fn(&[i32]) -> bool
-) -> (u8, i64, Vec<M8Record>) {
+) -> Result<(u8, i64, Vec<M8Record>)> {
     let lineages: Vec<Lineage> = hits
         .iter()
         .filter_map(|r| {
@@ -152,7 +152,7 @@ pub fn consensus_level(
         .collect();
 
     if lineages.is_empty() {
-        return (0, 0, Vec::new());
+        return Ok((0, 0, Vec::new()));
     }
 
     let mut max_level = 0u8;
@@ -182,9 +182,9 @@ pub fn consensus_level(
 
         // Apply filter
         if !should_keep(&validated) {
-            return (0, 0, Vec::new());  // No consensus if filtered out
+            return Ok((0, 0, Vec::new()));  // No consensus if filtered out
         }
     }
 
-    (max_level, consensus_taxid, hits.to_vec())
+    Ok((max_level, consensus_taxid, hits.to_vec()))
 }

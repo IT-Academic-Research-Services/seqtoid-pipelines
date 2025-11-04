@@ -29,7 +29,7 @@ use sled::Tree;
 use twox_hash::XxHash64;
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
@@ -1550,12 +1550,15 @@ pub async fn call_hits_m8_stream(
     let acc2taxid_db = sled::open(&acc2taxid_path)?;
     let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
 
-    // let should_keep = build_should_keep_filter(
-    //     PathBuf::from(config.args.deuterostome_list.clone().ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?),
-    //     PathBuf::from(config.args.taxon_whitelist.clone(),
-    //                   PathBuf::from(config.args.taxon_blacklist.clone(),
-    //
-    // ).await?;
+    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
+    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
+    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
+
+    let should_keep = build_should_keep_filter(
+        deuterostome_path,
+        taxon_whitelist_path,
+        taxon_blacklist_path,
+    ).await?;
 
     let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
     for entry in lineages_tree.iter() {
@@ -1619,7 +1622,7 @@ pub async fn call_hits_m8_stream(
                 // Lookup accession → taxid
                 if let Ok(Some(taxid_ivec)) = acc2taxid_tree.get(hit.tname.as_bytes()) {
                     let taxid_bytes: [u8; 4] = taxid_ivec[..4].try_into().map_err(|_| anyhow!("corrupt taxid"))?;
-                    let taxid = i32::from_le_bytes(taxid_bytes); // Use i32 to match Taxid
+                    let taxid = i32::from_le_bytes(taxid_bytes);
                     if taxid == 0 { continue; }
 
                     if is_filtered(taxid as i64, &blacklist, &deuterostome, &whitelist) {
@@ -1639,10 +1642,7 @@ pub async fn call_hits_m8_stream(
             let best = valid_hits[0].clone();
 
             // Compute consensus taxonomy level
-            let (tax_level, consensus_taxid, consensus_hits) = consensus_level(&valid_hits, &lineage_map);
-
-            acc2taxid: &Tree,
-            should_keep: &impl Fn(&[i32]) -> bool
+            let (tax_level, consensus_taxid, consensus_hits) = consensus_level(&valid_hits, &lineage_map, &acc2taxid_tree, &should_keep)?;
 
             let dedup_line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
@@ -2293,13 +2293,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         temp_dirs.push(index_temp);
     }
 
-    let m8_file_path = file_path_manipulator(
-        &PathBuf::from(&no_ext_sample_base_buf),
-        Some(&out_dir),
-        None,
-        Some(".m8"),
-        "",
-    );
+    let m8_file_path = out_dir.join(rename_file_path(&no_ext_sample_base_buf, None, Some("m8"), "."));
+    eprintln!("m8 m8 m8: {}", m8_file_path.display());
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
         config.clone(),
