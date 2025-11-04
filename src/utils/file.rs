@@ -50,6 +50,24 @@ pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
 }
 
 
+/// Absolut path resolver.
+/// # Arguments
+///
+/// * `path`: &str path
+/// * 'basedir': canoncially th cwd, but any absolute path dir
+///
+/// # Returns
+/// PathBuf:absolute path
+pub fn resolve_to_absolute(path: &str, base_dir: &Path) -> PathBuf {
+    let p = PathBuf::from(path);
+    let abs = if p.is_relative() {
+        base_dir.join(p)
+    } else {
+        p
+    };
+    abs.canonicalize().unwrap_or(abs)
+}
+
 /// Calls file_name_manipulator to make alterations to the file name.
 /// Then returns absolute path.
 /// # Arguments
