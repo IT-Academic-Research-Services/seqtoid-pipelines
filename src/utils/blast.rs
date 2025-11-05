@@ -1,11 +1,12 @@
 // BLAST-related file functions and structures
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
-use sled::Tree;
+use fst::Map;
 
 use crate::config::defs::{Taxid, Lineage};
 use crate::utils::taxonomy::validate_taxid_lineage;
@@ -112,40 +113,36 @@ fn negative_taxid(level: u8) -> i64 {
 ///
 /// (level, consensus_taxid, selected_hits) where level=1 species, 2 genus, 3 family, 0 none;
 /// consensus_taxid is the taxid at that level.
-pub fn consensus_level(
+pub fn consensus_level<D: AsRef<[u8]>>(
     hits: &[M8Record],
     lineage_map: &HashMap<Taxid, Lineage>,
-    acc2taxid: &Tree,
-    should_keep: &impl Fn(&[i32]) -> bool
-) -> Result<(u8, i64, Vec<M8Record>)> {
+    acc2taxid_map: &Map<D>,
+    should_keep: &Arc<impl Fn(&[i32]) -> bool + Send + Sync>,
+) -> Result<(u8, i64, Vec<M8Record>)>    {
     let lineages: Vec<Lineage> = hits
         .iter()
         .filter_map(|r| {
             let accession = &r.tname;
 
-            // lookup taxid in acc2taxid DB
-            let taxid_bytes_opt = match acc2taxid.get(accession.as_bytes()).ok().flatten() {
-                Some(b) => Some(b),
-                None => {
-                    // Try base without version (e.g., "MN988668.1" -> "MN988668")
-                    let base_acc = accession.split('.').next().unwrap_or(accession);
-                    if base_acc != accession {
-                        acc2taxid.get(base_acc.as_bytes()).ok().flatten()
-                    } else {
-                        None
-                    }
+            // 1. Try full accession (e.g., "ACC.1")
+            let taxid_opt = acc2taxid_map.get(accession.as_bytes());
+
+            // 2. Fallback: strip version → base accession (e.g., "ACC")
+            let taxid_u64 = taxid_opt.or_else(|| {
+                let base_acc = accession.split('.').next().unwrap_or(accession);
+                if base_acc != accession {
+                    acc2taxid_map.get(base_acc.as_bytes())
+                } else {
+                    None
                 }
-            };
+            })
+                .ok_or_else(|| anyhow!("Accession not found in acc2taxid map: {}", accession))
+                .ok()?; // ← This `?` is allowed here because we're in a `filter_map` returning `Option`
 
-            let taxid_bytes = match taxid_bytes_opt {
-                Some(b) => b,
-                None => return None,  // skip if no taxid found
-            };
-
-            let taxid: Taxid = match i32::from_le_bytes(taxid_bytes.as_ref().try_into().ok()?) {
-                t if t > 0 => t,
-                _ => return None,  // skip invalid taxid incl negative values
-            };
+            let taxid = taxid_u64 as i32;
+            if taxid <= 0 {
+                return None;
+            }
 
             lineage_map.get(&taxid).cloned()
         })
@@ -158,7 +155,7 @@ pub fn consensus_level(
     let mut max_level = 0u8;
     let mut consensus_taxid = 0i64;
 
-    for level in 0..3 {  // 0=species, 1=genus, 2=family
+    for level in 0..3 {
         let taxids: HashSet<i32> = lineages
             .iter()
             .map(|lin| lin.get(level).copied().unwrap_or(-1))
@@ -167,22 +164,18 @@ pub fn consensus_level(
 
         if taxids.len() == 1 {
             let agreed = *taxids.iter().next().unwrap() as i64;
-            max_level = (level + 1) as u8;  // Update to this more specific level
+            max_level = (level + 1) as u8;
             consensus_taxid = agreed;
         } else {
-            // No agreement at this level; stop as deeper levels won't agree
             break;
         }
     }
 
     if max_level > 0 {
-        // Take a representative lineage (since they agree up to max_level)
         let rep_lineage = &lineages[0];
         let validated = validate_taxid_lineage(rep_lineage, consensus_taxid as i32, max_level);
-
-        // Apply filter
-        if !should_keep(&validated) {
-            return Ok((0, 0, Vec::new()));  // No consensus if filtered out
+        if !(should_keep)(&validated) {
+            return Ok((0, 0, Vec::new()));
         }
     }
 
