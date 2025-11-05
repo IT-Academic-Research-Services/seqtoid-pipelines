@@ -48,7 +48,7 @@ use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
-use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage};
+use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -1533,49 +1533,37 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let lineages_db_path = PathBuf::from(config.args.taxid_lineages_db.clone());
-    let lineages_db = sled::open(&lineages_db_path)?;
-    let lineages_tree = lineages_db.open_tree("lineages")?;
+    // Load lineage map from bincode (AHashMap at runtime)
+    let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
+    let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
 
+    // Load acc2taxid FST
     let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
     let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
     let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
     let acc2taxid_map = Arc::new(acc2taxid_map);
 
-
+    // Build filter
     let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
     let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
     let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
 
-    let should_keep = build_should_keep_filter(
+    let should_keep = Arc::new(build_should_keep_filter(
         deuterostome_path,
         taxon_whitelist_path,
         taxon_blacklist_path,
-    )
-        .await?;
+    ).await?);
 
-    let mut lineage_map: HashMap<Taxid, Lineage> = HashMap::new();
-    for entry in lineages_tree.iter() {
-        let (key, value) = entry?;
-        let taxid = i32::from_le_bytes(key[..4].try_into().map_err(|_| anyhow!("bad taxid key"))?);
-        let lineage = crate::utils::taxonomy::unpack_lineage_bytes(&value)?;
-        lineage_map.insert(taxid, lineage);
-    }
 
-    let blacklist = load_optional_set(config.args.taxon_blacklist.clone()).await?;
-    let deuterostome = load_optional_set(config.args.deuterostome_list.clone()).await?;
-    let whitelist = load_optional_set(config.args.taxon_whitelist.clone()).await?;
+    // Use Arc<AHashMap<...>> directly
+    let lineage_map_clone = lineage_map.clone();
+    let acc2taxid_map_clone = acc2taxid_map.clone();
+    let should_keep_clone = should_keep.clone();
 
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
     let config_clone = config.clone();
-    let acc2taxid_map_clone = acc2taxid_map.clone();
-    let lineage_map_clone = lineage_map.clone();
-    let should_keep_clone = Arc::new(should_keep);  // ← Arc for Fn trait
-    let blacklist_clone = blacklist.clone();
-    let deuterostome_clone = deuterostome.clone();
-    let whitelist_clone = whitelist.clone();
 
     let processing_task = tokio::spawn(async move {
         let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::new();
@@ -1594,7 +1582,6 @@ pub async fn call_hits_m8_stream(
                 }
                 _ => continue,
             };
-            eprintln!("m8 line: {}", line);
 
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
@@ -1623,7 +1610,8 @@ pub async fn call_hits_m8_stream(
                     if taxid == 0 {
                         continue;
                     }
-                    if is_filtered(taxid as i64, &blacklist_clone, &deuterostome_clone, &whitelist_clone) {
+                    let lineage = lineage_map_clone.get(&taxid).cloned().unwrap_or([-1; 3]);
+                    if !(should_keep_clone)(&lineage) {
                         continue;
                     }
                     valid_hits.push(hit.clone());
@@ -1632,18 +1620,17 @@ pub async fn call_hits_m8_stream(
                 }
             }
 
-            eprintln!("valid hits {:?}", valid_hits);
             if valid_hits.is_empty() {
                 continue;
             }
 
-            valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal));
+            valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(Ordering::Equal));
             let best = valid_hits[0].clone();
 
             let (tax_level, consensus_taxid, consensus_hits) = consensus_level(
                 &hits,
-                &lineage_map,
-                &*acc2taxid_map,
+                &*lineage_map_clone,  // ← &AHashMap
+                &*acc2taxid_map_clone,
                 &should_keep_clone,
             )?;
 
@@ -1666,24 +1653,20 @@ pub async fn call_hits_m8_stream(
                 .send(ParseOutput::Bytes(Arc::new((dedup_line + "\n").into_bytes())))
                 .await?;
 
-            let species = consensus_hits
+            // Extract S/G/F from first hit's lineage
+            let first_lineage = consensus_hits
                 .first()
-                .and_then(|h| lineage_map_clone.get(&h.tname.parse::<Taxid>().unwrap_or(0)))
-                .and_then(|lin| lin.get(0).copied())
-                .map(|t| t as i64)
-                .unwrap_or(-100);
-            let genus = consensus_hits
-                .first()
-                .and_then(|h| lineage_map_clone.get(&h.tname.parse::<Taxid>().unwrap_or(0)))
-                .and_then(|lin| lin.get(1).copied())
-                .map(|t| t as i64)
-                .unwrap_or(-200);
-            let family = consensus_hits
-                .first()
-                .and_then(|h| lineage_map_clone.get(&h.tname.parse::<Taxid>().unwrap_or(0)))
-                .and_then(|lin| lin.get(2).copied())
-                .map(|t| t as i64)
-                .unwrap_or(-300);
+                .and_then(|h| acc2taxid_map_clone.get(h.tname.as_bytes()))
+                .and_then(|taxid_u64| {
+                    let taxid = taxid_u64 as i32;
+                    lineage_map_clone.get(&taxid)
+                })
+                .cloned()
+                .unwrap_or([-1; 3]);
+
+            let species = first_lineage[0] as i64;
+            let genus = first_lineage[1] as i64;
+            let family = first_lineage[2] as i64;
 
             let summary_line = format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -1709,8 +1692,7 @@ pub async fn call_hits_m8_stream(
         StreamDataType::JustBytes,
         "call_hits_m8_dedup".to_string(),
         None,
-    )
-        .await?;
+    ).await?;
     cleanup_receivers.push(dedup_done);
     let dedup_main = dedup_branches.remove(0);
     let dedup_file = dedup_branches.remove(0);
@@ -1726,8 +1708,7 @@ pub async fn call_hits_m8_stream(
         StreamDataType::JustBytes,
         "call_hits_m8_summary".to_string(),
         None,
-    )
-        .await?;
+    ).await?;
     cleanup_receivers.push(summary_done);
     let summary_main = summary_branches.remove(0);
     let summary_file = summary_branches.remove(0);

@@ -15,6 +15,9 @@ use sled::{Db, Tree, IVec};
 use fst::{MapBuilder};
 use needletail::{parse_fastx_file, FastxReader};
 use rayon::prelude::*;
+use bincode::{encode_into_std_write, decode_from_std_read};
+use serde::{Serialize, Deserialize};
+use ahash::AHashMap;
 
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
 
@@ -22,15 +25,15 @@ use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
 // DB creation functions
 // *******************
 
-/// Builds a taxid-lineages sled DB from taxdump.tar.gz files
+/// Builds a taxid-lineages map from taxdump.tar.gz files and serializes to bincode.
 /// Typical location, sourced from NCBI:
 /// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
 ///
 /// # Arguments
 ///
 ///  * `nodes_path` - path to the nodes.dmp file
-/// * `merged_path` - path to the megred.dmp file
-/// * `db_path` -  output db path
+/// * `merged_path` - path to the merged.dmp file
+/// * `output_bincode_path` - output bincode path
 ///
 /// # Returns
 ///
@@ -38,7 +41,7 @@ use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
 pub async fn build_taxid_lineages_db(
     nodes_path: &PathBuf,
     merged_path: &PathBuf,
-    db_path: &PathBuf,
+    output_bincode_path: &PathBuf,
 ) -> Result<()> {
     // Pre-allocate maps for efficiency (NCBI taxonomy ~2.7M entries)
     let mut parent_map: HashMap<Taxid, Taxid> = HashMap::with_capacity(3_000_000);
@@ -48,115 +51,103 @@ pub async fn build_taxid_lineages_db(
     let mut nodes_reader = BufReader::new(nodes_file).lines();
     while let Some(line) = nodes_reader.next_line().await? {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        if parts.len() < 3 {
-            warn!("Skipping invalid line in nodes.dmp: {}", line);
-            continue;
-        }
-        let taxid: Taxid = match parts[0].parse() {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Invalid taxid in nodes.dmp: {}, error: {}", parts[0], e);
-                continue;
-            }
-        };
-        let parent: Taxid = match parts[1].parse() {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Invalid parent taxid in nodes.dmp: {}, error: {}", parts[1], e);
-                continue;
-            }
-        };
+        if parts.len() < 3 { continue; }
+        let Ok(taxid) = parts[0].parse::<Taxid>() else { continue; };
+        let Ok(parent) = parts[1].parse::<Taxid>() else { continue; };
         let rank = parts[2].to_string();
-        if taxid != 1 { // Skip root
+        if taxid != 1 {
             parent_map.insert(taxid, parent);
             rank_map.insert(taxid, rank);
         }
     }
-    info!("Loaded {} parents and ranks from nodes.dmp", parent_map.len());
+    info!("Loaded {} nodes", parent_map.len());
 
     let mut merged_map: HashMap<Taxid, Taxid> = HashMap::with_capacity(100_000);
     let merged_file = File::open(merged_path).await?;
     let mut merged_reader = BufReader::new(merged_file).lines();
     while let Some(line) = merged_reader.next_line().await? {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        if parts.len() < 2 {
-            warn!("Skipping invalid line in merged.dmp: {}", line);
-            continue;
-        }
-        let old: Taxid = match parts[0].parse() {
-            Ok(o) => o,
-            Err(e) => {
-                warn!("Invalid old taxid in merged.dmp: {}, error: {}", parts[0], e);
-                continue;
-            }
-        };
-        let new: Taxid = match parts[1].parse() {
-            Ok(n) => n,
-            Err(e) => {
-                warn!("Invalid new taxid in merged.dmp: {}, error: {}", parts[1], e);
-                continue;
-            }
-        };
+        if parts.len() < 2 { continue; }
+        let Ok(old) = parts[0].parse::<Taxid>() else { continue; };
+        let Ok(new) = parts[1].parse::<Taxid>() else { continue; };
         merged_map.insert(old, new);
     }
-    info!("Loaded {} merges from merged.dmp", merged_map.len());
+    info!("Loaded {} merges", merged_map.len());
 
-    let db = sled::open(db_path)?;
-    let tree: Tree = db.open_tree("lineages")?;
-    let mut seen = HashSet::with_capacity(parent_map.len());
-    let mut missing_ranks = 0;
+    let mut resolved_parents = parent_map.clone();
+    let mut resolved_ranks = rank_map.clone();
 
-    for (&taxid, _) in &parent_map {
-        if seen.contains(&taxid) {
-            continue;
-        }
-        let mut species: Taxid = -100;
-        let mut genus: Taxid = -200;
-        let mut family: Taxid = -300;
+    for (&taxid, _) in parent_map.iter() {
         let mut current = taxid;
-        let mut depth = 0;
-        let max_depth = 50; // Increased for complex hierarchies
-
-        while current != 1 && depth < max_depth {
-            let rank = rank_map.get(&current).cloned().unwrap_or_default();
-            if rank == "species" && species == -100 {
-                species = current;
-            } else if rank == "genus" && genus == -200 {
-                genus = current;
-            } else if rank == "family" && family == -300 {
-                family = current;
-            }
-            if species != -100 && genus != -200 && family != -300 {
-                break; // All ranks found
-            }
-            current = *parent_map.get(&current).unwrap_or(&1);
-            if let Some(merged) = merged_map.get(&current) {
-                current = *merged;
-            }
-            depth += 1;
+        while let Some(&merged) = merged_map.get(&current) {
+            current = merged;
         }
-
-        if depth >= max_depth {
-            warn!("Depth limit reached for taxid {}: species={}, genus={}, family={}", taxid, species, genus, family);
-            missing_ranks += 1;
+        if current != taxid {
+            if let Some(&parent) = parent_map.get(&current) {
+                resolved_parents.insert(taxid, parent);
+            }
+            if let Some(rank) = rank_map.get(&current) {
+                resolved_ranks.insert(taxid, rank.clone());
+            }
         }
-
-        // Serialize lineage to bytes
-        let mut bytes = Vec::with_capacity(12);
-        bytes.extend_from_slice(&species.to_le_bytes());
-        bytes.extend_from_slice(&genus.to_le_bytes());
-        bytes.extend_from_slice(&family.to_le_bytes());
-
-        tree.insert(taxid.to_le_bytes(), bytes)?;
-        seen.insert(taxid);
     }
 
-    db.flush_async().await?;
-    info!("Built lineages DB with {} entries at {}. {} taxids reached depth limit.", seen.len(), db_path.display(), missing_ranks);
+    parent_map = resolved_parents;
+    rank_map = resolved_ranks;
+
+    let mut lineages: HashMap<Taxid, Lineage> = HashMap::with_capacity(parent_map.len());
+    for (&taxid, _) in parent_map.iter() {
+        let mut path = Vec::with_capacity(10);
+        let mut seen = HashSet::new();
+        let mut current = taxid;
+        while current != 1 && seen.insert(current) {
+            path.push(current);
+            if let Some(&parent) = parent_map.get(&current) {
+                current = parent;
+            } else {
+                break;
+            }
+        }
+        path.reverse();
+
+        let mut species = -1;
+        let mut genus = -1;
+        let mut family = -1;
+
+        for &t in &path {
+            let rank = rank_map.get(&t).map(|s| s.as_str()).unwrap_or("no_rank");
+            if rank == "species" && species == -1 {
+                species = t;
+            } else if rank == "genus" && genus == -1 {
+                genus = t;
+            } else if rank == "family" && family == -1 {
+                family = t;
+            }
+            if species != -1 && genus != -1 && family != -1 {
+                break;
+            }
+        }
+
+        lineages.insert(taxid, [species, genus, family]);
+    }
+
+    info!("Built {} lineages", lineages.len());
+
+    let mut file = StdFile::create(output_bincode_path)?;
+    encode_into_std_write(&lineages, &mut file, bincode::config::standard())
+        .map_err(|e| anyhow!("Bincode encode failed: {}", e))?;
+
+    info!("Saved to {}", output_bincode_path.display());
     Ok(())
 }
 
-
+pub async fn load_taxid_lineages_db(bincode_path: &PathBuf) -> Result<Arc<AHashMap<Taxid, Lineage>>> {
+    let mut file = StdFile::open(bincode_path)?;
+    let std_map: HashMap<Taxid, Lineage> = decode_from_std_read(&mut file, bincode::config::standard())
+        .map_err(|e| anyhow!("Bincode decode failed: {}", e))?;
+    let map = AHashMap::from_iter(std_map);
+    Ok(Arc::new(map))
+}
 
 /// Builds a accession2taxid sled DB from a known accession2taxid file
 /// Skips accessions not present in NT/NR
@@ -467,28 +458,6 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
 // *******************
 // DB access functions
 // *******************
-
-/// Unpacks the byte arrangement made in the sled DB build_taxid_lineages_db
-/// Typical location, sourced from NCBI:
-/// ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/accession2taxid/nucl_gb.accession2taxid.gz
-///
-/// # Arguments
-///
-///  * `gz_path` - accession2taxid.gz
-/// * `db_path` -  output db path
-///
-/// # Returns
-/// Result
-pub fn unpack_lineage_bytes(ivec: &IVec) -> Result<Vec<Taxid>> {
-    let data = ivec.as_ref();
-    if data.len() != 12 { return Err(anyhow!("malformed lineage: expected 12 bytes")); }
-    let mut lineage = Vec::with_capacity(3);
-    for i in 0..3 {
-        let start = 4 * i;
-        lineage.push(i32::from_le_bytes(data[start..start+4].try_into().unwrap()));
-    }
-    Ok(lineage)
-}
 
 
 pub fn validate_taxid_lineage(lineage: &[i32], hit_taxid: Taxid, hit_level: u8) -> Vec<i32> {

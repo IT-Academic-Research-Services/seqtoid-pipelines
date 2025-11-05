@@ -40,7 +40,7 @@ pub const DIAMOND_TAG: &str = "diamond";
 
 // Taxonomy defs
 pub type Taxid = i32;
-pub type Lineage = Vec<Taxid>;
+pub type Lineage = [i32; 3];
 pub const INVALID_CALL_BASE_ID: i32 = -100;
 
 pub const LOG_NORMAL_POSITIVE_DOUBLE: f64 = 1e-200;

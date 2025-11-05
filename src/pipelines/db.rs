@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use log::info;
 use crate::config::defs::{PipelineError, RunConfig};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs};
-use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db, unpack_lineage_bytes, build_fst_acc2taxid};
+use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db, build_fst_acc2taxid};
 
 pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
@@ -30,28 +30,11 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
         return Err(PipelineError::FileNotFound(nodes_dmp_path));
     }
 
-    let db_out_path = file_path_manipulator(&PathBuf::from("taxid_lineage"), Some(&config.out_dir), None, Some("sled.db"), "_");
+    let db_out_path = file_path_manipulator(&PathBuf::from("taxid_lineage"), Some(&config.out_dir), None, Some(".bincode"), "_");
 
     build_taxid_lineages_db(&nodes_dmp_path, &merged_dmp_path, &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
-
-    if config.args.verbose {
-        let db = sled::open(db_out_path).map_err(|e| PipelineError::Other(e.into()))?;
-        let tree = db.open_tree("lineages").map_err(|e| PipelineError::Other(e.into()))?;
-        let count = tree.iter().count();
-        println!("Total entries: {}", count);
-
-        for taxid in config.args.test_taxids.clone() {
-            if let Some(ivec) = tree.get(&taxid.to_le_bytes()).map_err(|e| PipelineError::Other(e.into()))? {
-                let lineage = unpack_lineage_bytes(&ivec)?;
-                println!("Taxid {} lineage: {:?}", taxid, lineage);
-            } else {
-                println!("Taxid {} not found", taxid);
-            }
-        }
-
-    }
 
     Ok(())
 }
@@ -109,21 +92,7 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // if config.args.verbose {
-    //     let db = sled::open(db_out_path).map_err(|e| PipelineError::Other(e.into()))?;
-    //     let tree = db.open_tree("acc2taxid").map_err(|e| PipelineError::Other(e.into()))?;
-    //     let count = tree.iter().count();
-    //     println!("Total entries: {}", count);
-    //
-    //     for acc in config.args.test_accessions.clone() {
-    //         if let Some(ivec) = tree.get(acc.as_bytes()).map_err(|e| PipelineError::Other(e.into()))? {
-    //             let taxid = i32::from_le_bytes(ivec[..4].try_into().map_err(|_| anyhow!("corrupt taxid"))?);
-    //             println!("Accession {} taxid: {}", acc, taxid);
-    //         } else {
-    //             println!("Accession {} not found", acc);
-    //         }
-    //     }
-    // }
+
 
     Ok(())
 }

@@ -7,6 +7,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
 use fst::Map;
+use ahash::AHashMap;
 
 use crate::config::defs::{Taxid, Lineage};
 use crate::utils::taxonomy::validate_taxid_lineage;
@@ -115,10 +116,10 @@ fn negative_taxid(level: u8) -> i64 {
 /// consensus_taxid is the taxid at that level.
 pub fn consensus_level<D: AsRef<[u8]>>(
     hits: &[M8Record],
-    lineage_map: &HashMap<Taxid, Lineage>,
+    lineage_map: &AHashMap<Taxid, Lineage>,
     acc2taxid_map: &Map<D>,
     should_keep: &Arc<impl Fn(&[i32]) -> bool + Send + Sync>,
-) -> Result<(u8, i64, Vec<M8Record>)>    {
+) -> Result<(u8, i64, Vec<M8Record>)>   {
     let lineages: Vec<Lineage> = hits
         .iter()
         .filter_map(|r| {
@@ -158,7 +159,7 @@ pub fn consensus_level<D: AsRef<[u8]>>(
     for level in 0..3 {
         let taxids: HashSet<i32> = lineages
             .iter()
-            .map(|lin| lin.get(level).copied().unwrap_or(-1))
+            .map(|lin| lin[level])
             .filter(|&t| t > 0)
             .collect();
 
@@ -172,8 +173,8 @@ pub fn consensus_level<D: AsRef<[u8]>>(
     }
 
     if max_level > 0 {
-        let rep_lineage = &lineages[0];
-        let validated = validate_taxid_lineage(rep_lineage, consensus_taxid as i32, max_level);
+        let rep_lineage = lineages[0];
+        let validated = validate_taxid_lineage(&rep_lineage, consensus_taxid as i32, max_level);
         if !(should_keep)(&validated) {
             return Ok((0, 0, Vec::new()));
         }
