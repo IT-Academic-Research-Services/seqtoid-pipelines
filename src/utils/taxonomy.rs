@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::fs::File as StdFile;
 use std::io::{BufReader as StdBufReader};
+use std::sync::Arc;
+use std::io::Write;
 
 use anyhow::{Result, anyhow};
 use log::{info, warn, debug};
@@ -10,6 +12,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use flate2::read::GzDecoder;
 use csv::ReaderBuilder;
 use sled::{Db, Tree, IVec};
+use fst::{MapBuilder};
+use needletail::{parse_fastx_file, FastxReader};
+use rayon::prelude::*;
 
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
 
@@ -288,6 +293,110 @@ pub async fn build_accession2taxid_db(
     Ok(())
 }
 
+pub async fn build_fst_acc2taxid(
+    mapping_files: &[PathBuf],
+    nt_file: Option<&PathBuf>,
+    nr_file: Option<&PathBuf>,
+    db_path: &PathBuf,
+) -> Result<()> {
+
+    let mut accession_bases: HashSet<String> = HashSet::new();
+
+    if let Some(path) = nt_file {
+        scan_fasta_bases(path, &mut accession_bases, "NT");
+    }
+    if let Some(path) = nr_file {
+        scan_fasta_bases(path, &mut accession_bases, "NR");
+    }
+
+    // fst map (accession → taxid)
+    let mut builder = MapBuilder::memory();
+    let mut total_mapped = 0;
+
+    for mapping_file in mapping_files {
+        let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
+        info!("Processing mapping file: {}", filename);
+
+        let file = StdFile::open(mapping_file)?;
+        let gz = GzDecoder::new(StdBufReader::new(file));
+        let mut rdr = ReaderBuilder::new()
+            .delimiter(b'\t')
+            .has_headers(false)
+            .from_reader(gz);
+
+        let mut mapped = 0;
+
+        for result in rdr.records() {
+            let record = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Parse error in {}: {}", filename, e);
+                    continue;
+                }
+            };
+
+            let full_acc = record[0].to_string();
+            let acc_base = full_acc.split('.').next().unwrap_or(&full_acc).to_string();
+
+            if !accession_bases.contains(&acc_base) {
+                continue;
+            }
+
+            let taxid_idx = if record.len() == 2 { 1 } else { 2 };
+            let taxid: Taxid = match record[taxid_idx].parse() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+
+            builder.insert(full_acc.as_bytes(), taxid as u64)?;
+            mapped += 1;
+            total_mapped += 1;
+
+            if total_mapped % 1_000_000 == 0 {
+                info!("\t{}M accessions mapped", total_mapped / 1_000_000);
+            }
+        }
+
+        info!("Finished {}: mapped={}", filename, mapped);
+    }
+
+
+    let map_bytes = builder.into_inner()?;
+    let mut out_file = StdFile::create(db_path)?;
+    out_file.write_all(&map_bytes)?;
+    info!("Built FST acc2taxid DB with {} entries at {}", total_mapped, db_path.display());
+
+    Ok(())
+}
+
+/// scans a FASTA file for base accessions (i.e. no version at end) and inserts
+pub fn scan_fasta_bases(
+    path: &PathBuf,
+    bases: &mut HashSet<String>,
+    name: &str,
+) {
+    let mut reader = parse_fastx_file(path)
+        .unwrap_or_else(|e| panic!("Failed to open {} FASTA {}: {}", name, path.display(), e));
+
+    let mut count = 0;
+    while let Some(record) = reader.next() {
+        let rec = record.expect("FASTA parse error");
+        if let Some(acc_base) = std::str::from_utf8(rec.id())
+            .ok()
+            .and_then(|id| id.split('.').next())
+        {
+            bases.insert(acc_base.to_string());
+            count += 1;
+        }
+    }
+
+    info!(
+        "Extracted {} unique accession bases from {}: {}",
+        bases.len(),
+        name,
+        path.display()
+    );
+}
 
 /// Builds filter for taxa to keep from the three lists input
 ///

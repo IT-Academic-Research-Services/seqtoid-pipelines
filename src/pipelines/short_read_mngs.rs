@@ -1550,6 +1550,15 @@ pub async fn call_hits_m8_stream(
     let acc2taxid_db = sled::open(&acc2taxid_path)?;
     let acc2taxid_tree = acc2taxid_db.open_tree("acc2taxid")?;
 
+    // After loading DB
+    let test_acc = "MT093571.1";
+    if let Ok(Some(ivec)) = acc2taxid_tree.get(test_acc.as_bytes()) {
+        let taxid = i32::from_le_bytes(ivec[..4].try_into().unwrap());
+        info!("DB TEST: {} → taxid {}", test_acc, taxid);  // Should print 2697049
+    } else {
+        error!("DB TEST FAILED: {} not found", test_acc);
+    }
+
     let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
     let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
     let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
@@ -2294,7 +2303,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
 
     let m8_file_path = out_dir.join(rename_file_path(&no_ext_sample_base_buf, None, Some("m8"), "."));
-    eprintln!("m8 m8 m8: {}", m8_file_path.display());
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
         config.clone(),
