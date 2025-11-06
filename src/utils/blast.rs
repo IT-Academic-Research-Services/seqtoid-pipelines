@@ -138,7 +138,7 @@ pub fn consensus_level<D: AsRef<[u8]>>(
                 }
             })
                 .ok_or_else(|| anyhow!("Accession not found in acc2taxid map: {}", accession))
-                .ok()?; // ← This `?` is allowed here because we're in a `filter_map` returning `Option`
+                .ok()?;
 
             let taxid = taxid_u64 as i32;
             if taxid <= 0 {

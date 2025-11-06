@@ -29,7 +29,7 @@ use sled::Tree;
 use twox_hash::XxHash64;
 use fst::Map;
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
@@ -1449,7 +1449,7 @@ pub async fn paf_to_m8(
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
             }
-
+            // eprintln!("paf: {}", line);
             let record = match PafRecord::parse_line(&line) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1460,6 +1460,8 @@ pub async fn paf_to_m8(
 
             let genome_size = config_clone.args.nt_db_size as f64;
             let m8_line = record.to_m8_line(genome_size);
+            // eprintln!("m8: {}", m8_line);
+            // eprintln!("");
             let m8_bytes = (m8_line + "\n").into_bytes();
 
             if m8_tx.send(ParseOutput::Bytes(Arc::new(m8_bytes))).await.is_err() {
@@ -1533,15 +1535,33 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    // Load lineage map from bincode (AHashMap at runtime)
     let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
     let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
 
-    // Load acc2taxid FST
+    debug!("Lineage DB size: {} entries", lineage_map.len());
+    if let Some(lineage) = lineage_map.get(&9606) {
+        info!("Taxon 9606 found: species={}, genus={}, family={}", lineage[0], lineage[1], lineage[2]);
+    } else {
+        warn!("Taxon 9606 (Homo sapiens) NOT found in lineage DB");
+    }
+
     let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
     let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
     let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
     let acc2taxid_map = Arc::new(acc2taxid_map);
+    eprintln!("acc2tax map len: {}", acc2taxid_map.len());
+
+
+    if let Some(taxid_u64) = acc2taxid_map.get(b"MT093571.1") {
+        println!("Taxid for full MT093571.1: {}", taxid_u64 as i32);
+    } else {
+        println!("Full not found (expected, since DB has bases)");
+    }
+    if let Some(taxid_u64) = acc2taxid_map.get(b"MT093571") {
+        println!("Taxid for base MT093571: {}", taxid_u64 as i32); // Should be 2697049
+    } else {
+        println!("Base not found!");
+    }
 
     // Build filter
     let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
@@ -1555,7 +1575,6 @@ pub async fn call_hits_m8_stream(
     ).await?);
 
 
-    // Use Arc<AHashMap<...>> directly
     let lineage_map_clone = lineage_map.clone();
     let acc2taxid_map_clone = acc2taxid_map.clone();
     let should_keep_clone = should_keep.clone();
@@ -1947,12 +1966,20 @@ pub async fn generate_taxon_counts(
                 continue;
             }
 
-            if evalue > 0.0 {
-                evalue = evalue.log10();
-                if evalue < LOG_NORMAL_POSITIVE_DOUBLE {
-                    evalue = LOG_NORMAL_POSITIVE_DOUBLE;
-                }
+            if evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
+                evalue = MIN_NORMAL_POSITIVE_DOUBLE;
             }
+            let evalue = evalue.log10();
+
+            let mut evalue = if evalue <= 0.0 || !evalue.is_finite() {
+                MIN_NORMAL_POSITIVE_DOUBLE
+            } else if evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
+                MIN_NORMAL_POSITIVE_DOUBLE
+            } else {
+                evalue
+            };
+            let evalue_log10 = evalue.log10();
+
 
             if level == 1 {
                 base_count_per_read.insert(read_id.clone(), alen * cluster_size);
@@ -1968,7 +1995,7 @@ pub async fn generate_taxon_counts(
                 bucket.base_count      += *base_count_per_read.get(&read_id).unwrap_or(&0);
                 bucket.sum_percent_identity += pident;
                 bucket.sum_alignment_length += alen as f64;
-                bucket.sum_e_value          += evalue;
+                bucket.sum_e_value          += evalue_log10;
 
                 if let Some(src) = &source_count_type {
                     bucket.source_count_type.insert(src.clone());

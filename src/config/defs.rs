@@ -44,6 +44,7 @@ pub type Lineage = [i32; 3];
 pub const INVALID_CALL_BASE_ID: i32 = -100;
 
 pub const LOG_NORMAL_POSITIVE_DOUBLE: f64 = 1e-200;
+pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
