@@ -1889,18 +1889,11 @@ pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
     mut m8_stream: ReceiverStream<ParseOutput>,
     mut summary_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes_path: Option<PathBuf>,
+    duplicate_cluster_sizes: HashMap<String, u64>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
     source_count_type: Option<String>,// e.g. "NR" for the other DB
 ) -> Result<Vec<TaxonCount>, PipelineError> {
-
-
-    let duplicate_cluster_sizes = if let Some(path) = duplicate_cluster_sizes_path {
-        load_duplicate_cluster_sizes(&path).await.map_err(|e| PipelineError::Other(e))?
-    } else {
-        HashMap::new()
-    };
 
 
     // Expected format (tab-separated):
@@ -2340,16 +2333,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //     config.clone(),
     //     call_stream,
     //     call_summary_stream,
-    //     Some(duplicate_cluster_sizes_path),
+    //     duplicate_cluster_sizes,
     //     should_keep_filter.clone(),
     //     "NT".to_string(),
     //     None,                       // source_count_type = None for pure NT
-    // ).await
-    //     .map_err(|e| PipelineError::Other(e))?;
-    //
+    // ).await?;
     // info!("NT taxon counts: {} entries", nt_counts.len());
 
+    let test_write_task = tokio::spawn(stream_to_file(
+        call_stream.into_inner(),
+        PathBuf::from("test.m8"),
+    ));
+    test_write_task.await??;
 
+    let summary_write_task = tokio::spawn(stream_to_file(
+        call_summary_stream.into_inner(),
+        PathBuf::from("test_summary.txt"),
+    ));
+    summary_write_task.await??;
+    eprintln!("test writes awaited");
 
     // *******************
     // Results retrieval
