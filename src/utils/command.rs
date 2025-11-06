@@ -1648,12 +1648,11 @@ pub mod diamond {
         ref_type: &str,
     ) -> Result<
         (
-            PathBuf,
+            PathBuf,                     // DB prefix path (without .dmnd)
             Vec<JoinHandle<Result<(), anyhow::Error>>>,
         ),
         PipelineError,
     > {
-
         let dmnd_path = index_path.ok_or_else(|| {
             PipelineError::MissingArgument(format!(
                 "{}: --diamond-db <PATH> is required (must be a .dmnd file)",
@@ -1674,7 +1673,10 @@ pub mod diamond {
             )));
         }
 
-        Ok((path,  vec![]))
+        // Return the prefix without .dmnd
+        let prefix = path.with_extension("");
+
+        Ok((prefix, vec![]))
     }
 
     impl ArgGenerator for DiamondArgGenerator {
