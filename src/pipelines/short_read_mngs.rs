@@ -727,7 +727,7 @@ async fn kallisto_quant(
     let fastq_stream = ReceiverStream::new(fastq_rx);
 
     debug!("Deinterleaving FASTQ stream for sample: {}", sample_base);
-    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+    let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
         config.clone(),
         fastq_stream,
         &sample_base,
@@ -736,11 +736,14 @@ async fn kallisto_quant(
 
     cleanup_tasks.push(deinterleave_handle);
     cleanup_tasks.push(r1_write_handle);
-    if let Some(r2_handle) = r2_write_handle {
+    if let Some(r2_handle) = r2_write_handle_opt {
         cleanup_tasks.push(r2_handle);
     }
 
     let kallisto_config = if paired {
+        let r2_fifo = r2_fifo_opt.as_ref().ok_or_else(|| {
+            PipelineError::InvalidConfig("Paired mode requested but R2 FIFO not created".to_string())
+        })?;
         KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
             subcommand_fields: HashMap::from([
@@ -783,22 +786,26 @@ async fn kallisto_quant(
         })?;
     cleanup_tasks.push(kallisto_err_task);
 
-    // Create Kallisto exit task
+    // Create Kallisto exit task with safe FIFO cleanup
     let r1_fifo_clone = r1_fifo.clone();
-    let r2_fifo_clone = r2_fifo.clone();
+    let r2_fifo_opt_clone = r2_fifo_opt.clone();
     let kallisto_exit_task = tokio::spawn(async move {
         let status = kallisto_child.wait().await
             .map_err(|e| anyhow!("Kallisto wait failed: {}", e))?;
         if !status.success() {
             return Err(anyhow!("Kallisto exited with code: {:?}", status.code()));
         }
-        // Clean up FIFOs
+
+        // Clean up R1 FIFO
         tokio::fs::remove_file(&r1_fifo_clone).await
             .map_err(|e| anyhow!("Failed to remove R1 FIFO {}: {}", r1_fifo_clone.display(), e))?;
-        if paired {
-            tokio::fs::remove_file(&r2_fifo_clone).await
-                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo_clone.display(), e))?;
+
+        // Clean up R2 FIFO only if it exists
+        if let Some(r2_fifo) = r2_fifo_opt_clone {
+            tokio::fs::remove_file(&r2_fifo).await
+                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo.display(), e))?;
         }
+
         Ok(())
     });
 
@@ -1541,7 +1548,8 @@ pub async fn call_hits_m8_stream(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
     sample_base_buf: PathBuf,
-    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    min_aln_len: u64
 ) -> Result<(
     ReceiverStream<ParseOutput>,
     ReceiverStream<ParseOutput>,
@@ -1599,7 +1607,7 @@ pub async fn call_hits_m8_stream(
                 }
             };
 
-            if rec.alen < config_clone.args.min_alignment_length {
+            if rec.alen < min_aln_len {
                 continue;
             }
 
@@ -1784,41 +1792,49 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
     }
     false
 }
-
 //
 // async fn diamond_non_host_align(
 //     config: Arc<RunConfig>,
 //     input_stream: ReceiverStream<ParseOutput>,
-// ) -> Result<(
-//     ReceiverStream<ParseOutput>,  // m8 stream (tabular lines)
-//     Vec<JoinHandle<Result<(), anyhow::Error>>>,
-//     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-//     Option<NamedTempFile>,
-//     Option<NamedTempFile>,
-//     Option<TempDir>,
-// ), PipelineError> {
+//     paired: bool,
+//     sample_base: String
+// ) -> Result<(mpsc::Receiver<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Option<NamedTempFile>, Option<NamedTempFile>, Option<TempDir>), PipelineError> {
 //     let mut cleanup_tasks = Vec::new();
 //     let mut cleanup_receivers = Vec::new();
+//     let mut db_temp: Option<NamedTempFile> = None;
+//     let mut index_temp: Option<NamedTempFile> = None;
+//     let mut index_dir: Option<TempDir> = None;
 //
-//     let ram_temp_dir = config.ram_temp_dir.clone();
+//     let diamond_db = config.args.diamond_db.clone().ok_or(PipelineError::MissingArgument("diamond_db required for NR alignment".to_string()))?;
+//     let (db_prefix, prep_tasks) = diamond_index_prep(Some(diamond_db), "non_host").await?;
+//     cleanup_tasks.extend(prep_tasks);
 //
-//     let (ref_fasta_path, diamond_index_path, ref_temp, index_temp, index_temp_dir, mut index_tasks) = diamond_index_prep(
-//         &config,
-//         &ram_temp_dir,
-//         config.args.diamond_fasta.clone(),
-//         config.args.diamond_db.clone(),
-//         "non_host_diamond",
+//
+//     // De-interleave to FIFOs
+//     let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+//         config.clone(),
+//         input_stream,
+//         &sample_base,
+//         paired,
 //     ).await?;
-//     cleanup_tasks.append(&mut index_tasks);
 //
-//     let diamond_options: HashMap<String, Option<String>> = HashMap::from([
+//     cleanup_tasks.push(deinterleave_handle);
+//     cleanup_tasks.push(r1_write_handle);
+//     if let Some(r2_handle) = r2_write_handle {
+//         cleanup_tasks.push(r2_handle);
+//     }
+//
+//
+//     // Diamond config matching WDL (--mid-sensitive, -f 6 for m8 tabular)
+//     let diamond_options = HashMap::from([
 //         ("--mid-sensitive".to_string(), None),
-//         ("--outfmt".to_string(), Some("6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore".to_string())),
+//         ("-f".to_string(), Some("6".to_string())),  // Tabular m8 format (matches WDL's m8 treatment)
+//         ("-o".to_string(), Some("-".to_string())),  // Stdout
 //     ]);
 //
 //     let diamond_config = DiamondConfig {
 //         subcommand: DiamondSubcommand::Blastx,
-//         db: diamond_index_path.clone(),
+//         db: db_prefix,
 //         subcommand_fields: diamond_options,
 //     };
 //
@@ -1828,12 +1844,18 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
 //             error: e.to_string(),
 //         })?;
 //
-//     let (mut diamond_child, diamond_stream_task, diamond_err_task) = stream_to_cmd(
+//     // Add -q <fifo(s)> (matching WDL's -q "~{sep=' ' fastas}")
+//     let mut full_args = diamond_args;
+//     full_args.push("-q".to_string());
+//     full_args.push(r1_fifo.to_string_lossy().to_string());
+//     if let Some(r2) = r2_fifo {
+//         full_args.push(r2.to_string_lossy().to_string());
+//     }
+//
+//     let (mut diamond_child, diamond_stream_task, diamond_err_task) = spawn_cmd(
 //         config.clone(),
-//         input_stream.into_inner(),
 //         DIAMOND_TAG,
-//         diamond_args,
-//         StreamDataType::IlluminaFastq,
+//         full_args,
 //         config.args.verbose,
 //     )
 //         .await
@@ -1844,12 +1866,13 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
 //     cleanup_tasks.push(diamond_stream_task);
 //     cleanup_tasks.push(diamond_err_task);
 //
-//     let diamond_out_stream = {
+//     // Parse stdout as m8 lines (Bytes mode, since m8 is tabular text)
+//     let m8_stream = {
 //         let mut guard = diamond_child.lock().await;
 //         parse_child_output(
 //             &mut guard,
 //             ChildStream::Stdout,
-//             ParseMode::Lines,  // m8 is tab-delimited lines
+//             ParseMode::Bytes,
 //             config.base_buffer_size,
 //         )
 //             .await
@@ -1859,14 +1882,7 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
 //             })?
 //     };
 //
-//     Ok((
-//         ReceiverStream::new(diamond_out_stream),
-//         cleanup_tasks,
-//         cleanup_receivers,
-//         ref_temp,
-//         index_temp,
-//         index_temp_dir,
-//     ))
+//     Ok((m8_stream, cleanup_tasks, cleanup_receivers, db_temp, index_temp, index_dir))
 // }
 
 /// Generates ytaxon counts from a called m8 stream
@@ -2302,11 +2318,38 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
 
 
+    // split inpout stream for mm2 and dmnd
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        dedup_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "non_host_mm2_dmnd_input".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(non_host_done_rx);
+
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let test_write_task = tokio::spawn(stream_to_file(
+        non_host_dmnd_stream,
+        PathBuf::from("whatever.txt"),
+    ));
+    test_write_task.await??;
+
     // Minimap2 non_host alignment
 
     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_ref_temp, non_host_index_temp, non_host_index_dir) = minimap2_non_host_align(
         config.clone(),
-        dedup_stream,
+        ReceiverStream::new(non_host_mm2_stream),
     )
         .await?;
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
@@ -2335,7 +2378,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
-        config.clone(), m8_stream, sample_base_buf.clone(), should_keep_filter.clone()
+        config.clone(),
+        m8_stream,
+        sample_base_buf.clone(),
+        should_keep_filter.clone(),
+        36
     ).await?;
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
@@ -2347,22 +2394,43 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         duplicate_cluster_sizes,
         should_keep_filter.clone(),
         "NT".to_string(),
-        None,                       // source_count_type = None for pure NT
+        None,
     ).await?;
     info!("NT taxon counts: {} entries", nt_counts.len());
 
-    // let test_write_task = tokio::spawn(stream_to_file(
-    //     call_stream.into_inner(),
-    //     PathBuf::from("test.m8"),
-    // ));
-    // test_write_task.await??;
+
+
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_dmnd_stream),
+    //     paired,
+    //     sample_base
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
     //
-    // let summary_write_task = tokio::spawn(stream_to_file(
-    //     call_summary_stream.into_inner(),
-    //     PathBuf::from("test_summary.txt"),
-    // ));
-    // summary_write_task.await??;
-    // eprintln!("test writes awaited");
+    // // Save m8 if needed (matching WDL's output File out_m8 = "rapsearch2.m8")
+    // let diamond_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("diamond.m8"), "."));
+    // let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_diamond_m8_stream),
+    //     sample_base_buf.clone(),
+    //     should_keep_filter.clone(),
+    //     0,
+    // ).await?;
+    // cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
+    // cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+    //
+    // let nr_counts = generate_taxon_counts(
+    //     config.clone(),
+    //     diamond_call_stream,
+    //     diamond_call_summary_stream,
+    //     duplicate_cluster_sizes.clone(),
+    //     should_keep_filter.clone(),
+    //     "NR".to_string(),
+    //     None,
+    // ).await?;
+    // info!("NR taxon counts: {} entries", nr_counts.len());
 
     // *******************
     // Results retrieval

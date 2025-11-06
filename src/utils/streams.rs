@@ -1113,26 +1113,53 @@ pub async fn deinterleave_fastq_stream_to_fifos(
     mut input_stream: ReceiverStream<ParseOutput>,
     sample_base: &str,
     paired: bool,
-) -> Result<(PathBuf, PathBuf, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>, Option<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(
+    PathBuf,
+    Option<PathBuf>,
+    JoinHandle<Result<(), anyhow::Error>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+    Option<JoinHandle<Result<(), anyhow::Error>>>,
+), PipelineError> {
     let ram_temp_dir = config.ram_temp_dir.clone();
     let r1_fifo = ram_temp_dir.join(format!("{}_R1.fq", sample_base));
-    let r2_fifo = ram_temp_dir.join(format!("{}_R2.fq", sample_base));
+    let r2_fifo = paired.then(|| ram_temp_dir.join(format!("{}_R2.fq", sample_base)));
 
-    // Proactively remove existing FIFOs with retry
-    debug!("Cleaning up existing FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
-    for fifo in [&r1_fifo, &r2_fifo] {
+    // Clean up any stale FIFOs (R1 always, R2 only if paired)
+    let fifos_to_clean: Vec<&PathBuf> = std::iter::once(&r1_fifo)
+        .chain(r2_fifo.as_ref())
+        .collect();
+
+    debug!(
+        "Cleaning up existing FIFOs: R1={}, R2={:?}",
+        r1_fifo.display(),
+        r2_fifo.as_ref().map(|p| p.display())
+    );
+
+    for fifo in fifos_to_clean {
         for attempt in 1..=3 {
             if metadata(fifo).await.is_ok() {
                 debug!("Attempt {} to remove existing FIFO: {}", attempt, fifo.display());
                 match remove_file(fifo).await {
-                    Ok(_) => debug!("Successfully removed FIFO: {}", fifo.display()),
+                    Ok(_) => {
+                        debug!("Successfully removed FIFO: {}", fifo.display());
+                        break;
+                    }
                     Err(e) => {
-                        warn!("Failed to remove FIFO {} on attempt {}: {}", fifo.display(), attempt, e);
+                        warn!(
+                            "Failed to remove FIFO {} on attempt {}: {}",
+                            fifo.display(),
+                            attempt,
+                            e
+                        );
                         if attempt < 3 {
-                            sleep(Duration::from_millis(100)).await; // Brief delay before retry
+                            sleep(Duration::from_millis(100)).await;
                             continue;
                         }
-                        return Err(PipelineError::IOError(format!("Failed to remove existing FIFO {} after {} attempts: {}", fifo.display(), attempt, e)));
+                        return Err(PipelineError::IOError(format!(
+                            "Failed to remove existing FIFO {} after 3 attempts: {}",
+                            fifo.display(),
+                            e
+                        )));
                     }
                 }
             } else {
@@ -1142,80 +1169,115 @@ pub async fn deinterleave_fastq_stream_to_fifos(
         }
     }
 
-    // Create FIFOs
-    debug!("Creating FIFOs: R1={}, R2={}", r1_fifo.display(), r2_fifo.display());
-    create_fifo(&r1_fifo).await
+    // Create R1 FIFO (always)
+    debug!("Creating R1 FIFO: {}", r1_fifo.display());
+    create_fifo(&r1_fifo)
+        .await
         .map_err(|e| PipelineError::IOError(format!("Failed to create R1 FIFO {}: {}", r1_fifo.display(), e)))?;
-    if !metadata(&r1_fifo).await.map_err(|e| PipelineError::IOError(format!("R1 FIFO check failed: {}", e)))?.file_type().is_fifo() {
-        return Err(PipelineError::IOError(format!("R1 path {} is not a FIFO", r1_fifo.display())));
+    if !metadata(&r1_fifo)
+        .await
+        .map_err(|e| PipelineError::IOError(format!("R1 FIFO check failed: {}", e)))?
+        .file_type()
+        .is_fifo()
+    {
+        return Err(PipelineError::IOError(format!(
+            "R1 path {} is not a FIFO",
+            r1_fifo.display()
+        )));
     }
 
-    if paired {
-        create_fifo(&r2_fifo).await
-            .map_err(|e| PipelineError::IOError(format!("Failed to create R2 FIFO {}: {}", r2_fifo.display(), e)))?;
-        if !metadata(&r2_fifo).await.map_err(|e| PipelineError::IOError(format!("R2 FIFO check failed: {}", e)))?.file_type().is_fifo() {
-            return Err(PipelineError::IOError(format!("R2 path {} is not a FIFO", r2_fifo.display())));
+    // Create R2 FIFO only if paired
+    if let Some(ref r2_path) = r2_fifo {
+        debug!("Creating R2 FIFO: {}", r2_path.display());
+        create_fifo(r2_path)
+            .await
+            .map_err(|e| PipelineError::IOError(format!("Failed to create R2 FIFO {}: {}", r2_path.display(), e)))?;
+        if !metadata(r2_path)
+            .await
+            .map_err(|e| PipelineError::IOError(format!("R2 FIFO check failed: {}", e)))?
+            .file_type()
+            .is_fifo()
+        {
+            return Err(PipelineError::IOError(format!(
+                "R2 path {} is not a FIFO",
+                r2_path.display()
+            )));
         }
     }
-
 
     let buffer_size = (config.base_buffer_size * 10).min(100_000);
     let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(buffer_size);
     let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(buffer_size);
 
-    // Deinterleave task
+    // Deinterleave task — convert PipelineError → anyhow::Error
     let deinterleave_handle = tokio::spawn(async move {
         let mut is_r1 = true;
         let mut record_count = 0;
+
         while let Some(item) = input_stream.next().await {
             record_count += 1;
             match item {
                 ParseOutput::Fastq(record) => {
                     if paired {
                         if is_r1 {
-                            r1_tx.send(ParseOutput::Fastq(record)).await
-                                .map_err(|_| PipelineError::StreamDataDropped)
-                                .map_err(Into::<anyhow::Error>::into)?;
+                            r1_tx
+                                .send(ParseOutput::Fastq(record))
+                                .await
+                                .map_err(|_| PipelineError::StreamDataDropped)?;
                         } else {
-                            r2_tx.send(ParseOutput::Fastq(record)).await
-                                .map_err(|_| PipelineError::StreamDataDropped)
-                                .map_err(Into::<anyhow::Error>::into)?;
+                            r2_tx
+                                .send(ParseOutput::Fastq(record))
+                                .await
+                                .map_err(|_| PipelineError::StreamDataDropped)?;
                         }
                         is_r1 = !is_r1;
                     } else {
-                        r1_tx.send(ParseOutput::Fastq(record)).await
-                            .map_err(|_| PipelineError::StreamDataDropped)
-                            .map_err(Into::<anyhow::Error>::into)?;
+                        r1_tx
+                            .send(ParseOutput::Fastq(record))
+                            .await
+                            .map_err(|_| PipelineError::StreamDataDropped)?;
                     }
                 }
-                _ => return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in deinterleave stream".to_string()))
-                    .map_err(Into::<anyhow::Error>::into),
+                _ => {
+                    return Err(PipelineError::InvalidFastqFormat(
+                        "Non-FASTQ in deinterleave stream".to_string(),
+                    )
+                        .into());
+                }
             }
         }
+
         if paired && !is_r1 {
             return Err(PipelineError::InvalidFastqFormat(format!(
-                "Incomplete paired-end stream: {} records, expected even number", record_count
-            )))
-                .map_err(Into::<anyhow::Error>::into);
+                "Incomplete paired-end stream: {} records, expected even number",
+                record_count
+            ))
+                .into());
         }
-        debug!("deinterleave_fastq_stream_to_fifos: Completed deinterleaving {} records", record_count);
+
+        debug!(
+            "deinterleave_fastq_stream_to_fifos: Completed deinterleaving {} records",
+            record_count
+        );
         Ok(())
     });
 
-    // Writer tasks
+    // Writer tasks — write_to_fifo returns JoinHandle<Result<(), anyhow::Error>>
     let r1_write_handle = tokio::spawn(write_to_fifo(r1_rx, r1_fifo.clone()));
     let r2_write_handle = if paired {
-        Some(tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone())))
-    }
-    else {
+        Some(tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone().unwrap())))
+    } else {
         None
     };
 
-    // Defer cleanup to pipeline completion (handled in run cleanup_tasks)
-    Ok((r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle))
+    Ok((
+        r1_fifo,
+        r2_fifo,
+        deinterleave_handle,
+        r1_write_handle,
+        r2_write_handle,
+    ))
 }
-
-
 
 
 pub async fn deinterleave_fastq_stream_to_process_sub<S>(
@@ -2714,13 +2776,15 @@ mod tests {
         });
 
         // Deinterleave
-        let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),
             stream,
             "test_paired",
             true,
         )
             .await?;
+
+        let r2_fifo = r2_fifo_opt.as_ref().expect("R2 FIFO should exist in paired mode");
 
         // Spawn readers for both FIFOs
         let mut r1_reader = Command::new("cat")
@@ -2729,7 +2793,7 @@ mod tests {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R1: {}", e))?;
         let mut r2_reader = Command::new("cat")
-            .arg(&r2_fifo)
+            .arg(r2_fifo)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R2: {}", e))?;
@@ -2741,7 +2805,7 @@ mod tests {
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        if let Some(handle) = r2_write_handle {
+        if let Some(handle) = r2_write_handle_opt {
             handle.await??;
         }
 
@@ -2753,7 +2817,7 @@ mod tests {
         assert!(r2_str.contains("@read2/2\nGGGG\n+\nKKKK\n"), "R2 should contain read2/2");
 
         tokio::fs::remove_file(&r1_fifo).await.ok();
-        tokio::fs::remove_file(&r2_fifo).await.ok();
+        tokio::fs::remove_file(r2_fifo).await.ok();
         Ok(())
     }
 
@@ -2785,7 +2849,7 @@ mod tests {
             }
         });
 
-        let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),
             stream,
             "test_single",
@@ -2793,36 +2857,26 @@ mod tests {
         )
             .await?;
 
+        assert!(r2_fifo_opt.is_none(), "R2 FIFO should not be created in single-end mode");
+        assert!(r2_write_handle_opt.is_none(), "R2 writer should not exist in single-end mode");
+
         let mut r1_reader = Command::new("cat")
             .arg(&r1_fifo)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R1: {}", e))?;
-        let mut r2_reader = Command::new("cat")
-            .arg(&r2_fifo)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn cat for R2: {}", e))?;
 
         let mut r1_output = Vec::new();
-        let mut r2_output = Vec::new();
         r1_reader.stdout.take().unwrap().read_to_end(&mut r1_output).await?;
-        r2_reader.stdout.take().unwrap().read_to_end(&mut r2_output).await?;
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        if let Some(handle) = r2_write_handle {
-            handle.await??;
-        }
 
         let r1_str = String::from_utf8_lossy(&r1_output);
-        let r2_str = String::from_utf8_lossy(&r2_output);
         assert!(r1_str.contains("@read1\nATCG\n+\nIIII\n"), "R1 should contain read1");
         assert!(r1_str.contains("@read2\nGCTA\n+\nHHHH\n"), "R1 should contain read2");
-        assert!(r2_str.is_empty(), "R2 should be empty for single-end");
 
         tokio::fs::remove_file(&r1_fifo).await.ok();
-        tokio::fs::remove_file(&r2_fifo).await.ok();
         Ok(())
     }
 
@@ -2833,7 +2887,7 @@ mod tests {
         drop(tx); // Close immediately
         let stream = ReceiverStream::new(rx);
 
-        let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),
             stream,
             "test_empty",
@@ -2841,6 +2895,7 @@ mod tests {
         )
             .await?;
 
+        let r2_fifo = r2_fifo_opt.as_ref().expect("R2 FIFO should exist");
 
         let mut r1_reader = Command::new("cat")
             .arg(&r1_fifo)
@@ -2848,7 +2903,7 @@ mod tests {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R1: {}", e))?;
         let mut r2_reader = Command::new("cat")
-            .arg(&r2_fifo)
+            .arg(r2_fifo)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R2: {}", e))?;
@@ -2858,10 +2913,9 @@ mod tests {
         r1_reader.stdout.take().unwrap().read_to_end(&mut r1_output).await?;
         r2_reader.stdout.take().unwrap().read_to_end(&mut r2_output).await?;
 
-
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        if let Some(handle) = r2_write_handle {
+        if let Some(handle) = r2_write_handle_opt {
             handle.await??;
         }
 
@@ -2869,7 +2923,7 @@ mod tests {
         assert!(r2_output.is_empty(), "R2 should be empty for empty stream");
 
         tokio::fs::remove_file(&r1_fifo).await.ok();
-        tokio::fs::remove_file(&r2_fifo).await.ok();
+        tokio::fs::remove_file(r2_fifo).await.ok();
         Ok(())
     }
 
@@ -2881,7 +2935,7 @@ mod tests {
 
         tx.send(ParseOutput::Bytes(Arc::new(b"invalid".to_vec()))).await?;
 
-        let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),
             stream,
             "test_non_fastq",
@@ -2889,17 +2943,9 @@ mod tests {
         )
             .await?;
 
-        // Spawn readers to avoid blocking
-        let _r1_reader = Command::new("cat")
-            .arg(&r1_fifo)
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
-        let _r2_reader = Command::new("cat")
-            .arg(&r2_fifo)
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
+        let _ = Command::new("cat").arg(&r1_fifo).spawn()?;
+        let _ = Command::new("cat").arg(r2_fifo_opt.as_ref().unwrap()).spawn()?;
 
-        // Check for error
         let result = deinterleave_handle.await?;
         assert!(result.is_err(), "Should error on non-FASTQ input");
         if let Err(e) = result {
@@ -2909,13 +2955,14 @@ mod tests {
                 e
             );
         }
+
         r1_write_handle.await??;
-        if let Some(handle) = r2_write_handle {
+        if let Some(handle) = r2_write_handle_opt {
             handle.await??;
         }
 
         tokio::fs::remove_file(&r1_fifo).await.ok();
-        tokio::fs::remove_file(&r2_fifo).await.ok();
+        tokio::fs::remove_file(r2_fifo_opt.unwrap()).await.ok();
         Ok(())
     }
 
@@ -2946,7 +2993,7 @@ mod tests {
             }
         });
 
-        let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+        let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),
             stream,
             "test_ram_paired",
@@ -2954,13 +3001,15 @@ mod tests {
         )
             .await?;
 
+        let r2_fifo = r2_fifo_opt.as_ref().expect("R2 FIFO should exist");
+
         // Verify FIFOs exist in ram_temp_dir
         assert!(
             metadata(&r1_fifo).await?.file_type().is_fifo(),
             "R1 FIFO should be in ram_temp_dir"
         );
         assert!(
-            metadata(&r2_fifo).await?.file_type().is_fifo(),
+            metadata(r2_fifo).await?.file_type().is_fifo(),
             "R2 FIFO should be in ram_temp_dir"
         );
 
@@ -2970,7 +3019,7 @@ mod tests {
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R1: {}", e))?;
         let mut r2_reader = Command::new("cat")
-            .arg(&r2_fifo)
+            .arg(r2_fifo)
             .stdout(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn cat for R2: {}", e))?;
@@ -2982,7 +3031,7 @@ mod tests {
 
         deinterleave_handle.await??;
         r1_write_handle.await??;
-        if let Some(handle) = r2_write_handle {
+        if let Some(handle) = r2_write_handle_opt {
             handle.await??;
         }
 
@@ -2992,7 +3041,7 @@ mod tests {
         assert!(r2_str.contains("@read1/2\nGCTA\n+\nHHHH\n"), "R2 should contain read1/2");
 
         tokio::fs::remove_file(&r1_fifo).await.ok();
-        tokio::fs::remove_file(&r2_fifo).await.ok();
+        tokio::fs::remove_file(r2_fifo).await.ok();
         Ok(())
     }
 
