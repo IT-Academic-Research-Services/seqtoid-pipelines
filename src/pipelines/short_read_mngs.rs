@@ -1526,7 +1526,8 @@ pub async fn paf_to_m8(
 pub async fn call_hits_m8_stream(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
-    sample_base_buf: PathBuf
+    sample_base_buf: PathBuf,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>
 ) -> Result<(
     ReceiverStream<ParseOutput>,
     ReceiverStream<ParseOutput>,
@@ -1539,46 +1540,11 @@ pub async fn call_hits_m8_stream(
     let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
     let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
 
-    debug!("Lineage DB size: {} entries", lineage_map.len());
-    if let Some(lineage) = lineage_map.get(&9606) {
-        info!("Taxon 9606 found: species={}, genus={}, family={}", lineage[0], lineage[1], lineage[2]);
-    } else {
-        warn!("Taxon 9606 (Homo sapiens) NOT found in lineage DB");
-    }
-
     let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
     let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
     let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
     let acc2taxid_map = Arc::new(acc2taxid_map);
-    eprintln!("acc2tax map len: {}", acc2taxid_map.len());
 
-
-    if let Some(taxid_u64) = acc2taxid_map.get(b"MT093571.1") {
-        println!("Taxid for full MT093571.1: {}", taxid_u64 as i32);
-    } else {
-        println!("Full not found (expected, since DB has bases)");
-    }
-    if let Some(taxid_u64) = acc2taxid_map.get(b"MT093571") {
-        println!("Taxid for base MT093571: {}", taxid_u64 as i32); // Should be 2697049
-    } else {
-        println!("Base not found!");
-    }
-
-    // Build filter
-    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
-    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
-    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
-
-    let should_keep = Arc::new(build_should_keep_filter(
-        deuterostome_path,
-        taxon_whitelist_path,
-        taxon_blacklist_path,
-    ).await?);
-
-
-    let lineage_map_clone = lineage_map.clone();
-    let acc2taxid_map_clone = acc2taxid_map.clone();
-    let should_keep_clone = should_keep.clone();
 
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
@@ -1586,6 +1552,10 @@ pub async fn call_hits_m8_stream(
     let config_clone = config.clone();
 
     let processing_task = tokio::spawn(async move {
+
+        let lineage_map_clone = lineage_map.clone();
+        let acc2taxid_map_clone = acc2taxid_map.clone();
+        let should_keep_clone = should_keep_filter.clone();
         let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::new();
 
         while let Some(item) = m8_input.next().await {
@@ -2222,7 +2192,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
 
-
     // Host filtering: mm2
     let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp, host_temp_dir) = minimap2_filter(
         config.clone(),
@@ -2309,6 +2278,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Non host Alignment
     // *******************
 
+    // Build filter
+    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
+    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
+    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
+
+    let should_keep_filter = Arc::new(
+        build_should_keep_filter(
+            deuterostome_path,
+            taxon_whitelist_path,
+            taxon_blacklist_path,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(e))?,
+    );
+
     // Minimap2 non_host alignment
 
     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_ref_temp, non_host_index_temp, non_host_index_dir) = minimap2_non_host_align(
@@ -2343,7 +2327,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
-        config.clone(), m8_stream, sample_base_buf.clone(),
+        config.clone(), m8_stream, sample_base_buf.clone(), should_keep_filter.clone()
     ).await?;
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);

@@ -405,7 +405,7 @@ pub async fn build_should_keep_filter(
     deuterostome_path: Option<PathBuf>,
     taxon_whitelist_path: Option<PathBuf>,
     taxon_blacklist_path: Option<PathBuf>,
-) -> Result<impl Fn(&[i32]) -> bool> {
+) -> Result<impl Fn(&[i32]) -> bool + Send + Sync + 'static> {
     let mut taxids_to_remove: HashSet<i32> = HashSet::from([9605, 9606]);
 
     if let Some(path) = taxon_blacklist_path {
