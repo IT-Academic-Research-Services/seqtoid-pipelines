@@ -90,23 +90,26 @@ impl PafRecord {
     fn extract_accession(&self) -> String {
         // Strategy:
         // 1. Try to find NT: or NR: prefix (CZ ID style)
-        // 2. If not, take first word after '>' or space (NCBI style)
+        // 2. If not, take first word after space/tab, strip '>' if present, else keep as-is
         self.tname
             .split(':')
             .find(|part| part.starts_with("NT:") || part.starts_with("NR:"))
             .and_then(|s| s.split('|').next())  // strip |kraken:taxid|
+            .map(|s| s.trim().to_string())
             .or_else(|| {
                 self.tname
                     .split(|c| c == ' ' || c == '\t')
                     .next()
-                    .and_then(|s| s.strip_prefix('>'))
+                    .map(|s| s.strip_prefix('>').unwrap_or(s).trim().to_string())
             })
-            .map(|s| s.trim().to_string())
             .unwrap_or_default()
     }
 
     pub fn to_m8_line(&self, genome_size: f64) -> String {
+
         let accession = self.extract_accession();
+        // NCBI policy: All versions of a GenBank accession (e.g., MT093571.1, MT093571.2) map to the same taxid.
+        let base_accession = accession.split('.').next().unwrap_or(&accession).to_string();
 
         if accession.is_empty() {
             return String::new();
@@ -130,7 +133,7 @@ impl PafRecord {
 
         format!(
             "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-            self.qname, accession, percent_ident, self.alen,
+            self.qname, base_accession, percent_ident, self.alen,
             nonmatch, gap_openings, qstart_1, self.qend,
             tstart_adj, tend_adj, evalue, bitscore
         )
