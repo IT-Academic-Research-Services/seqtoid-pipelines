@@ -1895,31 +1895,46 @@ pub async fn generate_taxon_counts(
     source_count_type: Option<String>,// e.g. "NR" for the other DB
 ) -> Result<Vec<TaxonCount>, PipelineError> {
 
-
     // Expected format (tab-separated):
-    // read_id   level   consensus_taxid   accession   species   genus   family
+    // read_id   accession   species   genus   family   level
     let mut read_summaries: HashMap<String, (u8, String, Vec<i32>)> = HashMap::new();
 
     while let Some(item) = summary_stream.next().await {
         let line = match item {
-            ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
-                .map_err(|e| PipelineError::Other(anyhow!("UTF-8 error: {}", e)))?,
-            _ => return Err(PipelineError::Other(anyhow!("Invalid stream item"))),
+            ParseOutput::Bytes(b) => {
+                let s = String::from_utf8(b.to_vec())
+                    .map_err(|e| PipelineError::Other(anyhow!("UTF-8 error: {}", e)))?;
+                let s = s.trim_end();
+                if s.is_empty() || s.starts_with('#') {
+                    continue;
+                }
+                s.to_string()
+            }
+            _ => continue,
         };
 
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 7 { continue; }
+        if cols.len() != 6 {
+            warn!("Skipping malformed summary line (expected 6 cols): {}", line);
+            continue;
+        }
 
-        let read_id          = cols[0].to_string();
-        let level: u8        = cols[1].parse().unwrap_or(0);
-        let _consensus_taxid = cols[2].parse::<i32>().unwrap_or(0);
-        let accession        = cols[3].to_string();
-        let species: i32     = cols[4].parse().unwrap_or(0);
-        let genus:   i32     = cols[5].parse().unwrap_or(0);
-        let family:  i32     = cols[6].parse().unwrap_or(0);
+        let read_id = cols[0].to_string();
+        let accession = cols[1].to_string();
+        let species: i32 = cols[2].parse().unwrap_or(0);
+        let genus: i32 = cols[3].parse().unwrap_or(0);
+        let family: i32 = cols[4].parse().unwrap_or(0);
+        let level: u8 = cols[5].parse().unwrap_or(0);
+
+        let consensus_taxid: i32 = match level {
+            1 => species,
+            2 => genus,
+            3 => family,
+            _ => 0,
+        };
 
         let raw_lineage = vec![species, genus, family];
-        let cleaned = validate_taxid_lineage(&raw_lineage, _consensus_taxid, level);
+        let cleaned = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
         read_summaries.insert(read_id, (level, accession, cleaned));
     }
     info!("Loaded {} read summaries", read_summaries.len());
@@ -2329,29 +2344,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
-    // let nt_counts = generate_taxon_counts(
-    //     config.clone(),
-    //     call_stream,
-    //     call_summary_stream,
-    //     duplicate_cluster_sizes,
-    //     should_keep_filter.clone(),
-    //     "NT".to_string(),
-    //     None,                       // source_count_type = None for pure NT
-    // ).await?;
-    // info!("NT taxon counts: {} entries", nt_counts.len());
+    let nt_counts = generate_taxon_counts(
+        config.clone(),
+        call_stream,
+        call_summary_stream,
+        duplicate_cluster_sizes,
+        should_keep_filter.clone(),
+        "NT".to_string(),
+        None,                       // source_count_type = None for pure NT
+    ).await?;
+    info!("NT taxon counts: {} entries", nt_counts.len());
 
-    let test_write_task = tokio::spawn(stream_to_file(
-        call_stream.into_inner(),
-        PathBuf::from("test.m8"),
-    ));
-    test_write_task.await??;
-
-    let summary_write_task = tokio::spawn(stream_to_file(
-        call_summary_stream.into_inner(),
-        PathBuf::from("test_summary.txt"),
-    ));
-    summary_write_task.await??;
-    eprintln!("test writes awaited");
+    // let test_write_task = tokio::spawn(stream_to_file(
+    //     call_stream.into_inner(),
+    //     PathBuf::from("test.m8"),
+    // ));
+    // test_write_task.await??;
+    //
+    // let summary_write_task = tokio::spawn(stream_to_file(
+    //     call_summary_stream.into_inner(),
+    //     PathBuf::from("test_summary.txt"),
+    // ));
+    // summary_write_task.await??;
+    // eprintln!("test writes awaited");
 
     // *******************
     // Results retrieval
