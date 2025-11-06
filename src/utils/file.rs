@@ -107,7 +107,7 @@ pub fn resolve_optional_path(
 /// # Returns
 /// PathBuf
 pub fn rename_file_path(
-    path: &Path,  
+    path: &Path,
     prefix: Option<&str>,
     postfix: Option<&str>,
     delimiter: &str,
@@ -198,31 +198,32 @@ pub fn file_name_manipulator(path: &PathBuf, prefix: Option<&str>, postfix:Optio
 /// # Returns
 /// PathBuf of stripped file, extensions.
 pub fn extension_remover(path: &Path) -> (PathBuf, Vec<String>) {
-    let parent = path.parent().unwrap_or(Path::new(""));
-    let mut current = path;
     let mut extensions = Vec::new();
+    let mut current = path;
 
     while let Some(ext_os) = current.extension() {
-        let ext = ext_os.to_str().unwrap_or("");
-        match extensions.len() {
-            1 => {
-                if extensions[0] == "gz" {
-                    extensions.push(ext.to_string());
-                } else {
-                    break;
-                }
-            }
-            0 => extensions.push(ext.to_string()),
-            _ => break,
+        let ext = ext_os.to_str().expect("non-UTF8 extension");
+        extensions.push(ext.to_string());
+
+        if extensions.len() > 2 { break; }
+        if extensions.len() == 2 && extensions[1] != "gz" {
+            extensions.pop();
+            break;
         }
+
         current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
     }
 
-    let stem_path = parent.join(current);
     extensions.reverse();
+
+    let stem_path = if let Some(parent) = path.parent() {
+        parent.join(current)
+    } else {
+        current.to_path_buf()
+    };
+
     (stem_path, extensions)
 }
-
 
 /// Checks if a file has one of a set of extensions
 /// # Arguments
