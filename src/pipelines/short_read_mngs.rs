@@ -1970,10 +1970,6 @@ pub async fn generate_taxon_counts(
                 continue;
             }
 
-            if evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
-                evalue = MIN_NORMAL_POSITIVE_DOUBLE;
-            }
-            let evalue = evalue.log10();
 
             let mut evalue = if evalue <= 0.0 || !evalue.is_finite() {
                 MIN_NORMAL_POSITIVE_DOUBLE
