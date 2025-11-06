@@ -1852,7 +1852,7 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
 //         full_args.push(r2.to_string_lossy().to_string());
 //     }
 //
-//     let (mut diamond_child, diamond_stream_task, diamond_err_task) = spawn_cmd(
+//     let (mut diamond_child, diamond_err_task) = spawn_cmd(
 //         config.clone(),
 //         DIAMOND_TAG,
 //         full_args,
@@ -1863,14 +1863,13 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
 //             tool: DIAMOND_TAG.to_string(),
 //             error: e.to_string(),
 //         })?;
-//     cleanup_tasks.push(diamond_stream_task);
 //     cleanup_tasks.push(diamond_err_task);
 //
 //     // Parse stdout as m8 lines (Bytes mode, since m8 is tabular text)
-//     let m8_stream = {
-//         let mut guard = diamond_child.lock().await;
+//     let m8_stream =
+//
 //         parse_child_output(
-//             &mut guard,
+//             &mut diamond_child,
 //             ChildStream::Stdout,
 //             ParseMode::Bytes,
 //             config.base_buffer_size,
@@ -1879,8 +1878,8 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
 //             .map_err(|e| PipelineError::ToolExecution {
 //                 tool: DIAMOND_TAG.to_string(),
 //                 error: e.to_string(),
-//             })?
-//     };
+//             })?;
+//
 //
 //     Ok((m8_stream, cleanup_tasks, cleanup_receivers, db_temp, index_temp, index_dir))
 // }
@@ -2341,7 +2340,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let test_write_task = tokio::spawn(stream_to_file(
         non_host_dmnd_stream,
-        PathBuf::from("whatever.txt"),
+        PathBuf::from("raw_dmnd.txt"),
     ));
     test_write_task.await??;
 
@@ -2391,13 +2390,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         call_stream,
         call_summary_stream,
-        duplicate_cluster_sizes,
+        duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
         "NT".to_string(),
         None,
     ).await?;
     info!("NT taxon counts: {} entries", nt_counts.len());
-
 
 
     // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
@@ -2409,7 +2407,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
     // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
     //
-    // // Save m8 if needed (matching WDL's output File out_m8 = "rapsearch2.m8")
     // let diamond_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("diamond.m8"), "."));
     // let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
     //     config.clone(),
