@@ -1526,6 +1526,7 @@ pub async fn paf_to_m8(
 pub async fn call_hits_m8_stream(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
+    sample_base_buf: PathBuf
 ) -> Result<(
     ReceiverStream<ParseOutput>,
     ReceiverStream<ParseOutput>,
@@ -1700,6 +1701,9 @@ pub async fn call_hits_m8_stream(
     });
     cleanup_tasks.push(processing_task);
 
+    let m8_dedup_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("dedup.m8"), "_"));
+    let summary_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("summary.txt"), "_"));
+
     let dedup_stream = ReceiverStream::new(dedup_rx);
     let (mut dedup_branches, dedup_done) = t_junction(
         dedup_stream,
@@ -1714,7 +1718,16 @@ pub async fn call_hits_m8_stream(
     ).await?;
     cleanup_receivers.push(dedup_done);
     let dedup_main = dedup_branches.remove(0);
-    let dedup_file = dedup_branches.remove(0);
+    let dedup_file_stream = dedup_branches.remove(0);
+
+    let call_file_write_task = write_byte_stream_to_file(
+        &m8_dedup_file_path,
+        ReceiverStream::new(dedup_file_stream),
+        Some(config.base_buffer_size),
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(call_file_write_task);
 
     let summary_stream = ReceiverStream::new(summary_rx);
     let (mut summary_branches, summary_done) = t_junction(
@@ -1730,7 +1743,16 @@ pub async fn call_hits_m8_stream(
     ).await?;
     cleanup_receivers.push(summary_done);
     let summary_main = summary_branches.remove(0);
-    let summary_file = summary_branches.remove(0);
+    let summary_file_stream = summary_branches.remove(0);
+
+    let summary_file_write_task = write_byte_stream_to_file(
+        &summary_file_path,
+        ReceiverStream::new(summary_file_stream),
+        Some(config.base_buffer_size),
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(summary_file_write_task);
 
     Ok((
         ReceiverStream::new(dedup_main),
@@ -2107,7 +2129,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone()
         .ok_or_else(|| PipelineError::MissingArgument("host_bowtie2_index is required".to_string()))?;
 
-    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
+    let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd)?;
     let paired = file2_path.is_some();
 
     let seed = config.args.seed.unwrap_or_else(|| {
@@ -2122,7 +2144,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         file1_path,
         file2_path,
-        no_ext_sample_base_buf.clone(),
+        sample_base_buf.clone(),
         &out_dir,
     ).await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
@@ -2180,7 +2202,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         kallisto_stream,
         out_dir.clone(),
         paired,
-        no_ext_sample_base_buf.clone(),
+        sample_base_buf.clone(),
     ).await?;
     cleanup_tasks.extend(kallisto_cleanup_tasks);
     cleanup_receivers.extend(kallisto_cleanup_receivers);
@@ -2307,7 +2329,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         temp_dirs.push(index_temp);
     }
 
-    let m8_file_path = out_dir.join(rename_file_path(&no_ext_sample_base_buf, None, Some("m8"), "."));
+    let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
         config.clone(),
@@ -2321,7 +2343,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
-        config.clone(), m8_stream
+        config.clone(), m8_stream, sample_base_buf.clone(),
     ).await?;
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
@@ -2374,7 +2396,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
                 info!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
                 let output_path = out_dir.join("insert_size_histogram.png");
-                let sample_name = no_ext_sample_base_buf
+                let sample_name = sample_base_buf
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("sample")
