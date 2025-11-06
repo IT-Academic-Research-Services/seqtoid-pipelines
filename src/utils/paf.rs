@@ -23,6 +23,7 @@ pub struct PafRecord {
 
 impl PafRecord {
     pub fn parse_line(line: &str) -> Result<Self> {
+        let line = line.trim_end();
         let mut fields = line.split('\t');
         let qname = fields.next().ok_or_else(|| anyhow!("Missing qname"))?.to_string();
         let qlen = fields.next().ok_or_else(|| anyhow!("Missing qlen"))?.parse()?;

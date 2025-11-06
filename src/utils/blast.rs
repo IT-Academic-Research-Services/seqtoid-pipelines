@@ -32,6 +32,7 @@ pub struct M8Record {
 
 impl M8Record {
     pub fn parse_line(line: &str) -> Result<Self> {
+        let line = line.trim_end();
         let mut fields = line.split('\t');
         macro_rules! next {
             () => { fields.next().ok_or_else(|| anyhow!("missing field"))? };
