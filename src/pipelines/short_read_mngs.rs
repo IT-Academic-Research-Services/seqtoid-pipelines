@@ -1192,7 +1192,7 @@ async fn dedup_and_subsample(
     max_subsample: u64,
     prefix_len: Option<usize>,
     out_dir: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, HashMap<String, u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -1272,15 +1272,29 @@ async fn dedup_and_subsample(
         }
     }
 
-    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
-    let dedup_map_clone = dedup_map.clone();
-    let tsv_write_task = tokio::spawn(async move {
-        let mut file = TokioOpenOptions::new().write(true).create(true).open(&tsv_path).await.map_err(|e| anyhow!("TSV open error: {}", e))?;
-        for (_, &(weight, ref records)) in &dedup_map_clone {
-            if !records.is_empty() {
-                file.write_all(format!("{}\t{}\n", records[0].id(), weight).as_bytes()).await?;
-            }
+    let mut duplicate_cluster_sizes: HashMap<String, u64> = HashMap::new();
+    for (&hash_key, &(weight, ref records)) in &dedup_map {
+        if !records.is_empty() {
+            duplicate_cluster_sizes.insert(records[0].id().to_string(), weight);
         }
+    }
+
+    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
+    let duplicate_cluster_sizes_clone = duplicate_cluster_sizes.clone(); // move into task
+    let tsv_write_task = tokio::spawn(async move {
+        let mut file = TokioOpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&tsv_path)
+            .await
+            .map_err(|e| anyhow!("TSV open error: {}", e))?;
+
+        for (read_id, weight) in duplicate_cluster_sizes_clone {
+            file.write_all(format!("{}\t{}\n", read_id, weight).as_bytes())
+                .await
+                .map_err(|e| anyhow!("TSV write error: {}", e))?;
+        }
+
         Ok(())
     });
     cleanup_tasks.push(tsv_write_task);
@@ -1300,7 +1314,7 @@ async fn dedup_and_subsample(
     });
     cleanup_tasks.push(send_task);
 
-    Ok((ReceiverStream::new(rx), count_rx, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(rx), count_rx, duplicate_cluster_sizes, cleanup_tasks, cleanup_receivers))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -1876,9 +1890,7 @@ pub async fn generate_taxon_counts(
     mut m8_stream: ReceiverStream<ParseOutput>,
     mut summary_stream: ReceiverStream<ParseOutput>,
     duplicate_cluster_sizes_path: Option<PathBuf>,
-    deuterostome_path: Option<PathBuf>,
-    taxon_whitelist_path: Option<PathBuf>,
-    taxon_blacklist_path: Option<PathBuf>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
     source_count_type: Option<String>,// e.g. "NR" for the other DB
 ) -> Result<Vec<TaxonCount>, PipelineError> {
@@ -1889,14 +1901,6 @@ pub async fn generate_taxon_counts(
     } else {
         HashMap::new()
     };
-
-    let should_keep = build_should_keep_filter(
-        deuterostome_path,
-        taxon_whitelist_path,
-        taxon_blacklist_path,
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e))?;
 
 
     // Expected format (tab-separated):
@@ -1954,7 +1958,7 @@ pub async fn generate_taxon_counts(
 
         // Metrics are guaranteed to exist because the m8 line came from the same read
         if let Some((pident, alen, mut evalue)) = read_metrics.get(&read_id).cloned() {
-            if !should_keep(&lineage) {
+            if !should_keep_filter(&lineage) {
                 continue;
             }
 
@@ -2261,7 +2265,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
@@ -2292,6 +2296,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await
             .map_err(|e| PipelineError::Other(e))?,
     );
+
 
     // Minimap2 non_host alignment
 
@@ -2325,20 +2330,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut m8_cleanup_receivers);
 
 
-
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(), m8_stream, sample_base_buf.clone(), should_keep_filter.clone()
     ).await?;
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
+    // let nt_counts = generate_taxon_counts(
+    //     config.clone(),
+    //     call_stream,
+    //     call_summary_stream,
+    //     Some(duplicate_cluster_sizes_path),
+    //     should_keep_filter.clone(),
+    //     "NT".to_string(),
+    //     None,                       // source_count_type = None for pure NT
+    // ).await
+    //     .map_err(|e| PipelineError::Other(e))?;
+    //
+    // info!("NT taxon counts: {} entries", nt_counts.len());
 
-    // Write test stream
-    let test_write_task = tokio::spawn(stream_to_file(
-        call_stream.into_inner(),
-        out_dir.join("test.m8"),
-    ));
-    cleanup_tasks.push(test_write_task);
+
 
     // *******************
     // Results retrieval
