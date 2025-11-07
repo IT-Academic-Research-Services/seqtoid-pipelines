@@ -23,6 +23,7 @@ pub struct PafRecord {
 
 impl PafRecord {
     pub fn parse_line(line: &str) -> Result<Self> {
+        let line = line.trim_end();
         let mut fields = line.split('\t');
         let qname = fields.next().ok_or_else(|| anyhow!("Missing qname"))?.to_string();
         let qlen = fields.next().ok_or_else(|| anyhow!("Missing qlen"))?.parse()?;
@@ -86,40 +87,56 @@ impl PafRecord {
         }
     }
 
+
+    fn extract_accession(&self) -> String {
+        // Strategy:
+        // 1. Try to find NT: or NR: prefix (CZ ID style)
+        // 2. If not, take first word after space/tab, strip '>' if present, else keep as-is
+        self.tname
+            .split(':')
+            .find(|part| part.starts_with("NT:") || part.starts_with("NR:"))
+            .and_then(|s| s.split('|').next())  // strip |kraken:taxid|
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                self.tname
+                    .split(|c| c == ' ' || c == '\t')
+                    .next()
+                    .map(|s| s.strip_prefix('>').unwrap_or(s).trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+
     pub fn to_m8_line(&self, genome_size: f64) -> String {
-        let mut tstart = self.tstart;
-        let mut tend = self.tend;
+
+        let accession = self.extract_accession();
+        // NCBI policy: All versions of a GenBank accession (e.g., MT093571.1, MT093571.2) map to the same taxid.
+        let base_accession = accession.split('.').next().unwrap_or(&accession).to_string();
+
+        if accession.is_empty() {
+            return String::new();
+        }
+
+        let (mut tstart, mut tend) = (self.tstart, self.tend);
         if self.strand == '-' {
             std::mem::swap(&mut tstart, &mut tend);
         }
         let qstart_1 = self.qstart + 1;
-        let mut tstart_adj = tstart;
-        let mut tend_adj = tend;
-        if self.strand == '+' {
-            tstart_adj += 1;
-        } else {
-            tend_adj += 1;
-        }
-        let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let tstart_adj = if self.strand == '+' { tstart + 1 } else { tstart };
+        let tend_adj   = if self.strand == '+' { tend } else { tend + 1 };
+
+        let nonmatch = self.tags.get("NM")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         let gap_openings = self.calc_gap_openings();
         let percent_ident = self.percent_identity();
         let bitscore = self.calc_bitscore();
         let evalue = self.calc_evalue(genome_size);
 
         format!(
-            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
-            self.qname,
-            self.tname,
-            percent_ident,
-            self.alen,
-            nonmatch,
-            gap_openings,
-            qstart_1,
-            self.qend,
-            tstart_adj,
-            tend_adj,
-            evalue,
-            bitscore
+            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
+            self.qname, base_accession, percent_ident, self.alen,
+            nonmatch, gap_openings, qstart_1, self.qend,
+            tstart_adj, tend_adj, evalue, bitscore
         )
     }
 }

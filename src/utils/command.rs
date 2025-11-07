@@ -5,7 +5,7 @@ use log::{self, LevelFilter, debug, info, error, warn};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -1612,6 +1612,108 @@ pub mod czid_dedup {
     }
 }
 
+
+pub mod diamond {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::path::Path;
+    use anyhow::anyhow;
+    use log::{debug, info, error, warn};
+    use tokio::fs::{self, DirEntry};
+    use tokio::task::JoinHandle;
+    use tokio::process::Command;
+    use tempfile::{NamedTempFile, TempDir};
+    use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, PipelineError};
+    use crate::utils::file::available_space_for_path;
+    use crate::utils::streams::{read_child_output_to_vec, ChildStream, spawn_cmd};
+    use crate::utils::command::{version_check, ArgGenerator};
+
+    #[derive(Debug)]
+    pub struct DiamondConfig {
+        pub subcommand: DiamondSubcommand,
+        pub db: PathBuf,
+        pub subcommand_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct DiamondArgGenerator;
+
+    pub async fn diamond_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    pub async fn diamond_index_prep(
+        index_path: Option<String>,
+        ref_type: &str,
+    ) -> Result<
+        (
+            PathBuf,                     // DB prefix path (without .dmnd)
+            Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        ),
+        PipelineError,
+    > {
+        let dmnd_path = index_path.ok_or_else(|| {
+            PipelineError::MissingArgument(format!(
+                "{}: --diamond-db <PATH> is required (must be a .dmnd file)",
+                ref_type
+            ))
+        })?;
+
+        let path = PathBuf::from(&dmnd_path);
+
+        if !path.exists() {
+            return Err(PipelineError::FileNotFound(path));
+        }
+        if path.extension() != Some(std::ffi::OsStr::new("dmnd")) {
+            return Err(PipelineError::InvalidConfig(format!(
+                "{} index must be a .dmnd file: {}",
+                ref_type,
+                path.display()
+            )));
+        }
+
+        // Return the prefix without .dmnd
+        let prefix = path.with_extension("");
+
+        Ok((prefix, vec![]))
+    }
+
+    impl ArgGenerator for DiamondArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let args = &run_config.args;
+            let config = extra
+                .and_then(|e| e.downcast_ref::<DiamondConfig>())
+                .ok_or_else(|| anyhow!("Diamond requires a DiamondConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                DiamondSubcommand::Blastx => {
+                    args_vec.push("blastx".to_string());
+                }
+
+            }
+
+            args_vec.push("-d".to_string());
+            args_vec.push(config.db.to_string_lossy().to_string());
+
+            args_vec.push("--threads".to_string());
+            let num_cores: usize = RunConfig::thread_allocation(run_config, DIAMOND_TAG, None);
+            args_vec.push(num_cores.to_string());
+
+            for (key, value) in config.subcommand_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -1631,6 +1733,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         KALLISTO_TAG => Box::new(kallisto::KallistoArgGenerator),
         STAR_TAG => Box::new(star::StarArgGenerator),
         CZID_DEDUP_TAG => Box::new(czid_dedup::CzidDedupArgGenerator),
+        DIAMOND_TAG => Box::new(diamond::DiamondArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -1657,6 +1760,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             KALLISTO_TAG => kallisto::kallisto_presence_check().await,
             STAR_TAG => star::star_presence_check().await,
             CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
+            DIAMOND_TAG => diamond::diamond_presence_check().await,
 
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;

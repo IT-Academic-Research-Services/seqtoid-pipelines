@@ -141,7 +141,54 @@ pub struct Arguments {
     #[arg(long, default_value_t = 1000000)]
     pub max_subsample: usize,
 
-    #[arg(long, default_value_t = 832400799511)]
+    #[arg(long, default_value_t = 1_528_186_360_278)]
     pub nt_db_size: usize,
-    
+
+    #[arg(long, default_value = "taxid-lineages.db")]
+    pub taxid_lineages_db: String,
+
+    #[arg(long, default_value = "accession2_taxid_sled.db")]
+    pub acc2taxid_db: String,
+
+    #[arg(long)]
+    pub taxon_whitelist: Option<String>,
+
+    #[arg(long)]
+    pub taxon_blacklist: Option<String>,
+
+    #[arg(long)]
+    pub deuterostome_list: Option<String>,
+
+    #[clap(long)]
+    pub duplicate_cluster_sizes: Option<String>,
+
+    #[arg(long, default_value_t = 36)]
+    pub min_alignment_length: u64,
+
+    #[clap(
+        long,
+        value_delimiter = ',',
+        value_parser = clap::value_parser!(i32),
+        default_value = "1,287,562,9606,10239",
+        help = "Comma-separated list of test taxids (e.g., 562,287)"
+    )]
+    pub test_taxids: Vec<i32>,
+
+    #[clap(
+        long,
+        value_delimiter = ',',
+        value_parser = clap::value_parser!(String),
+        default_value = "A00020,A01121",
+        help = "Comma-separated list of test accessions (e.g., A01121)"
+    )]
+    pub test_accessions: Vec<String>,
+
+    #[arg(long, default_value = "nt.fa")]
+    pub nt: Option<String>,
+
+    #[arg(long, default_value = "nr.fa")]
+    pub nr: Option<String>,
+
+    #[arg(long, default_value = "nr.dmnd")]
+    pub diamond_db: Option<String>,
 }

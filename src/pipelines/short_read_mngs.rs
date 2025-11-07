@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::io::{BufReader, BufRead};
 use std::hash::Hasher;
 use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
-use std::collections::{HashMap, BinaryHeap};
+use std::collections::{HashMap, BinaryHeap, HashSet};
 use std::cmp::Reverse;
 
 use anyhow::{anyhow, Result};
@@ -21,14 +21,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter, BufReader as TokioBufReader};
-use tokio::fs::{OpenOptions as TokioOpenOptions};
+use tokio::fs::{File, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use serde_json::Value;
+use sled::Tree;
 use twox_hash::XxHash64;
+use fst::Map;
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
@@ -36,6 +38,7 @@ use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::kallisto::KallistoConfig;
+use crate::utils::command::diamond::{DiamondConfig, DiamondArgGenerator, diamond_index_prep};
 use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
 use crate::utils::streams::{deinterleave_fastq_stream_to_fifos};
 use crate::utils::command::star::{StarConfig, star_index_prep};
@@ -44,6 +47,8 @@ use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
+use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
+use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -722,7 +727,7 @@ async fn kallisto_quant(
     let fastq_stream = ReceiverStream::new(fastq_rx);
 
     debug!("Deinterleaving FASTQ stream for sample: {}", sample_base);
-    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+    let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
         config.clone(),
         fastq_stream,
         &sample_base,
@@ -731,11 +736,14 @@ async fn kallisto_quant(
 
     cleanup_tasks.push(deinterleave_handle);
     cleanup_tasks.push(r1_write_handle);
-    if let Some(r2_handle) = r2_write_handle {
+    if let Some(r2_handle) = r2_write_handle_opt {
         cleanup_tasks.push(r2_handle);
     }
 
     let kallisto_config = if paired {
+        let r2_fifo = r2_fifo_opt.as_ref().ok_or_else(|| {
+            PipelineError::InvalidConfig("Paired mode requested but R2 FIFO not created".to_string())
+        })?;
         KallistoConfig {
             subcommand: KallistoSubcommand::Quant,
             subcommand_fields: HashMap::from([
@@ -778,22 +786,26 @@ async fn kallisto_quant(
         })?;
     cleanup_tasks.push(kallisto_err_task);
 
-    // Create Kallisto exit task
+    // Create Kallisto exit task with safe FIFO cleanup
     let r1_fifo_clone = r1_fifo.clone();
-    let r2_fifo_clone = r2_fifo.clone();
+    let r2_fifo_opt_clone = r2_fifo_opt.clone();
     let kallisto_exit_task = tokio::spawn(async move {
         let status = kallisto_child.wait().await
             .map_err(|e| anyhow!("Kallisto wait failed: {}", e))?;
         if !status.success() {
             return Err(anyhow!("Kallisto exited with code: {:?}", status.code()));
         }
-        // Clean up FIFOs
+
+        // Clean up R1 FIFO
         tokio::fs::remove_file(&r1_fifo_clone).await
             .map_err(|e| anyhow!("Failed to remove R1 FIFO {}: {}", r1_fifo_clone.display(), e))?;
-        if paired {
-            tokio::fs::remove_file(&r2_fifo_clone).await
-                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo_clone.display(), e))?;
+
+        // Clean up R2 FIFO only if it exists
+        if let Some(r2_fifo) = r2_fifo_opt_clone {
+            tokio::fs::remove_file(&r2_fifo).await
+                .map_err(|e| anyhow!("Failed to remove R2 FIFO {}: {}", r2_fifo.display(), e))?;
         }
+
         Ok(())
     });
 
@@ -875,527 +887,6 @@ async fn kallisto_results(
 
     Ok(parse_task)
 }
-
-/// HISAT2 filter
-///
-/// # Arguments
-///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream.
-/// * `hisat2_index_path` - Path to HISAT2 index.
-/// * `paired` - Whether the input is paired-end.
-/// * `hisat2_options` - Additional HISAT2 options as a HashMap (e.g., HashMap::from([("--no-spliced-alignment".to_string(), None)])).
-/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
-///
-/// # Returns
-/// Tuple:
-/// - Unmapped FASTQ stream.
-/// - Optional receiver for the total mapped count (u64) if count is needed.
-/// - Vector of cleanup tasks.
-/// - Vector of cleanup receivers.
-
-async fn hisat2_filter(
-    config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    hisat2_index_path: PathBuf,
-    paired: bool,
-    hisat2_options: HashMap<String, Option<String>>,
-    output_bam_path: Option<PathBuf>,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
-
-    // Deinterleave and write to files in CWD
-    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
-    let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
-        input_stream,
-        paired,
-        config.base_buffer_size,
-    ).await.map_err(|e| PipelineError::Other(e))?;
-
-    let r1_path = cwd.join("unmapped_r1.fq");
-    let r1_write_task = write_byte_stream_to_file(
-        &r1_path,
-        ReceiverStream::new(r1_rx),
-        Some(config.base_buffer_size),
-    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(r1_write_task);
-
-    let r2_path_opt = if paired {
-        let r2_path = cwd.join("unmapped_r2.fq");
-        let r2_write_task = write_byte_stream_to_file(
-            &r2_path,
-            ReceiverStream::new(r2_rx_opt.unwrap()),
-            Some(config.base_buffer_size),
-        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
-        cleanup_tasks.push(r2_write_task);
-        Some(r2_path)
-    } else {
-        None
-    };
-
-    deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
-
-    let hisat2_config = Hisat2Config {
-        hisat2_index_path: hisat2_index_path.clone(),
-        option_fields: hisat2_options,
-        r1_path: r1_path.to_string_lossy().to_string(),
-        r2_path: r2_path_opt.as_ref().map(|p| p.to_string_lossy().to_string()),
-    };
-
-    let hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config))
-        .map_err(|e| PipelineError::ToolExecution { tool: HISAT2_TAG.to_string(), error: e.to_string() })?;
-
-    let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
-        config.clone(),
-        HISAT2_TAG,
-        hisat2_args,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: HISAT2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    
-    let hisat2_out_stream = parse_child_output(
-        &mut hisat2_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: HISAT2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-
-    // Sort, output uncompressed BAM
-    let samtools_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            ("-".to_string(), None),
-        ]),
-    };
-    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
-        config.clone(),
-        hisat2_out_stream,
-        SAMTOOLS_TAG,
-        samtools_sort_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(samtools_sort_task);
-    cleanup_tasks.push(samtools_sort_err_task);
-
-    let samtools_sort_out_stream = {
-        let mut guard = samtools_sort_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        ).await.map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?
-    };
-
-    // number of streams for t_junction (unmapped + count + optional BAM)
-    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 };
-
-    let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
-
-    let (bam_streams, bam_done_rx) = if num_tees > 1 {
-        t_junction(
-            bam_rx_stream,
-            num_tees,
-            config.base_buffer_size,
-            config.args.stall_threshold,
-            None,
-            100,
-            StreamDataType::JustBytes,
-            "hisat2_bam_split".to_string(),
-            None,
-        ).await.map_err(|_| PipelineError::StreamDataDropped)?
-    } else {
-        (vec![bam_rx_stream.into_inner()], oneshot::channel::<Result<(), anyhow::Error>>().1)
-    };
-    cleanup_receivers.push(bam_done_rx);
-
-    let mut bam_streams_iter = bam_streams.into_iter();
-
-    // Optional: Write BAM to file
-    if let Some(bam_path) = output_bam_path {
-        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-        let bam_write_task = write_byte_stream_to_file(
-            &bam_path,
-            ReceiverStream::new(stream),
-            Some(config.base_buffer_size),
-        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
-        cleanup_tasks.push(bam_write_task);
-    }
-
-    // Count total mapped reads
-    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
-    let samtools_count_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-c".to_string(), None), // Count
-            (mapped_flag, None),
-            ("-".to_string(), None),
-        ]),
-    };
-    let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
-        config.clone(),
-        bam_count_stream,
-        SAMTOOLS_TAG,
-        samtools_count_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(count_stream_task);
-    cleanup_tasks.push(count_err_task);
-
-    let (count_tx, count_rx) = oneshot::channel::<u64>();
-
-    let count_future = tokio::spawn(async move {
-        let mut count_child = count_child_arc.lock().await;
-        let count_lines = read_child_output_to_vec(&mut count_child, ChildStream::Stdout).await?;
-        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        let _ = count_tx.send(mapped_count);
-        Ok(())
-    });
-    cleanup_tasks.push(count_future);
-
-    // Unmapped stream
-    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    // Extract unmapped FASTQ
-    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
-    let samtools_fastq_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            (unmapped_flag, None),
-            ("-".to_string(), None), // Output to stdout (interleaved for paired)
-        ]),
-    };
-    let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
-        config.clone(),
-        unmapped_stream,
-        SAMTOOLS_TAG,
-        samtools_fastq_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(fastq_stream_task);
-    cleanup_tasks.push(fastq_err_task);
-
-    let unmapped_fastq_stream = {
-        let mut guard = fastq_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Fastq,
-            config.base_buffer_size,
-        ).await.map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?
-    };
-
-
-    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
-}
-
-
-/// STAR filter
-///
-/// # Arguments
-///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream (interleaved).
-/// * `star_index_dir` - Path to STAR index directory.
-/// * `paired` - Whether the input is paired-end.
-/// * `star_options` - Additional STAR options as a HashMap (e.g., HashMap::from([("--outFilterMultimapNmax".to_string(), Some("5".to_string()))])).
-/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
-///
-/// # Returns
-/// Tuple:
-/// - unmapped FASTQ stream.
-/// - Receiver for the total mapped count (u64).
-/// - Vector of cleanup tasks.
-/// - Vector of cleanup receivers.
-async fn star_filter(
-    config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    star_index_path: PathBuf,
-    paired: bool,
-    star_options: HashMap<String, Option<String>>,
-    output_bam_path: Option<PathBuf>,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
-
-    // Deinterleave to FIFOs
-    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
-        config.clone(),
-        input_stream,
-        "star_filter",
-        paired,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: "deinterleave".to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(deinterleave_handle);
-    cleanup_tasks.push(r1_write_handle);
-    if let Some(r2_handle) = r2_write_handle {
-        cleanup_tasks.push(r2_handle);
-    }
-
-    // STAR config
-    let star_config = StarConfig {
-        star_index_dir: star_index_prep(&star_index_path, &std::env::current_dir().unwrap())?,
-        option_fields: star_options,
-        r1_fifo: r1_fifo.clone(),
-        r2_fifo: if paired { Some(r2_fifo.clone()) } else { None },
-    };
-
-    let star_args = generate_cli(STAR_TAG, &config, Some(&star_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: STAR_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    // Spawn STAR (no stdin stream, uses FIFOs)
-    let (mut star_child, star_err_task) = spawn_cmd(
-        config.clone(),
-        STAR_TAG,
-        star_args,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: STAR_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(star_err_task);
-
-    let star_out_stream = parse_child_output(
-        &mut star_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: STAR_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-
-    // Sort, output uncompressed BAM
-    let samtools_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            ("-".to_string(), None),
-        ]),
-    };
-    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
-        config.clone(),
-        star_out_stream,
-        SAMTOOLS_TAG,
-        samtools_sort_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(samtools_sort_task);
-    cleanup_tasks.push(samtools_sort_err_task);
-
-    let samtools_sort_out_stream = {
-        let mut guard = samtools_sort_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        ).await.map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?
-    };
-
-    // number of streams for t_junction (unmapped + count + optional BAM)
-    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 };
-
-    let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
-
-    let (bam_streams, bam_done_rx) = if num_tees > 1 {
-        t_junction(
-            bam_rx_stream,
-            num_tees,
-            config.base_buffer_size,
-            config.args.stall_threshold,
-            None,
-            100,
-            StreamDataType::JustBytes,
-            "star_bam_split".to_string(),
-            None,
-        ).await.map_err(|_| PipelineError::StreamDataDropped)?
-    } else {
-        (vec![bam_rx_stream.into_inner()], oneshot::channel::<Result<(), anyhow::Error>>().1)
-    };
-    cleanup_receivers.push(bam_done_rx);
-
-    let mut bam_streams_iter = bam_streams.into_iter();
-
-    // Optional: Write BAM to file
-    if let Some(bam_path) = output_bam_path {
-        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-        let bam_write_task = write_byte_stream_to_file(
-            &bam_path,
-            ReceiverStream::new(stream),
-            Some(config.base_buffer_size),
-        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
-        cleanup_tasks.push(bam_write_task);
-    }
-
-    // Count total mapped reads
-    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
-    let samtools_count_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-c".to_string(), None), // Count
-            (mapped_flag, None),
-            ("-".to_string(), None),
-        ]),
-    };
-    let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
-        config.clone(),
-        bam_count_stream,
-        SAMTOOLS_TAG,
-        samtools_count_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(count_stream_task);
-    cleanup_tasks.push(count_err_task);
-
-    let (count_tx, count_rx) = oneshot::channel::<u64>();
-
-    let count_future = tokio::spawn(async move {
-        let mut count_child = count_child_arc.lock().await;
-        let count_lines = read_child_output_to_vec(&mut count_child, ChildStream::Stdout).await?;
-        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        let _ = count_tx.send(mapped_count);
-        Ok(())
-    });
-    cleanup_tasks.push(count_future);
-
-    // Unmapped stream
-    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    // Extract unmapped FASTQ
-    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
-    let samtools_fastq_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            (unmapped_flag, None),
-            ("-".to_string(), None), // Output to stdout (interleaved for paired)
-        ]),
-    };
-    let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
-        config.clone(),
-        unmapped_stream,
-        SAMTOOLS_TAG,
-        samtools_fastq_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(fastq_stream_task);
-    cleanup_tasks.push(fastq_err_task);
-
-    let unmapped_fastq_stream = {
-        let mut guard = fastq_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Fastq,
-            config.base_buffer_size,
-        ).await.map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?
-    };
-
-    // Cleanup FIFOs
-    let r1_fifo_cleanup = r1_fifo.clone();
-    let r2_fifo_cleanup = r2_fifo.clone();
-    let fifo_cleanup_task = tokio::spawn(async move {
-        tokio::fs::remove_file(&r1_fifo_cleanup).await.ok();
-        if paired {
-            tokio::fs::remove_file(&r2_fifo_cleanup).await.ok();
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(fifo_cleanup_task);
-
-    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
-}
-
 
 /// Minimap2 filter
 ///
@@ -1678,373 +1169,6 @@ async fn minimap2_filter(
 }
 
 
-
-// Deduplicate using czid-dedup with FIFOs
-async fn czid_dedup_dedup(
-    config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    paired: bool,
-    out_dir: PathBuf,
-    sample_base_buf: PathBuf,
-    prefix_length: u32,
-) -> Result<(
-    ReceiverStream<ParseOutput>,
-    oneshot::Receiver<u64>,
-    Vec<JoinHandle<Result<(), anyhow::Error>>>,
-    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-), PipelineError> {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
-
-    // Check if input stream is empty or near-empty
-    let (pre_tx, pre_rx) = mpsc::channel(config.base_buffer_size);
-    let (t_junc_streams, t_junc_done_rx) = t_junction(
-        input_stream,
-        2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        100,
-        StreamDataType::IlluminaFastq,
-        "czid_dedup_pre_check".to_string(),
-        None,
-    ).await?;
-    cleanup_receivers.push(t_junc_done_rx);
-    let mut t_junc_iter = t_junc_streams.into_iter();
-    let input_stream = ReceiverStream::new(t_junc_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let pre_count_stream = ReceiverStream::new(t_junc_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let pre_count_task = tokio::spawn(async move {
-        let mut records = Vec::new();
-        let mut pre_count_stream = pre_count_stream;
-        while let Some(record) = pre_count_stream.next().await {
-            records.push(format!("{:?}", record));
-        }
-        let count = records.len() as u64;
-        Ok::<u64, anyhow::Error>(count)
-    });
-    let pre_count = pre_count_task.await??; // Unwrap Result<u64, anyhow::Error>
-    if pre_count <= 4 {
-        let (count_tx, count_rx) = oneshot::channel();
-        count_tx.send(0).map_err(|_| anyhow!("Failed to send empty count"))?;
-        drop(pre_tx); // Close sender to signal empty stream
-        return Ok((ReceiverStream::new(pre_rx), count_rx, cleanup_tasks, cleanup_receivers));
-    }
-    // Create output FIFOs
-    let num_files = if paired { 2 } else { 1 };
-    let mut output_fifos = Vec::with_capacity(num_files);
-    for i in 0..num_files {
-        let suffix = if paired { if i == 0 { "r1" } else { "r2" } } else { "se" };
-        let output_fifo = config.ram_temp_dir.join(format!("czid_output_{}_{}.fq", sample_base_buf.file_stem().unwrap().to_string_lossy(), suffix));
-        create_fifo(&output_fifo).await?;
-        output_fifos.push(output_fifo);
-    }
-
-    // Synchronization for FIFO writers
-    let notify = Arc::new(Notify::new());
-
-    // Deinterleave input stream to input FIFOs
-    let sample_base = sample_base_buf.file_stem().unwrap().to_string_lossy();
-    let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
-        config.clone(),
-        input_stream,
-        &sample_base,
-        paired,
-    ).await?;
-    cleanup_tasks.push(deinterleave_handle);
-    cleanup_tasks.push(r1_write_handle);
-    if let Some(handle) = r2_write_handle {
-        cleanup_tasks.push(handle);
-    }
-
-    // Input FIFOs for czid-dedup
-    let input_fifos = if paired {
-        vec![r1_fifo.clone(), r2_fifo.clone()]
-    } else {
-        vec![r1_fifo.clone()]
-    };
-
-    // Debug FIFO contents
-    let r1_fifo_debug = r1_fifo.clone();
-    let r2_fifo_debug = r2_fifo.clone();
-    let debug_fifo_task = tokio::spawn(async move {
-        for fifo in [&r1_fifo_debug, &r2_fifo_debug] {
-            if let Ok(data) = fs::read(fifo).await {
-                debug!("FIFO {} ok", fifo.display());
-            } else {
-                warn!("FIFO {} is empty or inaccessible", fifo.display());
-            }
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(debug_fifo_task);
-
-    // Notify that writers are ready
-    let notify_clone = notify.clone();
-    let writer_ready_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        notify_clone.notify_one();
-        Ok(())
-    });
-    cleanup_tasks.push(writer_ready_task);
-
-    // Optional cluster outputs
-    let cluster_out = out_dir.join("czid_clusters.csv");
-    let cluster_size_out = out_dir.join("czid_cluster_sizes.csv");
-
-    // Config and args
-    let czid_config = CzidDedupConfig {
-        input_paths: input_fifos,
-        output_paths: output_fifos.clone(),
-        prefix_length: Some(prefix_length),
-        cluster_output: Some(cluster_out),
-        cluster_size_output: Some(cluster_size_out),
-    };
-
-    let czid_args = generate_cli(CZID_DEDUP_TAG, &config, Some(&czid_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: CZID_DEDUP_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    // Wait for writers to be ready
-    notify.notified().await;
-
-    // Spawn czid-dedup
-    let (mut child, err_task) = spawn_cmd(
-        config.clone(),
-        CZID_DEDUP_TAG,
-        czid_args,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: CZID_DEDUP_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(err_task);
-
-    let exit_task = tokio::spawn(async move {
-        let status = child.wait().await?;
-        if !status.success() {
-            // Handle empty input case gracefully
-            if status.code() == Some(2) {
-                warn!("czid-dedup exited with code 2 (likely empty input); treating as empty output");
-                return Ok(());
-            }
-            return Err(anyhow!("czid-dedup failed with exit code: {:?}", status.code()));
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(exit_task);
-
-    // Read from output FIFOs
-    let (dedup_rx, count_rx) = if paired {
-        let (r1_rx, r1_count_task) = read_fastq(
-            output_fifos[0].clone(),
-            None,
-            None,
-            0, // max_reads
-            None,
-            None,
-            config.base_buffer_size,
-        ).map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
-        let (r2_rx, r2_count_task) = read_fastq(
-            output_fifos[1].clone(),
-            None,
-            None,
-            0, // max_reads
-            None,
-            None,
-            config.base_buffer_size,
-        ).map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
-        let (inter_rx, inter_task) = interleave_fastq_streams(r1_rx, r2_rx, config.base_buffer_size).await?;
-        cleanup_tasks.push(inter_task);
-        // Validate pair counts and send count
-        let (count_tx, count_rx) = oneshot::channel();
-        let count_validation_task = tokio::spawn(async move {
-            let r1_result = r1_count_task.await.map_err(|e| anyhow!("R1 count task failed: {}", e))?;
-            let r2_result = r2_count_task.await.map_err(|e| anyhow!("R2 count task failed: {}", e))?;
-            let (r1_stats, r2_stats) = match (r1_result, r2_result) {
-                (Ok(r1_stats), Ok(r2_stats)) => (r1_stats, r2_stats),
-                (Err(e), _) | (_, Err(e)) => {
-                    error!("read_fastq failed for R1 or R2: {}", e);
-                    count_tx.send(0).map_err(|_| anyhow!("Send failed"))?;
-                    return Ok(());
-                }
-            };
-            if r1_stats.validated != r2_stats.validated {
-                return Err(anyhow!("Mismatched pair counts: R1={}, R2={}", r1_stats.validated, r2_stats.validated));
-            }
-            count_tx.send(r1_stats.validated / 2)
-                .map_err(|_| anyhow!("Send failed"))?;
-            Ok(())
-        });
-        cleanup_tasks.push(count_validation_task);
-        (inter_rx, count_rx)
-    } else {
-        let (rx, count_task) = read_fastq(
-            output_fifos[0].clone(),
-            None,
-            None,
-            0, // max_reads
-            None,
-            None,
-            config.base_buffer_size,
-        ).map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
-        let (count_tx, count_rx) = oneshot::channel();
-        let count_wrap = tokio::spawn(async move {
-            let stats = count_task.await.map_err(|e| anyhow!("Count task failed: {}", e))?;
-            match stats {
-                Ok(stats) => {
-                    count_tx.send(stats.validated)
-                        .map_err(|_| anyhow!("Send failed"))?;
-                    Ok(())
-                }
-                Err(e) => {
-                    count_tx.send(0).map_err(|_| anyhow!("Send failed"))?;
-                    Ok(())
-                }
-            }
-        });
-        cleanup_tasks.push(count_wrap);
-        (rx, count_rx)
-    };
-
-    // FIFO cleanup with logging
-    let fifo_cleanup = tokio::spawn(async move {
-        for path in output_fifos.iter() {
-            if let Err(e) = fs::remove_file(path).await {
-                error!("Failed to remove FIFO {}: {}", path.display(), e);
-            }
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(fifo_cleanup);
-
-    Ok((ReceiverStream::new(dedup_rx), count_rx, cleanup_tasks, cleanup_receivers))
-}
-
-async fn fastp_dedup(
-    config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    paired: bool,
-    out_dir: PathBuf,
-    sample_base_buf: PathBuf,
-    prefix_length: Option<u32>,
-) -> Result<
-    (
-        ReceiverStream<ParseOutput>,
-        oneshot::Receiver<u64>,
-        Vec<JoinHandle<Result<(), anyhow::Error>>>,
-        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-    ),
-    PipelineError,
-> {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
-
-    // Configure fastp for deduplication only
-    let mut command_fields = HashMap::from([
-        ("-q".to_string(), Some("20".to_string())),
-        ("--qualified_quality_phred".to_string(), Some("15".to_string())),
-        ("--complexity_threshold".to_string(), Some("30".to_string())),
-        ("--stdin".to_string(), None), // Input from stdin
-        ("--stdout".to_string(), None), // Output to stdout
-        ("--dedup".to_string(), None), // Enable deduplication
-        ("--dup_calc_accuracy".to_string(), Some("3".to_string())), // Low memory (~1-2GB)
-        ("-w".to_string(), Some(RunConfig::thread_allocation(&config, FASTP_TAG, None).to_string())),
-        ("-j".to_string(), Some(out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy())).to_string_lossy().to_string())), // JSON report
-    ]);
-
-    // Handle paired-end
-    if paired {
-        command_fields.insert("--interleaved_in".to_string(), None);
-    }
-
-    // Handle prefix-length by trimming (if specified)
-    if let Some(len) = prefix_length {
-        command_fields.insert("--cut_tail".to_string(), Some(len.to_string()));
-        command_fields.insert("--cut_front".to_string(), Some("0".to_string()));
-        debug!("Trimming reads to {}bp for prefix-based deduplication", len);
-    }
-
-    let fastp_config = FastpConfig { command_fields };
-    let fastp_args = generate_cli(FASTP_TAG, &config, Some(&fastp_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: FASTP_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    // Stream to fastp
-    let (mut fastp_child, fastp_stream_task, fastp_err_task) = stream_to_cmd(
-        config.clone(),
-        input_stream.into_inner(),
-        FASTP_TAG,
-        fastp_args,
-        StreamDataType::JustBytes, // Or IlluminaFastq if parsing FASTQ records
-        config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: FASTP_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    cleanup_tasks.push(fastp_stream_task);
-    cleanup_tasks.push(fastp_err_task);
-
-    // Parse output stream
-    let dedup_stream = {
-        let mut guard = fastp_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: FASTP_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
-
-    // Count unique reads from JSON report
-    let json_path = out_dir.join(format!("{}_dedup.json", sample_base_buf.file_name().unwrap().to_string_lossy()));
-    let (count_tx, count_rx) = oneshot::channel();
-    let count_task = tokio::spawn(async move {
-        let json_content = match fs::read_to_string(&json_path).await {
-            Ok(content) => content,
-            Err(e) => {
-                return Err(anyhow!("JSON read error"));
-            }
-        };
-        let parsed: Value = match serde_json::from_str(&json_content) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("JSON parse error: {}", e);
-                count_tx.send(0).map_err(|_| anyhow!("Send failed"))?; // Fallback
-                return Ok(());
-            }
-        };
-
-        let uniques = parsed["duplication"]["unique_reads"].as_u64().unwrap_or_else(|| {
-            warn!("Missing unique_reads; falling back to 0");
-            0
-        });
-        let unique_pairs = uniques / if paired { 2 } else { 1 };
-        count_tx.send(unique_pairs).map_err(|_| anyhow!("Send failed"))?;
-        Ok(())
-    });
-    cleanup_tasks.push(count_task);
-
-    Ok((
-        ReceiverStream::new(dedup_stream),
-        count_rx,
-        cleanup_tasks,
-        cleanup_receivers,
-    ))
-}
-
-
 /// Combined de-duplication and subsambler.
 /// Uses and A-Res algorithm and hashing to creat a min heap BinaryHeap
 /// Runs in memory when possible, but has a disk option when
@@ -2075,7 +1199,7 @@ async fn dedup_and_subsample(
     max_subsample: u64,
     prefix_len: Option<usize>,
     out_dir: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, HashMap<String, u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -2155,15 +1279,29 @@ async fn dedup_and_subsample(
         }
     }
 
-    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
-    let dedup_map_clone = dedup_map.clone();
-    let tsv_write_task = tokio::spawn(async move {
-        let mut file = TokioOpenOptions::new().write(true).create(true).open(&tsv_path).await.map_err(|e| anyhow!("TSV open error: {}", e))?;
-        for (_, &(weight, ref records)) in &dedup_map_clone {
-            if !records.is_empty() {
-                file.write_all(format!("{}\t{}\n", records[0].id(), weight).as_bytes()).await?;
-            }
+    let mut duplicate_cluster_sizes: HashMap<String, u64> = HashMap::new();
+    for (&hash_key, &(weight, ref records)) in &dedup_map {
+        if !records.is_empty() {
+            duplicate_cluster_sizes.insert(records[0].id().to_string(), weight);
         }
+    }
+
+    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
+    let duplicate_cluster_sizes_clone = duplicate_cluster_sizes.clone(); // move into task
+    let tsv_write_task = tokio::spawn(async move {
+        let mut file = TokioOpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&tsv_path)
+            .await
+            .map_err(|e| anyhow!("TSV open error: {}", e))?;
+
+        for (read_id, weight) in duplicate_cluster_sizes_clone {
+            file.write_all(format!("{}\t{}\n", read_id, weight).as_bytes())
+                .await
+                .map_err(|e| anyhow!("TSV write error: {}", e))?;
+        }
+
         Ok(())
     });
     cleanup_tasks.push(tsv_write_task);
@@ -2183,7 +1321,7 @@ async fn dedup_and_subsample(
     });
     cleanup_tasks.push(send_task);
 
-    Ok((ReceiverStream::new(rx), count_rx, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(rx), count_rx, duplicate_cluster_sizes, cleanup_tasks, cleanup_receivers))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -2307,13 +1445,10 @@ pub async fn paf_to_m8(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 )> {
-    // Channel for converted m8 lines
     let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
-    // Clone config for closure — fixes E0382
     let config_clone = config.clone();
 
-    // Spawn PAF → m8 conversion task
     let conversion_handle = tokio::spawn(async move {
         while let Some(item) = input_stream.next().await {
             let line_bytes = match item {
@@ -2335,7 +1470,7 @@ pub async fn paf_to_m8(
             if line.trim().is_empty() || line.starts_with('#') {
                 continue;
             }
-
+            // eprintln!("paf: {}", line);
             let record = match PafRecord::parse_line(&line) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2344,9 +1479,10 @@ pub async fn paf_to_m8(
                 }
             };
 
-            // Use user-provided nt_db_size — no fallback
             let genome_size = config_clone.args.nt_db_size as f64;
             let m8_line = record.to_m8_line(genome_size);
+            // eprintln!("m8: {}", m8_line);
+            // eprintln!("");
             let m8_bytes = (m8_line + "\n").into_bytes();
 
             if m8_tx.send(ParseOutput::Bytes(Arc::new(m8_bytes))).await.is_err() {
@@ -2358,7 +1494,6 @@ pub async fn paf_to_m8(
 
     let m8_stream = ReceiverStream::new(m8_rx);
 
-    // Split stream: one for file, one for downstream
     let (mut streams, done_rx) = t_junction(
         m8_stream,
         2,
@@ -2375,7 +1510,6 @@ pub async fn paf_to_m8(
     let main_stream = streams.remove(0);
     let file_stream = streams.remove(0);
 
-    // Write to file
     let write_task = write_byte_stream_to_file(
         &m8_path,
         ReceiverStream::new(file_stream),
@@ -2388,6 +1522,564 @@ pub async fn paf_to_m8(
         vec![conversion_handle, write_task],
         vec![done_rx],
     ))
+}
+
+
+/// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `m8_inpout` - line-based m8 format input stream
+/// * `taxid_lineages_db_path` - path to sled-backed originally derived from tp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
+/// * `duplicate_cluster_sizes_path` - optinal duplicate cluster sizes for weighting
+/// * `taxon_blacklist_path` - optional list of excluded taxa
+/// * `deuterostome_path` - optional list of excluded taxa
+/// * `taxon_whitelist_path` -optional list of included taxa
+/// * `min_alignment_length` - will not attempt alignment under this threshold
+///
+///
+/// # Returns
+/// Tuple:
+/// - m8 stream
+///  -hit-summary TSV stream
+/// - Vec of cleanup tasks
+/// - Vec of cleanup receivers
+pub async fn call_hits_m8_stream(
+    config: Arc<RunConfig>,
+    mut m8_input: ReceiverStream<ParseOutput>,
+    sample_base_buf: PathBuf,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    min_aln_len: u64
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+)> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
+    let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
+
+    let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
+    let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
+    let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
+    let acc2taxid_map = Arc::new(acc2taxid_map);
+
+
+    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    let config_clone = config.clone();
+
+    let processing_task = tokio::spawn(async move {
+
+        let lineage_map_clone = lineage_map.clone();
+        let acc2taxid_map_clone = acc2taxid_map.clone();
+        let should_keep_clone = should_keep_filter.clone();
+        let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::new();
+
+        while let Some(item) = m8_input.next().await {
+            let line = match item {
+                ParseOutput::Bytes(b) => {
+                    let bytes = b.to_vec();
+                    match String::from_utf8(bytes) {
+                        Ok(s) => s.trim_end().to_string(),
+                        Err(e) => {
+                            debug!("m8 line not UTF-8: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                _ => continue,
+            };
+
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let rec = match M8Record::parse_line(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("m8 parse error: {} – {}", e, &line);
+                    continue;
+                }
+            };
+
+            if rec.alen < min_aln_len {
+                continue;
+            }
+
+            read_groups.entry(rec.qname.clone()).or_default().push(rec);
+        }
+
+        for (read_id, hits) in read_groups {
+            let mut valid_hits = Vec::new();
+            for hit in &hits {
+                if let Some(taxid_u64) = acc2taxid_map_clone.get(hit.tname.as_bytes()) {
+                    let taxid = taxid_u64 as i32;
+                    if taxid == 0 {
+                        continue;
+                    }
+                    let lineage = lineage_map_clone.get(&taxid).cloned().unwrap_or([-1; 3]);
+                    if !(should_keep_clone)(&lineage) {
+                        continue;
+                    }
+                    valid_hits.push(hit.clone());
+                } else {
+                    debug!("Missing taxid for accession: {}", hit.tname);
+                }
+            }
+
+            if valid_hits.is_empty() {
+                continue;
+            }
+
+            valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(Ordering::Equal));
+            let best = valid_hits[0].clone();
+
+            let (tax_level, consensus_taxid, consensus_hits) = consensus_level(
+                &hits,
+                &*lineage_map_clone,  // ← &AHashMap
+                &*acc2taxid_map_clone,
+                &should_keep_clone,
+            )?;
+
+            let dedup_line = format!(
+                "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
+                best.qname,
+                best.tname,
+                best.pident,
+                best.alen,
+                best.mismatch,
+                best.gapopen,
+                best.qstart,
+                best.qend,
+                best.tstart,
+                best.tend,
+                best.evalue,
+                best.bitscore
+            );
+            dedup_tx
+                .send(ParseOutput::Bytes(Arc::new((dedup_line + "\n").into_bytes())))
+                .await?;
+
+            // Extract S/G/F from first hit's lineage
+            let first_lineage = consensus_hits
+                .first()
+                .and_then(|h| acc2taxid_map_clone.get(h.tname.as_bytes()))
+                .and_then(|taxid_u64| {
+                    let taxid = taxid_u64 as i32;
+                    lineage_map_clone.get(&taxid)
+                })
+                .cloned()
+                .unwrap_or([-1; 3]);
+
+            let species = first_lineage[0] as i64;
+            let genus = first_lineage[1] as i64;
+            let family = first_lineage[2] as i64;
+
+            let summary_line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                read_id, best.tname, species, genus, family, tax_level
+            );
+            summary_tx
+                .send(ParseOutput::Bytes(Arc::new(summary_line.into_bytes())))
+                .await?;
+        }
+
+        Ok(())
+    });
+    cleanup_tasks.push(processing_task);
+
+    let m8_dedup_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("dedup.m8"), "_"));
+    let summary_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("summary.txt"), "_"));
+
+    let dedup_stream = ReceiverStream::new(dedup_rx);
+    let (mut dedup_branches, dedup_done) = t_junction(
+        dedup_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "call_hits_m8_dedup".to_string(),
+        None,
+    ).await?;
+    cleanup_receivers.push(dedup_done);
+    let dedup_main = dedup_branches.remove(0);
+    let dedup_file_stream = dedup_branches.remove(0);
+
+    let call_file_write_task = write_byte_stream_to_file(
+        &m8_dedup_file_path,
+        ReceiverStream::new(dedup_file_stream),
+        Some(config.base_buffer_size),
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(call_file_write_task);
+
+    let summary_stream = ReceiverStream::new(summary_rx);
+    let (mut summary_branches, summary_done) = t_junction(
+        summary_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "call_hits_m8_summary".to_string(),
+        None,
+    ).await?;
+    cleanup_receivers.push(summary_done);
+    let summary_main = summary_branches.remove(0);
+    let summary_file_stream = summary_branches.remove(0);
+
+    let summary_file_write_task = write_byte_stream_to_file(
+        &summary_file_path,
+        ReceiverStream::new(summary_file_stream),
+        Some(config.base_buffer_size),
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(summary_file_write_task);
+
+    Ok((
+        ReceiverStream::new(dedup_main),
+        ReceiverStream::new(summary_main),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
+
+async fn load_optional_set(path: Option<String>) -> Result<HashSet<i64>> {
+    let mut set = HashSet::new();
+    if let Some(p) = path {
+        let path = PathBuf::from(p);
+        let file = File::open(path).await?;
+        let mut lines = tokio::io::BufReader::new(file).lines();
+        while let Some(l) = lines.next_line().await? {
+            if let Ok(v) = l.parse::<i64>() {
+                set.insert(v);
+            }
+        }
+    }
+    Ok(set)
+}
+
+pub async fn load_duplicate_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
+    let file = File::open(path).await?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut map = HashMap::new();
+    while let Some(line) = lines.next_line().await? {
+        let mut parts = line.split('\t');
+        let read_id = parts.next().ok_or_else(|| anyhow!("bad dup line"))?.to_string();
+        let size: u64 = parts.next().unwrap_or("1").parse()?;
+        map.insert(read_id, size);
+    }
+    Ok(map)
+}
+
+fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>, whitelist: &HashSet<i64>) -> bool {
+    if blacklist.contains(&taxid) || deuterostome.contains(&taxid) {
+        return true;
+    }
+    if !whitelist.is_empty() && !whitelist.contains(&taxid) {
+        return true;
+    }
+    false
+}
+//
+// async fn diamond_non_host_align(
+//     config: Arc<RunConfig>,
+//     input_stream: ReceiverStream<ParseOutput>,
+//     paired: bool,
+//     sample_base: String
+// ) -> Result<(mpsc::Receiver<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Option<NamedTempFile>, Option<NamedTempFile>, Option<TempDir>), PipelineError> {
+//     let mut cleanup_tasks = Vec::new();
+//     let mut cleanup_receivers = Vec::new();
+//     let mut db_temp: Option<NamedTempFile> = None;
+//     let mut index_temp: Option<NamedTempFile> = None;
+//     let mut index_dir: Option<TempDir> = None;
+//
+//     let diamond_db = config.args.diamond_db.clone().ok_or(PipelineError::MissingArgument("diamond_db required for NR alignment".to_string()))?;
+//     let (db_prefix, prep_tasks) = diamond_index_prep(Some(diamond_db), "non_host").await?;
+//     cleanup_tasks.extend(prep_tasks);
+//
+//
+//     // De-interleave to FIFOs
+//     let (r1_fifo, r2_fifo, deinterleave_handle, r1_write_handle, r2_write_handle) = deinterleave_fastq_stream_to_fifos(
+//         config.clone(),
+//         input_stream,
+//         &sample_base,
+//         paired,
+//     ).await?;
+//
+//     cleanup_tasks.push(deinterleave_handle);
+//     cleanup_tasks.push(r1_write_handle);
+//     if let Some(r2_handle) = r2_write_handle {
+//         cleanup_tasks.push(r2_handle);
+//     }
+//
+//
+//     // Diamond config matching WDL (--mid-sensitive, -f 6 for m8 tabular)
+//     let diamond_options = HashMap::from([
+//         ("--mid-sensitive".to_string(), None),
+//         ("-f".to_string(), Some("6".to_string())),  // Tabular m8 format (matches WDL's m8 treatment)
+//         ("-o".to_string(), Some("-".to_string())),  // Stdout
+//     ]);
+//
+//     let diamond_config = DiamondConfig {
+//         subcommand: DiamondSubcommand::Blastx,
+//         db: db_prefix,
+//         subcommand_fields: diamond_options,
+//     };
+//
+//     let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: DIAMOND_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//
+//     // Add -q <fifo(s)> (matching WDL's -q "~{sep=' ' fastas}")
+//     let mut full_args = diamond_args;
+//     full_args.push("-q".to_string());
+//     full_args.push(r1_fifo.to_string_lossy().to_string());
+//     if let Some(r2) = r2_fifo {
+//         full_args.push(r2.to_string_lossy().to_string());
+//     }
+//
+//     let (mut diamond_child, diamond_err_task) = spawn_cmd(
+//         config.clone(),
+//         DIAMOND_TAG,
+//         full_args,
+//         config.args.verbose,
+//     )
+//         .await
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: DIAMOND_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//     cleanup_tasks.push(diamond_err_task);
+//
+//     // Parse stdout as m8 lines (Bytes mode, since m8 is tabular text)
+//     let m8_stream =
+//
+//         parse_child_output(
+//             &mut diamond_child,
+//             ChildStream::Stdout,
+//             ParseMode::Bytes,
+//             config.base_buffer_size,
+//         )
+//             .await
+//             .map_err(|e| PipelineError::ToolExecution {
+//                 tool: DIAMOND_TAG.to_string(),
+//                 error: e.to_string(),
+//             })?;
+//
+//
+//     Ok((m8_stream, cleanup_tasks, cleanup_receivers, db_temp, index_temp, index_dir))
+// }
+
+/// Generates ytaxon counts from a called m8 stream
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `m8_stream` - line-based m8 format input stream
+/// * `summary_stream` - stream of summary information from m8
+/// * `duplicate_cluster_sizes_path` - optinal duplicate cluster sizes for weighting
+/// * `taxon_blacklist_path` - optional list of excluded taxa
+/// * `deuterostome_path` - optional list of excluded taxa
+/// * `taxon_whitelist_path` -optional list of included taxa
+/// * `count_type` - e.g. NT , type of DB being refernced
+/// *  `source_count_type` - optional second source, e.g. NR
+///
+///
+/// # Returns
+/// vector of taxon counts
+pub async fn generate_taxon_counts(
+    config: Arc<RunConfig>,
+    mut m8_stream: ReceiverStream<ParseOutput>,
+    mut summary_stream: ReceiverStream<ParseOutput>,
+    duplicate_cluster_sizes: HashMap<String, u64>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    count_type: String,               // e.g. "NT"
+    source_count_type: Option<String>,// e.g. "NR" for the other DB
+) -> Result<Vec<TaxonCount>, PipelineError> {
+
+    // Expected format (tab-separated):
+    // read_id   accession   species   genus   family   level
+    let mut read_summaries: HashMap<String, (u8, String, Vec<i32>)> = HashMap::new();
+
+    while let Some(item) = summary_stream.next().await {
+        let line = match item {
+            ParseOutput::Bytes(b) => {
+                let s = String::from_utf8(b.to_vec())
+                    .map_err(|e| PipelineError::Other(anyhow!("UTF-8 error: {}", e)))?;
+                let s = s.trim_end();
+                if s.is_empty() || s.starts_with('#') {
+                    continue;
+                }
+                s.to_string()
+            }
+            _ => continue,
+        };
+
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() != 6 {
+            warn!("Skipping malformed summary line (expected 6 cols): {}", line);
+            continue;
+        }
+
+        let read_id = cols[0].to_string();
+        let accession = cols[1].to_string();
+        let species: i32 = cols[2].parse().unwrap_or(0);
+        let genus: i32 = cols[3].parse().unwrap_or(0);
+        let family: i32 = cols[4].parse().unwrap_or(0);
+        let level: u8 = cols[5].parse().unwrap_or(0);
+
+        let consensus_taxid: i32 = match level {
+            1 => species,
+            2 => genus,
+            3 => family,
+            _ => 0,
+        };
+
+        let raw_lineage = vec![species, genus, family];
+        let cleaned = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
+        read_summaries.insert(read_id, (level, accession, cleaned));
+    }
+    info!("Loaded {} read summaries", read_summaries.len());
+
+
+    // consume the **deduped m8** stream (one line per read)
+    // We only need percent-identity, alignment-length and e-value.
+    let mut read_metrics: HashMap<String, (f64, u64, f64)> = HashMap::new();
+
+    while let Some(item) = m8_stream.next().await {
+        let line = match item {
+            ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
+                .map_err(|e| anyhow!("m8 line not UTF-8: {}", e))?,
+            _ => continue,
+        };
+
+        let rec = M8Record::parse_line(&line)
+            .map_err(|e| anyhow!("failed to parse m8 line: {}", e))?;
+        read_metrics.insert(rec.qname, (rec.pident, rec.alen, rec.evalue));
+    }
+    info!("Loaded {} read metrics", read_metrics.len());
+
+
+    let mut aggregation: HashMap<Vec<i32>, AggBucket> = HashMap::new();
+    let mut base_count_per_read: HashMap<String, u64> = HashMap::new();
+
+    for (read_id, (level, _accession, lineage)) in read_summaries {
+        let cluster_size = *duplicate_cluster_sizes.get(&read_id).unwrap_or(&1u64);
+
+        // Metrics are guaranteed to exist because the m8 line came from the same read
+        if let Some((pident, alen, mut evalue)) = read_metrics.get(&read_id).cloned() {
+            if !should_keep_filter(&lineage) {
+                continue;
+            }
+
+
+            let mut evalue = if evalue <= 0.0 || !evalue.is_finite() {
+                MIN_NORMAL_POSITIVE_DOUBLE
+            } else if evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
+                MIN_NORMAL_POSITIVE_DOUBLE
+            } else {
+                evalue
+            };
+            let evalue_log10 = evalue.log10();
+
+
+            if level == 1 {
+                base_count_per_read.insert(read_id.clone(), alen * cluster_size);
+            }
+
+            // walk the lineagerootward
+            let mut agg_key = lineage.clone();
+            while !agg_key.is_empty() {
+                let bucket = aggregation.entry(agg_key.clone()).or_default();
+
+                bucket.nonunique_count += cluster_size;
+                bucket.unique_count    += 1;
+                bucket.base_count      += *base_count_per_read.get(&read_id).unwrap_or(&0);
+                bucket.sum_percent_identity += pident;
+                bucket.sum_alignment_length += alen as f64;
+                bucket.sum_e_value          += evalue_log10;
+
+                if let Some(src) = &source_count_type {
+                    bucket.source_count_type.insert(src.clone());
+                }
+
+                // chop the leafward rank
+                agg_key.remove(0);
+            }
+        }
+    }
+
+    let mut taxon_counts = Vec::new();
+
+    for (mut agg_key, bucket) in aggregation {
+        if bucket.unique_count == 0 { continue; }
+
+        // Number of ranks we still have in the key (3 = species, 2 = genus, 1 = family)
+        let remaining = agg_key.len() as u8;
+        let tax_level = 4 - remaining;               // 1 = species, 2 = genus, 3 = family
+        let tax_id    = agg_key[0];
+
+        // Helper to pull a rank with a negative fallback
+        macro_rules! rank_or_neg {
+            ($idx:expr, $neg:expr) => {
+                if tax_level <= $idx { agg_key.get($idx as usize - tax_level as usize).copied().unwrap_or($neg) }
+                else { $neg }
+            };
+        }
+        let genus_taxid  = rank_or_neg!(2, -200);
+        let family_taxid = rank_or_neg!(3, -300);
+
+        let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
+            bucket.nonunique_count
+        } else {
+            bucket.unique_count
+        };
+
+        let dcr = bucket.nonunique_count as f64 / bucket.unique_count as f64;
+        let percent_identity = bucket.sum_percent_identity / bucket.unique_count as f64;
+        let alignment_length = bucket.sum_alignment_length / bucket.unique_count as f64;
+        let e_value          = bucket.sum_e_value / bucket.unique_count as f64;
+
+        let source_vec = if bucket.source_count_type.is_empty() {
+            None
+        } else {
+            let mut v: Vec<String> = bucket.source_count_type.into_iter().collect();
+            v.sort_unstable();
+            Some(v)
+        };
+
+        taxon_counts.push(TaxonCount {
+            tax_id,
+            tax_level,
+            genus_taxid,
+            family_taxid,
+            count,
+            nonunique_count: bucket.nonunique_count,
+            unique_count:    bucket.unique_count,
+            dcr,
+            percent_identity,
+            alignment_length,
+            e_value,
+            count_type: count_type.clone(),
+            base_count: bucket.base_count,
+            source_count_type: source_vec,
+        });
+    }
+
+    Ok(taxon_counts)
 }
 
 
@@ -2430,7 +2122,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone()
         .ok_or_else(|| PipelineError::MissingArgument("host_bowtie2_index is required".to_string()))?;
 
-    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
+    let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd)?;
     let paired = file2_path.is_some();
 
     let seed = config.args.seed.unwrap_or_else(|| {
@@ -2445,7 +2137,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         file1_path,
         file2_path,
-        no_ext_sample_base_buf.clone(),
+        sample_base_buf.clone(),
         &out_dir,
     ).await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
@@ -2503,7 +2195,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         kallisto_stream,
         out_dir.clone(),
         paired,
-        no_ext_sample_base_buf.clone(),
+        sample_base_buf.clone(),
     ).await?;
     cleanup_tasks.extend(kallisto_cleanup_tasks);
     cleanup_receivers.extend(kallisto_cleanup_receivers);
@@ -2522,7 +2214,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
-
 
     // Host filtering: mm2
     let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp, host_temp_dir) = minimap2_filter(
@@ -2593,7 +2284,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    let (dedup_stream, dedup_count_rx, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
@@ -2606,17 +2297,58 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
 
-
-
     // *******************
     // Non host Alignment
     // *******************
+
+    // Build filter
+    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
+    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
+    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
+
+    let should_keep_filter = Arc::new(
+        build_should_keep_filter(
+            deuterostome_path,
+            taxon_whitelist_path,
+            taxon_blacklist_path,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(e))?,
+    );
+
+
+    // split inpout stream for mm2 and dmnd
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        dedup_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "non_host_mm2_dmnd_input".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(non_host_done_rx);
+
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let test_write_task = tokio::spawn(stream_to_file(
+        non_host_dmnd_stream,
+        PathBuf::from("raw_dmnd.txt"),
+    ));
+    test_write_task.await??;
 
     // Minimap2 non_host alignment
 
     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_ref_temp, non_host_index_temp, non_host_index_dir) = minimap2_non_host_align(
         config.clone(),
-        dedup_stream,
+        ReceiverStream::new(non_host_mm2_stream),
     )
         .await?;
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
@@ -2632,13 +2364,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         temp_dirs.push(index_temp);
     }
 
-    let m8_file_path = file_path_manipulator(
-        &PathBuf::from(&no_ext_sample_base_buf),
-        Some(&out_dir),
-        None,
-        Some(".m8"),
-        "",
-    );
+    let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
         config.clone(),
@@ -2650,12 +2376,58 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut m8_cleanup_receivers);
 
 
-    // Write test stream
-    let test_write_task = tokio::spawn(stream_to_file(
-        m8_stream.into_inner(),
-        out_dir.join("non_host.m8"),
-    ));
-    cleanup_tasks.push(test_write_task);
+    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
+        config.clone(),
+        m8_stream,
+        sample_base_buf.clone(),
+        should_keep_filter.clone(),
+        36
+    ).await?;
+    cleanup_tasks.append(&mut call_cleanup_tasks);
+    cleanup_receivers.append(&mut call_cleanup_receivers);
+
+    let nt_counts = generate_taxon_counts(
+        config.clone(),
+        call_stream,
+        call_summary_stream,
+        duplicate_cluster_sizes.clone(),
+        should_keep_filter.clone(),
+        "NT".to_string(),
+        None,
+    ).await?;
+    info!("NT taxon counts: {} entries", nt_counts.len());
+
+
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_dmnd_stream),
+    //     paired,
+    //     sample_base
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    //
+    // let diamond_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("diamond.m8"), "."));
+    // let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_diamond_m8_stream),
+    //     sample_base_buf.clone(),
+    //     should_keep_filter.clone(),
+    //     0,
+    // ).await?;
+    // cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
+    // cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+    //
+    // let nr_counts = generate_taxon_counts(
+    //     config.clone(),
+    //     diamond_call_stream,
+    //     diamond_call_summary_stream,
+    //     duplicate_cluster_sizes.clone(),
+    //     should_keep_filter.clone(),
+    //     "NR".to_string(),
+    //     None,
+    // ).await?;
+    // info!("NR taxon counts: {} entries", nr_counts.len());
 
     // *******************
     // Results retrieval
@@ -2697,7 +2469,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
                 info!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
                 let output_path = out_dir.join("insert_size_histogram.png");
-                let sample_name = no_ext_sample_base_buf
+                let sample_name = sample_base_buf
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("sample")

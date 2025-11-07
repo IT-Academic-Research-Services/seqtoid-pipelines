@@ -50,6 +50,87 @@ pub fn is_gzipped(path: &PathBuf) -> io::Result<bool> {
 }
 
 
+/// Absolut path resolver.
+/// # Arguments
+///
+/// * `path`: &str path
+/// * 'basedir': canoncially th cwd, but any absolute path dir
+///
+/// # Returns
+/// PathBuf:absolute path
+pub fn resolve_to_absolute(path: &str, base_dir: &Path) -> PathBuf {
+    let p = PathBuf::from(path);
+    let abs = if p.is_relative() {
+        base_dir.join(p)
+    } else {
+        p
+    };
+    abs.canonicalize().unwrap_or(abs)
+}
+
+
+/// Uses resolve_to_absolute to resolve optionmal file paths.
+/// # Arguments
+///
+/// * `cli`optiuonal cli arg string path
+/// * 'basedir': passes to resolve_to_absolute
+///
+/// # Returns
+/// Result of optional resolved PAthBuf
+pub fn resolve_optional_path(
+    cli: &Option<String>,
+    base_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    match cli {
+        Some(s) => {
+            let abs = resolve_to_absolute(s, base_dir);
+            if !abs.exists() {
+                return Err(anyhow!("File not found: {}", abs.display()));
+            }
+            if !abs.is_file() {
+                return Err(anyhow!("Not a file: {}", abs.display()));
+            }
+            Ok(Some(abs))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Allows pre and post-fixes to be appended to a base file name whle preserving its dir.
+/// # Arguments
+///
+/// * `path`: &PathBuf
+/// * 'prefix': Option<&str> = added ahead of base
+/// * 'postfix': Option<&str> = added after of base
+///  * 'delimiter': &str = added between prefix, postfix and base.
+///
+/// # Returns
+/// PathBuf
+pub fn rename_file_path(
+    path: &Path,
+    prefix: Option<&str>,
+    postfix: Option<&str>,
+    delimiter: &str,
+) -> PathBuf {
+    let (stem, extensions) = extension_remover(path);
+    let base = stem.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+    let new_base = match (prefix, postfix) {
+        (Some(p), Some(q)) => format!("{p}{delimiter}{base}{delimiter}{q}"),
+        (Some(p), None) => format!("{p}{delimiter}{base}"),
+        (None, Some(q)) => format!("{base}{delimiter}{q}"),
+        (None, None) => base.to_string(),
+    };
+
+    let new_name = if extensions.is_empty() {
+        new_base
+    } else {
+        format!("{}.{}", new_base, extensions.join("."))
+    };
+
+    PathBuf::from(new_name)
+}
+
 /// Calls file_name_manipulator to make alterations to the file name.
 /// Then returns absolute path.
 /// # Arguments
@@ -116,43 +197,33 @@ pub fn file_name_manipulator(path: &PathBuf, prefix: Option<&str>, postfix:Optio
 ///
 /// # Returns
 /// PathBuf of stripped file, extensions.
-pub fn extension_remover(path: &PathBuf) -> (PathBuf, Vec<String>) {
-    let path = Path::new(path);
-    let parent = path.parent().unwrap_or(Path::new(""));
-    let mut current = path;
+pub fn extension_remover(path: &Path) -> (PathBuf, Vec<String>) {
     let mut extensions = Vec::new();
+    let mut current = path;
 
-    while let Some(ext) = current.extension().and_then(|e| e.to_str()) {
+    while let Some(ext_os) = current.extension() {
+        let ext = ext_os.to_str().expect("non-UTF8 extension");
+        extensions.push(ext.to_string());
 
-        match extensions.len() {
-            1 => {
-                if extensions[0] == "gz" {
-                    extensions.push(ext.to_string());
-                } else {
-                    break;
-                }
-            }
-            0 => {
-                extensions.push(ext.to_string());
-            }
-            _ => {
-                break;
-            }
+        if extensions.len() > 2 { break; }
+        if extensions.len() == 2 && extensions[1] != "gz" {
+            extensions.pop();
+            break;
         }
 
         current = current.file_stem().map(Path::new).unwrap_or(Path::new(""));
     }
 
-    let stem = current.to_string_lossy().into_owned();
-    let out_path_buf = if parent == Path::new("") {
-        PathBuf::from(stem)
-    } else {
-        parent.join(stem)
-    };
     extensions.reverse();
-    (out_path_buf, extensions)
-}
 
+    let stem_path = if let Some(parent) = path.parent() {
+        parent.join(current)
+    } else {
+        current.to_path_buf()
+    };
+
+    (stem_path, extensions)
+}
 
 /// Checks if a file has one of a set of extensions
 /// # Arguments

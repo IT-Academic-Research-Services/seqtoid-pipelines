@@ -35,6 +35,16 @@ pub const HISAT2_TAG: &str = "hisat2";
 pub const KALLISTO_TAG: &str = "kallisto";
 pub const STAR_TAG: &str = "STAR";
 pub const CZID_DEDUP_TAG: &str = "czid-dedup";
+pub const DIAMOND_TAG: &str = "diamond";
+
+
+// Taxonomy defs
+pub type Taxid = i32;
+pub type Lineage = [i32; 3];
+pub const INVALID_CALL_BASE_ID: i32 = -100;
+
+pub const LOG_NORMAL_POSITIVE_DOUBLE: f64 = 1e-200;
+pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -53,6 +63,7 @@ lazy_static! {
         m.insert(HISAT2_TAG, 2.20);
         m.insert(STAR_TAG, 2.7);
         m.insert(CZID_DEDUP_TAG, 0.1);
+        m.insert(DIAMOND_TAG, 2.1);
         m
     };
 }
@@ -96,6 +107,11 @@ pub enum KallistoSubcommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiamondSubcommand {
+    Blastx
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CoreAllocation {
     Maximal,
     High,
@@ -110,6 +126,13 @@ pub enum StreamDataType {
     IlluminaFastq, // SequenceRecord for Illumina FASTQ or FASTA
     OntFastq,      // SequenceRecord for ONT FASTQ or FASTA
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadCountingMode {
+    CountAll,
+    CountUnique,
+}
+pub const READ_COUNTING_MODE: ReadCountingMode = ReadCountingMode::CountUnique;
 
 
 // For specifying which read (or read pairs are validated fore size.
@@ -157,7 +180,7 @@ pub struct RunConfig {
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
-            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _)  => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
@@ -195,32 +218,54 @@ impl RunConfig {
 
 #[derive(thiserror::Error, Debug)]
 pub enum PipelineError {
+
+    // File-related errors
     #[error("File not found: {0}")]
     FileNotFound(PathBuf),
-    #[error("Invalid FASTQ format in {0}")]
-    InvalidFastqFormat(String),
+
+    #[error("Should be a directory: {0}")]
+    NotDirectory(PathBuf),
+
     #[error("I/O error: {0}")]
     IOError(String),
-    #[error("Tool execution failed: {tool} with error: {error}")]
-    ToolExecution { tool: String, error: String },
-    #[error("Stream data dropped unexpectedly")]
-    StreamDataDropped,
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
-    #[error("Reference sequence retrieval failed: {0}")]
-    ReferenceRetrievalFailed(String),
-    #[error("Empty stream encountered")]
-    EmptyStream,
-    #[error("No sequences matched target taxonomy ID: {0}")]
-    NoTargetSequences(String),
-    #[error("No alignments.")]
-    NoAlignments,
-    #[error("Argument missing: {0}")]
-    MissingArgument(String),
+
     #[error("Wrong extension: {0}")]
     WrongExtension(String),
-    #[error("Invalid extension: {0}")]
-    Other(#[from] anyhow::Error), // Wraps external errors
+
+    // Format-related errors
+    #[error("Invalid FASTQ format in {0}")]
+    InvalidFastqFormat(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+
+    // Stream-related errors
+    #[error("Stream data dropped unexpectedly")]
+    StreamDataDropped,
+
+    #[error("Empty stream encountered")]
+    EmptyStream,
+
+    // Tool and execution errors
+    #[error("Tool execution failed: {tool} with error: {error}")]
+    ToolExecution { tool: String, error: String },
+
+    #[error("Argument missing: {0}")]
+    MissingArgument(String),
+
+    // Bioinformatics-specific errors
+    #[error("Reference sequence retrieval failed: {0}")]
+    ReferenceRetrievalFailed(String),
+
+    #[error("No sequences matched target taxonomy ID: {0}")]
+    NoTargetSequences(String),
+
+    #[error("No alignments.")]
+    NoAlignments,
+
+    // ¯\_(ツ)_/¯
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
 }
 
 impl From<std::io::Error> for PipelineError {
