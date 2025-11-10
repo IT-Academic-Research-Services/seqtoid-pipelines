@@ -1793,23 +1793,47 @@ fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>
     false
 }
 
+/// Non-host DIAMOND alignment – write to a temp file, then stream it.
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
     paired: bool,
-    sample_base: String
-) -> Result<(mpsc::Receiver<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Option<NamedTempFile>, Option<NamedTempFile>, Option<TempDir>), PipelineError> {
+    sample_base: String,
+) -> Result<(
+    mpsc::Receiver<ParseOutput>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    Option<NamedTempFile>,
+    Option<NamedTempFile>,
+    Option<TempDir>,
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let diamond_db = config.args.diamond_db.clone().ok_or(PipelineError::MissingArgument("diamond_db required for NR alignment".to_string()))?;
+    let diamond_db = config
+        .args
+        .diamond_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "diamond_db required for NR alignment".into(),
+        ))?;
     let (db_prefix, prep_tasks) = diamond_index_prep(Some(diamond_db), "non_host").await?;
     cleanup_tasks.extend(prep_tasks);
 
+
+    // let temp_output = NamedTempFile::new_in(&config.ram_temp_dir)
+    //     .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file: {}", e)))?;
+    // let temp_path = temp_output.path().to_path_buf();
+
+    let temp_path =  config.out_dir.join("raw_dmnd_out.txt");
+
+    // --------------------------------------------------------------------- //
+    // 3. Build DIAMOND CLI (note the explicit -o <temp>)
+    // --------------------------------------------------------------------- //
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
         ("-f".to_string(), Some("6".to_string())),
-        ("-o".to_string(), Some("-".to_string())),
+        ("-o".to_string(), Some(temp_path.to_string_lossy().to_string())),
     ]);
 
     let diamond_config = DiamondConfig {
@@ -1824,7 +1848,7 @@ async fn diamond_non_host_align(
             error: e.to_string(),
         })?;
 
-    eprintln!("diamond args: {:?}", diamond_args);
+    debug!("DIAMOND args: {:?}", diamond_args);
 
     let (diamond_child_arc, diamond_stream_task, diamond_err_task) = stream_to_cmd(
         config.clone(),
@@ -1833,44 +1857,68 @@ async fn diamond_non_host_align(
         diamond_args,
         StreamDataType::IlluminaFastq,
         config.args.verbose,
-    ).await?;
+    )
+        .await?;
 
     cleanup_tasks.push(diamond_err_task);
 
-    // ait for stdin to finish
     diamond_stream_task.await??;
 
-    // NOW read stdout
-    let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size);
-    let m8_task: JoinHandle<Result<(), anyhow::Error>> = {
-        let child_arc = diamond_child_arc.clone();
-        tokio::spawn(async move {
-            let mut guard = child_arc.lock().await;
-            let mut stdout = guard.stdout.take().ok_or(anyhow!("No stdout"))?;
+    let diamond_child_clone = diamond_child_arc.clone();
+    let wait_task = tokio::spawn(async move {
+        let mut guard = diamond_child_clone.lock().await;
+        let status = guard.wait().await.map_err(|e| anyhow!("Diamond wait error: {}", e))?;
+        if !status.success() {
+            return Err(anyhow!("DIAMOND exited with code {:?}", status.code()));
+        }
+        Ok(())
+    });
+    wait_task.await??;
 
-            let mut reader = TokioBufReader::with_capacity(1_048_576, stdout);
-            let mut buffer = vec![0u8; 8192];
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = Arc::new(buffer[..n].to_vec());
-                        if m8_tx.send(ParseOutput::Bytes(chunk)).await.is_err() {
-                            break;
-                        }
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+
+    let read_task = tokio::spawn(async move {
+        // Open the file we just created
+        let file = File::open(&temp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open DIAMOND output {}: {}", temp_path.display(), e))?;
+
+        let mut reader = TokioBufReader::new(file);
+        let mut line = Vec::<u8>::new();
+
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => {
+                    info!("DIAMOND temp-file EOF");
+                    break;
+                }
+                Ok(_) => {
+                    // Clone the line into an Arc so the rest of the pipeline can share it
+                    let arc_line = Arc::new(line.clone());
+                    if tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
+                        warn!("DIAMOND m8 receiver dropped");
+                        break;
                     }
-                    Err(e) => return Err(e.into()),
+                }
+                Err(e) => {
+                    error!("DIAMOND temp-file read error: {}", e);
+                    return Err(anyhow!("Read error: {}", e));
                 }
             }
-            Ok(())
-        })
-    };
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(read_task);
 
-    m8_task.await??;
+    // let cleanup_temp = tokio::spawn(async move {
+    //     // Dropping `temp_output` deletes the file
+    //     drop(temp_output);
+    //     Ok(())
+    // });
+    // cleanup_tasks.push(cleanup_temp);
 
-    let diamond_out_stream = m8_rx;
-
-    Ok((diamond_out_stream, cleanup_tasks, cleanup_receivers, None, None, None))
+    Ok((rx, cleanup_tasks, cleanup_receivers, None, None, None))
 }
 
 /// Generates ytaxon counts from a called m8 stream
@@ -2396,27 +2444,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
-    let diamond_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("diamond.m8"), "."));
-    let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
-        config.clone(),
-        ReceiverStream::new(non_host_diamond_m8_stream),
-        sample_base_buf.clone(),
-        should_keep_filter.clone(),
-        0,
-    ).await?;
-    cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
-    cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+    let test_write_task = tokio::spawn(stream_to_file(
+        non_host_diamond_m8_stream,
+        PathBuf::from("raw_dmnd.m8"),
+    ));
+    test_write_task.await??;
 
-    let nr_counts = generate_taxon_counts(
-        config.clone(),
-        diamond_call_stream,
-        diamond_call_summary_stream,
-        duplicate_cluster_sizes.clone(),
-        should_keep_filter.clone(),
-        "NR".to_string(),
-        None,
-    ).await?;
-    info!("NR taxon counts: {} entries", nr_counts.len());
+    // let diamond_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("diamond.m8"), "."));
+    // let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_diamond_m8_stream),
+    //     sample_base_buf.clone(),
+    //     should_keep_filter.clone(),
+    //     0,
+    // ).await?;
+    // cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
+    // cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+    //
+    // let nr_counts = generate_taxon_counts(
+    //     config.clone(),
+    //     diamond_call_stream,
+    //     diamond_call_summary_stream,
+    //     duplicate_cluster_sizes.clone(),
+    //     should_keep_filter.clone(),
+    //     "NR".to_string(),
+    //     None,
+    // ).await?;
+    // info!("NR taxon counts: {} entries", nr_counts.len());
 
     // *******************
     // Results retrieval
