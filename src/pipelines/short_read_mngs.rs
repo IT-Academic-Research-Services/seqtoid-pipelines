@@ -2315,8 +2315,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-
-
     let (dedup_stream, dedup_count_rx, duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
@@ -2370,12 +2368,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-
-    // let test_write_task = tokio::spawn(stream_to_file(
-    //     non_host_dmnd_stream,
-    //     PathBuf::from("raw_dmnd.txt"),
-    // ));
-    // test_write_task.await??;
 
     // Minimap2 non_host alignment
 
@@ -2440,33 +2432,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
-    let test_write_task = tokio::spawn(stream_to_file(
-        non_host_diamond_m8_stream,
-        PathBuf::from("raw_dmnd.m8"),
-    ));
-    test_write_task.await??;
 
-    // let diamond_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("diamond.m8"), "."));
-    // let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
-    //     config.clone(),
-    //     ReceiverStream::new(non_host_diamond_m8_stream),
-    //     sample_base_buf.clone(),
-    //     should_keep_filter.clone(),
-    //     0,
-    // ).await?;
-    // cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
-    // cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
-    //
-    // let nr_counts = generate_taxon_counts(
-    //     config.clone(),
-    //     diamond_call_stream,
-    //     diamond_call_summary_stream,
-    //     duplicate_cluster_sizes.clone(),
-    //     should_keep_filter.clone(),
-    //     "NR".to_string(),
-    //     None,
-    // ).await?;
-    // info!("NR taxon counts: {} entries", nr_counts.len());
+    let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
+        config.clone(),
+        ReceiverStream::new(non_host_diamond_m8_stream),
+        sample_base_buf.clone(),
+        should_keep_filter.clone(),
+        0,
+    ).await?;
+    cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
+    cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+
+    let nr_counts = generate_taxon_counts(
+        config.clone(),
+        diamond_call_stream,
+        diamond_call_summary_stream,
+        duplicate_cluster_sizes.clone(),
+        should_keep_filter.clone(),
+        "NR".to_string(),
+        None,
+    ).await?;
+    info!("NR taxon counts: {} entries", nr_counts.len());
 
     // *******************
     // Results retrieval
