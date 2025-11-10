@@ -17,7 +17,7 @@ use crate::utils::taxonomy::validate_taxid_lineage;
 #[derive(Debug, Clone)]
 pub struct M8Record {
     pub qname: String,       // Read ID
-    pub tname: String,       // Accession ID
+    pub tname: String,       // Base Accession ID (no version suffix)
     pub pident: f64,         // Percent identity
     pub alen: u64,           // Alignment length
     pub mismatch: u64,       // Mismatches
@@ -31,12 +31,18 @@ pub struct M8Record {
 }
 
 impl M8Record {
+    /// The second field (accession) is stripped of its version
+    ///  NCBI policy: All versions of a GenBank accession (e.g., MT093571.1, MT093571.2) map to the same taxid.
     pub fn parse_line(line: &str) -> Result<Self> {
         let line = line.trim_end();
         let mut fields = line.split('\t');
+
         macro_rules! next {
-            () => { fields.next().ok_or_else(|| anyhow!("missing field"))? };
+            () => {
+                fields.next().ok_or_else(|| anyhow!("missing field"))?
+            };
         }
+
         macro_rules! parse_float {
             () => {{
                 let s = next!();
@@ -45,9 +51,18 @@ impl M8Record {
             }};
         }
 
+
+        let qname = next!().to_string();
+        let raw_accession = next!();                     // e.g. "QIK02963.1"
+        let tname = raw_accession
+            .split('.')
+            .next()
+            .unwrap_or(raw_accession)
+            .to_string();                               // → "QIK02963"
+
         Ok(Self {
-            qname: next!().to_string(),
-            tname: next!().to_string(),
+            qname,
+            tname,
             pident: parse_float!(),
             alen: next!().parse()?,
             mismatch: next!().parse()?,
