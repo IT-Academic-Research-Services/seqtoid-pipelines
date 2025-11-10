@@ -1821,11 +1821,10 @@ async fn diamond_non_host_align(
     cleanup_tasks.extend(prep_tasks);
 
 
-    // let temp_output = NamedTempFile::new_in(&config.ram_temp_dir)
-    //     .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file: {}", e)))?;
-    // let temp_path = temp_output.path().to_path_buf();
+    let temp_output = NamedTempFile::new_in(&config.ram_temp_dir)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file: {}", e)))?;
+    let temp_path = temp_output.path().to_path_buf();
 
-    let temp_path =  config.out_dir.join("raw_dmnd_out.txt");
 
     // --------------------------------------------------------------------- //
     // 3. Build DIAMOND CLI (note the explicit -o <temp>)
@@ -1907,16 +1906,13 @@ async fn diamond_non_host_align(
                 }
             }
         }
+
+        drop(temp_output);
+
         Ok(())
     });
     cleanup_tasks.push(read_task);
 
-    // let cleanup_temp = tokio::spawn(async move {
-    //     // Dropping `temp_output` deletes the file
-    //     drop(temp_output);
-    //     Ok(())
-    // });
-    // cleanup_tasks.push(cleanup_temp);
 
     Ok((rx, cleanup_tasks, cleanup_receivers, None, None, None))
 }
