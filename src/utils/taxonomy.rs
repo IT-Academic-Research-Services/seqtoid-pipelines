@@ -284,29 +284,30 @@ pub async fn build_accession2taxid_db(
     Ok(())
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccTaxEntry {
+    pub acc: String,
+    pub taxid: Taxid,
+}
 pub async fn build_fst_acc2taxid(
     mapping_files: &[PathBuf],
     nt_file: Option<&PathBuf>,
     nr_file: Option<&PathBuf>,
     db_path: &PathBuf,
 ) -> Result<()> {
-
     let mut accession_bases: HashSet<String> = HashSet::new();
-
-    if let Some(path) = nt_file {
-        scan_fasta_bases(path, &mut accession_bases, "NT");
+    if let Some(p) = nt_file {
+        scan_fasta_bases(p, &mut accession_bases, "NT");
     }
-    if let Some(path) = nr_file {
-        scan_fasta_bases(path, &mut accession_bases, "NR");
+    if let Some(p) = nr_file {
+        scan_fasta_bases(p, &mut accession_bases, "NR");
     }
 
-    // fst map (accession → taxid)
-    let mut builder = MapBuilder::memory();
-    let mut total_mapped = 0;
+    let mut entries = Vec::new();
 
     for mapping_file in mapping_files {
         let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
-        info!("Processing mapping file: {}", filename);
+        info!("Reading mapping file: {}", filename);
 
         let file = StdFile::open(mapping_file)?;
         let gz = GzDecoder::new(StdBufReader::new(file));
@@ -315,16 +316,8 @@ pub async fn build_fst_acc2taxid(
             .has_headers(false)
             .from_reader(gz);
 
-        let mut mapped = 0;
-
         for result in rdr.records() {
-            let record = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Parse error in {}: {}", filename, e);
-                    continue;
-                }
-            };
+            let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
 
             let full_acc = record[0].to_string();
             let acc_base = full_acc.split('.').next().unwrap_or(&full_acc).to_string();
@@ -334,23 +327,37 @@ pub async fn build_fst_acc2taxid(
             }
 
             let taxid_idx = if record.len() == 2 { 1 } else { 2 };
-            let taxid: Taxid = match record[taxid_idx].parse() {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            let taxid: Taxid = record.get(taxid_idx)
+                .ok_or_else(|| anyhow!("Missing taxid column in {}", filename))?
+                .parse()
+                .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
 
-            builder.insert(full_acc.as_bytes(), taxid as u64)?;
-            mapped += 1;
-            total_mapped += 1;
-
-            if total_mapped % 1_000_000 == 0 {
-                info!("\t{}M accessions mapped", total_mapped / 1_000_000);
-            }
+            entries.push(AccTaxEntry { acc: full_acc, taxid });
         }
-
-        info!("Finished {}: mapped={}", filename, mapped);
     }
 
+
+    entries.sort_unstable_by(|a, b| a.acc.cmp(&b.acc));
+
+    let mut builder = MapBuilder::memory();
+    let mut total_mapped = 0;
+    let mut last_acc: Option<String> = None;
+
+    for entry in entries {
+        // Skip duplicate keys (same accession)
+        if last_acc.as_deref() == Some(&entry.acc) {
+            continue;
+        }
+
+        last_acc = Some(entry.acc.clone());
+
+        builder.insert(entry.acc.as_bytes(), entry.taxid as u64)?;
+        total_mapped += 1;
+
+        if total_mapped % 1_000_000 == 0 {
+            info!("\t{}M accessions mapped", total_mapped / 1_000_000);
+        }
+    }
 
     let map_bytes = builder.into_inner()?;
     let mut out_file = StdFile::create(db_path)?;
