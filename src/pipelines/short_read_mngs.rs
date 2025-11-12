@@ -2151,6 +2151,50 @@ pub async fn combine_taxon_counts(
 }
 
 
+/// Generates an accession map from streamed m8 data
+///
+/// # Arguments
+///
+/// * `m8_stream` -stream in m8 format as defined in blast.rs
+///
+/// # Returns
+/// Result of hashmap of id:accession
+///
+async fn collect_m8_to_accession_map(
+    mut m8_stream: ReceiverStream<ParseOutput>,
+) -> Result<HashMap<String, String>> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut item_count = 0;
+    let start_time = Instant::now();
+
+    while let Some(item) = m8_stream.next().await {
+        item_count += 1;
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes).to_string();
+            let fields: Vec<&str> = line.trim().split('\t').collect();
+            if fields.len() >= 2 {
+                let read_id = fields[0].to_string();
+                let accession = fields[1].to_string();
+                if map.insert(read_id.clone(), accession).is_some() {
+                    warn!("Duplicate read_id in deduped m8: {}", read_id);
+                }
+            } else {
+                warn!("Invalid m8 line: {}", line);
+            }
+        } else {
+            return Err(anyhow!("Non-Bytes in m8 stream"));
+        }
+
+        if item_count % 100_000 == 0 {
+            debug!("Processed {} m8 lines in {:?}", item_count, start_time.elapsed());
+        }
+    }
+
+    info!("Collected {} accessions from m8 stream", map.len());
+    Ok(map)
+}
+
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
