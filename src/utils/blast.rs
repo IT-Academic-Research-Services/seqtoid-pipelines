@@ -8,6 +8,7 @@ use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
 use fst::Map;
 use ahash::AHashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::config::defs::{Taxid, Lineage};
 use crate::utils::taxonomy::validate_taxid_lineage;
@@ -88,7 +89,7 @@ pub struct AggBucket {
     pub source_count_type: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaxonCount {
     pub tax_id: i32,
     pub tax_level: u8,

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
@@ -2096,6 +2096,61 @@ pub async fn generate_taxon_counts(
     Ok(taxon_counts)
 }
 
+/// Concats the nt and nr and writes a json
+/// expects the TaxonCount streucture prodiced in generatre_taxon_counts
+///
+/// # Arguments
+///
+/// * `nt_counts` - Vec<TaxonCount> from nt
+/// * `nr_counts` - Vec<TaxonCount> from nr
+/// * `output_path` - JSON pth
+///
+/// # Returns
+///
+///
+pub async fn combine_taxon_counts(
+    nt_counts: &[TaxonCount],
+    nr_counts: &[TaxonCount],
+    output_path: PathBuf,
+) -> Result<(PathBuf, JoinHandle<Result<()>>)> {
+
+    let nt_len = nt_counts.len();
+    let nr_len = nr_counts.len();
+    let total = nt_len + nr_len;
+
+    let mut all_counts = Vec::with_capacity(total);
+    all_counts.extend_from_slice(nt_counts);
+    all_counts.extend_from_slice(nr_counts);
+
+    let output_json = json!({
+        "pipeline_output": {
+            "taxon_counts_attributes": all_counts
+        }
+    });
+
+    let payload = serde_json::to_vec_pretty(&output_json)
+        .map_err(|e| anyhow!("JSON serialization failed: {}", e))?;
+
+    if payload.is_empty() {
+        return Err(anyhow!("Empty JSON payload for {}", output_path.display()));
+    }
+
+    let data_arc = Arc::new(payload);
+    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20)  // 1 Mb
+        .await
+        .map_err(|e| anyhow!("Failed to spawn JSON write: {}", e))?;
+
+    info!(
+        "Combined {} taxon count entries ({} NT + {} NR); spawning write to {}",
+        total,
+        nt_len,
+        nr_len,
+        output_path.display()
+    );
+
+    Ok((output_path, write_task))
+}
+
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2434,6 +2489,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None,
     ).await?;
     info!("NR taxon counts: {} entries", nr_counts.len());
+
+    let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
+    let (combined_path, write_json_task) = combine_taxon_counts(
+        &nt_counts,
+        &nr_counts,
+        combined_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+
+    cleanup_tasks.push(write_json_task);
 
     // *******************
     // Results retrieval
