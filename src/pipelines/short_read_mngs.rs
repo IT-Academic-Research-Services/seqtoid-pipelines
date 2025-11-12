@@ -24,10 +24,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufRead
 use tokio::fs::{File, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
-use serde_json::Value;
 use sled::Tree;
 use twox_hash::XxHash64;
 use fst::Map;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path};
@@ -82,9 +83,28 @@ impl PartialOrd for SampleItem {
     }
 }
 
-//Memory estimates for dedup_and_subsample, for switching between RAM and disk based
-const EST_BYTES_PER_UNIQUE: u64 = 1024;  // ~0.5–1KB for SequenceRecord pair + overhead
-const RAM_BUFFER_GB: u64 = 10;  // Min available RAM to stay in-memory
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CombinedTaxonCount {
+    pub tax_id: i32,
+    pub tax_level: u8,
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
+    pub nt: Option<TaxonMetrics>,
+    pub nr: Option<TaxonMetrics>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaxonMetrics {
+    pub count: u64,           // Adjusted reads assigned (with DCR)
+    pub nonunique_count: u64,
+    pub unique_count: u64,
+    pub dcr: f64,             // Duplicate compression ratio
+    pub percent_identity: f64,
+    pub alignment_length: f64,
+    pub e_value: f64,
+    pub base_count: u64,
+    pub source_count_type: Option<Vec<String>>,
+}
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
