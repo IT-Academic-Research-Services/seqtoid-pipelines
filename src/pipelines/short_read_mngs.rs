@@ -21,16 +21,17 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
-use tokio::fs::{File, OpenOptions as TokioOpenOptions};
+use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
-use serde_json::Value;
 use sled::Tree;
 use twox_hash::XxHash64;
 use fst::Map;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
@@ -49,6 +50,8 @@ use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
+
+const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -82,9 +85,28 @@ impl PartialOrd for SampleItem {
     }
 }
 
-//Memory estimates for dedup_and_subsample, for switching between RAM and disk based
-const EST_BYTES_PER_UNIQUE: u64 = 1024;  // ~0.5–1KB for SequenceRecord pair + overhead
-const RAM_BUFFER_GB: u64 = 10;  // Min available RAM to stay in-memory
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CombinedTaxonCount {
+    pub tax_id: i32,
+    pub tax_level: u8,
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
+    pub nt: Option<TaxonMetrics>,
+    pub nr: Option<TaxonMetrics>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaxonMetrics {
+    pub count: u64,           // Adjusted reads assigned (with DCR)
+    pub nonunique_count: u64,
+    pub unique_count: u64,
+    pub dcr: f64,             // Duplicate compression ratio
+    pub percent_identity: f64,
+    pub alignment_length: f64,
+    pub e_value: f64,
+    pub base_count: u64,
+    pub source_count_type: Option<Vec<String>>,
+}
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
@@ -848,7 +870,7 @@ async fn kallisto_results(
             }
         }
 
-        let abundance_file = tokio::fs::File::open(&abundance_path).await
+        let abundance_file = TokioFile::open(&abundance_path).await
             .map_err(|e| anyhow!("Failed to open abundance.tsv: {}", e))?;
         let reader = tokio::io::BufReader::new(abundance_file);
         let mut lines = reader.lines();
@@ -1199,7 +1221,7 @@ async fn dedup_and_subsample(
     max_subsample: u64,
     prefix_len: Option<usize>,
     out_dir: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, HashMap<String, u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, ReceiverStream<ParseOutput>, HashMap<String, u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -1286,6 +1308,25 @@ async fn dedup_and_subsample(
         }
     }
 
+    let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
+
+    tokio::spawn(async move {
+        for (&hash_key, &(weight, ref records)) in &dedup_map {
+            if records.is_empty() { continue; }
+            let rep_id = records[0].id();
+            let rep_line = format!("{},{}\n", rep_id, rep_id);
+            if cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await.is_err() {
+                break;
+            }
+            for rec in records.iter().skip(1) {
+                let line = format!("{},{}\n", rec.id(), rep_id);
+                if cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
     let duplicate_cluster_sizes_clone = duplicate_cluster_sizes.clone(); // move into task
     let tsv_write_task = tokio::spawn(async move {
@@ -1321,7 +1362,7 @@ async fn dedup_and_subsample(
     });
     cleanup_tasks.push(send_task);
 
-    Ok((ReceiverStream::new(rx), count_rx, duplicate_cluster_sizes, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(rx), count_rx, ReceiverStream::new(cluster_rx), duplicate_cluster_sizes, cleanup_tasks, cleanup_receivers))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -1754,45 +1795,6 @@ pub async fn call_hits_m8_stream(
     ))
 }
 
-
-async fn load_optional_set(path: Option<String>) -> Result<HashSet<i64>> {
-    let mut set = HashSet::new();
-    if let Some(p) = path {
-        let path = PathBuf::from(p);
-        let file = File::open(path).await?;
-        let mut lines = tokio::io::BufReader::new(file).lines();
-        while let Some(l) = lines.next_line().await? {
-            if let Ok(v) = l.parse::<i64>() {
-                set.insert(v);
-            }
-        }
-    }
-    Ok(set)
-}
-
-pub async fn load_duplicate_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
-    let file = File::open(path).await?;
-    let mut lines = tokio::io::BufReader::new(file).lines();
-    let mut map = HashMap::new();
-    while let Some(line) = lines.next_line().await? {
-        let mut parts = line.split('\t');
-        let read_id = parts.next().ok_or_else(|| anyhow!("bad dup line"))?.to_string();
-        let size: u64 = parts.next().unwrap_or("1").parse()?;
-        map.insert(read_id, size);
-    }
-    Ok(map)
-}
-
-fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>, whitelist: &HashSet<i64>) -> bool {
-    if blacklist.contains(&taxid) || deuterostome.contains(&taxid) {
-        return true;
-    }
-    if !whitelist.is_empty() && !whitelist.contains(&taxid) {
-        return true;
-    }
-    false
-}
-
 /// Non-host DIAMOND alignment – write to a temp file, then stream it.
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
@@ -1878,7 +1880,7 @@ async fn diamond_non_host_align(
 
     let read_task = tokio::spawn(async move {
         // Open the file we just created
-        let file = File::open(&temp_path)
+        let file = TokioFile::open(&temp_path)
             .await
             .map_err(|e| anyhow!("Failed to open DIAMOND output {}: {}", temp_path.display(), e))?;
 
@@ -2013,18 +2015,17 @@ pub async fn generate_taxon_counts(
         let cluster_size = *duplicate_cluster_sizes.get(&read_id).unwrap_or(&1u64);
 
         // Metrics are guaranteed to exist because the m8 line came from the same read
-        if let Some((pident, alen, mut evalue)) = read_metrics.get(&read_id).cloned() {
+        if let Some((pident, alen, mut raw_evalue)) = read_metrics.get(&read_id).cloned() {
             if !should_keep_filter(&lineage) {
                 continue;
             }
 
-
-            let mut evalue = if evalue <= 0.0 || !evalue.is_finite() {
+            let evalue = if raw_evalue <= 0.0 || !raw_evalue.is_finite() {
                 MIN_NORMAL_POSITIVE_DOUBLE
-            } else if evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
+            } else if raw_evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
                 MIN_NORMAL_POSITIVE_DOUBLE
             } else {
-                evalue
+                raw_evalue
             };
             let evalue_log10 = evalue.log10();
 
@@ -2043,7 +2044,7 @@ pub async fn generate_taxon_counts(
                 bucket.base_count      += *base_count_per_read.get(&read_id).unwrap_or(&0);
                 bucket.sum_percent_identity += pident;
                 bucket.sum_alignment_length += alen as f64;
-                bucket.sum_e_value          += evalue_log10;
+                bucket.sum_e_value += evalue_log10;
 
                 if let Some(src) = &source_count_type {
                     bucket.source_count_type.insert(src.clone());
@@ -2115,6 +2116,265 @@ pub async fn generate_taxon_counts(
     Ok(taxon_counts)
 }
 
+/// Concats the nt and nr and writes a json
+/// expects the TaxonCount streucture prodiced in generatre_taxon_counts
+///
+/// # Arguments
+///
+/// * `nt_counts` - Vec<TaxonCount> from nt
+/// * `nr_counts` - Vec<TaxonCount> from nr
+/// * `output_path` - JSON pth
+///
+/// # Returns
+///
+///
+pub async fn combine_taxon_counts(
+    nt_counts: &[TaxonCount],
+    nr_counts: &[TaxonCount],
+    output_path: PathBuf,
+) -> Result<(PathBuf, JoinHandle<Result<()>>)> {
+
+    let nt_len = nt_counts.len();
+    let nr_len = nr_counts.len();
+    let total = nt_len + nr_len;
+
+    let mut all_counts = Vec::with_capacity(total);
+    all_counts.extend_from_slice(nt_counts);
+    all_counts.extend_from_slice(nr_counts);
+
+    let output_json = json!({
+        "pipeline_output": {
+            "taxon_counts_attributes": all_counts
+        }
+    });
+
+    let payload = serde_json::to_vec_pretty(&output_json)
+        .map_err(|e| anyhow!("JSON serialization failed: {}", e))?;
+
+    if payload.is_empty() {
+        return Err(anyhow!("Empty JSON payload for {}", output_path.display()));
+    }
+
+    let data_arc = Arc::new(payload);
+    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20)  // 1 Mb
+        .await
+        .map_err(|e| anyhow!("Failed to spawn JSON write: {}", e))?;
+
+    info!(
+        "Combined {} taxon count entries ({} NT + {} NR); spawning write to {}",
+        total,
+        nt_len,
+        nr_len,
+        output_path.display()
+    );
+
+    Ok((output_path, write_task))
+}
+
+
+/// Generates an accession map from streamed m8 data
+///
+/// # Arguments
+///
+/// * `m8_stream` -stream in m8 format as defined in blast.rs
+///
+/// # Returns
+/// Result of hashmap of id:accession
+///
+async fn collect_m8_to_accession_map(
+    mut m8_stream: ReceiverStream<ParseOutput>,
+) -> Result<HashMap<String, String>> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut item_count = 0;
+    let start_time = Instant::now();
+
+    while let Some(item) = m8_stream.next().await {
+        item_count += 1;
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes).to_string();
+            let fields: Vec<&str> = line.trim().split('\t').collect();
+            if fields.len() >= 2 {
+                let read_id = fields[0].to_string();
+                let accession = fields[1].to_string();
+                if map.insert(read_id.clone(), accession).is_some() {
+                    warn!("Duplicate read_id in deduped m8: {}", read_id);
+                }
+            } else {
+                warn!("Invalid m8 line: {}", line);
+            }
+        } else {
+            return Err(anyhow!("Non-Bytes in m8 stream"));
+        }
+
+        if item_count % 100_000 == 0 {
+            debug!("Processed {} m8 lines in {:?}", item_count, start_time.elapsed());
+        }
+    }
+
+    info!("Collected {} accessions from m8 stream", map.len());
+    Ok(map)
+}
+
+
+/// Generates an annotated FASTA using deduped stream from  dedup_and_subsample
+/// and the full duplicate cluster size stream
+///
+/// # Arguments
+/// * `config` - RunConfig struct
+/// * `dedup_stream` - deduped FASTQ stream
+/// * `cluster_stream - full stream if cluster sizes
+/// * `nt_map` -
+///
+/// # Returns
+/// Result of hashmap of id:accession
+///
+pub async fn generate_annotated_fasta(
+    config: Arc<RunConfig>,
+    mut dedup_stream: ReceiverStream<ParseOutput>,
+    mut cluster_stream: ReceiverStream<ParseOutput>,
+    nt_map: HashMap<String, String>,
+    nr_map: HashMap<String, String>,
+    out_dir: &PathBuf,
+    sample_base: PathBuf,
+) -> Result<(
+    PathBuf,                     // annotated_merged.fa
+    PathBuf,                     // unidentified.fa
+    Option<PathBuf>,             // unique_unidentified.fa
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+)> {
+
+    let annotated_path = out_dir.join(rename_file_path(&sample_base, None, Some("annotated_merged.fa"), "_"));
+    let unidentified_path = out_dir.join(rename_file_path(&sample_base, None, Some("unidentified.fa"), "_"));
+    let unique_unid_path = out_dir.join(rename_file_path(&sample_base, None, Some("unique_unidentified.fa"), "_"));
+
+    let annotated_file = TokioFile::create(&annotated_path).await?;
+    let unid_file = TokioFile::create(&unidentified_path).await?;
+    let unique_file = TokioFile::create(&unique_unid_path).await?;
+
+    let mut annotated_writer = BufWriter::with_capacity(config.base_buffer_size, annotated_file);
+    let mut unid_writer = BufWriter::with_capacity(config.base_buffer_size, unid_file);
+    let mut unique_writer = BufWriter::with_capacity(config.base_buffer_size, unique_file);
+
+
+    let (done_tx, done_rx) = oneshot::channel();
+    let mut cleanup_receivers = vec![done_rx];
+
+
+    // Helper macro – writes a FASTA entry (header + seq + newline)
+    macro_rules! write_fasta {
+        ($writer:expr, $header:expr, $seq:expr) => {{
+            $writer.write_all($header.as_bytes()).await?;
+            $writer.write_all($seq).await?;   // $seq is &[u8]
+            $writer.write_all(b"\n").await?;
+        }};
+    }
+
+    let mut rep_buffer: HashMap<String, (Vec<u8>, bool)> = HashMap::with_capacity(1_000_000);
+    let mut csv_line = String::with_capacity(256);
+
+    let mut processed_reps = 0u64;
+    let mut unidentified_reps = 0u64;
+    let mut expanded_duplicates = 0u64;
+    let start = Instant::now();
+
+    let process_task = tokio::spawn(async move {
+        while let Some(item) = dedup_stream.next().await {
+            let record = match item {
+                ParseOutput::Fastq(rec) => rec,
+                _ => continue,
+            };
+
+            processed_reps += 1;
+            if processed_reps % 100_000 == 0 {
+                debug!("generate_annotated_fasta: processed {} reps", processed_reps);
+            }
+
+            let rep_id = record.id().to_string();
+            let seq = record.seq().to_vec();
+            let nr_acc = nr_map.get(&rep_id).cloned().unwrap_or_default();
+            let nt_acc = nt_map.get(&rep_id).cloned().unwrap_or_default();
+            let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
+
+            rep_buffer.insert(rep_id.clone(), (seq.clone(), is_unidentified));
+
+            if !is_unidentified {
+                let header = format!(">NR:{}:NT:{}:{}\n", nr_acc, nt_acc, rep_id);
+                write_fasta!(annotated_writer, header, &seq);
+            } else {
+                unidentified_reps += 1;
+                let header = format!("{}{}\n", UNMAPPED_HEADER_PREFIX, rep_id);
+                write_fasta!(unid_writer, header, &seq);
+                write_fasta!(unique_writer, header, &seq);
+            }
+
+            // Drain CSV lines for this rep
+            loop {
+                let csv_opt = cluster_stream.next().await;
+                let csv_item = match csv_opt {
+                    Some(item) => item,
+                    None => break,
+                };
+
+                if let ParseOutput::Bytes(bytes) = csv_item {
+                    csv_line.clear();
+                    csv_line.push_str(&String::from_utf8_lossy(&bytes));
+
+                    if !csv_line.ends_with('\n') {
+                        continue;
+                    }
+
+                    let line = std::mem::take(&mut csv_line);
+                    let parts: Vec<&str> = line.trim().split(',').collect();
+                    if parts.len() != 2 { continue; }
+
+                    let member_id = parts[0];
+                    let csv_rep_id = parts[1];
+
+                    if csv_rep_id == rep_id && is_unidentified {
+                        if let Some((seq, _)) = rep_buffer.get(&rep_id) {
+                            let (base, suffix) = if member_id.ends_with("/1") || member_id.ends_with("/2") {
+                                let len = member_id.len();
+                                (&member_id[..len - 2], &member_id[len - 2..])
+                            } else {
+                                (member_id, "")
+                            };
+                            let header = format!("{}{}{}\n", UNMAPPED_HEADER_PREFIX, base, suffix);
+                            write_fasta!(unid_writer, header, seq);
+                            expanded_duplicates += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        annotated_writer.flush().await?;
+        unid_writer.flush().await?;
+        unique_writer.flush().await?;
+
+        info!(
+            "generate_annotated_fasta: {} reps, {} unidentified ({} expanded duplicates) in {:?}",
+            processed_reps,
+            unidentified_reps,
+            expanded_duplicates,
+            start.elapsed()
+        );
+
+        let _ = done_tx.send(Ok(()));
+        Ok(())
+    });
+
+
+    let mut cleanup_tasks = vec![process_task];
+
+    Ok((
+        annotated_path,
+        unidentified_path,
+        Some(unique_unid_path),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2315,7 +2575,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
@@ -2351,7 +2611,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -2367,10 +2627,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut non_host_streams_iter = non_host_streams.into_iter();
     let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     // Minimap2 non_host alignment
-
     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_ref_temp, non_host_index_temp, non_host_index_dir) = minimap2_non_host_align(
         config.clone(),
         ReceiverStream::new(non_host_mm2_stream),
@@ -2411,9 +2671,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
+    let (nt_streams, nt_done_rx) = t_junction(
+        call_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nt_call".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_done_rx);
+
+    let mut nt_streams_iter =nt_streams.into_iter();
+    let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
     let nt_counts = generate_taxon_counts(
         config.clone(),
-        call_stream,
+        ReceiverStream::new(nt_call_stream),
         call_summary_stream,
         duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
@@ -2422,7 +2701,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     info!("NT taxon counts: {} entries", nt_counts.len());
 
+    let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
 
+
+    // Diamond non_host alignment
     let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
         config.clone(),
         ReceiverStream::new(non_host_dmnd_stream),
@@ -2443,9 +2725,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
     cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
 
+    let (nr_streams, nr_done_rx) = t_junction(
+        diamond_call_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nr_call".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_done_rx);
+
+    let mut nr_streams_iter = nr_streams.into_iter();
+    let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
     let nr_counts = generate_taxon_counts(
         config.clone(),
-        diamond_call_stream,
+        ReceiverStream::new(nr_call_stream),
         diamond_call_summary_stream,
         duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
@@ -2453,6 +2754,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None,
     ).await?;
     info!("NR taxon counts: {} entries", nr_counts.len());
+
+    let nr_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_stream)).await?;
+
+    let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
+    let (_combined_path, write_json_task) = combine_taxon_counts(
+        &nt_counts,
+        &nr_counts,
+        combined_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+    cleanup_tasks.push(write_json_task);
+
+    let (_annotated_path, _unidentified_path, _unique_path_opt, mut annot_tasks, mut annot_rxs) =
+        generate_annotated_fasta(
+            config.clone(),
+            ReceiverStream::new(non_host_annot_stream),
+            cluster_stream,
+            nt_map, nr_map,
+            &out_dir, sample_base_buf.clone(),
+        ).await?;
+    cleanup_tasks.append(&mut annot_tasks);
+    cleanup_receivers.append(&mut annot_rxs);
 
     // *******************
     // Results retrieval

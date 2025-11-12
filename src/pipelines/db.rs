@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use log::info;
 use crate::config::defs::{PipelineError, RunConfig};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs};
-use crate::utils::taxonomy::{build_taxid_lineages_db, build_fst_acc2taxid};
+use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db};
 
 pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
@@ -83,16 +83,10 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 
     let db_out_path = file_path_manipulator(&PathBuf::from("accession2_taxid"), Some(&cwd), None, Some(".fst"), "_");
     eprintln!("Writing to DB {:?}", db_out_path);
-
-    // build_accession2taxid_db(&gz_paths, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
-    //     .await
-    //     .map_err(|e| PipelineError::Other(e.into()))?;
-
-    build_fst_acc2taxid(&gz_paths, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
+    
+    build_accession2taxid_db(&gz_paths, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
-
-
 
     Ok(())
 }
