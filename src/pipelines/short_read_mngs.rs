@@ -1994,18 +1994,17 @@ pub async fn generate_taxon_counts(
         let cluster_size = *duplicate_cluster_sizes.get(&read_id).unwrap_or(&1u64);
 
         // Metrics are guaranteed to exist because the m8 line came from the same read
-        if let Some((pident, alen, mut evalue)) = read_metrics.get(&read_id).cloned() {
+        if let Some((pident, alen, mut raw_evalue)) = read_metrics.get(&read_id).cloned() {
             if !should_keep_filter(&lineage) {
                 continue;
             }
 
-
-            let mut evalue = if evalue <= 0.0 || !evalue.is_finite() {
+            let evalue = if raw_evalue <= 0.0 || !raw_evalue.is_finite() {
                 MIN_NORMAL_POSITIVE_DOUBLE
-            } else if evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
+            } else if raw_evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
                 MIN_NORMAL_POSITIVE_DOUBLE
             } else {
-                evalue
+                raw_evalue
             };
             let evalue_log10 = evalue.log10();
 
@@ -2024,7 +2023,7 @@ pub async fn generate_taxon_counts(
                 bucket.base_count      += *base_count_per_read.get(&read_id).unwrap_or(&0);
                 bucket.sum_percent_identity += pident;
                 bucket.sum_alignment_length += alen as f64;
-                bucket.sum_e_value          += evalue_log10;
+                bucket.sum_e_value += evalue_log10;
 
                 if let Some(src) = &source_count_type {
                     bucket.source_count_type.insert(src.clone());

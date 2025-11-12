@@ -64,7 +64,7 @@ impl PafRecord {
     fn calc_evalue(&self, genome_size: f64) -> f64 {
         let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let alen = self.alen as f64;
-        let score = (alen - 2.0 * nonmatch).max(0.0);
+        let score = alen - 2.0 * nonmatch;
         K * alen * genome_size * (-LAMBDA * score).exp()
     }
 
