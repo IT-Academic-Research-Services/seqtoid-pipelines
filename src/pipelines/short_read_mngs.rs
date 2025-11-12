@@ -1754,45 +1754,6 @@ pub async fn call_hits_m8_stream(
     ))
 }
 
-
-async fn load_optional_set(path: Option<String>) -> Result<HashSet<i64>> {
-    let mut set = HashSet::new();
-    if let Some(p) = path {
-        let path = PathBuf::from(p);
-        let file = File::open(path).await?;
-        let mut lines = tokio::io::BufReader::new(file).lines();
-        while let Some(l) = lines.next_line().await? {
-            if let Ok(v) = l.parse::<i64>() {
-                set.insert(v);
-            }
-        }
-    }
-    Ok(set)
-}
-
-pub async fn load_duplicate_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
-    let file = File::open(path).await?;
-    let mut lines = tokio::io::BufReader::new(file).lines();
-    let mut map = HashMap::new();
-    while let Some(line) = lines.next_line().await? {
-        let mut parts = line.split('\t');
-        let read_id = parts.next().ok_or_else(|| anyhow!("bad dup line"))?.to_string();
-        let size: u64 = parts.next().unwrap_or("1").parse()?;
-        map.insert(read_id, size);
-    }
-    Ok(map)
-}
-
-fn is_filtered(taxid: i64, blacklist: &HashSet<i64>, deuterostome: &HashSet<i64>, whitelist: &HashSet<i64>) -> bool {
-    if blacklist.contains(&taxid) || deuterostome.contains(&taxid) {
-        return true;
-    }
-    if !whitelist.is_empty() && !whitelist.contains(&taxid) {
-        return true;
-    }
-    false
-}
-
 /// Non-host DIAMOND alignment – write to a temp file, then stream it.
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
