@@ -1742,7 +1742,7 @@ pub mod spades {
             let mut args_vec: Vec<String> = Vec::new();
 
             if config.paired {
-                args_vec.push("-12".to_string());
+                args_vec.push("--pe1-12".to_string());
             }
             else {
                 args_vec.push("-s".to_string());
@@ -1764,7 +1764,7 @@ pub mod spades {
                 }
             }
 
-            args_vec.push("--only-assembler".to_string());
+
             args_vec.push("-o".to_string());
             args_vec.push(config.outdir_path.to_string());
 

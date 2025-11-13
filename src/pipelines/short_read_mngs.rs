@@ -30,7 +30,7 @@ use fst::Map;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
@@ -50,6 +50,7 @@ use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
+use crate::utils::command::spades::SpadesConfig;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
@@ -1828,9 +1829,6 @@ async fn diamond_non_host_align(
     let temp_path = temp_output.path().to_path_buf();
 
 
-    // --------------------------------------------------------------------- //
-    // 3. Build DIAMOND CLI (note the explicit -o <temp>)
-    // --------------------------------------------------------------------- //
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
         ("-f".to_string(), Some("6".to_string())),
@@ -2376,6 +2374,136 @@ pub async fn generate_annotated_fasta(
     ))
 }
 
+/// Runs spades assembler
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Raw byte FASTQ stream
+///
+/// # Returns
+async fn spades_assembly(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    out_dir: PathBuf,
+    paired: bool,
+    sample_base_buf: PathBuf,
+)  -> Result<(
+    JoinHandle<Result<(), anyhow::Error>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+),  PipelineError>
+
+
+{
+
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let spades_out_dir = out_dir.join("assembly");
+    fs::create_dir_all(&spades_out_dir).await?;
+    let spades_work_dir = spades_out_dir.join("spades");
+    fs::create_dir_all(&spades_work_dir).await?;
+
+    let (assembly_streams, non_host_done_rx) = t_junction(
+        input_stream,
+        1,
+        config.base_buffer_size * 32, // jumbo buffer due to mismatch in read speed between bt2 and spades
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "assembly_spades_bt2".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(non_host_done_rx);
+
+    let mut assembly_streams_iter = assembly_streams.into_iter();
+    let assembly_spades_stream = assembly_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    // let assembly_bt2_stream = assembly_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let fifo_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
+
+    create_fifo(&fifo_path)
+        .await
+        .map_err(|e| PipelineError::IOError(format!("Failed to create assembly FIFO {}: {}", fifo_path.display(), e)))?;
+
+    let fifo_write_handle = tokio::spawn(write_to_fifo(assembly_spades_stream, fifo_path.clone()));
+
+
+    let spades_config = SpadesConfig {
+        input_path: fifo_path,
+        outdir_path: spades_out_dir,
+        paired: paired,
+
+        option_fields: HashMap::from([
+            ("--only-assembler".to_string(), None),
+        ]),
+    };
+    let spades_args = generate_cli(MINIMAP2_TAG, &config, Some(&spades_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SPADES_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut spades_child, spades_err_task) = spawn_cmd(
+        config.clone(),
+        SPADES_TAG,
+        spades_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SPADES_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(spades_err_task);
+
+
+    let spades_task = tokio::spawn(async move {
+        let status = spades_child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("spades assembly failed with exit code: {:?}", status.code()));
+        }
+        Ok(())
+    });
+
+
+
+    // bt2
+
+
+
+
+
+
+
+    // let raw_contigs = spades_work_dir.join("contigs_before_rr.fasta"); // unfiltered
+    // let final_contigs_in_spades = spades_work_dir.join("contigs.fasta");   // SPAdes' filtered
+    //
+    // // contigs_all.fasta = raw unfiltered
+    // let contigs_all_out = assembly_out_dir.join("contigs_all.fasta");
+    // fs::copy(&raw_contigs, &contigs_all_out).await?;
+    //
+    // // contigs.fasta = apply user's min_contig_length (exactly like Python step)
+    // let contigs_out = assembly_out_dir.join("contigs.fasta");
+    // let contigs_out = assembly_out_dir.join("contigs.fasta");
+    // filter_contigs_by_length(&contigs_all_out, min_contig_length as usize, &contigs_out).await?;
+    //
+    // // scaffolds.fasta
+    // let scaffolds_out = assembly_out_dir.join("scaffolds.fasta");
+    // fs::copy(spades_work_dir.join("scaffolds.fasta"), &scaffolds_out).await?;
+
+
+
+    let _ = fs::remove_dir_all(&spades_work_dir).await;
+
+    Ok((fifo_write_handle, spades_task, cleanup_tasks, cleanup_receivers))
+}
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -2407,7 +2535,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // External tools check
-    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, CZID_DEDUP_TAG])
+    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG])
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
