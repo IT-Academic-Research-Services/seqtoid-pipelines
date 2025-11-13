@@ -2611,13 +2611,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
-        3,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
         100,
         StreamDataType::IlluminaFastq,
-        "non_host_mm2_dmnd_input".to_string(),
+        "non_host_output".to_string(),
         None,
     )
         .await
@@ -2628,6 +2628,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     // Minimap2 non_host alignment
@@ -2777,6 +2778,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ).await?;
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
+
+    // *******************
+    // Post-processing
+    // *******************
+
+    // Assembly
+    //  non_host_assembly_stream
+
 
     // *******************
     // Results retrieval

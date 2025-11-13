@@ -36,6 +36,7 @@ pub const KALLISTO_TAG: &str = "kallisto";
 pub const STAR_TAG: &str = "STAR";
 pub const CZID_DEDUP_TAG: &str = "czid-dedup";
 pub const DIAMOND_TAG: &str = "diamond";
+pub const SPADES_TAG: &str = "spades.py";
 
 
 // Taxonomy defs
@@ -64,6 +65,7 @@ lazy_static! {
         m.insert(STAR_TAG, 2.7);
         m.insert(CZID_DEDUP_TAG, 0.1);
         m.insert(DIAMOND_TAG, 2.1);
+        m.insert(SPADES_TAG, 4.2);
         m
     };
 }
@@ -180,7 +182,7 @@ pub struct RunConfig {
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
-            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
+            (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _) | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) | (SPADES_TAG, _) => CoreAllocation::Maximal,  // Keep as-is for full potential
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _)  => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |

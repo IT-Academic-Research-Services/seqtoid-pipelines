@@ -5,7 +5,7 @@ use log::{self, LevelFilter, debug, info, error, warn};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -1714,6 +1714,65 @@ pub mod diamond {
     }
 }
 
+
+pub mod spades {
+    use std::collections::HashMap;
+    use super::*;
+    use log::{self, LevelFilter, debug, info, error, warn};
+
+    pub struct SpadesConfig {
+        pub input_path: PathBuf,
+        pub outdir_path: PathBuf,
+        pub paired: bool,
+        pub option_fields: HashMap<String, Option<String>>,
+    }
+    pub struct SpadesArgGenerator;
+
+    pub async fn spades_presence_check() -> anyhow::Result<f32> {
+        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for SpadesArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<SpadesConfig>())
+                .ok_or_else(|| anyhow!("Spades requires a SpadesConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            if config.paired {
+                args_vec.push("-12".to_string());
+            }
+            else {
+                args_vec.push("-s".to_string());
+            }
+            args_vec.push(config.input_path.to_string());
+
+            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None);
+            args_vec.push("-t".to_string());
+            args_vec.push(num_cores.to_string());
+
+            args_vec.push("-m".to_string());
+            let spades_mem = run_config.available_ram / 2.0; // NB: this is a guess
+            args_vec.push(spades_mem.to_string());
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(format!("{}", key));
+                if let Some(v) = value {
+                    args_vec.push(format!("{}", v));
+                }
+            }
+
+            args_vec.push("--only-assembler".to_string());
+            args_vec.push("-o".to_string());
+            args_vec.push(config.outdir_path.to_string());
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -1734,6 +1793,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         STAR_TAG => Box::new(star::StarArgGenerator),
         CZID_DEDUP_TAG => Box::new(czid_dedup::CzidDedupArgGenerator),
         DIAMOND_TAG => Box::new(diamond::DiamondArgGenerator),
+        SPADES_TAG => Box::new(spades::SpadesArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -1761,6 +1821,7 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             STAR_TAG => star::star_presence_check().await,
             CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
             DIAMOND_TAG => diamond::diamond_presence_check().await,
+            SPADES_TAG => spades::spades_presence_check().await,
 
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
