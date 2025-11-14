@@ -22,6 +22,7 @@ use tokio_stream::StreamExt;
 use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
+use tokio::process::Command;
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use sled::Tree;
@@ -31,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
+use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header, read_fasta};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
@@ -51,6 +52,7 @@ use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
 use crate::utils::command::spades::SpadesConfig;
+use crate::utils::sambam::generate_info_from_sam_stream;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
@@ -107,6 +109,23 @@ pub struct TaxonMetrics {
     pub e_value: f64,
     pub base_count: u64,
     pub source_count_type: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+pub struct AssemblyHandle {
+    pub spades_task: JoinHandle<Result<(), anyhow::Error>>,
+    pub work_dir: PathBuf,
+    pub out_dir: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct CoverageOutputs {
+    pub coverage_json: PathBuf,
+    pub contigs_fasta: PathBuf,
+    pub contig_stats_json: PathBuf,
+    pub sam_path: PathBuf,
+    pub contigs_all_fasta: PathBuf,
+    pub scaffolds_fasta: PathBuf,
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -225,6 +244,7 @@ async fn bowtie2_filter(
     // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
+        paired: paired,
         option_fields: bowtie2_options,
     };
 
@@ -1670,7 +1690,7 @@ pub async fn call_hits_m8_stream(
                     }
                     valid_hits.push(hit.clone());
                 } else {
-                    debug!("Missing taxid for accession: {}", hit.tname);
+                    // debug!("Missing taxid for accession: {}", hit.tname);
                 }
             }
 
@@ -2374,6 +2394,7 @@ pub async fn generate_annotated_fasta(
     ))
 }
 
+
 /// Runs spades assembler
 ///
 /// # Arguments
@@ -2389,66 +2410,78 @@ async fn spades_assembly(
     paired: bool,
     sample_base_buf: PathBuf,
 )  -> Result<(
-    JoinHandle<Result<(), anyhow::Error>>,
-    JoinHandle<Result<(), anyhow::Error>>,
+    AssemblyHandle,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 ),  PipelineError>
 
-
 {
-
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
     let spades_out_dir = out_dir.join("assembly");
     fs::create_dir_all(&spades_out_dir).await?;
-    let spades_work_dir = spades_out_dir.join("spades");
+    let spades_work_dir =  config.ram_temp_dir.join("spades");
     fs::create_dir_all(&spades_work_dir).await?;
 
-    let (assembly_streams, non_host_done_rx) = t_junction(
-        input_stream,
-        1,
-        config.base_buffer_size * 32, // jumbo buffer due to mismatch in read speed between bt2 and spades
-        config.args.stall_threshold,
-        None,
-        100,
-        StreamDataType::IlluminaFastq,
-        "assembly_spades_bt2".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(non_host_done_rx);
+    let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
 
-    let mut assembly_streams_iter = assembly_streams.into_iter();
-    let assembly_spades_stream = assembly_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    // let assembly_bt2_stream = assembly_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let write_input_task = tokio::spawn({
+        let input_file_path = input_file_path.clone();
 
+        async move {
+            let file = TokioFile::create(&input_file_path).await
+                .map_err(|e| anyhow!("Cannot create SPAdes input file {}: {}", input_file_path.display(), e))?;
+            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+            
+            let mut stream = input_stream;
+            let mut total_bytes = 0u64;
 
-    let fifo_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
+            while let Some(item) = stream.next().await {
 
-    create_fifo(&fifo_path)
-        .await
-        .map_err(|e| PipelineError::IOError(format!("Failed to create assembly FIFO {}: {}", fifo_path.display(), e)))?;
+                let bytes = item.to_bytes()
+                    .map_err(|e| anyhow!("Failed to convert ParseOutput to FASTQ bytes: {}", e))?;
 
-    let fifo_write_handle = tokio::spawn(write_to_fifo(assembly_spades_stream, fifo_path.clone()));
+                writer.write_all(&bytes).await
+                    .map_err(|e| anyhow!("Write error to {}: {}", input_file_path.display(), e))?;
 
+                total_bytes += bytes.len() as u64;
+            }
+
+            writer.flush().await
+                .map_err(|e| anyhow!("Flush error to {}: {}", input_file_path.display(), e))?;
+
+            info!(
+            "SPAdes input written: {} ({} bytes)",
+            input_file_path.display(),
+            total_bytes
+        );
+
+            if total_bytes == 0 {
+                warn!("SPAdes input file is empty – no non-host reads");
+            }
+            Ok::<PathBuf, anyhow::Error>(input_file_path)
+        }
+    });
+
+    let input_file_path = write_input_task.await??;
 
     let spades_config = SpadesConfig {
-        input_path: fifo_path,
-        outdir_path: spades_out_dir,
+        input_path: input_file_path.clone(),
+        outdir_path: spades_out_dir.clone(),
         paired: paired,
 
         option_fields: HashMap::from([
             ("--only-assembler".to_string(), None),
         ]),
     };
-    let spades_args = generate_cli(MINIMAP2_TAG, &config, Some(&spades_config))
+    let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SPADES_TAG.to_string(),
             error: e.to_string(),
         })?;
+
+    eprintln!("SPAdes command: {} {}", SPADES_TAG, spades_args.join(" "));
 
     let (mut spades_child, spades_err_task) = spawn_cmd(
         config.clone(),
@@ -2461,48 +2494,242 @@ async fn spades_assembly(
             error: e.to_string(),
         })?;
     cleanup_tasks.push(spades_err_task);
+    eprintln!("spades spawedn:");
 
 
     let spades_task = tokio::spawn(async move {
-        let status = spades_child.wait().await?;
-        if !status.success() {
-            return Err(anyhow!("spades assembly failed with exit code: {:?}", status.code()));
+        let output = spades_child.wait_with_output().await?;
+        eprintln!("SPAdes exit: {:?}", output.status);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("SPAdes FAILED:\n{}", stderr);
+            return Err(anyhow!("SPAdes failed: {}", stderr));
         }
         Ok(())
     });
 
-
-
-    // bt2
-
-
-
-
-
-
-
-    // let raw_contigs = spades_work_dir.join("contigs_before_rr.fasta"); // unfiltered
-    // let final_contigs_in_spades = spades_work_dir.join("contigs.fasta");   // SPAdes' filtered
-    //
-    // // contigs_all.fasta = raw unfiltered
-    // let contigs_all_out = assembly_out_dir.join("contigs_all.fasta");
-    // fs::copy(&raw_contigs, &contigs_all_out).await?;
-    //
-    // // contigs.fasta = apply user's min_contig_length (exactly like Python step)
-    // let contigs_out = assembly_out_dir.join("contigs.fasta");
-    // let contigs_out = assembly_out_dir.join("contigs.fasta");
-    // filter_contigs_by_length(&contigs_all_out, min_contig_length as usize, &contigs_out).await?;
-    //
-    // // scaffolds.fasta
-    // let scaffolds_out = assembly_out_dir.join("scaffolds.fasta");
-    // fs::copy(spades_work_dir.join("scaffolds.fasta"), &scaffolds_out).await?;
-
-
-
-    let _ = fs::remove_dir_all(&spades_work_dir).await;
-
-    Ok((fifo_write_handle, spades_task, cleanup_tasks, cleanup_receivers))
+    Ok((AssemblyHandle {
+        spades_task,
+        work_dir: spades_work_dir,
+        out_dir: spades_out_dir}, cleanup_tasks, cleanup_receivers))
 }
+
+
+// pub async fn generate_coverage_stats(
+//     config: Arc<RunConfig>,
+//     mut handle: AssemblyHandle,
+//     bowtie_stream: ReceiverStream<ParseOutput>,
+//     duplicate_cluster_sizes: HashMap<String, u64>,
+//     min_contig_length: usize,
+//     paired: bool,
+//     out_dir: PathBuf,
+// ) -> Result<CoverageOutputs> {
+//     let mut cleanup_tasks = Vec::new();
+//     let mut cleanup_receivers = Vec::new();
+//     let mut temp_files: Vec<NamedTempFile> = Vec::new();
+//
+//     handle.fifo_write_handle.await??;
+//     handle.spades_task.await??;
+//
+//     let out_dir = &handle.out_dir;
+//     let work_dir = &handle.work_dir;
+//
+//     // Check spades success + create final files
+//     let raw_contigs_path = work_dir.join("contigs_before_rr.fasta");
+//     let spades_contigs_path = work_dir.join("contigs.fasta");
+//
+//     let spades_success = if raw_contigs_path.exists() {
+//         fs::metadata(&raw_contigs_path).await?.len() > 0
+//     } else {
+//         false
+//     };
+//
+//     // if it failed, we can to write faked empty data here
+//     if !spades_success {
+//
+//         let dummy = ";ASSEMBLY FAILED";
+//         let empty_sam = "@NO INFO\n";
+//         let empty_json = "{}";
+//
+//         fs::write(out_dir.join("contigs.fasta"), dummy).await?;
+//         fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
+//         fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
+//         fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
+//         fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
+//
+//         return Ok(CoverageOutputs {
+//             coverage_json: out_dir.join("assembly_contig_coverage.json"),
+//             contigs_fasta: out_dir.join("contigs.fasta"),
+//             contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+//             scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+//             sam_path: out_dir.join("read-contig.sam"),
+//             contig_stats_json: out_dir.join("contig_stats.json"),
+//         });
+//     }
+//
+//     let contigs_all_out = out_dir.join("contigs_all.fasta");
+//     fs::copy(&raw_contigs_path, &contigs_all_out).await?;
+//
+//     let contigs_out = out_dir.join("contigs.fasta");
+//
+//     //contig length filtering
+//     let rx = read_fasta(
+//         raw_contigs_path.clone(),
+//         u64::MAX,           // no record limit
+//         Some(min_contig_length),
+//         None,               // no max
+//         8192,               // chunk size
+//     ).await?;
+//
+//     let (write_task, temp_path, _temp) = write_parse_output_to_temp_file(
+//         ReceiverStream::new(rx),
+//         None,
+//         Some(".fasta"),
+//         out_dir,
+//     ).await?;
+//     temp_files.push(_temp);
+//
+//     write_task.await??;
+//     tokio::fs::rename(&temp_path, &contigs_out).await?;
+//
+//     let scaffolds_out = out_dir.join("scaffolds.fasta");
+//     let spades_scaffolds = work_dir.join("scaffolds.fasta");
+//     if spades_scaffolds.exists() {
+//         fs::copy(&spades_scaffolds, &scaffolds_out).await?;
+//     } else {
+//         fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
+//     }
+//
+//     // bt2 map-back
+//     let sam_path = out_dir.join("read-contig.sam");
+//
+//     let index_dir = handle.out_dir.join("bowtie_index");
+//     fs::create_dir_all(&index_dir).await?;
+//
+//     let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
+//
+//     let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
+//
+//     let build_status = Command::new("bowtie2-build")
+//         .args([
+//             "--threads",
+//             num_index_cores,
+//             "--quiet",
+//             contigs_out.to_str().unwrap(),
+//             index_prefix.to_str().unwrap(),
+//         ])
+//         .status()
+//         .await
+//         .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
+//
+//     if !build_status.success() {
+//         return Err(anyhow!("bowtie2-build failed with status {:?}", build_status));
+//     }
+//
+//     let bt2_options = HashMap::from([
+//         ("--very-sensitive-local".to_string(), None),
+//         ("--no-unal".to_string(), None),
+//     ]);
+//
+//     // BT2
+//     let bt2_config_view = Bowtie2Config {
+//         bt2_index_path: index_prefix,
+//         paired: paired,
+//         option_fields: bt2_options,
+//     };
+//
+//     let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view))
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: BOWTIE2_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//
+//     let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
+//         config.clone(),
+//         bowtie_stream.into_inner(),
+//         BOWTIE2_TAG,
+//         bt2_args,
+//         StreamDataType::JustBytes,
+//         config.args.verbose,
+//     )
+//         .await
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: BOWTIE2_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//     cleanup_tasks.push(bt2_stream_task);
+//     cleanup_tasks.push(bt2_err_task);
+//
+//     let bt2_out_stream = {
+//         let mut guard = bt2_child.lock().await;
+//         parse_child_output(
+//             &mut guard,
+//             ChildStream::Stdout,
+//             ParseMode::Bytes,
+//             config.base_buffer_size,
+//         )
+//             .await
+//             .map_err(|e| PipelineError::ToolExecution {
+//                 tool: BOWTIE2_TAG.to_string(),
+//                 error: e.to_string(),
+//             })?
+//     };
+//
+//
+//     // Sort, output uncompressed BAM
+//     let samtools_sort_config = SamtoolsConfig {
+//         subcommand: SamtoolsSubcommand::Sort,
+//         subcommand_fields: HashMap::from([
+//             ("-n".to_string(), None), // Name-sorted for fastq extraction
+//             ("-u".to_string(), None),
+//             ("-O".to_string(), Some("bam".to_string())),
+//             ("-".to_string(), None),
+//         ]),
+//     };
+//     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: SAMTOOLS_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//
+//     let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+//         config.clone(),
+//         bt2_out_stream,
+//         SAMTOOLS_TAG,
+//         samtools_sort_args,
+//         StreamDataType::JustBytes,
+//         config.args.verbose,
+//     )
+//         .await
+//         .map_err(|e| PipelineError::ToolExecution {
+//             tool: SAMTOOLS_TAG.to_string(),
+//             error: e.to_string(),
+//         })?;
+//     cleanup_tasks.push(samtools_sort_task);
+//     cleanup_tasks.push(samtools_sort_err_task);
+//
+//     let samtools_sort_out_stream = {
+//         let mut guard = samtools_sort_child.lock().await;
+//         parse_child_output(
+//             &mut guard,
+//             ChildStream::Stdout,
+//             ParseMode::Bytes,
+//             config.base_buffer_size,
+//         )
+//             .await
+//             .map_err(|e| PipelineError::ToolExecution {
+//                 tool: SAMTOOLS_TAG.to_string(),
+//                 error: e.to_string(),
+//             })?
+//     };
+//
+//     let contig_stats = generate_info_from_sam_stream(
+//         samtools_sort_out_stream,
+//         &duplicate_cluster_sizes,
+//         MIN_CONTIG_SIZE,
+//     ).await?;
+//
+// }
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2757,6 +2984,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    // let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    eprintln!("blargh");
+
+
+    // let test_write_task = tokio::spawn(stream_to_file(
+    //     non_host_assembly_stream,
+    //     PathBuf::from("non_host.fq"),
+    // ));
+    // test_write_task.await??;
+
+    // This is part of post-process starting here
+
+    let (assembly_handle, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
+        config.clone(),
+        ReceiverStream::new(non_host_assembly_stream),
+        out_dir.clone(),
+        paired,
+        sample_base_buf.clone(),
+    ).await?;
+
+    cleanup_tasks.append(&mut assembly_cleanup_tasks);
+    cleanup_receivers.append(&mut assembly_cleanup_receivers);
 
 
     // Minimap2 non_host alignment
@@ -2912,7 +3161,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // Assembly
-    //  non_host_assembly_stream
+    //  generate_coverage_stats runs HWERE
+    // test drain the assembly handle.
+
+
+    assembly_handle.spades_task.await??;
+    let _ = fs::remove_dir_all(&assembly_handle.work_dir).await;
+
+
 
 
     // *******************

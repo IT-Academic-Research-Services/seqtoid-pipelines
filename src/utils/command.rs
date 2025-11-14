@@ -1760,8 +1760,11 @@ pub mod spades {
             args_vec.push(num_cores.to_string());
 
             args_vec.push("-m".to_string());
-            let spades_mem = run_config.available_ram as f64 / 2.0; // NB: this is a guess
-            args_vec.push(spades_mem.to_string());
+
+            let available_gb = (run_config.available_ram as f64 / 1_000_000_000.0) as u64;
+            let spades_gb = (available_gb * 3 / 4).max(8);
+
+            args_vec.push(spades_gb.to_string());
 
             for (key, value) in config.option_fields.iter() {
                 args_vec.push(format!("{}", key));
