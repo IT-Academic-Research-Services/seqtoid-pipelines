@@ -962,6 +962,7 @@ pub mod bowtie2 {
 
     pub struct Bowtie2Config {
         pub bt2_index_path: PathBuf,
+        pub paired: bool,
         pub option_fields: HashMap<String, Option<String>>,
     }
 
@@ -1109,7 +1110,12 @@ pub mod bowtie2 {
             args_vec.push("-p".to_string());
             let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
             args_vec.push(num_cores.to_string());
-            args_vec.push("--interleaved".to_string());
+            if config.paired{
+                args_vec.push("--interleaved".to_string()); // if paired, will be an interleaved stream
+            }
+            else {
+                args_vec.push("-U".to_string());
+            }
             args_vec.push("-".to_string());
 
             Ok(args_vec)
@@ -1747,14 +1753,14 @@ pub mod spades {
             else {
                 args_vec.push("-s".to_string());
             }
-            args_vec.push(config.input_path.to_string());
+            args_vec.push(config.input_path.display().to_string());
 
             let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
             args_vec.push("-m".to_string());
-            let spades_mem = run_config.available_ram / 2.0; // NB: this is a guess
+            let spades_mem = run_config.available_ram as f64 / 2.0; // NB: this is a guess
             args_vec.push(spades_mem.to_string());
 
             for (key, value) in config.option_fields.iter() {
@@ -1766,7 +1772,7 @@ pub mod spades {
 
 
             args_vec.push("-o".to_string());
-            args_vec.push(config.outdir_path.to_string());
+            args_vec.push(config.outdir_path.display().to_string());
 
             Ok(args_vec)
         }
