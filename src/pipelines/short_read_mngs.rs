@@ -120,12 +120,14 @@ pub struct AssemblyHandle {
 
 #[derive(Debug)]
 pub struct CoverageOutputs {
-    pub coverage_json: PathBuf,
     pub contigs_fasta: PathBuf,
-    pub contig_stats_json: PathBuf,
-    pub sam_path: PathBuf,
     pub contigs_all_fasta: PathBuf,
     pub scaffolds_fasta: PathBuf,
+    pub sam_path: PathBuf,
+    pub contig_stats_json: PathBuf,
+    pub coverage_json: PathBuf,
+    pub coverage_summary_csv: PathBuf,
+    pub contig_stats: HashMap<String, u64>,
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -2433,7 +2435,7 @@ async fn spades_assembly(
             let file = TokioFile::create(&input_file_path).await
                 .map_err(|e| anyhow!("Cannot create SPAdes input file {}: {}", input_file_path.display(), e))?;
             let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
-            
+
             let mut stream = input_stream;
             let mut total_bytes = 0u64;
 
@@ -2481,7 +2483,6 @@ async fn spades_assembly(
             error: e.to_string(),
         })?;
 
-    eprintln!("SPAdes command: {} {}", SPADES_TAG, spades_args.join(" "));
 
     let (mut spades_child, spades_err_task) = spawn_cmd(
         config.clone(),
@@ -2494,7 +2495,6 @@ async fn spades_assembly(
             error: e.to_string(),
         })?;
     cleanup_tasks.push(spades_err_task);
-    eprintln!("spades spawedn:");
 
 
     let spades_task = tokio::spawn(async move {
@@ -2515,221 +2515,259 @@ async fn spades_assembly(
 }
 
 
-// pub async fn generate_coverage_stats(
-//     config: Arc<RunConfig>,
-//     mut handle: AssemblyHandle,
-//     bowtie_stream: ReceiverStream<ParseOutput>,
-//     duplicate_cluster_sizes: HashMap<String, u64>,
-//     min_contig_length: usize,
-//     paired: bool,
-//     out_dir: PathBuf,
-// ) -> Result<CoverageOutputs> {
-//     let mut cleanup_tasks = Vec::new();
-//     let mut cleanup_receivers = Vec::new();
-//     let mut temp_files: Vec<NamedTempFile> = Vec::new();
-//
-//     handle.fifo_write_handle.await??;
-//     handle.spades_task.await??;
-//
-//     let out_dir = &handle.out_dir;
-//     let work_dir = &handle.work_dir;
-//
-//     // Check spades success + create final files
-//     let raw_contigs_path = work_dir.join("contigs_before_rr.fasta");
-//     let spades_contigs_path = work_dir.join("contigs.fasta");
-//
-//     let spades_success = if raw_contigs_path.exists() {
-//         fs::metadata(&raw_contigs_path).await?.len() > 0
-//     } else {
-//         false
-//     };
-//
-//     // if it failed, we can to write faked empty data here
-//     if !spades_success {
-//
-//         let dummy = ";ASSEMBLY FAILED";
-//         let empty_sam = "@NO INFO\n";
-//         let empty_json = "{}";
-//
-//         fs::write(out_dir.join("contigs.fasta"), dummy).await?;
-//         fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
-//         fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
-//         fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
-//         fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
-//
-//         return Ok(CoverageOutputs {
-//             coverage_json: out_dir.join("assembly_contig_coverage.json"),
-//             contigs_fasta: out_dir.join("contigs.fasta"),
-//             contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-//             scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-//             sam_path: out_dir.join("read-contig.sam"),
-//             contig_stats_json: out_dir.join("contig_stats.json"),
-//         });
-//     }
-//
-//     let contigs_all_out = out_dir.join("contigs_all.fasta");
-//     fs::copy(&raw_contigs_path, &contigs_all_out).await?;
-//
-//     let contigs_out = out_dir.join("contigs.fasta");
-//
-//     //contig length filtering
-//     let rx = read_fasta(
-//         raw_contigs_path.clone(),
-//         u64::MAX,           // no record limit
-//         Some(min_contig_length),
-//         None,               // no max
-//         8192,               // chunk size
-//     ).await?;
-//
-//     let (write_task, temp_path, _temp) = write_parse_output_to_temp_file(
-//         ReceiverStream::new(rx),
-//         None,
-//         Some(".fasta"),
-//         out_dir,
-//     ).await?;
-//     temp_files.push(_temp);
-//
-//     write_task.await??;
-//     tokio::fs::rename(&temp_path, &contigs_out).await?;
-//
-//     let scaffolds_out = out_dir.join("scaffolds.fasta");
-//     let spades_scaffolds = work_dir.join("scaffolds.fasta");
-//     if spades_scaffolds.exists() {
-//         fs::copy(&spades_scaffolds, &scaffolds_out).await?;
-//     } else {
-//         fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
-//     }
-//
-//     // bt2 map-back
-//     let sam_path = out_dir.join("read-contig.sam");
-//
-//     let index_dir = handle.out_dir.join("bowtie_index");
-//     fs::create_dir_all(&index_dir).await?;
-//
-//     let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
-//
-//     let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
-//
-//     let build_status = Command::new("bowtie2-build")
-//         .args([
-//             "--threads",
-//             num_index_cores,
-//             "--quiet",
-//             contigs_out.to_str().unwrap(),
-//             index_prefix.to_str().unwrap(),
-//         ])
-//         .status()
-//         .await
-//         .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
-//
-//     if !build_status.success() {
-//         return Err(anyhow!("bowtie2-build failed with status {:?}", build_status));
-//     }
-//
-//     let bt2_options = HashMap::from([
-//         ("--very-sensitive-local".to_string(), None),
-//         ("--no-unal".to_string(), None),
-//     ]);
-//
-//     // BT2
-//     let bt2_config_view = Bowtie2Config {
-//         bt2_index_path: index_prefix,
-//         paired: paired,
-//         option_fields: bt2_options,
-//     };
-//
-//     let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view))
-//         .map_err(|e| PipelineError::ToolExecution {
-//             tool: BOWTIE2_TAG.to_string(),
-//             error: e.to_string(),
-//         })?;
-//
-//     let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
-//         config.clone(),
-//         bowtie_stream.into_inner(),
-//         BOWTIE2_TAG,
-//         bt2_args,
-//         StreamDataType::JustBytes,
-//         config.args.verbose,
-//     )
-//         .await
-//         .map_err(|e| PipelineError::ToolExecution {
-//             tool: BOWTIE2_TAG.to_string(),
-//             error: e.to_string(),
-//         })?;
-//     cleanup_tasks.push(bt2_stream_task);
-//     cleanup_tasks.push(bt2_err_task);
-//
-//     let bt2_out_stream = {
-//         let mut guard = bt2_child.lock().await;
-//         parse_child_output(
-//             &mut guard,
-//             ChildStream::Stdout,
-//             ParseMode::Bytes,
-//             config.base_buffer_size,
-//         )
-//             .await
-//             .map_err(|e| PipelineError::ToolExecution {
-//                 tool: BOWTIE2_TAG.to_string(),
-//                 error: e.to_string(),
-//             })?
-//     };
-//
-//
-//     // Sort, output uncompressed BAM
-//     let samtools_sort_config = SamtoolsConfig {
-//         subcommand: SamtoolsSubcommand::Sort,
-//         subcommand_fields: HashMap::from([
-//             ("-n".to_string(), None), // Name-sorted for fastq extraction
-//             ("-u".to_string(), None),
-//             ("-O".to_string(), Some("bam".to_string())),
-//             ("-".to_string(), None),
-//         ]),
-//     };
-//     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
-//         .map_err(|e| PipelineError::ToolExecution {
-//             tool: SAMTOOLS_TAG.to_string(),
-//             error: e.to_string(),
-//         })?;
-//
-//     let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
-//         config.clone(),
-//         bt2_out_stream,
-//         SAMTOOLS_TAG,
-//         samtools_sort_args,
-//         StreamDataType::JustBytes,
-//         config.args.verbose,
-//     )
-//         .await
-//         .map_err(|e| PipelineError::ToolExecution {
-//             tool: SAMTOOLS_TAG.to_string(),
-//             error: e.to_string(),
-//         })?;
-//     cleanup_tasks.push(samtools_sort_task);
-//     cleanup_tasks.push(samtools_sort_err_task);
-//
-//     let samtools_sort_out_stream = {
-//         let mut guard = samtools_sort_child.lock().await;
-//         parse_child_output(
-//             &mut guard,
-//             ChildStream::Stdout,
-//             ParseMode::Bytes,
-//             config.base_buffer_size,
-//         )
-//             .await
-//             .map_err(|e| PipelineError::ToolExecution {
-//                 tool: SAMTOOLS_TAG.to_string(),
-//                 error: e.to_string(),
-//             })?
-//     };
-//
-//     let contig_stats = generate_info_from_sam_stream(
-//         samtools_sort_out_stream,
-//         &duplicate_cluster_sizes,
-//         MIN_CONTIG_SIZE,
-//     ).await?;
-//
-// }
+pub async fn process_assembly(
+    config: Arc<RunConfig>,
+    out_dir: &PathBuf,
+    work_dir: &PathBuf,
+    bowtie_stream: ReceiverStream<ParseOutput>,
+    duplicate_cluster_sizes: HashMap<String, u64>,
+    paired: bool,
+) -> Result<(
+           CoverageOutputs,
+           Vec<JoinHandle<Result<()>>>,
+           Vec<oneshot::Receiver<Result<()>>>,
+       ),  PipelineError>
+
+ {
+    let mut cleanup_tasks = Vec::new();let mut cleanup_receivers = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
+
+    let raw_contigs_path    = work_dir.join("contigs.fasta");
+    let raw_scaffolds_path  = work_dir.join("scaffolds.fasta");
+
+    let spades_success = if raw_contigs_path.exists() {
+        fs::metadata(&raw_contigs_path).await?.len() > 0
+    } else {
+        false
+    };
+
+    // if it failed write empty data
+    if !spades_success {
+
+        let dummy = ";ASSEMBLY FAILED";
+        let empty_sam = "@NO INFO\n";
+        let empty_json = "{}";
+
+        fs::write(out_dir.join("contigs.fasta"), dummy).await?;
+        fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
+        fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
+        fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
+        fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
+
+        return Ok((CoverageOutputs {
+            contigs_fasta: out_dir.join("contigs.fasta"),
+            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+            sam_path: out_dir.join("read-contig.sam"),
+            contig_stats_json: out_dir.join("contig_stats.json"),
+            coverage_json: out_dir.join("assembly_contig_coverage.json"),
+            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+            contig_stats: HashMap::new(),
+        }, cleanup_tasks,  cleanup_receivers));
+    }
+
+    let contigs_all_out = out_dir.join("contigs_all.fasta");
+    fs::copy(&raw_contigs_path, &contigs_all_out).await?;
+
+    let contigs_out = out_dir.join("contigs.fasta");
+
+    //contig length filtering
+    let rx = read_fasta(
+        raw_contigs_path.clone(),
+        u64::MAX,           // no record limit
+        Some(config.args.min_contig_length),
+        None,
+        8192,
+    ).map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
+
+    let (write_task, temp_path, _temp) = write_parse_output_to_temp_file(
+        ReceiverStream::new(rx),
+        None,
+        Some(".fasta"),
+        config.ram_temp_dir.clone(),
+    ).await?;
+    temp_files.push(_temp);
+
+    write_task.await??;
+    tokio::fs::rename(&temp_path, &contigs_out).await?;
+
+    let scaffolds_out = out_dir.join("scaffolds.fasta");
+    let spades_scaffolds = work_dir.join("scaffolds.fasta");
+    if spades_scaffolds.exists() {
+        fs::copy(&spades_scaffolds, &scaffolds_out).await?;
+    } else {
+        fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
+    }
+
+    // bt2 index
+    let index_dir = out_dir.join("bowtie_index");
+    fs::create_dir_all(&index_dir).await?;
+    let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
+
+    let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
+
+    let build_status = Command::new("bowtie2-build")
+        .args([
+            "--threads",
+            &num_index_cores.to_string(),
+            "--quiet",
+            contigs_out.to_str().unwrap(),
+            index_prefix.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
+
+    if !build_status.success() {
+        return Err(PipelineError::ToolExecution {tool: BOWTIE2_TAG.to_string(), error: build_status.to_string()});
+    }
+
+    let bt2_options = HashMap::from([
+        ("--very-sensitive".to_string(), None),
+    ]);
+
+    // BT2
+    let bt2_config_view = Bowtie2Config {
+        bt2_index_path: index_prefix,
+        paired: paired,
+        option_fields: bt2_options,
+    };
+
+    let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    eprintln!("Bowtie 2 args: {:?}", bt2_args);
+    let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
+        config.clone(),
+        bowtie_stream.into_inner(),
+        BOWTIE2_TAG,
+        bt2_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(bt2_stream_task);
+    cleanup_tasks.push(bt2_err_task);
+
+    let bt2_out_stream = {
+        let mut guard = bt2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BOWTIE2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // Sort, output uncompressed BAM
+    let samtools_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None), // Name-sorted for fastq extraction
+            ("-u".to_string(), None),
+            ("-O".to_string(), Some("sam".to_string())), // SAM for direct reading
+            ("-".to_string(), None),
+        ]),
+    };
+    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+        config.clone(),
+        bt2_out_stream,
+        SAMTOOLS_TAG,
+        samtools_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_sort_task);
+    cleanup_tasks.push(samtools_sort_err_task);
+
+    let samtools_sort_out_stream = {
+        let mut guard = samtools_sort_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+     let (non_host_streams, non_host_done_rx) = t_junction(
+         ReceiverStream::new(samtools_sort_out_stream),
+         2,
+         config.base_buffer_size,
+         config.args.stall_threshold,
+         None,
+         100,
+         StreamDataType::IlluminaFastq,
+         "process_assembly_sam".to_string(),
+         None,
+     )
+         .await
+         .map_err(|_| PipelineError::StreamDataDropped)?;
+     cleanup_receivers.push(non_host_done_rx);
+
+     let mut non_host_streams_iter = non_host_streams.into_iter();
+     let sam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+     let sam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+     let sam_path = out_dir.join("read-contig.sam");
+
+     let write_sam_task = write_byte_stream_to_file(
+         &sam_path,
+         ReceiverStream::new(sam_for_file),
+         Some(config.base_buffer_size),
+     )
+         .await?;
+     cleanup_tasks.push(write_sam_task);
+
+    let contig_stats = generate_info_from_sam_stream(
+        sam_for_stats,
+        &duplicate_cluster_sizes,
+        config.args.min_contig_length,
+    ).await?;
+
+    Ok((CoverageOutputs {
+        contigs_fasta: out_dir.join("contigs.fasta"),
+        contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+        scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+        sam_path: out_dir.join("read-contig.sam"),
+        contig_stats_json: out_dir.join("contig_stats.json"),
+        coverage_json: out_dir.join("assembly_contig_coverage.json"),
+        coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+        contig_stats: contig_stats,
+    }, cleanup_tasks,  cleanup_receivers))
+
+
+
+}
+
+
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -2966,7 +3004,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
-        4,
+        5,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -2984,15 +3022,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    // let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    eprintln!("blargh");
+    let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
-    // let test_write_task = tokio::spawn(stream_to_file(
-    //     non_host_assembly_stream,
-    //     PathBuf::from("non_host.fq"),
-    // ));
-    // test_write_task.await??;
 
     // This is part of post-process starting here
 
@@ -3160,17 +3192,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Post-processing
     // *******************
 
-    // Assembly
-    //  generate_coverage_stats runs HWERE
-    // test drain the assembly handle.
+    // Assembly stats
 
+    let assembly_out_dir = &assembly_handle.out_dir;
+    let assembly_work_dir =  &assembly_handle.work_dir;
 
     assembly_handle.spades_task.await??;
-    let _ = fs::remove_dir_all(&assembly_handle.work_dir).await;
 
+    let (assembly_outputs, mut post_assembly_cleanup_tasks, mut post_assembly_cleanup_receivers) = process_assembly(
+        config.clone(),
+        assembly_out_dir,
+        assembly_work_dir,
+        ReceiverStream::new(non_host_coverage_bt2_stream),
+        duplicate_cluster_sizes.clone(),
+        paired
+    ).await?;
 
+    // Push cleanup tasks
+    cleanup_tasks.extend(post_assembly_cleanup_tasks);
+    cleanup_receivers.extend(post_assembly_cleanup_receivers);
 
+    let _ = fs::remove_dir_all(assembly_work_dir).await;
 
+    
     // *******************
     // Results retrieval
     // *******************

@@ -238,6 +238,9 @@ pub enum PipelineError {
     #[error("Invalid FASTQ format in {0}")]
     InvalidFastqFormat(String),
 
+    #[error("Invalid FASTA format in {0}")]
+    InvalidFastaFormat(String),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
