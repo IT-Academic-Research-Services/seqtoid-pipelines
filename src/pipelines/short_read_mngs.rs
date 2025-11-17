@@ -30,6 +30,7 @@ use twox_hash::XxHash64;
 use fst::Map;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use noodles::sam as sam;
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
@@ -2768,7 +2769,31 @@ pub async fn process_assembly(
 }
 
 
-
+//
+// pub async fn generate_assembly_coverage(
+//     config: Arc<RunConfig>,
+//     sam_path: &PathBuf,
+//     contigs_fasta_path: &PathBuf,
+//     coverage_json_path: &PathBuf,
+//     coverage_csv_path: &PathBuf,
+//
+// ) -> Result<()> {
+//     // Early exit if low covergae
+//     if fs::metadata(contigs_fasta_path).await?.len() < 50 {
+//         fs::write(coverage_json_path, "{}").await?;
+//         fs::write(coverage_csv_path, "No Contigs\n").await?;
+//         return Ok(());
+//     }
+//
+//     info!("Computing real coverage from {} → {}", sam_path.display(), coverage_json_path.display());
+//
+//     // Open SAM and read header
+//     let mut file = fs::File::open(sam_path).await?;
+//     let mut reader = sam::AsyncReader::new(&mut file);
+//     let header = reader.read_header().await?;
+//
+//
+// }
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
