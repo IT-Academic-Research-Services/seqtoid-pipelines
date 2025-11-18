@@ -31,6 +31,11 @@ use fst::Map;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use noodles::sam as sam;
+use noodles::bam::r#async::io::Reader as BamAsyncReader;
+use noodles::bam::record::Record;
+
+use needletail::{parse_fastx_file, FastxReader};
+use dashmap::DashMap;
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
@@ -2476,6 +2481,7 @@ async fn spades_assembly(
 
         option_fields: HashMap::from([
             ("--only-assembler".to_string(), None),
+            ("--isolate".to_string(), None),
         ]),
     };
     let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))
@@ -2781,7 +2787,7 @@ pub async fn generate_assembly_coverage(
     coverage_json_path: &PathBuf,
     coverage_csv_path: &PathBuf,
 ) -> Result<()> {
-    let mut cleanup_tasks = Vec::new();
+    // let mut cleanup_tasks = Vec::new();
 
     // early exit for insufficient vontigs
     let meta = match fs::metadata(&contigs_fasta_path).await {
@@ -2799,17 +2805,178 @@ pub async fn generate_assembly_coverage(
         return Ok(());
     }
 
+    info!("Streaming coverage: {} → {}", contigs_fasta_path.display(), coverage_json_path.display());
 
-    //dummy
-    let sam_path = "test-contig.bam";
-    let write_sam_task = write_byte_stream_to_file(
-        &PathBuf::from(sam_path),
-        ReceiverStream::new(assembly_bam_rx),
-        Some(config.base_buffer_size),
-    )
-        .await?;
-    cleanup_tasks.push(write_sam_task);
+    // 2. Load contig order + lengths with needletail (preserves SPAdes order exactly)
+    let (contig_order, contig_lengths): (Vec<String>, HashMap<String, usize>) = {
+        let mut reader = parse_fastx_file(&contigs_fasta_path)
+            .map_err(|e| anyhow!("Failed to open contigs.fasta with needletail: {}", e))?;
 
+        let mut order = Vec::new();
+        let mut lengths = HashMap::with_capacity(100_000);
+
+        while let Some(record) = reader.next() {
+            let record = record.map_err(|e| anyhow!("needletail parse error: {}", e))?;
+            let id = std::str::from_utf8(record.id())
+                .map_err(|_| anyhow!("Contig ID is not valid UTF-8"))?
+                .to_string();
+            let len = record.seq().len();
+
+            if len > 0 {
+                order.push(id.clone());
+                lengths.insert(id, len);
+            }
+        }
+
+        if order.is_empty() {
+            fs::write(&coverage_json_path, "{}").await?;
+            fs::write(&coverage_csv_path, "No Contigs\n").await?;
+            return Ok(());
+        }
+
+        (order, lengths)
+    };
+
+    // 3. Pre-allocate depth vectors — 4 bytes/base
+    let depths: Arc<DashMap<String, Vec<u32>>> = Arc::new(DashMap::with_capacity(contig_lengths.len()));
+    for name in &contig_order {
+        if let Some(&len) = contig_lengths.get(name) {
+            depths.insert(name.clone(), vec![0u32; len + 1]); // +1 to avoid bounds checks
+        }
+    }
+
+    // 4. Stream BAM bytes → increment coverage
+    // let mut channel_reader = ChannelReader::new(assembly_bam_rx);
+    // let mut bam_reader = BamAsyncReader::new(&mut channel_reader);
+    // let header = bam_reader.read_header().await?;
+    // let mut record = Record::default();
+    //
+    // while bam_reader.read_record(&mut record).await? > 0 {
+    //     let flags = record.flags();
+    //     if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+    //         continue;
+    //     }
+    //
+    //     let Some(rid) = record.reference_sequence_id() else { continue; };
+    //     let Some((contig_name, _)) = header.reference_sequences().get_index(rid as usize) else { continue; };
+    //     let contig_name = contig_name.to_string_lossy().into_owned();
+    //
+    //     if let Some(mut entry) = depths.get_mut(&contig_name) {
+    //         let Some(start) = record.alignment_start() else { continue; };
+    //         let mut pos = (start.get() as usize).saturating_sub(1); // 1-based → 0-based
+    //
+    //         for op in record.cigar().iter() {
+    //             let kind = op.kind();
+    //             let len = op.len() as usize;
+    //
+    //             match kind {
+    //                 Op::Match | Op::SeqMatch | Op::SeqMismatch => {
+    //                     // Vectorised increment — peak Epyc performance
+    //                     if pos + len <= entry.len() {
+    //                         for i in 0..len {
+    //                             entry[pos + i] = entry[pos + i].saturating_add(1);
+    //                         }
+    //                     } else if pos < entry.len() {
+    //                         for i in pos..entry.len() {
+    //                             entry[i] = entry[i].saturating_add(1);
+    //                         }
+    //                     }
+    //                     pos += len;
+    //                 }
+    //                 Op::Del | Op::Skip => pos += len,
+    //                 _ => {} // Ins, SoftClip, HardClip, Pad → no ref consumed
+    //             }
+    //         }
+    //     }
+    // }
+    //
+    // // 5. stats in parallel
+    // let stats: Vec<(String, Value)> = config.thread_pool.install(|| {
+    //     contig_order
+    //         .par_iter()
+    //         .filter_map(|name| {
+    //             let entry = depths.get(name)?;
+    //             let len = contig_lengths[name];
+    //             let cov = &entry[1..=len]; // skip padding
+    //
+    //             let sum: u64 = cov.iter().map(|&d| d as u64).sum();
+    //             let avg = sum as f64 / len as f64;
+    //
+    //             let mut sorted = cov.to_vec();
+    //             sorted.sort_unstable();
+    //
+    //             let p25 = sorted[((len as f64 * 0.25) as usize).min(len - 1)];
+    //             let p50 = sorted[((len as f64 * 0.50) as usize).min(len - 1)];
+    //             let p75 = sorted[((len as f64 * 0.75) as usize).min(len - 1)];
+    //
+    //             let min = *sorted.first().unwrap_or(&0);
+    //             let max = *sorted.last().unwrap_or(&0);
+    //
+    //             let avg2xcnt = cov.iter().filter(|&&d| d as f64 > 2.0 * avg).count() as f64 / len as f64;
+    //             let cnt0 = cov.iter().filter(|&&d| d == 0).count() as f64 / len as f64;
+    //             let cnt1 = cov.iter().filter(|&&d| d == 1).count() as f64 / len as f64;
+    //             let cnt2 = cov.iter().filter(|&&d| d == 2).count() as f64 / len as f64;
+    //
+    //             let coverage_array: Vec<u64> = cov.iter().map(|&d| d as u64).collect();
+    //
+    //             let stat = json!({
+    //                 "coverage": coverage_array,
+    //                 "avg": avg,
+    //                 "min": min,
+    //                 "max": max,
+    //                 "p25": p25,
+    //                 "p50": p50,
+    //                 "p75": p75,
+    //                 "avg2xcnt": avg2xcnt,
+    //                 "cnt0": cnt0,
+    //                 "cnt1": cnt1,
+    //                 "cnt2": cnt2,
+    //                 "contig_len": len as u64,
+    //             });
+    //
+    //             Some((name.clone(), stat))
+    //         })
+    //         .collect()
+    // });
+    //
+    // //6. write outputs
+    //
+    // let mut json_file = BufWriter::new(fs::File::create(&coverage_json_path).await?);
+    // let mut csv_file = BufWriter::new(fs::File::create(&coverage_csv_path).await?);
+    //
+    // writeln!(csv_file, "contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2")?;
+    //
+    // json_file.write_all(b"{").await?;
+    // for (i, (name, stat)) in stats.iter().enumerate() {
+    //     if i > 0 {
+    //         json_file.write_all(b",").await?;
+    //     }
+    //     write!(json_file, r#""{}":{}"#, name, stat).await?;
+    // }
+    // json_file.write_all(b"}").await?;
+    // json_file.flush().await?;
+    //
+    // for (name, stat) in &stats {
+    //     let s = stat.as_object().unwrap();
+    //     writeln!(
+    //         csv_file,
+    //         "{},{:.6},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+    //         name,
+    //         s["avg"].as_f64().unwrap_or(0.0),
+    //         s["min"].as_u64().unwrap_or(0),
+    //         s["max"].as_u64().unwrap_or(0),
+    //         s["p25"].as_u64().unwrap_or(0),
+    //         s["p50"].as_u64().unwrap_or(0),
+    //         s["p75"].as_u64().unwrap_or(0),
+    //         s["avg2xcnt"].as_f64().unwrap_or(0.0),
+    //         s["cnt0"].as_f64().unwrap_or(0.0),
+    //         s["cnt1"].as_f64().unwrap_or(0.0),
+    //         s["cnt2"].as_f64().unwrap_or(0.0),
+    //     )?;
+    // }
+    // csv_file.flush().await?;
+    //
+    // info!("Streaming coverage complete: {} contigs", stats.len());
 
     Ok(())
 }
