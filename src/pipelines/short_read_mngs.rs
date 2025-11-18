@@ -2782,14 +2782,22 @@ pub async fn generate_assembly_coverage(
     coverage_csv_path: &PathBuf,
 ) -> Result<()> {
     let mut cleanup_tasks = Vec::new();
+
     // early exit for insufficient vontigs
-    if fs::metadata(contigs_fasta_path).await?.len() < 50 {
-        warn!("Contigs FASTA continas fewer than 50 lines. Aborting generate_assembly_coverage ");
-        fs::write(coverage_json_path, "{}").await?;
-        fs::write(coverage_csv_path, "No Contigs\n").await?;
+    let meta = match fs::metadata(&contigs_fasta_path).await {
+        Ok(m) => m,
+        Err(_) => {
+            fs::write(&coverage_json_path, "{}").await?;
+            fs::write(&coverage_csv_path, "No Contigs\n").await?;
+            return Ok(());
+        }
+    };
+
+    if meta.len() < 50 {
+        fs::write(&coverage_json_path, "{}").await?;
+        fs::write(&coverage_csv_path, "No Contigs\n").await?;
         return Ok(());
     }
-
 
 
     //dummy
