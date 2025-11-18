@@ -53,7 +53,7 @@ use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
 use crate::utils::command::spades::SpadesConfig;
-use crate::utils::sambam::generate_info_from_sam_stream;
+use crate::utils::sambam::generate_info_from_bam_stream;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
@@ -2677,7 +2677,7 @@ pub async fn process_assembly(
         subcommand_fields: HashMap::from([
             ("-n".to_string(), None), // Name-sorted for fastq extraction
             ("-u".to_string(), None),
-            ("-O".to_string(), Some("sam".to_string())), // SAM for direct reading
+            ("-O".to_string(), Some("bam".to_string())), // uncompressed BAM for noodles to consume
             ("-".to_string(), None),
         ]),
     };
@@ -2737,7 +2737,7 @@ pub async fn process_assembly(
      let sam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
      let sam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-     let sam_path = out_dir.join("read-contig.sam");
+     let sam_path = out_dir.join("read-contig.bam");
 
      let write_sam_task = write_byte_stream_to_file(
          &sam_path,
@@ -2747,11 +2747,12 @@ pub async fn process_assembly(
          .await?;
      cleanup_tasks.push(write_sam_task);
 
-    let contig_stats = generate_info_from_sam_stream(
+    let contig_stats = generate_info_from_bam_stream(
         sam_for_stats,
         &duplicate_cluster_sizes,
         config.args.min_contig_length,
     ).await?;
+
 
     Ok((CoverageOutputs {
         contigs_fasta: out_dir.join("contigs.fasta"),
@@ -2769,16 +2770,14 @@ pub async fn process_assembly(
 }
 
 
-//
 // pub async fn generate_assembly_coverage(
 //     config: Arc<RunConfig>,
 //     sam_path: &PathBuf,
 //     contigs_fasta_path: &PathBuf,
 //     coverage_json_path: &PathBuf,
 //     coverage_csv_path: &PathBuf,
-//
 // ) -> Result<()> {
-//     // Early exit if low covergae
+//     // Early exit: tiny contigs → CZID dummy outputs
 //     if fs::metadata(contigs_fasta_path).await?.len() < 50 {
 //         fs::write(coverage_json_path, "{}").await?;
 //         fs::write(coverage_csv_path, "No Contigs\n").await?;
@@ -2787,13 +2786,138 @@ pub async fn process_assembly(
 //
 //     info!("Computing real coverage from {} → {}", sam_path.display(), coverage_json_path.display());
 //
-//     // Open SAM and read header
-//     let mut file = fs::File::open(sam_path).await?;
-//     let mut reader = sam::AsyncReader::new(&mut file);
+//     // Open + buffer file
+//     let file = fs::File::open(sam_path).await?;
+//     let mut buffered_file = TokioBufReader::new(file);
+//     let mut reader = sam::r#async::io::Reader::new(&mut buffered_file);
+//
+//     // Read header
 //     let header = reader.read_header().await?;
 //
+//     let mut contig_info: Vec<(String, usize)> = Vec::new();
+//     for (name, record) in header.reference_sequences().iter() {
+//         if let Some(nz_len) = record.length() {
+//             let len = nz_len.get();
+//             if len > 0 {
+//                 contig_info.push((name.as_ref().to_string(), len));
+//             }
+//         }
+//     }
 //
+//     if contig_info.is_empty() {
+//         fs::write(coverage_json_path, "{}").await?;
+//         fs::write(coverage_csv_path, "").await?;
+//         return Ok(());
+//     }
+//
+//     // Pre-allocate coverage vectors
+//     let mut coverages: Vec<Vec<u32>> = contig_info
+//         .iter()
+//         .map(|&(_, len)| vec![0u32; len])
+//         .collect();
+//
+//     // Stream records
+//     let mut record = sam::Record::default();
+//     while reader.read_record(&mut record).await? != 0 {
+//         let flags = record.flags()?;
+//         if flags.is_unmapped() {
+//             continue;
+//         }
+//
+//         let rid = record.reference_sequence_id(&header);
+//         let Some(rid) = rid else { continue };
+//
+//         let start = record.alignment_start()?;
+//         let end = record.alignment_end()?;
+//
+//         let cov = &mut coverages[rid as usize];
+//         let start = start.get() as usize;
+//         let end = end.get() as usize;
+//
+//         for pos in (start.saturating_sub(1))..end.min(cov.len()) {
+//             cov[pos] = cov[pos].saturating_add(1);
+//         }
+//     }
+//
+//     // Parallel stats using your thread_pool
+//     let stats: Vec<(String, serde_json::Value)> = config.thread_pool.install(|| {
+//         contig_info.par_iter().zip(coverages.par_iter()).map(|((name, len), cov)| {
+//             let len_f64 = *len as f64;
+//             let sum: u64 = cov.iter().map(|&d| d as u64).sum();
+//             let avg = sum as f64 / len_f64;
+//
+//             let mut sorted = cov.clone();
+//             sorted.sort_unstable();
+//
+//             let p25_idx = (len_f64 * 0.25).min(len_f64 - 1.0) as usize;
+//             let p50_idx = (len_f64 * 0.50).min(len_f64 - 1.0) as usize;
+//             let p75_idx = (len_f64 * 0.75).min(len_f64 - 1.0) as usize;
+//
+//             let p25 = *sorted.get(p25_idx).unwrap_or(&0);
+//             let p50 = *sorted.get(p50_idx).unwrap_or(&0);
+//             let p75 = *sorted.get(p75_idx).unwrap_or(&0);
+//
+//             let avg2x_cnt = cov.iter().filter(|&&d| d as f64 > 2.0 * avg).count() as f64 / len_f64;
+//             let cnt0 = cov.iter().filter(|&&d| d == 0).count() as f64 / len_f64;
+//             let cnt1 = cov.iter().filter(|&&d| d == 1).count() as f64 / len_f64;
+//             let cnt2 = cov.iter().filter(|&&d| d == 2).count() as f64 / len_f64;
+//
+//             let stat = json!({
+//                 "avg": avg,
+//                 "min": *sorted.first().unwrap_or(&0),
+//                 "max": *sorted.last().unwrap_or(&0),
+//                 "p25": p25,
+//                 "p50": p50,
+//                 "p75": p75,
+//                 "avg2xcnt": avg2x_cnt,
+//                 "cnt0": cnt0,
+//                 "cnt1": cnt1,
+//                 "cnt2": cnt2,
+//                 "contig_len": *len as u64,
+//             });
+//
+//             (name.clone(), stat)
+//         }).collect()
+//     });
+//
+//     // Write JSON
+//     let mut json_writer = BufWriter::new(fs::File::create(coverage_json_path).await?);
+//     json_writer.write_all(b"{").await?;
+//     for (i, (name, stat)) in stats.iter().enumerate() {
+//         if i > 0 { json_writer.write_all(b",").await?; }
+//         json_writer.write_all(format!(r#""{}":{}"#, name, stat).as_bytes()).await?;
+//     }
+//     json_writer.write_all(b"}").await?;
+//     json_writer.flush().await?;
+//
+//     // Write CSV — 11 fields
+//     let mut csv_writer = BufWriter::new(fs::File::create(coverage_csv_path).await?);
+//     csv_writer.write_all(b"contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2\n").await?;
+//     for (name, stat) in &stats {
+//         let s = stat.as_object().unwrap();
+//         let line = format!(
+//             "{},{:.6},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:6}\n",
+//             name,
+//             s["avg"].as_f64().unwrap_or(0.0),
+//             s["min"].as_u64().unwrap_or(0),
+//             s["max"].as_u64().unwrap_or(0),
+//             s["p25"].as_u64().unwrap_or(0),
+//             s["p50"].as_u64().unwrap_or(0),
+//             s["p75"].as_u64().unwrap_or(0),
+//             s["avg2xcnt"].as_f64().unwrap_or(0.0),
+//             s["cnt0"].as_f64().unwrap_or(0.0),
+//             s["cnt1"].as_f64().unwrap_or(0.0),
+//             s["cnt2"].as_f64().unwrap_or(0.0),
+//         );
+//         csv_writer.write_all(line.as_bytes()).await?;
+//     }
+//     csv_writer.flush().await?;
+//
+//     info!("Real coverage computed: {} contigs", stats.len());
+//     Ok(())
 // }
+
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -3238,6 +3362,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
 
     let _ = fs::remove_dir_all(assembly_work_dir).await;
+
+    eprintln!("contigs stats len {}", assembly_outputs.contig_stats.len());
 
     
     // *******************

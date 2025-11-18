@@ -1,12 +1,16 @@
-use std::collections::{HashMap, HashSet};
-
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use futures::StreamExt;
-use anyhow::{Result, anyhow};
+use noodles::bam::r#async::io::Reader as BamAsyncReader;
+use noodles::bam::record::Record;
+use noodles::sam::Header;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
+use tokio_util::io::StreamReader;
 use crate::utils::streams::ParseOutput;
-
 
 pub async fn stream_sam_alignment_counter(
     rx: mpsc::Receiver<ParseOutput>,
@@ -36,53 +40,77 @@ pub async fn stream_sam_alignment_counter(
 }
 
 
-pub async fn generate_info_from_sam_stream(
+fn anyhow_to_io(e: anyhow::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
     duplicate_cluster_sizes: &HashMap<String, u64>,
     min_contig_size: usize,
 ) -> Result<HashMap<String, u64>> {
-    let mut stream = ReceiverStream::new(rx);
-    let mut contig_stats = HashMap::new();
-    let mut contig_unique_counts = HashMap::new();
-    let mut seen = HashSet::new();
 
-    while let Some(item) = stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => return Err(anyhow!("Expected Bytes in SAM stream")),
-        };
+    let byte_stream = ReceiverStream::new(rx).map(|item| match item {
+        ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())), // Clone Vec<u8>, then to Bytes
+        _ => Err(anyhow_to_io(anyhow!(
+            "BAM stream received non-Bytes variant — data loss prevented"
+        ))),
+    });
 
-        let line = std::str::from_utf8(&bytes)
-            .map_err(|e| anyhow!("SAM line not UTF-8: {}", e))?;
+    let stream_reader = StreamReader::new(byte_stream);
+    let mut bam_reader = BamAsyncReader::new(stream_reader);
 
-        if line.starts_with('@') {
-            continue;
+    let header = bam_reader
+        .read_header()
+        .await
+        .map_err(|e| anyhow!("BAM header error: {e}"))?;
+
+    let mut contig_stats = HashMap::with_capacity(1024);
+    let mut contig_unique_counts = HashMap::with_capacity(1024);
+    let mut seen_reads = HashSet::with_capacity(20_000_000); // Scales to 100M+ reads, fits 1.5TB RAM
+    let mut record = Record::default(); // Reused: zero per-record allocs
+
+    loop {
+        match bam_reader.read_record(&mut record).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let flags = record.flags();
+                if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+                    continue;
+                }
+
+                let read_name = record
+                    .name()
+                    .and_then(|b| std::str::from_utf8(b.as_ref()).ok())
+                    .unwrap_or("*")
+                    .to_string();
+
+                if !seen_reads.insert(read_name.clone()) {
+                    continue;
+                }
+
+                let rid = record
+                    .reference_sequence_id()
+                    .ok_or_else(|| anyhow!("Missing reference_sequence_id"))??;
+
+                let contig_name = header
+                    .reference_sequences()
+                    .get_index(rid)
+                    .ok_or_else(|| anyhow!("Invalid reference ID {rid:?}"))?
+                    .0
+                    .to_string();
+
+                let cluster_size = duplicate_cluster_sizes.get(&read_name).copied().unwrap_or(1);
+                *contig_stats.entry(contig_name.clone()).or_insert(0u64) += cluster_size;
+                *contig_unique_counts.entry(contig_name).or_insert(0usize) += 1;
+            }
+            Err(e) => return Err(anyhow!("BAM record error: {e}")), // Propagate: no silent drops
         }
-
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 3 {
-            continue;
-        }
-
-        let read = fields[0];
-        if seen.contains(read) {
-            continue;
-        }
-        seen.insert(read.to_string());
-
-        let contig = fields[2];
-        if contig == "*" {
-            continue;
-        }
-
-        let cluster_size = duplicate_cluster_sizes.get(read).copied().unwrap_or(1);
-        *contig_stats.entry(contig.to_string()).or_insert(0) += cluster_size;
-        *contig_unique_counts.entry(contig.to_string()).or_insert(0) += 1;
     }
 
-    // Filter by min_contig_size
-    contig_stats.retain(|contig, _| {
-        contig_unique_counts.get(contig).copied().unwrap_or(0) >= min_contig_size
+    // Retain contigs with >= min_contig_size unique reads
+    contig_stats.retain(|contig_name, _| {
+        contig_unique_counts.get(contig_name).copied().unwrap_or(0) >= min_contig_size
     });
 
     Ok(contig_stats)
