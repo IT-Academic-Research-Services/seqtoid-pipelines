@@ -19,20 +19,27 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
+use tokio::process::Command;
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
-use sled::Tree;
 use twox_hash::XxHash64;
 use fst::Map;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use noodles::bam::r#async::io::Reader as BamAsyncReader;
+use noodles::bam::record::Record;
+use bytes::Bytes;
+use noodles::sam::alignment::record::cigar::{op::Kind as OpKind, Op};
+use tokio_util::io::StreamReader;
+use rayon::prelude::*;
+use needletail::parse_fastx_file;
+use dashmap::DashMap;
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
+use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header, read_fasta};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
@@ -50,6 +57,8 @@ use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
+use crate::utils::command::spades::SpadesConfig;
+use crate::utils::sambam::generate_info_from_bam_stream;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
@@ -106,6 +115,25 @@ pub struct TaxonMetrics {
     pub e_value: f64,
     pub base_count: u64,
     pub source_count_type: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+pub struct AssemblyHandle {
+    pub spades_task: JoinHandle<Result<(), anyhow::Error>>,
+    pub work_dir: PathBuf,
+    pub out_dir: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct CoverageOutputs {
+    pub contigs_fasta: PathBuf,
+    pub contigs_all_fasta: PathBuf,
+    pub scaffolds_fasta: PathBuf,
+    pub sam_path: PathBuf,
+    pub contig_stats_json: PathBuf,
+    pub coverage_json: PathBuf,
+    pub coverage_summary_csv: PathBuf,
+    pub contig_stats: HashMap<String, u64>,
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -224,6 +252,7 @@ async fn bowtie2_filter(
     // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
+        paired: paired,
         option_fields: bowtie2_options,
     };
 
@@ -1669,7 +1698,7 @@ pub async fn call_hits_m8_stream(
                     }
                     valid_hits.push(hit.clone());
                 } else {
-                    debug!("Missing taxid for accession: {}", hit.tname);
+                    // debug!("Missing taxid for accession: {}", hit.tname);
                 }
             }
 
@@ -1828,9 +1857,6 @@ async fn diamond_non_host_align(
     let temp_path = temp_output.path().to_path_buf();
 
 
-    // --------------------------------------------------------------------- //
-    // 3. Build DIAMOND CLI (note the explicit -o <temp>)
-    // --------------------------------------------------------------------- //
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
         ("-f".to_string(), Some("6".to_string())),
@@ -2376,6 +2402,591 @@ pub async fn generate_annotated_fasta(
     ))
 }
 
+
+/// Runs spades assembler
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Raw byte FASTQ stream
+///
+/// # Returns
+async fn spades_assembly(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    out_dir: PathBuf,
+    paired: bool,
+    sample_base_buf: PathBuf,
+)  -> Result<(
+    AssemblyHandle,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+),  PipelineError>
+
+{
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let spades_out_dir = out_dir.join("assembly");
+    fs::create_dir_all(&spades_out_dir).await?;
+    let spades_work_dir =  config.ram_temp_dir.join("spades");
+    fs::create_dir_all(&spades_work_dir).await?;
+
+    let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
+
+    let write_input_task = tokio::spawn({
+        let input_file_path = input_file_path.clone();
+
+        async move {
+            let file = TokioFile::create(&input_file_path).await
+                .map_err(|e| anyhow!("Cannot create SPAdes input file {}: {}", input_file_path.display(), e))?;
+            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+
+            let mut stream = input_stream;
+            let mut total_bytes = 0u64;
+
+            while let Some(item) = stream.next().await {
+
+                let bytes = item.to_bytes()
+                    .map_err(|e| anyhow!("Failed to convert ParseOutput to FASTQ bytes: {}", e))?;
+
+                writer.write_all(&bytes).await
+                    .map_err(|e| anyhow!("Write error to {}: {}", input_file_path.display(), e))?;
+
+                total_bytes += bytes.len() as u64;
+            }
+
+            writer.flush().await
+                .map_err(|e| anyhow!("Flush error to {}: {}", input_file_path.display(), e))?;
+
+            info!(
+            "SPAdes input written: {} ({} bytes)",
+            input_file_path.display(),
+            total_bytes
+        );
+
+            if total_bytes == 0 {
+                warn!("SPAdes input file is empty – no non-host reads");
+            }
+            Ok::<PathBuf, anyhow::Error>(input_file_path)
+        }
+    });
+
+    let input_file_path = write_input_task.await??;
+
+    let spades_config = SpadesConfig {
+        input_path: input_file_path.clone(),
+        outdir_path: spades_out_dir.clone(),
+        paired: paired,
+
+        option_fields: HashMap::from([
+            ("--only-assembler".to_string(), None),
+            ("--isolate".to_string(), None),
+        ]),
+    };
+    let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SPADES_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+
+    let (mut spades_child, spades_err_task) = spawn_cmd(
+        config.clone(),
+        SPADES_TAG,
+        spades_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SPADES_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(spades_err_task);
+
+
+    let spades_task = tokio::spawn(async move {
+        let output = spades_child.wait_with_output().await?;
+        eprintln!("SPAdes exit: {:?}", output.status);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("SPAdes FAILED:\n{}", stderr);
+            return Err(anyhow!("SPAdes failed: {}", stderr));
+        }
+        Ok(())
+    });
+
+    Ok((AssemblyHandle {
+        spades_task,
+        work_dir: spades_work_dir,
+        out_dir: spades_out_dir}, cleanup_tasks, cleanup_receivers))
+}
+
+
+pub async fn process_assembly(
+    config: Arc<RunConfig>,
+    out_dir: &PathBuf,
+    work_dir: &PathBuf,
+    bowtie_stream: ReceiverStream<ParseOutput>,
+    duplicate_cluster_sizes: HashMap<String, u64>,
+    paired: bool,
+) -> Result<(
+           CoverageOutputs,
+           ReceiverStream<ParseOutput>,
+           Vec<JoinHandle<Result<()>>>,
+           Vec<oneshot::Receiver<Result<()>>>,
+       ),  PipelineError>
+
+ {
+    let mut cleanup_tasks = Vec::new();let mut cleanup_receivers = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
+
+    let raw_contigs_path    = work_dir.join("contigs.fasta");
+    let raw_scaffolds_path  = work_dir.join("scaffolds.fasta");
+
+     let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
+
+    let spades_success = if raw_contigs_path.exists() {
+        fs::metadata(&raw_contigs_path).await?.len() > 0
+    } else {
+        false
+    };
+
+    // if it failed write empty data
+    if !spades_success {
+
+        let dummy = ";ASSEMBLY FAILED";
+        let empty_sam = "@NO INFO\n";
+        let empty_json = "{}";
+
+        fs::write(out_dir.join("contigs.fasta"), dummy).await?;
+        fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
+        fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
+        fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
+        fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
+
+        return Ok((CoverageOutputs {
+            contigs_fasta: out_dir.join("contigs.fasta"),
+            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+            sam_path: out_dir.join("read-contig.sam"),
+            contig_stats_json: out_dir.join("contig_stats.json"),
+            coverage_json: out_dir.join("assembly_contig_coverage.json"),
+            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+            contig_stats: HashMap::new(),
+        }, ReceiverStream::new(empty_rx), cleanup_tasks,  cleanup_receivers));
+    }
+
+    let contigs_all_out = out_dir.join("contigs_all.fasta");
+    fs::copy(&raw_contigs_path, &contigs_all_out).await?;
+
+    let contigs_out = out_dir.join("contigs.fasta");
+
+    //contig length filtering
+    let rx = read_fasta(
+        raw_contigs_path.clone(),
+        u64::MAX,           // no record limit
+        Some(config.args.min_contig_length),
+        None,
+        8192,
+    ).map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
+
+    let (write_task, temp_path, _temp) = write_parse_output_to_temp_file(
+        ReceiverStream::new(rx),
+        None,
+        Some(".fasta"),
+        config.ram_temp_dir.clone(),
+    ).await?;
+    temp_files.push(_temp);
+
+    write_task.await??;
+    tokio::fs::rename(&temp_path, &contigs_out).await?;
+
+    let scaffolds_out = out_dir.join("scaffolds.fasta");
+    let spades_scaffolds = work_dir.join("scaffolds.fasta");
+    if spades_scaffolds.exists() {
+        fs::copy(&spades_scaffolds, &scaffolds_out).await?;
+    } else {
+        fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
+    }
+
+    // bt2 index
+    let index_dir = out_dir.join("bowtie_index");
+    fs::create_dir_all(&index_dir).await?;
+    let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
+
+    let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
+
+    let build_status = Command::new("bowtie2-build")
+        .args([
+            "--threads",
+            &num_index_cores.to_string(),
+            "--quiet",
+            contigs_out.to_str().unwrap(),
+            index_prefix.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
+
+    if !build_status.success() {
+        return Err(PipelineError::ToolExecution {tool: BOWTIE2_TAG.to_string(), error: build_status.to_string()});
+    }
+
+    let bt2_options = HashMap::from([
+        ("--very-sensitive".to_string(), None),
+    ]);
+
+    // BT2
+    let bt2_config_view = Bowtie2Config {
+        bt2_index_path: index_prefix,
+        paired: paired,
+        option_fields: bt2_options,
+    };
+
+    let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    eprintln!("Bowtie 2 args: {:?}", bt2_args);
+    let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
+        config.clone(),
+        bowtie_stream.into_inner(),
+        BOWTIE2_TAG,
+        bt2_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(bt2_stream_task);
+    cleanup_tasks.push(bt2_err_task);
+
+    let bt2_out_stream = {
+        let mut guard = bt2_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BOWTIE2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // Sort, output uncompressed BAM
+    let samtools_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None), // Name-sorted for fastq extraction
+            ("-u".to_string(), None),
+            ("-O".to_string(), Some("bam".to_string())), // uncompressed BAM for noodles to consume
+            ("-".to_string(), None),
+        ]),
+    };
+    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+        config.clone(),
+        bt2_out_stream,
+        SAMTOOLS_TAG,
+        samtools_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(samtools_sort_task);
+    cleanup_tasks.push(samtools_sort_err_task);
+
+    let samtools_sort_out_stream = {
+        let mut guard = samtools_sort_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+     let (non_host_streams, non_host_done_rx) = t_junction(
+         ReceiverStream::new(samtools_sort_out_stream),
+         2,
+         config.base_buffer_size,
+         config.args.stall_threshold,
+         None,
+         100,
+         StreamDataType::IlluminaFastq,
+         "process_assembly_sam".to_string(),
+         None,
+     )
+         .await
+         .map_err(|_| PipelineError::StreamDataDropped)?;
+     cleanup_receivers.push(non_host_done_rx);
+
+     let mut non_host_streams_iter = non_host_streams.into_iter();
+     let bam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+     let bam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+     let bam_for_output = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+     let sam_path = out_dir.join("read-contig.bam");
+
+     let write_sam_task = write_byte_stream_to_file(
+         &sam_path,
+         ReceiverStream::new(bam_for_file),
+         Some(config.base_buffer_size),
+     )
+         .await?;
+     cleanup_tasks.push(write_sam_task);
+
+    let contig_stats = generate_info_from_bam_stream(
+        bam_for_stats,
+        &duplicate_cluster_sizes,
+        config.args.min_contig_length,
+    ).await?;
+     // let contig_stats = HashMap::with_capacity(1024);
+
+
+    Ok((CoverageOutputs {
+        contigs_fasta: out_dir.join("contigs.fasta"),
+        contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+        scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+        sam_path: out_dir.join("read-contig.sam"),
+        contig_stats_json: out_dir.join("contig_stats.json"),
+        coverage_json: out_dir.join("assembly_contig_coverage.json"),
+        coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+        contig_stats: contig_stats,
+    }, ReceiverStream::new(bam_for_output), cleanup_tasks,  cleanup_receivers))
+
+
+
+}
+
+
+/// Generates assembly coverage stats from BAM stream (using noodles) and results of process_assembly
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `assembly_bam_rx` - Uncompressed BAM stream
+/// * `contigs_fasta_path` - PAth to contigs fasta file
+/// * `coverage_json_path` - JSON file containing coverage data
+/// * `coverage_csv_path` - CSV of coverage summary
+///
+///
+/// # Returns
+/// Result
+pub async fn generate_assembly_coverage(
+    config: Arc<RunConfig>,
+    assembly_bam_rx: ReceiverStream<ParseOutput>,
+    contigs_fasta_path: &PathBuf,
+    coverage_json_path: &PathBuf,
+    coverage_csv_path: &PathBuf,
+) -> Result<()> {
+    // Early exit
+    let meta = fs::metadata(contigs_fasta_path).await
+        .map_err(|_| anyhow!("contigs metadata fail"))?;
+    if meta.len() < 50 {
+        fs::write(coverage_json_path, "{}").await?;
+        fs::write(coverage_csv_path, "No Contigs\n").await?;
+        return Ok(());
+    }
+
+    info!("Streaming coverage: {} → {}", contigs_fasta_path.display(), coverage_json_path.display());
+
+    // Load contigs
+    let (contig_order, contig_lengths): (Vec<String>, HashMap<String, usize>) = {
+        let mut reader = parse_fastx_file(contigs_fasta_path)
+            .map_err(|e| anyhow!("needletail open fail: {e}"))?;
+        let mut order = Vec::with_capacity(100_000);
+        let mut lengths = HashMap::with_capacity(100_000);
+
+        while let Some(record) = reader.next() {
+            let rec = record.map_err(|e| anyhow!("needletail parse fail: {e}"))?;
+            let id = String::from_utf8_lossy(rec.id()).into_owned();
+            let len = rec.seq().len();
+            if len > 0 {
+                order.push(id.clone());
+                lengths.insert(id, len);
+            }
+        }
+        if order.is_empty() {
+            fs::write(coverage_json_path, "{}").await?;
+            fs::write(coverage_csv_path, "No Contigs\n").await?;
+            return Ok(());
+        }
+        (order, lengths)
+    };
+
+    // Pre-alloc depths
+    let depths: Arc<DashMap<String, Vec<u32>>> = Arc::new(DashMap::with_capacity(contig_lengths.len()));
+    for name in &contig_order {
+        if let Some(&len) = contig_lengths.get(name) {
+            depths.insert(name.clone(), vec![0u32; len + 1]);
+        }
+    }
+
+    // Stream BAM
+    let byte_stream = assembly_bam_rx.map(|item| match item {
+        ParseOutput::Bytes(b) => Ok(Bytes::from(b.to_vec())),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "non-bytes in BAM stream")),
+    });
+    let stream_reader = StreamReader::new(byte_stream);
+    let mut bam_reader = BamAsyncReader::new(stream_reader);
+    let header = bam_reader.read_header().await?;
+    let mut record = Record::default();
+
+    while bam_reader.read_record(&mut record).await? > 0 {
+        let flags = record.flags();
+        if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+            continue;
+        }
+
+        let rid = match record.reference_sequence_id() {
+            Some(Ok(rid)) => rid as usize,
+            _ => continue,
+        };
+
+        let contig_name = match header.reference_sequences().get_index(rid) {
+            Some((name, _)) => name.to_string(),
+            None => continue,
+        };
+
+        let mut entry = depths.get_mut(&contig_name).unwrap_or_else(|| {
+            panic!("Contig {} not pre-allocated", contig_name);
+        });
+
+        let start_pos = match record.alignment_start() {
+            Some(Ok(p)) => p.get(),
+            _ => continue,
+        };
+        let mut pos = start_pos.saturating_sub(1);
+
+        for op in record.cigar().iter().filter_map(Result::ok) {
+            let kind = op.kind();
+            let len = op.len() as usize;
+
+            match kind {
+                OpKind::Match | OpKind::Insertion | OpKind::SequenceMatch | OpKind::SequenceMismatch => {
+                    let end = (pos + len).min(entry.len());
+                    for i in pos..end {
+                        entry[i] = entry[i].saturating_add(1);
+                    }
+                    pos = end;
+                }
+                OpKind::Deletion | OpKind::Skip => {
+                    pos = (pos + len).min(entry.len());
+                }
+                OpKind::SoftClip | OpKind::HardClip | OpKind::Pad => {}
+            }
+        }
+    }
+
+    // Parallel stats
+    let stats: Vec<(String, Value)> = config.thread_pool.install(|| {
+        contig_order.par_iter().filter_map(|name| {
+            let entry = depths.get(name)?;
+            let len = contig_lengths[name];
+            let cov = &entry[..=len];
+
+            let sum: u64 = cov.iter().map(|&d| d as u64).sum();
+            let avg = sum as f64 / len as f64;
+
+            let mut sorted = cov.to_vec();
+            sorted.sort_unstable();
+
+            let p25 = sorted[((len as f64 * 0.25) as usize).min(len - 1)];
+            let p50 = sorted[((len as f64 * 0.50) as usize).min(len - 1)];
+            let p75 = sorted[((len as f64 * 0.75) as usize).min(len - 1)];
+            let min = *sorted.first()?;
+            let max = *sorted.last()?;
+
+            let avg2xcnt = cov.iter().filter(|&&d| d as f64 > 2.0 * avg).count() as f64 / len as f64;
+            let cnt0 = cov.iter().filter(|&&d| d == 0).count() as f64 / len as f64;
+            let cnt1 = cov.iter().filter(|&&d| d == 1).count() as f64 / len as f64;
+            let cnt2 = cov.iter().filter(|&&d| d == 2).count() as f64 / len as f64;
+
+            let coverage_array: Vec<u64> = cov.iter().map(|&d| d as u64).collect();
+
+            Some((
+                name.clone(),
+                json!({
+                    "coverage": coverage_array,
+                    "avg": avg,
+                    "min": min as u64,
+                    "max": max as u64,
+                    "p25": p25 as u64,
+                    "p50": p50 as u64,
+                    "p75": p75 as u64,
+                    "avg2xcnt": avg2xcnt,
+                    "cnt0": cnt0,
+                    "cnt1": cnt1,
+                    "cnt2": cnt2,
+                    "contig_len": len as u64,
+                }),
+            ))
+        }).collect()
+    });
+
+    // Async write — using AsyncWriteExt
+    let mut json_file = BufWriter::new(TokioFile::create(coverage_json_path).await?);
+    let mut csv_file = BufWriter::new(TokioFile::create(coverage_csv_path).await?);
+
+    csv_file.write_all(b"contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2\n").await?;
+    json_file.write_all(b"{").await?;
+
+    for (i, (name, stat)) in stats.iter().enumerate() {
+        if i > 0 {
+            json_file.write_all(b",").await?;
+        }
+        let line = format!(r#""{}":{}"#, name, stat);
+        json_file.write_all(line.as_bytes()).await?;
+    }
+    json_file.write_all(b"}").await?;
+    json_file.flush().await?;
+
+    for (name, stat) in &stats {
+        let s = stat.as_object().unwrap();
+        let line = format!(
+            "{},{:.6},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+            name,
+            s["avg"].as_f64().unwrap_or(0.0),
+            s["min"].as_u64().unwrap_or(0),
+            s["max"].as_u64().unwrap_or(0),
+            s["p25"].as_u64().unwrap_or(0),
+            s["p50"].as_u64().unwrap_or(0),
+            s["p75"].as_u64().unwrap_or(0),
+            s["avg2xcnt"].as_f64().unwrap_or(0.0),
+            s["cnt0"].as_f64().unwrap_or(0.0),
+            s["cnt1"].as_f64().unwrap_or(0.0),
+            s["cnt2"].as_f64().unwrap_or(0.0),
+        );
+        csv_file.write_all(line.as_bytes()).await?;
+    }
+    csv_file.flush().await?;
+
+    info!("Coverage complete — {} contigs", stats.len());
+    Ok(())
+}
+
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -2407,7 +3018,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // External tools check
-    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, CZID_DEDUP_TAG])
+    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG])
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -2611,13 +3222,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
-        3,
+        5,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
         100,
         StreamDataType::IlluminaFastq,
-        "non_host_mm2_dmnd_input".to_string(),
+        "non_host_output".to_string(),
         None,
     )
         .await
@@ -2628,6 +3239,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+
+    // This is part of post-process starting here
+
+    let (assembly_handle, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
+        config.clone(),
+        ReceiverStream::new(non_host_assembly_stream),
+        out_dir.clone(),
+        paired,
+        sample_base_buf.clone(),
+    ).await?;
+
+    cleanup_tasks.append(&mut assembly_cleanup_tasks);
+    cleanup_receivers.append(&mut assembly_cleanup_receivers);
 
 
     // Minimap2 non_host alignment
@@ -2778,6 +3406,45 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
 
+    // *******************
+    // Post-processing
+    // *******************
+
+    // Assembly stats
+
+    let assembly_out_dir = &assembly_handle.out_dir;
+    let assembly_work_dir =  &assembly_handle.work_dir;
+
+    assembly_handle.spades_task.await??;
+
+    let (assembly_outputs, assembly_bam_out_stream, mut post_assembly_cleanup_tasks, mut post_assembly_cleanup_receivers) = process_assembly(
+        config.clone(),
+        assembly_out_dir,
+        assembly_work_dir,
+        ReceiverStream::new(non_host_coverage_bt2_stream),
+        duplicate_cluster_sizes.clone(),
+        paired
+    ).await?;
+
+    // Push cleanup tasks
+    cleanup_tasks.extend(post_assembly_cleanup_tasks);
+    cleanup_receivers.extend(post_assembly_cleanup_receivers);
+
+    let _ = fs::remove_dir_all(assembly_work_dir).await;
+
+    eprintln!("contigs stats len {}", assembly_outputs.contig_stats.len());
+
+    let generate_assembly_coverage_result = generate_assembly_coverage(
+        config.clone(),
+        assembly_bam_out_stream,
+        &assembly_outputs.contigs_fasta,
+        &assembly_outputs.coverage_json,
+        &assembly_outputs.coverage_summary_csv,
+    )
+        .await
+        .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
+    eprintln!("coverage result {:?}", generate_assembly_coverage_result);
+    
     // *******************
     // Results retrieval
     // *******************

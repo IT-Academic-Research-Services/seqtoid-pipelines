@@ -191,4 +191,7 @@ pub struct Arguments {
 
     #[arg(long, default_value = "nr.dmnd")]
     pub diamond_db: Option<String>,
+
+    #[arg(long, default_value_t = 100)]
+    pub min_contig_length: usize,
 }
