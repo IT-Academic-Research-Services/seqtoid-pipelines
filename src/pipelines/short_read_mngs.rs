@@ -30,9 +30,9 @@ use twox_hash::XxHash64;
 use fst::Map;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use noodles::sam as sam;
-use noodles::bam::r#async::io::Reader as BamAsyncReader;
-use noodles::bam::record::Record;
+// use noodles::sam as sam;
+// use noodles::bam::r#async::io::Reader as BamAsyncReader;
+// use noodles::bam::record::Record;
 
 use needletail::{parse_fastx_file, FastxReader};
 use dashmap::DashMap;
@@ -58,7 +58,7 @@ use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
 use crate::utils::command::spades::SpadesConfig;
-use crate::utils::sambam::generate_info_from_bam_stream;
+// use crate::utils::sambam::generate_info_from_bam_stream;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
@@ -2757,11 +2757,12 @@ pub async fn process_assembly(
          .await?;
      cleanup_tasks.push(write_sam_task);
 
-    let contig_stats = generate_info_from_bam_stream(
-        bam_for_stats,
-        &duplicate_cluster_sizes,
-        config.args.min_contig_length,
-    ).await?;
+    // let contig_stats = generate_info_from_bam_stream(
+    //     bam_for_stats,
+    //     &duplicate_cluster_sizes,
+    //     config.args.min_contig_length,
+    // ).await?;
+     let contig_stats = HashMap::with_capacity(1024);
 
 
     Ok((CoverageOutputs {
@@ -2844,6 +2845,8 @@ pub async fn generate_assembly_coverage(
             depths.insert(name.clone(), vec![0u32; len + 1]); // +1 to avoid bounds checks
         }
     }
+
+    eprintln!("vectors allocated.");
 
     // 4. Stream BAM bytes → increment coverage
     // let mut channel_reader = ChannelReader::new(assembly_bam_rx);
