@@ -19,22 +19,22 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tokio::sync::Notify;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tokio::process::Command;
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
-use sled::Tree;
 use twox_hash::XxHash64;
 use fst::Map;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-// use noodles::sam as sam;
-// use noodles::bam::r#async::io::Reader as BamAsyncReader;
-// use noodles::bam::record::Record;
-
-use needletail::{parse_fastx_file, FastxReader};
+use noodles::bam::r#async::io::Reader as BamAsyncReader;
+use noodles::bam::record::Record;
+use bytes::Bytes;
+use noodles::sam::alignment::record::cigar::{op::Kind as OpKind, Op};
+use tokio_util::io::StreamReader;
+use rayon::prelude::*;
+use needletail::parse_fastx_file;
 use dashmap::DashMap;
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
@@ -58,7 +58,7 @@ use crate::utils::paf::PafRecord;
 use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
 use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
 use crate::utils::command::spades::SpadesConfig;
-// use crate::utils::sambam::generate_info_from_bam_stream;
+use crate::utils::sambam::generate_info_from_bam_stream;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 
@@ -2757,12 +2757,12 @@ pub async fn process_assembly(
          .await?;
      cleanup_tasks.push(write_sam_task);
 
-    // let contig_stats = generate_info_from_bam_stream(
-    //     bam_for_stats,
-    //     &duplicate_cluster_sizes,
-    //     config.args.min_contig_length,
-    // ).await?;
-     let contig_stats = HashMap::with_capacity(1024);
+    let contig_stats = generate_info_from_bam_stream(
+        bam_for_stats,
+        &duplicate_cluster_sizes,
+        config.args.min_contig_length,
+    ).await?;
+     // let contig_stats = HashMap::with_capacity(1024);
 
 
     Ok((CoverageOutputs {
@@ -2781,206 +2781,208 @@ pub async fn process_assembly(
 }
 
 
+/// Generates assembly coverage stats from BAM stream (using noodles) and results of process_assembly
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `assembly_bam_rx` - Uncompressed BAM stream
+/// * `contigs_fasta_path` - PAth to contigs fasta file
+/// * `coverage_json_path` - JSON file containing coverage data
+/// * `coverage_csv_path` - CSV of coverage summary
+///
+///
+/// # Returns
+/// Result
 pub async fn generate_assembly_coverage(
     config: Arc<RunConfig>,
-    assembly_bam_rx: mpsc::Receiver<ParseOutput>,
+    assembly_bam_rx: ReceiverStream<ParseOutput>,
     contigs_fasta_path: &PathBuf,
     coverage_json_path: &PathBuf,
     coverage_csv_path: &PathBuf,
 ) -> Result<()> {
-    // let mut cleanup_tasks = Vec::new();
-
-    // early exit for insufficient vontigs
-    let meta = match fs::metadata(&contigs_fasta_path).await {
-        Ok(m) => m,
-        Err(_) => {
-            fs::write(&coverage_json_path, "{}").await?;
-            fs::write(&coverage_csv_path, "No Contigs\n").await?;
-            return Ok(());
-        }
-    };
-
+    // Early exit
+    let meta = fs::metadata(contigs_fasta_path).await
+        .map_err(|_| anyhow!("contigs metadata fail"))?;
     if meta.len() < 50 {
-        fs::write(&coverage_json_path, "{}").await?;
-        fs::write(&coverage_csv_path, "No Contigs\n").await?;
+        fs::write(coverage_json_path, "{}").await?;
+        fs::write(coverage_csv_path, "No Contigs\n").await?;
         return Ok(());
     }
 
     info!("Streaming coverage: {} → {}", contigs_fasta_path.display(), coverage_json_path.display());
 
-    // 2. Load contig order + lengths with needletail (preserves SPAdes order exactly)
+    // Load contigs
     let (contig_order, contig_lengths): (Vec<String>, HashMap<String, usize>) = {
-        let mut reader = parse_fastx_file(&contigs_fasta_path)
-            .map_err(|e| anyhow!("Failed to open contigs.fasta with needletail: {}", e))?;
-
-        let mut order = Vec::new();
+        let mut reader = parse_fastx_file(contigs_fasta_path)
+            .map_err(|e| anyhow!("needletail open fail: {e}"))?;
+        let mut order = Vec::with_capacity(100_000);
         let mut lengths = HashMap::with_capacity(100_000);
 
         while let Some(record) = reader.next() {
-            let record = record.map_err(|e| anyhow!("needletail parse error: {}", e))?;
-            let id = std::str::from_utf8(record.id())
-                .map_err(|_| anyhow!("Contig ID is not valid UTF-8"))?
-                .to_string();
-            let len = record.seq().len();
-
+            let rec = record.map_err(|e| anyhow!("needletail parse fail: {e}"))?;
+            let id = String::from_utf8_lossy(rec.id()).into_owned();
+            let len = rec.seq().len();
             if len > 0 {
                 order.push(id.clone());
                 lengths.insert(id, len);
             }
         }
-
         if order.is_empty() {
-            fs::write(&coverage_json_path, "{}").await?;
-            fs::write(&coverage_csv_path, "No Contigs\n").await?;
+            fs::write(coverage_json_path, "{}").await?;
+            fs::write(coverage_csv_path, "No Contigs\n").await?;
             return Ok(());
         }
-
         (order, lengths)
     };
 
-    // 3. Pre-allocate depth vectors — 4 bytes/base
+    // Pre-alloc depths
     let depths: Arc<DashMap<String, Vec<u32>>> = Arc::new(DashMap::with_capacity(contig_lengths.len()));
     for name in &contig_order {
         if let Some(&len) = contig_lengths.get(name) {
-            depths.insert(name.clone(), vec![0u32; len + 1]); // +1 to avoid bounds checks
+            depths.insert(name.clone(), vec![0u32; len + 1]);
         }
     }
 
-    eprintln!("vectors allocated.");
+    // Stream BAM
+    let byte_stream = assembly_bam_rx.map(|item| match item {
+        ParseOutput::Bytes(b) => Ok(Bytes::from(b.to_vec())),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "non-bytes in BAM stream")),
+    });
+    let stream_reader = StreamReader::new(byte_stream);
+    let mut bam_reader = BamAsyncReader::new(stream_reader);
+    let header = bam_reader.read_header().await?;
+    let mut record = Record::default();
 
-    // 4. Stream BAM bytes → increment coverage
-    // let mut channel_reader = ChannelReader::new(assembly_bam_rx);
-    // let mut bam_reader = BamAsyncReader::new(&mut channel_reader);
-    // let header = bam_reader.read_header().await?;
-    // let mut record = Record::default();
-    //
-    // while bam_reader.read_record(&mut record).await? > 0 {
-    //     let flags = record.flags();
-    //     if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
-    //         continue;
-    //     }
-    //
-    //     let Some(rid) = record.reference_sequence_id() else { continue; };
-    //     let Some((contig_name, _)) = header.reference_sequences().get_index(rid as usize) else { continue; };
-    //     let contig_name = contig_name.to_string_lossy().into_owned();
-    //
-    //     if let Some(mut entry) = depths.get_mut(&contig_name) {
-    //         let Some(start) = record.alignment_start() else { continue; };
-    //         let mut pos = (start.get() as usize).saturating_sub(1); // 1-based → 0-based
-    //
-    //         for op in record.cigar().iter() {
-    //             let kind = op.kind();
-    //             let len = op.len() as usize;
-    //
-    //             match kind {
-    //                 Op::Match | Op::SeqMatch | Op::SeqMismatch => {
-    //                     // Vectorised increment — peak Epyc performance
-    //                     if pos + len <= entry.len() {
-    //                         for i in 0..len {
-    //                             entry[pos + i] = entry[pos + i].saturating_add(1);
-    //                         }
-    //                     } else if pos < entry.len() {
-    //                         for i in pos..entry.len() {
-    //                             entry[i] = entry[i].saturating_add(1);
-    //                         }
-    //                     }
-    //                     pos += len;
-    //                 }
-    //                 Op::Del | Op::Skip => pos += len,
-    //                 _ => {} // Ins, SoftClip, HardClip, Pad → no ref consumed
-    //             }
-    //         }
-    //     }
-    // }
-    //
-    // // 5. stats in parallel
-    // let stats: Vec<(String, Value)> = config.thread_pool.install(|| {
-    //     contig_order
-    //         .par_iter()
-    //         .filter_map(|name| {
-    //             let entry = depths.get(name)?;
-    //             let len = contig_lengths[name];
-    //             let cov = &entry[1..=len]; // skip padding
-    //
-    //             let sum: u64 = cov.iter().map(|&d| d as u64).sum();
-    //             let avg = sum as f64 / len as f64;
-    //
-    //             let mut sorted = cov.to_vec();
-    //             sorted.sort_unstable();
-    //
-    //             let p25 = sorted[((len as f64 * 0.25) as usize).min(len - 1)];
-    //             let p50 = sorted[((len as f64 * 0.50) as usize).min(len - 1)];
-    //             let p75 = sorted[((len as f64 * 0.75) as usize).min(len - 1)];
-    //
-    //             let min = *sorted.first().unwrap_or(&0);
-    //             let max = *sorted.last().unwrap_or(&0);
-    //
-    //             let avg2xcnt = cov.iter().filter(|&&d| d as f64 > 2.0 * avg).count() as f64 / len as f64;
-    //             let cnt0 = cov.iter().filter(|&&d| d == 0).count() as f64 / len as f64;
-    //             let cnt1 = cov.iter().filter(|&&d| d == 1).count() as f64 / len as f64;
-    //             let cnt2 = cov.iter().filter(|&&d| d == 2).count() as f64 / len as f64;
-    //
-    //             let coverage_array: Vec<u64> = cov.iter().map(|&d| d as u64).collect();
-    //
-    //             let stat = json!({
-    //                 "coverage": coverage_array,
-    //                 "avg": avg,
-    //                 "min": min,
-    //                 "max": max,
-    //                 "p25": p25,
-    //                 "p50": p50,
-    //                 "p75": p75,
-    //                 "avg2xcnt": avg2xcnt,
-    //                 "cnt0": cnt0,
-    //                 "cnt1": cnt1,
-    //                 "cnt2": cnt2,
-    //                 "contig_len": len as u64,
-    //             });
-    //
-    //             Some((name.clone(), stat))
-    //         })
-    //         .collect()
-    // });
-    //
-    // //6. write outputs
-    //
-    // let mut json_file = BufWriter::new(fs::File::create(&coverage_json_path).await?);
-    // let mut csv_file = BufWriter::new(fs::File::create(&coverage_csv_path).await?);
-    //
-    // writeln!(csv_file, "contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2")?;
-    //
-    // json_file.write_all(b"{").await?;
-    // for (i, (name, stat)) in stats.iter().enumerate() {
-    //     if i > 0 {
-    //         json_file.write_all(b",").await?;
-    //     }
-    //     write!(json_file, r#""{}":{}"#, name, stat).await?;
-    // }
-    // json_file.write_all(b"}").await?;
-    // json_file.flush().await?;
-    //
-    // for (name, stat) in &stats {
-    //     let s = stat.as_object().unwrap();
-    //     writeln!(
-    //         csv_file,
-    //         "{},{:.6},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
-    //         name,
-    //         s["avg"].as_f64().unwrap_or(0.0),
-    //         s["min"].as_u64().unwrap_or(0),
-    //         s["max"].as_u64().unwrap_or(0),
-    //         s["p25"].as_u64().unwrap_or(0),
-    //         s["p50"].as_u64().unwrap_or(0),
-    //         s["p75"].as_u64().unwrap_or(0),
-    //         s["avg2xcnt"].as_f64().unwrap_or(0.0),
-    //         s["cnt0"].as_f64().unwrap_or(0.0),
-    //         s["cnt1"].as_f64().unwrap_or(0.0),
-    //         s["cnt2"].as_f64().unwrap_or(0.0),
-    //     )?;
-    // }
-    // csv_file.flush().await?;
-    //
-    // info!("Streaming coverage complete: {} contigs", stats.len());
+    while bam_reader.read_record(&mut record).await? > 0 {
+        let flags = record.flags();
+        if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+            continue;
+        }
 
+        let rid = match record.reference_sequence_id() {
+            Some(Ok(rid)) => rid as usize,
+            _ => continue,
+        };
+
+        let contig_name = match header.reference_sequences().get_index(rid) {
+            Some((name, _)) => name.to_string(),
+            None => continue,
+        };
+
+        let mut entry = depths.get_mut(&contig_name).unwrap_or_else(|| {
+            panic!("Contig {} not pre-allocated", contig_name);
+        });
+
+        let start_pos = match record.alignment_start() {
+            Some(Ok(p)) => p.get(),
+            _ => continue,
+        };
+        let mut pos = start_pos.saturating_sub(1);
+
+        for op in record.cigar().iter().filter_map(Result::ok) {
+            let kind = op.kind();
+            let len = op.len() as usize;
+
+            match kind {
+                OpKind::Match | OpKind::Insertion | OpKind::SequenceMatch | OpKind::SequenceMismatch => {
+                    let end = (pos + len).min(entry.len());
+                    for i in pos..end {
+                        entry[i] = entry[i].saturating_add(1);
+                    }
+                    pos = end;
+                }
+                OpKind::Deletion | OpKind::Skip => {
+                    pos = (pos + len).min(entry.len());
+                }
+                OpKind::SoftClip | OpKind::HardClip | OpKind::Pad => {}
+            }
+        }
+    }
+
+    // Parallel stats
+    let stats: Vec<(String, Value)> = config.thread_pool.install(|| {
+        contig_order.par_iter().filter_map(|name| {
+            let entry = depths.get(name)?;
+            let len = contig_lengths[name];
+            let cov = &entry[..=len];
+
+            let sum: u64 = cov.iter().map(|&d| d as u64).sum();
+            let avg = sum as f64 / len as f64;
+
+            let mut sorted = cov.to_vec();
+            sorted.sort_unstable();
+
+            let p25 = sorted[((len as f64 * 0.25) as usize).min(len - 1)];
+            let p50 = sorted[((len as f64 * 0.50) as usize).min(len - 1)];
+            let p75 = sorted[((len as f64 * 0.75) as usize).min(len - 1)];
+            let min = *sorted.first()?;
+            let max = *sorted.last()?;
+
+            let avg2xcnt = cov.iter().filter(|&&d| d as f64 > 2.0 * avg).count() as f64 / len as f64;
+            let cnt0 = cov.iter().filter(|&&d| d == 0).count() as f64 / len as f64;
+            let cnt1 = cov.iter().filter(|&&d| d == 1).count() as f64 / len as f64;
+            let cnt2 = cov.iter().filter(|&&d| d == 2).count() as f64 / len as f64;
+
+            let coverage_array: Vec<u64> = cov.iter().map(|&d| d as u64).collect();
+
+            Some((
+                name.clone(),
+                json!({
+                    "coverage": coverage_array,
+                    "avg": avg,
+                    "min": min as u64,
+                    "max": max as u64,
+                    "p25": p25 as u64,
+                    "p50": p50 as u64,
+                    "p75": p75 as u64,
+                    "avg2xcnt": avg2xcnt,
+                    "cnt0": cnt0,
+                    "cnt1": cnt1,
+                    "cnt2": cnt2,
+                    "contig_len": len as u64,
+                }),
+            ))
+        }).collect()
+    });
+
+    // Async write — using AsyncWriteExt
+    let mut json_file = BufWriter::new(TokioFile::create(coverage_json_path).await?);
+    let mut csv_file = BufWriter::new(TokioFile::create(coverage_csv_path).await?);
+
+    csv_file.write_all(b"contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2\n").await?;
+    json_file.write_all(b"{").await?;
+
+    for (i, (name, stat)) in stats.iter().enumerate() {
+        if i > 0 {
+            json_file.write_all(b",").await?;
+        }
+        let line = format!(r#""{}":{}"#, name, stat);
+        json_file.write_all(line.as_bytes()).await?;
+    }
+    json_file.write_all(b"}").await?;
+    json_file.flush().await?;
+
+    for (name, stat) in &stats {
+        let s = stat.as_object().unwrap();
+        let line = format!(
+            "{},{:.6},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6}\n",
+            name,
+            s["avg"].as_f64().unwrap_or(0.0),
+            s["min"].as_u64().unwrap_or(0),
+            s["max"].as_u64().unwrap_or(0),
+            s["p25"].as_u64().unwrap_or(0),
+            s["p50"].as_u64().unwrap_or(0),
+            s["p75"].as_u64().unwrap_or(0),
+            s["avg2xcnt"].as_f64().unwrap_or(0.0),
+            s["cnt0"].as_f64().unwrap_or(0.0),
+            s["cnt1"].as_f64().unwrap_or(0.0),
+            s["cnt2"].as_f64().unwrap_or(0.0),
+        );
+        csv_file.write_all(line.as_bytes()).await?;
+    }
+    csv_file.flush().await?;
+
+    info!("Coverage complete — {} contigs", stats.len());
     Ok(())
 }
 
@@ -3432,17 +3434,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     eprintln!("contigs stats len {}", assembly_outputs.contig_stats.len());
 
-
-    let generate_assembly_Coverage_result = generate_assembly_coverage(
+    let generate_assembly_coverage_result = generate_assembly_coverage(
         config.clone(),
-        assembly_bam_out_stream.into_inner(),
+        assembly_bam_out_stream,
         &assembly_outputs.contigs_fasta,
         &assembly_outputs.coverage_json,
         &assembly_outputs.coverage_summary_csv,
     )
         .await
         .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
-
+    eprintln!("coverage result {:?}", generate_assembly_coverage_result);
     
     // *******************
     // Results retrieval

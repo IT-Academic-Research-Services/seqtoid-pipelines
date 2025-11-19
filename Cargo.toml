@@ -37,10 +37,11 @@ lexical = "6.1.1"
 fst = "0.4.7"
 bincode = "2.0.1"
 ahash = "0.8.12"
-#noodles = { version = "0.84.0", default-features = false, features = ["async", "bam", "sam", "bgzf"] }
+noodles = { version = "0.102.0", features = ["bam", "sam", "async"] }
 tokio-util = { version = "0.7.17", features = ["io"] }
 bytes = "1.8"
 dashmap = "6.1.0"
+bstr = "1.12.1"
 
 [dev-dependencies]
 sysinfo = "0.37.0"
