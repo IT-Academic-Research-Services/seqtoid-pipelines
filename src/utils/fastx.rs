@@ -6,7 +6,7 @@ use std::io::{BufWriter as StdBufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashSet;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use log::{self, debug, info, error, warn};
 
 use std::collections::HashMap;
@@ -1167,40 +1167,70 @@ pub async fn concatenate_paired_reads(
 pub fn build_fasta_index(
     fasta_path: &PathBuf,
     index_path: &PathBuf,
-) -> Result<(), anyhow::Error> {
-    let file = File::open(fasta_path)?;
-    let mut reader = BufReader::new(file);
-    let mut builder = MapBuilder::new(StdBufWriter::new(File::create(index_path)?))?;
+) -> Result<()> {
+    let file = File::open(fasta_path)
+        .with_context(|| format!("Failed to open FASTA file: {}", fasta_path.display()))?;
 
+    let mut reader = BufReader::new(file);
+
+    let mut entries: Vec<(String, u64)> = Vec::new();
     let mut line = String::with_capacity(512);
     let mut current_id: Option<String> = None;
 
-    loop {
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 { break; }
-
+    while reader.read_line(&mut line)? > 0 {
         if line.starts_with('>') {
             if let Some(id) = current_id.take() {
-                builder.insert(&id, reader.stream_position()?)?;
+                let offset = reader.stream_position()?;
+                entries.push((id, offset));
             }
-            let acc = line[1..]
+
+            let header = line[1..].trim_start();
+            let acc = header
                 .split_whitespace()
                 .next()
-                .unwrap()
+                .ok_or_else(|| anyhow::anyhow!("Empty FASTA header in {}", fasta_path.display()))?
                 .split('.')
                 .next()
                 .unwrap()
-                .to_owned();  // the split on . removes trailing .1 .2 style versions as we dont seek on those
+                .to_owned();
+
             current_id = Some(acc);
         }
         line.clear();
     }
 
     if let Some(id) = current_id {
-        builder.insert(&id, reader.stream_position()?)?;
+        entries.push((id, reader.stream_position()?));
     }
 
-    builder.finish()?;
+        // Sort  for fst::MapBuilder
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let entry_count = entries.len();
+
+    let mut builder = MapBuilder::new(
+        std::io::BufWriter::new(
+            File::create(index_path)
+                .with_context(|| format!("Failed to create index file: {}", index_path.display()))?,
+        ),
+    )
+        .with_context(|| "Failed to initialise fst::MapBuilder")?;
+
+    for (key, offset) in entries {
+        builder
+            .insert(&key, offset)
+            .with_context(|| format!("Failed to insert key `{key}` into fst"))?;
+    }
+
+    builder
+        .finish()
+        .with_context(|| "Failed to finish fst map")?;
+
+    info!(
+        "Built FASTA offset index with {entry_count} entries → {}",
+        index_path.display()
+    );
+
     Ok(())
 }
 
