@@ -41,7 +41,6 @@ noodles = { version = "0.102.0", features = ["bam", "sam", "async"] }
 tokio-util = { version = "0.7.17", features = ["io"] }
 bytes = "1.8"
 dashmap = "6.1.0"
-bstr = "1.12.1"
 
 [dev-dependencies]
 sysinfo = "0.37.0"

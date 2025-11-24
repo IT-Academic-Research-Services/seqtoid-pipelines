@@ -1,36 +1,34 @@
 use std::fs::File;
-use std::io::Write;
 use std::io::Cursor;
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufWriter as StdBufWriter, Write};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Result, anyhow};
-use log::{self, LevelFilter, debug, info, error, warn};
-use flate2::read::GzDecoder;
-use crate::utils::file::{extension_remover, is_gzipped, FileReader};
-use crate::cli::Technology;
+use log::{self, debug, info, error, warn};
+
 use std::collections::HashMap;
 use lazy_static::lazy_static;
 use crate::utils::sequence::{DNA, normal_phred_qual_string}; 
 use futures::Stream;
 use tokio_stream::{self as stream};
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats};
-use needletail::{parse_fastx_file, FastxReader, parser::{SequenceRecord as NeedletailSequenceRecord, FastqReader}};
+
+use needletail::{parse_fastx_file, FastxReader, parser::{FastqReader}};
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::utils::streams::ParseOutput;
-use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc::Receiver;
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration};
 use futures::future::try_join_all;
 use tokio::task::JoinHandle;
 use memchr::memmem;
-use memchr::memchr;
+use fst::{MapBuilder};
+
+use crate::utils::streams::ParseOutput;
+use crate::utils::file::{extension_remover};
+use crate::cli::Technology;
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -130,6 +128,7 @@ impl From<needletail::parser::SequenceRecord<'_>> for SequenceRecord {
         }
     }
 }
+
 
 /// HashSet based sequence validator
 ///
@@ -1154,6 +1153,57 @@ pub async fn concatenate_paired_reads(
 
     Ok((ReceiverStream::new(rx), task))
 }
+
+/// Reads a FASTA and generates an index file for that FASTA for only the offsets of the
+/// accessions in the file. This allows faster lookups of the accessions. Especially
+/// useful for huge files like NT or NR.
+///
+/// # Arguments
+/// * `fasta_path` - Path to a fasta file
+/// * `index_ath` - Name of the resulting index file
+///
+/// # Returns
+/// Result \ , Box error
+pub fn build_fasta_index(
+    fasta_path: &str,
+    index_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(fasta_path)?;
+    let mut reader = BufReader::new(file);
+    let mut builder = MapBuilder::new(StdBufWriter::new(File::create(index_path)?))?;
+
+    let mut line = String::with_capacity(512);
+    let mut current_id: Option<String> = None;
+
+    loop {
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 { break; }
+
+        if line.starts_with('>') {
+            if let Some(id) = current_id.take() {
+                builder.insert(&id, reader.stream_position()?)?;
+            }
+            let acc = line[1..]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .split('.')
+                .next()
+                .unwrap()
+                .to_owned();  // the split on . removes trailing .1 .2 style versions as we dont seek on those
+            current_id = Some(acc);
+        }
+        line.clear();
+    }
+
+    if let Some(id) = current_id {
+        builder.insert(&id, reader.stream_position()?)?;
+    }
+
+    builder.finish()?;
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
