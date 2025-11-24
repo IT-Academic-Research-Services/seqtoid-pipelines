@@ -194,4 +194,10 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = 100)]
     pub min_contig_length: usize,
+
+    #[arg(long, default_value = "nt_index.fst")]
+    pub nt_offset_db : Option<String>,
+
+    #[arg(long, default_value = "nr_index.fst")]
+    pub nr_offset_db : Option<String>,
 }
