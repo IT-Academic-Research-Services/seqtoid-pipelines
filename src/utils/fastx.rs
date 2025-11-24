@@ -1167,7 +1167,7 @@ pub async fn concatenate_paired_reads(
 pub fn build_fasta_index(
     fasta_path: &PathBuf,
     index_path: &PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), anyhow::Error> {
     let file = File::open(fasta_path)?;
     let mut reader = BufReader::new(file);
     let mut builder = MapBuilder::new(StdBufWriter::new(File::create(index_path)?))?;
