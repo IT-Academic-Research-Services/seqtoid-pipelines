@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
         "short_read_mngs" => short_read_mngs_run(run_config).await,
         "build_taxid_lineages" => build_taxid_lineages_run(run_config).await,
         "build_accession2taxid" => build_accession2taxid_run(run_config).await,
+        "build_fasta_offset" => build_fasta_offset_db_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
     } {
         error!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
@@ -147,6 +148,10 @@ async fn build_taxid_lineages_run(run_config: Arc<RunConfig>) -> Result<(), Pipe
 
 async fn build_accession2taxid_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     db::accession2taxid_db(run_config).await
+}
+
+async fn build_fasta_offset_db_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    db::fasta_offset_db(run_config).await
 }
 
 /// Sets up output directory

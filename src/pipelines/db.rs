@@ -4,13 +4,15 @@ use std::fs;
 use anyhow::anyhow;
 use log::info;
 use crate::config::defs::{PipelineError, RunConfig};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, rename_file_path};
 use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db};
+use crate::utils::fastx::build_fasta_index;
 
 pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
+    info!("Building taxid lineages db");
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
 
-    info!("Building taxid lineages db.");
+
 
     let (taxid_dir_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
 
@@ -87,6 +89,18 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     build_accession2taxid_db(&gz_paths, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+
+    Ok(())
+}
+
+pub async fn fasta_offset_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
+
+    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+    let (fasta_path, _file2_path, sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
+
+    let fasta_index_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("index.fst"), "_"));
+
+    info!("Building FASTA offset {} db for {}", fasta_index_path.display(), fasta_path.display());
 
     Ok(())
 }
