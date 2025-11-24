@@ -1203,10 +1203,12 @@ pub fn build_fasta_index(
         entries.push((id, reader.stream_position()?));
     }
 
-        // Sort  for fst::MapBuilder
-        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
 
     let entry_count = entries.len();
+
+    info!("Building FST index with {entry_count} unique accessions → {}", index_path.display());
 
     let mut builder = MapBuilder::new(
         std::io::BufWriter::new(
