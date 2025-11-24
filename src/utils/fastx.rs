@@ -1165,8 +1165,8 @@ pub async fn concatenate_paired_reads(
 /// # Returns
 /// Result \ , Box error
 pub fn build_fasta_index(
-    fasta_path: &str,
-    index_path: &str,
+    fasta_path: &PathBuf,
+    index_path: &PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(fasta_path)?;
     let mut reader = BufReader::new(file);

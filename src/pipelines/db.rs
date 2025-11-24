@@ -97,10 +97,11 @@ pub async fn fasta_offset_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pipel
 
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let (fasta_path, _file2_path, sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd)?;
-
-    let fasta_index_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("index.fst"), "_"));
+    let fasta_index_path = cwd.join(rename_file_path(&sample_base_buf, None, Some("index.fst"), "_"));
 
     info!("Building FASTA offset {} db for {}", fasta_index_path.display(), fasta_path.display());
+
+    build_fasta_index(&fasta_path, &fasta_index_path)?;
 
     Ok(())
 }
