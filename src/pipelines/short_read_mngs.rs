@@ -3154,7 +3154,6 @@ pub async fn extract_accessions_to_fasta(
             let mut seq_len: u64 = 0;
             let mut buf = String::with_capacity(1024);
 
-            // Header
             buf.clear();
             if reader.read_line(&mut buf)? == 0 {
                 warn!("EOF while reading header for {}", acc);
@@ -3170,7 +3169,7 @@ pub async fn extract_accessions_to_fasta(
             buf.clear();
             while reader.read_line(&mut buf)? > 0 {
                 if buf.starts_with('>') {
-                    // Save for next iteration
+
                     reader.seek(SeekFrom::Current(-(buf.len() as i64)))
                         .with_context(|| "Failed to rewind for next header")?;
                     break;
@@ -3179,7 +3178,7 @@ pub async fn extract_accessions_to_fasta(
                 if seq_len > MAX_ACCESSION_SEQUENCE_LEN {
                     skipped_long += 1;
                     info!("Skipping long sequence for {} ({} bytes)", acc, seq_len);
-                    // Drain rest of sequence
+                    // srain rest of sequence
                     while reader.read_line(&mut buf)? > 0 && !buf.starts_with('>') {
                         buf.clear();
                     }
