@@ -1174,83 +1174,60 @@ pub fn build_fasta_index(
 
     let mut reader = BufReader::new(file);
     let mut line = String::with_capacity(1024);
-    let mut entries: Vec<(String, u64)> = Vec::with_capacity(5_000_000); // NR is biggest size for it
-    let mut current_acc: Option<String> = None;
+    let mut entries = Vec::with_capacity(8_000_000);  // trying to size for NR
 
-    // capture the offset before consuming the header line
+    let mut pos: u64 = 0;
+
     while reader.read_line(&mut line)? > 0 {
         if line.starts_with('>') {
-            // current position is exactly the byte offset of the '>' character
-            let header_offset = reader.seek(SeekFrom::Current(0))? - line.len() as u64;
-
-            // Save the previous record (if any)
-            if let Some(acc) = current_acc.take() {
-                entries.push((acc, header_offset));
-            }
-
-            // Extract accession (first token, strip version suffix)
-            let header = line[1..].trim_start(); // strip leading '>'
+            let header = line[1..].trim_start();
             let acc = header
                 .split_whitespace()
                 .next()
-                .ok_or_else(|| anyhow!("Empty FASTA header in {}", fasta_path.display()))?
+                .ok_or_else(|| anyhow!("Empty FASTA header"))?
                 .split('.')
                 .next()
                 .unwrap()
                 .to_owned();
 
-            current_acc = Some(acc);
+            entries.push((acc, pos));
 
             // Optional verification
             if verify {
                 let mut byte = [0u8; 1];
-                reader.seek(SeekFrom::Start(header_offset))?;
+                reader.seek(SeekFrom::Start(pos))?;
                 reader.read_exact(&mut byte)?;
                 if byte[0] != b'>' {
                     return Err(anyhow!(
-                        "Verification failed: expected '>' at offset {} (found '{:x?}')",
-                        header_offset,
+                        "VERIFICATION FAILED at offset {pos}: expected '>', got 0x{:02x}",
                         byte[0]
                     ));
                 }
-                // seek back to where we were (start of next line)
-                reader.seek(SeekFrom::Start(header_offset + line.len() as u64))?;
+                // Return to where we were (after the line we just read)
+                reader.seek(SeekFrom::Start(pos + line.len() as u64))?;
             }
         }
+        pos += line.len() as u64;
         line.clear();
     }
 
-    // Don't forget the very last record
-    if let Some(acc) = current_acc {
-        // Re-use the last captured header_offset (it's still valid)
-        if let Some(last_entry) = entries.last_mut() {
-            // If we have entries, the last one already has the correct offset
-            // (nothing to do)
-        } else {
-            // File had only one record — we never saved its offset yet
-            let final_offset = reader.seek(SeekFrom::Current(0))? - line.len() as u64;
-            entries.push((acc, final_offset));
-        }
-    }
-
-    // Sort + dedup (in case of duplicate accessions)
+    // Dedup + sort (keeps first occurrence)
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    entries.dedup_by(|a, b| a.0 == b.0);
+    entries.dedup_by_key(|e| &e.0);
 
-    let entry_count = entries.len();
-    info!("Building FST index with {entry_count} unique accessions → {}", index_path.display());
+    info!("Writing FST index with {} unique accessions → {}", entries.len(), index_path.display());
 
     let mut builder = MapBuilder::new(StdBufWriter::new(
         File::create(index_path)
-            .with_context(|| format!("Failed to create index file: {}", index_path.display()))?,
+            .with_context(|| format!("Cannot create index file: {}", index_path.display()))?,
     ))?;
 
     for (acc, offset) in entries {
-        builder.insert(&acc, offset)?;
+        builder.insert(acc, offset)?;
     }
 
     builder.finish()?;
-    info!("FST index built successfully → {}", index_path.display());
+    info!("FST index built successfully");
 
     Ok(())
 }

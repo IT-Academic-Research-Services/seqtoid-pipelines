@@ -39,6 +39,7 @@ use rayon::prelude::*;
 use needletail::parse_fastx_file;
 use dashmap::DashMap;
 use regex::Regex;
+use once_cell::sync::Lazy;
 
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
@@ -68,6 +69,11 @@ const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
 const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
 const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
+
+static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<accession_id>[^ ]+) (?P<wrong_pattern>, *)?(?P<description>.*)$")
+        .unwrap()
+});
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -3049,43 +3055,25 @@ async fn collect_accessions_from_m8_stream(mut stream: ReceiverStream<ParseOutpu
 /// * `header` - header
 /// # Returns
 /// header as String
-fn fix_header(header: &str) -> String {
-    let header = header.trim_end();
-    if header.len() <= 1 {
-        return header.to_owned();
+fn fix_header(header_line: &str) -> String {
+    if !header_line.starts_with('>') {
+        return header_line.to_owned();
     }
 
-    let content = &header[1..]; // Strip '>'
+    // Split on CTRL-A (\x01) for multi-header entries
+    let parts: Vec<String> = header_line[1..] // strip '>'
+        .split('\x01')
+        .map(|part| {
+            let trimmed = part.trim_start();
+            FIX_COMMA_REGEXP
+                .replace(trimmed, "$accession_id $description")
+                .trim()
+                .to_string()
+        })
+        .collect();
 
-    // Find first whitespace
-    if let Some(space_pos) = content.find(' ') {
-        let (acc, desc) = content.split_at(space_pos);
-        let desc = desc.trim_start_matches(',').trim_start();
-        if desc.is_empty() {
-            format!(">{}", acc)
-        } else {
-            format!(">{} {}", acc, desc)
-        }
-    } else {
-        // No space → assume accession is prefix of uppercase letters/digits
-        let mut acc_end = 0;
-        for (i, c) in content.chars().enumerate() {
-            if !c.is_ascii_alphanumeric() && c != '_' && c != '.' {
-                acc_end = i;
-                break;
-            }
-            if c.is_lowercase() {
-                acc_end = i;
-                break;
-            }
-        }
-        if acc_end == 0 {
-            acc_end = content.len().min(20); // Fallback
-        }
-        let acc = &content[..acc_end];
-        let seq_preview = &content[acc_end..].chars().take(50).collect::<String>();
-        format!(">{} {}", acc, seq_preview)
-    }
+    // Rejoin with \x01 and restore '>'
+    format!(">{}", parts.join("\x01"))
 }
 
 
@@ -3173,8 +3161,9 @@ pub async fn extract_accessions_to_fasta(
                 missing_offsets += 1;
                 continue;
             }
-            eprintln!("for accession {} offset {} buffer {}", acc, offset , buf);
+
             let fixed_header = fix_header(&buf);
+            eprintln!("for accession: {}  offset: {}  buffer:  {}  fixed header: {}", acc, offset , buf, fixed_header);
             seq_len += fixed_header.len() as u64;
             writer.write_all(fixed_header.as_bytes())?;
 
@@ -3737,8 +3726,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // fs::copy(nt_ref_fasta_path, "nt-refine.fa").await?;
-    // fs::copy(nr_ref_fasta_path, "nr-refine.fa").await?;
+    fs::copy(nt_ref_fasta_path, "nt-refine.fa").await?;
+    fs::copy(nr_ref_fasta_path, "nr-refine.fa").await?;
     // eprintln!("NT refine {}", nt_ref_fasta_path.display());
     // eprintln!("NR refine {}", nr_ref_fasta_path.display());
     // *******************
