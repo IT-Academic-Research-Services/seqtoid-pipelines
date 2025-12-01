@@ -3166,7 +3166,7 @@ pub async fn extract_accessions_to_fasta(
             eprintln!("for accession: {}  offset: {}  buffer:  {}  fixed header: {}", acc, offset , buf, fixed_header);
             seq_len += fixed_header.len() as u64;
             writer.write_all(fixed_header.as_bytes())?;
-
+            writer.write_all(b"\n")?;
             // Sequence
             buf.clear();
             while reader.read_line(&mut buf)? > 0 {
