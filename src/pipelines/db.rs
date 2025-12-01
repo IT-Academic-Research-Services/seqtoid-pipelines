@@ -101,7 +101,7 @@ pub async fn fasta_offset_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pipel
 
     info!("Building FASTA offset {} db for {}", fasta_index_path.display(), fasta_path.display());
 
-    build_fasta_index(&fasta_path, &fasta_index_path)
+    build_fasta_index(&fasta_path, &fasta_index_path, config.args.verbose)
         .map_err(|e| PipelineError::Other(e.into()))?;
 
     Ok(())
