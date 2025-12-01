@@ -3147,7 +3147,7 @@ pub async fn extract_accessions_to_fasta(
 
     for acc in &acc_vec {
         if let Some(offset) = index.get(acc.as_bytes()) {
-            eprintln!();
+
             reader.seek(SeekFrom::Start(offset))
                 .with_context(|| format!("Failed to seek to offset {} for {}", offset, acc))?;
 
@@ -3163,11 +3163,10 @@ pub async fn extract_accessions_to_fasta(
             }
 
             let fixed_header = fix_header(&buf);
-            eprintln!("for accession: {}  offset: {}  buffer:  {}  fixed header: {}", acc, offset , buf, fixed_header);
             seq_len += fixed_header.len() as u64;
             writer.write_all(fixed_header.as_bytes())?;
             writer.write_all(b"\n")?;
-            // Sequence
+
             buf.clear();
             while reader.read_line(&mut buf)? > 0 {
                 if buf.starts_with('>') {
