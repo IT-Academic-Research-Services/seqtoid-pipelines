@@ -3050,24 +3050,42 @@ async fn collect_accessions_from_m8_stream(mut stream: ReceiverStream<ParseOutpu
 /// # Returns
 /// header as String
 fn fix_header(header: &str) -> String {
-    let re = Regex::new(r"^(?P<acc>[^ ]+) (?P<comma>, *)?(?P<desc>.*)$")
-        .expect("Invalid regex for header fix");
-
-    let mut fixed = String::new();
-    let items: Vec<&str> = header[1..].split('\x01').collect(); // Strip leading '>'
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            fixed.push('\x01');
-        }
-        if let Some(caps) = re.captures(item) {
-            fixed.push_str(&caps["acc"]);
-            fixed.push(' ');
-            fixed.push_str(&caps["desc"]);
-        } else {
-            fixed.push_str(item); // Fallback
-        }
+    let header = header.trim_end();
+    if header.len() <= 1 {
+        return header.to_owned();
     }
-    format!(">{}", fixed)
+
+    let content = &header[1..]; // Strip '>'
+
+    // Find first whitespace
+    if let Some(space_pos) = content.find(' ') {
+        let (acc, desc) = content.split_at(space_pos);
+        let desc = desc.trim_start_matches(',').trim_start();
+        if desc.is_empty() {
+            format!(">{}", acc)
+        } else {
+            format!(">{} {}", acc, desc)
+        }
+    } else {
+        // No space → assume accession is prefix of uppercase letters/digits
+        let mut acc_end = 0;
+        for (i, c) in content.chars().enumerate() {
+            if !c.is_ascii_alphanumeric() && c != '_' && c != '.' {
+                acc_end = i;
+                break;
+            }
+            if c.is_lowercase() {
+                acc_end = i;
+                break;
+            }
+        }
+        if acc_end == 0 {
+            acc_end = content.len().min(20); // Fallback
+        }
+        let acc = &content[..acc_end];
+        let seq_preview = &content[acc_end..].chars().take(50).collect::<String>();
+        format!(">{} {}", acc, seq_preview)
+    }
 }
 
 
@@ -3141,6 +3159,7 @@ pub async fn extract_accessions_to_fasta(
 
     for acc in &acc_vec {
         if let Some(offset) = index.get(acc.as_bytes()) {
+            eprintln!();
             reader.seek(SeekFrom::Start(offset))
                 .with_context(|| format!("Failed to seek to offset {} for {}", offset, acc))?;
 
@@ -3154,6 +3173,7 @@ pub async fn extract_accessions_to_fasta(
                 missing_offsets += 1;
                 continue;
             }
+            eprintln!("for accession {} offset {} buffer {}", acc, offset , buf);
             let fixed_header = fix_header(&buf);
             seq_len += fixed_header.len() as u64;
             writer.write_all(fixed_header.as_bytes())?;
@@ -3575,7 +3595,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_streams, nr_done_rx) = t_junction(
         diamond_call_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3591,6 +3611,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_streams_iter = nr_streams.into_iter();
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nr_counts = generate_taxon_counts(
         config.clone(),
@@ -3663,7 +3684,63 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
     eprintln!("coverage result {:?}", generate_assembly_coverage_result);
-    
+
+
+    let nt_file = config
+        .args
+        .nt
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT file required for fasta extraction".into(),
+        ))?;
+
+    let nt_offset_db_file = config
+        .args
+        .nt_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT offset DB file required for fasta extraction".into(),
+        ))?;
+
+    //nt accessions
+    let nt_ref_fasta_path = extract_accessions_to_fasta(
+        config.clone(),
+        ReceiverStream::new(nt_acc_stream),
+        &PathBuf::from(nt_file),
+        &PathBuf::from(nt_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let nr_file = config
+        .args
+        .nr
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR file required for fasta extraction".into(),
+        ))?;
+
+    let nr_offset_db_file = config
+        .args
+        .nr_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR offset DB file required for fasta extraction".into(),
+        ))?;
+
+    let nr_ref_fasta_path = extract_accessions_to_fasta(
+        config.clone(),
+        ReceiverStream::new(nr_acc_stream),
+        &PathBuf::from(nr_file),
+        &PathBuf::from(nr_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // fs::copy(nt_ref_fasta_path, "nt-refine.fa").await?;
+    // fs::copy(nr_ref_fasta_path, "nr-refine.fa").await?;
+    // eprintln!("NT refine {}", nt_ref_fasta_path.display());
+    // eprintln!("NR refine {}", nr_ref_fasta_path.display());
     // *******************
     // Results retrieval
     // *******************
