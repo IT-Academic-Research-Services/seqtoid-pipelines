@@ -3724,10 +3724,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    fs::copy(nt_ref_fasta_path, "nt-refine.fa").await?;
-    fs::copy(nr_ref_fasta_path, "nr-refine.fa").await?;
-    // eprintln!("NT refine {}", nt_ref_fasta_path.display());
-    // eprintln!("NR refine {}", nr_ref_fasta_path.display());
     // *******************
     // Results retrieval
     // *******************
