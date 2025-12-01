@@ -1213,7 +1213,7 @@ pub fn build_fasta_index(
 
     // Dedup + sort (keeps first occurrence)
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    entries.dedup_by_key(|e| &e.0);
+    entries.dedup_by(|a, b| a.0 == b.0);
 
     info!("Writing FST index with {} unique accessions → {}", entries.len(), index_path.display());
 
