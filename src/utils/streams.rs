@@ -70,19 +70,7 @@ impl ToBytes for SequenceRecord {
     }
 }
 
-impl ToBytes for ParseOutput {
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        match self {
-            ParseOutput::Fastq(record) => record.to_bytes(),
-            ParseOutput::Fasta(record) => record.to_bytes(),
-            ParseOutput::Bytes(bytes) => {
-                // Avoid cloning if possible; return Vec only if needed
-                Arc::try_unwrap(bytes.clone()).map_err(|_| anyhow!("Cannot unwrap Arc with multiple references"))
-                    .or_else(|_| Ok((**bytes).clone())) // Fallback to clone if Arc is shared
-            }
-        }
-    }
-}
+
 
 #[derive(Clone, Copy, Debug)]
 pub enum ChildStream {
@@ -103,6 +91,20 @@ pub enum ParseOutput {
     Fastq(SequenceRecord),
     Fasta(SequenceRecord),
     Bytes(Arc<Vec<u8>>),
+}
+
+impl ToBytes for ParseOutput {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            ParseOutput::Fastq(record) => record.to_bytes(),
+            ParseOutput::Fasta(record) => record.to_bytes(),
+            ParseOutput::Bytes(bytes) => {
+                // Avoid cloning if possible; return Vec only if needed
+                Arc::try_unwrap(bytes.clone()).map_err(|_| anyhow!("Cannot unwrap Arc with multiple references"))
+                    .or_else(|_| Ok((**bytes).clone())) // Fallback to clone if Arc is shared
+            }
+        }
+    }
 }
 
 /// Converts mpsc::Receiver<ParseOutput> type output to AsyncRead suitable to parse_fasta. parse_fastq.

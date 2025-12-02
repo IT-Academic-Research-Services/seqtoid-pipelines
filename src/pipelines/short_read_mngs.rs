@@ -24,6 +24,7 @@ use tokio_stream::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tokio::process::Command;
+use tokio::try_join;
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use twox_hash::XxHash64;
@@ -40,6 +41,7 @@ use needletail::parse_fastx_file;
 use dashmap::DashMap;
 use regex::Regex;
 use once_cell::sync::Lazy;
+use ahash::AHashMap;
 
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
@@ -153,20 +155,35 @@ pub struct CoverageOutputs {
 }
 
 #[derive(Debug, Clone)]
-struct HitSummaryEntry {
-    read_id: String,
-    level: u8,
-    taxid: i32,
-    accession_id: Option<String>,
-    species_taxid: i32,
-    genus_taxid: i32,
-    family_taxid: i32,
-    contig_id: Option<String>,
-    contig_accession_id: Option<String>,
-    contig_species_taxid: Option<i32>,
-    contig_genus_taxid: Option<i32>,
-    contig_family_taxid: Option<i32>,
-    from_assembly: Option<String>,
+pub struct HitSummaryEntry {
+    pub read_id: String,
+    pub level: u8,
+    pub taxid: i32,
+    pub accession_id: Option<String>,
+    pub species_taxid: i32,
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
+    pub contig_id: Option<String>,
+    pub contig_accession_id: Option<String>,
+    pub contig_species_taxid: Option<i32>,
+    pub contig_genus_taxid: Option<i32>,
+    pub contig_family_taxid: Option<i32>,
+    pub from_assembly: Option<String>,
+}
+
+impl HitSummaryEntry {
+    pub fn to_line(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.read_id,
+            self.level,
+            self.taxid,
+            self.accession_id.as_deref().unwrap_or(""),
+            self.species_taxid,
+            self.genus_taxid,
+            self.family_taxid
+        )
+    }
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -1628,6 +1645,53 @@ pub async fn paf_to_m8(
 }
 
 
+
+/// Loads the taxid (taxid → [species, genus, family])
+/// and acc2tax (accession bytes → taxid) DB's
+/// async
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+///
+/// # Returns
+/// Result:
+///     Arc<AHashMap<Taxid, Lineage>>,
+///     Arc<Map<Vec<u8>>>,
+pub async fn load_lineage_and_acc2tax_maps(
+    config: Arc<RunConfig>,
+) -> Result<(
+    Arc<AHashMap<Taxid, Lineage>>,
+    Arc<Map<Vec<u8>>>,
+)> {
+    let lineage_path = PathBuf::from(&config.args.taxid_lineages_db);
+    let acc2taxid_path = PathBuf::from(&config.args.acc2taxid_db);
+
+    let lineage_future = async move {
+        load_taxid_lineages_db(&lineage_path).await
+            .map_err(|e| anyhow!("Failed to load lineage DB from {}: {}", lineage_path.display(), e))
+    };
+
+    let acc2taxid_future = async move {
+        let bytes = tokio::fs::read(&acc2taxid_path).await
+            .map_err(|e| anyhow!("Failed to read acc2taxid DB {}: {}", acc2taxid_path.display(), e))?;
+
+        let map = Map::new(bytes)
+            .map_err(|e| anyhow!("Failed to parse acc2taxid fst map: {}", e))?;
+
+        Ok::<Arc<Map<Vec<u8>>>, anyhow::Error>(Arc::new(map))
+    };
+
+    let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
+
+    info!(
+        "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
+        lineage_map.len(),
+        acc2taxid_map.len()
+    );
+
+    Ok((lineage_map, acc2taxid_map))
+}
+
 /// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
 /// # Arguments
 ///
@@ -1651,6 +1715,8 @@ pub async fn call_hits_m8_stream(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
     sample_base_buf: PathBuf,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    acc2taxid_map: Arc<Map<Vec<u8>>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     min_aln_len: u64
 ) -> Result<(
@@ -1662,13 +1728,13 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
-    let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
-
-    let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
-    let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
-    let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
-    let acc2taxid_map = Arc::new(acc2taxid_map);
+    // let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
+    // let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
+    //
+    // let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
+    // let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
+    // let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
+    // let acc2taxid_map = Arc::new(acc2taxid_map);
 
 
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
@@ -3290,32 +3356,32 @@ fn parse_hit_summary(path: &PathBuf) -> Result<(HashMap<String, HitSummaryEntry>
 /// # Arguments
 /// # Returns
 /// Result
-fn write_empty_blast_outputs(
-    blast_m8: &PathBuf,
-    blast_top_m8: &PathBuf,
-    refined_m8: &PathBuf,
-    refined_hit_summary: &PathBuf,
-    refined_counts_with_dcr: &PathBuf,
-    contig_summary_json: &PathBuf,
-    deduped_m8: &PathBuf,
-    hit_summary: &PathBuf,
-    orig_counts_with_dcr: &PathBuf,
-) -> Result<()> {
-    let mut file = File::create(blast_m8)?;
-    file.write_all(b" ")?;
-
-    let mut file = File::create(blast_top_m8)?;
-    file.write_all(b" ")?;
-
-    fs::copy(deduped_m8, refined_m8)?;
-    fs::copy(hit_summary, refined_hit_summary)?;
-    fs::copy(orig_counts_with_dcr, refined_counts_with_dcr)?;
-
-    let mut file = File::create(contig_summary_json)?;
-    file.write_all(b"[]")?;
-
-    Ok(())
-}
+// fn write_empty_blast_outputs(
+//     blast_m8: &PathBuf,
+//     blast_top_m8: &PathBuf,
+//     refined_m8: &PathBuf,
+//     refined_hit_summary: &PathBuf,
+//     refined_counts_with_dcr: &PathBuf,
+//     contig_summary_json: &PathBuf,
+//     deduped_m8: &PathBuf,
+//     hit_summary: &PathBuf,
+//     orig_counts_with_dcr: &PathBuf,
+// ) -> Result<()> {
+//     let mut file = File::create(blast_m8)?;
+//     file.write_all(b" ")?;
+//
+//     let mut file = File::create(blast_top_m8)?;
+//     file.write_all(b" ")?;
+//
+//     fs::copy(deduped_m8, refined_m8)?;
+//     fs::copy(hit_summary, refined_hit_summary)?;
+//     fs::copy(orig_counts_with_dcr, refined_counts_with_dcr)?;
+//
+//     let mut file = File::create(contig_summary_json)?;
+//     file.write_all(b"[]")?;
+//
+//     Ok(())
+// }
 
 
 /// Run function for Short Read mNGS pipelines
@@ -3366,6 +3432,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let random_seed = u64::from_le_bytes(bytes);
         random_seed
     });
+
+    let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
 
     // Input Validation
     let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
@@ -3619,11 +3687,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut m8_cleanup_tasks);
     cleanup_receivers.append(&mut m8_cleanup_receivers);
 
+    let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(),
         m8_stream,
         sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
         should_keep_filter.clone(),
         36
     ).await?;
@@ -3679,6 +3750,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(non_host_diamond_m8_stream),
         sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
         should_keep_filter.clone(),
         0,
     ).await?;

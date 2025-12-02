@@ -76,6 +76,24 @@ impl M8Record {
             bitscore: parse_float!(),
         })
     }
+
+    pub fn to_tab_string(&self) -> String {
+        format!(
+            "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{}",
+            self.qname,
+            self.tname,
+            self.pident,
+            self.alen,
+            self.mismatch,
+            self.gapopen,
+            self.qstart,
+            self.qend,
+            self.tstart,
+            self.tend,
+            self.evalue,
+            self.bitscore
+        )
+    }
 }
 
 #[derive(Default)]
