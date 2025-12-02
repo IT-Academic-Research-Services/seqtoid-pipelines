@@ -70,6 +70,9 @@ const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
 const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
 const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
 
+const MIN_REF_FASTA_SIZE: u64 = 25;
+const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
+
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?P<accession_id>[^ ]+) (?P<wrong_pattern>, *)?(?P<description>.*)$")
         .unwrap()
@@ -147,6 +150,23 @@ pub struct CoverageOutputs {
     pub coverage_json: PathBuf,
     pub coverage_summary_csv: PathBuf,
     pub contig_stats: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+struct HitSummaryEntry {
+    read_id: String,
+    level: u8,
+    taxid: i32,
+    accession_id: Option<String>,
+    species_taxid: i32,
+    genus_taxid: i32,
+    family_taxid: i32,
+    contig_id: Option<String>,
+    contig_accession_id: Option<String>,
+    contig_species_taxid: Option<i32>,
+    contig_genus_taxid: Option<i32>,
+    contig_family_taxid: Option<i32>,
+    from_assembly: Option<String>,
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -3210,6 +3230,58 @@ pub async fn extract_accessions_to_fasta(
     );
 
     Ok(output_path)
+}
+
+
+/// Parse hit_summary file into maps
+///
+/// # Arguments
+/// * `path` - path to hit sumamry file.
+/// # Returns
+/// hash map of HitSummaries
+fn parse_hit_summary(path: &PathBuf) -> Result<(HashMap<String, HitSummaryEntry>, HashMap<String, (i32, i32, i32)>)> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut read_dict: HashMap<String, HitSummaryEntry> = HashMap::new();
+    let mut accession_dict: HashMap<String, (i32, i32, i32)> = HashMap::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 7 { continue; }
+
+        let read_id = fields[0].to_string();
+        let level: u8 = fields[1].parse()?;
+        let taxid: i32 = fields[2].parse()?;
+        let accession_id = if fields[3].is_empty() { None } else { Some(fields[3].to_string()) };
+        let species_taxid: i32 = fields[4].parse()?;
+        let genus_taxid: i32 = fields[5].parse()?;
+        let family_taxid: i32 = fields[6].parse()?;
+
+        let entry = HitSummaryEntry {
+            read_id: read_id.clone(),
+            level,
+            taxid,
+            accession_id: accession_id.clone(),
+            species_taxid,
+            genus_taxid,
+            family_taxid,
+            contig_id: None,
+            contig_accession_id: None,
+            contig_species_taxid: None,
+            contig_genus_taxid: None,
+            contig_family_taxid: None,
+            from_assembly: None,
+        };
+
+        read_dict.insert(read_id, entry);
+
+        if let Some(acc) = accession_id {
+            accession_dict.insert(acc, (species_taxid, genus_taxid, family_taxid));
+        }
+    }
+
+    Ok((read_dict, accession_dict))
 }
 
 
