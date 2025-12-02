@@ -1,4 +1,6 @@
 
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::{BufReader, BufRead, ErrorKind};
@@ -7,7 +9,7 @@ use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
 use std::collections::{HashMap, BinaryHeap, HashSet};
 use std::cmp::Reverse;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use log::{self, LevelFilter, debug, info, error, warn};
 use futures::future::try_join_all;
 use rand::prelude::*;
@@ -36,6 +38,9 @@ use tokio_util::io::StreamReader;
 use rayon::prelude::*;
 use needletail::parse_fastx_file;
 use dashmap::DashMap;
+use regex::Regex;
+use once_cell::sync::Lazy;
+
 
 use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
@@ -61,6 +66,14 @@ use crate::utils::command::spades::SpadesConfig;
 use crate::utils::sambam::generate_info_from_bam_stream;
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
+const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
+const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
+const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
+
+static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<accession_id>[^ ]+) (?P<wrong_pattern>, *)?(?P<description>.*)$")
+        .unwrap()
+});
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -2987,6 +3000,219 @@ pub async fn generate_assembly_coverage(
 }
 
 
+/// Herlper function that pulls the accessions from an m8 stream
+/// a
+///
+/// # Arguments
+/// * `stream` - M8 stream
+/// # Returns
+/// Result of hashset of the accessions
+async fn collect_accessions_from_m8_stream(mut stream: ReceiverStream<ParseOutput>) -> Result<HashSet<String>> {
+    let mut accessions = HashSet::new();
+    let mut parse_errors = 0;
+
+    while let Some(item) = stream.next().await {
+        let line = match item {
+            ParseOutput::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+            _ => {
+                parse_errors += 1;
+                warn!("Invalid item in M8 stream — expected Bytes");
+                continue;
+            }
+        };
+
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 12 {
+            parse_errors += 1;
+            warn!("Invalid M8 line: {}", line);
+            continue;
+        }
+
+        let sacc = fields[1]; // Subject accession
+        let base_acc = sacc.split('.').next().unwrap_or(sacc).to_string();
+        accessions.insert(base_acc);
+    }
+
+    if parse_errors > MAX_PARSE_ERRORS {
+        return Err(anyhow!("Too many parse errors in M8 stream: {} > {}", parse_errors, MAX_PARSE_ERRORS));
+    }
+
+    info!("Collected {} unique accessions from M8 stream", accessions.len());
+    Ok(accessions)
+}
+
+
+/// Fixes FASTA header by removing leading comma in description if present.
+/// apparently there are a few broken accessions out there
+/// Handles multi-headers separated by \x01 (CTRL-A).
+///
+/// # Arguments
+/// * `header` - header
+/// # Returns
+/// header as String
+fn fix_header(header_line: &str) -> String {
+    if !header_line.starts_with('>') {
+        return header_line.to_owned();
+    }
+
+    // Split on CTRL-A (\x01) for multi-header entries
+    let parts: Vec<String> = header_line[1..] // strip '>'
+        .split('\x01')
+        .map(|part| {
+            let trimmed = part.trim_start();
+            FIX_COMMA_REGEXP
+                .replace(trimmed, "$accession_id $description")
+                .trim()
+                .to_string()
+        })
+        .collect();
+
+    // Rejoin with \x01 and restore '>'
+    format!(">{}", parts.join("\x01"))
+}
+
+
+/// Extracts accessions from a FASTA, then uses an offset FST db to locatre
+/// offsets in a FASTa. Then extracts those accessions + seqs and
+/// writes them to a file, ideally to RAM
+/// a
+///
+/// # Arguments
+/// * `config` - RunConfig struct from main.
+/// * `m8_stream` - stream in m8 format
+/// * `fasta_path` - path to fulle fasta (e.g. NT.fa) where all accession/seqs stored
+/// * `index_path` - path to FST offset index associated witht erh abover fasta_path
+/// * `out_path
+/// # Returns
+/// Result of hashset of the accessions
+pub async fn extract_accessions_to_fasta(
+    config: Arc<RunConfig>,
+    m8_stream: ReceiverStream<ParseOutput>,
+    fasta_path: &PathBuf,
+    index_path: &PathBuf,
+) -> Result<PathBuf> {
+    let accessions = collect_accessions_from_m8_stream(m8_stream).await?;
+    if accessions.is_empty() {
+        return Err(anyhow!("No accessions found in M8 stream"));
+    }
+
+    let mut acc_vec: Vec<String> = accessions.into_iter().collect();
+    acc_vec.sort();
+
+    let index_data = std::fs::read(index_path)
+        .with_context(|| format!("Failed to read index: {}", index_path.display()))?;
+    let index = Map::new(index_data)
+        .with_context(|| format!("Failed to load FST index: {}", index_path.display()))?;
+
+    let file = File::open(fasta_path)
+        .with_context(|| format!("Failed to open FASTA: {}", fasta_path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let estimated_size = (acc_vec.len() as u64) * EST_BYTES_PER_ACCESSION;
+    let avail_ram = available_space_for_path(&config.ram_temp_dir).await?;
+    let use_ram = estimated_size < avail_ram / 4;
+
+    let temp_dir = if use_ram {
+        info!(
+            "Using RAM temp (/dev/shm) for accession extraction (est. {} MB < avail {} MB / 4)",
+            estimated_size / 1_048_576,
+            avail_ram / 1_048_576
+        );
+        config.ram_temp_dir.clone()
+    } else {
+        info!(
+            "Fallback to disk temp (est. {} MB exceeds RAM threshold)",
+            estimated_size / 1_048_576
+        );
+        std::env::temp_dir()
+    };
+
+    let output_path = temp_dir.join(format!(
+        "refined_hits_{}.fasta",
+        rand::rng().random::<u32>()
+    ));
+
+    let mut writer = std::io::BufWriter::new(
+        File::create(&output_path)
+            .with_context(|| format!("Failed to create output: {}", output_path.display()))?,
+    );
+
+    let mut skipped_long = 0;
+    let mut missing_offsets = 0;
+
+    for acc in &acc_vec {
+        if let Some(offset) = index.get(acc.as_bytes()) {
+
+            reader.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("Failed to seek to offset {} for {}", offset, acc))?;
+
+            let mut seq_len: u64 = 0;
+            let mut buf = String::with_capacity(1024);
+
+            buf.clear();
+            if reader.read_line(&mut buf)? == 0 {
+                warn!("EOF while reading header for {}", acc);
+                missing_offsets += 1;
+                continue;
+            }
+
+            let fixed_header = fix_header(&buf);
+            seq_len += fixed_header.len() as u64;
+            writer.write_all(fixed_header.as_bytes())?;
+            writer.write_all(b"\n")?;
+
+            buf.clear();
+            while reader.read_line(&mut buf)? > 0 {
+                if buf.starts_with('>') {
+
+                    reader.seek(SeekFrom::Current(-(buf.len() as i64)))
+                        .with_context(|| "Failed to rewind for next header")?;
+                    break;
+                }
+                seq_len += buf.len() as u64;
+                if seq_len > MAX_ACCESSION_SEQUENCE_LEN {
+                    skipped_long += 1;
+                    info!("Skipping long sequence for {} ({} bytes)", acc, seq_len);
+                    // srain rest of sequence
+                    while reader.read_line(&mut buf)? > 0 && !buf.starts_with('>') {
+                        buf.clear();
+                    }
+                    break;
+                }
+                writer.write_all(buf.as_bytes())?;
+                buf.clear();
+            }
+        } else {
+            missing_offsets += 1;
+            warn!("No offset found for accession: {}", acc);
+        }
+    }
+
+    writer.flush().with_context(|| "Failed to flush output file")?;
+
+    if skipped_long > 0 || missing_offsets > 0 {
+        warn!(
+            "Extraction complete: {} long sequences skipped, {} accessions missing",
+            skipped_long, missing_offsets
+        );
+    }
+
+    let extracted_count = acc_vec.len() - missing_offsets;
+    info!(
+        "Successfully extracted {} accession sequences → {}",
+        extracted_count,
+        output_path.display()
+    );
+
+    Ok(output_path)
+}
+
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -3301,7 +3527,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3317,6 +3543,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_streams_iter =nt_streams.into_iter();
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_acc_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nt_counts = generate_taxon_counts(
         config.clone(),
@@ -3355,7 +3582,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_streams, nr_done_rx) = t_junction(
         diamond_call_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3371,6 +3598,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_streams_iter = nr_streams.into_iter();
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nr_counts = generate_taxon_counts(
         config.clone(),
@@ -3426,7 +3654,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         paired
     ).await?;
 
-    // Push cleanup tasks
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
 
@@ -3444,7 +3671,59 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
     eprintln!("coverage result {:?}", generate_assembly_coverage_result);
-    
+
+
+    let nt_file = config
+        .args
+        .nt
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT file required for fasta extraction".into(),
+        ))?;
+
+    let nt_offset_db_file = config
+        .args
+        .nt_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT offset DB file required for fasta extraction".into(),
+        ))?;
+
+    //nt accessions
+    let nt_ref_fasta_path = extract_accessions_to_fasta(
+        config.clone(),
+        ReceiverStream::new(nt_acc_stream),
+        &PathBuf::from(nt_file),
+        &PathBuf::from(nt_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let nr_file = config
+        .args
+        .nr
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR file required for fasta extraction".into(),
+        ))?;
+
+    let nr_offset_db_file = config
+        .args
+        .nr_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR offset DB file required for fasta extraction".into(),
+        ))?;
+
+    let nr_ref_fasta_path = extract_accessions_to_fasta(
+        config.clone(),
+        ReceiverStream::new(nr_acc_stream),
+        &PathBuf::from(nr_file),
+        &PathBuf::from(nr_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
     // *******************
     // Results retrieval
     // *******************

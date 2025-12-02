@@ -1167,71 +1167,67 @@ pub async fn concatenate_paired_reads(
 pub fn build_fasta_index(
     fasta_path: &PathBuf,
     index_path: &PathBuf,
+    verify: bool,
 ) -> Result<()> {
     let file = File::open(fasta_path)
         .with_context(|| format!("Failed to open FASTA file: {}", fasta_path.display()))?;
 
     let mut reader = BufReader::new(file);
+    let mut line = String::with_capacity(1024);
+    let mut entries = Vec::with_capacity(8_000_000);  // trying to size for NR
 
-    let mut entries: Vec<(String, u64)> = Vec::new();
-    let mut line = String::with_capacity(512);
-    let mut current_id: Option<String> = None;
+    let mut pos: u64 = 0;
 
     while reader.read_line(&mut line)? > 0 {
         if line.starts_with('>') {
-            if let Some(id) = current_id.take() {
-                let offset = reader.stream_position()?;
-                entries.push((id, offset));
-            }
-
             let header = line[1..].trim_start();
             let acc = header
                 .split_whitespace()
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("Empty FASTA header in {}", fasta_path.display()))?
+                .ok_or_else(|| anyhow!("Empty FASTA header"))?
                 .split('.')
                 .next()
                 .unwrap()
                 .to_owned();
 
-            current_id = Some(acc);
+            entries.push((acc, pos));
+
+            // Optional verification
+            if verify {
+                let mut byte = [0u8; 1];
+                reader.seek(SeekFrom::Start(pos))?;
+                reader.read_exact(&mut byte)?;
+                if byte[0] != b'>' {
+                    return Err(anyhow!(
+                        "VERIFICATION FAILED at offset {pos}: expected '>', got 0x{:02x}",
+                        byte[0]
+                    ));
+                }
+                // Return to where we were (after the line we just read)
+                reader.seek(SeekFrom::Start(pos + line.len() as u64))?;
+            }
         }
+        pos += line.len() as u64;
         line.clear();
     }
 
-    if let Some(id) = current_id {
-        entries.push((id, reader.stream_position()?));
-    }
-
+    // Dedup + sort (keeps first occurrence)
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    entries.dedup_by(|a, b| a.0.as_str() == b.0.as_str());
+    entries.dedup_by(|a, b| a.0 == b.0);
 
-    let entry_count = entries.len();
+    info!("Writing FST index with {} unique accessions → {}", entries.len(), index_path.display());
 
-    info!("Building FST index with {entry_count} unique accessions → {}", index_path.display());
+    let mut builder = MapBuilder::new(StdBufWriter::new(
+        File::create(index_path)
+            .with_context(|| format!("Cannot create index file: {}", index_path.display()))?,
+    ))?;
 
-    let mut builder = MapBuilder::new(
-        std::io::BufWriter::new(
-            File::create(index_path)
-                .with_context(|| format!("Failed to create index file: {}", index_path.display()))?,
-        ),
-    )
-        .with_context(|| "Failed to initialise fst::MapBuilder")?;
-
-    for (key, offset) in entries {
-        builder
-            .insert(&key, offset)
-            .with_context(|| format!("Failed to insert key `{key}` into fst"))?;
+    for (acc, offset) in entries {
+        builder.insert(acc, offset)?;
     }
 
-    builder
-        .finish()
-        .with_context(|| "Failed to finish fst map")?;
-
-    info!(
-        "Built FASTA offset index with {entry_count} entries → {}",
-        index_path.display()
-    );
+    builder.finish()?;
+    info!("FST index built successfully");
 
     Ok(())
 }
