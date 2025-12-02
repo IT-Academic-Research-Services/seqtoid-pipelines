@@ -3285,6 +3285,39 @@ fn parse_hit_summary(path: &PathBuf) -> Result<(HashMap<String, HitSummaryEntry>
 }
 
 
+/// Helper for writing empty output of blast_contigs in no assemled results
+///
+/// # Arguments
+/// # Returns
+/// Result
+fn write_empty_blast_outputs(
+    blast_m8: &PathBuf,
+    blast_top_m8: &PathBuf,
+    refined_m8: &PathBuf,
+    refined_hit_summary: &PathBuf,
+    refined_counts_with_dcr: &PathBuf,
+    contig_summary_json: &PathBuf,
+    deduped_m8: &PathBuf,
+    hit_summary: &PathBuf,
+    orig_counts_with_dcr: &PathBuf,
+) -> Result<()> {
+    let mut file = File::create(blast_m8)?;
+    file.write_all(b" ")?;
+
+    let mut file = File::create(blast_top_m8)?;
+    file.write_all(b" ")?;
+
+    fs::copy(deduped_m8, refined_m8)?;
+    fs::copy(hit_summary, refined_hit_summary)?;
+    fs::copy(orig_counts_with_dcr, refined_counts_with_dcr)?;
+
+    let mut file = File::create(contig_summary_json)?;
+    file.write_all(b"[]")?;
+
+    Ok(())
+}
+
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
