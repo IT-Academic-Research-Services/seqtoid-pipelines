@@ -1782,6 +1782,196 @@ pub mod spades {
     }
 }
 
+pub mod makeblastdb {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{MAKEBLASTDB_TAG, RunConfig};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct MakeblastdbConfig {
+        pub input: PathBuf,  // reference_fasta
+        pub dbtype: String,  // "nucl" or "prot"
+        pub output: PathBuf, // blast_index_path (without extension)
+        pub option_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct MakeblastdbArgGenerator;
+
+    pub async fn makeblastdb_presence_check() -> Result<f32> {
+        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for MakeblastdbArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<MakeblastdbConfig>())
+                .ok_or_else(|| anyhow!("makeblastdb requires MakeblastdbConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            args_vec.push("-in".to_string());
+            args_vec.push(config.input.to_string_lossy().to_string());
+
+            args_vec.push("-dbtype".to_string());
+            args_vec.push(config.dbtype.clone());
+
+            args_vec.push("-out".to_string());
+            args_vec.push(config.output.to_string_lossy().to_string());
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
+pub mod blastn {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{BLASTN_TAG, RunConfig};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct BlastnConfig {
+        pub query: PathBuf,          // assembled_contig
+        pub db: PathBuf,             // blast_index_path (without extension)
+        pub out: PathBuf,            // blast_m8
+        pub outfmt: String,          // e.g., "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
+        pub evalue: f64,             // e.g. 1e-10
+        pub max_target_seqs: u32,    // e.g. 5000
+        pub option_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct BlastnArgGenerator;
+
+    pub async fn blastn_presence_check() -> Result<f32> {
+        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for BlastnArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<BlastnConfig>())
+                .ok_or_else(|| anyhow!("blastn requires BlastnConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            args_vec.push("-query".to_string());
+            args_vec.push(config.query.to_string_lossy().to_string());
+
+            args_vec.push("-db".to_string());
+            args_vec.push(config.db.to_string_lossy().to_string());
+
+            args_vec.push("-out".to_string());
+            args_vec.push(config.out.to_string_lossy().to_string());
+
+            args_vec.push("-outfmt".to_string());
+            args_vec.push(config.outfmt.clone());
+
+            args_vec.push("-evalue".to_string());
+            args_vec.push(config.evalue.to_string());
+
+            args_vec.push("-max_target_seqs".to_string());
+            args_vec.push(config.max_target_seqs.to_string());
+
+            let num_cores: usize = RunConfig::thread_allocation(run_config, BLASTN_TAG, None);
+            args_vec.push("-num_threads".to_string());
+            args_vec.push(num_cores.to_string());
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+
+
+}
+
+pub mod blastx {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{BLASTX_TAG, RunConfig};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct BlastxConfig {
+        pub query: PathBuf,          // assembled_contig
+        pub db: PathBuf,             // blast_index_path (without extension)
+        pub out: PathBuf,            // blast_m8
+        pub outfmt: u32,             // 6 (standard tabular)
+        pub evalue: f64,             // e.g. 1e-10
+        pub num_alignments: u32,     // e.g. 5
+        pub option_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct BlastxArgGenerator;
+
+    pub async fn blastx_presence_check() -> Result<f32> {
+        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for BlastxArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<BlastxConfig>())
+                .ok_or_else(|| anyhow!("blastx requires BlastxConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            args_vec.push("-query".to_string());
+            args_vec.push(config.query.to_string_lossy().to_string());
+
+            args_vec.push("-db".to_string());
+            args_vec.push(config.db.to_string_lossy().to_string());
+
+            args_vec.push("-out".to_string());
+            args_vec.push(config.out.to_string_lossy().to_string());
+
+            args_vec.push("-outfmt".to_string());
+            args_vec.push(config.outfmt.to_string());
+
+            args_vec.push("-evalue".to_string());
+            args_vec.push(config.evalue.to_string());
+
+            args_vec.push("-num_alignments".to_string());
+            args_vec.push(config.num_alignments.to_string());
+
+            let num_cores: usize = RunConfig::thread_allocation(run_config, BLASTX_TAG, None);
+            args_vec.push("-num_threads".to_string());
+            args_vec.push(num_cores.to_string());
+
+            for (key, value) in config.option_fields.iter() {
+                args_vec.push(key.clone());
+                if let Some(v) = value {
+                    args_vec.push(v.clone());
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -1803,6 +1993,9 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         CZID_DEDUP_TAG => Box::new(czid_dedup::CzidDedupArgGenerator),
         DIAMOND_TAG => Box::new(diamond::DiamondArgGenerator),
         SPADES_TAG => Box::new(spades::SpadesArgGenerator),
+        BLASTN_TAG => Box::new(blastn::BlastnArgGenerator),
+        BLASTX_TAG => Box::new(blastx::BlastxArgGenerator),
+        MAKEBLASTDB_TAG => {Box::new(makeblastdb::MakeblastdbArgGenerator)},
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -1831,6 +2024,10 @@ pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
             CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
             DIAMOND_TAG => diamond::diamond_presence_check().await,
             SPADES_TAG => spades::spades_presence_check().await,
+            BLASTN_TAG => blastn::blastn_presence_check().await,
+            BLASTX_TAG => blastx::blastx_presence_check().await,
+            MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
+
 
             _ => return Err(anyhow!("Unknown tool: {}", tool)),
         }?;
