@@ -1,3 +1,4 @@
+use tokio_stream::StreamExt;
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::fs::File as StdFile;
@@ -18,9 +19,10 @@ use rayon::prelude::*;
 use bincode::{encode_into_std_write, decode_from_std_read};
 use serde::{Serialize, Deserialize};
 use ahash::AHashMap;
-
+use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
-
+use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
+use crate::utils::streams::ParseOutput;
 // *******************
 // DB creation functions
 // *******************
@@ -343,6 +345,64 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
     }
     Ok(set)
 }
+
+/// Retrieves the top hit from an m8 stream
+///
+/// # Arguments
+/// * `path` - path to hit sumamry file.
+/// # Returns
+/// hash map of HitSummaries
+pub async fn get_top_m8_nt(
+    mut input: ReceiverStream<ParseOutput>,
+    mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
+) -> Result<()> {
+    let mut best_per_contig: HashMap<String, M8Record> = HashMap::new();
+
+    while let Some(item) = input.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue,
+        };
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        if line.is_empty() { continue; }
+
+        let m8 = match M8Record::parse_line(line) {
+            Ok(m8) => m8,
+            Err(e) => {
+                warn!("Failed to parse m8 line: {} — {}", e, line);
+                continue;
+            }
+        };
+
+        let contig_id = m8.qname.clone();
+        if let Some(current) = best_per_contig.get_mut(&contig_id) {
+            if m8.bitscore > current.bitscore ||
+                (m8.bitscore == current.bitscore && m8.evalue < current.evalue) {
+                *current = m8;
+            }
+        } else {
+            best_per_contig.insert(contig_id, m8);
+        }
+    }
+
+    for (_, best) in best_per_contig {
+        let line = best.to_tab_string() + "\n";
+        output_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn get_top_m8_nr(
+    mut input: ReceiverStream<ParseOutput>,
+    mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
+) -> Result<()> {
+    // Identical to NT for now (adjust if NR ranking differs)
+    get_top_m8_nt(input, output_tx).await
+}
+
+
 
 
 // *******************

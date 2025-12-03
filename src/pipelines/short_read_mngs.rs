@@ -18,6 +18,7 @@ use tokio::fs;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::{channel, Sender};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -44,10 +45,24 @@ use once_cell::sync::Lazy;
 use ahash::AHashMap;
 
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header, read_fasta};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG,
+                          BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG,
+                          MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand,
+                          KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG,
+                          Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE,
+                          ReadCountingMode, DIAMOND_TAG, DiamondSubcommand,
+                          MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
+                          BLASTN_TAG, BLASTX_TAG};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
+                         available_space_for_path, rename_file_path, resolve_optional_path,
+                         write_vecu8_to_file, write_parse_output_to_temp_file};
+use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord,
+                          compare_read_ids, parse_header, read_fasta};
+use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd,
+                            parse_child_output, ChildStream, ParseMode, stream_to_file,
+                            read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader,
+                            write_to_fifo, deinterleave_fastq_stream, create_fifo,
+                            interleave_fastq_streams, ToBytes};
 use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -56,16 +71,18 @@ use crate::utils::command::kallisto::KallistoConfig;
 use crate::utils::command::diamond::{DiamondConfig, DiamondArgGenerator, diamond_index_prep};
 use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
 use crate::utils::streams::{deinterleave_fastq_stream_to_fifos};
-use crate::utils::command::star::{StarConfig, star_index_prep};
 use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
-use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
-use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
+use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket, generate_taxon_count_json_from_m8};
+use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db, get_top_m8_nt, get_top_m8_nr};
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::sambam::generate_info_from_bam_stream;
+use crate::utils::command::makeblastdb::{MakeblastdbConfig, MakeblastdbArgGenerator};
+use crate::utils::command::blastn::{BlastnConfig, BlastnArgGenerator};
+use crate::utils::command::blastx::{BlastxConfig, BlastxArgGenerator};
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
@@ -154,7 +171,7 @@ pub struct CoverageOutputs {
     pub contig_stats: HashMap<String, u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct HitSummaryEntry {
     pub read_id: String,
     pub level: u8,
@@ -3305,45 +3322,52 @@ pub async fn extract_accessions_to_fasta(
 /// * `path` - path to hit sumamry file.
 /// # Returns
 /// hash map of HitSummaries
-fn parse_hit_summary(path: &PathBuf) -> Result<(HashMap<String, HitSummaryEntry>, HashMap<String, (i32, i32, i32)>)> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
+pub async fn parse_hit_summary(mut stream: ReceiverStream<ParseOutput>) -> Result<(HashMap<String, HitSummaryEntry>, HashMap<String, (i32, i32, i32)>)> {
     let mut read_dict: HashMap<String, HitSummaryEntry> = HashMap::new();
     let mut accession_dict: HashMap<String, (i32, i32, i32)> = HashMap::new();
 
-    for line in reader.lines() {
-        let line = line?;
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 7 { continue; }
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Bytes(bytes) => {
+                let text = String::from_utf8_lossy(&*bytes);
+                for line in text.lines() {
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if fields.len() < 7 {
+                        continue;
+                    }
 
-        let read_id = fields[0].to_string();
-        let level: u8 = fields[1].parse()?;
-        let taxid: i32 = fields[2].parse()?;
-        let accession_id = if fields[3].is_empty() { None } else { Some(fields[3].to_string()) };
-        let species_taxid: i32 = fields[4].parse()?;
-        let genus_taxid: i32 = fields[5].parse()?;
-        let family_taxid: i32 = fields[6].parse()?;
+                    let read_id = fields[0].to_string();
+                    let level: u8 = fields[1].parse().map_err(|_| anyhow!("Invalid level: {}", fields[1]))?;
+                    let taxid: i32 = fields[2].parse().map_err(|_| anyhow!("Invalid taxid: {}", fields[2]))?;
+                    let accession_id = if fields[3].is_empty() { None } else { Some(fields[3].to_string()) };
+                    let species_taxid: i32 = fields[4].parse().map_err(|_| anyhow!("Invalid species_taxid: {}", fields[4]))?;
+                    let genus_taxid: i32 = fields[5].parse().map_err(|_| anyhow!("Invalid genus_taxid: {}", fields[5]))?;
+                    let family_taxid: i32 = fields[6].parse().map_err(|_| anyhow!("Invalid family_taxid: {}", fields[6]))?;
 
-        let entry = HitSummaryEntry {
-            read_id: read_id.clone(),
-            level,
-            taxid,
-            accession_id: accession_id.clone(),
-            species_taxid,
-            genus_taxid,
-            family_taxid,
-            contig_id: None,
-            contig_accession_id: None,
-            contig_species_taxid: None,
-            contig_genus_taxid: None,
-            contig_family_taxid: None,
-            from_assembly: None,
-        };
+                    let entry = HitSummaryEntry {
+                        read_id: read_id.clone(),
+                        level,
+                        taxid,
+                        accession_id: accession_id.clone(),
+                        species_taxid,
+                        genus_taxid,
+                        family_taxid,
+                        contig_id: None,
+                        contig_accession_id: None,
+                        contig_species_taxid: None,
+                        contig_genus_taxid: None,
+                        contig_family_taxid: None,
+                        from_assembly: None,
+                    };
 
-        read_dict.insert(read_id, entry);
+                    read_dict.insert(read_id, entry);
 
-        if let Some(acc) = accession_id {
-            accession_dict.insert(acc, (species_taxid, genus_taxid, family_taxid));
+                    if let Some(acc) = accession_id {
+                        accession_dict.insert(acc, (species_taxid, genus_taxid, family_taxid));
+                    }
+                }
+            }
+            _ => return Err(anyhow!("Unexpected ParseOutput variant in hit summary stream")),
         }
     }
 
@@ -3351,37 +3375,6 @@ fn parse_hit_summary(path: &PathBuf) -> Result<(HashMap<String, HitSummaryEntry>
 }
 
 
-/// Helper for writing empty output of blast_contigs in no assemled results
-///
-/// # Arguments
-/// # Returns
-/// Result
-// fn write_empty_blast_outputs(
-//     blast_m8: &PathBuf,
-//     blast_top_m8: &PathBuf,
-//     refined_m8: &PathBuf,
-//     refined_hit_summary: &PathBuf,
-//     refined_counts_with_dcr: &PathBuf,
-//     contig_summary_json: &PathBuf,
-//     deduped_m8: &PathBuf,
-//     hit_summary: &PathBuf,
-//     orig_counts_with_dcr: &PathBuf,
-// ) -> Result<()> {
-//     let mut file = File::create(blast_m8)?;
-//     file.write_all(b" ")?;
-//
-//     let mut file = File::create(blast_top_m8)?;
-//     file.write_all(b" ")?;
-//
-//     fs::copy(deduped_m8, refined_m8)?;
-//     fs::copy(hit_summary, refined_hit_summary)?;
-//     fs::copy(orig_counts_with_dcr, refined_counts_with_dcr)?;
-//
-//     let mut file = File::create(contig_summary_json)?;
-//     file.write_all(b"[]")?;
-//
-//     Ok(())
-// }
 
 
 /// Run function for Short Read mNGS pipelines
@@ -3415,7 +3408,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // External tools check
-    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG])
+    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
+                        BLASTN_TAG, BLASTX_TAG])
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -3720,11 +3714,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_acc_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    // let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (nt_summary_streams, nt_summary_done_rx) = t_junction(
+        call_summary_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nt_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_summary_done_rx);
+    let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
+    let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let nt_hit_summary_handle = tokio::spawn(async move {
+        parse_hit_summary(ReceiverStream::new(nt_summary_hit_stream)).await
+    });
 
     let nt_counts = generate_taxon_counts(
         config.clone(),
         ReceiverStream::new(nt_call_stream),
-        call_summary_stream,
+        ReceiverStream::new(nt_summary_taxon_stream),
         duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
         "NT".to_string(),
@@ -3746,7 +3763,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
 
-    let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
+    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(),
         ReceiverStream::new(non_host_diamond_m8_stream),
         sample_base_buf.clone(),
@@ -3755,11 +3772,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         should_keep_filter.clone(),
         0,
     ).await?;
-    cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
-    cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+    cleanup_tasks.append(&mut nr_call_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
     let (nr_streams, nr_done_rx) = t_junction(
-        diamond_call_stream,
+        nr_call_stream,
         3,
         config.base_buffer_size,
         config.args.stall_threshold,
@@ -3778,10 +3795,32 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
+    let (nr_summary_streams, nr_summary_done_rx) = t_junction(
+        nr_call_summary_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_summary_done_rx);
+    let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
+    let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let nr_hit_summary_handle = tokio::spawn(async move {
+        parse_hit_summary(ReceiverStream::new(nr_summary_hit_stream)).await
+    });
+
     let nr_counts = generate_taxon_counts(
         config.clone(),
         ReceiverStream::new(nr_call_stream),
-        diamond_call_summary_stream,
+        ReceiverStream::new(nr_summary_taxon_stream),
         duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
         "NR".to_string(),
@@ -3901,6 +3940,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+
+
+    // Blast contigs
+    //NT
+    let (nt_read_dict, nt_accession_dict) = nt_hit_summary_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("Hit summary parsing failed: {}", e)))?;
+
+
+
+
+
+    //NR
+    let (nr_read_dict, nr_accession_dict) = nr_hit_summary_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("Hit summary parsing failed: {}", e)))?;
+
 
     // *******************
     // Results retrieval

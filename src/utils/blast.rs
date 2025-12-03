@@ -9,8 +9,9 @@ use lexical::parse as lexical_parse;
 use fst::Map;
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
-
+use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{Taxid, Lineage};
+use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 
 
@@ -216,4 +217,90 @@ pub fn consensus_level<D: AsRef<[u8]>>(
     }
 
     Ok((max_level, consensus_taxid, hits.to_vec()))
+}
+
+fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() >= 3 {
+        Some((parts[0].to_string(), parts[2].parse().ok()?))
+    } else {
+        None
+    }
+}
+
+pub async fn generate_taxon_count_json_from_m8(
+    mut m8_stream: ReceiverStream<ParseOutput>,
+    mut hit_summary_stream: ReceiverStream<ParseOutput>,
+    db_type: &str,
+    lineage_map: Arc<HashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+
+    duplicate_cluster_sizes: &HashMap<String, u64>,
+    mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
+) -> Result<()> {
+
+    let mut read_to_taxid: HashMap<String, i32> = HashMap::new();
+    while let Some(item) = hit_summary_stream.next().await {
+        if let ParseOutput::Bytes(b) = item {
+            let line = String::from_utf8_lossy(&b);
+            if let Some((read_id, taxid)) = parse_read_taxid_from_hitsummary(&line) {
+                read_to_taxid.insert(read_id, taxid);
+            }
+        }
+    }
+
+    let mut buckets: HashMap<i32, AggBucket> = HashMap::new();
+
+    while let Some(item) = m8_stream.next().await {
+        if let ParseOutput::Bytes(b) = item {
+            let line = String::from_utf8_lossy(&b);
+            if let Ok(m8) = M8Record::parse_line(&line) {
+                if let Some(&taxid) = read_to_taxid.get(&m8.qname) {
+                    if taxid <= 0 { continue; }
+                    let bucket = buckets.entry(taxid).or_default();
+                    bucket.nonunique_count += 1;
+                    bucket.unique_count += duplicate_cluster_sizes.get(&m8.qname).cloned().unwrap_or(1);
+                    bucket.base_count += 1;
+                    bucket.sum_percent_identity += m8.pident;
+                    bucket.sum_alignment_length += m8.alen as f64;
+                    bucket.sum_e_value += m8.evalue;
+                    bucket.source_count_type.insert(db_type.to_string());
+                }
+            }
+        }
+    }
+
+    for (taxid, bucket) in buckets {
+        let lineage = lineage_map.get(&taxid).cloned().ok_or(anyhow!("Missing lineage for taxid {}", taxid))?;
+        if !(should_keep_filter)(&lineage) { continue; }
+
+        let dcr = if bucket.nonunique_count > 0 {
+            bucket.unique_count as f64 / bucket.nonunique_count as f64
+        } else { 0.0 };
+        let percent_identity = if bucket.base_count > 0 { bucket.sum_percent_identity / bucket.base_count as f64 } else { 0.0 };
+        let alignment_length = if bucket.base_count > 0 { bucket.sum_alignment_length / bucket.base_count as f64 } else { 0.0 };
+        let e_value = if bucket.base_count > 0 { bucket.sum_e_value / bucket.base_count as f64 } else { 0.0 };
+
+        let count = TaxonCount {
+            tax_id: taxid,
+            tax_level: 1,
+            genus_taxid: lineage[1],
+            family_taxid: lineage[2],
+            count: bucket.unique_count,
+            nonunique_count: bucket.nonunique_count,
+            unique_count: bucket.unique_count,
+            dcr,
+            percent_identity,
+            alignment_length,
+            e_value,
+            count_type: db_type.to_string(),
+            base_count: bucket.base_count,
+            source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+        };
+
+        let json_line = serde_json::to_string(&count)? + "\n";
+        output_tx.send(ParseOutput::Bytes(Arc::new(json_line.into_bytes()))).await?;
+    }
+
+    Ok(())
 }
