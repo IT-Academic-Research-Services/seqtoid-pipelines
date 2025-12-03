@@ -55,7 +55,7 @@ use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, M
                           BLASTN_TAG, BLASTX_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          available_space_for_path, rename_file_path, resolve_optional_path,
-                         write_vecu8_to_file, write_parse_output_to_temp_file};
+                         write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord,
                           compare_read_ids, parse_header, read_fasta};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd,
@@ -3220,20 +3220,12 @@ pub async fn extract_accessions_to_fasta(
     let avail_ram = available_space_for_path(&config.ram_temp_dir).await?;
     let use_ram = estimated_size < avail_ram / 4;
 
-    let temp_dir = if use_ram {
-        info!(
-            "Using RAM temp (/dev/shm) for accession extraction (est. {} MB < avail {} MB / 4)",
-            estimated_size / 1_048_576,
-            avail_ram / 1_048_576
-        );
-        config.ram_temp_dir.clone()
-    } else {
-        info!(
-            "Fallback to disk temp (est. {} MB exceeds RAM threshold)",
-            estimated_size / 1_048_576
-        );
-        std::env::temp_dir()
-    };
+    let temp_dir = choose_temp_dir(
+        estimated_size,
+        &config.ram_temp_dir,
+        4,
+    ).await?;
+
 
     let output_path = temp_dir.join(format!(
         "refined_hits_{}.fasta",
@@ -3915,6 +3907,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+    eprintln!("nt path {}", nt_ref_fasta_path.display());
 
     let nr_file = config
         .args
@@ -3940,6 +3933,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+    eprintln!("nr path {}", nr_ref_fasta_path.display());
 
 
     // Blast contigs
