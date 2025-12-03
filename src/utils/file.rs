@@ -646,6 +646,11 @@ pub async fn write_byte_stream_to_file(
     Ok(task)
 }
 
+pub async fn file_size(path: &PathBuf) -> Result<u64> {
+    let metadata = tokio::fs::metadata(path).await
+        .map_err(|e| anyhow!("Failed to read file metadata {}: {}", path.display(), e))?;
+    Ok(metadata.len())
+}
 
 pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
     let disks = Disks::new_with_refreshed_list();
@@ -656,6 +661,40 @@ pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
         }
     }
     Err(anyhow!("No disk found for path: {}", path.display()))
+}
+
+
+/// pick RAM-backed temp dir or fallback to disk temp dir
+/// based on avialble space qand headroom
+///
+/// # Arguments
+/// * `estimated_bytes` –  file size, buffer size in bytes
+/// * `ram_dir` – e.g., `/dev/shm` or `config.ram_temp_dir`
+/// * `headroom_factor` – how much of available RAM you’re willing to use (e.g., 4 = 25%)
+///
+/// # Returns
+/// The chosen temp directory (`ram_dir` if safe, otherwise `std::env::temp_dir()`)
+pub async fn choose_temp_dir(
+    estimated_bytes: u64,
+    ram_dir: &PathBuf,
+    headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
+) -> Result<PathBuf> {
+    let avail = available_space_for_path(ram_dir).await?;
+    let max_allowed = avail / headroom_factor;
+
+    if estimated_bytes <= max_allowed {
+        info!(
+            "Using RAM temp dir: {} bytes fits in {} bytes available (/{})",
+            estimated_bytes, avail, headroom_factor
+        );
+        Ok(ram_dir.clone())
+    } else {
+        warn!(
+            "RAM temp dir too small: need {} bytes, only {} bytes available (/{}) → falling back to disk temp",
+            estimated_bytes, avail, headroom_factor
+        );
+        Ok(std::env::temp_dir())
+    }
 }
 
 #[cfg(test)]
