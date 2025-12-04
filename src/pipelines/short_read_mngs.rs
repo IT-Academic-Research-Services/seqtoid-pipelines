@@ -88,6 +88,7 @@ const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
 const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
 const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
+const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
@@ -2550,6 +2551,8 @@ async fn spades_assembly(
 
     let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
 
+    let mut total_input_bytes : u64 = 0;
+
     let write_input_task = tokio::spawn({
         let input_file_path = input_file_path.clone();
 
@@ -2584,9 +2587,22 @@ async fn spades_assembly(
             if total_bytes == 0 {
                 warn!("SPAdes input file is empty – no non-host reads");
             }
+            total_input_bytes = total_bytes;
             Ok::<PathBuf, anyhow::Error>(input_file_path)
         }
+
     });
+
+    // Decide SPAdes work dir based on actual input size
+    let spades_work_dir = if total_input_bytes <= MAX_SPADES_WORK_DIR {
+        config.ram_temp_dir.join("spades")
+    } else {
+        warn!("SPAdes input {} bytes ({:.1} MB) → too large for RAM, using disk temp",
+          total_input_bytes, total_input_bytes as f64 / 1e6);
+        std::env::temp_dir().join("spades")
+    };
+
+    fs::create_dir_all(&spades_work_dir).await?;
 
     let input_file_path = write_input_task.await??;
 
@@ -3629,7 +3645,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    // This is part of post-process starting here
+    // This is part of post-process starting here for concurrency
 
     let (assembly_handle, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
         config.clone(),
