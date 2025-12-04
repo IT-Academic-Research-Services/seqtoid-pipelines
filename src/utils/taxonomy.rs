@@ -409,18 +409,50 @@ pub async fn get_top_m8_nr(
 // DB access functions
 // *******************
 
+/// Validates and cleans a taxonomic lineage
+/// /// # Arguments
+/// * `lineage`  lineage from taxdump (species, genus, family, ... root). May contain 0s or gaps.
+/// * `hit_taxid`   - The taxid at the level where consensus was reached
+/// * `hit_level`   - 1: species, 2: genus, 3: family
+///
+///
+/// # Returns
+/// Validayte lineage vector with negtive taxids by converntion for no hit at that level
+pub fn validate_taxid_lineage(
+    lineage: &[i32], //
+    hit_taxid: Taxid,
+    hit_level: u8
+) -> Vec<i32> {
+    const INVALID_BASE: i32 = -2_000_000_000; //  base for artificial negative taxids
 
-pub fn validate_taxid_lineage(lineage: &[i32], hit_taxid: Taxid, hit_level: u8) -> Vec<i32> {
     let mut cleaned = lineage.to_vec();
-    for level in 0..(hit_level as usize - 1) {
-        cleaned[level] = INVALID_CALL_BASE_ID - (level as i32 + 1) * 100;
+
+    // Invalidate all levels below the consensus level
+    // If hit_level == 0 → no consensus → invalidate everything
+    let invalidate_up_to = if hit_level == 0 {
+        cleaned.len()
+    } else {
+        hit_level.saturating_sub(1) as usize
+    };
+
+    for level in 0..invalidate_up_to {
+        cleaned[level] = INVALID_BASE - (level as i32 + 1) * 100;
     }
-    let mut parent = hit_taxid;
-    for level in (hit_level as usize - 1)..cleaned.len() {
-        if cleaned[level] <= 0 {
-            cleaned[level] = INVALID_CALL_BASE_ID - (level as i32 + 1) * 100 - parent;
+
+    //  From the consensus level upward, fill missing/invalid entries
+    // with artificial negative taxids based on parent
+    if hit_level > 0 && hit_level <= cleaned.len() as u8 {
+        let start_level = (hit_level as usize).saturating_sub(1); // inclusive
+        let mut parent = hit_taxid;
+
+        for level in start_level..cleaned.len() {
+            if cleaned[level] <= 0 {
+                // missing or invalid. so artificial negative ID
+                cleaned[level] = INVALID_BASE - (level as i32 + 1) * 100 - parent;
+            }
+            parent = cleaned[level];
         }
-        parent = cleaned[level];
     }
+
     cleaned
 }
