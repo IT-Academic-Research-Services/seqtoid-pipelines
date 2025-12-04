@@ -3217,7 +3217,9 @@ pub async fn extract_accessions_to_fasta(
 ) -> Result<PathBuf> {
     let accessions = collect_accessions_from_m8_stream(m8_stream).await?;
     if accessions.is_empty() {
-        return Err(anyhow!("No accessions found in M8 stream"));
+        warn!("No accessions found in M8 stream (empty assembly?); writing empty FASTA.");
+        let empty_fasta = NamedTempFile::new()?;
+        return Ok(empty_fasta.path().to_path_buf());
     }
 
     let mut acc_vec: Vec<String> = accessions.into_iter().collect();
@@ -3233,8 +3235,6 @@ pub async fn extract_accessions_to_fasta(
     let mut reader = BufReader::new(file);
 
     let estimated_size = (acc_vec.len() as u64) * EST_BYTES_PER_ACCESSION;
-    let avail_ram = available_space_for_path(&config.ram_temp_dir).await?;
-    let use_ram = estimated_size < avail_ram / 4;
 
     let temp_dir = choose_temp_dir(
         estimated_size,
@@ -4037,9 +4037,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
     info!("Dedup: unique reads/pairs: {}", dedup_count);
 
-    // Await Kallisto exit and process results
-    join_with_error_handling(kallisto_exit_task).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
+    // Cannot asusme ERCC's spiked in.
+    let kallisto_exit = join_with_error_handling(kallisto_exit_task).await;
+    match kallisto_exit {
+        Ok(_) => info!("Kallisto completed successfully"),
+        Err(e) => {
+            warn!("Kallisto failed (non-fatal, possibly no ERCC spiked in): {}", e);
+        }
+    }
 
     let kallisto_results_task = kallisto_results(out_dir.join("kallisto"), kallisto_ercc_tx)
         .await
