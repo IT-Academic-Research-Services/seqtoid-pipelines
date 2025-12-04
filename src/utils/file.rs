@@ -634,7 +634,7 @@ pub async fn write_byte_stream_to_file(
                                output_path_clone.display(), e))?;
 
         if total_bytes == 0 {
-            return Err(anyhow!("No bytes written to file at {}", output_path_clone.display()));
+            warn!("No bytes written to file at {}", output_path_clone.display());
         }
 
         debug!("write_byte_stream_to_file: Wrote {} bytes to {}",
