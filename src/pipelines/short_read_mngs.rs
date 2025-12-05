@@ -45,14 +45,7 @@ use once_cell::sync::Lazy;
 use ahash::AHashMap;
 
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG,
-                          BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG,
-                          MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand,
-                          KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG,
-                          Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE,
-                          ReadCountingMode, DIAMOND_TAG, DiamondSubcommand,
-                          MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
-                          BLASTN_TAG, BLASTX_TAG};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG, BLASTX_TAG, NT_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          available_space_for_path, rename_file_path, resolve_optional_path,
                          write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir, file_size};
@@ -173,36 +166,27 @@ pub struct CoverageOutputs {
     pub contig_stats: HashMap<String, u64>,
 }
 
+
 #[derive(Clone, Debug)]
-pub struct HitSummaryEntry {
-    pub read_id: String,
+pub struct ReadHit {
     pub level: u8,
     pub taxid: i32,
-    pub accession_id: Option<String>,
+    pub accession_id: Option<String>,           // base accession (no version)
     pub species_taxid: i32,
     pub genus_taxid: i32,
     pub family_taxid: i32,
     pub contig_id: Option<String>,
     pub contig_accession_id: Option<String>,
-    pub contig_species_taxid: Option<i32>,
-    pub contig_genus_taxid: Option<i32>,
-    pub contig_family_taxid: Option<i32>,
-    pub from_assembly: Option<String>,
+    pub contig_species_taxid: i32,
+    pub contig_genus_taxid: i32,
+    pub contig_family_taxid: i32,
+    pub from_assembly: bool,
 }
 
-impl HitSummaryEntry {
-    pub fn to_line(&self) -> String {
-        format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            self.read_id,
-            self.level,
-            self.taxid,
-            self.accession_id.as_deref().unwrap_or(""),
-            self.species_taxid,
-            self.genus_taxid,
-            self.family_taxid
-        )
-    }
+#[derive(Default, Clone, Debug)]
+pub struct AccessionHit {
+    pub taxid: i32,   // always species_taxid in Python
+    pub count: u64,
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -1787,10 +1771,10 @@ pub async fn call_hits_m8_stream(
                 continue;
             }
 
-            let rec = match M8Record::parse_line(&line) {
+            let rec = match M8Record::parse_line_nr(&line) {  // ←short-read alignment processing,12 column, thus  nr, not nt
                 Ok(r) => r,
                 Err(e) => {
-                    debug!("m8 parse error: {} – {}", e, &line);
+                    warn!("Failed to parse GSNAP m8 line: {} — {}", e, line);
                     continue;
                 }
             };
@@ -2145,7 +2129,7 @@ pub async fn generate_taxon_counts(
             _ => continue,
         };
 
-        let rec = M8Record::parse_line(&line)
+        let rec = M8Record::parse_line_nr(&line)
             .map_err(|e| anyhow!("failed to parse m8 line: {}", e))?;
         read_metrics.insert(rec.qname, (rec.pident, rec.alen, rec.evalue));
     }
@@ -3347,64 +3331,286 @@ pub async fn extract_accessions_to_fasta(
 }
 
 
-/// Parse hit_summary file into maps
-///
-/// # Arguments
-/// * `path` - path to hit sumamry file.
-/// # Returns
-/// hash map of HitSummaries
-pub async fn parse_hit_summary(mut stream: ReceiverStream<ParseOutput>) -> Result<(HashMap<String, HitSummaryEntry>, HashMap<String, (i32, i32, i32)>)> {
-    let mut read_dict: HashMap<String, HitSummaryEntry> = HashMap::new();
-    let mut accession_dict: HashMap<String, (i32, i32, i32)> = HashMap::new();
+pub async fn summarize_hits(
+    mut stream: ReceiverStream<ParseOutput>,
+) -> Result<(AHashMap<String, ReadHit>, AHashMap<String, AccessionHit>)> {
+    let mut read_dict = AHashMap::with_capacity(5_000_000);
+    let mut accession_dict: AHashMap<String, AccessionHit> = AHashMap::new();
 
     while let Some(item) = stream.next().await {
-        match item {
-            ParseOutput::Bytes(bytes) => {
-                let text = String::from_utf8_lossy(&*bytes);
-                for line in text.lines() {
-                    let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() < 7 {
-                        continue;
-                    }
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => return Err(anyhow!("Non-Bytes in hit_summary stream")),
+        };
 
-                    let read_id = fields[0].to_string();
-                    let level: u8 = fields[1].parse().map_err(|_| anyhow!("Invalid level: {}", fields[1]))?;
-                    let taxid: i32 = fields[2].parse().map_err(|_| anyhow!("Invalid taxid: {}", fields[2]))?;
-                    let accession_id = if fields[3].is_empty() { None } else { Some(fields[3].to_string()) };
-                    let species_taxid: i32 = fields[4].parse().map_err(|_| anyhow!("Invalid species_taxid: {}", fields[4]))?;
-                    let genus_taxid: i32 = fields[5].parse().map_err(|_| anyhow!("Invalid genus_taxid: {}", fields[5]))?;
-                    let family_taxid: i32 = fields[6].parse().map_err(|_| anyhow!("Invalid family_taxid: {}", fields[6]))?;
+        let line = String::from_utf8_lossy(&**bytes);
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
 
-                    let entry = HitSummaryEntry {
-                        read_id: read_id.clone(),
-                        level,
-                        taxid,
-                        accession_id: accession_id.clone(),
-                        species_taxid,
-                        genus_taxid,
-                        family_taxid,
-                        contig_id: None,
-                        contig_accession_id: None,
-                        contig_species_taxid: None,
-                        contig_genus_taxid: None,
-                        contig_family_taxid: None,
-                        from_assembly: None,
-                    };
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 7 {
+            warn!("Malformed hit_summary line (<7 fields): {}", line);
+            continue;
+        }
 
-                    read_dict.insert(read_id, entry);
+        let read_id = parts[0].to_string();
 
-                    if let Some(acc) = accession_id {
-                        accession_dict.insert(acc, (species_taxid, genus_taxid, family_taxid));
-                    }
-                }
+        let level = match parts[1].parse::<u8>() {
+            Ok(l) => l,
+            Err(_) => {
+                warn!("Invalid level: {}", parts[1]);
+                continue;
             }
-            _ => return Err(anyhow!("Unexpected ParseOutput variant in hit summary stream")),
+        };
+
+        let taxid = match parts[2].parse::<i32>() {
+            Ok(t) => t,
+            Err(_) => {
+                warn!("Invalid taxid: {}", parts[2]);
+                continue;
+            }
+        };
+
+        let accession_raw = parts[3];
+        let accession_base = if accession_raw == "-" || accession_raw == "-1" || accession_raw.is_empty() {
+            None
+        } else {
+            Some(accession_raw.split('.').next().unwrap().to_string())
+        };
+
+        let species_taxid = parts[4].parse::<i32>().unwrap_or(0);
+        let genus_taxid = parts[5].parse::<i32>().unwrap_or(0);
+        let family_taxid = parts[6].parse::<i32>().unwrap_or(0);
+
+        // Always insert into read_dict
+        read_dict.insert(read_id.clone(), ReadHit {
+            level,
+            taxid,
+            accession_id: accession_base.clone(),
+            species_taxid,
+            genus_taxid,
+            family_taxid,
+            contig_id: None,
+            contig_accession_id: None,
+            contig_species_taxid: 0,
+            contig_genus_taxid: 0,
+            contig_family_taxid: 0,
+            from_assembly: false,
+        });
+
+        // accession_dict only when level > 0 && taxid > 0
+        if level > 0 && taxid > 0 {
+            if let Some(base) = accession_base {
+                let entry = accession_dict.entry(base).or_default();
+                entry.count += 1;
+                entry.taxid = species_taxid;
+            }
         }
     }
 
     Ok((read_dict, accession_dict))
 }
 
+
+/// Helper for writing empty output of blast_contigs in no assemled results
+///
+/// # Arguments
+/// # Returns
+/// Result
+async fn write_empty_blast_outputs(
+    blast_m8: &PathBuf,
+    blast_top_m8: &PathBuf,
+    refined_m8: &PathBuf,
+    refined_hit_summary: &PathBuf,
+    refined_counts_with_dcr: &PathBuf,
+    contig_summary_json: &PathBuf,
+    deduped_m8: &PathBuf,
+    hit_summary: &PathBuf,
+    orig_counts_with_dcr: &PathBuf,
+) -> Result<()> {
+    tokio::fs::write(blast_m8, b" ").await?;
+    tokio::fs::write(blast_top_m8, b" ").await?;
+    tokio::fs::copy(deduped_m8, refined_m8).await?;
+    tokio::fs::copy(hit_summary, refined_hit_summary).await?;
+    tokio::fs::copy(orig_counts_with_dcr, refined_counts_with_dcr).await?;
+    tokio::fs::write(contig_summary_json, b"[]").await?;
+    Ok(())
+}
+
+/// Updates the read_dict in blast_contigs from streamed m8 data.
+///
+/// # Arguments
+/// * `read2contig` - Assignment of reads to contigs
+/// * `blast_top_m8_stream` - stream in m8 format, top as found in get_top_m8_nt/nr
+/// * `accession_dict` - accession → (species, genus, family)
+/// * `updated_read_tx` - sendiner
+
+/// # Returns
+/// Result of hashset of the accessions
+pub async fn update_read_dict(
+    read2contig: &HashMap<String, String>,
+    mut top_m8_stream: ReceiverStream<ParseOutput>,
+    mut read_dict: AHashMap<String, ReadHit>,
+    accession_dict: &AHashMap<String, AccessionHit>,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    accession2taxid: Arc<fst::Map<Vec<u8>>>,
+    should_keep: Arc<dyn Fn(&[i32]) -> bool + Send + Sync>,
+    db_type: &str,
+    mut contig2lineage_tx: Sender<ParseOutput>,
+    mut read2blastm8_tx: Sender<ParseOutput>,
+) -> Result<AHashMap<String, ReadHit>> {
+    let mut added_reads = AHashMap::new();
+
+    while let Some(item) = top_m8_stream.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue,
+        };
+        let line = String::from_utf8_lossy(&**bytes).trim_end().to_string();
+        if line.is_empty() { continue; }
+
+        let m8 = if db_type == "nt" {
+            M8Record::parse_line_nt(&line)?
+        } else {
+            M8Record::parse_line_nr(&line)?
+        };
+
+        let contig_id = m8.qname.clone();
+        let accession = m8.tname.clone();
+
+        let taxid = accession2taxid.get(accession.as_bytes())
+            .map(|v| u32::from_le_bytes(v.to_le_bytes()[0..4].try_into().unwrap()) as i32)
+            .unwrap_or(0);
+
+        let lineage = if taxid > 0 {
+            lineage_map.get(&taxid).cloned().unwrap_or([0; 3])
+        } else {
+            [0; 3]
+        };
+
+        if !(should_keep)(&lineage) {
+            continue;
+        }
+
+        // Emit contig2lineage for contig_summary
+        let json = json!({
+            "contig_name": contig_id,
+            "species_taxid": lineage[0],
+            "genus_taxid": lineage[1],
+            "family_taxid": lineage[2],
+        });
+        let mut line_out = serde_json::to_string(&json)?;
+        line_out.push('\n');
+        contig2lineage_tx.send(ParseOutput::Bytes(Arc::new(line_out.into_bytes()))).await?;
+
+        let reads: Vec<_> = read2contig.iter()
+            .filter(|&(_, c)| c == &contig_id)
+            .map(|(r, _)| r.clone())
+            .collect();
+
+        for read_id in reads {
+            let updated = ReadHit {
+                level: 1,
+                taxid: lineage[0],
+                accession_id: Some(accession.clone()),
+                species_taxid: lineage[0],
+                genus_taxid: lineage[1],
+                family_taxid: lineage[2],
+                contig_id: Some(contig_id.clone()),
+                contig_accession_id: Some(accession.clone()),
+                contig_species_taxid: lineage[0],
+                contig_genus_taxid: lineage[1],
+                contig_family_taxid: lineage[2],
+                from_assembly: true,
+            };
+
+            if read_dict.contains_key(&read_id) {
+                read_dict.insert(read_id.clone(), updated);
+            } else {
+                added_reads.insert(read_id.clone(), updated);
+            }
+
+            // Emit blast m8 line
+            let mut m8_line = m8.to_tab_string();
+            m8_line.push('\n');
+            read2blastm8_tx.send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes()))).await?;
+        }
+    }
+
+    // Merge added into read_dict
+    read_dict.extend(added_reads);
+    Ok(read_dict)
+}
+
+
+
+pub async fn generate_contig_summary_json(
+    mut contig2lineage_stream: ReceiverStream<ParseOutput>,
+    contig_stats: &HashMap<String, u64>, // contig → read count (dcr-weighted)
+    contigs_fasta_path: &PathBuf,
+    db_type: &str,
+    mut output_tx: Sender<ParseOutput>,
+) -> Result<()> {
+    let mut summary = Vec::new();
+
+    while let Some(item) = contig2lineage_stream.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue,
+        };
+        let line = String::from_utf8_lossy(&**bytes);
+        let json: Value = serde_json::from_str(&line)?;
+        let contig_name = json["contig_name"].as_str().unwrap().to_string();
+        let species = json["species_taxid"].as_i64().unwrap() as i32;
+        let genus = json["genus_taxid"].as_i64().unwrap() as i32;
+        let family = json["family_taxid"].as_i64().unwrap() as i32;
+
+        let reads = *contig_stats.get(&contig_name).unwrap_or(&0) as u64;
+        let bases = file_size(&contigs_fasta_path).await? ; // approximate or precompute per contig
+
+        summary.push(json!({
+            "contig_name": contig_name,
+            "db_type": db_type,
+            "reads": reads,
+            "bases": bases,
+            "species_taxid": species,
+            "genus_taxid": genus,
+            "family_taxid": family,
+            "common_name": null,
+            "category_name": null,
+            "score": null,
+        }));
+    }
+
+    let out = serde_json::to_string(&summary)? + "\n";
+    output_tx.send(ParseOutput::Bytes(Arc::new(out.into_bytes()))).await?;
+    Ok(())
+}
+
+
+
+
+pub async fn blast_contigs (
+    config: Arc<RunConfig>,
+    db_type: &str,
+    deduped_m8_stream: ReceiverStream<ParseOutput>, // deduped_m8
+    read_dict: AHashMap<String, ReadHit>, //hit_summary, but already done
+    accession_dict: AHashMap<String, AccessionHit> ,  //hit_summary, but already done
+    taxon_counts: Vec<TaxonCount>, // orig_counts_with_dcr
+    assembled_contig_fasta: &PathBuf, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
+    sam_stats: HashMap<String, u64>, // the SAM file itself not needed, just pass the stats
+    reference_fasta: &PathBuf, // reference_fasta
+    duplicate_cluster_sizes: &HashMap<String, u64>, //duplicate_cluster_sizes_path
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    accession_map: Arc<Map<Vec<u8>>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>
+
+) -> Result<()> {
+
+    Ok(())
+}
 
 
 
@@ -3728,7 +3934,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
-        3,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3745,7 +3951,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_acc_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    // let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
         call_summary_stream,
@@ -3765,9 +3971,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nt_hit_summary_handle = tokio::spawn(async move {
-        parse_hit_summary(ReceiverStream::new(nt_summary_hit_stream)).await
-    });
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream)));
 
     let nt_counts = generate_taxon_counts(
         config.clone(),
@@ -3844,9 +4048,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nr_hit_summary_handle = tokio::spawn(async move {
-        parse_hit_summary(ReceiverStream::new(nr_summary_hit_stream)).await
-    });
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream)));
 
     let nr_counts = generate_taxon_counts(
         config.clone(),
@@ -3893,7 +4095,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     assembly_handle.spades_task.await??;
 
-    let (assembly_outputs, assembly_bam_out_stream, mut post_assembly_cleanup_tasks, mut post_assembly_cleanup_receivers) = process_assembly(
+    let (assembly_outputs, assembly_bam_out_stream,
+        mut post_assembly_cleanup_tasks,
+        mut post_assembly_cleanup_receivers) = process_assembly(
         config.clone(),
         assembly_out_dir,
         assembly_work_dir,
@@ -3980,18 +4184,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //NT
     let (nt_read_dict, nt_accession_dict) = nt_hit_summary_handle
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("Hit summary task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(anyhow!("Hit summary parsing failed: {}", e)))?;
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
 
 
+    let nt_result = blast_contigs(
+        config,
+        NT_TAG,
+        ReceiverStream::new(nt_blast_stream), // deduped_m8
+        nt_read_dict, //hit_summary, but already done
+        nt_accession_dict,   //hit_summary, but already done
+        nt_counts, // orig_counts_with_dcr
+        &assembly_outputs.contigs_ram_fasta, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
+        assembly_outputs.contig_stats, // the SAM file itself not needed, just pass the stats
+        &nt_ref_fasta_path, // reference_fasta
+        &duplicate_cluster_sizes, //duplicate_cluster_sizes_path
+        lineage_map,
+        acc2taxid_map,
+        should_keep_filter
+
+    );
 
 
 
     //NR
     let (nr_read_dict, nr_accession_dict) = nr_hit_summary_handle
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("Hit summary task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(anyhow!("Hit summary parsing failed: {}", e)))?;
+        .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
 
 
     // *******************
