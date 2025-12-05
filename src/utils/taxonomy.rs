@@ -347,7 +347,10 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
 }
 
 /// Retrieves the top hit from an m8 stream
-///
+/// Ranking
+/// 1. Higher AAI = pident * alen / qlen
+/// 2. Lower evalue
+/// 3. Higher bitscore
 /// # Arguments
 /// * `path` - path to hit sumamry file.
 /// # Returns
@@ -356,50 +359,167 @@ pub async fn get_top_m8_nt(
     mut input: ReceiverStream<ParseOutput>,
     mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
 ) -> Result<()> {
-    let mut best_per_contig: HashMap<String, M8Record> = HashMap::new();
+    // Group all valid M8 records by contig (qname)
+    let mut hits_per_contig: HashMap<String, Vec<M8Record>> = HashMap::new();
 
     while let Some(item) = input.next().await {
         let bytes = match item {
             ParseOutput::Bytes(b) => b,
-            _ => continue,
+            _ => continue, // Skip non-bytes (should never happen in BLAST output)
         };
+
         let line = String::from_utf8_lossy(&bytes);
         let line = line.trim_end();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
-        let m8 = match M8Record::parse_line(line) {
+        let m8 = match M8Record::parse_line_nt(line) {
             Ok(m8) => m8,
             Err(e) => {
-                warn!("Failed to parse m8 line: {} — {}", e, line);
+                warn!("Failed to parse NT m8 line: {} — {}", e, line);
                 continue;
             }
         };
 
-        let contig_id = m8.qname.clone();
-        if let Some(current) = best_per_contig.get_mut(&contig_id) {
-            if m8.bitscore > current.bitscore ||
-                (m8.bitscore == current.bitscore && m8.evalue < current.evalue) {
-                *current = m8;
-            }
-        } else {
-            best_per_contig.insert(contig_id, m8);
+        // qlen must be > 0 (defensive — BLAST should guarantee this)
+        if m8.qlen == 0 {
+            warn!("Skipping hit with qlen=0 for contig {}", m8.qname);
+            continue;
         }
+
+        hits_per_contig
+            .entry(m8.qname.clone())
+            .or_default()
+            .push(m8);
     }
 
-    for (_, best) in best_per_contig {
+    // For each contig, select the single best hit
+    for (contig_id, mut hits) in hits_per_contig {
+        if hits.is_empty() {
+            continue;
+        }
+
+        hits.sort_by(|a, b| {
+            // Primary: AAI = pident * alen / qlen (higher is better)
+            let aai_a = a.pident * a.alen as f64 / a.qlen as f64;
+            let aai_b = b.pident * b.alen as f64 / b.qlen as f64;
+
+            // Descending AAI
+            let cmp = aai_b.partial_cmp(&aai_a).unwrap_or(std::cmp::Ordering::Equal);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+
+            // Ascending evalue
+            let cmp = a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+
+            // Descending bitscore
+            b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let best = hits.into_iter().next().unwrap(); // Top after sort
+
         let line = best.to_tab_string() + "\n";
-        output_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
+        output_tx
+            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send top NT m8 line — receiver dropped"))?;
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct MergedHsp {
+    total_alen: u64,
+    sum_pident: f64,
+    evalue: f64,
+    bitscore: f64,
+    hsp_count: u64,
+    representative: M8Record,
 }
 
 pub async fn get_top_m8_nr(
     mut input: ReceiverStream<ParseOutput>,
     mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
 ) -> Result<()> {
-    // Identical to NT for now (adjust if NR ranking differs)
-    get_top_m8_nt(input, output_tx).await
+    // (contig, subject) → merged stats
+    let mut merged: HashMap<(String, String), MergedHsp> = HashMap::new();
+
+    while let Some(item) = input.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue,
+        };
+
+        let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Use a 12-column parser for NR — we'll assume M8Record can parse without qlen/slen
+        // (you'll need a separate parse_line_nr or make qlen/slen optional)
+        let m8 = match M8Record::parse_line_nr(&line) {  // ← implement this
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to parse NR m8 line: {} — {}", e, line);
+                continue;
+            }
+        };
+
+        let key = (m8.qname.clone(), m8.tname.clone());
+        let entry = merged.entry(key).or_default();
+
+        entry.total_alen += m8.alen;
+        entry.sum_pident += m8.pident * m8.alen as f64;
+        entry.evalue = entry.evalue.min(m8.evalue);
+        entry.bitscore = entry.bitscore.max(m8.bitscore);
+        entry.hsp_count += 1;
+        // Keep one representative HSP for output (the one with highest bitscore)
+        if m8.bitscore > entry.representative.bitscore {
+            entry.representative = m8;
+        }
+    }
+
+    // Now per contig, pick best subject
+    let mut best_per_contig: HashMap<String, MergedHsp> = HashMap::new();
+
+    for ((contig, _subject), merged_hsp) in merged {
+        let current = best_per_contig.entry(contig).or_default();
+        if merged_hsp.bitscore > current.bitscore ||
+            (merged_hsp.bitscore == current.bitscore && merged_hsp.evalue < current.evalue) {
+            *current = merged_hsp;
+        }
+    }
+
+    for (_contig, best) in best_per_contig {
+        let rep = &best.representative;
+        // Reconstruct line using merged values where Python does (pident = weighted avg)
+        let avg_pident = if best.total_alen > 0 {
+            best.sum_pident / best.total_alen as f64
+        } else {
+            rep.pident
+        };
+
+        // Use representative's fields, but override pident with merged average
+        let line = format!(
+            "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
+            rep.qname, rep.tname, avg_pident, best.total_alen,
+            rep.mismatch, rep.gapopen, rep.qstart, rep.qend,
+            rep.tstart, rep.tend, best.evalue, best.bitscore
+        );
+
+        output_tx
+            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .await
+            .map_err(|_| anyhow::anyhow!("NR top m8 sender dropped"))?;
+    }
+
+    Ok(())
 }
 
 
