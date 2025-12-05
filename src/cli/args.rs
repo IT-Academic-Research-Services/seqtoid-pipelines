@@ -33,6 +33,9 @@ pub struct Arguments {
     #[arg(short = 'o', long = "out", help = "Output directory for all generated files. If not specified, a directory named '<sample_base>_YYYYMMDD' will be created in the current working directory.")]
     pub out_dir: Option<String>,
 
+    #[arg(long)]
+    pub nvme_scratch: Option<String>,
+
     #[arg(long, default_value_t = 50000000)]
     pub max_reads: usize,
 

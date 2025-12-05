@@ -55,9 +55,9 @@ use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, M
                           BLASTN_TAG, BLASTX_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          available_space_for_path, rename_file_path, resolve_optional_path,
-                         write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir};
+                         write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir, file_size};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord,
-                          compare_read_ids, parse_header, read_fasta};
+                          compare_read_ids, parse_header, read_fasta, write_fasta_stream_to_file};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd,
                             parse_child_output, ChildStream, ParseMode, stream_to_file,
                             read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader,
@@ -163,6 +163,7 @@ pub struct AssemblyHandle {
 #[derive(Debug)]
 pub struct CoverageOutputs {
     pub contigs_fasta: PathBuf,
+    pub contigs_ram_fasta: PathBuf,
     pub contigs_all_fasta: PathBuf,
     pub scaffolds_fasta: PathBuf,
     pub sam_path: PathBuf,
@@ -2661,6 +2662,7 @@ pub async fn process_assembly(
     bowtie_stream: ReceiverStream<ParseOutput>,
     duplicate_cluster_sizes: HashMap<String, u64>,
     paired: bool,
+    assembly_headroom: u64,
 ) -> Result<(
            CoverageOutputs,
            ReceiverStream<ParseOutput>,
@@ -2691,6 +2693,7 @@ pub async fn process_assembly(
         let empty_json = "{}";
 
         fs::write(out_dir.join("contigs.fasta"), dummy).await?;
+        fs::write(out_dir.join("contigs.ram.fasta"), dummy).await?;
         fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
         fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
         fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
@@ -2698,6 +2701,7 @@ pub async fn process_assembly(
 
         return Ok((CoverageOutputs {
             contigs_fasta: out_dir.join("contigs.fasta"),
+            contigs_ram_fasta: out_dir.join("contigs.ram.fasta"),
             contigs_all_fasta: out_dir.join("contigs_all.fasta"),
             scaffolds_fasta: out_dir.join("scaffolds.fasta"),
             sam_path: out_dir.join("read-contig.sam"),
@@ -2713,6 +2717,19 @@ pub async fn process_assembly(
 
     let contigs_out = out_dir.join("contigs.fasta");
 
+     let contigs_size = file_size(&raw_contigs_path).await?;
+
+     let temp_dir = choose_temp_dir(
+         contigs_size,
+         &config.ram_temp_dir,
+         &config.args.nvme_scratch,
+         assembly_headroom,
+     ).await?;
+
+     let ram_fasta_path = NamedTempFile::with_suffix_in(".fa", &temp_dir)
+         .map_err(|e| PipelineError::Other(e.into()))?;
+     let ram_path = ram_fasta_path.path().to_owned(); // PathBuf, so its owned
+
     //contig length filtering
     let rx = read_fasta(
         raw_contigs_path.clone(),
@@ -2722,16 +2739,20 @@ pub async fn process_assembly(
         8192,
     ).map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
 
-    let (write_task, temp_path, _temp) = write_parse_output_to_temp_file(
-        ReceiverStream::new(rx),
-        None,
-        Some(".fasta"),
-        config.ram_temp_dir.clone(),
-    ).await?;
-    temp_files.push(_temp);
+     let (write_handle, _ram_path) = write_fasta_stream_to_file(
+         ReceiverStream::new(rx),
+         ram_path.clone(),
+         config.base_buffer_size,
+     ).await?;
 
-    write_task.await??;
-    tokio::fs::rename(&temp_path, &contigs_out).await?;
+     write_handle.await
+         .map_err(|e| PipelineError::Other(anyhow!("FASTA write task panicked: {}", e)))?
+         .map_err(|e| PipelineError::Other(anyhow!("FASTA write failed: {}", e)))?;
+
+     fs::copy(&ram_path, contigs_out).await
+         .map_err(|e| PipelineError::Other(anyhow!("Failed to copy contigs to output: {}", e)))?;
+
+     temp_files.push(ram_fasta_path);
 
     let scaffolds_out = out_dir.join("scaffolds.fasta");
     let spades_scaffolds = work_dir.join("scaffolds.fasta");
@@ -2753,7 +2774,7 @@ pub async fn process_assembly(
             "--threads",
             &num_index_cores.to_string(),
             "--quiet",
-            contigs_out.to_str().unwrap(),
+            ram_path.clone().to_str().unwrap(),
             index_prefix.to_str().unwrap(),
         ])
         .status()
@@ -2899,6 +2920,7 @@ pub async fn process_assembly(
 
     Ok((CoverageOutputs {
         contigs_fasta: out_dir.join("contigs.fasta"),
+        contigs_ram_fasta: ram_path.clone(),
         contigs_all_fasta: out_dir.join("contigs_all.fasta"),
         scaffolds_fasta: out_dir.join("scaffolds.fasta"),
         sam_path: out_dir.join("read-contig.sam"),
@@ -3239,6 +3261,7 @@ pub async fn extract_accessions_to_fasta(
     let temp_dir = choose_temp_dir(
         estimated_size,
         &config.ram_temp_dir,
+        &config.args.nvme_scratch,
         4,
     ).await?;
 
@@ -3876,7 +3899,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         assembly_work_dir,
         ReceiverStream::new(non_host_coverage_bt2_stream),
         duplicate_cluster_sizes.clone(),
-        paired
+        paired,
+        4 // this can become as CLI arg if needed
     ).await?;
 
     cleanup_tasks.extend(post_assembly_cleanup_tasks);

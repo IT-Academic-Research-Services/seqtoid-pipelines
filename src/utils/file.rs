@@ -677,24 +677,57 @@ pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
 pub async fn choose_temp_dir(
     estimated_bytes: u64,
     ram_dir: &PathBuf,
+    nvme_scratch: &Option<String>,
     headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
 ) -> Result<PathBuf> {
-    let avail = available_space_for_path(ram_dir).await?;
-    let max_allowed = avail / headroom_factor;
 
-    if estimated_bytes <= max_allowed {
-        info!(
-            "Using RAM temp dir: {} bytes fits in {} bytes available (/{})",
-            estimated_bytes, avail, headroom_factor
-        );
-        Ok(ram_dir.clone())
-    } else {
-        warn!(
-            "RAM temp dir too small: need {} bytes, only {} bytes available (/{}) → falling back to disk temp",
-            estimated_bytes, avail, headroom_factor
-        );
-        Ok(std::env::temp_dir())
+    async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool> {
+        let avail = available_space_for_path(path).await?;
+        Ok(required <= avail / factor)
     }
+
+    // 1. Try RAM dir
+    if check_space(ram_dir, estimated_bytes, headroom_factor).await? {
+        debug!(
+            "Using RAM temp dir {}: {} bytes fits in {} available (/{})",
+            ram_dir.display(),
+            estimated_bytes,
+            available_space_for_path(ram_dir).await?,
+            headroom_factor
+        );
+        return Ok(ram_dir.clone());
+    }
+
+    // 2. Try NVMe scratch if provided
+    if let Some(nvme) = nvme_scratch {
+        let nvme_path = PathBuf::from(nvme);
+        if check_space(&nvme_path, estimated_bytes, headroom_factor).await? {
+            debug!(
+                "Using NVMe scratch {}: {} bytes fits (/{})",
+                nvme_path.display(),
+                estimated_bytes,
+                headroom_factor
+            );
+            return Ok(nvme_path.clone());
+        } else {
+            warn!(
+                "NVMe scratch {} insufficient: need {} bytes (/{})",
+                nvme_path.display(),
+                estimated_bytes,
+                headroom_factor
+            );
+        }
+    } else {
+        debug!("No NVMe scratch configured — skipping");
+    }
+
+    // 3. Final fallback: system temp
+    debug!(
+        "Falling back to system temp dir {} (RAM/NVMe insufficient or unavailable)",
+        std::env::temp_dir().display()
+    );
+    Ok(std::env::temp_dir())
+
 }
 
 #[cfg(test)]
