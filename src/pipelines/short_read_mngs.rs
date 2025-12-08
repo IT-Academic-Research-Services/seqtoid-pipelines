@@ -189,6 +189,20 @@ pub struct AccessionHit {
     pub count: u64,
 }
 
+#[derive(Serialize)]
+pub struct ContigSummaryEntry {
+    contig_name: String,
+    common_name: Option<String>,
+    category_name: Option<String>,
+    score: Option<f64>,
+    db_type: String,
+    reads: u64,
+    bases: u64,
+    species_taxid: i32,
+    genus_taxid: i32,
+    family_taxid: i32,
+}
+
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
 /// # Arguments
@@ -1731,19 +1745,8 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    // let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
-    // let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
-    //
-    // let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
-    // let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
-    // let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
-    // let acc2taxid_map = Arc::new(acc2taxid_map);
-
-
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
-
-    let config_clone = config.clone();
 
     let processing_task = tokio::spawn(async move {
 
@@ -3608,6 +3611,19 @@ pub async fn blast_contigs (
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>
 
 ) -> Result<()> {
+
+    let out_dir = config.out_dir.join(format!("blast_{}", db_type));
+    tokio::fs::create_dir_all(&out_dir).await?;
+
+    let blast_m8_path = out_dir.join("blast.m8");
+    let blast_top_m8_path = out_dir.join("blast_top.m8");
+    let refined_m8_path = out_dir.join("refined.m8");
+    let refined_hit_summary_path = out_dir.join("refined_hit_summary.tab");
+    let refined_counts_path = out_dir.join("refined_counts_with_dcr.json");
+    let contig_summary_path = out_dir.join("contig_summary.json");
+
+    let contig_size = file_size(assembled_contig_fasta).await?;
+    let ref_size = file_size(reference_fasta).await?;
 
     Ok(())
 }
