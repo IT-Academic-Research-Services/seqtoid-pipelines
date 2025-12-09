@@ -1846,7 +1846,6 @@ pub mod blastn {
     pub struct BlastnConfig {
         pub query: PathBuf,          // assembled_contig
         pub db: PathBuf,             // blast_index_path (without extension)
-        pub out: PathBuf,            // blast_m8
         pub outfmt: String,          // e.g., "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
         pub evalue: f64,             // e.g. 1e-10
         pub max_target_seqs: u32,    // e.g. 5000
@@ -1874,8 +1873,6 @@ pub mod blastn {
             args_vec.push("-db".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
 
-            args_vec.push("-out".to_string());
-            args_vec.push(config.out.to_string_lossy().to_string());
 
             args_vec.push("-outfmt".to_string());
             args_vec.push(config.outfmt.clone());
@@ -1916,7 +1913,6 @@ pub mod blastx {
     pub struct BlastxConfig {
         pub query: PathBuf,          // assembled_contig
         pub db: PathBuf,             // blast_index_path (without extension)
-        pub out: PathBuf,            // blast_m8
         pub outfmt: u32,             // 6 (standard tabular)
         pub evalue: f64,             // e.g. 1e-10
         pub num_alignments: u32,     // e.g. 5
@@ -1944,8 +1940,6 @@ pub mod blastx {
             args_vec.push("-db".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
 
-            args_vec.push("-out".to_string());
-            args_vec.push(config.out.to_string_lossy().to_string());
 
             args_vec.push("-outfmt".to_string());
             args_vec.push(config.outfmt.to_string());
