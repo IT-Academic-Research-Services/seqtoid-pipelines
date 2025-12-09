@@ -11,9 +11,11 @@ use fst::Map;
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
-use crate::config::defs::{Taxid, Lineage};
+use tokio::sync::mpsc::Sender;
+use crate::config::defs::{Taxid, Lineage, NT_TAG};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
+use crate::utils::streams::ToBytes;
 
 
 /// Single BLAST m8 line
@@ -332,71 +334,50 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 }
 
 pub async fn generate_taxon_count_json_from_m8(
-    mut m8_stream: ReceiverStream<ParseOutput>,
-    mut hit_summary_stream: ReceiverStream<ParseOutput>,
+    mut refined_m8_stream: ReceiverStream<ParseOutput>,
+    mut refined_hit_summary_stream: ReceiverStream<ParseOutput>,
     db_type: &str,
-    lineage_map: Arc<HashMap<Taxid, Lineage>>,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_cluster_sizes: &HashMap<String, u64>,
-    mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
+    mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
+    let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
 
-    // === 1. Build read_to_taxid from hit_summary_stream ===
-    let mut read_to_taxid: HashMap<String, i32> = HashMap::with_capacity(1_000_000); // Pre-size for speed
+    // 1. Read-to-taxid map from refined hit summary
+    let mut read_to_taxid: AHashMap<String, Taxid> = AHashMap::with_capacity(10_000_000);
+    while let Some(item) = refined_hit_summary_stream.next().await {
+        let bytes = item.to_bytes()?;  // ← note the ? here
+        let line = String::from_utf8_lossy(&bytes);
 
-    while let Some(item) = hit_summary_stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => return Err(anyhow!("Unexpected non-Bytes in hit_summary_stream")),
-        };
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 3 { continue; }
 
-        let line = String::from_utf8_lossy(&**bytes);  // ← Fixed: &**bytes gives &[u8]
-        if let Some((read_id, taxid)) = parse_read_taxid_from_hitsummary(&line) {
-            read_to_taxid.insert(read_id, taxid);
-        }
+        let read_id = fields[0].to_string();
+        let taxid = fields[1].parse::<Taxid>().unwrap_or(0);
+        read_to_taxid.insert(read_id, taxid);
     }
 
-    // === 2. Aggregate from m8_stream ===
-    let mut buckets: HashMap<i32, AggBucket> = HashMap::with_capacity(100_000);
 
-    while let Some(item) = m8_stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => return Err(anyhow!("Unexpected non-Bytes in m8_stream")),
-        };
+    while let Some(item) = refined_m8_stream.next().await {
+        let bytes = item.to_bytes()?;  // ← again, ? to propagate any error
+        let line = String::from_utf8_lossy(&bytes);
 
-        let line = String::from_utf8_lossy(&**bytes);  // ← Fixed here too
-        let line_str = line.trim_end();
-        if line_str.is_empty() {
-            continue;
-        }
-
-        // Parse using correct parser per db_type
-        let m8 = if db_type == "nt" {
-            match M8Record::parse_line_nt(line_str) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to parse NT m8 line (skipping): {} — {}", e, line_str);
-                    continue;
-                }
-            }
-        } else if db_type == "nr" {
-            match M8Record::parse_line_nr(line_str) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to parse NR m8 line (skipping): {} — {}", e, line_str);
-                    continue;
-                }
-            }
+        let m8 = if db_type == NT_TAG {
+            M8Record::parse_line_nt(&line)?
         } else {
-            return Err(anyhow!("Unknown db_type: {}", db_type));
+            M8Record::parse_line_nr(&line)?
         };
 
-        // Only process if read has a valid taxid from hit_summary
         if let Some(&taxid) = read_to_taxid.get(&m8.qname) {
-            if taxid <= 0 {
-                continue;
-            }
+            if taxid <= 0 { continue; }
+
+            let lineage = match lineage_map.get(&taxid) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            if !(should_keep_filter)(lineage) { continue; }
 
             let bucket = buckets.entry(taxid).or_default();
             bucket.nonunique_count += 1;
@@ -409,43 +390,34 @@ pub async fn generate_taxon_count_json_from_m8(
         }
     }
 
-    // === 3. Emit JSON lines for filtered taxids ===
-    for (taxid, bucket) in buckets {
-        let lineage = lineage_map.get(&taxid)
-            .ok_or_else(|| anyhow!("Missing lineage for taxid {}", taxid))?
-            .clone();
 
-        if !(should_keep_filter)(&lineage) {
-            continue;
-        }
+    for (taxid, bucket) in buckets {
+        let lineage = match lineage_map.get(&taxid) {
+            Some(l) => l,
+            None => continue,
+        };
+
+        if !(should_keep_filter)(lineage) { continue; }
 
         let dcr = if bucket.nonunique_count > 0 {
             bucket.unique_count as f64 / bucket.nonunique_count as f64
-        } else {
-            0.0
-        };
+        } else { 0.0 };
 
         let percent_identity = if bucket.base_count > 0 {
             bucket.sum_percent_identity / bucket.base_count as f64
-        } else {
-            0.0
-        };
+        } else { 0.0 };
 
         let alignment_length = if bucket.base_count > 0 {
             bucket.sum_alignment_length / bucket.base_count as f64
-        } else {
-            0.0
-        };
+        } else { 0.0 };
 
         let e_value = if bucket.base_count > 0 {
             bucket.sum_e_value / bucket.base_count as f64
-        } else {
-            0.0
-        };
+        } else { 0.0 };
 
         let count = TaxonCount {
             tax_id: taxid,
-            tax_level: 1,
+            tax_level: 1, // always species-level aggregation in refined counts
             genus_taxid: lineage[1],
             family_taxid: lineage[2],
             count: bucket.unique_count,
@@ -457,14 +429,14 @@ pub async fn generate_taxon_count_json_from_m8(
             e_value,
             count_type: db_type.to_string(),
             base_count: bucket.base_count,
-            source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+            source_count_type: Some(bucket.source_count_type.iter().cloned().collect()),
         };
 
         let json_line = serde_json::to_string(&count)? + "\n";
         output_tx
             .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
             .await
-            .map_err(|_| anyhow!("Failed to send taxon count JSON — receiver dropped"))?;
+            .map_err(|_| anyhow!("taxon count receiver dropped"))?;
     }
 
     Ok(())
