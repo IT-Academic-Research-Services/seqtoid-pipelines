@@ -1,91 +1,90 @@
-
+use std::cmp::Reverse;
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
+use std::hash::Hasher;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::io::{BufReader, BufRead, ErrorKind};
-use std::hash::Hasher;
-use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
-use std::collections::{HashMap, BinaryHeap, HashSet};
-use std::cmp::Reverse;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result, Context};
-use log::{self, LevelFilter, debug, info, error, warn};
-use futures::future::try_join_all;
-use rand::prelude::*;
-use rand_core::{RngCore, OsRng};
-use tokio::fs;
-use tokio::time::{sleep, Duration, Instant};
-use tokio::sync::oneshot;
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{channel, Sender};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
-use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
-use tokio::process::Command;
-use tokio::try_join;
-use tempfile::NamedTempFile;
-use tempfile::TempDir;
-use twox_hash::XxHash64;
+use ahash::AHashMap;
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use dashmap::DashMap;
 use fst::Map;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use futures::future::try_join_all;
+use log::{self, debug, error, info, warn, LevelFilter};
+use needletail::parse_fastx_file;
 use noodles::bam::r#async::io::Reader as BamAsyncReader;
 use noodles::bam::record::Record;
-use bytes::Bytes;
 use noodles::sam::alignment::record::cigar::{op::Kind as OpKind, Op};
-use tokio_util::io::StreamReader;
-use rayon::prelude::*;
-use needletail::parse_fastx_file;
-use dashmap::DashMap;
-use regex::Regex;
 use once_cell::sync::Lazy;
-use ahash::AHashMap;
+use rand::prelude::*;
+use rand_core::{OsRng, RngCore};
+use rayon::prelude::*;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tempfile::NamedTempFile;
+use tempfile::TempDir;
+use tokio::fs;
+use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration, Instant};
+use tokio::try_join;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+use tokio_util::io::StreamReader;
+use twox_hash::XxHash64;
 
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG,
-                          BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG,
-                          MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand,
-                          KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG,
-                          Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE,
-                          ReadCountingMode, DIAMOND_TAG, DiamondSubcommand,
-                          MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
-                          BLASTN_TAG, BLASTX_TAG, NT_TAG, NR_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
-                         available_space_for_path, rename_file_path, resolve_optional_path,
-                         write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir,
-                         file_size};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord,
-                          compare_read_ids, parse_header, read_fasta, write_fasta_stream_to_file};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd,
-                            parse_child_output, ChildStream, ParseMode, stream_to_file,
-                            read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader,
-                            write_to_fifo, deinterleave_fastq_stream, create_fifo,
-                            interleave_fastq_streams, ToBytes};
-use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
-use crate::utils::command::{check_versions, generate_cli};
-use crate::utils::command::samtools::SamtoolsConfig;
-use crate::utils::command::fastp::FastpConfig;
-use crate::utils::command::kallisto::KallistoConfig;
-use crate::utils::command::diamond::{DiamondConfig, DiamondArgGenerator, diamond_index_prep};
-use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
-use crate::utils::streams::{deinterleave_fastq_stream_to_fifos};
-use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
-use crate::utils::stats::parse_samtools_stats;
-use crate::utils::plotting::plot_insert_sizes;
+use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode,
+                          ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType,
+                          Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG,
+                          CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG,
+                          KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG,
+                          MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
+                          NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
+                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG};
+use crate::utils::blast::{consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
+                          TaxonCount};
+use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
+use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
+use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
 use crate::utils::command::czid_dedup::CzidDedupConfig;
-use crate::utils::paf::PafRecord;
-use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket,
-                          generate_taxon_count_json_from_m8};
-use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage,
-                             load_taxid_lineages_db, get_top_m8_nt, get_top_m8_nr};
+use crate::utils::command::diamond::{diamond_index_prep, DiamondArgGenerator, DiamondConfig};
+use crate::utils::command::fastp::FastpConfig;
+use crate::utils::command::hisat2::{hisat2_index_prep, Hisat2Config};
+use crate::utils::command::kallisto::KallistoConfig;
+use crate::utils::command::makeblastdb::{MakeblastdbArgGenerator, MakeblastdbConfig};
+use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2ArgGenerator, Minimap2Config};
+use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
+use crate::utils::command::{check_versions, generate_cli};
+use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
+                          read_fastq, stream_record_counter, write_fasta_stream_to_file, SequenceRecord};
+use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
+                         file_size, rename_file_path, resolve_optional_path,
+                         validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
+                         write_vecu8_to_file};
+use crate::utils::paf::PafRecord;
+use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::generate_info_from_bam_stream;
-use crate::utils::command::makeblastdb::{MakeblastdbConfig, MakeblastdbArgGenerator};
-use crate::utils::command::blastn::{BlastnConfig, BlastnArgGenerator};
-use crate::utils::command::blastx::{BlastxConfig, BlastxArgGenerator};
+use crate::utils::stats::parse_samtools_stats;
+use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
+                            parse_child_output, parse_fastq, read_child_output_to_vec, spawn_cmd,
+                            stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
+                            ChannelReader, ChildStream, ParseMode,
+                            ParseOutput, ToBytes};
+use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
+use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
+                             get_top_m8_nt, load_taxid_lineages_db, validate_taxid_lineage};
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
@@ -3504,18 +3503,16 @@ async fn write_empty_blast_outputs(
 pub async fn update_read_dict(
     read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
-    mut read_dict: AHashMap<String, ReadHit>,
+    read_dict: Arc<Mutex<AHashMap<String, ReadHit>>>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     accession_map: Arc<AHashMap<String, AccessionHit>>,
     should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    db_type: &'static str,
+    db_type: &str,
     mut contig2lineage_tx: Sender<ParseOutput>,
     mut read2blastm8_tx: Sender<ParseOutput>,
     mut updated_tx: Sender<ParseOutput>,
     mut added_tx: Sender<ParseOutput>,
-) -> Result<AHashMap<String, ReadHit>> {
-    let mut added_reads = AHashMap::new();
-
+) -> Result<()> {
     while let Some(item) = top_m8_stream.next().await {
         let bytes = match item {
             ParseOutput::Bytes(b) => b,
@@ -3564,57 +3561,64 @@ pub async fn update_read_dict(
             .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
             .await?;
 
-
+        // Send refined M8 line
         let mut m8_line = m8.to_tab_string();
         m8_line.push('\n');
         read2blastm8_tx
             .send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes())))
             .await?;
 
+        // Get all reads in this contig
         let reads_in_contig: Vec<String> = read2contig
             .iter()
             .filter(|&(_, c)| c == &contig_id)
             .map(|(r, _)| r.clone())
             .collect();
 
+        let hit = ReadHit {
+            level: 1,
+            taxid: lineage[0],
+            accession_id: Some(accession.clone()),
+            species_taxid: lineage[0],
+            genus_taxid: lineage[1],
+            family_taxid: lineage[2],
+            contig_id: Some(contig_id.clone()),
+            contig_accession_id: Some(accession.clone()),
+            contig_species_taxid: lineage[0],
+            contig_genus_taxid: lineage[1],
+            contig_family_taxid: lineage[2],
+            from_assembly: true,
+        };
+
+        // Precompute the base hit summary line
+        let base_line = hit.to_tab_string();
+        let placeholder_line = format!("{}\t{}", "", &base_line["".len()..]);
+
         for read_id in reads_in_contig {
-            let hit = ReadHit {
-                level: 1,
-                taxid: lineage[0],
-                accession_id: Some(accession.clone()),
-                species_taxid: lineage[0],
-                genus_taxid: lineage[1],
-                family_taxid: lineage[2],
-                contig_id: Some(contig_id.clone()),
-                contig_accession_id: Some(accession.clone()),
-                contig_species_taxid: lineage[0],
-                contig_genus_taxid: lineage[1],
-                contig_family_taxid: lineage[2],
-                from_assembly: true,
-            };
+            let final_line = format!("{}\t{}", read_id, &placeholder_line["".len()..]);
 
-            let mut line = hit.to_tab_string();
+            // MUTATE INSIDE A SHORT LOCK
+            let was_present = {
+                let mut dict = read_dict.lock().unwrap();  // ← lock
+                let was_present = dict.contains_key(&read_id);
+                dict.insert(read_id.clone(), hit.clone());
+                was_present
+            };  // ← unlock (guard drops)
 
-            line = format!("{}\t{}", read_id, &line["".len()..]); // skip placeholder empty string
-
-            if read_dict.contains_key(&read_id) {
+            // Send (outside lock — no contention)
+            if was_present {
                 let _ = updated_tx
-                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                    .send(ParseOutput::Bytes(Arc::new(final_line.into_bytes())))
                     .await;
-                read_dict.insert(read_id.clone(), hit);
             } else {
-                _ = added_tx
-                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                let _ = added_tx
+                    .send(ParseOutput::Bytes(Arc::new(final_line.into_bytes())))
                     .await;
-                added_reads.insert(read_id.clone(), hit);
             }
         }
     }
 
-    // Merge new reads into main dict
-    read_dict.extend(added_reads);
-
-    Ok(read_dict)
+    Ok(())
 }
 
 
@@ -3622,9 +3626,8 @@ pub async fn update_read_dict(
 pub async fn generate_contig_summary_json(
     read2contig: Arc<HashMap<String, String>>,
     contig2lineage: AHashMap<String, [i32; 3]>,
-    updated_read_dict: AHashMap<String, ReadHit>,
-    added_reads: AHashMap<String, ReadHit>,
-    db_type: &'static str,
+    read_dict: Arc<Mutex<AHashMap<String, ReadHit>>>,
+    db_type: &str,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     min_contig_size: u64,
@@ -3633,11 +3636,12 @@ pub async fn generate_contig_summary_json(
     let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
     let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
 
-    // Merge read_dict with added_reads
-    let mut all_reads = updated_read_dict;
-    all_reads.extend(added_reads);
+    // Lock once, copy data, unlock — then process without lock
+    let all_reads: Vec<(String, ReadHit)> = {
+        let dict = read_dict.lock().unwrap();
+        dict.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
 
-    // Mirror record_read
     for (read_id, read_info) in all_reads {
         let contig = read2contig.get(&read_id).cloned().unwrap_or_else(|| "*".to_string());
         let lineage = contig2lineage.get(&contig);
@@ -3646,28 +3650,28 @@ pub async fn generate_contig_summary_json(
             let l = lineage.unwrap();
             (l[0], l[1])
         } else {
-            (read_info.species_taxid, read_info.genus_taxid)  // assume ReadHit has these fields
+            (read_info.species_taxid, read_info.genus_taxid)
         };
 
         let cluster_size = duplicate_cluster_sizes.get(&read_id).cloned().unwrap_or(1);
 
-        // increment species
+        // species
         let contig_counts = species_summary.entry(species_taxid).or_default();
         let counters = contig_counts.entry(contig.clone()).or_insert([0, 0]);
         counters[0] += 1;
         counters[1] += cluster_size;
 
-        // Increment genus
+        // genus
         let contig_counts = genus_summary.entry(genus_taxid).or_default();
         let counters = contig_counts.entry(contig).or_insert([0, 0]);
         counters[0] += 1;
         counters[1] += cluster_size;
     }
 
-    // Filter min contig size
+    // Emit JSON lines without lock (safe for await)
     for (tax_level, summary) in vec![(1, species_summary), (2, genus_summary)] {
         for (taxid, contig_counts) in summary {
-            let filtered_counts: HashMap<String, u64> = contig_counts
+            let filtered: HashMap<String, u64> = contig_counts
                 .into_iter()
                 .filter_map(|(contig, [unique, cluster])| {
                     if unique >= min_contig_size {
@@ -3678,17 +3682,15 @@ pub async fn generate_contig_summary_json(
                 })
                 .collect();
 
-            if !filtered_counts.is_empty() {
+            if !filtered.is_empty() {
                 let entry = json!({
-                "taxid": taxid,
-                "tax_level": tax_level,
-                "count_type": db_type,
-                "contig_counts": filtered_counts
-            });
-                let json_line = entry.to_string() + "\n";
-                output_tx
-                    .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
-                    .await?;
+                    "taxid": taxid,
+                    "tax_level": tax_level,
+                    "count_type": db_type,
+                    "contig_counts": filtered
+                });
+                let line = entry.to_string() + "\n";
+                output_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
             }
         }
     }
@@ -3775,11 +3777,10 @@ pub async fn blast_contigs (
     db_type: &'static str,
     deduped_m8_stream: ReceiverStream<ParseOutput>, // deduped_m8
     hit_summary_stream: ReceiverStream<ParseOutput>, // deduped_m8
-    read_dict: AHashMap<String, ReadHit>, //hit_summary, but already done
+    read_dict: Arc<Mutex<AHashMap<String, ReadHit>>>,
     accession_map: Arc<AHashMap<String, AccessionHit>> ,  //hit_summary, but already done
     taxon_counts: Vec<TaxonCount>, // orig_counts_with_dcr
     assembled_contig_fasta: &PathBuf, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
-    sam_stats: HashMap<String, u64>, // the SAM file itself not needed
     read2contig: Arc<HashMap<String, String>>,
     reference_fasta: &PathBuf, // reference_fasta
     duplicate_cluster_sizes: Arc<HashMap<String, u64>>, //duplicate_cluster_sizes_path
@@ -3788,7 +3789,7 @@ pub async fn blast_contigs (
     blast_headroom: u64
 
 
-) -> Result<( AHashMap<String, ReadHit>, Vec<TaxonCount>, Vec<ContigSummaryEntry>,     Vec<JoinHandle<Result<()>>>,
+) -> Result<( AHashMap<String, ReadHit>, Vec<TaxonCount>, Vec<ContigSummaryEntry>, Vec<JoinHandle<Result<()>>>,
              Vec<oneshot::Receiver<Result<()>>>, Vec<NamedTempFile> )>{
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
@@ -3816,8 +3817,8 @@ pub async fn blast_contigs (
             &contig_summary_path,
         ).await?;
 
-
-        return Ok(( read_dict, taxon_counts, vec![], cleanup_tasks, cleanup_receivers, temp_files ));
+        let final_read_dict = read_dict.lock().unwrap().clone();
+        return Ok(( final_read_dict, taxon_counts, vec![], cleanup_tasks, cleanup_receivers, temp_files ));
     }
 
     let temp_dir = choose_temp_dir(
@@ -3984,7 +3985,7 @@ pub async fn blast_contigs (
         refined_counts_tx,
     ));
 
-    let updated_read_dict = update_handle.await??;
+    update_handle.await??;
 
     let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
     let mut lineage_stream = ReceiverStream::new(contig2lineage_rx);
@@ -4006,12 +4007,11 @@ pub async fn blast_contigs (
     let contig_summary_handle = tokio::spawn(generate_contig_summary_json(
         read2contig.clone(),
         contig2lineage,
-        updated_read_dict.clone(),
-        AHashMap::new(),               // added_reads is empty – we already merged into updated_read_dict
+        read_dict.clone(),
         db_type,
         should_keep_filter.clone(),
         duplicate_cluster_sizes.clone(),
-        4,                            // MIN_CONTIG_SIZE
+        4,
         contig_summary_tx,
     ));
 
@@ -4046,8 +4046,9 @@ pub async fn blast_contigs (
         contig_summary.push(entry);
     }
 
+    let final_read_dict = read_dict.lock().unwrap().clone();
     Ok((
-        updated_read_dict,
+        final_read_dict,
         refined_counts,
         contig_summary,
         cleanup_tasks,
@@ -4627,17 +4628,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Blast contigs
     //NT
-    let (nt_read_dict, nt_accession_dict) = nt_hit_summary_handle
+    let (nt_read_dict_noarc, nt_accession_dict_noarc) = nt_hit_summary_handle
         .await
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
+
+    let mut nt_read_dict = Arc::new(Mutex::new(nt_read_dict_noarc));
+    let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
 
     // let nt_result = blast_contigs(
     //     config.clone(),
     //     NT_TAG,
     //     ReceiverStream::new(nt_blast_stream),
+    //     ReceiverStream::new(nt_blast_hit_stream),
     //     nt_read_dict,
+
+    
     //     nt_accession_dict,
     //     nt_counts,
     //     &assembly_outputs.contigs_ram_fasta,
@@ -4652,11 +4659,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
+
     //NR
-    let (nr_read_dict, nr_accession_dict) = nr_hit_summary_handle
+    let (nr_read_dict_noarc, nr_accession_dict_noarc) = nr_hit_summary_handle
         .await
         .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
+
+    let mut nr_read_dict = Arc::new(Mutex::new(nr_read_dict_noarc));
+    let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
 
 
     // *******************
