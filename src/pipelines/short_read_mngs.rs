@@ -45,10 +45,18 @@ use once_cell::sync::Lazy;
 use ahash::AHashMap;
 
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG, BLASTX_TAG, NT_TAG};
+use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG,
+                          BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG,
+                          MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand,
+                          KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG,
+                          Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE,
+                          ReadCountingMode, DIAMOND_TAG, DiamondSubcommand,
+                          MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
+                          BLASTN_TAG, BLASTX_TAG, NT_TAG, NR_TAG};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          available_space_for_path, rename_file_path, resolve_optional_path,
-                         write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir, file_size};
+                         write_vecu8_to_file, write_parse_output_to_temp_file, choose_temp_dir,
+                         file_size};
 use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord,
                           compare_read_ids, parse_header, read_fasta, write_fasta_stream_to_file};
 use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd,
@@ -69,8 +77,10 @@ use crate::utils::stats::parse_samtools_stats;
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::command::czid_dedup::CzidDedupConfig;
 use crate::utils::paf::PafRecord;
-use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket, generate_taxon_count_json_from_m8};
-use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db, get_top_m8_nt, get_top_m8_nr};
+use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket,
+                          generate_taxon_count_json_from_m8};
+use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage,
+                             load_taxid_lineages_db, get_top_m8_nt, get_top_m8_nr};
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::sambam::generate_info_from_bam_stream;
 use crate::utils::command::makeblastdb::{MakeblastdbConfig, MakeblastdbArgGenerator};
@@ -163,7 +173,8 @@ pub struct CoverageOutputs {
     pub contig_stats_json: PathBuf,
     pub coverage_json: PathBuf,
     pub coverage_summary_csv: PathBuf,
-    pub contig_stats: HashMap<String, u64>,
+    pub contig_stats: Arc<HashMap<String, u64>>,
+    pub read2contig: Arc<HashMap<String, String>>,
 }
 
 
@@ -183,13 +194,52 @@ pub struct ReadHit {
     pub from_assembly: bool,
 }
 
+impl ReadHit {
+    /// Convert a ReadHit into the exact tab-separated line format used by the original CZID pipeline
+    /// This matches what HitSummaryWriter writes in the Python code
+    pub fn to_tab_string(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            // 1. read_id — not stored in ReadHit, will be added by caller
+            "", // placeholder — we fill it in update_read_dict
+            self.level,
+            self.taxid,
+            self.accession_id.as_deref().unwrap_or(""),
+            "", // alignment length — not used in hit summary
+            "", // percent identity — not used
+            "", // bitscore — not used
+            "", // evalue — not used
+            self.species_taxid,
+            self.genus_taxid,
+            self.family_taxid,
+            "", // name — not used
+            "", // common_name — not used
+            self.contig_id.as_deref().unwrap_or(""),
+            self.contig_accession_id.as_deref().unwrap_or(""),
+            self.contig_species_taxid,
+            self.contig_genus_taxid,
+            self.contig_family_taxid,
+            "", // contig_length — not used
+            "", // contig_name — not used
+            "", // contig_accession — duplicate
+            "", // contig_taxid — not used
+            "", // contig_species_taxid — duplicate
+            "", // contig_genus_taxid — duplicate
+            "", // contig_family_taxid — duplicate
+            if self.from_assembly { "1" } else { "0" },
+            "1", // count — always 1 per read
+            "1"  // count_type — not used downstream
+        )
+    }
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct AccessionHit {
     pub taxid: i32,   // always species_taxid in Python
     pub count: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
     contig_name: String,
     common_name: Option<String>,
@@ -2070,7 +2120,7 @@ pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
     mut m8_stream: ReceiverStream<ParseOutput>,
     mut summary_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes: HashMap<String, u64>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
     source_count_type: Option<String>,// e.g. "NR" for the other DB
@@ -2647,7 +2697,7 @@ pub async fn process_assembly(
     out_dir: &PathBuf,
     work_dir: &PathBuf,
     bowtie_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes: HashMap<String, u64>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     paired: bool,
     assembly_headroom: u64,
 ) -> Result<(
@@ -2655,7 +2705,8 @@ pub async fn process_assembly(
            ReceiverStream<ParseOutput>,
            Vec<JoinHandle<Result<()>>>,
            Vec<oneshot::Receiver<Result<()>>>,
-       ),  PipelineError>
+           Vec<NamedTempFile>
+),  PipelineError>
 
  {
     let mut cleanup_tasks = Vec::new();let mut cleanup_receivers = Vec::new();
@@ -2695,8 +2746,9 @@ pub async fn process_assembly(
             contig_stats_json: out_dir.join("contig_stats.json"),
             coverage_json: out_dir.join("assembly_contig_coverage.json"),
             coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-            contig_stats: HashMap::new(),
-        }, ReceiverStream::new(empty_rx), cleanup_tasks,  cleanup_receivers));
+            contig_stats: Arc::new(HashMap::new()),
+            read2contig: Arc::new(HashMap::new()),
+        }, ReceiverStream::new(empty_rx), cleanup_tasks,  cleanup_receivers, temp_files));
     }
 
     let contigs_all_out = out_dir.join("contigs_all.fasta");
@@ -2897,13 +2949,11 @@ pub async fn process_assembly(
          .await?;
      cleanup_tasks.push(write_sam_task);
 
-    let contig_stats = generate_info_from_bam_stream(
-        bam_for_stats,
-        &duplicate_cluster_sizes,
-        config.args.min_contig_length,
-    ).await?;
-     // let contig_stats = HashMap::with_capacity(1024);
-
+     let (read2contig, contig_stats) = generate_info_from_bam_stream(
+         bam_for_stats,
+         &duplicate_cluster_sizes,
+         config.args.min_contig_length,
+     ).await?;
 
     Ok((CoverageOutputs {
         contigs_fasta: out_dir.join("contigs.fasta"),
@@ -2914,8 +2964,9 @@ pub async fn process_assembly(
         contig_stats_json: out_dir.join("contig_stats.json"),
         coverage_json: out_dir.join("assembly_contig_coverage.json"),
         coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-        contig_stats: contig_stats,
-    }, ReceiverStream::new(bam_for_output), cleanup_tasks,  cleanup_receivers))
+        contig_stats: Arc::new(contig_stats),
+        read2contig: Arc::new(read2contig),
+    }, ReceiverStream::new(bam_for_output), cleanup_tasks,  cleanup_receivers, temp_files))
 
 
 
@@ -3429,15 +3480,13 @@ async fn write_empty_blast_outputs(
     refined_hit_summary: &PathBuf,
     refined_counts_with_dcr: &PathBuf,
     contig_summary_json: &PathBuf,
-    deduped_m8: &PathBuf,
-    hit_summary: &PathBuf,
-    orig_counts_with_dcr: &PathBuf,
+
 ) -> Result<()> {
     tokio::fs::write(blast_m8, b" ").await?;
     tokio::fs::write(blast_top_m8, b" ").await?;
-    tokio::fs::copy(deduped_m8, refined_m8).await?;
-    tokio::fs::copy(hit_summary, refined_hit_summary).await?;
-    tokio::fs::copy(orig_counts_with_dcr, refined_counts_with_dcr).await?;
+    tokio::fs::write(refined_m8, b" ").await?;
+    tokio::fs::write(refined_hit_summary, b" ").await?;
+    tokio::fs::write(refined_counts_with_dcr, b" ").await?;
     tokio::fs::write(contig_summary_json, b"[]").await?;
     Ok(())
 }
@@ -3453,16 +3502,17 @@ async fn write_empty_blast_outputs(
 /// # Returns
 /// Result of hashset of the accessions
 pub async fn update_read_dict(
-    read2contig: &HashMap<String, String>,
+    read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
     mut read_dict: AHashMap<String, ReadHit>,
-    accession_dict: &AHashMap<String, AccessionHit>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
-    accession2taxid: Arc<fst::Map<Vec<u8>>>,
-    should_keep: Arc<dyn Fn(&[i32]) -> bool + Send + Sync>,
-    db_type: &str,
+    accession_map: Arc<AHashMap<String, AccessionHit>>,
+    should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    db_type: &'static str,
     mut contig2lineage_tx: Sender<ParseOutput>,
     mut read2blastm8_tx: Sender<ParseOutput>,
+    mut updated_tx: Sender<ParseOutput>,
+    mut added_tx: Sender<ParseOutput>,
 ) -> Result<AHashMap<String, ReadHit>> {
     let mut added_reads = AHashMap::new();
 
@@ -3471,20 +3521,25 @@ pub async fn update_read_dict(
             ParseOutput::Bytes(b) => b,
             _ => continue,
         };
-        let line = String::from_utf8_lossy(&**bytes).trim_end().to_string();
-        if line.is_empty() { continue; }
+
+        let line = String::from_utf8_lossy(&**bytes);
+        let line_trimmed = line.trim_end();
+        if line_trimmed.is_empty() {
+            continue;
+        }
 
         let m8 = if db_type == "nt" {
-            M8Record::parse_line_nt(&line)?
+            M8Record::parse_line_nt(line_trimmed)?
         } else {
-            M8Record::parse_line_nr(&line)?
+            M8Record::parse_line_nr(line_trimmed)?
         };
 
         let contig_id = m8.qname.clone();
         let accession = m8.tname.clone();
 
-        let taxid = accession2taxid.get(accession.as_bytes())
-            .map(|v| u32::from_le_bytes(v.to_le_bytes()[0..4].try_into().unwrap()) as i32)
+        let taxid = accession_map
+            .get(&accession)
+            .map(|hit| hit.taxid)
             .unwrap_or(0);
 
         let lineage = if taxid > 0 {
@@ -3497,24 +3552,33 @@ pub async fn update_read_dict(
             continue;
         }
 
-        // Emit contig2lineage for contig_summary
         let json = json!({
             "contig_name": contig_id,
             "species_taxid": lineage[0],
             "genus_taxid": lineage[1],
             "family_taxid": lineage[2],
         });
-        let mut line_out = serde_json::to_string(&json)?;
-        line_out.push('\n');
-        contig2lineage_tx.send(ParseOutput::Bytes(Arc::new(line_out.into_bytes()))).await?;
+        let mut json_line = serde_json::to_string(&json)?;
+        json_line.push('\n');
+        contig2lineage_tx
+            .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
+            .await?;
 
-        let reads: Vec<_> = read2contig.iter()
+
+        let mut m8_line = m8.to_tab_string();
+        m8_line.push('\n');
+        read2blastm8_tx
+            .send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes())))
+            .await?;
+
+        let reads_in_contig: Vec<String> = read2contig
+            .iter()
             .filter(|&(_, c)| c == &contig_id)
             .map(|(r, _)| r.clone())
             .collect();
 
-        for read_id in reads {
-            let updated = ReadHit {
+        for read_id in reads_in_contig {
+            let hit = ReadHit {
                 level: 1,
                 taxid: lineage[0],
                 accession_id: Some(accession.clone()),
@@ -3529,88 +3593,206 @@ pub async fn update_read_dict(
                 from_assembly: true,
             };
 
-            if read_dict.contains_key(&read_id) {
-                read_dict.insert(read_id.clone(), updated);
-            } else {
-                added_reads.insert(read_id.clone(), updated);
-            }
+            let mut line = hit.to_tab_string();
 
-            // Emit blast m8 line
-            let mut m8_line = m8.to_tab_string();
-            m8_line.push('\n');
-            read2blastm8_tx.send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes()))).await?;
+            line = format!("{}\t{}", read_id, &line["".len()..]); // skip placeholder empty string
+
+            if read_dict.contains_key(&read_id) {
+                let _ = updated_tx
+                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                    .await;
+                read_dict.insert(read_id.clone(), hit);
+            } else {
+                _ = added_tx
+                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                    .await;
+                added_reads.insert(read_id.clone(), hit);
+            }
         }
     }
 
-    // Merge added into read_dict
+    // Merge new reads into main dict
     read_dict.extend(added_reads);
+
     Ok(read_dict)
 }
 
 
 
 pub async fn generate_contig_summary_json(
-    mut contig2lineage_stream: ReceiverStream<ParseOutput>,
-    contig_stats: &HashMap<String, u64>, // contig → read count (dcr-weighted)
-    contigs_fasta_path: &PathBuf,
-    db_type: &str,
+    read2contig: Arc<HashMap<String, String>>,
+    contig2lineage: AHashMap<String, [i32; 3]>,
+    updated_read_dict: AHashMap<String, ReadHit>,
+    added_reads: AHashMap<String, ReadHit>,
+    db_type: &'static str,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    min_contig_size: u64,
     mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
-    let mut summary = Vec::new();
+    let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
+    let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
 
-    while let Some(item) = contig2lineage_stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => continue,
+    // Merge read_dict with added_reads
+    let mut all_reads = updated_read_dict;
+    all_reads.extend(added_reads);
+
+    // Mirror record_read
+    for (read_id, read_info) in all_reads {
+        let contig = read2contig.get(&read_id).cloned().unwrap_or_else(|| "*".to_string());
+        let lineage = contig2lineage.get(&contig);
+
+        let (species_taxid, genus_taxid) = if contig != "*" && lineage.is_some() {
+            let l = lineage.unwrap();
+            (l[0], l[1])
+        } else {
+            (read_info.species_taxid, read_info.genus_taxid)  // assume ReadHit has these fields
         };
-        let line = String::from_utf8_lossy(&**bytes);
-        let json: Value = serde_json::from_str(&line)?;
-        let contig_name = json["contig_name"].as_str().unwrap().to_string();
-        let species = json["species_taxid"].as_i64().unwrap() as i32;
-        let genus = json["genus_taxid"].as_i64().unwrap() as i32;
-        let family = json["family_taxid"].as_i64().unwrap() as i32;
 
-        let reads = *contig_stats.get(&contig_name).unwrap_or(&0) as u64;
-        let bases = file_size(&contigs_fasta_path).await? ; // approximate or precompute per contig
+        let cluster_size = duplicate_cluster_sizes.get(&read_id).cloned().unwrap_or(1);
 
-        summary.push(json!({
-            "contig_name": contig_name,
-            "db_type": db_type,
-            "reads": reads,
-            "bases": bases,
-            "species_taxid": species,
-            "genus_taxid": genus,
-            "family_taxid": family,
-            "common_name": null,
-            "category_name": null,
-            "score": null,
-        }));
+        // increment species
+        let contig_counts = species_summary.entry(species_taxid).or_default();
+        let counters = contig_counts.entry(contig.clone()).or_insert([0, 0]);
+        counters[0] += 1;
+        counters[1] += cluster_size;
+
+        // Increment genus
+        let contig_counts = genus_summary.entry(genus_taxid).or_default();
+        let counters = contig_counts.entry(contig).or_insert([0, 0]);
+        counters[0] += 1;
+        counters[1] += cluster_size;
     }
 
-    let out = serde_json::to_string(&summary)? + "\n";
-    output_tx.send(ParseOutput::Bytes(Arc::new(out.into_bytes()))).await?;
+    // Filter min contig size
+    for (tax_level, summary) in vec![(1, species_summary), (2, genus_summary)] {
+        for (taxid, contig_counts) in summary {
+            let filtered_counts: HashMap<String, u64> = contig_counts
+                .into_iter()
+                .filter_map(|(contig, [unique, cluster])| {
+                    if unique >= min_contig_size {
+                        Some((contig, cluster))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !filtered_counts.is_empty() {
+                let entry = json!({
+                "taxid": taxid,
+                "tax_level": tax_level,
+                "count_type": db_type,
+                "contig_counts": filtered_counts
+            });
+                let json_line = entry.to_string() + "\n";
+                output_tx
+                    .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
+                    .await?;
+            }
+        }
+    }
+
     Ok(())
 }
 
 
+pub async fn generate_m8_and_hit_summary(
+    mut updated_reads_stream: ReceiverStream<ParseOutput>,
+    mut added_reads_stream: ReceiverStream<ParseOutput>,
+    mut blast_hits_stream: ReceiverStream<ParseOutput>,
+    mut original_hit_summary_stream: ReceiverStream<ParseOutput>,
+    mut original_deduped_m8_stream: ReceiverStream<ParseOutput>,
+    refined_m8_tx: Sender<ParseOutput>,
+    refined_hit_summary_tx: Sender<ParseOutput>,
+) -> Result<()> {
+
+
+    // copy everything from original deduped M8
+    while let Some(item) = original_deduped_m8_stream.next().await {
+        refined_m8_tx.send(item).await
+            .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+    }
+
+    // append new blast hits
+    while let Some(item) = blast_hits_stream.next().await {
+        refined_m8_tx.send(item).await
+            .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+    }
+    drop(refined_m8_tx); // signals EOF
+
+
+    // stream through the original hit summary and replace rows that were updated
+    let mut updated_reads = AHashMap::new();
+    while let Some(item) = updated_reads_stream.next().await {
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes);
+            let read_id = line.split('\t').next().unwrap_or("").to_string();
+            updated_reads.insert(read_id, bytes);
+        }
+    }
+
+    let mut added_reads = AHashMap::new();
+    while let Some(item) = added_reads_stream.next().await {
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes);
+            let read_id = line.split('\t').next().unwrap_or("").to_string();
+            added_reads.insert(read_id, bytes);
+        }
+    }
+
+    //walk the original hit summary once
+    while let Some(item) = original_hit_summary_stream.next().await {
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes);
+            let read_id = line.split('\t').next().unwrap_or("").to_string();
+
+            // pefer updated version, then added, otherwise keep original
+            let to_send = updated_reads.get(&read_id)
+                .or_else(|| added_reads.get(&read_id))
+                .map_or(bytes.clone(), |v| v.clone());
+
+            refined_hit_summary_tx.send(ParseOutput::Bytes(to_send)).await
+                .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+        }
+    }
+
+    // append  added reads not in the original hit summary
+    for (read_id, bytes) in added_reads {
+        if !updated_reads.contains_key(&read_id) {
+            refined_hit_summary_tx.send(ParseOutput::Bytes(bytes)).await
+                .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+        }
+    }
+
+    drop(refined_hit_summary_tx);
+    Ok(())
+}
 
 
 pub async fn blast_contigs (
     config: Arc<RunConfig>,
-    db_type: &str,
+    db_type: &'static str,
     deduped_m8_stream: ReceiverStream<ParseOutput>, // deduped_m8
+    hit_summary_stream: ReceiverStream<ParseOutput>, // deduped_m8
     read_dict: AHashMap<String, ReadHit>, //hit_summary, but already done
-    accession_dict: AHashMap<String, AccessionHit> ,  //hit_summary, but already done
+    accession_map: Arc<AHashMap<String, AccessionHit>> ,  //hit_summary, but already done
     taxon_counts: Vec<TaxonCount>, // orig_counts_with_dcr
     assembled_contig_fasta: &PathBuf, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
-    sam_stats: HashMap<String, u64>, // the SAM file itself not needed, just pass the stats
+    sam_stats: HashMap<String, u64>, // the SAM file itself not needed
+    read2contig: Arc<HashMap<String, String>>,
     reference_fasta: &PathBuf, // reference_fasta
-    duplicate_cluster_sizes: &HashMap<String, u64>, //duplicate_cluster_sizes_path
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>, //duplicate_cluster_sizes_path
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
-    accession_map: Arc<Map<Vec<u8>>>,
-    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    blast_headroom: u64
 
-) -> Result<()> {
+
+) -> Result<( AHashMap<String, ReadHit>, Vec<TaxonCount>, Vec<ContigSummaryEntry>,     Vec<JoinHandle<Result<()>>>,
+             Vec<oneshot::Receiver<Result<()>>>, Vec<NamedTempFile> )>{
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
     let out_dir = config.out_dir.join(format!("blast_{}", db_type));
     tokio::fs::create_dir_all(&out_dir).await?;
@@ -3624,8 +3806,254 @@ pub async fn blast_contigs (
 
     let contig_size = file_size(assembled_contig_fasta).await?;
     let ref_size = file_size(reference_fasta).await?;
+    if contig_size < MIN_REF_FASTA_SIZE || ref_size < MIN_ASSEMBLED_CONTIG_SIZE {
+        write_empty_blast_outputs(
+            &blast_m8_path,
+            &blast_top_m8_path,
+            &refined_m8_path,
+            &refined_hit_summary_path,
+            &refined_counts_path,
+            &contig_summary_path,
+        ).await?;
 
-    Ok(())
+
+        return Ok(( read_dict, taxon_counts, vec![], cleanup_tasks, cleanup_receivers, temp_files ));
+    }
+
+    let temp_dir = choose_temp_dir(
+        ref_size + contig_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        blast_headroom,
+    ).await?;
+
+    let blastdb_suffix = format!("{}_blastindex", db_type);
+    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let blastdb_path = blastdb_ram_path.path().to_owned();
+    temp_files.push(blastdb_ram_path);
+
+    let makeblastdb_config = MakeblastdbConfig {
+        input: reference_fasta.clone(),
+        dbtype: if db_type == NT_TAG { "nucl".to_string() } else { "prot".to_string() },
+        output: blastdb_path.clone(),
+        option_fields: HashMap::new()
+    };
+
+    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAKEBLASTDB_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    debug!("Spawning makeblastdb with args: {:?}", makeblastdb_args);
+
+    let (_, makeblastdb_err_task) = spawn_cmd(
+        config.clone(),
+        MAKEBLASTDB_TAG,
+        makeblastdb_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAKEBLASTDB_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(makeblastdb_err_task);
+
+    let (blast_tx, blast_rx) = channel(1024);
+
+    let blast_command = if db_type == NT_TAG { BLASTN_TAG } else { BLASTX_TAG };
+
+    let blast_args = if db_type == NT_TAG {
+        let blastn_config = BlastnConfig {
+            query: assembled_contig_fasta.clone(),
+            db: blastdb_path.clone(),
+            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen".to_string(),
+            evalue: 1e-10,
+            max_target_seqs: 5000,
+            option_fields: HashMap::new(),
+        };
+
+        generate_cli(BLASTN_TAG, &config, Some(&blastn_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BLASTN_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    } else {
+        let blastx_config = BlastxConfig {
+            query: assembled_contig_fasta.clone(),
+            db: blastdb_path.clone(),
+            outfmt: 6,
+            evalue: 1e-10,
+            num_alignments: 5,
+            option_fields: HashMap::new(),
+        };
+
+        generate_cli(BLASTX_TAG, &config, Some(&blastx_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BLASTX_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // let envs = if db_type == NT_TAG {
+    //     vec![("BATCH_SIZE".to_string(), "10000".to_string())]
+    // } else {
+    //     vec![]
+    // };
+
+    let (mut blast_child, err_task) = spawn_cmd(
+        config.clone(),
+        blast_command,
+        blast_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: blast_command.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(err_task);
+
+
+    let blast_out_stream = {
+        parse_child_output(
+            &mut blast_child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            config.base_buffer_size,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: "blastn/x".to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    let (top_tx, top_rx) = channel(1024);
+    let top_handle = if db_type == NT_TAG {
+        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_rx), top_tx))
+    } else {
+        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_rx), top_tx))
+    };
+
+    let (contig2lineage_tx, contig2lineage_rx) = channel(1024);
+    let (read2blastm8_tx, read2blastm8_rx) = channel(1024);
+
+    let (updated_tx, updated_rx) = channel(1024);
+    let (added_tx, added_rx) = channel(1024);
+
+    let update_handle = tokio::spawn(update_read_dict(
+        read2contig.clone(),
+        ReceiverStream::new(top_rx),
+        read_dict.clone(),
+        lineage_map.clone(),
+        accession_map.clone(),
+        should_keep_filter.clone(),
+        db_type,
+        contig2lineage_tx,
+        read2blastm8_tx,
+        updated_tx,
+        added_tx,
+    ));
+
+    let (refined_m8_tx, refined_m8_rx) = channel(2_000_000);
+    let (refined_hit_summary_tx, refined_hit_summary_rx) = channel(2_000_000);
+
+    let (updated_tx, updated_rx) = channel(1024);
+    let (added_tx, added_rx) = channel(1024);
+
+    let generate_m8_handle = tokio::spawn(generate_m8_and_hit_summary(
+        ReceiverStream::new(updated_rx),        // not used any more – we’ll ignore it
+        ReceiverStream::new(added_rx),         // not used any more
+        ReceiverStream::new(read2blastm8_rx),   // new BLAST hits (read → best hit)
+        hit_summary_stream,                   // original hit summary (teed)
+        deduped_m8_stream,                   // original deduped M8
+        refined_m8_tx.clone(),
+        refined_hit_summary_tx.clone(),
+    ));
+
+    let (refined_counts_tx, refined_counts_rx) = channel(1024);
+    let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
+        ReceiverStream::new(refined_m8_rx),
+        ReceiverStream::new(refined_hit_summary_rx),
+        db_type,
+        lineage_map.clone(),
+        should_keep_filter.clone(),
+        duplicate_cluster_sizes.clone(),
+        refined_counts_tx,
+    ));
+
+    let updated_read_dict = update_handle.await??;
+
+    let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
+    let mut lineage_stream = ReceiverStream::new(contig2lineage_rx);
+    while let Some(item) = lineage_stream.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 4 {
+            let contig  = fields[0].to_string();
+            let species  = fields[1].parse().unwrap_or(0);
+            let genus    = fields[2].parse().unwrap_or(0);
+            let family   = fields[3].parse().unwrap_or(0);
+            contig2lineage.insert(contig, [species, genus, family]);
+        }
+    }
+
+
+    let (contig_summary_tx, contig_summary_rx) = channel(1024);
+    let contig_summary_handle = tokio::spawn(generate_contig_summary_json(
+        read2contig.clone(),
+        contig2lineage,
+        updated_read_dict.clone(),
+        AHashMap::new(),               // added_reads is empty – we already merged into updated_read_dict
+        db_type,
+        should_keep_filter.clone(),
+        duplicate_cluster_sizes.clone(),
+        4,                            // MIN_CONTIG_SIZE
+        contig_summary_tx,
+    ));
+
+    let results = try_join_all(vec![
+        top_handle,
+        generate_m8_handle,
+        counts_handle,
+        contig_summary_handle,
+    ])
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("contig processing task panicked: {}", e)))?;
+
+    for res in results {
+        res.map_err(|e| PipelineError::Other(anyhow!("contig processing task failed: {}", e)))?;
+    }
+
+    let mut refined_counts = Vec::new();
+    let mut rx = ReceiverStream::new(refined_counts_rx);
+    while let Some(item) = rx.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let count: TaxonCount = serde_json::from_str(&line)?;
+        refined_counts.push(count);
+    }
+
+    let mut contig_summary = Vec::new();
+    let mut rx = ReceiverStream::new(contig_summary_rx);
+    while let Some(item) = rx.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let entry: ContigSummaryEntry = serde_json::from_str(&line)?;
+        contig_summary.push(entry);
+    }
+
+    Ok((
+        updated_read_dict,
+        refined_counts,
+        contig_summary,
+        cleanup_tasks,
+        cleanup_receivers,
+        temp_files
+    ))
 }
 
 
@@ -3832,7 +4260,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_cluster_sizes_noarc, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
@@ -3844,6 +4272,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
+    let duplicate_cluster_sizes = Arc::new(duplicate_cluster_sizes_noarc);
 
     // *******************
     // Non host Alignment
@@ -3971,7 +4400,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
         call_summary_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3986,6 +4415,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
     let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream)));
 
@@ -4113,7 +4543,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (assembly_outputs, assembly_bam_out_stream,
         mut post_assembly_cleanup_tasks,
-        mut post_assembly_cleanup_receivers) = process_assembly(
+        mut post_assembly_cleanup_receivers, mut post_assemly_temp_files) = process_assembly(
         config.clone(),
         assembly_out_dir,
         assembly_work_dir,
@@ -4125,10 +4555,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
+    temp_files.extend(post_assemly_temp_files);
 
     let _ = fs::remove_dir_all(assembly_work_dir).await;
-
-    eprintln!("contigs stats len {}", assembly_outputs.contig_stats.len());
 
     let generate_assembly_coverage_result = generate_assembly_coverage(
         config.clone(),
@@ -4204,22 +4633,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
 
 
-    let nt_result = blast_contigs(
-        config,
-        NT_TAG,
-        ReceiverStream::new(nt_blast_stream), // deduped_m8
-        nt_read_dict, //hit_summary, but already done
-        nt_accession_dict,   //hit_summary, but already done
-        nt_counts, // orig_counts_with_dcr
-        &assembly_outputs.contigs_ram_fasta, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
-        assembly_outputs.contig_stats, // the SAM file itself not needed, just pass the stats
-        &nt_ref_fasta_path, // reference_fasta
-        &duplicate_cluster_sizes, //duplicate_cluster_sizes_path
-        lineage_map,
-        acc2taxid_map,
-        should_keep_filter
-
-    );
+    // let nt_result = blast_contigs(
+    //     config.clone(),
+    //     NT_TAG,
+    //     ReceiverStream::new(nt_blast_stream),
+    //     nt_read_dict,
+    //     nt_accession_dict,
+    //     nt_counts,
+    //     &assembly_outputs.contigs_ram_fasta,
+    //     assembly_outputs.contig_stats.clone(),
+    //     &nt_ref_fasta_path,
+    //     &duplicate_cluster_sizes,
+    //     lineage_map.clone(),
+    //     acc2taxid_map.clone(),
+    //     should_keep_filter.clone(),
+    //     assembly_outputs.read2contig.clone(),
+    // );
 
 
 

@@ -339,7 +339,7 @@ pub async fn generate_taxon_count_json_from_m8(
     db_type: &str,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_cluster_sizes: &HashMap<String, u64>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
     let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
