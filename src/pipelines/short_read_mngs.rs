@@ -3896,8 +3896,7 @@ pub async fn blast_contigs (
             error: e.to_string(),
         })?;
     cleanup_tasks.push(makeblastdb_err_task);
-
-    let (blast_tx, blast_rx) = channel(1024);
+    
 
     let blast_command = if db_type == NT_TAG { BLASTN_TAG } else { BLASTX_TAG };
 
