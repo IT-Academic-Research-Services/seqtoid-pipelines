@@ -3653,7 +3653,6 @@ pub async fn generate_contig_summary_json(
     contig2lineage: AHashMap<String, [i32; 3]>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     db_type: &str,
-    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     min_contig_size: u64,
     mut output_tx: Sender<ParseOutput>,
@@ -3661,59 +3660,74 @@ pub async fn generate_contig_summary_json(
     let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
     let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
 
+    //lock once
     {
         let dict = read_dict.lock().unwrap();
-        for (read_id, hit_arc) in dict.iter() {
-            let hit: &ReadHit = hit_arc.as_ref();  // Deref
-            let contig = read2contig.get(read_id).cloned().unwrap_or_else(|| "*".to_string());
-            let lineage = contig2lineage.get(&contig);
 
-            let (species_taxid, genus_taxid) = if contig != "*" && lineage.is_some() {
-                let l = lineage.unwrap();
-                (l[0], l[1])
+        for (read_id, hit_arc) in dict.iter() {
+            let hit: &ReadHit = hit_arc.as_ref();
+
+            let contig = read2contig
+                .get(read_id)
+                .cloned()
+                .unwrap_or_else(|| "*".to_string());
+
+            let (species_taxid, genus_taxid) = if contig != "*" {
+                if let Some(lineage) = contig2lineage.get(&contig) {
+                    (lineage[0], lineage[1])
+                } else {
+                    (hit.species_taxid, hit.genus_taxid)
+                }
             } else {
                 (hit.species_taxid, hit.genus_taxid)
             };
 
-            let cluster_size = duplicate_cluster_sizes.get(read_id).cloned().unwrap_or(1);
+            let cluster_size = duplicate_cluster_sizes
+                .get(read_id)
+                .copied()
+                .unwrap_or(1);
 
-            // species
-            let contig_counts = species_summary.entry(species_taxid).or_default();
-            let counters = contig_counts.entry(contig.clone()).or_insert([0, 0]);
-            counters[0] += 1;
-            counters[1] += cluster_size;
+            // Species-level aggregation
+            let sp_entry = species_summary
+                .entry(species_taxid)
+                .or_default()
+                .entry(contig.clone())
+                .or_insert([0, 0]);
+            sp_entry[0] += 1;           // unique reads
+            sp_entry[1] += cluster_size; // weighted by duplicates
 
-            // genus
-            let contig_counts = genus_summary.entry(genus_taxid).or_default();
-            let counters = contig_counts.entry(contig).or_insert([0, 0]);
-            counters[0] += 1;
-            counters[1] += cluster_size;
+            // Genus-level aggregation
+            let gn_entry = genus_summary
+                .entry(genus_taxid)
+                .or_default()
+                .entry(contig)
+                .or_insert([0, 0]);
+            gn_entry[0] += 1;
+            gn_entry[1] += cluster_size;
         }
-    }
+    } // ← MutexGuard dropped here — no await while holding lock
 
-    // Emit JSON lines without lock (safe for await)
-    for (tax_level, summary) in vec![(1, species_summary), (2, genus_summary)] {
-        for (taxid, contig_counts) in summary {
+    // Now emit JSON — safe to await
+    for (tax_level, summary_map) in [(1, species_summary), (2, genus_summary)] {
+        for (taxid, contig_counts) in summary_map {
             let filtered: HashMap<String, u64> = contig_counts
                 .into_iter()
-                .filter_map(|(contig, [unique, cluster])| {
-                    if unique >= min_contig_size {
-                        Some((contig, cluster))
-                    } else {
-                        None
-                    }
-                })
+                .filter(|(_, [unique, _])| *unique >= min_contig_size)
+                .map(|(contig, [_, weighted])| (contig, weighted))
                 .collect();
 
             if !filtered.is_empty() {
                 let entry = json!({
                     "taxid": taxid,
                     "tax_level": tax_level,
-                    "count_type": db_type,
+                    "count_type": db_type.to_uppercase(),
                     "contig_counts": filtered
                 });
-                let line = entry.to_string() + "\n";
-                output_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
+                let line = format!("{entry}\n");
+                output_tx
+                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                    .await
+                    .map_err(|_| anyhow!("contig_summary_tx dropped"))?;
             }
         }
     }
@@ -4032,7 +4046,6 @@ pub async fn blast_contigs (
         contig2lineage,
         read_dict.clone(),
         db_type,
-        should_keep_filter.clone(),
         duplicate_cluster_sizes.clone(),
         4,
         contig_summary_tx,
