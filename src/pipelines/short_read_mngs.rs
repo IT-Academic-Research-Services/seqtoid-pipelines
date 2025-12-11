@@ -4459,7 +4459,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_streams, nr_done_rx) = t_junction(
         nr_call_stream,
-        3,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -4476,10 +4476,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
 
     let (nr_summary_streams, nr_summary_done_rx) = t_junction(
         nr_call_summary_stream,
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -4494,6 +4496,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
     let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream)));
 
@@ -4636,31 +4639,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_read_dict = Arc::new(Mutex::new(nt_read_dict_noarc));
     let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
-
-    // let nt_result = blast_contigs(
-    //     config.clone(),
-    //     NT_TAG,
-    //     ReceiverStream::new(nt_blast_stream),
-    //     ReceiverStream::new(nt_blast_hit_stream),
-    //     nt_read_dict,
-
-    
-    //     nt_accession_dict,
-    //     nt_counts,
-    //     &assembly_outputs.contigs_ram_fasta,
-    //     assembly_outputs.contig_stats.clone(),
-    //     &nt_ref_fasta_path,
-    //     &duplicate_cluster_sizes,
-    //     lineage_map.clone(),
-    //     acc2taxid_map.clone(),
-    //     should_keep_filter.clone(),
-    //     assembly_outputs.read2contig.clone(),
-    // );
-
-
-
-
-    //NR
+    // //NR
     let (nr_read_dict_noarc, nr_accession_dict_noarc) = nr_hit_summary_handle
         .await
         .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
@@ -4668,6 +4647,87 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let mut nr_read_dict = Arc::new(Mutex::new(nr_read_dict_noarc));
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
+
+    let nt_handle = tokio::spawn({
+        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_cluster_sizes = duplicate_cluster_sizes.clone();
+        let read2contig = assembly_outputs.read2contig.clone();
+
+        async move {
+            blast_contigs(
+                config,
+                NT_TAG,
+                ReceiverStream::new(nt_blast_stream),
+                ReceiverStream::new(nt_blast_hit_stream),
+                nt_read_dict,
+                nt_accession_dict,
+                nt_counts,
+                &contigs_fasta_path.clone(),
+                read2contig,
+                &nt_ref_fasta_path,
+                duplicate_cluster_sizes,
+                lineage_map,
+                should_keep_filter,
+                4,
+            ).await
+        }
+    });
+
+    let nr_handle = tokio::spawn({
+        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_cluster_sizes = duplicate_cluster_sizes.clone();
+        let read2contig = assembly_outputs.read2contig.clone();
+
+        async move {
+            blast_contigs(
+                config,
+                NR_TAG,
+                ReceiverStream::new(nr_blast_stream),
+                ReceiverStream::new(nr_blast_hit_stream),
+                nr_read_dict,
+                nr_accession_dict,
+                nr_counts,
+                &contigs_fasta_path.clone(),
+                read2contig,
+                &nr_ref_fasta_path,        // note: NR uses its own ref fasta!
+                duplicate_cluster_sizes,
+                lineage_map,
+                should_keep_filter,
+                4,
+            ).await
+        }
+    });
+
+
+
+    //  Do everything else that does NOT depend on the results
+    //    (e.g. writing intermediate JSONs, logging, cleanup prep…)
+
+
+
+    let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
+        .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
+
+    let (nt_read_dict, nt_refined_counts, nt_contig_summary,
+        nt_cleanup_tasks, nt_cleanup_receivers,
+        nt_temp_files) = nt_res?;
+
+    cleanup_tasks.extend(nt_cleanup_tasks);
+    cleanup_receivers.extend(nt_cleanup_receivers);
+    temp_files.extend(nt_temp_files);
+
+    let (nr_read_dict, nr_refined_counts, nr_contig_summary,
+        nr_cleanup_tasks, nr_cleanup_receivers,
+        nr_temp_files) = nr_res?;
+    cleanup_tasks.extend(nr_cleanup_tasks);
+    cleanup_receivers.extend(nr_cleanup_receivers);
+    temp_files.extend(nr_temp_files);
 
 
     // *******************
