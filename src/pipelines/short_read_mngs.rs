@@ -96,8 +96,7 @@ const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
 
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?P<accession_id>[^ ]+) (?P<wrong_pattern>, *)?(?P<description>.*)$")
-        .unwrap()
+    Regex::new(r",(?=[^\s])").unwrap()
 });
 
 #[derive(Debug)]
@@ -3193,19 +3192,15 @@ fn fix_header(header_line: &str) -> String {
         return header_line.to_owned();
     }
 
-    // Split on CTRL-A (\x01) for multi-header entries
-    let parts: Vec<String> = header_line[1..] // strip '>'
+    // Split on \x01 (multi-accession entries), fix commas in each part, rejoin
+    let parts: Vec<String> = header_line[1..]
         .split('\x01')
         .map(|part| {
             let trimmed = part.trim_start();
-            FIX_COMMA_REGEXP
-                .replace(trimmed, "$accession_id $description")
-                .trim()
-                .to_string()
+            FIX_COMMA_REGEXP.replace_all(trimmed, " ").to_string()
         })
         .collect();
 
-    // Rejoin with \x01 and restore '>'
     format!(">{}", parts.join("\x01"))
 }
 
@@ -3296,7 +3291,7 @@ pub async fn build_reference_fasta_from_selected_genera(
                 continue;
             }
 
-            let header = buf.trim_end().to_string();
+            let header = fix_header(&buf);
             let mut seq_len: u64 = header.len() as u64;
             writer.write_all(header.as_bytes())?;
             writer.write_all(b"\n")?;
