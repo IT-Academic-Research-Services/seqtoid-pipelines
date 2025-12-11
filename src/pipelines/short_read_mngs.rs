@@ -177,11 +177,11 @@ pub struct CoverageOutputs {
 }
 
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct ReadHit {
     pub level: u8,
     pub taxid: i32,
-    pub accession_id: Option<String>,           // base accession (no version)
+    pub accession_id: String,
     pub species_taxid: i32,
     pub genus_taxid: i32,
     pub family_taxid: i32,
@@ -203,7 +203,7 @@ impl ReadHit {
             "", // placeholder — we fill it in update_read_dict
             self.level,
             self.taxid,
-            self.accession_id.as_deref().unwrap_or(""),
+            &self.accession_id,
             "", // alignment length — not used in hit summary
             "", // percent identity — not used
             "", // bitscore — not used
@@ -234,7 +234,9 @@ impl ReadHit {
 
 #[derive(Default, Clone, Debug)]
 pub struct AccessionHit {
-    pub taxid: i32,   // always species_taxid in Python
+    pub taxid: i32, // i.e. species_taxid
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
     pub count: u64,
 }
 
@@ -3386,18 +3388,38 @@ pub async fn extract_accessions_to_fasta(
 
 pub async fn summarize_hits(
     mut stream: ReceiverStream<ParseOutput>,
-) -> Result<(AHashMap<String, ReadHit>, AHashMap<String, AccessionHit>)> {
-    let mut read_dict = AHashMap::with_capacity(5_000_000);
-    let mut accession_dict: AHashMap<String, AccessionHit> = AHashMap::new();
+    min_reads_per_genus: usize,
+) -> Result<(
+    AHashMap<String, ReadHit>,
+    AHashMap<String, AccessionHit>,
+    HashMap<i32, Vec<String>>, // selected_genera: genus_taxid → Vec<accession>
+    usize,                     // total_reads processed
+)> {
+
+
+    let read_dict: DashMap<String, ReadHit> = DashMap::with_capacity(8_000_000);
+    let accession_dict: DashMap<String, AccessionHit> = DashMap::with_capacity(2_000_000);
+
+    let genus_read_counts: DashMap<i32, usize> = DashMap::new();
+    let genus_species: DashMap<i32, HashSet<i32>> = DashMap::new();
+    let genus_accessions: DashMap<i32, HashSet<String>> = DashMap::new();
+
+    let mut total_reads: usize = 0;
 
     while let Some(item) = stream.next().await {
         let bytes = match item {
             ParseOutput::Bytes(b) => b,
-            _ => return Err(anyhow!("Non-Bytes in hit_summary stream")),
+            _ => return Err(anyhow!("Expected Bytes in summarize_hits stream")),
         };
 
-        let line = String::from_utf8_lossy(&**bytes);
-        let line = line.trim_end();
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(s) => s.trim_end(),
+            Err(_) => {
+                warn!("Non-UTF8 line in hit summary stream");
+                continue;
+            }
+        };
+
         if line.is_empty() {
             continue;
         }
@@ -3413,7 +3435,7 @@ pub async fn summarize_hits(
         let level = match parts[1].parse::<u8>() {
             Ok(l) => l,
             Err(_) => {
-                warn!("Invalid level: {}", parts[1]);
+                warn!("Invalid level field: {}", parts[1]);
                 continue;
             }
         };
@@ -3421,49 +3443,96 @@ pub async fn summarize_hits(
         let taxid = match parts[2].parse::<i32>() {
             Ok(t) => t,
             Err(_) => {
-                warn!("Invalid taxid: {}", parts[2]);
+                warn!("Invalid taxid field: {}", parts[2]);
                 continue;
             }
         };
 
-        let accession_raw = parts[3];
-        let accession_base = if accession_raw == "-" || accession_raw == "-1" || accession_raw.is_empty() {
-            None
+        let accession_id = if parts[3] == "-" || parts[3].is_empty() {
+            "-".to_string()
         } else {
-            Some(accession_raw.split('.').next().unwrap().to_string())
+            parts[3].to_string() // keep full versioned accession
         };
 
         let species_taxid = parts[4].parse::<i32>().unwrap_or(0);
         let genus_taxid = parts[5].parse::<i32>().unwrap_or(0);
         let family_taxid = parts[6].parse::<i32>().unwrap_or(0);
 
-        // Always insert into read_dict
-        read_dict.insert(read_id.clone(), ReadHit {
-            level,
-            taxid,
-            accession_id: accession_base.clone(),
-            species_taxid,
-            genus_taxid,
-            family_taxid,
-            contig_id: None,
-            contig_accession_id: None,
-            contig_species_taxid: 0,
-            contig_genus_taxid: 0,
-            contig_family_taxid: 0,
-            from_assembly: false,
-        });
+        read_dict.insert(
+            read_id.clone(),
+            ReadHit {
+                level,
+                taxid,
+                accession_id: accession_id.clone(),
+                species_taxid,
+                genus_taxid,
+                family_taxid,
+                contig_id: None,
+                contig_accession_id: None,
+                contig_species_taxid: 0,
+                contig_genus_taxid: 0,
+                contig_family_taxid: 0,
+                from_assembly: false,
+            },
+        );
 
-        // accession_dict only when level > 0 && taxid > 0
-        if level > 0 && taxid > 0 {
-            if let Some(base) = accession_base {
-                let entry = accession_dict.entry(base).or_default();
-                entry.count += 1;
-                entry.taxid = species_taxid;
-            }
+        total_reads += 1;
+
+        if accession_id != "-" && genus_taxid > 0 {
+            accession_dict
+                .entry(accession_id.clone())
+                .or_insert_with(|| AccessionHit {
+                    taxid: species_taxid,
+                    genus_taxid,
+                    family_taxid,
+                    count: 0,
+                })
+                .count += 1;
+
+            // Update genus aggregation (all DashMap, fully parallel)
+            *genus_read_counts.entry(genus_taxid).or_insert(0) += 1;
+            genus_species.entry(genus_taxid).or_default().insert(species_taxid);
+            genus_accessions.entry(genus_taxid).or_default().insert(accession_id);
         }
     }
 
-    Ok((read_dict, accession_dict))
+    info!(
+        "summarize_hits: processed {} reads, {} unique accessions",
+        total_reads,
+        accession_dict.len()
+    );
+
+    let mut selected_genera: HashMap<i32, Vec<String>> = HashMap::new();
+    for entry in genus_read_counts.iter() {
+        let genus_taxid = *entry.key();
+        let read_count = *entry.value();
+
+        if read_count < min_reads_per_genus {
+            continue;
+        }
+
+        let species_set = genus_species.get(&genus_taxid);
+        let species_count = species_set.as_ref().map(|s| s.len()).unwrap_or(0);
+
+        if species_count <= 1 {
+            continue; // must have >1 species in genus
+        }
+
+        if let Some(acc_set) = genus_accessions.get(&genus_taxid) {
+            let accessions: Vec<String> = acc_set.iter().cloned().collect();
+            selected_genera.insert(genus_taxid, accessions);
+        }
+    }
+
+    let read_dict_final: AHashMap<String, ReadHit> = read_dict.into_iter().collect();
+    let accession_dict_final: AHashMap<String, AccessionHit> = accession_dict.into_iter().collect();
+
+    Ok((
+        read_dict_final,
+        accession_dict_final,
+        selected_genera,
+        total_reads,
+    ))
 }
 
 
@@ -3578,7 +3647,7 @@ pub async fn update_read_dict(
         let hit = ReadHit {
             level: 1,
             taxid: lineage[0],
-            accession_id: Some(accession.clone()),
+            accession_id: accession.clone(),
             species_taxid: lineage[0],
             genus_taxid: lineage[1],
             family_taxid: lineage[2],
@@ -4418,7 +4487,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream)));
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream), 0));
 
     let nt_counts = generate_taxon_counts(
         config.clone(),
@@ -4498,7 +4567,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream)));
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream), 0));
 
     let nr_counts = generate_taxon_counts(
         config.clone(),
@@ -4631,7 +4700,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Blast contigs
     //NT
-    let (nt_read_dict_noarc, nt_accession_dict_noarc) = nt_hit_summary_handle
+    let (
+        nt_read_dict_noarc,
+        nt_accession_dict_noarc,
+        nt_selected_genera,
+        nt_total_reads,
+    ) = nt_hit_summary_handle
         .await
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
@@ -4640,10 +4714,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
     // //NR
-    let (nr_read_dict_noarc, nr_accession_dict_noarc) = nr_hit_summary_handle
+    let (
+        nr_read_dict_noarc,
+        nr_accession_dict_noarc,
+        nr_selected_genera,
+        nr_total_reads,
+    ) = nr_hit_summary_handle
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
 
     let mut nr_read_dict = Arc::new(Mutex::new(nr_read_dict_noarc));
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
