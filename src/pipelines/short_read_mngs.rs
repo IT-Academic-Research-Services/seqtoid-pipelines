@@ -3180,53 +3180,6 @@ pub async fn generate_assembly_coverage(
 }
 
 
-/// Herlper function that pulls the accessions from an m8 stream
-/// a
-///
-/// # Arguments
-/// * `stream` - M8 stream
-/// # Returns
-/// Result of hashset of the accessions
-async fn collect_accessions_from_m8_stream(mut stream: ReceiverStream<ParseOutput>) -> Result<HashSet<String>> {
-    let mut accessions = HashSet::new();
-    let mut parse_errors = 0;
-
-    while let Some(item) = stream.next().await {
-        let line = match item {
-            ParseOutput::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            _ => {
-                parse_errors += 1;
-                warn!("Invalid item in M8 stream — expected Bytes");
-                continue;
-            }
-        };
-
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 12 {
-            parse_errors += 1;
-            warn!("Invalid M8 line: {}", line);
-            continue;
-        }
-
-        let sacc = fields[1]; // Subject accession
-        let base_acc = sacc.split('.').next().unwrap_or(sacc).to_string();
-        accessions.insert(base_acc);
-    }
-
-    if parse_errors > MAX_PARSE_ERRORS {
-        return Err(anyhow!("Too many parse errors in M8 stream: {} > {}", parse_errors, MAX_PARSE_ERRORS));
-    }
-
-    info!("Collected {} unique accessions from M8 stream", accessions.len());
-    Ok(accessions)
-}
-
-
 /// Fixes FASTA header by removing leading comma in description if present.
 /// apparently there are a few broken accessions out there
 /// Handles multi-headers separated by \x01 (CTRL-A).
@@ -3264,39 +3217,56 @@ fn fix_header(header_line: &str) -> String {
 ///
 /// # Arguments
 /// * `config` - RunConfig struct from main.
-/// * `m8_stream` - stream in m8 format
+/// * `selelcted_genera` - Hashmap of
 /// * `fasta_path` - path to fulle fasta (e.g. NT.fa) where all accession/seqs stored
 /// * `index_path` - path to FST offset index associated witht erh abover fasta_path
 /// * `out_path
 /// # Returns
 /// Result of hashset of the accessions
-pub async fn extract_accessions_to_fasta(
+pub async fn build_reference_fasta_from_selected_genera(
     config: Arc<RunConfig>,
-    m8_stream: ReceiverStream<ParseOutput>,
-    fasta_path: &PathBuf,
-    index_path: &PathBuf,
+    selected_genera: &HashMap<i32, Vec<String>>,  // genus_taxid → [accessions]
+    db_type: &str,
+    source_fasta_path: &PathBuf,                  // full NT/NR FASTA (e.g. nt.fa)
+    source_index_path: &PathBuf,                  // FST index for fast lookup
 ) -> Result<PathBuf> {
-    let accessions = collect_accessions_from_m8_stream(m8_stream).await?;
+    // Flatten and deduplicate accessions
+    let mut accessions: HashSet<String> = HashSet::new();
+    for acc_list in selected_genera.values() {
+        accessions.extend(acc_list.iter().cloned());
+    }
+
     if accessions.is_empty() {
-        warn!("No accessions found in M8 stream (empty assembly?); writing empty FASTA.");
-        let empty_fasta = NamedTempFile::new()?;
-        return Ok(empty_fasta.path().to_path_buf());
+        warn!("selected_genera is empty — writing empty reference FASTA");
+        let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;
+        let empty_path = temp_dir.join(format!("{}_empty_ref.fasta", db_type));
+        fs::write(&empty_path, b">empty\nN\n").await?;
+        return Ok(empty_path);
     }
 
     let mut acc_vec: Vec<String> = accessions.into_iter().collect();
-    acc_vec.sort();
+    acc_vec.sort(); // deterministic order
 
-    let index_data = std::fs::read(index_path)
-        .with_context(|| format!("Failed to read index: {}", index_path.display()))?;
-    let index = Map::new(index_data)
-        .with_context(|| format!("Failed to load FST index: {}", index_path.display()))?;
+    info!(
+        "Building reference FASTA from {} filtered accessions (selected_genera)",
+        acc_vec.len()
+    );
 
-    let file = File::open(fasta_path)
-        .with_context(|| format!("Failed to open FASTA: {}", fasta_path.display()))?;
+
+
+    // Load FST index
+    let index_data = std::fs::read(source_index_path)
+        .with_context(|| format!("Failed to read FST index: {}", source_index_path.display()))?;
+    let index = fst::Map::new(index_data)
+        .with_context(|| format!("Failed to load FST index: {}", source_index_path.display()))?;
+
+    // Open source FASTA
+    let file = File::open(source_fasta_path)
+        .with_context(|| format!("Failed to open source FASTA: {}", source_fasta_path.display()))?;
     let mut reader = BufReader::new(file);
 
-    let estimated_size = (acc_vec.len() as u64) * EST_BYTES_PER_ACCESSION;
-
+    // Estimate size and pick best temp location
+    let estimated_size = (acc_vec.len() as u64) * 2000; // ~2KB per accession avg
     let temp_dir = choose_temp_dir(
         estimated_size,
         &config.ram_temp_dir,
@@ -3304,82 +3274,77 @@ pub async fn extract_accessions_to_fasta(
         4,
     ).await?;
 
-
-    let output_path = temp_dir.join(format!(
-        "refined_hits_{}.fasta",
-        rand::rng().random::<u32>()
-    ));
-
+    let output_path = temp_dir.join(format!("{}_ref_from_selected_genera.fasta", db_type));
     let mut writer = std::io::BufWriter::new(
         File::create(&output_path)
-            .with_context(|| format!("Failed to create output: {}", output_path.display()))?,
+            .with_context(|| format!("Failed to create ref FASTA: {}", output_path.display()))?,
     );
 
+    let mut missing = 0;
     let mut skipped_long = 0;
-    let mut missing_offsets = 0;
 
     for acc in &acc_vec {
-        if let Some(offset) = index.get(acc.as_bytes()) {
+        let key = acc.as_bytes();
+        if let Some(offset) = index.get(key) {
+            reader.seek(SeekFrom::Start(offset))?;
 
-            reader.seek(SeekFrom::Start(offset))
-                .with_context(|| format!("Failed to seek to offset {} for {}", offset, acc))?;
-
-            let mut seq_len: u64 = 0;
             let mut buf = String::with_capacity(1024);
-
             buf.clear();
             if reader.read_line(&mut buf)? == 0 {
                 warn!("EOF while reading header for {}", acc);
-                missing_offsets += 1;
+                missing += 1;
                 continue;
             }
 
-            let fixed_header = fix_header(&buf);
-            seq_len += fixed_header.len() as u64;
-            writer.write_all(fixed_header.as_bytes())?;
+            let header = buf.trim_end().to_string();
+            let mut seq_len: u64 = header.len() as u64;
+            writer.write_all(header.as_bytes())?;
             writer.write_all(b"\n")?;
 
             buf.clear();
-            while reader.read_line(&mut buf)? > 0 {
-                if buf.starts_with('>') {
-
-                    reader.seek(SeekFrom::Current(-(buf.len() as i64)))
-                        .with_context(|| "Failed to rewind for next header")?;
+            loop {
+                let bytes_read = reader.read_line(&mut buf)?;
+                if bytes_read == 0 || buf.starts_with('>') {
+                    // Rewind so next accession can read its header
+                    let rewind = buf.len() as i64;
+                    reader.seek(SeekFrom::Current(-rewind))?;
                     break;
                 }
-                seq_len += buf.len() as u64;
-                if seq_len > MAX_ACCESSION_SEQUENCE_LEN {
+
+                seq_len += bytes_read as u64;
+                if seq_len > 100_000 {
                     skipped_long += 1;
-                    info!("Skipping long sequence for {} ({} bytes)", acc, seq_len);
-                    // srain rest of sequence
+                    info!("Skipping very long sequence: {} ({} bp)", acc, seq_len);
+                    // Drain rest of sequence
                     while reader.read_line(&mut buf)? > 0 && !buf.starts_with('>') {
                         buf.clear();
                     }
                     break;
                 }
+
                 writer.write_all(buf.as_bytes())?;
                 buf.clear();
             }
         } else {
-            missing_offsets += 1;
-            warn!("No offset found for accession: {}", acc);
+            missing += 1;
+            // This is normal — selected_genera may include accessions not in current DB
         }
     }
 
-    writer.flush().with_context(|| "Failed to flush output file")?;
+    writer.flush()?;
+    drop(writer); // ensure written
 
-    if skipped_long > 0 || missing_offsets > 0 {
-        warn!(
-            "Extraction complete: {} long sequences skipped, {} accessions missing",
-            skipped_long, missing_offsets
-        );
+    if missing > 0 {
+        warn!("{} accessions from selected_genera not found in source FASTA", missing);
+    }
+    if skipped_long > 0 {
+        warn!("{} sequences skipped (too long)", skipped_long);
     }
 
-    let extracted_count = acc_vec.len() - missing_offsets;
     info!(
-        "Successfully extracted {} accession sequences → {}",
-        extracted_count,
-        output_path.display()
+        "Reference FASTA built: {} → {} accessions extracted",
+        output_path.display(),
+        acc_vec.len() - missing
     );
 
     Ok(output_path)
@@ -4660,16 +4625,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             "NT offset DB file required for fasta extraction".into(),
         ))?;
 
-    //nt accessions
-    let nt_ref_fasta_path = extract_accessions_to_fasta(
-        config.clone(),
-        ReceiverStream::new(nt_acc_stream),
-        &PathBuf::from(nt_file),
-        &PathBuf::from(nt_offset_db_file),
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    eprintln!("nt path {}", nt_ref_fasta_path.display());
+
 
     let nr_file = config
         .args
@@ -4687,15 +4643,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             "NR offset DB file required for fasta extraction".into(),
         ))?;
 
-    let nr_ref_fasta_path = extract_accessions_to_fasta(
-        config.clone(),
-        ReceiverStream::new(nr_acc_stream),
-        &PathBuf::from(nr_file),
-        &PathBuf::from(nr_offset_db_file),
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    eprintln!("nr path {}", nr_ref_fasta_path.display());
+
 
 
     // Blast contigs
@@ -4713,6 +4661,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_read_dict = Arc::new(Mutex::new(nt_read_dict_noarc));
     let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
+    //nt accessions
+    let nt_ref_fasta_path = build_reference_fasta_from_selected_genera(
+        config.clone(),
+        &nt_selected_genera,
+        NT_TAG,
+        &PathBuf::from(nt_file),
+        &PathBuf::from(nt_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    eprintln!("nt path {}", nt_ref_fasta_path.display());
+
+
     // //NR
     let (
         nr_read_dict_noarc,
@@ -4726,6 +4687,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let mut nr_read_dict = Arc::new(Mutex::new(nr_read_dict_noarc));
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
+
+
+    let nr_ref_fasta_path = build_reference_fasta_from_selected_genera(
+        config.clone(),
+        &nr_selected_genera,
+        NR_TAG,
+        &PathBuf::from(nr_file),
+        &PathBuf::from(nr_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    eprintln!("nr path {}", nr_ref_fasta_path.display());
 
     let nt_handle = tokio::spawn({
         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
@@ -4774,7 +4747,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nr_counts,
                 &contigs_fasta_path.clone(),
                 read2contig,
-                &nr_ref_fasta_path,        // note: NR uses its own ref fasta!
+                &nr_ref_fasta_path,
                 duplicate_cluster_sizes,
                 lineage_map,
                 should_keep_filter,
