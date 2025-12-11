@@ -71,9 +71,9 @@ lazy_static! {
         m.insert(CZID_DEDUP_TAG, 0.1);
         m.insert(DIAMOND_TAG, 2.1);
         m.insert(SPADES_TAG, 4.2);
-        m.insert(BLASTN_TAG, 2.17);
-        m.insert(BLASTX_TAG, 2.17);
-        m.insert(MAKEBLASTDB_TAG, 2.17);
+        m.insert(BLASTN_TAG, 2.12);
+        m.insert(BLASTX_TAG, 2.12);
+        m.insert(MAKEBLASTDB_TAG, 2.12);
         m
     };
 }
