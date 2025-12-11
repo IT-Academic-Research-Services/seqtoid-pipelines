@@ -3350,14 +3350,12 @@ pub async fn summarize_hits(
     mut stream: ReceiverStream<ParseOutput>,
     min_reads_per_genus: usize,
 ) -> Result<(
-    AHashMap<String, ReadHit>,
+    AHashMap<String, Arc<ReadHit>>,
     AHashMap<String, AccessionHit>,
-    HashMap<i32, Vec<String>>, // selected_genera: genus_taxid → Vec<accession>
-    usize,                     // total_reads processed
+    HashMap<i32, Vec<String>>,
+    usize,
 )> {
-
-
-    let read_dict: DashMap<String, ReadHit> = DashMap::with_capacity(8_000_000);
+    let read_dict: DashMap<String, Arc<ReadHit>> = DashMap::with_capacity(8_000_000);
     let accession_dict: DashMap<String, AccessionHit> = DashMap::with_capacity(2_000_000);
 
     let genus_read_counts: DashMap<i32, usize> = DashMap::new();
@@ -3420,7 +3418,7 @@ pub async fn summarize_hits(
 
         read_dict.insert(
             read_id.clone(),
-            ReadHit {
+            Arc::new(ReadHit {
                 level,
                 taxid,
                 accession_id: accession_id.clone(),
@@ -3433,7 +3431,7 @@ pub async fn summarize_hits(
                 contig_genus_taxid: 0,
                 contig_family_taxid: 0,
                 from_assembly: false,
-            },
+            }),
         );
 
         total_reads += 1;
@@ -3449,7 +3447,6 @@ pub async fn summarize_hits(
                 })
                 .count += 1;
 
-            // Update genus aggregation (all DashMap, fully parallel)
             *genus_read_counts.entry(genus_taxid).or_insert(0) += 1;
             genus_species.entry(genus_taxid).or_default().insert(species_taxid);
             genus_accessions.entry(genus_taxid).or_default().insert(accession_id);
@@ -3475,7 +3472,7 @@ pub async fn summarize_hits(
         let species_count = species_set.as_ref().map(|s| s.len()).unwrap_or(0);
 
         if species_count <= 1 {
-            continue; // must have >1 species in genus
+            continue;
         }
 
         if let Some(acc_set) = genus_accessions.get(&genus_taxid) {
@@ -3484,7 +3481,7 @@ pub async fn summarize_hits(
         }
     }
 
-    let read_dict_final: AHashMap<String, ReadHit> = read_dict.into_iter().collect();
+    let read_dict_final: AHashMap<String, Arc<ReadHit>> = read_dict.into_iter().collect();
     let accession_dict_final: AHashMap<String, AccessionHit> = accession_dict.into_iter().collect();
 
     Ok((
@@ -3532,7 +3529,7 @@ async fn write_empty_blast_outputs(
 pub async fn update_read_dict(
     read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
-    read_dict: Arc<Mutex<AHashMap<String, ReadHit>>>,
+    read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     accession_map: Arc<AHashMap<String, AccessionHit>>,
     should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
@@ -3604,7 +3601,7 @@ pub async fn update_read_dict(
             .map(|(r, _)| r.clone())
             .collect();
 
-        let hit = ReadHit {
+        let shared_hit: Arc<ReadHit> = Arc::new(ReadHit {
             level: 1,
             taxid: lineage[0],
             accession_id: accession.clone(),
@@ -3617,34 +3614,33 @@ pub async fn update_read_dict(
             contig_genus_taxid: lineage[1],
             contig_family_taxid: lineage[2],
             from_assembly: true,
-        };
+        });
 
+        let hit_tab_suffix = shared_hit.to_tab_string();
         // Precompute the base hit summary line
-        let base_line = hit.to_tab_string();
-        let placeholder_line = format!("{}\t{}", "", &base_line["".len()..]);
+
 
         for read_id in reads_in_contig {
-            let final_line = format!("{}\t{}", read_id, &placeholder_line["".len()..]);
+            let final_line = format!("{}\t{}", read_id, &hit_tab_suffix);
 
-            // MUTATE INSIDE A SHORT LOCK
             let was_present = {
-                let mut dict = read_dict.lock().unwrap();  // ← lock
+                let mut dict = read_dict.lock().unwrap();
                 let was_present = dict.contains_key(&read_id);
-                dict.insert(read_id.clone(), hit.clone());
+                // This is now just an atomic ref-count increment — essentially free
+                dict.insert(read_id.clone(), shared_hit.clone());
                 was_present
-            };  // ← unlock (guard drops)
+            };
 
-            // Send (outside lock — no contention)
+            let bytes = Arc::new(final_line.into_bytes());
             if was_present {
-                let _ = updated_tx
-                    .send(ParseOutput::Bytes(Arc::new(final_line.into_bytes())))
-                    .await;
+                let _ = updated_tx.send(ParseOutput::Bytes(bytes)).await;
             } else {
-                let _ = added_tx
-                    .send(ParseOutput::Bytes(Arc::new(final_line.into_bytes())))
-                    .await;
+                let _ = added_tx.send(ParseOutput::Bytes(bytes)).await;
             }
         }
+
+
+
     }
 
     Ok(())
@@ -3655,7 +3651,7 @@ pub async fn update_read_dict(
 pub async fn generate_contig_summary_json(
     read2contig: Arc<HashMap<String, String>>,
     contig2lineage: AHashMap<String, [i32; 3]>,
-    read_dict: Arc<Mutex<AHashMap<String, ReadHit>>>,
+    read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     db_type: &str,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
@@ -3665,36 +3661,34 @@ pub async fn generate_contig_summary_json(
     let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
     let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
 
-    // Lock once, copy data, unlock — then process without lock
-    let all_reads: Vec<(String, ReadHit)> = {
+    {
         let dict = read_dict.lock().unwrap();
-        dict.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
+        for (read_id, hit_arc) in dict.iter() {
+            let hit: &ReadHit = hit_arc.as_ref();  // Deref
+            let contig = read2contig.get(read_id).cloned().unwrap_or_else(|| "*".to_string());
+            let lineage = contig2lineage.get(&contig);
 
-    for (read_id, read_info) in all_reads {
-        let contig = read2contig.get(&read_id).cloned().unwrap_or_else(|| "*".to_string());
-        let lineage = contig2lineage.get(&contig);
+            let (species_taxid, genus_taxid) = if contig != "*" && lineage.is_some() {
+                let l = lineage.unwrap();
+                (l[0], l[1])
+            } else {
+                (hit.species_taxid, hit.genus_taxid)
+            };
 
-        let (species_taxid, genus_taxid) = if contig != "*" && lineage.is_some() {
-            let l = lineage.unwrap();
-            (l[0], l[1])
-        } else {
-            (read_info.species_taxid, read_info.genus_taxid)
-        };
+            let cluster_size = duplicate_cluster_sizes.get(read_id).cloned().unwrap_or(1);
 
-        let cluster_size = duplicate_cluster_sizes.get(&read_id).cloned().unwrap_or(1);
+            // species
+            let contig_counts = species_summary.entry(species_taxid).or_default();
+            let counters = contig_counts.entry(contig.clone()).or_insert([0, 0]);
+            counters[0] += 1;
+            counters[1] += cluster_size;
 
-        // species
-        let contig_counts = species_summary.entry(species_taxid).or_default();
-        let counters = contig_counts.entry(contig.clone()).or_insert([0, 0]);
-        counters[0] += 1;
-        counters[1] += cluster_size;
-
-        // genus
-        let contig_counts = genus_summary.entry(genus_taxid).or_default();
-        let counters = contig_counts.entry(contig).or_insert([0, 0]);
-        counters[0] += 1;
-        counters[1] += cluster_size;
+            // genus
+            let contig_counts = genus_summary.entry(genus_taxid).or_default();
+            let counters = contig_counts.entry(contig).or_insert([0, 0]);
+            counters[0] += 1;
+            counters[1] += cluster_size;
+        }
     }
 
     // Emit JSON lines without lock (safe for await)
@@ -3806,7 +3800,7 @@ pub async fn blast_contigs (
     db_type: &'static str,
     deduped_m8_stream: ReceiverStream<ParseOutput>, // deduped_m8
     hit_summary_stream: ReceiverStream<ParseOutput>, // deduped_m8
-    read_dict: Arc<Mutex<AHashMap<String, ReadHit>>>,
+    read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     accession_map: Arc<AHashMap<String, AccessionHit>> ,  //hit_summary, but already done
     taxon_counts: Vec<TaxonCount>, // orig_counts_with_dcr
     assembled_contig_fasta: &PathBuf, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
@@ -3818,7 +3812,7 @@ pub async fn blast_contigs (
     blast_headroom: u64
 
 
-) -> Result<( AHashMap<String, ReadHit>, Vec<TaxonCount>, Vec<ContigSummaryEntry>, Vec<JoinHandle<Result<()>>>,
+) -> Result<( AHashMap<String, Arc<ReadHit>>, Vec<TaxonCount>, Vec<ContigSummaryEntry>, Vec<JoinHandle<Result<()>>>,
              Vec<oneshot::Receiver<Result<()>>>, Vec<NamedTempFile> )>{
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
@@ -4653,7 +4647,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
 
-    let mut nt_read_dict = Arc::new(Mutex::new(nt_read_dict_noarc));
+    let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_noarc));
     let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
     //nt accessions
@@ -4680,7 +4674,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
 
-    let mut nr_read_dict = Arc::new(Mutex::new(nr_read_dict_noarc));
+    let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_noarc));
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
 
 
@@ -4709,7 +4703,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 NT_TAG,
                 ReceiverStream::new(nt_blast_stream),
                 ReceiverStream::new(nt_blast_hit_stream),
-                nt_read_dict,
+                nt_read_dict.clone(),
                 nt_accession_dict,
                 nt_counts,
                 &contigs_fasta_path.clone(),
@@ -4737,7 +4731,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 NR_TAG,
                 ReceiverStream::new(nr_blast_stream),
                 ReceiverStream::new(nr_blast_hit_stream),
-                nr_read_dict,
+                nr_read_dict.clone(),
                 nr_accession_dict,
                 nr_counts,
                 &contigs_fasta_path.clone(),
