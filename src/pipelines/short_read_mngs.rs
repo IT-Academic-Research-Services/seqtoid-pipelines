@@ -3953,26 +3953,23 @@ pub async fn blast_contigs (
     cleanup_tasks.push(err_task);
 
 
-    let blast_out_stream = {
-        parse_child_output(
-            &mut blast_child,
-            ChildStream::Stdout,
-            ParseMode::Lines,
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: "blastn/x".to_string(),
-                error: e.to_string(),
-            })?
-    };
+    let blast_out_stream = parse_child_output(
+        &mut blast_child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        config.base_buffer_size,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: "blastn/x".to_string(),
+            error: e.to_string(),
+        })?;
 
-
+    // Now feed blast_out_stream directly into top_m8
     let (top_tx, top_rx) = channel(1024);
     let top_handle = if db_type == NT_TAG {
-        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_rx), top_tx))
+        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_tx))
     } else {
-        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_rx), top_tx))
+        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_tx))
     };
 
     let (contig2lineage_tx, contig2lineage_rx) = channel(1024);
