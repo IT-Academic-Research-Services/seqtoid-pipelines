@@ -344,80 +344,148 @@ pub async fn generate_taxon_count_json_from_m8(
 ) -> Result<()> {
     let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
 
-    // 1. Read-to-taxid map from refined hit summary
+
+    // 0: read_id
+    // 1: accession
+    // 2: hit_taxid (often isolate-level)
+    // 3: genus_taxid
+    // 4: family_taxid
+    // 5: consensus_level (1=genus, 2=family, 3=species)
     let mut read_to_taxid: AHashMap<String, Taxid> = AHashMap::with_capacity(10_000_000);
     while let Some(item) = refined_hit_summary_stream.next().await {
-        let bytes = item.to_bytes()?;  // ← note the ? here
+        let bytes = item.to_bytes()?;
         let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
 
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 3 { continue; }
+        if fields.len() != 6 {
+            warn!(
+                "Malformed refined hit_summary line (expected 6 fields, got {}): {}",
+                fields.len(),
+                line
+            );
+            continue;
+        }
 
         let read_id = fields[0].to_string();
-        let taxid = fields[1].parse::<Taxid>().unwrap_or(0);
+
+        let taxid: Taxid = match fields[2].parse() {
+            Ok(t) if t > 0 => t,
+            Ok(t) => {
+                debug!("Read {} has non-positive taxid {} → skipping", read_id, t);
+                continue;
+            }
+            Err(e) => {
+                warn!("Invalid taxid '{}' in refined hit_summary (parse error: {}): {}", fields[2], e, line);
+                continue;
+            }
+        };
+
         read_to_taxid.insert(read_id, taxid);
     }
 
+    info!("Loaded {} read → taxid mappings from refined hit summary", read_to_taxid.len());
 
     while let Some(item) = refined_m8_stream.next().await {
-        let bytes = item.to_bytes()?;  // ← again, ? to propagate any error
+        let bytes = item.to_bytes()?;
         let line = String::from_utf8_lossy(&bytes);
 
+        // Parse m8 line — defensive with warnings
         let m8 = if db_type == NT_TAG {
-            M8Record::parse_line_nt(&line)?
+            match M8Record::parse_line_nt(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to parse NT m8 line: {} — {}", e, line);
+                    continue;
+                }
+            }
         } else {
-            M8Record::parse_line_nr(&line)?
+            match M8Record::parse_line_nr(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to parse NR m8 line: {} — {}", e, line);
+                    continue;
+                }
+            }
         };
 
-        if let Some(&taxid) = read_to_taxid.get(&m8.qname) {
-            if taxid <= 0 { continue; }
+        let Some(&taxid) = read_to_taxid.get(&m8.qname) else {
+            // This is expected for unmapped reads — not an error
+            continue;
+        };
 
-            let lineage = match lineage_map.get(&taxid) {
-                Some(l) => l,
-                None => continue,
-            };
-
-            if !(should_keep_filter)(lineage) { continue; }
-
-            let bucket = buckets.entry(taxid).or_default();
-            bucket.nonunique_count += 1;
-            bucket.unique_count += duplicate_cluster_sizes.get(&m8.qname).cloned().unwrap_or(1);
-            bucket.base_count += 1;
-            bucket.sum_percent_identity += m8.pident;
-            bucket.sum_alignment_length += m8.alen as f64;
-            bucket.sum_e_value += m8.evalue;
-            bucket.source_count_type.insert(db_type.to_string());
+        if taxid <= 0 {
+            debug!("Read {} has invalid refined taxid {} — skipping m8 hit", m8.qname, taxid);
+            continue;
         }
+
+        let lineage = match lineage_map.get(&taxid) {
+            Some(l) => l,
+            None => {
+                warn!("Missing lineage for taxid {} (read: {}) — skipping hit", taxid, m8.qname);
+                continue;
+            }
+        };
+
+        if !(should_keep_filter)(lineage) {
+            debug!("Read {} (taxid {}) filtered out by should_keep_filter", m8.qname, taxid);
+            continue;
+        }
+
+        let bucket = buckets.entry(taxid).or_default();
+        bucket.nonunique_count += 1;
+        bucket.unique_count += duplicate_cluster_sizes.get(&m8.qname).cloned().unwrap_or(1);
+        bucket.base_count += 1;
+        bucket.sum_percent_identity += m8.pident;
+        bucket.sum_alignment_length += m8.alen as f64;
+        bucket.sum_e_value += m8.evalue;
+        bucket.source_count_type.insert(db_type.to_string());
     }
 
 
     for (taxid, bucket) in buckets {
         let lineage = match lineage_map.get(&taxid) {
             Some(l) => l,
-            None => continue,
+            None => {
+                warn!("No lineage for final taxid {} — skipping output", taxid);
+                continue;
+            }
         };
 
-        if !(should_keep_filter)(lineage) { continue; }
+        if !(should_keep_filter)(lineage) {
+            continue;
+        }
 
         let dcr = if bucket.nonunique_count > 0 {
             bucket.unique_count as f64 / bucket.nonunique_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let percent_identity = if bucket.base_count > 0 {
             bucket.sum_percent_identity / bucket.base_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let alignment_length = if bucket.base_count > 0 {
             bucket.sum_alignment_length / bucket.base_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let e_value = if bucket.base_count > 0 {
             bucket.sum_e_value / bucket.base_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let count = TaxonCount {
             tax_id: taxid,
-            tax_level: 1, // always species-level aggregation in refined counts
+            tax_level: 1, // species-level aggregation
             genus_taxid: lineage[1],
             family_taxid: lineage[2],
             count: bucket.unique_count,
@@ -436,7 +504,7 @@ pub async fn generate_taxon_count_json_from_m8(
         output_tx
             .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
             .await
-            .map_err(|_| anyhow!("taxon count receiver dropped"))?;
+            .map_err(|_| anyhow!("taxon count output channel dropped"))?;
     }
 
     Ok(())
