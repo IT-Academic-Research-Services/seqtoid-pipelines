@@ -996,60 +996,100 @@ async fn kallisto_results(
     ercc_tx: oneshot::Sender<KallistoResults>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>, PipelineError> {
     let abundance_path = kallisto_out_dir.join("abundance.tsv");
+
     let parse_task = tokio::spawn(async move {
-        // Retry reading abundance.tsv (handles NVMe flush delays)
-        let mut retries = 5;
-        loop {
+        // Wait for non-empty file
+        let mut attempts = 5;
+        let file = loop {
             match fs::metadata(&abundance_path).await {
-                Ok(meta) if meta.len() > 0 => {
-                    debug!("Found abundance.tsv: {} bytes", meta.len());
-                    break;
+                Ok(meta) if meta.len() > 0 => break TokioFile::open(&abundance_path).await?,
+                _ if attempts == 0 => {
+                    return Err(anyhow!("kallisto abundance.tsv never appeared or is empty"));
                 }
                 _ => {
-                    if retries == 0 {
-                        return Err(anyhow!("No abundance.tsv found at {}", abundance_path.display()));
-                    }
-                    warn!("abundance.tsv not ready (retry {}); sleeping 2s", retries);
+                    attempts -= 1;
+                    warn!("Waiting for kallisto abundance.tsv ({} attempts left)...", attempts + 1);
                     sleep(Duration::from_secs(2)).await;
-                    retries -= 1;
                 }
             }
+        };
+
+        let mut lines = TokioBufReader::new(file).lines();
+
+        // Skip header
+        if lines.next_line().await?.is_none() {
+            warn!("kallisto abundance.tsv has no header — assuming empty");
+            let _ = ercc_tx.send(KallistoResults {
+                ercc_counts: vec![],
+                transcript_to_gene: vec![],
+            });
+            return Ok(());
         }
 
-        let abundance_file = TokioFile::open(&abundance_path).await
-            .map_err(|e| anyhow!("Failed to open abundance.tsv: {}", e))?;
-        let reader = tokio::io::BufReader::new(abundance_file);
-        let mut lines = reader.lines();
         let mut ercc_counts = Vec::new();
         let mut transcript_to_gene = Vec::new();
+        let mut parsed = 0;
+        let mut skipped = 0;
 
-        debug!("Starting to read abundance.tsv from: {}", abundance_path.display());
+        while let Some(line_result) = lines.next_line().await.transpose() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("I/O error reading kallisto abundance.tsv: {}", e);
+                    skipped += 1;
+                    continue;
+                }
+            };
 
-        if lines.next_line().await?.is_none() {
-            return Err(anyhow!("Empty abundance.tsv"));
-        }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
 
-        // Parse each line: target_id, length, eff_length, est_counts, tpm
-        while let Some(line) = lines.next_line().await? {
             let fields: Vec<&str> = line.split('\t').collect();
             if fields.len() < 5 {
-                return Err(anyhow!("Invalid abundance.tsv line: {}", line));
+                warn!("Malformed kallisto line ({} fields): {}", fields.len(), line);
+                skipped += 1;
+                continue;
             }
+
             let target_id = fields[0].to_string();
-            let est_counts = fields[3].parse::<f64>()
-                .map_err(|e| anyhow!("Failed to parse est_counts in line {}: {}", line, e))?;
-            ercc_counts.push((target_id.clone(), est_counts));
+
+            let est_counts: f64 = match fields[3].parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Invalid est_counts '{}' → {} (line: {})", fields[3], e, line);
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Optional: parse TPM too
+            let _tpm: f64 = fields[4].parse().unwrap_or(0.0);
+
+            // Keep ERCCs only
+            if target_id.starts_with("ERCC-") {
+                ercc_counts.push((target_id.clone(), est_counts));
+            }
+
             transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
+            parsed += 1;
         }
 
-        debug!("Finished reading kallisto's abundance.tsv: {} transcripts", ercc_counts.len());
-        let results = KallistoResults {
-            ercc_counts,
-            transcript_to_gene,
-        };
-        ercc_tx.send(results)
-            .map_err(|_| anyhow!("Failed to send Kallisto results"))?;
-        debug!("Sent Kallisto results");
+        info!(
+            "Kallisto parsing finished — {} lines parsed, {} skipped, {} ERCCs found",
+            parsed,
+            skipped,
+            ercc_counts.len()
+        );
+
+        ercc_tx
+            .send(KallistoResults {
+                ercc_counts,
+                transcript_to_gene,
+            })
+            .map_err(|_| anyhow!("Kallisto receiver dropped"))?;
+
         Ok(())
     });
 
@@ -2701,30 +2741,37 @@ pub async fn process_assembly(
     paired: bool,
     assembly_headroom: u64,
 ) -> Result<(
-           CoverageOutputs,
-           ReceiverStream<ParseOutput>,
-           Vec<JoinHandle<Result<()>>>,
-           Vec<oneshot::Receiver<Result<()>>>,
-           Vec<NamedTempFile>
-),  PipelineError>
-
- {
-    let mut cleanup_tasks = Vec::new();let mut cleanup_receivers = Vec::new();
+    CoverageOutputs,
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+    Vec<NamedTempFile>,
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
-    let raw_contigs_path    = work_dir.join("contigs.fasta");
-    let raw_scaffolds_path  = work_dir.join("scaffolds.fasta");
+    let raw_contigs_path = work_dir.join("contigs.fasta");
+    let raw_scaffolds_path = work_dir.join("scaffolds.fasta");
+    let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
 
-     let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
+    let spades_success = raw_contigs_path.exists()
+        && fs::metadata(&raw_contigs_path)
+        .await
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
 
-    let spades_success = if raw_contigs_path.exists() {
-        fs::metadata(&raw_contigs_path).await?.len() > 0
-    } else {
-        false
-    };
-
-    // if it failed write empty data
     if !spades_success {
+        let reason = if !raw_contigs_path.exists() {
+            "contigs.fasta does not exist"
+        } else {
+            "contigs.fasta is empty"
+        };
+
+        warn!(
+            "SPAdes assembly failed: {} — writing dummy outputs and skipping contig-based refinement",
+            reason
+        );
 
         let dummy = ";ASSEMBLY FAILED";
         let empty_sam = "@NO INFO\n";
@@ -2737,71 +2784,78 @@ pub async fn process_assembly(
         fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
         fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
 
-        return Ok((CoverageOutputs {
-            contigs_fasta: out_dir.join("contigs.fasta"),
-            contigs_ram_fasta: out_dir.join("contigs.ram.fasta"),
-            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-            sam_path: out_dir.join("read-contig.sam"),
-            contig_stats_json: out_dir.join("contig_stats.json"),
-            coverage_json: out_dir.join("assembly_contig_coverage.json"),
-            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-            contig_stats: Arc::new(HashMap::new()),
-            read2contig: Arc::new(HashMap::new()),
-        }, ReceiverStream::new(empty_rx), cleanup_tasks,  cleanup_receivers, temp_files));
+        return Ok((
+            CoverageOutputs {
+                contigs_fasta: out_dir.join("contigs.fasta"),
+                contigs_ram_fasta: out_dir.join("contigs.ram.fasta"),
+                contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+                scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+                sam_path: out_dir.join("read-contig.sam"),
+                contig_stats_json: out_dir.join("contig_stats.json"),
+                coverage_json: out_dir.join("assembly_contig_coverage.json"),
+                coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+                contig_stats: Arc::new(HashMap::new()),
+                read2contig: Arc::new(HashMap::new()),
+            },
+            ReceiverStream::new(empty_rx),
+            cleanup_tasks,
+            cleanup_receivers,
+            temp_files,
+        ));
     }
 
     let contigs_all_out = out_dir.join("contigs_all.fasta");
     fs::copy(&raw_contigs_path, &contigs_all_out).await?;
 
     let contigs_out = out_dir.join("contigs.fasta");
+    let contigs_size = file_size(&raw_contigs_path).await?;
 
-     let contigs_size = file_size(&raw_contigs_path).await?;
+    let temp_dir = choose_temp_dir(
+        contigs_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        assembly_headroom,
+    )
+        .await?;
 
-     let temp_dir = choose_temp_dir(
-         contigs_size,
-         &config.ram_temp_dir,
-         &config.args.nvme_scratch,
-         assembly_headroom,
-     ).await?;
+    let ram_fasta_path = NamedTempFile::with_suffix_in(".fa", &temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let ram_path = ram_fasta_path.path().to_owned();
 
-     let ram_fasta_path = NamedTempFile::with_suffix_in(".fa", &temp_dir)
-         .map_err(|e| PipelineError::Other(e.into()))?;
-     let ram_path = ram_fasta_path.path().to_owned(); // PathBuf, so its owned
-
-    //contig length filtering
+    // Contig length filtering
     let rx = read_fasta(
         raw_contigs_path.clone(),
-        u64::MAX,           // no record limit
+        u64::MAX,
         Some(config.args.min_contig_length),
         None,
         8192,
-    ).map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
+    )
+        .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
 
-     let (write_handle, _ram_path) = write_fasta_stream_to_file(
-         ReceiverStream::new(rx),
-         ram_path.clone(),
-         config.base_buffer_size,
-     ).await?;
+    let (write_handle, _ram_path) = write_fasta_stream_to_file(
+        ReceiverStream::new(rx),
+        ram_path.clone(),
+        config.base_buffer_size,
+    )
+        .await?;
 
-     write_handle.await
-         .map_err(|e| PipelineError::Other(anyhow!("FASTA write task panicked: {}", e)))?
-         .map_err(|e| PipelineError::Other(anyhow!("FASTA write failed: {}", e)))?;
+    write_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("FASTA write task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("FASTA write failed: {}", e)))?;
 
-     fs::copy(&ram_path, contigs_out).await
-         .map_err(|e| PipelineError::Other(anyhow!("Failed to copy contigs to output: {}", e)))?;
+    fs::copy(&ram_path, &contigs_out).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to copy contigs to output: {}", e)))?;
 
-     temp_files.push(ram_fasta_path);
+    temp_files.push(ram_fasta_path);
 
     let scaffolds_out = out_dir.join("scaffolds.fasta");
-    let spades_scaffolds = work_dir.join("scaffolds.fasta");
-    if spades_scaffolds.exists() {
-        fs::copy(&spades_scaffolds, &scaffolds_out).await?;
+    if raw_scaffolds_path.exists() {
+        fs::copy(&raw_scaffolds_path, &scaffolds_out).await?;
     } else {
         fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
     }
 
-    // bt2 index
     let index_dir = out_dir.join("bowtie_index");
     fs::create_dir_all(&index_dir).await?;
     let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
@@ -2821,14 +2875,14 @@ pub async fn process_assembly(
         .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
 
     if !build_status.success() {
-        return Err(PipelineError::ToolExecution {tool: BOWTIE2_TAG.to_string(), error: build_status.to_string()});
+        return Err(PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: build_status.to_string(),
+        });
     }
 
-    let bt2_options = HashMap::from([
-        ("--very-sensitive".to_string(), None),
-    ]);
+    let bt2_options = HashMap::from([("--very-sensitive".to_string(), None)]);
 
-    // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: index_prefix,
         paired: paired,
@@ -2840,7 +2894,7 @@ pub async fn process_assembly(
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    eprintln!("Bowtie 2 args: {:?}", bt2_args);
+
     let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
         config.clone(),
         bowtie_stream.into_inner(),
@@ -2854,6 +2908,7 @@ pub async fn process_assembly(
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(bt2_stream_task);
     cleanup_tasks.push(bt2_err_task);
 
@@ -2872,16 +2927,16 @@ pub async fn process_assembly(
             })?
     };
 
-    // Sort, output uncompressed BAM
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted for fastq extraction
+            ("-n".to_string(), None),
             ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())), // uncompressed BAM for noodles to consume
+            ("-O".to_string(), Some("bam".to_string())),
             ("-".to_string(), None),
         ]),
     };
+
     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -2901,6 +2956,7 @@ pub async fn process_assembly(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(samtools_sort_task);
     cleanup_tasks.push(samtools_sort_err_task);
 
@@ -2919,57 +2975,62 @@ pub async fn process_assembly(
             })?
     };
 
-     let (non_host_streams, non_host_done_rx) = t_junction(
-         ReceiverStream::new(samtools_sort_out_stream),
-         2,
-         config.base_buffer_size,
-         config.args.stall_threshold,
-         None,
-         100,
-         StreamDataType::IlluminaFastq,
-         "process_assembly_sam".to_string(),
-         None,
-     )
-         .await
-         .map_err(|_| PipelineError::StreamDataDropped)?;
-     cleanup_receivers.push(non_host_done_rx);
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        ReceiverStream::new(samtools_sort_out_stream),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "process_assembly_sam".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
-     let mut non_host_streams_iter = non_host_streams.into_iter();
-     let bam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-     let bam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-     let bam_for_output = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    cleanup_receivers.push(non_host_done_rx);
 
-     let sam_path = out_dir.join("read-contig.bam");
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let bam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_for_output = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-     let write_sam_task = write_byte_stream_to_file(
-         &sam_path,
-         ReceiverStream::new(bam_for_file),
-         Some(config.base_buffer_size),
-     )
-         .await?;
-     cleanup_tasks.push(write_sam_task);
+    let sam_path = out_dir.join("read-contig.bam");
 
-     let (read2contig, contig_stats) = generate_info_from_bam_stream(
-         bam_for_stats,
-         &duplicate_cluster_sizes,
-         config.args.min_contig_length,
-     ).await?;
+    let write_sam_task = write_byte_stream_to_file(
+        &sam_path,
+        ReceiverStream::new(bam_for_file),
+        Some(config.base_buffer_size),
+    )
+        .await?;
+    cleanup_tasks.push(write_sam_task);
 
-    Ok((CoverageOutputs {
-        contigs_fasta: out_dir.join("contigs.fasta"),
-        contigs_ram_fasta: ram_path.clone(),
-        contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-        scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-        sam_path: out_dir.join("read-contig.sam"),
-        contig_stats_json: out_dir.join("contig_stats.json"),
-        coverage_json: out_dir.join("assembly_contig_coverage.json"),
-        coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-        contig_stats: Arc::new(contig_stats),
-        read2contig: Arc::new(read2contig),
-    }, ReceiverStream::new(bam_for_output), cleanup_tasks,  cleanup_receivers, temp_files))
+    let (read2contig, contig_stats) = generate_info_from_bam_stream(
+        bam_for_stats,
+        &duplicate_cluster_sizes,
+        config.args.min_contig_length,
+    )
+        .await?;
 
-
-
+    Ok((
+        CoverageOutputs {
+            contigs_fasta: out_dir.join("contigs.fasta"),
+            contigs_ram_fasta: ram_path.clone(),
+            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+            sam_path: out_dir.join("read-contig.sam"),
+            contig_stats_json: out_dir.join("contig_stats.json"),
+            coverage_json: out_dir.join("assembly_contig_coverage.json"),
+            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+            contig_stats: Arc::new(contig_stats),
+            read2contig: Arc::new(read2contig),
+        },
+        ReceiverStream::new(bam_for_output),
+        cleanup_tasks,
+        cleanup_receivers,
+        temp_files,
+    ))
 }
 
 
