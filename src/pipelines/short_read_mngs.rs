@@ -3350,7 +3350,6 @@ pub async fn build_reference_fasta_from_selected_genera(
 /// # Arguments
 /// * `stream` - stream in m8 format
 /// * `min_reads_per_genus` - Minimum threshold of reads per genus to be included
-
 /// # Returns
 /// read dicttionary of read id's -> Readhit
 ///  accesions -> Accesiohit
@@ -3391,44 +3390,53 @@ pub async fn summarize_hits(
         }
 
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 7 {
-            warn!("Malformed hit_summary line (<7 fields): {}", line);
+
+        if parts.len() != 6 {
+            warn!(
+        "Malformed hit_summary line (expected exactly 6 fields, got {}): {}",
+        parts.len(),
+        line
+    );
             continue;
         }
 
-        let read_id = parts[0].to_string();
-
-        let level = match parts[1].parse::<u8>() {
-            Ok(l) => l,
-            Err(_) => {
-                warn!("Invalid level field: {}", parts[1]);
-                continue;
-            }
-        };
-
-        let taxid = match parts[2].parse::<i32>() {
-            Ok(t) => t,
-            Err(_) => {
-                warn!("Invalid taxid field: {}", parts[2]);
-                continue;
-            }
-        };
-
-        let accession_id = if parts[3] == "-" || parts[3].is_empty() {
+        let read_id       = parts[0].to_string();
+        let accession_id  = if parts[1].is_empty() || parts[1] == "-" {
             "-".to_string()
         } else {
-            parts[3].to_string() // keep full versioned accession
+            parts[1].to_string()
+        };
+        let hit_taxid: i32 = parts[2].parse()
+            .map_err(|_| warn!("Invalid hit_taxid: {}", parts[2])).ok().unwrap_or(0);
+        let genus_taxid: i32 = parts[3].parse()
+            .map_err(|_| warn!("Invalid genus_taxid: {}", parts[3])).ok().unwrap_or(0);
+        let family_taxid: i32 = parts[4].parse()
+            .map_err(|_| warn!("Invalid family_taxid: {}", parts[4])).ok().unwrap_or(0);
+        let level: u8 = parts[5].parse()
+            .map_err(|_| warn!("Invalid level: {}", parts[5])).ok().unwrap_or(0);
+
+        let species_taxid = if level >= 3 && hit_taxid > 0 {
+            hit_taxid                     // level 3+ means species consensus already achieved
+        } else {
+            0                             // only genus/family → species unknown
         };
 
-        let species_taxid = parts[4].parse::<i32>().unwrap_or(0);
-        let genus_taxid = parts[5].parse::<i32>().unwrap_or(0);
-        let family_taxid = parts[6].parse::<i32>().unwrap_or(0);
+        // assign highest resolved level
+        let assigned_taxid = if level >= 3 {
+            species_taxid
+        } else if level == 2 {
+            genus_taxid
+        } else if level == 1 {
+            genus_taxid
+        } else {
+            hit_taxid                     // fallback (should be rare)
+        };
 
         read_dict.insert(
             read_id.clone(),
             Arc::new(ReadHit {
                 level,
-                taxid,
+                taxid: assigned_taxid,
                 accession_id: accession_id.clone(),
                 species_taxid,
                 genus_taxid,
@@ -3525,16 +3533,21 @@ async fn write_empty_blast_outputs(
 }
 
 /// Updates the read_dict in blast_contigs from streamed m8 data.
-///
+/// Updates it in place using a lock, does not return it
 /// # Arguments
 /// * `read2contig` - Assignment of reads to contigs
 /// * `top_m8_stream` - stream in m8 format, top as found in get_top_m8_nt/nr
 /// * `read_dict` - HashMap of ReadID -> ReadHits
-/// * `accession_dict` - accession → (species, genus, family)
-/// * `updated_read_tx` - sendiner
-
+/// * `lneage_map` - Hashmap os taxon id -> full lineage (family, genus, species)
+/// * `accession_map` - accession → (species, genus, family)
+/// * `should_keep` - combination of taxon lists and deuterostome filters
+/// * `db_type` - denotes NT or NR DB's to keep intermdiate and output files distinguished form each other
+/// * `contig2lineage_tx` - json sender
+/// * `read2blastm8_tx` - refined m8 sender
+/// * 'updated_tx` - updated dict sender
+/// * `added_tx` - added to dict snde
 /// # Returns
-/// Result of hashset of the accessions
+/// Result
 pub async fn update_read_dict(
     read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
@@ -3543,10 +3556,10 @@ pub async fn update_read_dict(
     accession_map: Arc<AHashMap<String, AccessionHit>>,
     should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     db_type: &str,
-    mut contig2lineage_tx: Sender<ParseOutput>,
-    mut read2blastm8_tx: Sender<ParseOutput>,
-    mut updated_tx: Sender<ParseOutput>,
-    mut added_tx: Sender<ParseOutput>,
+    contig2lineage_tx: Sender<ParseOutput>,
+    read2blastm8_tx: Sender<ParseOutput>,
+    updated_tx: Sender<ParseOutput>,
+    added_tx: Sender<ParseOutput>,
 ) -> Result<()> {
     while let Some(item) = top_m8_stream.next().await {
         let bytes = match item {
@@ -3626,8 +3639,6 @@ pub async fn update_read_dict(
         });
 
         let hit_tab_suffix = shared_hit.to_tab_string();
-        // Precompute the base hit summary line
-
 
         for read_id in reads_in_contig {
             let final_line = format!("{}\t{}", read_id, &hit_tab_suffix);
@@ -3635,7 +3646,6 @@ pub async fn update_read_dict(
             let was_present = {
                 let mut dict = read_dict.lock().unwrap();
                 let was_present = dict.contains_key(&read_id);
-                // This is now just an atomic ref-count increment — essentially free
                 dict.insert(read_id.clone(), shared_hit.clone());
                 was_present
             };
@@ -3647,8 +3657,6 @@ pub async fn update_read_dict(
                 let _ = added_tx.send(ParseOutput::Bytes(bytes)).await;
             }
         }
-
-
 
     }
 
