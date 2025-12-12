@@ -3346,6 +3346,14 @@ pub async fn build_reference_fasta_from_selected_genera(
 }
 
 
+/// Summarizes an M8 stream as a
+/// # Arguments
+/// * `stream` - stream in m8 format
+/// * `min_reads_per_genus` - Minimum threshold of reads per genus to be included
+
+/// # Returns
+/// read dicttionary of read id's -> Readhit
+///  accesions -> Accesiohit
 pub async fn summarize_hits(
     mut stream: ReceiverStream<ParseOutput>,
     min_reads_per_genus: usize,
@@ -3520,7 +3528,8 @@ async fn write_empty_blast_outputs(
 ///
 /// # Arguments
 /// * `read2contig` - Assignment of reads to contigs
-/// * `blast_top_m8_stream` - stream in m8 format, top as found in get_top_m8_nt/nr
+/// * `top_m8_stream` - stream in m8 format, top as found in get_top_m8_nt/nr
+/// * `read_dict` - HashMap of ReadID -> ReadHits
 /// * `accession_dict` - accession → (species, genus, family)
 /// * `updated_read_tx` - sendiner
 
@@ -3896,7 +3905,7 @@ pub async fn blast_contigs (
             error: e.to_string(),
         })?;
     cleanup_tasks.push(makeblastdb_err_task);
-    
+
 
     let blast_command = if db_type == NT_TAG { BLASTN_TAG } else { BLASTX_TAG };
 
@@ -4508,7 +4517,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     let (nr_summary_streams, nr_summary_done_rx) = t_junction(
@@ -4528,7 +4537,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
     let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream), 0));
 
