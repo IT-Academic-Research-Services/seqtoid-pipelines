@@ -79,50 +79,65 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
         match item {
             ParseOutput::Bytes(line_bytes) => {
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-                if line.is_empty() {
+                if line.is_empty() || !line.starts_with('#') {
                     continue;
                 }
 
-                if line.starts_with("SN") {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() >= 3 {
-                        let key = parts[1].trim_end_matches(':').to_string();
-                        let value = parts[2].to_string();
-                        summary.insert(key, value);
+                // Remove leading '# '
+                let line = line.trim_start_matches('#').trim();
+
+                let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
+
+                if parts.is_empty() {
+                    continue;
+                }
+
+                match parts[0] {
+                    "SN" => {
+                        if parts.len() >= 2 {
+                            let key = parts[0].trim_end_matches(':').to_string();
+                            let value = parts[1].to_string();
+                            summary.insert(key, value);
+                        } else {
+                            warn!("Malformed SN line (expected >=2 fields): {}", line);
+                        }
                     }
-                } else if line.starts_with("IS\t") {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() == 5 {
-                        let size: u32 = match parts[1].parse() {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("Failed to parse insert size: {}", e);
-                                continue;
-                            }
-                        };
-                        let inward: u64 = match parts[2].parse() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to parse inward count: {}", e);
-                                continue;
-                            }
-                        };
-                        let outward: u64 = match parts[3].parse() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to parse outward count: {}", e);
-                                continue;
-                            }
-                        };
-                        let other: u64 = match parts[4].parse() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to parse other count: {}", e);
-                                continue;
-                            }
-                        };
-                        insert_sizes.push((size, inward + outward + other));
+                    "IS" => {
+                        if parts.len() == 5 {
+                            let size: u32 = match parts[1].parse() {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!("Failed to parse insert size '{}' in IS line: {} (line: {})", parts[1], e, line);
+                                    continue;
+                                }
+                            };
+                            let inward: u64 = match parts[2].parse() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("Failed to parse inward count '{}' in IS line: {} (line: {})", parts[2], e, line);
+                                    continue;
+                                }
+                            };
+                            let outward: u64 = match parts[3].parse() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("Failed to parse outward count '{}' in IS line: {} (line: {})", parts[3], e, line);
+                                    continue;
+                                }
+                            };
+                            let other: u64 = match parts[4].parse() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("Failed to parse other count '{}' in IS line: {} (line: {})", parts[4], e, line);
+                                    continue;
+                                }
+                            };
+                            insert_sizes.push((size, inward + outward + other));
+                        } else {
+                            warn!("Malformed IS line (expected 5 fields, got {}): {}", parts.len(), line);
+                        }
                     }
+                    _ => {}
                 }
             }
             _ => {
@@ -132,7 +147,12 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
         }
     }
 
-    // Return empty stats instead of error if no data
+    if insert_sizes.is_empty() {
+        warn!("No valid IS (insert size) lines parsed from samtools stats — check if BAM is paired-end and samtools version >=1.6");
+    } else {
+        info!("Parsed {} insert size entries from samtools stats", insert_sizes.len());
+    }
+
     Ok(SamtoolsStats { summary, insert_sizes })
 }
 
