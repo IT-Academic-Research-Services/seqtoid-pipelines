@@ -75,8 +75,6 @@ async fn main() -> Result<()> {
 
     let (max_cores, cpu_load) = detect_cores_and_load(args.threads, args.use_smt).await?;
     let stream_threads = compute_stream_threads(max_cores, cpu_load, args.threads, args.use_smt);
-    debug!("Detected {} physical cores; CPU load {}%; using {} threads for pool, {} for streams",
-              max_cores, cpu_load, max_cores, stream_threads);
 
     let thread_pool = Arc::new(ThreadPoolBuilder::new()
         .num_threads(max_cores)
