@@ -253,7 +253,7 @@ where
                 // Check buffer fullness for backpressure
                 if tx.capacity() < buffer_size / 10 { // <10% capacity left
                     backpressure_detected = true;
-                    // warn!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
+                    debug!("{}: Backpressure detected on receiver {} at item {} (capacity {}/{}", label, i, item_count, tx.capacity(), buffer_size);
                 }
                 match tx.try_send(item.clone()) {
                     Ok(()) => active_txs.push((i, tx)),
