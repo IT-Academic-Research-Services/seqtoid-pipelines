@@ -3254,13 +3254,7 @@ fn fix_header(header_line: &str) -> String {
     }
 
     // Split on \x01 (multi-accession entries), fix commas in each part, rejoin
-    let parts: Vec<String> = header_line[1..]
-        .split('\x01')
-        .map(|part| {
-            let trimmed = part.trim_start();
-            FIX_COMMA_REGEXP.replace_all(trimmed, " ").to_string()
-        })
-        .collect();
+    let parts: Vec<&str> = header_line.split(|c: char| c == ',' && header_line.as_bytes().get(header_line.find(',').unwrap_or(0) + 1).map_or(false, |&b| b != b' ')).collect();
 
     format!(">{}", parts.join("\x01"))
 }
