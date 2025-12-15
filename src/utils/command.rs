@@ -1708,6 +1708,11 @@ pub mod diamond {
             let num_cores: usize = RunConfig::thread_allocation(run_config, DIAMOND_TAG, None);
             args_vec.push(num_cores.to_string());
 
+            args_vec.push("--block-size".to_string());
+            args_vec.push("8.0".to_string());  // 8 GB blocks —
+            args_vec.push("-c".to_string());
+            args_vec.push("8".to_string());
+
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(key.clone());
                 if let Some(v) = value {
