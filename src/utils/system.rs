@@ -28,15 +28,26 @@ use crate::config::defs::{RunConfig, StreamDataType};
 /// # Returns
 ///
 /// Result<usize, f32> maximum cores, current cpu usage
-pub async fn detect_cores_and_load(args_threads: usize) -> Result<(usize, f32)> {
+// In system.rs
+pub async fn detect_cores_and_load(args_threads: usize, use_smt: bool) -> Result<(usize, f32)> {
     let refresh_kind = RefreshKind::nothing().with_cpu(Default::default());
     let mut system = System::new_with_specifics(refresh_kind);
     system.refresh_cpu_all();
-    let physical_cores = System::physical_core_count().unwrap_or(1);
+
+    let cores = if use_smt {
+        system.cpus().len()
+    } else {
+        System::physical_core_count().unwrap_or(1)
+    };
+
     system.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
     sleep(Duration::from_millis(100)).await;
     let cpu_load = system.global_cpu_usage();
-    let max_cores = physical_cores.min(args_threads);
+
+    let max_cores = cores.min(args_threads);
+    debug!("Detected {} {} cores; CPU load {}%; using {} threads",
+           max_cores, if use_smt { "logical" } else { "physical" }, cpu_load, max_cores);
+
     Ok((max_cores, cpu_load))
 }
 
@@ -51,9 +62,10 @@ pub async fn detect_cores_and_load(args_threads: usize) -> Result<(usize, f32)> 
 /// # Returns
 ///
 /// Result<usize, f32> maximum cores, current cpu usage
-pub fn compute_stream_threads(physical_cores: usize, cpu_load: f32, args_threads: usize) -> usize {
-    if cfg!(target_os = "linux") && physical_cores > 50 {
-        let max_threads = if cpu_load > 50.0 { physical_cores } else { physical_cores * 2 };
+pub fn compute_stream_threads(cores: usize, cpu_load: f32, args_threads: usize, use_smt: bool) -> usize {
+    let base = if use_smt { cores * 2 } else { cores };  
+    if cfg!(target_os = "linux") && base > 50 {
+        let max_threads = if cpu_load > 50.0 { base } else { base * 2 };
         max_threads.min(args_threads).min(256)
     } else {
         20 // Lower bound for small systems
