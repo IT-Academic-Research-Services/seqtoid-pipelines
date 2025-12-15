@@ -209,7 +209,7 @@ where
 
     const MAX_PROCESSES: usize = 4;
     const RAM_FRACTION: f64 = 0.5;
-    const MIN_BUFFER_PER_STREAM: usize = 5_000;
+    const MIN_BUFFER_PER_STREAM: usize = 10_000;
     const MAX_BUFFER_PER_STREAM: usize = 2_000_000;
 
     let record_size = match data_type {
@@ -290,6 +290,7 @@ where
             };
 
             if pause_ms > 0 {
+                if item_count % 10000 == 0 {
                 debug!(
                     "{}: Adaptive backpressure pause {}ms (lowest capacity {:.1}%) at item {}",
                     label,
@@ -297,7 +298,8 @@ where
                     lowest_capacity_ratio * 100.0,
                     item_count
                 );
-                sleep(Duration::from_millis(pause_ms)).await;
+            }
+            sleep(Duration::from_millis(pause_ms)).await;
             }
 
             if item_count % stall_threshold == 0 {
