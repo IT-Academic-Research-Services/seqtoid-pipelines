@@ -4409,7 +4409,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
         5,
-        config.base_buffer_size,
+        config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
         config.args.stall_threshold,
         None,
         100,
