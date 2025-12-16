@@ -190,44 +190,72 @@ pub struct ReadHit {
     pub contig_genus_taxid: i32,
     pub contig_family_taxid: i32,
     pub from_assembly: bool,
+    pub source_count_type: Option<String>,
 }
 
 impl ReadHit {
-    /// Convert a ReadHit into the exact tab-separated line format used by the original CZID pipeline
-    /// This matches what HitSummaryWriter writes in the Python code
     pub fn to_tab_string(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            // 1. read_id — not stored in ReadHit, will be added by caller
-            "", // placeholder — we fill it in update_read_dict
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.level,
             self.taxid,
             &self.accession_id,
-            "", // alignment length — not used in hit summary
-            "", // percent identity — not used
-            "", // bitscore — not used
-            "", // evalue — not used
+            "", // alignment length
+            "", // percent identity
+            "", // bitscore
+            "", // evalue
             self.species_taxid,
             self.genus_taxid,
             self.family_taxid,
-            "", // name — not used
-            "", // common_name — not used
+            "", // name
+            "", // common_name
             self.contig_id.as_deref().unwrap_or(""),
             self.contig_accession_id.as_deref().unwrap_or(""),
             self.contig_species_taxid,
             self.contig_genus_taxid,
             self.contig_family_taxid,
-            "", // contig_length — not used
-            "", // contig_name — not used
-            "", // contig_accession — duplicate
-            "", // contig_taxid — not used
-            "", // contig_species_taxid — duplicate
-            "", // contig_genus_taxid — duplicate
-            "", // contig_family_taxid — duplicate
+            "", // contig_length
+            "", // contig_name
+            "", // contig_accession
+            "", // contig_taxid
+            "", // contig_species_taxid duplicate
+            "", // contig_genus_taxid duplicate
+            "", // contig_family_taxid duplicate
             if self.from_assembly { "1" } else { "0" },
-            "1", // count — always 1 per read
-            "1"  // count_type — not used downstream
+            "1", // count
+            self.source_count_type.as_deref().unwrap_or("")
         )
+    }
+
+
+    pub fn to_full_tab_line(&self, read_id: &str) -> String {
+        format!("{}\t{}", read_id, self.to_tab_string())
+    }
+
+    pub fn from_tab_line(line: &str) -> Result<(String, Self)> {
+        let fields: Vec<&str> = line.trim().split('\t').collect();
+        if fields.len() != 28 {
+            return Err(anyhow!("Invalid hit summary line: expected 28 fields, got {}", fields.len()));
+        }
+
+        let read_id = fields[0].to_string();
+        let hit = Self {
+            level: fields[1].parse()?,
+            taxid: fields[2].parse()?,
+            accession_id: fields[3].to_string(),
+            species_taxid: fields[8].parse()?,
+            genus_taxid: fields[9].parse()?,
+            family_taxid: fields[10].parse()?,
+            contig_id: if fields[13].is_empty() { None } else { Some(fields[13].to_string()) },
+            contig_accession_id: if fields[14].is_empty() { None } else { Some(fields[14].to_string()) },
+            contig_species_taxid: fields[15].parse()?,
+            contig_genus_taxid: fields[16].parse()?,
+            contig_family_taxid: fields[17].parse()?,
+            from_assembly: fields[25] == "1",
+            source_count_type: if fields[27].is_empty() { None } else { Some(fields[27].to_string()) },
+        };
+
+        Ok((read_id, hit))
     }
 }
 
@@ -3502,6 +3530,7 @@ pub async fn summarize_hits(
                 contig_genus_taxid: 0,
                 contig_family_taxid: 0,
                 from_assembly: false,
+                source_count_type: None
             }),
         );
 
@@ -3691,12 +3720,12 @@ pub async fn update_read_dict(
             contig_genus_taxid: lineage[1],
             contig_family_taxid: lineage[2],
             from_assembly: true,
+            source_count_type: Some(db_type.to_uppercase()),
         });
 
-        let hit_tab_suffix = shared_hit.to_tab_string();
 
         for read_id in reads_in_contig {
-            let final_line = format!("{}\t{}", read_id, &hit_tab_suffix);
+            let final_line = shared_hit.to_full_tab_line(&read_id);
 
             let was_present = {
                 let mut dict = read_dict.lock().unwrap();
