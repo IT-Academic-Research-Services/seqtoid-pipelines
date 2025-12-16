@@ -634,7 +634,7 @@ pub async fn write_byte_stream_to_file(
                                output_path_clone.display(), e))?;
 
         if total_bytes == 0 {
-            return Err(anyhow!("No bytes written to file at {}", output_path_clone.display()));
+            warn!("No bytes written to file at {}", output_path_clone.display());
         }
 
         debug!("write_byte_stream_to_file: Wrote {} bytes to {}",
@@ -646,6 +646,11 @@ pub async fn write_byte_stream_to_file(
     Ok(task)
 }
 
+pub async fn file_size(path: &PathBuf) -> Result<u64> {
+    let metadata = tokio::fs::metadata(path).await
+        .map_err(|e| anyhow!("Failed to read file metadata {}: {}", path.display(), e))?;
+    Ok(metadata.len())
+}
 
 pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
     let disks = Disks::new_with_refreshed_list();
@@ -656,6 +661,73 @@ pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
         }
     }
     Err(anyhow!("No disk found for path: {}", path.display()))
+}
+
+
+/// pick RAM-backed temp dir or fallback to disk temp dir
+/// based on avialble space qand headroom
+///
+/// # Arguments
+/// * `estimated_bytes` –  file size, buffer size in bytes
+/// * `ram_dir` – e.g., `/dev/shm` or `config.ram_temp_dir`
+/// * `headroom_factor` – how much of available RAM you’re willing to use (e.g., 4 = 25%)
+///
+/// # Returns
+/// The chosen temp directory (`ram_dir` if safe, otherwise `std::env::temp_dir()`)
+pub async fn choose_temp_dir(
+    estimated_bytes: u64,
+    ram_dir: &PathBuf,
+    nvme_scratch: &Option<String>,
+    headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
+) -> Result<PathBuf> {
+
+    async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool> {
+        let avail = available_space_for_path(path).await?;
+        Ok(required <= avail / factor)
+    }
+
+    // 1. Try RAM dir
+    if check_space(ram_dir, estimated_bytes, headroom_factor).await? {
+        debug!(
+            "Using RAM temp dir {}: {} bytes fits in {} available (/{})",
+            ram_dir.display(),
+            estimated_bytes,
+            available_space_for_path(ram_dir).await?,
+            headroom_factor
+        );
+        return Ok(ram_dir.clone());
+    }
+
+    // 2. Try NVMe scratch if provided
+    if let Some(nvme) = nvme_scratch {
+        let nvme_path = PathBuf::from(nvme);
+        if check_space(&nvme_path, estimated_bytes, headroom_factor).await? {
+            debug!(
+                "Using NVMe scratch {}: {} bytes fits (/{})",
+                nvme_path.display(),
+                estimated_bytes,
+                headroom_factor
+            );
+            return Ok(nvme_path.clone());
+        } else {
+            warn!(
+                "NVMe scratch {} insufficient: need {} bytes (/{})",
+                nvme_path.display(),
+                estimated_bytes,
+                headroom_factor
+            );
+        }
+    } else {
+        debug!("No NVMe scratch configured — skipping");
+    }
+
+    // 3. Final fallback: system temp
+    debug!(
+        "Falling back to system temp dir {} (RAM/NVMe insufficient or unavailable)",
+        std::env::temp_dir().display()
+    );
+    Ok(std::env::temp_dir())
+
 }
 
 #[cfg(test)]

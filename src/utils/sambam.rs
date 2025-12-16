@@ -48,7 +48,7 @@ pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
     duplicate_cluster_sizes: &HashMap<String, u64>,
     min_contig_size: usize,
-) -> Result<HashMap<String, u64>> {
+) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
 
     let byte_stream = ReceiverStream::new(rx).map(|item| match item {
         ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())), // Clone Vec<u8>, then to Bytes
@@ -65,6 +65,7 @@ pub async fn generate_info_from_bam_stream(
         .await
         .map_err(|e| anyhow!("BAM header error: {e}"))?;
 
+    let mut read2contig = HashMap::with_capacity(20_000_000);
     let mut contig_stats = HashMap::with_capacity(1024);
     let mut contig_unique_counts = HashMap::with_capacity(1024);
     let mut seen_reads = HashSet::with_capacity(20_000_000); // Scales to 100M+ reads, fits 1.5TB RAM
@@ -99,7 +100,7 @@ pub async fn generate_info_from_bam_stream(
                     .ok_or_else(|| anyhow!("Invalid reference ID {rid:?}"))?
                     .0
                     .to_string();
-
+                read2contig.insert(read_name.clone(), contig_name.clone());
                 let cluster_size = duplicate_cluster_sizes.get(&read_name).copied().unwrap_or(1);
                 *contig_stats.entry(contig_name.clone()).or_insert(0u64) += cluster_size;
                 *contig_unique_counts.entry(contig_name).or_insert(0usize) += 1;
@@ -113,7 +114,7 @@ pub async fn generate_info_from_bam_stream(
         contig_unique_counts.get(contig_name).copied().unwrap_or(0) >= min_contig_size
     });
 
-    Ok(contig_stats)
+    Ok((read2contig, contig_stats))
 }
 
 #[cfg(test)]

@@ -1,78 +1,102 @@
-
+use std::cmp::Reverse;
+use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
+use std::hash::Hasher;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::io::{BufReader, BufRead, ErrorKind};
-use std::hash::Hasher;
-use std::cmp::{Ord, Ordering, PartialOrd, Eq, PartialEq};
-use std::collections::{HashMap, BinaryHeap, HashSet};
-use std::cmp::Reverse;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result, Context};
-use log::{self, LevelFilter, debug, info, error, warn};
-use futures::future::try_join_all;
-use rand::prelude::*;
-use rand_core::{RngCore, OsRng};
-use tokio::fs;
-use tokio::time::{sleep, Duration, Instant};
-use tokio::sync::oneshot;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncReadExt, BufWriter, BufReader as TokioBufReader};
-use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
-use tokio::process::Command;
-use tempfile::NamedTempFile;
-use tempfile::TempDir;
-use twox_hash::XxHash64;
+use ahash::AHashMap;
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use dashmap::DashMap;
 use fst::Map;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use futures::future::try_join_all;
+use log::{self, debug, error, info, warn, LevelFilter};
+use needletail::parse_fastx_file;
 use noodles::bam::r#async::io::Reader as BamAsyncReader;
 use noodles::bam::record::Record;
-use bytes::Bytes;
 use noodles::sam::alignment::record::cigar::{op::Kind as OpKind, Op};
-use tokio_util::io::StreamReader;
-use rayon::prelude::*;
-use needletail::parse_fastx_file;
-use dashmap::DashMap;
-use regex::Regex;
 use once_cell::sync::Lazy;
+use rand::prelude::*;
+use rand_core::{OsRng, RngCore};
+use rayon::prelude::*;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tempfile::NamedTempFile;
+use tempfile::TempDir;
+use tokio::fs;
+use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, Duration, Instant};
+use tokio::try_join;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+use tokio_util::io::StreamReader;
+use twox_hash::XxHash64;
 
 
-use crate::config::defs::{PipelineError, RunConfig, StreamDataType, ReadStats, MINIMAP2_TAG, BOWTIE2_TAG, SAMTOOLS_TAG, FASTP_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, MAFFT_TAG, SEQKIT_TAG, QUAST_TAG, HISAT2_TAG, SamtoolsSubcommand, KALLISTO_TAG, KallistoSubcommand, STAR_TAG, SamtoolsStats, CZID_DEDUP_TAG, Taxid, Lineage, READ_COUNTING_MODE, LOG_NORMAL_POSITIVE_DOUBLE, ReadCountingMode, DIAMOND_TAG, DiamondSubcommand, MIN_NORMAL_POSITIVE_DOUBLE, PIGZ_TAG, SPADES_TAG};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, available_space_for_path, rename_file_path, resolve_optional_path, write_vecu8_to_file, write_parse_output_to_temp_file};
-use crate::utils::fastx::{raw_read_count, read_fastq, stream_record_counter, SequenceRecord, compare_read_ids, parse_header, read_fasta};
-use crate::utils::streams::{t_junction, ParseOutput, join_with_error_handling, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, read_child_output_to_vec, spawn_cmd, parse_fastq, ChannelReader, write_to_fifo, deinterleave_fastq_stream, create_fifo, interleave_fastq_streams, ToBytes};
-use crate::utils::command::bowtie2::{Bowtie2Config, bowtie2_index_prep};
-use crate::utils::command::{check_versions, generate_cli};
-use crate::utils::command::samtools::SamtoolsConfig;
-use crate::utils::command::fastp::FastpConfig;
-use crate::utils::command::kallisto::KallistoConfig;
-use crate::utils::command::diamond::{DiamondConfig, DiamondArgGenerator, diamond_index_prep};
-use crate::utils::command::hisat2::{Hisat2Config, hisat2_index_prep};
-use crate::utils::streams::{deinterleave_fastq_stream_to_fifos};
-use crate::utils::command::star::{StarConfig, star_index_prep};
-use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
-use crate::utils::stats::parse_samtools_stats;
-use crate::utils::plotting::plot_insert_sizes;
+use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode,
+                          ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType,
+                          Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG,
+                          CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG,
+                          KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG,
+                          MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
+                          NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
+                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG};
+use crate::utils::blast::{consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
+                          TaxonCount};
+use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
+use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
+use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
 use crate::utils::command::czid_dedup::CzidDedupConfig;
-use crate::utils::paf::PafRecord;
-use crate::utils::blast::{M8Record, consensus_level, TaxonCount, AggBucket};
-use crate::utils::taxonomy::{build_should_keep_filter, validate_taxid_lineage, load_taxid_lineages_db};
+use crate::utils::command::diamond::{diamond_index_prep, DiamondArgGenerator, DiamondConfig};
+use crate::utils::command::fastp::FastpConfig;
+use crate::utils::command::hisat2::{hisat2_index_prep, Hisat2Config};
+use crate::utils::command::kallisto::KallistoConfig;
+use crate::utils::command::makeblastdb::{MakeblastdbArgGenerator, MakeblastdbConfig};
+use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2ArgGenerator, Minimap2Config};
+use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
+use crate::utils::command::{check_versions, generate_cli};
+use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
+                          read_fastq, stream_record_counter, write_fasta_stream_to_file, SequenceRecord};
+use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
+                         file_size, rename_file_path, resolve_optional_path,
+                         validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
+                         write_vecu8_to_file};
+use crate::utils::paf::PafRecord;
+use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::generate_info_from_bam_stream;
+use crate::utils::stats::parse_samtools_stats;
+use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
+                            parse_child_output, parse_fastq, read_child_output_to_vec, spawn_cmd,
+                            stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
+                            ChannelReader, ChildStream, ParseMode,
+                            ParseOutput, ToBytes};
+use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
+use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
+                             get_top_m8_nt, load_taxid_lineages_db, validate_taxid_lineage};
 
 const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
 const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
 const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
 const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
+const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
+
+const MIN_REF_FASTA_SIZE: u64 = 25;
+const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
 
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?P<accession_id>[^ ]+) (?P<wrong_pattern>, *)?(?P<description>.*)$")
-        .unwrap()
+    Regex::new(r",(?=[^\s])").unwrap()
 });
 
 #[derive(Debug)]
@@ -140,13 +164,93 @@ pub struct AssemblyHandle {
 #[derive(Debug)]
 pub struct CoverageOutputs {
     pub contigs_fasta: PathBuf,
+    pub contigs_ram_fasta: PathBuf,
     pub contigs_all_fasta: PathBuf,
     pub scaffolds_fasta: PathBuf,
     pub sam_path: PathBuf,
     pub contig_stats_json: PathBuf,
     pub coverage_json: PathBuf,
     pub coverage_summary_csv: PathBuf,
-    pub contig_stats: HashMap<String, u64>,
+    pub contig_stats: Arc<HashMap<String, u64>>,
+    pub read2contig: Arc<HashMap<String, String>>,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct ReadHit {
+    pub level: u8,
+    pub taxid: i32,
+    pub accession_id: String,
+    pub species_taxid: i32,
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
+    pub contig_id: Option<String>,
+    pub contig_accession_id: Option<String>,
+    pub contig_species_taxid: i32,
+    pub contig_genus_taxid: i32,
+    pub contig_family_taxid: i32,
+    pub from_assembly: bool,
+}
+
+impl ReadHit {
+    /// Convert a ReadHit into the exact tab-separated line format used by the original CZID pipeline
+    /// This matches what HitSummaryWriter writes in the Python code
+    pub fn to_tab_string(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            // 1. read_id — not stored in ReadHit, will be added by caller
+            "", // placeholder — we fill it in update_read_dict
+            self.level,
+            self.taxid,
+            &self.accession_id,
+            "", // alignment length — not used in hit summary
+            "", // percent identity — not used
+            "", // bitscore — not used
+            "", // evalue — not used
+            self.species_taxid,
+            self.genus_taxid,
+            self.family_taxid,
+            "", // name — not used
+            "", // common_name — not used
+            self.contig_id.as_deref().unwrap_or(""),
+            self.contig_accession_id.as_deref().unwrap_or(""),
+            self.contig_species_taxid,
+            self.contig_genus_taxid,
+            self.contig_family_taxid,
+            "", // contig_length — not used
+            "", // contig_name — not used
+            "", // contig_accession — duplicate
+            "", // contig_taxid — not used
+            "", // contig_species_taxid — duplicate
+            "", // contig_genus_taxid — duplicate
+            "", // contig_family_taxid — duplicate
+            if self.from_assembly { "1" } else { "0" },
+            "1", // count — always 1 per read
+            "1"  // count_type — not used downstream
+        )
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct AccessionHit {
+    pub taxid: i32, // i.e. species_taxid
+    pub genus_taxid: i32,
+    pub family_taxid: i32,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContigSummaryEntry {
+    contig_name: String,
+    common_name: Option<String>,
+    category_name: Option<String>,
+    score: Option<f64>,
+    db_type: String,
+    reads: u64,
+    bases: u64,
+    species_taxid: i32,
+    genus_taxid: i32,
+    family_taxid: i32,
 }
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -892,60 +996,100 @@ async fn kallisto_results(
     ercc_tx: oneshot::Sender<KallistoResults>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>, PipelineError> {
     let abundance_path = kallisto_out_dir.join("abundance.tsv");
+
     let parse_task = tokio::spawn(async move {
-        // Retry reading abundance.tsv (handles NVMe flush delays)
-        let mut retries = 5;
-        loop {
+        // Wait for non-empty file
+        let mut attempts = 5;
+        let file = loop {
             match fs::metadata(&abundance_path).await {
-                Ok(meta) if meta.len() > 0 => {
-                    debug!("Found abundance.tsv: {} bytes", meta.len());
-                    break;
+                Ok(meta) if meta.len() > 0 => break TokioFile::open(&abundance_path).await?,
+                _ if attempts == 0 => {
+                    return Err(anyhow!("kallisto abundance.tsv never appeared or is empty"));
                 }
                 _ => {
-                    if retries == 0 {
-                        return Err(anyhow!("No abundance.tsv found at {}", abundance_path.display()));
-                    }
-                    warn!("abundance.tsv not ready (retry {}); sleeping 2s", retries);
+                    attempts -= 1;
+                    warn!("Waiting for kallisto abundance.tsv ({} attempts left)...", attempts + 1);
                     sleep(Duration::from_secs(2)).await;
-                    retries -= 1;
                 }
             }
+        };
+
+        let mut lines = TokioBufReader::new(file).lines();
+
+        // Skip header
+        if lines.next_line().await?.is_none() {
+            warn!("kallisto abundance.tsv has no header — assuming empty");
+            let _ = ercc_tx.send(KallistoResults {
+                ercc_counts: vec![],
+                transcript_to_gene: vec![],
+            });
+            return Ok(());
         }
 
-        let abundance_file = TokioFile::open(&abundance_path).await
-            .map_err(|e| anyhow!("Failed to open abundance.tsv: {}", e))?;
-        let reader = tokio::io::BufReader::new(abundance_file);
-        let mut lines = reader.lines();
         let mut ercc_counts = Vec::new();
         let mut transcript_to_gene = Vec::new();
+        let mut parsed = 0;
+        let mut skipped = 0;
 
-        debug!("Starting to read abundance.tsv from: {}", abundance_path.display());
+        while let Some(line_result) = lines.next_line().await.transpose() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("I/O error reading kallisto abundance.tsv: {}", e);
+                    skipped += 1;
+                    continue;
+                }
+            };
 
-        if lines.next_line().await?.is_none() {
-            return Err(anyhow!("Empty abundance.tsv"));
-        }
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
 
-        // Parse each line: target_id, length, eff_length, est_counts, tpm
-        while let Some(line) = lines.next_line().await? {
             let fields: Vec<&str> = line.split('\t').collect();
             if fields.len() < 5 {
-                return Err(anyhow!("Invalid abundance.tsv line: {}", line));
+                warn!("Malformed kallisto line ({} fields): {}", fields.len(), line);
+                skipped += 1;
+                continue;
             }
+
             let target_id = fields[0].to_string();
-            let est_counts = fields[3].parse::<f64>()
-                .map_err(|e| anyhow!("Failed to parse est_counts in line {}: {}", line, e))?;
-            ercc_counts.push((target_id.clone(), est_counts));
+
+            let est_counts: f64 = match fields[3].parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Invalid est_counts '{}' → {} (line: {})", fields[3], e, line);
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Optional: parse TPM too
+            let _tpm: f64 = fields[4].parse().unwrap_or(0.0);
+
+            // Keep ERCCs only
+            if target_id.starts_with("ERCC-") {
+                ercc_counts.push((target_id.clone(), est_counts));
+            }
+
             transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
+            parsed += 1;
         }
 
-        debug!("Finished reading kallisto's abundance.tsv: {} transcripts", ercc_counts.len());
-        let results = KallistoResults {
-            ercc_counts,
-            transcript_to_gene,
-        };
-        ercc_tx.send(results)
-            .map_err(|_| anyhow!("Failed to send Kallisto results"))?;
-        debug!("Sent Kallisto results");
+        info!(
+            "Kallisto parsing finished — {} lines parsed, {} skipped, {} ERCCs found",
+            parsed,
+            skipped,
+            ercc_counts.len()
+        );
+
+        ercc_tx
+            .send(KallistoResults {
+                ercc_counts,
+                transcript_to_gene,
+            })
+            .map_err(|_| anyhow!("Kallisto receiver dropped"))?;
+
         Ok(())
     });
 
@@ -1608,6 +1752,53 @@ pub async fn paf_to_m8(
 }
 
 
+
+/// Loads the taxid (taxid → [species, genus, family])
+/// and acc2tax (accession bytes → taxid) DB's
+/// async
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+///
+/// # Returns
+/// Result:
+///     Arc<AHashMap<Taxid, Lineage>>,
+///     Arc<Map<Vec<u8>>>,
+pub async fn load_lineage_and_acc2tax_maps(
+    config: Arc<RunConfig>,
+) -> Result<(
+    Arc<AHashMap<Taxid, Lineage>>,
+    Arc<Map<Vec<u8>>>,
+)> {
+    let lineage_path = PathBuf::from(&config.args.taxid_lineages_db);
+    let acc2taxid_path = PathBuf::from(&config.args.acc2taxid_db);
+
+    let lineage_future = async move {
+        load_taxid_lineages_db(&lineage_path).await
+            .map_err(|e| anyhow!("Failed to load lineage DB from {}: {}", lineage_path.display(), e))
+    };
+
+    let acc2taxid_future = async move {
+        let bytes = tokio::fs::read(&acc2taxid_path).await
+            .map_err(|e| anyhow!("Failed to read acc2taxid DB {}: {}", acc2taxid_path.display(), e))?;
+
+        let map = Map::new(bytes)
+            .map_err(|e| anyhow!("Failed to parse acc2taxid fst map: {}", e))?;
+
+        Ok::<Arc<Map<Vec<u8>>>, anyhow::Error>(Arc::new(map))
+    };
+
+    let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
+
+    info!(
+        "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
+        lineage_map.len(),
+        acc2taxid_map.len()
+    );
+
+    Ok((lineage_map, acc2taxid_map))
+}
+
 /// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
 /// # Arguments
 ///
@@ -1631,6 +1822,8 @@ pub async fn call_hits_m8_stream(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
     sample_base_buf: PathBuf,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    acc2taxid_map: Arc<Map<Vec<u8>>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     min_aln_len: u64
 ) -> Result<(
@@ -1642,19 +1835,8 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let lineage_bincode_path = PathBuf::from(config.args.taxid_lineages_db.clone());
-    let lineage_map = Arc::new(load_taxid_lineages_db(&lineage_bincode_path).await?);
-
-    let acc2taxid_path = PathBuf::from(config.args.acc2taxid_db.clone());
-    let acc2taxid_bytes = tokio::fs::read(&acc2taxid_path).await?;
-    let acc2taxid_map: Map<Vec<u8>> = Map::new(acc2taxid_bytes)?;
-    let acc2taxid_map = Arc::new(acc2taxid_map);
-
-
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
-
-    let config_clone = config.clone();
 
     let processing_task = tokio::spawn(async move {
 
@@ -1682,10 +1864,10 @@ pub async fn call_hits_m8_stream(
                 continue;
             }
 
-            let rec = match M8Record::parse_line(&line) {
+            let rec = match M8Record::parse_line_nr(&line) {  // ←short-read alignment processing,12 column, thus  nr, not nt
                 Ok(r) => r,
                 Err(e) => {
-                    debug!("m8 parse error: {} – {}", e, &line);
+                    warn!("Failed to parse GSNAP m8 line: {} — {}", e, line);
                     continue;
                 }
             };
@@ -1978,7 +2160,7 @@ pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
     mut m8_stream: ReceiverStream<ParseOutput>,
     mut summary_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes: HashMap<String, u64>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
     source_count_type: Option<String>,// e.g. "NR" for the other DB
@@ -2040,7 +2222,7 @@ pub async fn generate_taxon_counts(
             _ => continue,
         };
 
-        let rec = M8Record::parse_line(&line)
+        let rec = M8Record::parse_line_nr(&line)
             .map_err(|e| anyhow!("failed to parse m8 line: {}", e))?;
         read_metrics.insert(rec.qname, (rec.pident, rec.alen, rec.evalue));
     }
@@ -2447,6 +2629,8 @@ async fn spades_assembly(
 
     let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
 
+    let mut total_input_bytes : u64 = 0;
+
     let write_input_task = tokio::spawn({
         let input_file_path = input_file_path.clone();
 
@@ -2481,9 +2665,22 @@ async fn spades_assembly(
             if total_bytes == 0 {
                 warn!("SPAdes input file is empty – no non-host reads");
             }
+            total_input_bytes = total_bytes;
             Ok::<PathBuf, anyhow::Error>(input_file_path)
         }
+
     });
+
+    // Decide SPAdes work dir based on actual input size
+    let spades_work_dir = if total_input_bytes <= MAX_SPADES_WORK_DIR {
+        config.ram_temp_dir.join("spades")
+    } else {
+        warn!("SPAdes input {} bytes ({:.1} MB) → too large for RAM, using disk temp",
+          total_input_bytes, total_input_bytes as f64 / 1e6);
+        std::env::temp_dir().join("spades")
+    };
+
+    fs::create_dir_all(&spades_work_dir).await?;
 
     let input_file_path = write_input_task.await??;
 
@@ -2540,89 +2737,125 @@ pub async fn process_assembly(
     out_dir: &PathBuf,
     work_dir: &PathBuf,
     bowtie_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes: HashMap<String, u64>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     paired: bool,
+    assembly_headroom: u64,
 ) -> Result<(
-           CoverageOutputs,
-           ReceiverStream<ParseOutput>,
-           Vec<JoinHandle<Result<()>>>,
-           Vec<oneshot::Receiver<Result<()>>>,
-       ),  PipelineError>
-
- {
-    let mut cleanup_tasks = Vec::new();let mut cleanup_receivers = Vec::new();
+    CoverageOutputs,
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+    Vec<NamedTempFile>,
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
-    let raw_contigs_path    = work_dir.join("contigs.fasta");
-    let raw_scaffolds_path  = work_dir.join("scaffolds.fasta");
+    let raw_contigs_path = work_dir.join("contigs.fasta");
+    let raw_scaffolds_path = work_dir.join("scaffolds.fasta");
+    let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
 
-     let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
+    let spades_success = raw_contigs_path.exists()
+        && fs::metadata(&raw_contigs_path)
+        .await
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
 
-    let spades_success = if raw_contigs_path.exists() {
-        fs::metadata(&raw_contigs_path).await?.len() > 0
-    } else {
-        false
-    };
-
-    // if it failed write empty data
     if !spades_success {
+        let reason = if !raw_contigs_path.exists() {
+            "contigs.fasta does not exist"
+        } else {
+            "contigs.fasta is empty"
+        };
+
+        warn!(
+            "SPAdes assembly failed: {} — writing dummy outputs and skipping contig-based refinement",
+            reason
+        );
 
         let dummy = ";ASSEMBLY FAILED";
         let empty_sam = "@NO INFO\n";
         let empty_json = "{}";
 
         fs::write(out_dir.join("contigs.fasta"), dummy).await?;
+        fs::write(out_dir.join("contigs.ram.fasta"), dummy).await?;
         fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
         fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
         fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
         fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
 
-        return Ok((CoverageOutputs {
-            contigs_fasta: out_dir.join("contigs.fasta"),
-            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-            sam_path: out_dir.join("read-contig.sam"),
-            contig_stats_json: out_dir.join("contig_stats.json"),
-            coverage_json: out_dir.join("assembly_contig_coverage.json"),
-            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-            contig_stats: HashMap::new(),
-        }, ReceiverStream::new(empty_rx), cleanup_tasks,  cleanup_receivers));
+        return Ok((
+            CoverageOutputs {
+                contigs_fasta: out_dir.join("contigs.fasta"),
+                contigs_ram_fasta: out_dir.join("contigs.ram.fasta"),
+                contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+                scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+                sam_path: out_dir.join("read-contig.sam"),
+                contig_stats_json: out_dir.join("contig_stats.json"),
+                coverage_json: out_dir.join("assembly_contig_coverage.json"),
+                coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+                contig_stats: Arc::new(HashMap::new()),
+                read2contig: Arc::new(HashMap::new()),
+            },
+            ReceiverStream::new(empty_rx),
+            cleanup_tasks,
+            cleanup_receivers,
+            temp_files,
+        ));
     }
 
     let contigs_all_out = out_dir.join("contigs_all.fasta");
     fs::copy(&raw_contigs_path, &contigs_all_out).await?;
 
     let contigs_out = out_dir.join("contigs.fasta");
+    let contigs_size = file_size(&raw_contigs_path).await?;
 
-    //contig length filtering
+    let temp_dir = choose_temp_dir(
+        contigs_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        assembly_headroom,
+    )
+        .await?;
+
+    let ram_fasta_path = NamedTempFile::with_suffix_in(".fa", &temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let ram_path = ram_fasta_path.path().to_owned();
+
+    // Contig length filtering
     let rx = read_fasta(
         raw_contigs_path.clone(),
-        u64::MAX,           // no record limit
+        u64::MAX,
         Some(config.args.min_contig_length),
         None,
         8192,
-    ).map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
+    )
+        .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
 
-    let (write_task, temp_path, _temp) = write_parse_output_to_temp_file(
+    let (write_handle, _ram_path) = write_fasta_stream_to_file(
         ReceiverStream::new(rx),
-        None,
-        Some(".fasta"),
-        config.ram_temp_dir.clone(),
-    ).await?;
-    temp_files.push(_temp);
+        ram_path.clone(),
+        config.base_buffer_size,
+    )
+        .await?;
 
-    write_task.await??;
-    tokio::fs::rename(&temp_path, &contigs_out).await?;
+    write_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("FASTA write task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("FASTA write failed: {}", e)))?;
+
+    fs::copy(&ram_path, &contigs_out).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to copy contigs to output: {}", e)))?;
+
+    temp_files.push(ram_fasta_path);
 
     let scaffolds_out = out_dir.join("scaffolds.fasta");
-    let spades_scaffolds = work_dir.join("scaffolds.fasta");
-    if spades_scaffolds.exists() {
-        fs::copy(&spades_scaffolds, &scaffolds_out).await?;
+    if raw_scaffolds_path.exists() {
+        fs::copy(&raw_scaffolds_path, &scaffolds_out).await?;
     } else {
         fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
     }
 
-    // bt2 index
     let index_dir = out_dir.join("bowtie_index");
     fs::create_dir_all(&index_dir).await?;
     let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
@@ -2634,7 +2867,7 @@ pub async fn process_assembly(
             "--threads",
             &num_index_cores.to_string(),
             "--quiet",
-            contigs_out.to_str().unwrap(),
+            ram_path.clone().to_str().unwrap(),
             index_prefix.to_str().unwrap(),
         ])
         .status()
@@ -2642,14 +2875,14 @@ pub async fn process_assembly(
         .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
 
     if !build_status.success() {
-        return Err(PipelineError::ToolExecution {tool: BOWTIE2_TAG.to_string(), error: build_status.to_string()});
+        return Err(PipelineError::ToolExecution {
+            tool: BOWTIE2_TAG.to_string(),
+            error: build_status.to_string(),
+        });
     }
 
-    let bt2_options = HashMap::from([
-        ("--very-sensitive".to_string(), None),
-    ]);
+    let bt2_options = HashMap::from([("--very-sensitive".to_string(), None)]);
 
-    // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: index_prefix,
         paired: paired,
@@ -2661,7 +2894,7 @@ pub async fn process_assembly(
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
-    eprintln!("Bowtie 2 args: {:?}", bt2_args);
+
     let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
         config.clone(),
         bowtie_stream.into_inner(),
@@ -2675,6 +2908,7 @@ pub async fn process_assembly(
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(bt2_stream_task);
     cleanup_tasks.push(bt2_err_task);
 
@@ -2693,16 +2927,16 @@ pub async fn process_assembly(
             })?
     };
 
-    // Sort, output uncompressed BAM
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted for fastq extraction
+            ("-n".to_string(), None),
             ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())), // uncompressed BAM for noodles to consume
+            ("-O".to_string(), Some("bam".to_string())),
             ("-".to_string(), None),
         ]),
     };
+
     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -2722,6 +2956,7 @@ pub async fn process_assembly(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(samtools_sort_task);
     cleanup_tasks.push(samtools_sort_err_task);
 
@@ -2740,57 +2975,62 @@ pub async fn process_assembly(
             })?
     };
 
-     let (non_host_streams, non_host_done_rx) = t_junction(
-         ReceiverStream::new(samtools_sort_out_stream),
-         2,
-         config.base_buffer_size,
-         config.args.stall_threshold,
-         None,
-         100,
-         StreamDataType::IlluminaFastq,
-         "process_assembly_sam".to_string(),
-         None,
-     )
-         .await
-         .map_err(|_| PipelineError::StreamDataDropped)?;
-     cleanup_receivers.push(non_host_done_rx);
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        ReceiverStream::new(samtools_sort_out_stream),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "process_assembly_sam".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
-     let mut non_host_streams_iter = non_host_streams.into_iter();
-     let bam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-     let bam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-     let bam_for_output = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    cleanup_receivers.push(non_host_done_rx);
 
-     let sam_path = out_dir.join("read-contig.bam");
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let bam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_for_output = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-     let write_sam_task = write_byte_stream_to_file(
-         &sam_path,
-         ReceiverStream::new(bam_for_file),
-         Some(config.base_buffer_size),
-     )
-         .await?;
-     cleanup_tasks.push(write_sam_task);
+    let sam_path = out_dir.join("read-contig.bam");
 
-    let contig_stats = generate_info_from_bam_stream(
+    let write_sam_task = write_byte_stream_to_file(
+        &sam_path,
+        ReceiverStream::new(bam_for_file),
+        Some(config.base_buffer_size),
+    )
+        .await?;
+    cleanup_tasks.push(write_sam_task);
+
+    let (read2contig, contig_stats) = generate_info_from_bam_stream(
         bam_for_stats,
         &duplicate_cluster_sizes,
         config.args.min_contig_length,
-    ).await?;
-     // let contig_stats = HashMap::with_capacity(1024);
+    )
+        .await?;
 
-
-    Ok((CoverageOutputs {
-        contigs_fasta: out_dir.join("contigs.fasta"),
-        contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-        scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-        sam_path: out_dir.join("read-contig.sam"),
-        contig_stats_json: out_dir.join("contig_stats.json"),
-        coverage_json: out_dir.join("assembly_contig_coverage.json"),
-        coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-        contig_stats: contig_stats,
-    }, ReceiverStream::new(bam_for_output), cleanup_tasks,  cleanup_receivers))
-
-
-
+    Ok((
+        CoverageOutputs {
+            contigs_fasta: out_dir.join("contigs.fasta"),
+            contigs_ram_fasta: ram_path.clone(),
+            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
+            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
+            sam_path: out_dir.join("read-contig.sam"),
+            contig_stats_json: out_dir.join("contig_stats.json"),
+            coverage_json: out_dir.join("assembly_contig_coverage.json"),
+            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+            contig_stats: Arc::new(contig_stats),
+            read2contig: Arc::new(read2contig),
+        },
+        ReceiverStream::new(bam_for_output),
+        cleanup_tasks,
+        cleanup_receivers,
+        temp_files,
+    ))
 }
 
 
@@ -3000,53 +3240,6 @@ pub async fn generate_assembly_coverage(
 }
 
 
-/// Herlper function that pulls the accessions from an m8 stream
-/// a
-///
-/// # Arguments
-/// * `stream` - M8 stream
-/// # Returns
-/// Result of hashset of the accessions
-async fn collect_accessions_from_m8_stream(mut stream: ReceiverStream<ParseOutput>) -> Result<HashSet<String>> {
-    let mut accessions = HashSet::new();
-    let mut parse_errors = 0;
-
-    while let Some(item) = stream.next().await {
-        let line = match item {
-            ParseOutput::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-            _ => {
-                parse_errors += 1;
-                warn!("Invalid item in M8 stream — expected Bytes");
-                continue;
-            }
-        };
-
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 12 {
-            parse_errors += 1;
-            warn!("Invalid M8 line: {}", line);
-            continue;
-        }
-
-        let sacc = fields[1]; // Subject accession
-        let base_acc = sacc.split('.').next().unwrap_or(sacc).to_string();
-        accessions.insert(base_acc);
-    }
-
-    if parse_errors > MAX_PARSE_ERRORS {
-        return Err(anyhow!("Too many parse errors in M8 stream: {} > {}", parse_errors, MAX_PARSE_ERRORS));
-    }
-
-    info!("Collected {} unique accessions from M8 stream", accessions.len());
-    Ok(accessions)
-}
-
-
 /// Fixes FASTA header by removing leading comma in description if present.
 /// apparently there are a few broken accessions out there
 /// Handles multi-headers separated by \x01 (CTRL-A).
@@ -3060,19 +3253,9 @@ fn fix_header(header_line: &str) -> String {
         return header_line.to_owned();
     }
 
-    // Split on CTRL-A (\x01) for multi-header entries
-    let parts: Vec<String> = header_line[1..] // strip '>'
-        .split('\x01')
-        .map(|part| {
-            let trimmed = part.trim_start();
-            FIX_COMMA_REGEXP
-                .replace(trimmed, "$accession_id $description")
-                .trim()
-                .to_string()
-        })
-        .collect();
+    // Split on \x01 (multi-accession entries), fix commas in each part, rejoin
+    let parts: Vec<&str> = header_line.split(|c: char| c == ',' && header_line.as_bytes().get(header_line.find(',').unwrap_or(0) + 1).map_or(false, |&b| b != b' ')).collect();
 
-    // Rejoin with \x01 and restore '>'
     format!(">{}", parts.join("\x01"))
 }
 
@@ -3084,133 +3267,900 @@ fn fix_header(header_line: &str) -> String {
 ///
 /// # Arguments
 /// * `config` - RunConfig struct from main.
-/// * `m8_stream` - stream in m8 format
+/// * `selelcted_genera` - Hashmap of
 /// * `fasta_path` - path to fulle fasta (e.g. NT.fa) where all accession/seqs stored
 /// * `index_path` - path to FST offset index associated witht erh abover fasta_path
 /// * `out_path
 /// # Returns
 /// Result of hashset of the accessions
-pub async fn extract_accessions_to_fasta(
+pub async fn build_reference_fasta_from_selected_genera(
     config: Arc<RunConfig>,
-    m8_stream: ReceiverStream<ParseOutput>,
-    fasta_path: &PathBuf,
-    index_path: &PathBuf,
+    selected_genera: &HashMap<i32, Vec<String>>,  // genus_taxid → [accessions]
+    db_type: &str,
+    source_fasta_path: &PathBuf,                  // full NT/NR FASTA (e.g. nt.fa)
+    source_index_path: &PathBuf,                  // FST index for fast lookup
 ) -> Result<PathBuf> {
-    let accessions = collect_accessions_from_m8_stream(m8_stream).await?;
+    // Flatten and deduplicate accessions
+    let mut accessions: HashSet<String> = HashSet::new();
+    for acc_list in selected_genera.values() {
+        accessions.extend(acc_list.iter().cloned());
+    }
+
     if accessions.is_empty() {
-        return Err(anyhow!("No accessions found in M8 stream"));
+        warn!("selected_genera is empty — writing empty reference FASTA");
+        let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;
+        let empty_path = temp_dir.join(format!("{}_empty_ref.fasta", db_type));
+        fs::write(&empty_path, b">empty\nN\n").await?;
+        return Ok(empty_path);
     }
 
     let mut acc_vec: Vec<String> = accessions.into_iter().collect();
-    acc_vec.sort();
+    acc_vec.sort(); // deterministic order
 
-    let index_data = std::fs::read(index_path)
-        .with_context(|| format!("Failed to read index: {}", index_path.display()))?;
-    let index = Map::new(index_data)
-        .with_context(|| format!("Failed to load FST index: {}", index_path.display()))?;
-
-    let file = File::open(fasta_path)
-        .with_context(|| format!("Failed to open FASTA: {}", fasta_path.display()))?;
-    let mut reader = BufReader::new(file);
-
-    let estimated_size = (acc_vec.len() as u64) * EST_BYTES_PER_ACCESSION;
-    let avail_ram = available_space_for_path(&config.ram_temp_dir).await?;
-    let use_ram = estimated_size < avail_ram / 4;
-
-    let temp_dir = if use_ram {
-        info!(
-            "Using RAM temp (/dev/shm) for accession extraction (est. {} MB < avail {} MB / 4)",
-            estimated_size / 1_048_576,
-            avail_ram / 1_048_576
-        );
-        config.ram_temp_dir.clone()
-    } else {
-        info!(
-            "Fallback to disk temp (est. {} MB exceeds RAM threshold)",
-            estimated_size / 1_048_576
-        );
-        std::env::temp_dir()
-    };
-
-    let output_path = temp_dir.join(format!(
-        "refined_hits_{}.fasta",
-        rand::rng().random::<u32>()
-    ));
-
-    let mut writer = std::io::BufWriter::new(
-        File::create(&output_path)
-            .with_context(|| format!("Failed to create output: {}", output_path.display()))?,
+    info!(
+        "Building reference FASTA from {} filtered accessions (selected_genera)",
+        acc_vec.len()
     );
 
+
+
+    // Load FST index
+    let index_data = std::fs::read(source_index_path)
+        .with_context(|| format!("Failed to read FST index: {}", source_index_path.display()))?;
+    let index = fst::Map::new(index_data)
+        .with_context(|| format!("Failed to load FST index: {}", source_index_path.display()))?;
+
+    // Open source FASTA
+    let file = File::open(source_fasta_path)
+        .with_context(|| format!("Failed to open source FASTA: {}", source_fasta_path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    // Estimate size and pick best temp location
+    let estimated_size = (acc_vec.len() as u64) * 2000; // ~2KB per accession avg
+    let temp_dir = choose_temp_dir(
+        estimated_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
+
+    let output_path = temp_dir.join(format!("{}_ref_from_selected_genera.fasta", db_type));
+    let mut writer = std::io::BufWriter::new(
+        File::create(&output_path)
+            .with_context(|| format!("Failed to create ref FASTA: {}", output_path.display()))?,
+    );
+
+    let mut missing = 0;
     let mut skipped_long = 0;
-    let mut missing_offsets = 0;
 
     for acc in &acc_vec {
-        if let Some(offset) = index.get(acc.as_bytes()) {
+        let key = acc.as_bytes();
+        if let Some(offset) = index.get(key) {
+            reader.seek(SeekFrom::Start(offset))?;
 
-            reader.seek(SeekFrom::Start(offset))
-                .with_context(|| format!("Failed to seek to offset {} for {}", offset, acc))?;
-
-            let mut seq_len: u64 = 0;
             let mut buf = String::with_capacity(1024);
-
             buf.clear();
             if reader.read_line(&mut buf)? == 0 {
                 warn!("EOF while reading header for {}", acc);
-                missing_offsets += 1;
+                missing += 1;
                 continue;
             }
 
-            let fixed_header = fix_header(&buf);
-            seq_len += fixed_header.len() as u64;
-            writer.write_all(fixed_header.as_bytes())?;
+            let header = fix_header(&buf);
+            let mut seq_len: u64 = header.len() as u64;
+            writer.write_all(header.as_bytes())?;
             writer.write_all(b"\n")?;
 
             buf.clear();
-            while reader.read_line(&mut buf)? > 0 {
-                if buf.starts_with('>') {
-
-                    reader.seek(SeekFrom::Current(-(buf.len() as i64)))
-                        .with_context(|| "Failed to rewind for next header")?;
+            loop {
+                let bytes_read = reader.read_line(&mut buf)?;
+                if bytes_read == 0 || buf.starts_with('>') {
+                    // Rewind so next accession can read its header
+                    let rewind = buf.len() as i64;
+                    reader.seek(SeekFrom::Current(-rewind))?;
                     break;
                 }
-                seq_len += buf.len() as u64;
-                if seq_len > MAX_ACCESSION_SEQUENCE_LEN {
+
+                seq_len += bytes_read as u64;
+                if seq_len > 100_000 {
                     skipped_long += 1;
-                    info!("Skipping long sequence for {} ({} bytes)", acc, seq_len);
-                    // srain rest of sequence
+                    info!("Skipping very long sequence: {} ({} bp)", acc, seq_len);
+                    // Drain rest of sequence
                     while reader.read_line(&mut buf)? > 0 && !buf.starts_with('>') {
                         buf.clear();
                     }
                     break;
                 }
+
                 writer.write_all(buf.as_bytes())?;
                 buf.clear();
             }
         } else {
-            missing_offsets += 1;
-            warn!("No offset found for accession: {}", acc);
+            missing += 1;
+            // This is normal — selected_genera may include accessions not in current DB
         }
     }
 
-    writer.flush().with_context(|| "Failed to flush output file")?;
+    writer.flush()?;
+    drop(writer); // ensure written
 
-    if skipped_long > 0 || missing_offsets > 0 {
-        warn!(
-            "Extraction complete: {} long sequences skipped, {} accessions missing",
-            skipped_long, missing_offsets
-        );
+    if missing > 0 {
+        warn!("{} accessions from selected_genera not found in source FASTA", missing);
+    }
+    if skipped_long > 0 {
+        warn!("{} sequences skipped (too long)", skipped_long);
     }
 
-    let extracted_count = acc_vec.len() - missing_offsets;
     info!(
-        "Successfully extracted {} accession sequences → {}",
-        extracted_count,
-        output_path.display()
+        "Reference FASTA built: {} → {} accessions extracted",
+        output_path.display(),
+        acc_vec.len() - missing
     );
 
     Ok(output_path)
 }
+
+
+/// Summarizes an M8 stream as a
+/// # Arguments
+/// * `stream` - stream in m8 format
+/// * `min_reads_per_genus` - Minimum threshold of reads per genus to be included
+/// # Returns
+/// read dicttionary of read id's -> Readhit
+///  accesions -> Accesiohit
+pub async fn summarize_hits(
+    mut stream: ReceiverStream<ParseOutput>,
+    min_reads_per_genus: usize,
+) -> Result<(
+    AHashMap<String, Arc<ReadHit>>,
+    AHashMap<String, AccessionHit>,
+    HashMap<i32, Vec<String>>,
+    usize,
+)> {
+    let read_dict: DashMap<String, Arc<ReadHit>> = DashMap::with_capacity(8_000_000);
+    let accession_dict: DashMap<String, AccessionHit> = DashMap::with_capacity(2_000_000);
+
+    let genus_read_counts: DashMap<i32, usize> = DashMap::new();
+    let genus_species: DashMap<i32, HashSet<i32>> = DashMap::new();
+    let genus_accessions: DashMap<i32, HashSet<String>> = DashMap::new();
+
+    let mut total_reads: usize = 0;
+
+    while let Some(item) = stream.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => return Err(anyhow!("Expected Bytes in summarize_hits stream")),
+        };
+
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(s) => s.trim_end(),
+            Err(_) => {
+                warn!("Non-UTF8 line in hit summary stream");
+                continue;
+            }
+        };
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split('\t').collect();
+
+        if parts.len() != 6 {
+            warn!(
+        "Malformed hit_summary line (expected exactly 6 fields, got {}): {}",
+        parts.len(),
+        line
+    );
+            continue;
+        }
+
+        let read_id       = parts[0].to_string();
+        let accession_id  = if parts[1].is_empty() || parts[1] == "-" {
+            "-".to_string()
+        } else {
+            parts[1].to_string()
+        };
+        let hit_taxid: i32 = parts[2].parse()
+            .map_err(|_| warn!("Invalid hit_taxid: {}", parts[2])).ok().unwrap_or(0);
+        let genus_taxid: i32 = parts[3].parse()
+            .map_err(|_| warn!("Invalid genus_taxid: {}", parts[3])).ok().unwrap_or(0);
+        let family_taxid: i32 = parts[4].parse()
+            .map_err(|_| warn!("Invalid family_taxid: {}", parts[4])).ok().unwrap_or(0);
+        let level: u8 = parts[5].parse()
+            .map_err(|_| warn!("Invalid level: {}", parts[5])).ok().unwrap_or(0);
+
+        let species_taxid = if level >= 3 && hit_taxid > 0 {
+            hit_taxid                     // level 3+ means species consensus already achieved
+        } else {
+            0                             // only genus/family → species unknown
+        };
+
+        // assign highest resolved level
+        let assigned_taxid = if level >= 3 {
+            species_taxid
+        } else if level == 2 {
+            genus_taxid
+        } else if level == 1 {
+            genus_taxid
+        } else {
+            hit_taxid                     // fallback (should be rare)
+        };
+
+        read_dict.insert(
+            read_id.clone(),
+            Arc::new(ReadHit {
+                level,
+                taxid: assigned_taxid,
+                accession_id: accession_id.clone(),
+                species_taxid,
+                genus_taxid,
+                family_taxid,
+                contig_id: None,
+                contig_accession_id: None,
+                contig_species_taxid: 0,
+                contig_genus_taxid: 0,
+                contig_family_taxid: 0,
+                from_assembly: false,
+            }),
+        );
+
+        total_reads += 1;
+
+        if accession_id != "-" && genus_taxid > 0 {
+            accession_dict
+                .entry(accession_id.clone())
+                .or_insert_with(|| AccessionHit {
+                    taxid: species_taxid,
+                    genus_taxid,
+                    family_taxid,
+                    count: 0,
+                })
+                .count += 1;
+
+            *genus_read_counts.entry(genus_taxid).or_insert(0) += 1;
+            genus_species.entry(genus_taxid).or_default().insert(species_taxid);
+            genus_accessions.entry(genus_taxid).or_default().insert(accession_id);
+        }
+    }
+
+    info!(
+        "summarize_hits: processed {} reads, {} unique accessions",
+        total_reads,
+        accession_dict.len()
+    );
+
+    let mut selected_genera: HashMap<i32, Vec<String>> = HashMap::new();
+    for entry in genus_read_counts.iter() {
+        let genus_taxid = *entry.key();
+        let read_count = *entry.value();
+
+        if read_count < min_reads_per_genus {
+            continue;
+        }
+
+        let species_set = genus_species.get(&genus_taxid);
+        let species_count = species_set.as_ref().map(|s| s.len()).unwrap_or(0);
+
+        if species_count <= 1 {
+            continue;
+        }
+
+        if let Some(acc_set) = genus_accessions.get(&genus_taxid) {
+            let accessions: Vec<String> = acc_set.iter().cloned().collect();
+            selected_genera.insert(genus_taxid, accessions);
+        }
+    }
+
+    let read_dict_final: AHashMap<String, Arc<ReadHit>> = read_dict.into_iter().collect();
+    let accession_dict_final: AHashMap<String, AccessionHit> = accession_dict.into_iter().collect();
+
+    Ok((
+        read_dict_final,
+        accession_dict_final,
+        selected_genera,
+        total_reads,
+    ))
+}
+
+
+/// Helper for writing empty output of blast_contigs in no assemled results
+///
+/// # Arguments
+/// # Returns
+/// Result
+async fn write_empty_blast_outputs(
+    blast_m8: &PathBuf,
+    blast_top_m8: &PathBuf,
+    refined_m8: &PathBuf,
+    refined_hit_summary: &PathBuf,
+    refined_counts_with_dcr: &PathBuf,
+    contig_summary_json: &PathBuf,
+
+) -> Result<()> {
+    tokio::fs::write(blast_m8, b" ").await?;
+    tokio::fs::write(blast_top_m8, b" ").await?;
+    tokio::fs::write(refined_m8, b" ").await?;
+    tokio::fs::write(refined_hit_summary, b" ").await?;
+    tokio::fs::write(refined_counts_with_dcr, b" ").await?;
+    tokio::fs::write(contig_summary_json, b"[]").await?;
+    Ok(())
+}
+
+/// Updates the read_dict in blast_contigs from streamed m8 data.
+/// Updates it in place using a lock, does not return it
+/// # Arguments
+/// * `read2contig` - Assignment of reads to contigs
+/// * `top_m8_stream` - stream in m8 format, top as found in get_top_m8_nt/nr
+/// * `read_dict` - HashMap of ReadID -> ReadHits
+/// * `lneage_map` - Hashmap os taxon id -> full lineage (family, genus, species)
+/// * `accession_map` - accession → (species, genus, family)
+/// * `should_keep` - combination of taxon lists and deuterostome filters
+/// * `db_type` - denotes NT or NR DB's to keep intermdiate and output files distinguished form each other
+/// * `contig2lineage_tx` - json sender
+/// * `read2blastm8_tx` - refined m8 sender
+/// * 'updated_tx` - updated dict sender
+/// * `added_tx` - added to dict snde
+/// # Returns
+/// Result
+pub async fn update_read_dict(
+    read2contig: Arc<HashMap<String, String>>,
+    mut top_m8_stream: ReceiverStream<ParseOutput>,
+    read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    accession_map: Arc<AHashMap<String, AccessionHit>>,
+    should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    db_type: &str,
+    contig2lineage_tx: Sender<ParseOutput>,
+    read2blastm8_tx: Sender<ParseOutput>,
+    updated_tx: Sender<ParseOutput>,
+    added_tx: Sender<ParseOutput>,
+) -> Result<()> {
+    while let Some(item) = top_m8_stream.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue,
+        };
+
+        let line = String::from_utf8_lossy(&**bytes);
+        let line_trimmed = line.trim_end();
+        if line_trimmed.is_empty() {
+            continue;
+        }
+
+        let m8 = if db_type == "nt" {
+            M8Record::parse_line_nt(line_trimmed)?
+        } else {
+            M8Record::parse_line_nr(line_trimmed)?
+        };
+
+        let contig_id = m8.qname.clone();
+        let accession = m8.tname.clone();
+
+        let taxid = accession_map
+            .get(&accession)
+            .map(|hit| hit.taxid)
+            .unwrap_or(0);
+
+        let lineage = if taxid > 0 {
+            lineage_map.get(&taxid).cloned().unwrap_or([0; 3])
+        } else {
+            [0; 3]
+        };
+
+        if !(should_keep)(&lineage) {
+            continue;
+        }
+
+        let json = json!({
+            "contig_name": contig_id,
+            "species_taxid": lineage[0],
+            "genus_taxid": lineage[1],
+            "family_taxid": lineage[2],
+        });
+        let mut json_line = serde_json::to_string(&json)?;
+        json_line.push('\n');
+        contig2lineage_tx
+            .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
+            .await?;
+
+        // Send refined M8 line
+        let mut m8_line = m8.to_tab_string();
+        m8_line.push('\n');
+        read2blastm8_tx
+            .send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes())))
+            .await?;
+
+        // Get all reads in this contig
+        let reads_in_contig: Vec<String> = read2contig
+            .iter()
+            .filter(|&(_, c)| c == &contig_id)
+            .map(|(r, _)| r.clone())
+            .collect();
+
+        let shared_hit: Arc<ReadHit> = Arc::new(ReadHit {
+            level: 1,
+            taxid: lineage[0],
+            accession_id: accession.clone(),
+            species_taxid: lineage[0],
+            genus_taxid: lineage[1],
+            family_taxid: lineage[2],
+            contig_id: Some(contig_id.clone()),
+            contig_accession_id: Some(accession.clone()),
+            contig_species_taxid: lineage[0],
+            contig_genus_taxid: lineage[1],
+            contig_family_taxid: lineage[2],
+            from_assembly: true,
+        });
+
+        let hit_tab_suffix = shared_hit.to_tab_string();
+
+        for read_id in reads_in_contig {
+            let final_line = format!("{}\t{}", read_id, &hit_tab_suffix);
+
+            let was_present = {
+                let mut dict = read_dict.lock().unwrap();
+                let was_present = dict.contains_key(&read_id);
+                dict.insert(read_id.clone(), shared_hit.clone());
+                was_present
+            };
+
+            let bytes = Arc::new(final_line.into_bytes());
+            if was_present {
+                let _ = updated_tx.send(ParseOutput::Bytes(bytes)).await;
+            } else {
+                let _ = added_tx.send(ParseOutput::Bytes(bytes)).await;
+            }
+        }
+
+    }
+
+    Ok(())
+}
+
+
+
+pub async fn generate_contig_summary_json(
+    read2contig: Arc<HashMap<String, String>>,
+    contig2lineage: AHashMap<String, [i32; 3]>,
+    read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
+    db_type: &str,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    min_contig_size: u64,
+    mut output_tx: Sender<ParseOutput>,
+) -> Result<()> {
+    let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
+    let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
+
+    //lock once
+    {
+        let dict = read_dict.lock().unwrap();
+
+        for (read_id, hit_arc) in dict.iter() {
+            let hit: &ReadHit = hit_arc.as_ref();
+
+            let contig = read2contig
+                .get(read_id)
+                .cloned()
+                .unwrap_or_else(|| "*".to_string());
+
+            let (species_taxid, genus_taxid) = if contig != "*" {
+                if let Some(lineage) = contig2lineage.get(&contig) {
+                    (lineage[0], lineage[1])
+                } else {
+                    (hit.species_taxid, hit.genus_taxid)
+                }
+            } else {
+                (hit.species_taxid, hit.genus_taxid)
+            };
+
+            let cluster_size = duplicate_cluster_sizes
+                .get(read_id)
+                .copied()
+                .unwrap_or(1);
+
+            // Species-level aggregation
+            let sp_entry = species_summary
+                .entry(species_taxid)
+                .or_default()
+                .entry(contig.clone())
+                .or_insert([0, 0]);
+            sp_entry[0] += 1;           // unique reads
+            sp_entry[1] += cluster_size; // weighted by duplicates
+
+            // Genus-level aggregation
+            let gn_entry = genus_summary
+                .entry(genus_taxid)
+                .or_default()
+                .entry(contig)
+                .or_insert([0, 0]);
+            gn_entry[0] += 1;
+            gn_entry[1] += cluster_size;
+        }
+    } // ← MutexGuard dropped here — no await while holding lock
+
+    // Now emit JSON — safe to await
+    for (tax_level, summary_map) in [(1, species_summary), (2, genus_summary)] {
+        for (taxid, contig_counts) in summary_map {
+            let filtered: HashMap<String, u64> = contig_counts
+                .into_iter()
+                .filter(|(_, [unique, _])| *unique >= min_contig_size)
+                .map(|(contig, [_, weighted])| (contig, weighted))
+                .collect();
+
+            if !filtered.is_empty() {
+                let entry = json!({
+                    "taxid": taxid,
+                    "tax_level": tax_level,
+                    "count_type": db_type.to_uppercase(),
+                    "contig_counts": filtered
+                });
+                let line = format!("{entry}\n");
+                output_tx
+                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                    .await
+                    .map_err(|_| anyhow!("contig_summary_tx dropped"))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
+pub async fn generate_m8_and_hit_summary(
+    mut updated_reads_stream: ReceiverStream<ParseOutput>,
+    mut added_reads_stream: ReceiverStream<ParseOutput>,
+    mut blast_hits_stream: ReceiverStream<ParseOutput>,
+    mut original_hit_summary_stream: ReceiverStream<ParseOutput>,
+    mut original_deduped_m8_stream: ReceiverStream<ParseOutput>,
+    refined_m8_tx: Sender<ParseOutput>,
+    refined_hit_summary_tx: Sender<ParseOutput>,
+) -> Result<()> {
+
+
+    // copy everything from original deduped M8
+    while let Some(item) = original_deduped_m8_stream.next().await {
+        refined_m8_tx.send(item).await
+            .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+    }
+
+    // append new blast hits
+    while let Some(item) = blast_hits_stream.next().await {
+        refined_m8_tx.send(item).await
+            .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+    }
+    drop(refined_m8_tx); // signals EOF
+
+
+    // stream through the original hit summary and replace rows that were updated
+    let mut updated_reads = AHashMap::new();
+    while let Some(item) = updated_reads_stream.next().await {
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes);
+            let read_id = line.split('\t').next().unwrap_or("").to_string();
+            updated_reads.insert(read_id, bytes);
+        }
+    }
+
+    let mut added_reads = AHashMap::new();
+    while let Some(item) = added_reads_stream.next().await {
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes);
+            let read_id = line.split('\t').next().unwrap_or("").to_string();
+            added_reads.insert(read_id, bytes);
+        }
+    }
+
+    //walk the original hit summary once
+    while let Some(item) = original_hit_summary_stream.next().await {
+        if let ParseOutput::Bytes(bytes) = item {
+            let line = String::from_utf8_lossy(&*bytes);
+            let read_id = line.split('\t').next().unwrap_or("").to_string();
+
+            // pefer updated version, then added, otherwise keep original
+            let to_send = updated_reads.get(&read_id)
+                .or_else(|| added_reads.get(&read_id))
+                .map_or(bytes.clone(), |v| v.clone());
+
+            refined_hit_summary_tx.send(ParseOutput::Bytes(to_send)).await
+                .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+        }
+    }
+
+    // append  added reads not in the original hit summary
+    for (read_id, bytes) in added_reads {
+        if !updated_reads.contains_key(&read_id) {
+            refined_hit_summary_tx.send(ParseOutput::Bytes(bytes)).await
+                .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+        }
+    }
+
+    drop(refined_hit_summary_tx);
+    Ok(())
+}
+
+
+pub async fn blast_contigs (
+    config: Arc<RunConfig>,
+    db_type: &'static str,
+    deduped_m8_stream: ReceiverStream<ParseOutput>, // deduped_m8
+    hit_summary_stream: ReceiverStream<ParseOutput>, // deduped_m8
+    read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
+    accession_map: Arc<AHashMap<String, AccessionHit>> ,  //hit_summary, but already done
+    taxon_counts: Vec<TaxonCount>, // orig_counts_with_dcr
+    assembled_contig_fasta: &PathBuf, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
+    read2contig: Arc<HashMap<String, String>>,
+    reference_fasta: &PathBuf, // reference_fasta
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>, //duplicate_cluster_sizes_path
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    blast_headroom: u64
+
+
+) -> Result<( AHashMap<String, Arc<ReadHit>>, Vec<TaxonCount>, Vec<ContigSummaryEntry>, Vec<JoinHandle<Result<()>>>,
+             Vec<oneshot::Receiver<Result<()>>>, Vec<NamedTempFile> )>{
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
+
+    let out_dir = config.out_dir.join(format!("blast_{}", db_type));
+    tokio::fs::create_dir_all(&out_dir).await?;
+
+    let blast_m8_path = out_dir.join("blast.m8");
+    let blast_top_m8_path = out_dir.join("blast_top.m8");
+    let refined_m8_path = out_dir.join("refined.m8");
+    let refined_hit_summary_path = out_dir.join("refined_hit_summary.tab");
+    let refined_counts_path = out_dir.join("refined_counts_with_dcr.json");
+    let contig_summary_path = out_dir.join("contig_summary.json");
+
+    let contig_size = file_size(assembled_contig_fasta).await?;
+    let ref_size = file_size(reference_fasta).await?;
+    if contig_size < MIN_REF_FASTA_SIZE || ref_size < MIN_ASSEMBLED_CONTIG_SIZE {
+        write_empty_blast_outputs(
+            &blast_m8_path,
+            &blast_top_m8_path,
+            &refined_m8_path,
+            &refined_hit_summary_path,
+            &refined_counts_path,
+            &contig_summary_path,
+        ).await?;
+
+        let final_read_dict = read_dict.lock().unwrap().clone();
+        return Ok(( final_read_dict, taxon_counts, vec![], cleanup_tasks, cleanup_receivers, temp_files ));
+    }
+
+    let temp_dir = choose_temp_dir(
+        ref_size + contig_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        blast_headroom,
+    ).await?;
+
+    let blastdb_suffix = format!("{}_blastindex", db_type);
+    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let blastdb_path = blastdb_ram_path.path().to_owned();
+    temp_files.push(blastdb_ram_path);
+
+    let makeblastdb_config = MakeblastdbConfig {
+        input: reference_fasta.clone(),
+        dbtype: if db_type == NT_TAG { "nucl".to_string() } else { "prot".to_string() },
+        output: blastdb_path.clone(),
+        option_fields: HashMap::new()
+    };
+
+    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAKEBLASTDB_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    debug!("Spawning makeblastdb with args: {:?}", makeblastdb_args);
+
+    let (_, makeblastdb_err_task) = spawn_cmd(
+        config.clone(),
+        MAKEBLASTDB_TAG,
+        makeblastdb_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAKEBLASTDB_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    cleanup_tasks.push(makeblastdb_err_task);
+
+
+    let blast_command = if db_type == NT_TAG { BLASTN_TAG } else { BLASTX_TAG };
+
+    let blast_args = if db_type == NT_TAG {
+        let blastn_config = BlastnConfig {
+            query: assembled_contig_fasta.clone(),
+            db: blastdb_path.clone(),
+            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen".to_string(),
+            evalue: 1e-10,
+            max_target_seqs: 5000,
+            option_fields: HashMap::new(),
+        };
+
+        generate_cli(BLASTN_TAG, &config, Some(&blastn_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BLASTN_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    } else {
+        let blastx_config = BlastxConfig {
+            query: assembled_contig_fasta.clone(),
+            db: blastdb_path.clone(),
+            outfmt: 6,
+            evalue: 1e-10,
+            num_alignments: 5,
+            option_fields: HashMap::new(),
+        };
+
+        generate_cli(BLASTX_TAG, &config, Some(&blastx_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: BLASTX_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // let envs = if db_type == NT_TAG {
+    //     vec![("BATCH_SIZE".to_string(), "10000".to_string())]
+    // } else {
+    //     vec![]
+    // };
+
+    let (mut blast_child, err_task) = spawn_cmd(
+        config.clone(),
+        blast_command,
+        blast_args,
+        config.args.verbose,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: blast_command.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(err_task);
+
+
+    let blast_out_stream = parse_child_output(
+        &mut blast_child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        config.base_buffer_size,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: "blastn/x".to_string(),
+            error: e.to_string(),
+        })?;
+
+    // Now feed blast_out_stream directly into top_m8
+    let (top_tx, top_rx) = channel(1024);
+    let top_handle = if db_type == NT_TAG {
+        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_tx))
+    } else {
+        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_tx))
+    };
+
+    let (contig2lineage_tx, contig2lineage_rx) = channel(1024);
+    let (read2blastm8_tx, read2blastm8_rx) = channel(1024);
+
+    let (updated_tx, updated_rx) = channel(1024);
+    let (added_tx, added_rx) = channel(1024);
+
+    let update_handle = tokio::spawn(update_read_dict(
+        read2contig.clone(),
+        ReceiverStream::new(top_rx),
+        read_dict.clone(),
+        lineage_map.clone(),
+        accession_map.clone(),
+        should_keep_filter.clone(),
+        db_type,
+        contig2lineage_tx,
+        read2blastm8_tx,
+        updated_tx,
+        added_tx,
+    ));
+
+    let (refined_m8_tx, refined_m8_rx) = channel(2_000_000);
+    let (refined_hit_summary_tx, refined_hit_summary_rx) = channel(2_000_000);
+
+    let (updated_tx, updated_rx) = channel(1024);
+    let (added_tx, added_rx) = channel(1024);
+
+    let generate_m8_handle = tokio::spawn(generate_m8_and_hit_summary(
+        ReceiverStream::new(updated_rx),        // not used any more – we’ll ignore it
+        ReceiverStream::new(added_rx),         // not used any more
+        ReceiverStream::new(read2blastm8_rx),   // new BLAST hits (read → best hit)
+        hit_summary_stream,                   // original hit summary (teed)
+        deduped_m8_stream,                   // original deduped M8
+        refined_m8_tx.clone(),
+        refined_hit_summary_tx.clone(),
+    ));
+
+    let (refined_counts_tx, refined_counts_rx) = channel(1024);
+    let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
+        ReceiverStream::new(refined_m8_rx),
+        ReceiverStream::new(refined_hit_summary_rx),
+        db_type,
+        lineage_map.clone(),
+        should_keep_filter.clone(),
+        duplicate_cluster_sizes.clone(),
+        refined_counts_tx,
+    ));
+
+    update_handle.await??;
+
+    let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
+    let mut lineage_stream = ReceiverStream::new(contig2lineage_rx);
+    while let Some(item) = lineage_stream.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 4 {
+            let contig  = fields[0].to_string();
+            let species  = fields[1].parse().unwrap_or(0);
+            let genus    = fields[2].parse().unwrap_or(0);
+            let family   = fields[3].parse().unwrap_or(0);
+            contig2lineage.insert(contig, [species, genus, family]);
+        }
+    }
+
+
+    let (contig_summary_tx, contig_summary_rx) = channel(1024);
+    let contig_summary_handle = tokio::spawn(generate_contig_summary_json(
+        read2contig.clone(),
+        contig2lineage,
+        read_dict.clone(),
+        db_type,
+        duplicate_cluster_sizes.clone(),
+        4,
+        contig_summary_tx,
+    ));
+
+    let results = try_join_all(vec![
+        top_handle,
+        generate_m8_handle,
+        counts_handle,
+        contig_summary_handle,
+    ])
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("contig processing task panicked: {}", e)))?;
+
+    for res in results {
+        res.map_err(|e| PipelineError::Other(anyhow!("contig processing task failed: {}", e)))?;
+    }
+
+    let mut refined_counts = Vec::new();
+    let mut rx = ReceiverStream::new(refined_counts_rx);
+    while let Some(item) = rx.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let count: TaxonCount = serde_json::from_str(&line)?;
+        refined_counts.push(count);
+    }
+
+    let mut contig_summary = Vec::new();
+    let mut rx = ReceiverStream::new(contig_summary_rx);
+    while let Some(item) = rx.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let entry: ContigSummaryEntry = serde_json::from_str(&line)?;
+        contig_summary.push(entry);
+    }
+
+    let final_read_dict = read_dict.lock().unwrap().clone();
+    Ok((
+        final_read_dict,
+        refined_counts,
+        contig_summary,
+        cleanup_tasks,
+        cleanup_receivers,
+        temp_files
+    ))
+}
+
 
 
 /// Run function for Short Read mNGS pipelines
@@ -3244,7 +4194,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // External tools check
-    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG])
+    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
+                        BLASTN_TAG, BLASTX_TAG])
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -3261,6 +4212,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let random_seed = u64::from_le_bytes(bytes);
         random_seed
     });
+
+    let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
 
     // Input Validation
     let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
@@ -3412,7 +4365,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_cluster_sizes, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_cluster_sizes_noarc, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
@@ -3424,6 +4377,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
+    let duplicate_cluster_sizes = Arc::new(duplicate_cluster_sizes_noarc);
 
     // *******************
     // Non host Alignment
@@ -3449,7 +4403,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
         5,
-        config.base_buffer_size,
+        config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
         config.args.stall_threshold,
         None,
         100,
@@ -3470,7 +4424,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    // This is part of post-process starting here
+    // This is part of post-process starting here for concurrency
 
     let (assembly_handle, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
         config.clone(),
@@ -3514,11 +4468,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut m8_cleanup_tasks);
     cleanup_receivers.append(&mut m8_cleanup_receivers);
 
+    let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(),
         m8_stream,
         sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
         should_keep_filter.clone(),
         36
     ).await?;
@@ -3527,7 +4484,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
-        3,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3544,11 +4501,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_acc_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (nt_summary_streams, nt_summary_done_rx) = t_junction(
+        call_summary_stream,
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nt_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_summary_done_rx);
+    let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
+    let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream), 0));
 
     let nt_counts = generate_taxon_counts(
         config.clone(),
         ReceiverStream::new(nt_call_stream),
-        call_summary_stream,
+        ReceiverStream::new(nt_summary_taxon_stream),
         duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
         "NT".to_string(),
@@ -3570,19 +4549,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
 
-    let (diamond_call_stream, diamond_call_summary_stream, mut diamond_call_cleanup_tasks, mut diamond_call_cleanup_receivers) = call_hits_m8_stream(
+    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(),
         ReceiverStream::new(non_host_diamond_m8_stream),
         sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
         should_keep_filter.clone(),
         0,
     ).await?;
-    cleanup_tasks.append(&mut diamond_call_cleanup_tasks);
-    cleanup_receivers.append(&mut diamond_call_cleanup_receivers);
+    cleanup_tasks.append(&mut nr_call_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
     let (nr_streams, nr_done_rx) = t_junction(
-        diamond_call_stream,
-        3,
+        nr_call_stream,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -3599,11 +4580,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (nr_summary_streams, nr_summary_done_rx) = t_junction(
+        nr_call_summary_stream,
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_summary_done_rx);
+    let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
+    let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream), 0));
 
     let nr_counts = generate_taxon_counts(
         config.clone(),
         ReceiverStream::new(nr_call_stream),
-        diamond_call_summary_stream,
+        ReceiverStream::new(nr_summary_taxon_stream),
         duplicate_cluster_sizes.clone(),
         should_keep_filter.clone(),
         "NR".to_string(),
@@ -3645,21 +4649,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     assembly_handle.spades_task.await??;
 
-    let (assembly_outputs, assembly_bam_out_stream, mut post_assembly_cleanup_tasks, mut post_assembly_cleanup_receivers) = process_assembly(
+    let (assembly_outputs, assembly_bam_out_stream,
+        mut post_assembly_cleanup_tasks,
+        mut post_assembly_cleanup_receivers, mut post_assemly_temp_files) = process_assembly(
         config.clone(),
         assembly_out_dir,
         assembly_work_dir,
         ReceiverStream::new(non_host_coverage_bt2_stream),
         duplicate_cluster_sizes.clone(),
-        paired
+        paired,
+        4 // this can become as CLI arg if needed
     ).await?;
 
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
+    temp_files.extend(post_assemly_temp_files);
 
     let _ = fs::remove_dir_all(assembly_work_dir).await;
-
-    eprintln!("contigs stats len {}", assembly_outputs.contig_stats.len());
 
     let generate_assembly_coverage_result = generate_assembly_coverage(
         config.clone(),
@@ -3689,15 +4695,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             "NT offset DB file required for fasta extraction".into(),
         ))?;
 
-    //nt accessions
-    let nt_ref_fasta_path = extract_accessions_to_fasta(
-        config.clone(),
-        ReceiverStream::new(nt_acc_stream),
-        &PathBuf::from(nt_file),
-        &PathBuf::from(nt_offset_db_file),
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+
 
     let nr_file = config
         .args
@@ -3715,14 +4713,144 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             "NR offset DB file required for fasta extraction".into(),
         ))?;
 
-    let nr_ref_fasta_path = extract_accessions_to_fasta(
+
+
+
+    // Blast contigs
+    //NT
+    let (
+        nt_read_dict_noarc,
+        nt_accession_dict_noarc,
+        nt_selected_genera,
+        nt_total_reads,
+    ) = nt_hit_summary_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
+
+    let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_noarc));
+    let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
+
+    //nt accessions
+    let nt_ref_fasta_path = build_reference_fasta_from_selected_genera(
         config.clone(),
-        ReceiverStream::new(nr_acc_stream),
+        &nt_selected_genera,
+        NT_TAG,
+        &PathBuf::from(nt_file),
+        &PathBuf::from(nt_offset_db_file),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    eprintln!("nt path {}", nt_ref_fasta_path.display());
+
+
+    // //NR
+    let (
+        nr_read_dict_noarc,
+        nr_accession_dict_noarc,
+        nr_selected_genera,
+        nr_total_reads,
+    ) = nr_hit_summary_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
+
+    let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_noarc));
+    let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
+
+
+    let nr_ref_fasta_path = build_reference_fasta_from_selected_genera(
+        config.clone(),
+        &nr_selected_genera,
+        NR_TAG,
         &PathBuf::from(nr_file),
         &PathBuf::from(nr_offset_db_file),
     )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
+    eprintln!("nr path {}", nr_ref_fasta_path.display());
+
+    let nt_handle = tokio::spawn({
+        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_cluster_sizes = duplicate_cluster_sizes.clone();
+        let read2contig = assembly_outputs.read2contig.clone();
+
+        async move {
+            blast_contigs(
+                config,
+                NT_TAG,
+                ReceiverStream::new(nt_blast_stream),
+                ReceiverStream::new(nt_blast_hit_stream),
+                nt_read_dict.clone(),
+                nt_accession_dict,
+                nt_counts,
+                &contigs_fasta_path.clone(),
+                read2contig,
+                &nt_ref_fasta_path,
+                duplicate_cluster_sizes,
+                lineage_map,
+                should_keep_filter,
+                4,
+            ).await
+        }
+    });
+
+    let nr_handle = tokio::spawn({
+        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_cluster_sizes = duplicate_cluster_sizes.clone();
+        let read2contig = assembly_outputs.read2contig.clone();
+
+        async move {
+            blast_contigs(
+                config,
+                NR_TAG,
+                ReceiverStream::new(nr_blast_stream),
+                ReceiverStream::new(nr_blast_hit_stream),
+                nr_read_dict.clone(),
+                nr_accession_dict,
+                nr_counts,
+                &contigs_fasta_path.clone(),
+                read2contig,
+                &nr_ref_fasta_path,
+                duplicate_cluster_sizes,
+                lineage_map,
+                should_keep_filter,
+                4,
+            ).await
+        }
+    });
+
+
+
+    //  Do everything else that does NOT depend on the results
+    //    (e.g. writing intermediate JSONs, logging, cleanup prep…)
+
+
+
+    let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
+        .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
+
+    let (nt_read_dict, nt_refined_counts, nt_contig_summary,
+        nt_cleanup_tasks, nt_cleanup_receivers,
+        nt_temp_files) = nt_res?;
+
+    cleanup_tasks.extend(nt_cleanup_tasks);
+    cleanup_receivers.extend(nt_cleanup_receivers);
+    temp_files.extend(nt_temp_files);
+
+    let (nr_read_dict, nr_refined_counts, nr_contig_summary,
+        nr_cleanup_tasks, nr_cleanup_receivers,
+        nr_temp_files) = nr_res?;
+    cleanup_tasks.extend(nr_cleanup_tasks);
+    cleanup_receivers.extend(nr_cleanup_receivers);
+    temp_files.extend(nr_temp_files);
+
 
     // *******************
     // Results retrieval
@@ -3791,9 +4919,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
     info!("Dedup: unique reads/pairs: {}", dedup_count);
 
-    // Await Kallisto exit and process results
-    join_with_error_handling(kallisto_exit_task).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
+    // Cannot asusme ERCC's spiked in.
+    let kallisto_exit = join_with_error_handling(kallisto_exit_task).await;
+    match kallisto_exit {
+        Ok(_) => info!("Kallisto completed successfully"),
+        Err(e) => {
+            warn!("Kallisto failed (non-fatal, possibly no ERCC spiked in): {}", e);
+        }
+    }
 
     let kallisto_results_task = kallisto_results(out_dir.join("kallisto"), kallisto_ercc_tx)
         .await

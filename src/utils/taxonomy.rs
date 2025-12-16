@@ -1,3 +1,4 @@
+use tokio_stream::StreamExt;
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::fs::File as StdFile;
@@ -18,9 +19,10 @@ use rayon::prelude::*;
 use bincode::{encode_into_std_write, decode_from_std_read};
 use serde::{Serialize, Deserialize};
 use ahash::AHashMap;
-
+use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
-
+use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
+use crate::utils::streams::ParseOutput;
 // *******************
 // DB creation functions
 // *******************
@@ -344,23 +346,233 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
     Ok(set)
 }
 
+/// Retrieves the top hit from an m8 stream
+/// Ranking
+/// 1. Higher AAI = pident * alen / qlen
+/// 2. Lower evalue
+/// 3. Higher bitscore
+/// # Arguments
+/// * `path` - path to hit sumamry file.
+/// # Returns
+/// hash map of HitSummaries
+pub async fn get_top_m8_nt(
+    mut input: ReceiverStream<ParseOutput>,
+    mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
+) -> Result<()> {
+    // Group all valid M8 records by contig (qname)
+    let mut hits_per_contig: HashMap<String, Vec<M8Record>> = HashMap::new();
+
+    while let Some(item) = input.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue, // Skip non-bytes (should never happen in BLAST output)
+        };
+
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+
+        let m8 = match M8Record::parse_line_nt(line) {
+            Ok(m8) => m8,
+            Err(e) => {
+                warn!("Failed to parse NT m8 line: {} — {}", e, line);
+                continue;
+            }
+        };
+
+        // qlen must be > 0 (defensive — BLAST should guarantee this)
+        if m8.qlen == 0 {
+            warn!("Skipping hit with qlen=0 for contig {}", m8.qname);
+            continue;
+        }
+
+        hits_per_contig
+            .entry(m8.qname.clone())
+            .or_default()
+            .push(m8);
+    }
+
+    // For each contig, select the single best hit
+    for (contig_id, mut hits) in hits_per_contig {
+        if hits.is_empty() {
+            continue;
+        }
+
+        hits.sort_by(|a, b| {
+            // Primary: AAI = pident * alen / qlen (higher is better)
+            let aai_a = a.pident * a.alen as f64 / a.qlen as f64;
+            let aai_b = b.pident * b.alen as f64 / b.qlen as f64;
+
+            // Descending AAI
+            let cmp = aai_b.partial_cmp(&aai_a).unwrap_or(std::cmp::Ordering::Equal);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+
+            // Ascending evalue
+            let cmp = a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+
+            // Descending bitscore
+            b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let best = hits.into_iter().next().unwrap(); // Top after sort
+
+        let line = best.to_tab_string() + "\n";
+        output_tx
+            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send top NT m8 line — receiver dropped"))?;
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct MergedHsp {
+    total_alen: u64,
+    sum_pident: f64,
+    evalue: f64,
+    bitscore: f64,
+    hsp_count: u64,
+    representative: M8Record,
+}
+
+pub async fn get_top_m8_nr(
+    mut input: ReceiverStream<ParseOutput>,
+    mut output_tx: tokio::sync::mpsc::Sender<ParseOutput>,
+) -> Result<()> {
+    // (contig, subject) → merged stats
+    let mut merged: HashMap<(String, String), MergedHsp> = HashMap::new();
+
+    while let Some(item) = input.next().await {
+        let bytes = match item {
+            ParseOutput::Bytes(b) => b,
+            _ => continue,
+        };
+
+        let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Use a 12-column parser for NR — we'll assume M8Record can parse without qlen/slen
+        // (you'll need a separate parse_line_nr or make qlen/slen optional)
+        let m8 = match M8Record::parse_line_nr(&line) {  // ← implement this
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to parse NR m8 line: {} — {}", e, line);
+                continue;
+            }
+        };
+
+        let key = (m8.qname.clone(), m8.tname.clone());
+        let entry = merged.entry(key).or_default();
+
+        entry.total_alen += m8.alen;
+        entry.sum_pident += m8.pident * m8.alen as f64;
+        entry.evalue = entry.evalue.min(m8.evalue);
+        entry.bitscore = entry.bitscore.max(m8.bitscore);
+        entry.hsp_count += 1;
+        // Keep one representative HSP for output (the one with highest bitscore)
+        if m8.bitscore > entry.representative.bitscore {
+            entry.representative = m8;
+        }
+    }
+
+    // Now per contig, pick best subject
+    let mut best_per_contig: HashMap<String, MergedHsp> = HashMap::new();
+
+    for ((contig, _subject), merged_hsp) in merged {
+        let current = best_per_contig.entry(contig).or_default();
+        if merged_hsp.bitscore > current.bitscore ||
+            (merged_hsp.bitscore == current.bitscore && merged_hsp.evalue < current.evalue) {
+            *current = merged_hsp;
+        }
+    }
+
+    for (_contig, best) in best_per_contig {
+        let rep = &best.representative;
+        // Reconstruct line using merged values where Python does (pident = weighted avg)
+        let avg_pident = if best.total_alen > 0 {
+            best.sum_pident / best.total_alen as f64
+        } else {
+            rep.pident
+        };
+
+        // Use representative's fields, but override pident with merged average
+        let line = format!(
+            "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
+            rep.qname, rep.tname, avg_pident, best.total_alen,
+            rep.mismatch, rep.gapopen, rep.qstart, rep.qend,
+            rep.tstart, rep.tend, best.evalue, best.bitscore
+        );
+
+        output_tx
+            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .await
+            .map_err(|_| anyhow::anyhow!("NR top m8 sender dropped"))?;
+    }
+
+    Ok(())
+}
+
+
+
 
 // *******************
 // DB access functions
 // *******************
 
+/// Validates and cleans a taxonomic lineage
+/// /// # Arguments
+/// * `lineage`  lineage from taxdump (species, genus, family, ... root). May contain 0s or gaps.
+/// * `hit_taxid`   - The taxid at the level where consensus was reached
+/// * `hit_level`   - 1: species, 2: genus, 3: family
+///
+///
+/// # Returns
+/// Validayte lineage vector with negtive taxids by converntion for no hit at that level
+pub fn validate_taxid_lineage(
+    lineage: &[i32], //
+    hit_taxid: Taxid,
+    hit_level: u8
+) -> Vec<i32> {
+    const INVALID_BASE: i32 = -2_000_000_000; //  base for artificial negative taxids
 
-pub fn validate_taxid_lineage(lineage: &[i32], hit_taxid: Taxid, hit_level: u8) -> Vec<i32> {
     let mut cleaned = lineage.to_vec();
-    for level in 0..(hit_level as usize - 1) {
-        cleaned[level] = INVALID_CALL_BASE_ID - (level as i32 + 1) * 100;
+
+    // Invalidate all levels below the consensus level
+    // If hit_level == 0 → no consensus → invalidate everything
+    let invalidate_up_to = if hit_level == 0 {
+        cleaned.len()
+    } else {
+        hit_level.saturating_sub(1) as usize
+    };
+
+    for level in 0..invalidate_up_to {
+        cleaned[level] = INVALID_BASE - (level as i32 + 1) * 100;
     }
-    let mut parent = hit_taxid;
-    for level in (hit_level as usize - 1)..cleaned.len() {
-        if cleaned[level] <= 0 {
-            cleaned[level] = INVALID_CALL_BASE_ID - (level as i32 + 1) * 100 - parent;
+
+    //  From the consensus level upward, fill missing/invalid entries
+    // with artificial negative taxids based on parent
+    if hit_level > 0 && hit_level <= cleaned.len() as u8 {
+        let start_level = (hit_level as usize).saturating_sub(1); // inclusive
+        let mut parent = hit_taxid;
+
+        for level in start_level..cleaned.len() {
+            if cleaned[level] <= 0 {
+                // missing or invalid. so artificial negative ID
+                cleaned[level] = INVALID_BASE - (level as i32 + 1) * 100 - parent;
+            }
+            parent = cleaned[level];
         }
-        parent = cleaned[level];
     }
+
     cleaned
 }

@@ -3,19 +3,23 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use log::{self, LevelFilter, debug, info, error, warn};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
 use fst::Map;
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
-
-use crate::config::defs::{Taxid, Lineage};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc::Sender;
+use crate::config::defs::{Taxid, Lineage, NT_TAG};
+use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
+use crate::utils::streams::ToBytes;
 
 
 /// Single BLAST m8 line
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct M8Record {
     pub qname: String,       // Read ID
     pub tname: String,       // Base Accession ID (no version suffix)
@@ -29,18 +33,23 @@ pub struct M8Record {
     pub tend: u64,           // Target end
     pub evalue: f64,         // E-value
     pub bitscore: f64,       // Bitscore
+    pub qlen: u64,   // Query length: From column in NT; 0 or contig len in NR (unused in NR logic)
+    pub slen: u64,   // Subject length: From column in NT; 0 in NR (unused entirely)
 }
 
 impl M8Record {
-    /// The second field (accession) is stripped of its version
-    ///  NCBI policy: All versions of a GenBank accession (e.g., MT093571.1, MT093571.2) map to the same taxid.
-    pub fn parse_line(line: &str) -> Result<Self> {
+    /// Parse 14-column NT (blastn) output — matches BlastnOutput6NTReader
+    pub fn parse_line_nt(line: &str) -> Result<Self> {
         let line = line.trim_end();
+        if line.is_empty() {
+            return Err(anyhow!("empty line"));
+        }
+
         let mut fields = line.split('\t');
 
         macro_rules! next {
             () => {
-                fields.next().ok_or_else(|| anyhow!("missing field"))?
+                fields.next().ok_or_else(|| anyhow!("missing field in NT m8 line"))?
             };
         }
 
@@ -52,29 +61,144 @@ impl M8Record {
             }};
         }
 
+        macro_rules! parse_u64 {
+            () => {
+                next!().parse::<u64>().map_err(|e| anyhow!("invalid u64: {}", e))?
+            };
+        }
 
         let qname = next!().to_string();
-        let raw_accession = next!();                     // e.g. "QIK02963.1"
+        let raw_accession = next!(); // e.g., "NC_123456.2"
         let tname = raw_accession
             .split('.')
             .next()
             .unwrap_or(raw_accession)
-            .to_string();                               // → "QIK02963"
+            .to_string(); // → "NC_123456"
+
+        let pident = parse_float!();
+        let alen = parse_u64!();
+        let mismatch = parse_u64!();
+        let gapopen = parse_u64!();
+        let qstart = parse_u64!();
+        let qend = parse_u64!();
+        let tstart = parse_u64!();
+        let tend = parse_u64!();
+        let evalue = parse_float!();
+        let bitscore = parse_float!();
+        let qlen = parse_u64!();
+        let slen = parse_u64!();
+
+        // Defensive: Warn on extra columns
+        if fields.next().is_some() {
+            warn!("Extra columns in NT m8 line (expected 14): {}", line);
+        }
 
         Ok(Self {
             qname,
             tname,
-            pident: parse_float!(),
-            alen: next!().parse()?,
-            mismatch: next!().parse()?,
-            gapopen: next!().parse()?,
-            qstart: next!().parse()?,
-            qend: next!().parse()?,
-            tstart: next!().parse()?,
-            tend: next!().parse()?,
-            evalue: parse_float!(),
-            bitscore: parse_float!(),
+            pident,
+            alen,
+            mismatch,
+            gapopen,
+            qstart,
+            qend,
+            tstart,
+            tend,
+            evalue,
+            bitscore,
+            qlen,
+            slen,
         })
+    }
+
+    /// Parse 12-column NR (blastx) output — matches BlastnOutput6Reader
+    pub fn parse_line_nr(line: &str) -> Result<Self> {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return Err(anyhow!("empty line"));
+        }
+
+        let mut fields = line.split('\t');
+
+        macro_rules! next {
+            () => {
+                fields.next().ok_or_else(|| anyhow!("missing field in NR m8 line"))?
+            };
+        }
+
+        macro_rules! parse_float {
+            () => {{
+                let s = next!();
+                lexical_parse::<f64, _>(s.as_bytes())
+                    .map_err(|e| anyhow!("invalid float '{}': {}", s, e))?
+            }};
+        }
+
+        macro_rules! parse_u64 {
+            () => {
+                next!().parse::<u64>().map_err(|e| anyhow!("invalid u64: {}", e))?
+            };
+        }
+
+        let qname = next!().to_string();
+        let raw_accession = next!(); // e.g., "QIK02963.1"
+        let tname = raw_accession
+            .split('.')
+            .next()
+            .unwrap_or(raw_accession)
+            .to_string(); // → "QIK02963"
+
+        let pident = parse_float!();
+        let alen = parse_u64!();
+        let mismatch = parse_u64!();
+        let gapopen = parse_u64!();
+        let qstart = parse_u64!();
+        let qend = parse_u64!();
+        let tstart = parse_u64!();
+        let tend = parse_u64!();
+        let evalue = parse_float!();
+        let bitscore = parse_float!();
+
+        // Defensive: Warn on extra columns
+        if fields.next().is_some() {
+            warn!("Extra columns in NR m8 line (expected 12): {}", line);
+        }
+
+        Ok(Self {
+            qname,
+            tname,
+            pident,
+            alen,
+            mismatch,
+            gapopen,
+            qstart,
+            qend,
+            tstart,
+            tend,
+            evalue,
+            bitscore,
+            qlen: 0,  // Safe default: Not present/used in NR logic
+            slen: 0,  // Safe default: Not present/used anywhere
+        })
+    }
+
+
+    pub fn to_tab_string(&self) -> String {
+        format!(
+            "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{}",
+            self.qname,
+            self.tname,
+            self.pident,
+            self.alen,
+            self.mismatch,
+            self.gapopen,
+            self.qstart,
+            self.qend,
+            self.tstart,
+            self.tend,
+            self.evalue,
+            self.bitscore
+        )
     }
 }
 
@@ -198,4 +322,190 @@ pub fn consensus_level<D: AsRef<[u8]>>(
     }
 
     Ok((max_level, consensus_taxid, hits.to_vec()))
+}
+
+fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() >= 3 {
+        Some((parts[0].to_string(), parts[2].parse().ok()?))
+    } else {
+        None
+    }
+}
+
+pub async fn generate_taxon_count_json_from_m8(
+    mut refined_m8_stream: ReceiverStream<ParseOutput>,
+    mut refined_hit_summary_stream: ReceiverStream<ParseOutput>,
+    db_type: &str,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    mut output_tx: Sender<ParseOutput>,
+) -> Result<()> {
+    let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
+
+
+    // 0: read_id
+    // 1: accession
+    // 2: hit_taxid (often isolate-level)
+    // 3: genus_taxid
+    // 4: family_taxid
+    // 5: consensus_level (1=genus, 2=family, 3=species)
+    let mut read_to_taxid: AHashMap<String, Taxid> = AHashMap::with_capacity(10_000_000);
+    while let Some(item) = refined_hit_summary_stream.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 6 {
+            warn!(
+                "Malformed refined hit_summary line (expected 6 fields, got {}): {}",
+                fields.len(),
+                line
+            );
+            continue;
+        }
+
+        let read_id = fields[0].to_string();
+
+        let taxid: Taxid = match fields[2].parse() {
+            Ok(t) if t > 0 => t,
+            Ok(t) => {
+                debug!("Read {} has non-positive taxid {} → skipping", read_id, t);
+                continue;
+            }
+            Err(e) => {
+                warn!("Invalid taxid '{}' in refined hit_summary (parse error: {}): {}", fields[2], e, line);
+                continue;
+            }
+        };
+
+        read_to_taxid.insert(read_id, taxid);
+    }
+
+    info!("Loaded {} read → taxid mappings from refined hit summary", read_to_taxid.len());
+
+    while let Some(item) = refined_m8_stream.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+
+        // Parse m8 line — defensive with warnings
+        let m8 = if db_type == NT_TAG {
+            match M8Record::parse_line_nt(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to parse NT m8 line: {} — {}", e, line);
+                    continue;
+                }
+            }
+        } else {
+            match M8Record::parse_line_nr(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Failed to parse NR m8 line: {} — {}", e, line);
+                    continue;
+                }
+            }
+        };
+
+        let Some(&taxid) = read_to_taxid.get(&m8.qname) else {
+            // This is expected for unmapped reads — not an error
+            continue;
+        };
+
+        if taxid <= 0 {
+            debug!("Read {} has invalid refined taxid {} — skipping m8 hit", m8.qname, taxid);
+            continue;
+        }
+
+        let lineage = match lineage_map.get(&taxid) {
+            Some(l) => l,
+            None => {
+                warn!("Missing lineage for taxid {} (read: {}) — skipping hit", taxid, m8.qname);
+                continue;
+            }
+        };
+
+        if !(should_keep_filter)(lineage) {
+            debug!("Read {} (taxid {}) filtered out by should_keep_filter", m8.qname, taxid);
+            continue;
+        }
+
+        let bucket = buckets.entry(taxid).or_default();
+        bucket.nonunique_count += 1;
+        bucket.unique_count += duplicate_cluster_sizes.get(&m8.qname).cloned().unwrap_or(1);
+        bucket.base_count += 1;
+        bucket.sum_percent_identity += m8.pident;
+        bucket.sum_alignment_length += m8.alen as f64;
+        bucket.sum_e_value += m8.evalue;
+        bucket.source_count_type.insert(db_type.to_string());
+    }
+
+
+    for (taxid, bucket) in buckets {
+        let lineage = match lineage_map.get(&taxid) {
+            Some(l) => l,
+            None => {
+                warn!("No lineage for final taxid {} — skipping output", taxid);
+                continue;
+            }
+        };
+
+        if !(should_keep_filter)(lineage) {
+            continue;
+        }
+
+        let dcr = if bucket.nonunique_count > 0 {
+            bucket.unique_count as f64 / bucket.nonunique_count as f64
+        } else {
+            0.0
+        };
+
+        let percent_identity = if bucket.base_count > 0 {
+            bucket.sum_percent_identity / bucket.base_count as f64
+        } else {
+            0.0
+        };
+
+        let alignment_length = if bucket.base_count > 0 {
+            bucket.sum_alignment_length / bucket.base_count as f64
+        } else {
+            0.0
+        };
+
+        let e_value = if bucket.base_count > 0 {
+            bucket.sum_e_value / bucket.base_count as f64
+        } else {
+            0.0
+        };
+
+        let count = TaxonCount {
+            tax_id: taxid,
+            tax_level: 1, // species-level aggregation
+            genus_taxid: lineage[1],
+            family_taxid: lineage[2],
+            count: bucket.unique_count,
+            nonunique_count: bucket.nonunique_count,
+            unique_count: bucket.unique_count,
+            dcr,
+            percent_identity,
+            alignment_length,
+            e_value,
+            count_type: db_type.to_string(),
+            base_count: bucket.base_count,
+            source_count_type: Some(bucket.source_count_type.iter().cloned().collect()),
+        };
+
+        let json_line = serde_json::to_string(&count)? + "\n";
+        output_tx
+            .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
+            .await
+            .map_err(|_| anyhow!("taxon count output channel dropped"))?;
+    }
+
+    Ok(())
 }

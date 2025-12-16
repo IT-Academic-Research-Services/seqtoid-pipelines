@@ -20,12 +20,14 @@ use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::time::{Duration};
+use tokio::fs::File as TokioFile;
 use futures::future::try_join_all;
+use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use memchr::memmem;
 use fst::{MapBuilder};
 
-use crate::utils::streams::ParseOutput;
+use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats};
@@ -720,6 +722,48 @@ pub fn read_fasta(
     });
 
     Ok(rx)
+}
+
+
+/// Write any ParseOutput stream that contains FASTA records to a file.
+/// The caller decides the destination path (RAM temp, scratch, final output, …).
+///
+/// # Arguments
+///
+/// * `stream` - ParseOutput stream, must eb fASTA foirmat
+/// * 'dest_path' - location to write to
+/// * 'mbuffer_capacity'
+/// # Returns
+///  Result<(JoinHandle<Result<u64>>, PathBuf)>
+pub async fn write_fasta_stream_to_file(
+    mut stream: ReceiverStream<ParseOutput>,
+    dest_path: PathBuf,
+    buffer_capacity: usize,
+) -> Result<(JoinHandle<Result<u64>>, PathBuf)> {
+    let dest_path_clone = dest_path.clone();
+
+    let task = tokio::spawn(async move {
+        let file = TokioFile::create(&dest_path_clone).await
+            .map_err(|e| anyhow!("Cannot create FASTA file {}: {}", dest_path_clone.display(), e))?;
+        let mut writer = tokio::io::BufWriter::with_capacity(buffer_capacity, file);
+        let mut total_bytes = 0u64;
+
+        while let Some(item) = stream.next().await {
+            let bytes = item.to_bytes()
+                .map_err(|e| anyhow!("Failed to convert FASTA record to bytes: {}", e))?;
+            writer.write_all(&bytes).await
+                .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+            total_bytes += bytes.len() as u64;
+        }
+
+        writer.flush().await
+            .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
+
+        info!("FASTA written to {} ({} bytes)", dest_path_clone.display(), total_bytes);
+        Ok(total_bytes)
+    });
+
+    Ok((task, dest_path))
 }
 
 fn compare_read_ids_bytes(head1: &[u8], head2: &[u8]) -> bool {
