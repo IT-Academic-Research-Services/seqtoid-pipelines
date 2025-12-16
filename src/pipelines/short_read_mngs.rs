@@ -32,7 +32,7 @@ use tokio::fs;
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -53,7 +53,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
                           SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG};
 use crate::utils::blast::{consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
-                          TaxonCount};
+                          TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
@@ -267,19 +267,6 @@ pub struct AccessionHit {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContigSummaryEntry {
-    contig_name: String,
-    common_name: Option<String>,
-    category_name: Option<String>,
-    score: Option<f64>,
-    db_type: String,
-    reads: u64,
-    bases: u64,
-    species_taxid: i32,
-    genus_taxid: i32,
-    family_taxid: i32,
-}
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
@@ -3910,25 +3897,32 @@ pub async fn generate_m8_and_hit_summary(
 }
 
 
-pub async fn blast_contigs (
+
+pub async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
-    deduped_m8_stream: ReceiverStream<ParseOutput>, // deduped_m8
-    hit_summary_stream: ReceiverStream<ParseOutput>, // deduped_m8
+    deduped_m8_stream: ReceiverStream<ParseOutput>,
+    hit_summary_stream: ReceiverStream<ParseOutput>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
-    accession_map: Arc<AHashMap<String, AccessionHit>> ,  //hit_summary, but already done
-    taxon_counts: Vec<TaxonCount>, // orig_counts_with_dcr
-    assembled_contig_fasta: &PathBuf, //assembled_contig, CoverageOutputs -> contigs_ram_fasta
+    accession_map: Arc<AHashMap<String, AccessionHit>>,
+    taxon_counts: Vec<TaxonCount>,
+    assembled_contig_fasta: &PathBuf,
     read2contig: Arc<HashMap<String, String>>,
-    reference_fasta: &PathBuf, // reference_fasta
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>, //duplicate_cluster_sizes_path
+    reference_fasta: &PathBuf,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    blast_headroom: u64
-
-
-) -> Result<( AHashMap<String, Arc<ReadHit>>, Vec<TaxonCount>, Vec<ContigSummaryEntry>, Vec<JoinHandle<Result<()>>>,
-             Vec<oneshot::Receiver<Result<()>>>, Vec<NamedTempFile> )>{
+    blast_headroom: u64,
+) -> Result<(
+    AHashMap<String, Arc<ReadHit>>,
+    Vec<TaxonCount>,
+    Vec<ContigSummaryEntry>,
+    broadcast::Receiver<ParseOutput>,
+    broadcast::Receiver<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+    Vec<NamedTempFile>,
+)> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
@@ -3953,10 +3947,28 @@ pub async fn blast_contigs (
             &refined_hit_summary_path,
             &refined_counts_path,
             &contig_summary_path,
-        ).await?;
+        )
+            .await?;
 
         let final_read_dict = read_dict.lock().unwrap().clone();
-        return Ok(( final_read_dict, taxon_counts, vec![], cleanup_tasks, cleanup_receivers, temp_files ));
+
+        let (m8_tx, _) = broadcast::channel(1);
+        let (hit_tx, _) = broadcast::channel(1);
+        let m8_rx = m8_tx.subscribe();
+        let hit_rx = hit_tx.subscribe();
+        drop(m8_tx);
+        drop(hit_tx);
+
+        return Ok((
+            final_read_dict,
+            taxon_counts,
+            vec![],
+            m8_rx,
+            hit_rx,
+            cleanup_tasks,
+            cleanup_receivers,
+            temp_files,
+        ));
     }
 
     let temp_dir = choose_temp_dir(
@@ -3964,7 +3976,8 @@ pub async fn blast_contigs (
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         blast_headroom,
-    ).await?;
+    )
+        .await?;
 
     let blastdb_suffix = format!("{}_blastindex", db_type);
     let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
@@ -3974,9 +3987,13 @@ pub async fn blast_contigs (
 
     let makeblastdb_config = MakeblastdbConfig {
         input: reference_fasta.clone(),
-        dbtype: if db_type == NT_TAG { "nucl".to_string() } else { "prot".to_string() },
+        dbtype: if db_type == NT_TAG {
+            "nucl".to_string()
+        } else {
+            "prot".to_string()
+        },
         output: blastdb_path.clone(),
-        option_fields: HashMap::new()
+        option_fields: HashMap::new(),
     };
 
     let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
@@ -3991,13 +4008,13 @@ pub async fn blast_contigs (
         MAKEBLASTDB_TAG,
         makeblastdb_args,
         config.args.verbose,
-    ).await
+    )
+        .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: MAKEBLASTDB_TAG.to_string(),
             error: e.to_string(),
         })?;
     cleanup_tasks.push(makeblastdb_err_task);
-
 
     let blast_command = if db_type == NT_TAG { BLASTN_TAG } else { BLASTX_TAG };
 
@@ -4005,17 +4022,19 @@ pub async fn blast_contigs (
         let blastn_config = BlastnConfig {
             query: assembled_contig_fasta.clone(),
             db: blastdb_path.clone(),
-            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen".to_string(),
+            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
+                .to_string(),
             evalue: 1e-10,
             max_target_seqs: 5000,
             option_fields: HashMap::new(),
         };
 
-        generate_cli(BLASTN_TAG, &config, Some(&blastn_config))
-            .map_err(|e| PipelineError::ToolExecution {
+        generate_cli(BLASTN_TAG, &config, Some(&blastn_config)).map_err(|e| {
+            PipelineError::ToolExecution {
                 tool: BLASTN_TAG.to_string(),
                 error: e.to_string(),
-            })?
+            }
+        })?
     } else {
         let blastx_config = BlastxConfig {
             query: assembled_contig_fasta.clone(),
@@ -4026,25 +4045,21 @@ pub async fn blast_contigs (
             option_fields: HashMap::new(),
         };
 
-        generate_cli(BLASTX_TAG, &config, Some(&blastx_config))
-            .map_err(|e| PipelineError::ToolExecution {
+        generate_cli(BLASTX_TAG, &config, Some(&blastx_config)).map_err(|e| {
+            PipelineError::ToolExecution {
                 tool: BLASTX_TAG.to_string(),
                 error: e.to_string(),
-            })?
+            }
+        })?
     };
-
-    // let envs = if db_type == NT_TAG {
-    //     vec![("BATCH_SIZE".to_string(), "10000".to_string())]
-    // } else {
-    //     vec![]
-    // };
 
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
         blast_command,
         blast_args,
         config.args.verbose,
-    ).await
+    )
+        .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: blast_command.to_string(),
             error: e.to_string(),
@@ -4052,31 +4067,29 @@ pub async fn blast_contigs (
 
     cleanup_tasks.push(err_task);
 
-
     let blast_out_stream = parse_child_output(
         &mut blast_child,
         ChildStream::Stdout,
         ParseMode::Lines,
         config.base_buffer_size,
-    ).await
+    )
+        .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: "blastn/x".to_string(),
             error: e.to_string(),
         })?;
 
-    // Now feed blast_out_stream directly into top_m8
-    let (top_tx, top_rx) = channel(1024);
+    let (top_tx, top_rx) = mpsc::channel(1024);
     let top_handle = if db_type == NT_TAG {
         tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_tx))
     } else {
         tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_tx))
     };
 
-    let (contig2lineage_tx, contig2lineage_rx) = channel(1024);
-    let (read2blastm8_tx, read2blastm8_rx) = channel(1024);
-
-    let (updated_tx, updated_rx) = channel(1024);
-    let (added_tx, added_rx) = channel(1024);
+    let (contig2lineage_tx, contig2lineage_rx) = mpsc::channel(1024);
+    let (read2blastm8_tx, read2blastm8_rx) = mpsc::channel(1024);
+    let (updated_tx, updated_rx) = mpsc::channel(1024);
+    let (added_tx, added_rx) = mpsc::channel(1024);
 
     let update_handle = tokio::spawn(update_read_dict(
         read2contig.clone(),
@@ -4092,26 +4105,65 @@ pub async fn blast_contigs (
         added_tx,
     ));
 
-    let (refined_m8_tx, refined_m8_rx) = channel(2_000_000);
-    let (refined_hit_summary_tx, refined_hit_summary_rx) = channel(2_000_000);
+    // Broadcast channels for downstream merge
+    let (refined_m8_broadcast_tx, _) = broadcast::channel(2_000_000);
+    let (refined_hit_summary_broadcast_tx, _) = broadcast::channel(2_000_000);
 
-    let (updated_tx, updated_rx) = channel(1024);
-    let (added_tx, added_rx) = channel(1024);
+    let refined_m8_stream_out = refined_m8_broadcast_tx.subscribe();
+    let refined_hit_summary_stream_out = refined_hit_summary_broadcast_tx.subscribe();
+
+    // Local mpsc channels used by generate_m8_and_hit_summary
+    let (refined_m8_mpsc_tx, refined_m8_mpsc_rx) = mpsc::channel(2_000_000);
+    let (refined_hit_summary_mpsc_tx, refined_hit_summary_mpsc_rx) = mpsc::channel(2_000_000);
 
     let generate_m8_handle = tokio::spawn(generate_m8_and_hit_summary(
-        ReceiverStream::new(updated_rx),        // not used any more – we’ll ignore it
-        ReceiverStream::new(added_rx),         // not used any more
-        ReceiverStream::new(read2blastm8_rx),   // new BLAST hits (read → best hit)
-        hit_summary_stream,                   // original hit summary (teed)
-        deduped_m8_stream,                   // original deduped M8
-        refined_m8_tx.clone(),
-        refined_hit_summary_tx.clone(),
+        ReceiverStream::new(updated_rx),
+        ReceiverStream::new(added_rx),
+        ReceiverStream::new(read2blastm8_rx),
+        hit_summary_stream,
+        deduped_m8_stream,
+        refined_m8_mpsc_tx.clone(),
+        refined_hit_summary_mpsc_tx.clone(),
     ));
 
-    let (refined_counts_tx, refined_counts_rx) = channel(1024);
+    // Create new mpsc channels for internal aggregation
+    let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
+    let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
+
+    // Forwarding task: consume original mpsc, tee to broadcast + internal channel
+    let m8_forward_handle = tokio::spawn({
+        let mut rx = refined_m8_mpsc_rx;
+        let broadcast_tx = refined_m8_broadcast_tx.clone();
+        let counts_tx = refined_m8_for_counts_tx.clone();
+        async move {
+            while let Some(item) = rx.recv().await {
+                let _ = broadcast_tx.send(item.clone());
+                let _ = counts_tx.send(item).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    cleanup_tasks.push(m8_forward_handle);
+
+    let hit_forward_handle = tokio::spawn({
+        let mut rx = refined_hit_summary_mpsc_rx;
+        let broadcast_tx = refined_hit_summary_broadcast_tx.clone();
+        let counts_tx = refined_hit_for_counts_tx.clone();
+        async move {
+            while let Some(item) = rx.recv().await {
+                let _ = broadcast_tx.send(item.clone());
+                let _ = counts_tx.send(item).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    cleanup_tasks.push(hit_forward_handle);
+
+    // Internal taxon count aggregation now uses the teed channels
+    let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
     let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
-        ReceiverStream::new(refined_m8_rx),
-        ReceiverStream::new(refined_hit_summary_rx),
+        ReceiverStream::new(refined_m8_for_counts_rx),
+        ReceiverStream::new(refined_hit_for_counts_rx),
         db_type,
         lineage_map.clone(),
         should_keep_filter.clone(),
@@ -4128,16 +4180,15 @@ pub async fn blast_contigs (
         let line = String::from_utf8_lossy(&bytes);
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() >= 4 {
-            let contig  = fields[0].to_string();
-            let species  = fields[1].parse().unwrap_or(0);
-            let genus    = fields[2].parse().unwrap_or(0);
-            let family   = fields[3].parse().unwrap_or(0);
+            let contig = fields[0].to_string();
+            let species = fields[1].parse().unwrap_or(0);
+            let genus = fields[2].parse().unwrap_or(0);
+            let family = fields[3].parse().unwrap_or(0);
             contig2lineage.insert(contig, [species, genus, family]);
         }
     }
 
-
-    let (contig_summary_tx, contig_summary_rx) = channel(1024);
+    let (contig_summary_tx, contig_summary_rx) = mpsc::channel(1024);
     let contig_summary_handle = tokio::spawn(generate_contig_summary_json(
         read2contig.clone(),
         contig2lineage,
@@ -4180,15 +4231,19 @@ pub async fn blast_contigs (
     }
 
     let final_read_dict = read_dict.lock().unwrap().clone();
+
     Ok((
         final_read_dict,
         refined_counts,
         contig_summary,
+        refined_m8_stream_out,
+        refined_hit_summary_stream_out,
         cleanup_tasks,
         cleanup_receivers,
-        temp_files
+        temp_files,
     ))
 }
+
 
 
 
@@ -4857,15 +4912,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    //  Do everything else that does NOT depend on the results
-    //    (e.g. writing intermediate JSONs, logging, cleanup prep…)
 
 
 
     let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
         .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
 
-    let (nt_read_dict, nt_refined_counts, nt_contig_summary,
+    let (nt_read_dict, nt_refined_counts,
+        nt_contig_summary,  nt_refined_m8_stream_out,
+        nt_refined_hit_summary_stream_out,
         nt_cleanup_tasks, nt_cleanup_receivers,
         nt_temp_files) = nt_res?;
 
@@ -4873,12 +4928,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(nt_cleanup_receivers);
     temp_files.extend(nt_temp_files);
 
-    let (nr_read_dict, nr_refined_counts, nr_contig_summary,
+    let (nr_read_dict, nr_refined_counts,
+        nr_contig_summary, nr_refined_m8_stream_out,
+        nr_refined_hit_summary_stream_out,
         nr_cleanup_tasks, nr_cleanup_receivers,
         nr_temp_files) = nr_res?;
     cleanup_tasks.extend(nr_cleanup_tasks);
     cleanup_receivers.extend(nr_cleanup_receivers);
     temp_files.extend(nr_temp_files);
+
+
+    let merge_handle = tokio::spawn(compute_merged_taxon_counts(
+        config,
+        nt_refined_m8_stream_out,
+        nt_refined_hit_summary_stream_out,
+        nt_contig_summary,
+        nr_refined_m8_stream_out,
+        nr_refined_hit_summary_stream_out,
+        nr_contig_summary,
+        lineage_map.clone(),
+        should_keep_filter.clone(),
+        duplicate_cluster_sizes.clone(),
+        out_dir.join("refined.m8"),
+        out_dir.join("refined.hitsummary.tab"),
+        out_dir.join("refined_taxon_counts_with_dcr.json"),
+        out_dir.join("assembly_combined_contig_summary.json"),
+    ));
+
+    let () = merge_handle.await??;
 
 
     // *******************

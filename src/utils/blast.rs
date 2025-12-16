@@ -1,22 +1,48 @@
 // BLAST-related file functions and structures
 use std::collections::{HashMap, HashSet};
+use std::env::args;
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use log::{self, LevelFilter, debug, info, error, warn};
-use tokio::io::AsyncBufReadExt;
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
 use fst::Map;
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::mpsc::Sender;
-use crate::config::defs::{Taxid, Lineage, NT_TAG};
+use tokio::fs::File as TokioFile;
+use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
+use tokio_stream::wrappers::BroadcastStream;
+use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
+use crate::utils::file::write_byte_stream_to_file;
 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContigSummaryEntry {
+    contig_name: String,
+    common_name: Option<String>,
+    category_name: Option<String>,
+    score: Option<f64>,
+    db_type: String,
+    reads: u64,
+    bases: u64,
+    species_taxid: i32,
+    genus_taxid: i32,
+    family_taxid: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SpeciesAlignmentResults {
+    contig: Option<Taxid>,
+    read: Option<Taxid>,
+}
 
 /// Single BLAST m8 line
 #[derive(Debug, Clone, Default)]
@@ -507,5 +533,236 @@ pub async fn generate_taxon_count_json_from_m8(
             .map_err(|_| anyhow!("taxon count output channel dropped"))?;
     }
 
+    Ok(())
+}
+
+
+pub async fn compute_merged_taxon_counts(
+    config: Arc<RunConfig>,
+    nt_m8_stream: broadcast::Receiver<ParseOutput>,
+    nt_hit_summary_stream: broadcast::Receiver<ParseOutput>,
+    nt_contig_summary: Vec<ContigSummaryEntry>,
+
+    nr_m8_stream: broadcast::Receiver<ParseOutput>,
+    nr_hit_summary_stream: broadcast::Receiver<ParseOutput>,
+    nr_contig_summary: Vec<ContigSummaryEntry>,
+
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+
+    merged_m8_path: PathBuf,
+    merged_hitsummary_path: PathBuf,
+    merged_taxon_counts_path: PathBuf,
+    merged_contig_summary_path: PathBuf,
+) -> Result<()> {
+
+    // Load NR hit summary into memory
+    let mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults> = HashMap::with_capacity(80_000_000);
+
+    let mut nr_hit_stream_load = BroadcastStream::new(nr_hit_summary_stream.resubscribe());
+    while let Some(res) = nr_hit_stream_load.next().await {
+        let item = res.map_err(|e| anyhow!("NR hit broadcast error during load: {}", e))?;
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = trimmed.split('\t').collect();
+        if fields.len() < 10 {
+            warn!("Malformed NR hit summary line: {}", trimmed);
+            continue;
+        }
+
+        let read_id = fields[0].to_string();
+        let contig_taxid = fields[9].parse::<Taxid>().ok();
+        let read_taxid = fields[3].parse::<Taxid>().ok();
+
+        nr_alignment_per_read.insert(
+            read_id,
+            SpeciesAlignmentResults {
+                contig: contig_taxid,
+                read: read_taxid,
+            },
+        );
+    }
+    info!("Loaded {} NR alignments into memory", nr_alignment_per_read.len());
+
+    // Write merged m8 and hit summary to disk
+    let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
+    let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
+
+    // NT pass
+    let mut nt_m8_stream = BroadcastStream::new(nt_m8_stream.resubscribe());
+    let mut nt_hit_stream = BroadcastStream::new(nt_hit_summary_stream.resubscribe());
+
+    while let (Some(m8_res), Some(hit_res)) = (nt_m8_stream.next().await, nt_hit_stream.next().await) {
+        let m8_item = m8_res.map_err(|e| anyhow!("NT m8 error: {}", e))?;
+        let hit_item = hit_res.map_err(|e| anyhow!("NT hit error: {}", e))?;
+
+        let m8_bytes = m8_item.to_bytes()?;
+        let hit_bytes = hit_item.to_bytes()?;
+        let hit_line = String::from_utf8_lossy(&hit_bytes);
+        let hit_trimmed = hit_line.trim_end();
+        if hit_trimmed.is_empty() {
+            continue;
+        }
+
+        let hit_fields: Vec<&str> = hit_trimmed.split('\t').collect();
+        if hit_fields.len() < 10 {
+            warn!("Malformed NT hit line: {}", hit_trimmed);
+            continue;
+        }
+
+        let read_id = hit_fields[0];
+
+        let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
+        let nt_read = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+
+        let nr_align = nr_alignment_per_read.get(read_id);
+        let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
+        let has_nr_read = nr_align.map_or(false, |a| a.read.is_some());
+
+        if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
+            merged_m8_file.write_all(&m8_bytes).await?;
+            merged_m8_file.write_all(b"\n").await?;
+
+            let mut hit_with_source = hit_fields.iter().copied().collect::<Vec<&str>>();
+            hit_with_source.push(NT_TAG);
+            merged_hit_file
+                .write_all(hit_with_source.join("\t").as_bytes())
+                .await?;
+            merged_hit_file.write_all(b"\n").await?;
+
+            nr_alignment_per_read.remove(read_id);
+        }
+    }
+
+    // Remaining NR pass
+    let mut nr_m8_stream = BroadcastStream::new(nr_m8_stream.resubscribe());
+    let mut nr_hit_stream = BroadcastStream::new(nr_hit_summary_stream.resubscribe());
+
+    while let (Some(m8_res), Some(hit_res)) = (nr_m8_stream.next().await, nr_hit_stream.next().await) {
+        let m8_item = m8_res.map_err(|e| anyhow!("NR m8 error: {}", e))?;
+        let hit_item = hit_res.map_err(|e| anyhow!("NR hit error: {}", e))?;
+
+        let hit_bytes = hit_item.to_bytes()?;
+        let hit_line = String::from_utf8_lossy(&hit_bytes);
+        let hit_trimmed = hit_line.trim_end();
+        if hit_trimmed.is_empty() {
+            continue;
+        }
+
+        let hit_fields: Vec<&str> = hit_trimmed.split('\t').collect();
+        let read_id = hit_fields[0];
+
+        if nr_alignment_per_read.contains_key(read_id) {
+            let m8_bytes = m8_item.to_bytes()?;
+            merged_m8_file.write_all(&m8_bytes).await?;
+            merged_m8_file.write_all(b"\n").await?;
+
+            let mut hit_with_source = hit_fields.iter().copied().collect::<Vec<&str>>();
+            hit_with_source.push(NR_TAG);
+            merged_hit_file
+                .write_all(hit_with_source.join("\t").as_bytes())
+                .await?;
+            merged_hit_file.write_all(b"\n").await?;
+        }
+    }
+
+    merged_m8_file.flush().await?;
+    merged_hit_file.flush().await?;
+    drop(merged_m8_file);
+    drop(merged_hit_file);
+    info!("Merged alignment files written to disk");
+
+    // Stream merged files back for taxon counting
+    let (m8_tx, m8_rx) = mpsc::channel(4096);
+    let (hit_tx, hit_rx) = mpsc::channel(4096);
+
+    let m8_path_clone = merged_m8_path.clone();
+    let m8_task = tokio::spawn(async move {
+        let file = TokioFile::open(m8_path_clone).await?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        while reader.read_line(&mut line).await? > 0 {
+            if !line.trim_end().is_empty() {
+                let _ = m8_tx.send(ParseOutput::Bytes(Arc::new(line.as_bytes().to_vec()))).await;
+            }
+            line.clear();
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let hit_path_clone = merged_hitsummary_path.clone();
+    let hit_task = tokio::spawn(async move {
+        let file = TokioFile::open(hit_path_clone).await?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        while reader.read_line(&mut line).await? > 0 {
+            if !line.trim_end().is_empty() {
+                let _ = hit_tx.send(ParseOutput::Bytes(Arc::new(line.as_bytes().to_vec()))).await;
+            }
+            line.clear();
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let merged_taxon_counts_path_clone = merged_taxon_counts_path.clone();
+    let config_clone = config.clone();
+
+    let (json_tx, json_rx) = mpsc::channel(1024);
+    let write_task = tokio::spawn(async move {
+        write_byte_stream_to_file(
+            &merged_taxon_counts_path_clone,
+            ReceiverStream::new(json_rx),
+            Some(config_clone.base_buffer_size),
+        ).await
+    });
+
+    generate_taxon_count_json_from_m8(
+        ReceiverStream::new(m8_rx),
+        ReceiverStream::new(hit_rx),
+        "merged_NT_NR",
+        lineage_map.clone(),
+        should_keep_filter.clone(),
+        duplicate_cluster_sizes.clone(),
+        json_tx,
+    )
+        .await?;
+
+    m8_task.await??;
+    hit_task.await??;
+    write_task.await??;
+    info!("Merged taxon counts generated");
+
+    // Contig summary merge
+    let mut merged_contigs: HashMap<Taxid, Vec<ContigSummaryEntry>> = HashMap::new();
+    let mut nt_contig_names: HashSet<String> = HashSet::new();
+
+    for mut entry in nt_contig_summary {
+        entry.db_type = "merged_NT_NR".to_string();
+        nt_contig_names.insert(entry.contig_name.clone());
+        merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+    }
+
+    for mut entry in nr_contig_summary {
+        if !nt_contig_names.contains(&entry.contig_name) {
+            entry.db_type = "merged_NT_NR".to_string();
+            merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+        }
+    }
+
+    let final_contigs: Vec<ContigSummaryEntry> = merged_contigs.into_values().flatten().collect();
+
+    let json = serde_json::to_string_pretty(&final_contigs)?;
+    let mut out = BufWriter::new(TokioFile::create(&merged_contig_summary_path).await?);
+    out.write_all(json.as_bytes()).await?;
+    out.flush().await?;
+    info!("Merged contig summary written ({} entries)", final_contigs.len());
+
+    info!("compute_merged_taxon_counts complete");
     Ok(())
 }
