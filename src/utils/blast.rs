@@ -13,7 +13,7 @@ use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::fs::File as TokioFile;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
 use tokio_stream::wrappers::BroadcastStream;
@@ -39,9 +39,9 @@ pub struct ContigSummaryEntry {
 }
 
 #[derive(Debug, Clone, Default)]
-struct SpeciesAlignmentResults {
-    contig: Option<Taxid>,
-    read: Option<Taxid>,
+pub struct SpeciesAlignmentResults {
+    pub contig: Option<Taxid>,
+    pub read: Option<Taxid>,
 }
 
 /// Single BLAST m8 line
@@ -539,12 +539,12 @@ pub async fn generate_taxon_count_json_from_m8(
 
 pub async fn compute_merged_taxon_counts(
     config: Arc<RunConfig>,
-    nt_m8_stream: broadcast::Receiver<ParseOutput>,
-    nt_hit_summary_stream: broadcast::Receiver<ParseOutput>,
+    nt_m8_stream: mpsc::Receiver<ParseOutput>,
+    nt_hit_summary_stream: mpsc::Receiver<ParseOutput>,
     nt_contig_summary: Vec<ContigSummaryEntry>,
 
-    nr_m8_stream: broadcast::Receiver<ParseOutput>,
-    nr_hit_summary_stream: broadcast::Receiver<ParseOutput>,
+    nr_m8_stream: mpsc::Receiver<ParseOutput>,
+    nr_hit_summary_stream: mpsc::Receiver<ParseOutput>,
     nr_contig_summary: Vec<ContigSummaryEntry>,
 
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
@@ -555,53 +555,18 @@ pub async fn compute_merged_taxon_counts(
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
+
+    mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults>,
 ) -> Result<()> {
-
-    // Load NR hit summary into memory
-    let mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults> = HashMap::with_capacity(80_000_000);
-
-    let mut nr_hit_stream_load = BroadcastStream::new(nr_hit_summary_stream.resubscribe());
-    while let Some(res) = nr_hit_stream_load.next().await {
-        let item = res.map_err(|e| anyhow!("NR hit broadcast error during load: {}", e))?;
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let fields: Vec<&str> = trimmed.split('\t').collect();
-        if fields.len() < 10 {
-            warn!("Malformed NR hit summary line: {}", trimmed);
-            continue;
-        }
-
-        let read_id = fields[0].to_string();
-        let contig_taxid = fields[9].parse::<Taxid>().ok();
-        let read_taxid = fields[3].parse::<Taxid>().ok();
-
-        nr_alignment_per_read.insert(
-            read_id,
-            SpeciesAlignmentResults {
-                contig: contig_taxid,
-                read: read_taxid,
-            },
-        );
-    }
-    info!("Loaded {} NR alignments into memory", nr_alignment_per_read.len());
-
     // Write merged m8 and hit summary to disk
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
     let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
 
     // NT pass
-    let mut nt_m8_stream = BroadcastStream::new(nt_m8_stream.resubscribe());
-    let mut nt_hit_stream = BroadcastStream::new(nt_hit_summary_stream.resubscribe());
+    let mut nt_m8_stream = ReceiverStream::new(nt_m8_stream);
+    let mut nt_hit_stream = ReceiverStream::new(nt_hit_summary_stream);
 
-    while let (Some(m8_res), Some(hit_res)) = (nt_m8_stream.next().await, nt_hit_stream.next().await) {
-        let m8_item = m8_res.map_err(|e| anyhow!("NT m8 error: {}", e))?;
-        let hit_item = hit_res.map_err(|e| anyhow!("NT hit error: {}", e))?;
-
+    while let (Some(m8_item), Some(hit_item)) = (nt_m8_stream.next().await, nt_hit_stream.next().await) {
         let m8_bytes = m8_item.to_bytes()?;
         let hit_bytes = hit_item.to_bytes()?;
         let hit_line = String::from_utf8_lossy(&hit_bytes);
@@ -641,13 +606,10 @@ pub async fn compute_merged_taxon_counts(
     }
 
     // Remaining NR pass
-    let mut nr_m8_stream = BroadcastStream::new(nr_m8_stream.resubscribe());
-    let mut nr_hit_stream = BroadcastStream::new(nr_hit_summary_stream.resubscribe());
+    let mut nr_m8_stream = ReceiverStream::new(nr_m8_stream);
+    let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
 
-    while let (Some(m8_res), Some(hit_res)) = (nr_m8_stream.next().await, nr_hit_stream.next().await) {
-        let m8_item = m8_res.map_err(|e| anyhow!("NR m8 error: {}", e))?;
-        let hit_item = hit_res.map_err(|e| anyhow!("NR hit error: {}", e))?;
-
+    while let (Some(m8_item), Some(hit_item)) = (nr_m8_stream.next().await, nr_hit_stream.next().await) {
         let hit_bytes = hit_item.to_bytes()?;
         let hit_line = String::from_utf8_lossy(&hit_bytes);
         let hit_trimmed = hit_line.trim_end();
