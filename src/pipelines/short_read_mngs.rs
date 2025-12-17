@@ -4945,7 +4945,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     temp_files.extend(nr_temp_files);
 
 
-    let merge_handle = tokio::spawn(compute_merged_taxon_counts(
+    let compute_merged_taxon_handle = tokio::spawn(compute_merged_taxon_counts(
         config,
         nt_refined_m8_stream_out,
         nt_refined_hit_summary_stream_out,
@@ -4962,7 +4962,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("assembly_combined_contig_summary.json"),
     ));
 
-    let () = merge_handle.await??;
+    
+    let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
+    let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
+        &nt_refined_counts,
+        &nr_refined_counts,
+        refined_combined_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+    cleanup_tasks.push(refined_write_json_task);
 
 
     // *******************
@@ -5053,6 +5062,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
     // info!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
+
+
+    let compute_merged_taxon_result = compute_merged_taxon_handle.await??;
 
     // *******************
     // Cleanup
