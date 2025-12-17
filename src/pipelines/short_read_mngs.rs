@@ -32,7 +32,7 @@ use tokio::fs;
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -53,7 +53,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
                           SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG};
 use crate::utils::blast::{consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
-                          TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts};
+                          TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
@@ -78,7 +78,7 @@ use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::generate_info_from_bam_stream;
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
-                            parse_child_output, parse_fastq, read_child_output_to_vec, spawn_cmd,
+                            parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
                             stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
                             ChannelReader, ChildStream, ParseMode,
                             ParseOutput, ToBytes};
@@ -3917,8 +3917,8 @@ pub async fn blast_contigs(
     AHashMap<String, Arc<ReadHit>>,
     Vec<TaxonCount>,
     Vec<ContigSummaryEntry>,
-    broadcast::Receiver<ParseOutput>,
-    broadcast::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,   // ← plain mpsc, no broadcast
+    mpsc::Receiver<ParseOutput>,   // ← plain mpsc
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
@@ -3952,12 +3952,8 @@ pub async fn blast_contigs(
 
         let final_read_dict = read_dict.lock().unwrap().clone();
 
-        let (m8_tx, _) = broadcast::channel(1);
-        let (hit_tx, _) = broadcast::channel(1);
-        let m8_rx = m8_tx.subscribe();
-        let hit_rx = hit_tx.subscribe();
-        drop(m8_tx);
-        drop(hit_tx);
+        let (_m8_tx, m8_rx) = mpsc::channel(1);
+        let (_hit_tx, hit_rx) = mpsc::channel(1);
 
         return Ok((
             final_read_dict,
@@ -3978,13 +3974,6 @@ pub async fn blast_contigs(
         blast_headroom,
     )
         .await?;
-
-    // let envs = if db_type == NT_TAG {
-    //     vec![("BATCH_SIZE".to_string(), "10000".to_string())]
-    // } else {
-    //     vec![]
-    // };
-
 
     let blastdb_suffix = format!("{}_blastindex", db_type);
     let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
@@ -4112,16 +4101,9 @@ pub async fn blast_contigs(
         added_tx,
     ));
 
-    // Broadcast channels for downstream merge
-    let (refined_m8_broadcast_tx, _) = broadcast::channel(2_000_000);
-    let (refined_hit_summary_broadcast_tx, _) = broadcast::channel(2_000_000);
-
-    let refined_m8_stream_out = refined_m8_broadcast_tx.subscribe();
-    let refined_hit_summary_stream_out = refined_hit_summary_broadcast_tx.subscribe();
-
     // Local mpsc channels used by generate_m8_and_hit_summary
-    let (refined_m8_mpsc_tx, refined_m8_mpsc_rx) = mpsc::channel(2_000_000);
-    let (refined_hit_summary_mpsc_tx, refined_hit_summary_mpsc_rx) = mpsc::channel(2_000_000);
+    let (refined_m8_local_tx, refined_m8_local_rx) = mpsc::channel(2_000_000);
+    let (refined_hit_summary_local_tx, refined_hit_summary_local_rx) = mpsc::channel(2_000_000);
 
     let generate_m8_handle = tokio::spawn(generate_m8_and_hit_summary(
         ReceiverStream::new(updated_rx),
@@ -4129,22 +4111,26 @@ pub async fn blast_contigs(
         ReceiverStream::new(read2blastm8_rx),
         hit_summary_stream,
         deduped_m8_stream,
-        refined_m8_mpsc_tx.clone(),
-        refined_hit_summary_mpsc_tx.clone(),
+        refined_m8_local_tx.clone(),
+        refined_hit_summary_local_tx.clone(),
     ));
 
-    // Create new mpsc channels for internal aggregation
+    // Output mpsc channels (returned to caller)
+    let (refined_m8_tx, refined_m8_rx) = mpsc::channel(2_000_000);
+    let (refined_hit_summary_tx, refined_hit_summary_rx) = mpsc::channel(2_000_000);
+
+    // Internal channels for taxon counting (still needed)
     let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
     let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
 
-    // Forwarding task: consume original mpsc, tee to broadcast + internal channel
+    // Forwarding: local → output + counts
     let m8_forward_handle = tokio::spawn({
-        let mut rx = refined_m8_mpsc_rx;
-        let broadcast_tx = refined_m8_broadcast_tx.clone();
+        let mut rx = refined_m8_local_rx;
+        let out_tx = refined_m8_tx.clone();
         let counts_tx = refined_m8_for_counts_tx.clone();
         async move {
             while let Some(item) = rx.recv().await {
-                let _ = broadcast_tx.send(item.clone());
+                let _ = out_tx.send(item.clone()).await;
                 let _ = counts_tx.send(item).await;
             }
             Ok::<(), anyhow::Error>(())
@@ -4153,12 +4139,12 @@ pub async fn blast_contigs(
     cleanup_tasks.push(m8_forward_handle);
 
     let hit_forward_handle = tokio::spawn({
-        let mut rx = refined_hit_summary_mpsc_rx;
-        let broadcast_tx = refined_hit_summary_broadcast_tx.clone();
+        let mut rx = refined_hit_summary_local_rx;
+        let out_tx = refined_hit_summary_tx.clone();
         let counts_tx = refined_hit_for_counts_tx.clone();
         async move {
             while let Some(item) = rx.recv().await {
-                let _ = broadcast_tx.send(item.clone());
+                let _ = out_tx.send(item.clone()).await;
                 let _ = counts_tx.send(item).await;
             }
             Ok::<(), anyhow::Error>(())
@@ -4166,7 +4152,7 @@ pub async fn blast_contigs(
     });
     cleanup_tasks.push(hit_forward_handle);
 
-    // Internal taxon count aggregation now uses the teed channels
+    // Internal taxon count aggregation
     let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
     let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
         ReceiverStream::new(refined_m8_for_counts_rx),
@@ -4243,8 +4229,8 @@ pub async fn blast_contigs(
         final_read_dict,
         refined_counts,
         contig_summary,
-        refined_m8_stream_out,
-        refined_hit_summary_stream_out,
+        refined_m8_rx,
+        refined_hit_summary_rx,
         cleanup_tasks,
         cleanup_receivers,
         temp_files,
@@ -4935,6 +4921,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(nt_cleanup_receivers);
     temp_files.extend(nt_temp_files);
 
+
+    let (nt_m8_streams, nt_m8_rx) = t_junction(
+        ReceiverStream::new(nt_refined_m8_stream_out),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nt_m8".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_m8_rx);
+
+    let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
+    let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+
     let (nr_read_dict, nr_refined_counts,
         nr_contig_summary, nr_refined_m8_stream_out,
         nr_refined_hit_summary_stream_out,
@@ -4945,13 +4953,86 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     temp_files.extend(nr_temp_files);
 
 
+    let (nr_m8_streams, nr_m8_rx) = t_junction(
+        ReceiverStream::new(nr_refined_m8_stream_out),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nr_m8".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_m8_rx);
+
+    let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
+    let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
+        ReceiverStream::new(nr_refined_hit_summary_stream_out),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "validate_input".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_hitsummary_rx);
+
+    let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
+    let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    //prelod
+    let mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults> = HashMap::with_capacity(80_000_000);
+
+    let mut preload_stream = ReceiverStream::new(nr_hit_summary_preload);
+    while let Some(item) = preload_stream.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = trimmed.split('\t').collect();
+        if fields.len() < 10 {
+            warn!("Malformed NR hit summary line during preload: {}", trimmed);
+            continue;
+        }
+
+        let read_id = fields[0].to_string();
+        let contig_taxid = fields[9].parse::<Taxid>().ok();
+        let read_taxid = fields[3].parse::<Taxid>().ok();
+
+        nr_alignment_per_read.insert(
+            read_id,
+            SpeciesAlignmentResults {
+                contig: contig_taxid,
+                read: read_taxid,
+            },
+        );
+    }
+    info!("Preloaded {} NR alignments into memory for merge", nr_alignment_per_read.len());
+
+
     let compute_merged_taxon_handle = tokio::spawn(compute_merged_taxon_counts(
-        config,
-        nt_refined_m8_stream_out,
+        config.clone(),
+        nt_m8_merge,
         nt_refined_hit_summary_stream_out,
         nt_contig_summary,
-        nr_refined_m8_stream_out,
-        nr_refined_hit_summary_stream_out,
+        nr_m8_merge,
+        nr_hit_summary_merge,
         nr_contig_summary,
         lineage_map.clone(),
         should_keep_filter.clone(),
@@ -4960,6 +5041,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("refined.hitsummary.tab"),
         out_dir.join("refined_taxon_counts_with_dcr.json"),
         out_dir.join("assembly_combined_contig_summary.json"),
+        nr_alignment_per_read
     ));
 
     
@@ -4973,6 +5055,55 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
     cleanup_tasks.push(refined_write_json_task);
 
+
+    // Build refined accession maps
+    let nt_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_map)).await
+        .map_err(|e| PipelineError::Other(anyhow!("NT refined accession map failed: {}", e)))?;
+
+    let nr_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_map)).await
+        .map_err(|e| PipelineError::Other(anyhow!("NR refined accession map failed: {}", e)))?;
+
+
+    // Contig FASTA stream (from assembly)
+    // ───────────────────────────────────────────────────────────────
+    let contigs_fasta = assembly_outputs.contigs_fasta.clone();
+    let contigs_file = tokio::fs::File::open(&contigs_fasta).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
+
+    let contigs_rx = parse_fasta(contigs_file, 32768).await
+        .map_err(|e| PipelineError::Other(anyhow!("parse_fasta failed: {}", e)))?;
+
+    let mut contigs_stream = ReceiverStream::new(contigs_rx);
+
+    // Empty cluster stream (contigs have no duplicates)
+    let (_cluster_tx, cluster_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(_cluster_tx);
+    let contigs_cluster_stream = ReceiverStream::new(cluster_rx);
+
+    let assembly_dir = out_dir.join("assembly");
+    tokio::fs::create_dir_all(&assembly_dir).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
+
+    let (annotated_path, unidentified_path, _unique_path_opt, mut annot_tasks, mut annot_rxs) =
+        generate_annotated_fasta(
+            config.clone(),
+            contigs_stream,
+            contigs_cluster_stream,
+            nt_refined_map,
+            nr_refined_map,
+            &assembly_dir,
+            sample_base_buf.clone(),
+        )
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+
+
+    let refined_annotated_merged_fa = assembly_dir.join("refined_annotated_merged_fa");
+    let refined_unidentified_fa = assembly_dir.join("refined_unidentified_fa");
+    tokio::fs::rename(&annotated_path, &refined_annotated_merged_fa).await?;
+    tokio::fs::rename(&unidentified_path, &refined_unidentified_fa).await?;
+    cleanup_tasks.append(&mut annot_tasks);
+    cleanup_receivers.append(&mut annot_rxs);
 
     // *******************
     // Results retrieval
