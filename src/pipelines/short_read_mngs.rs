@@ -3979,6 +3979,13 @@ pub async fn blast_contigs(
     )
         .await?;
 
+    // let envs = if db_type == NT_TAG {
+    //     vec![("BATCH_SIZE".to_string(), "10000".to_string())]
+    // } else {
+    //     vec![]
+    // };
+
+
     let blastdb_suffix = format!("{}_blastindex", db_type);
     let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
         .map_err(|e| PipelineError::Other(e.into()))?;
