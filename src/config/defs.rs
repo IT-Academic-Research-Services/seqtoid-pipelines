@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use rand::rngs::StdRng;
 use tokio::task::JoinError;
 use serde_json::Error as SerdeJsonError;
+use serde::{Deserialize, Serialize};
 use log::LevelFilter;
 
 use crate::cli::Arguments;
@@ -187,6 +188,14 @@ pub struct RunConfig {
     pub available_ram: u64,
     pub rng: StdRng,
     pub log_level: LevelFilter,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaxonSeqLocation {
+    pub taxid: i32,
+    pub first_byte: u64,
+    pub last_byte: u64,
+    pub hit_type: String,
 }
 
 impl RunConfig {

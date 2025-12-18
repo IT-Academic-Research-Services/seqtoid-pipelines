@@ -68,7 +68,7 @@ use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
-                          read_fastq, stream_record_counter, write_fasta_stream_to_file, SequenceRecord, generate_taxid_fasta};
+                          read_fastq, stream_record_counter, write_fasta_stream_to_file, SequenceRecord, generate_taxid_fasta, generate_taxid_locator};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
@@ -5065,7 +5065,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
     let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;    // ← for generate_taxid_fasta
+    let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     //prelod
     let mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults> = HashMap::with_capacity(80_000_000);
@@ -5199,12 +5199,32 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(taxid_main_task);
 
 
+    let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
+        ReceiverStream::new(taxid_mapped_rx),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "taxid_mapped".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(taxid_mapped_rx);
+
+    let mut taxid_mapped_streams_iter = taxid_mapped_streams.into_iter();
+    let taxid_mapped_file = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let taxid_mapped_locator = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    
+
     let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
     let combined_path = assembly_dir.join("refined_taxid_annot_fasta");
 
 
     let write_mapped_handle = write_fasta_stream_to_file(
-        ReceiverStream::new(taxid_mapped_rx),
+        ReceiverStream::new(taxid_mapped_file),
         mapped_path.clone(),
         config.base_buffer_size,
     );
@@ -5216,6 +5236,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.base_buffer_size,
     );
     cleanup_tasks.push(write_combined_handle);
+
+
+    let assembly_dir = out_dir.join("assembly");
+    
+    let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
+        taxid_mapped_locator, // directly pass the receiver
+        assembly_dir,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
+    
+    cleanup_tasks.append(&mut locator_tasks);
+    info!("Taxid locator files generated: {:?}", locator_outputs);
 
 
 

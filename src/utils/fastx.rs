@@ -25,14 +25,15 @@ use tokio::fs::File as TokioFile;
 use futures::future::try_join_all;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
+use tokio::sync::mpsc::Receiver;
 use memchr::memmem;
 use fst::{MapBuilder};
 
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE};
-use crate::utils::taxonomy::get_valid_lineage;
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError};
+use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -1423,6 +1424,139 @@ pub async fn generate_taxid_fasta(
         main_task,
     ))
 }
+
+
+
+pub async fn generate_taxid_locator(
+    fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
+    assembly_dir: PathBuf,
+) -> Result<
+    (
+        Vec<PathBuf>,
+        Vec<JoinHandle<Result<()>>>,
+        Vec<Receiver<Result<()>>>,
+    ),
+    PipelineError,
+> {
+
+    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
+    let mut records: Vec<(String, String)> = Vec::with_capacity(1_000_000);
+
+    while let Some(item) = fasta_stream.next().await {
+        let bytes = item
+            .to_bytes()
+            .map_err(|e| PipelineError::Other(anyhow!("ParseOutput to_bytes failed: {}", e)))?;
+
+        if bytes.is_empty() {
+            continue;
+        }
+
+        let record_str = String::from_utf8(bytes.to_vec())
+            .map_err(|e| PipelineError::Other(anyhow!("Invalid UTF-8 in FASTA record: {}", e)))?;
+
+        let mut lines = record_str.lines();
+        let header_line = match lines.next() {
+            Some(l) => l,
+            None => continue,
+        };
+        let seq_line = match lines.next() {
+            Some(l) => l,
+            None => {
+                warn!("FASTA record missing sequence line");
+                continue;
+            }
+        };
+
+        if !header_line.starts_with('>') {
+            warn!("Invalid FASTA header (missing '>'): {}", header_line);
+            continue;
+        }
+
+        let header = header_line[1..].trim().to_string(); // strip '>'
+        let seq = seq_line.trim().to_string();
+
+        records.push((header, seq));
+    }
+
+    info!("Collected {} mapped contigs for taxid locator generation", records.len());
+
+    if records.is_empty() {
+        // Write empty outputs
+        let empty_paths = vec![
+            assembly_dir.join("refined_taxid_annot_sorted_nt.fasta"),
+            assembly_dir.join("refined_taxid_annot_sorted_nr.fasta"),
+        ];
+        return Ok((empty_paths, vec![], vec![]));
+    }
+
+    let records_arc = Arc::new(records);
+
+    let levels = ["species", "genus", "family"];
+    let hit_types = ["NT", "NR"];
+
+    let mut output_paths: Vec<PathBuf> = Vec::new();
+    let mut locator_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+
+    for &level in &levels {
+        for &hit_type in &hit_types {
+            let taxid_field = format!("{}_{}", level, hit_type.to_lowercase());
+
+            let fa_name = if level == "species" {
+                format!("refined_taxid_annot_sorted_{}.fasta", hit_type.to_lowercase())
+            } else {
+                format!("refined_taxid_annot_sorted_{}_{}.fasta", level, hit_type.to_lowercase())
+            };
+            let output_fa = assembly_dir.join(&fa_name);
+            let output_json = assembly_dir.join(format!(
+                "refined_taxid_locations_{}_{}.json",
+                level,
+                hit_type.to_lowercase()
+            ));
+
+            let records_clone = records_arc.clone();
+            let taxid_field_clone = taxid_field.clone();
+            let hit_type_clone = hit_type.to_string();
+            let output_fa_clone = output_fa.clone();
+            let output_json_clone = output_json.clone();
+
+            let handle = tokio::task::spawn_blocking(move || {
+                generate_locator_work(
+                    records_clone,
+                    taxid_field_clone,
+                    hit_type_clone,
+                    output_fa_clone,
+                    output_json_clone,
+                )
+            });
+
+            locator_tasks.push(handle);
+
+            output_paths.push(output_fa);
+            output_paths.push(output_json);
+        }
+    }
+
+    let json_paths: Vec<PathBuf> = output_paths
+        .iter()
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .cloned()
+        .collect();
+
+    let combined_path = assembly_dir.join("refined_taxid_locations_combined.json");
+    let combined_path_for_worker = combined_path.clone(); // ← explicit clone
+
+    let combine_handle = tokio::task::spawn_blocking(move || {
+        combine_taxon_loc_json(json_paths, combined_path_for_worker)
+    });
+
+    locator_tasks.push(combine_handle);
+    output_paths.push(combined_path);
+
+    Ok((output_paths, locator_tasks, vec![]))
+}
+
+
+
 
 #[cfg(test)]
 mod tests {
