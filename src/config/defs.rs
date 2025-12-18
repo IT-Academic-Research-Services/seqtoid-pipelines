@@ -52,6 +52,8 @@ pub const INVALID_CALL_BASE_ID: i32 = -100;
 pub const LOG_NORMAL_POSITIVE_DOUBLE: f64 = 1e-200;
 pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 
+pub const CONFORMING_PREAMBLE: &str = ">family_nr:-300:family_nt:-300:genus_nr:-200:genus_nt:-200:species_nr:-100:species_nt:-100:";
+
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();

@@ -23,6 +23,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
 use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
 use crate::utils::streams::ParseOutput;
+
+const SPECIES_NON_SPECIFIC: Taxid = -100;
+const GENUS_NON_SPECIFIC: Taxid = -200;
+const FAMILY_NON_SPECIFIC: Taxid = -300;
+
+const NULL_TAXID: Taxid = -1;
+const NULL_LINEAGE: Lineage = [NULL_TAXID; 3];
+
 // *******************
 // DB creation functions
 // *******************
@@ -575,4 +583,31 @@ pub fn validate_taxid_lineage(
     }
 
     cleaned
+}
+
+
+pub fn get_valid_lineage(
+    hits_by_read_id: &AHashMap<String, (Taxid, u8)>,     // contig_id → (taxid, level)
+    lineage_map: &Arc<AHashMap<Taxid, Lineage>>,
+    read_id: &str,
+) -> Lineage {
+    let (hit_taxid, hit_level) = hits_by_read_id
+        .get(read_id)
+        .copied()
+        .unwrap_or((-1, 255)); // 255 = invalid level
+
+    if hit_taxid <= 0 {
+        return NULL_LINEAGE;
+    }
+
+    if hit_level == 1 {
+
+        lineage_map
+            .get(&hit_taxid)
+            .copied()
+            .unwrap_or(NULL_LINEAGE)
+    } else {
+
+        [SPECIES_NON_SPECIFIC, GENUS_NON_SPECIFIC, FAMILY_NON_SPECIFIC]
+    }
 }
