@@ -12,3 +12,4 @@ pub mod system;
 pub mod paf;
 pub mod blast;
 pub mod taxonomy;
+mod coverage_viz;
