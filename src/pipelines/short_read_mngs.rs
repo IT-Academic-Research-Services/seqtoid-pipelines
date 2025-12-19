@@ -2795,11 +2795,17 @@ pub async fn process_assembly(
     let raw_scaffolds_path = work_dir.join("scaffolds.fasta");
     let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
 
-    let spades_success = raw_contigs_path.exists()
-        && fs::metadata(&raw_contigs_path)
-        .await
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let spades_success = async {
+        match fs::metadata(&raw_contigs_path).await {
+            Ok(meta) => meta.len() > 0 && meta.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                warn!("Failed to read contigs.fasta metadata: {}", e);
+                false
+            }
+        }
+    }
+        .await;
 
     if !spades_success {
         let reason = if !raw_contigs_path.exists() {
@@ -4606,7 +4612,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
         call_summary_stream,
-        3,
+        4,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -4621,6 +4627,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
     let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream), 0));
@@ -4680,7 +4687,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_streams_iter = nr_streams.into_iter();
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_acc_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_initial_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
@@ -4752,14 +4759,53 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let unidentified_path = assembly_dir.join("unidentified.fa");
     let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
 
-    cleanup_tasks.push(write_fasta_stream_to_file(
+
+    let (initial_annotated_streams, initial_annotated_done_rx) = t_junction(
         ReceiverStream::new(annotated_rx),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_annotated_done_rx);
+    let mut initial_annotated_streams_iter = initial_annotated_streams.into_iter();
+    let initial_annotated_file_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_annotated_taxon_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (initial_unidentified_streams, initial_unidentified_done_rx) = t_junction(
+        ReceiverStream::new(unidentified_rx),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_unidentified_done_rx);
+    let mut initial_unidentified_streams_iter = initial_unidentified_streams.into_iter();
+    let initial_unidentified_file_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_unidentified_taxon_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        ReceiverStream::new(initial_annotated_file_stream),
         annotated_path.clone(),
         config.base_buffer_size,
     ));
 
     cleanup_tasks.push(write_fasta_stream_to_file(
-        ReceiverStream::new(unidentified_rx),
+        ReceiverStream::new(initial_unidentified_file_stream),
         unidentified_path.clone(),
         config.base_buffer_size,
     ));
@@ -5201,7 +5247,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
         ReceiverStream::new(taxid_mapped_rx),
-        3,
+        2,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -5217,7 +5263,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut taxid_mapped_streams_iter = taxid_mapped_streams.into_iter();
     let taxid_mapped_file = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let taxid_mapped_locator = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    
+
 
     let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
     let combined_path = assembly_dir.join("refined_taxid_annot_fasta");
@@ -5239,16 +5285,119 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let assembly_dir = out_dir.join("assembly");
-    
+
     let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
         taxid_mapped_locator, // directly pass the receiver
         assembly_dir,
     )
         .await
         .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
-    
+
     cleanup_tasks.append(&mut locator_tasks);
     info!("Taxid locator files generated: {:?}", locator_outputs);
+
+
+    // *******************
+    // Experimental
+    // *******************
+
+    let (
+        initial_taxid_mapped_rx,
+        initial_taxid_combined_rx,
+        initial_load_nt_task,
+        initial_load_nr_task,
+        initial_taxid_main_task,
+    ) = generate_taxid_fasta(
+        ReceiverStream::new(initial_annotated_taxon_stream),
+        ReceiverStream::new(initial_unidentified_taxon_stream),
+        ReceiverStream::new(nt_initial_stream),
+        ReceiverStream::new(nr_initial_stream),
+        lineage_map.clone(),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_fasta failed: {}", e)))?;
+
+    cleanup_tasks.push(initial_load_nt_task);
+    cleanup_tasks.push(initial_load_nr_task);
+    cleanup_tasks.push(initial_taxid_main_task);
+
+    let experimental_dir = out_dir.join("experimental");
+    tokio::fs::create_dir_all(&experimental_dir).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create experimental dir: {}", e)))?;
+
+    let initial_mapped_path = experimental_dir.join("taxid_annot_mapped_only.fasta");
+    let initial_combined_path = experimental_dir.join("taxid_annot.fasta");
+
+    let (initial_taxid_mapped_streams, initial_taxid_mapped_rx) = t_junction(
+        ReceiverStream::new(initial_taxid_mapped_rx),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "initial_taxid_mapped".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_taxid_mapped_rx);
+
+    let mut initial_taxid_mapped_streams_iter = initial_taxid_mapped_streams.into_iter();
+    let initial_taxid_mapped_file = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
+    let initial_taxid_mapped_locator = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_taxid_mapped_count = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (initial_taxid_combined_streams, initial_taxid_combined_rx) = t_junction(
+        ReceiverStream::new(initial_taxid_combined_rx),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "initial_taxid_combined".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_taxid_combined_rx);
+
+    let mut initial_taxid_combined_streams_iter = initial_taxid_combined_streams.into_iter();
+    let initial_taxid_combined_file = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
+    let initial_taxid_combined_count = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let initial_write_mapped_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(initial_taxid_mapped_file), // Clone rx if needed for logging
+        initial_mapped_path.clone(),
+        config.base_buffer_size,
+    );
+    cleanup_tasks.push(initial_write_mapped_handle);
+
+    let initial_write_combined_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(initial_taxid_combined_file),
+        initial_combined_path.clone(),
+        config.base_buffer_size,
+    );
+    cleanup_tasks.push(initial_write_combined_handle);
+
+
+    let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false).await?;
+    let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false).await?;
+    info!("Experimental: {} mapped, {} combined records", initial_mapped_count, initial_combined_count);
+
+
+    let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
+        initial_taxid_mapped_locator,
+        experimental_dir.clone(),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e)))?;
+
+    cleanup_tasks.append(&mut initial_locator_tasks);
+    info!("Experimental taxid locator files generated: {:?}", initial_locator_outputs);
 
 
 
@@ -5359,6 +5508,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?
             .map_err(|e| PipelineError::Other(e))?;
     }
+
 
     drop(temp_files);
     drop(temp_dirs);
