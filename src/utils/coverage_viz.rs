@@ -9,11 +9,11 @@ use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader as TokioBufReader};
-
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 use crate::utils::blast::M8Record;
-
+use crate::utils::streams::{ParseOutput, ToBytes};
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
@@ -102,13 +102,11 @@ struct CoverageBin {
 
 
 pub async fn generate_coverage_viz(
-    _refined_gsnap_reassigned_m8: Box<dyn AsyncRead + Unpin + Send>, // Unused in original
-    refined_gsnap_hitsummary2_tab: Box<dyn AsyncRead + Unpin + Send>,
-    refined_gsnap_blast_top_m8: Box<dyn AsyncRead + Unpin + Send>,
+    refined_gsnap_hitsummary2_tab: ReceiverStream<ParseOutput>,
+    refined_gsnap_blast_top_m8: ReceiverStream<ParseOutput>,
     contig_coverage_json: PathBuf,
     contig_stats_json: PathBuf,
-    _contigs_fasta: Box<dyn AsyncRead + Unpin + Send>, // Byte ranges not used in final viz
-    gsnap_deduped_m8: Box<dyn AsyncRead + Unpin + Send>,
+    gsnap_deduped_m8: ReceiverStream<ParseOutput>,
     nt_info_db: PathBuf,
     output_dir: PathBuf,
     max_num_bins_coverage: Option<usize>,
@@ -161,11 +159,11 @@ pub async fn generate_coverage_viz(
 }
 
 async fn prepare_data(
-    hit_summary: Box<dyn AsyncRead + Unpin + Send>,
-    blast_top_m8: Box<dyn AsyncRead + Unpin + Send>,
+    hit_summary: ReceiverStream<ParseOutput>,
+    blast_top_m8: ReceiverStream<ParseOutput>,
     contig_coverage_json: &Path,
     contig_stats_json: &Path,
-    gsnap_deduped_m8: Box<dyn AsyncRead + Unpin + Send>,
+    gsnap_deduped_m8: ReceiverStream<ParseOutput>,
     info_dict: HashMap<String, (String, u64)>,
     min_contig_size: u64,
     num_accessions_per_taxon: usize,
@@ -187,7 +185,7 @@ async fn prepare_data(
 
     augment_accession_data_with_info(&info_dict, &mut accession_data);
 
-    let assigned_reads = get_unassigned_reads_set(&accession_data);  // Renamed for clarity (misnamed in Python as "unassigned")
+    let assigned_reads = get_unassigned_reads_set(&accession_data);  // actually assigned, per Python
 
     let mut contig_data = generate_contig_data(blast_top_m8, &valid_contigs).await?;
 
@@ -236,22 +234,22 @@ fn get_valid_contigs_with_read_counts(
 }
 
 async fn generate_accession_data(
-    mut hit_summary: Box<dyn AsyncRead + Unpin + Send>,
+    mut hit_summary: ReceiverStream<ParseOutput>,
     valid_contigs: &HashMap<String, u64>,
 ) -> Result<(HashMap<String, AccessionData>, HashMap<String, TaxonData>)> {
     let mut accession_data: HashMap<String, AccessionData> = HashMap::new();
     let mut taxon_data: HashMap<String, TaxonData> = HashMap::new();
 
-    let mut reader = TokioBufReader::new(hit_summary);
-    let mut line = String::new();
     let mut line_count = 0;
 
-    while reader.read_line(&mut line).await? > 0 {
+    while let Some(item) = hit_summary.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
             log::info!("Processed {} hit_summary lines", line_count);
         }
 
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
         let fields: Vec<&str> = line.trim().split('\t').collect();
 
         if fields.len() >= 12 && valid_contigs.contains_key(fields[7]) {
@@ -269,8 +267,6 @@ async fn generate_accession_data(
             taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
             accession_data.entry(acc).or_default().reads.push(read);
         }
-
-        line.clear();
     }
 
     for td in taxon_data.values_mut() {
@@ -329,24 +325,23 @@ fn get_unassigned_reads_set(accession_data: &HashMap<String, AccessionData>) -> 
 }
 
 async fn generate_contig_data(
-    mut blast_top_m8: Box<dyn AsyncRead + Unpin + Send>,
+    mut blast_top_m8: ReceiverStream<ParseOutput>,
     valid_contigs: &HashMap<String, u64>,
 ) -> Result<HashMap<String, Vec<ContigHit>>> {
     let mut contig_data: HashMap<String, Vec<ContigHit>> = HashMap::new();
 
-    let mut reader = TokioBufReader::new(blast_top_m8);
-    let mut line = String::new();
     let mut line_count = 0;
 
-    while reader.read_line(&mut line).await? > 0 {
+    while let Some(item) = blast_top_m8.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
             log::info!("Processed {} blast_top_m8 lines", line_count);
         }
 
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
         let line_trim = line.trim_end();
         if line_trim.is_empty() {
-            line.clear();
             continue;
         }
 
@@ -354,14 +349,12 @@ async fn generate_contig_data(
             Ok(record) => record,
             Err(e) => {
                 warn!("Failed to parse m8 line: {} - {}", line_trim, e);
-                line.clear();
                 continue;
             }
         };
 
         let contig_name = m8.qname.clone();
         if !valid_contigs.contains_key(&contig_name) {
-            line.clear();
             continue;
         }
 
@@ -379,32 +372,29 @@ async fn generate_contig_data(
         };
 
         contig_data.entry(contig_name).or_default().push(hit);
-
-        line.clear();
     }
 
     Ok(contig_data)
 }
 
 async fn generate_read_data(
-    mut gsnap_deduped_m8: Box<dyn AsyncRead + Unpin + Send>,
-    assigned_reads: &HashSet<String>,  // Renamed for clarity (misnamed "unassigned" in Python)
+    mut gsnap_deduped_m8: ReceiverStream<ParseOutput>,
+    assigned_reads: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<ReadHit>>> {
     let mut read_data: HashMap<String, Vec<ReadHit>> = HashMap::new();
 
-    let mut reader = TokioBufReader::new(gsnap_deduped_m8);
-    let mut line = String::new();
     let mut line_count = 0;
 
-    while reader.read_line(&mut line).await? > 0 {
+    while let Some(item) = gsnap_deduped_m8.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
             log::info!("Processed {} gsnap_deduped_m8 lines", line_count);
         }
 
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
         let line_trim = line.trim_end();
         if line_trim.is_empty() {
-            line.clear();
             continue;
         }
 
@@ -412,14 +402,12 @@ async fn generate_read_data(
             Ok(record) => record,
             Err(e) => {
                 warn!("Failed to parse m8 line: {} - {}", line_trim, e);
-                line.clear();
                 continue;
             }
         };
 
         let read_name = m8.qname.clone();
         if assigned_reads.contains(&read_name) {
-            line.clear();
             continue;
         }
 
@@ -434,8 +422,6 @@ async fn generate_read_data(
         };
 
         read_data.entry(read_name).or_default().push(hit);
-
-        line.clear();
     }
 
     Ok(read_data)
@@ -491,40 +477,28 @@ fn generate_coverage_viz_data(
     read_data: &HashMap<String, Vec<ReadHit>>,
     max_num_bins: usize,
 ) -> Result<HashMap<String, CoverageVizData>> {
-    // Collect results from all threads into a Vec first
-    let viz_results: Vec<(String, CoverageVizData)> = accession_data
+    // Collect results in parallel into a Vec, then build HashMap sequentially
+    let viz_results: Result<Vec<(String, CoverageVizData)>> = accession_data
         .par_iter()
-        .filter_map(|(acc_id, acc_obj)| {
+        .map(|(acc_id, acc_obj)| {
             let total_len = acc_obj.total_length as f64;
             if total_len == 0.0 {
-                return None; // Skip zero-length accessions
+                return Err(anyhow!("Zero length accession: {}", acc_id));
             }
 
             let num_bins = max_num_bins.min(total_len as usize);
             let bin_size = total_len / num_bins as f64;
 
-            let (coverage, _) = match calculate_accession_coverage(
+            let (coverage, _) = calculate_accession_coverage(
                 acc_id,
                 acc_obj,
                 contig_data,
                 read_data,
                 num_bins,
                 bin_size,
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("Failed coverage calc for {}: {}", acc_id, e);
-                    return None;
-                }
-            };
+            )?;
 
-            let stats = match calculate_accession_stats(acc_obj, contig_data, read_data, total_len) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed stats calc for {}: {}", acc_id, e);
-                    return None;
-                }
-            };
+            let stats = calculate_accession_stats(acc_obj, contig_data, read_data, total_len)?;
 
             let viz = CoverageVizData {
                 total_length: acc_obj.total_length,
@@ -538,9 +512,11 @@ fn generate_coverage_viz_data(
                 avg_prop_mismatch: format_percent(stats.avg_prop_mismatch),
             };
 
-            Some((acc_id.clone(), viz))
+            Ok((acc_id.clone(), viz))
         })
         .collect();
+
+    let viz_results = viz_results?;
 
     let mut result = HashMap::with_capacity(viz_results.len());
     for (acc_id, viz) in viz_results {
@@ -560,7 +536,6 @@ fn calculate_accession_coverage(
 ) -> Result<(Vec<[f64; 5]>, f64)> {
     let mut coverage = vec![CoverageBin::default(); num_bins];
 
-    // Process contigs
     for contig_name in &acc_obj.contigs {
         if let Some(hits) = contig_data.get(contig_name) {
             for hit in hits {
@@ -617,7 +592,6 @@ fn calculate_accession_coverage(
         }
     }
 
-    // Process reads
     for read_name in &acc_obj.reads {
         if let Some(hits) = read_data.get(read_name) {
             for hit in hits {
@@ -702,7 +676,6 @@ fn calculate_accession_stats(
     let mut hit_count = 0usize;
     let mut endpoints = Vec::new();
 
-    // Contigs
     for contig in &acc_obj.contigs {
         if let Some(hits) = contig_data.get(contig) {
             for hit in hits {
@@ -724,7 +697,6 @@ fn calculate_accession_stats(
         }
     }
 
-    // Reads
     for read in &acc_obj.reads {
         if let Some(hits) = read_data.get(read) {
             for hit in hits {
