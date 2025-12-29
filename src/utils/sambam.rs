@@ -10,7 +10,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
+
 use crate::utils::streams::ParseOutput;
+use crate::config::defs::{ClusterInfo, DuplicateClusters};
 
 pub async fn stream_sam_alignment_counter(
     rx: mpsc::Receiver<ParseOutput>,
@@ -46,7 +48,7 @@ fn anyhow_to_io(e: anyhow::Error) -> io::Error {
 
 pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
-    duplicate_cluster_sizes: &HashMap<String, u64>,
+    duplicate_clusters: &Arc<HashMap<String, ClusterInfo>>,
     min_contig_size: usize,
 ) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
 
@@ -101,7 +103,12 @@ pub async fn generate_info_from_bam_stream(
                     .0
                     .to_string();
                 read2contig.insert(read_name.clone(), contig_name.clone());
-                let cluster_size = duplicate_cluster_sizes.get(&read_name).copied().unwrap_or(1);
+
+                let cluster_size = duplicate_clusters
+                    .get(&read_name)
+                    .map(|cluster| cluster.size)
+                    .unwrap_or(1u64);
+                
                 *contig_stats.entry(contig_name.clone()).or_insert(0u64) += cluster_size;
                 *contig_unique_counts.entry(contig_name).or_insert(0usize) += 1;
             }

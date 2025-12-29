@@ -198,6 +198,14 @@ pub struct TaxonSeqLocation {
     pub hit_type: String,
 }
 
+pub type DuplicateClusters = HashMap<String, ClusterInfo>;
+
+#[derive(Clone)]
+pub struct ClusterInfo {
+    pub size: u64,                  // Cluster size (weight) – used by generate_taxon_counts & process_assembly
+    pub members: Vec<String>,       // All member IDs (including rep at [0]) – used by non-host FASTQ in CountAll mode
+}
+
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {

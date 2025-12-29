@@ -51,7 +51,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG,
                           MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
-                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG};
+                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters};
 use crate::utils::blast::{consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
@@ -271,6 +271,8 @@ pub struct AccessionHit {
     pub family_taxid: i32,
     pub count: u64,
 }
+
+
 
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
@@ -1427,7 +1429,7 @@ async fn dedup_and_subsample(
     max_subsample: u64,
     prefix_len: Option<usize>,
     out_dir: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, ReceiverStream<ParseOutput>, HashMap<String, u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, ReceiverStream<ParseOutput>, Arc<HashMap<String, ClusterInfo>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -1507,11 +1509,21 @@ async fn dedup_and_subsample(
         }
     }
 
-    let mut duplicate_cluster_sizes: HashMap<String, u64> = HashMap::new();
-    for (&hash_key, &(weight, ref records)) in &dedup_map {
-        if !records.is_empty() {
-            duplicate_cluster_sizes.insert(records[0].id().to_string(), weight);
+    let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
+    for (&_hash_key, &(size, ref records)) in &dedup_map {
+        if records.is_empty() {
+            continue;
         }
+        let rep_id = records[0].id().to_string();
+        let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
+
+        duplicate_clusters.insert(
+            rep_id,
+            ClusterInfo {
+                size,
+                members,
+            },
+        );
     }
 
     let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
@@ -1534,7 +1546,8 @@ async fn dedup_and_subsample(
     });
 
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
-    let duplicate_cluster_sizes_clone = duplicate_cluster_sizes.clone(); // move into task
+    let duplicate_clusters_for_tsv = duplicate_clusters.clone();
+
     let tsv_write_task = tokio::spawn(async move {
         let mut file = TokioOpenOptions::new()
             .write(true)
@@ -1543,8 +1556,9 @@ async fn dedup_and_subsample(
             .await
             .map_err(|e| anyhow!("TSV open error: {}", e))?;
 
-        for (read_id, weight) in duplicate_cluster_sizes_clone {
-            file.write_all(format!("{}\t{}\n", read_id, weight).as_bytes())
+        // Iterate over entries and extract rep_id + size only
+        for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
+            file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes())
                 .await
                 .map_err(|e| anyhow!("TSV write error: {}", e))?;
         }
@@ -1568,7 +1582,7 @@ async fn dedup_and_subsample(
     });
     cleanup_tasks.push(send_task);
 
-    Ok((ReceiverStream::new(rx), count_rx, ReceiverStream::new(cluster_rx), duplicate_cluster_sizes, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(rx), count_rx, ReceiverStream::new(cluster_rx), Arc::new(duplicate_clusters), cleanup_tasks, cleanup_receivers))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -2180,7 +2194,7 @@ pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
     mut m8_stream: ReceiverStream<ParseOutput>,
     mut summary_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
     source_count_type: Option<String>,// e.g. "NR" for the other DB
@@ -2253,7 +2267,10 @@ pub async fn generate_taxon_counts(
     let mut base_count_per_read: HashMap<String, u64> = HashMap::new();
 
     for (read_id, (level, _accession, lineage)) in read_summaries {
-        let cluster_size = *duplicate_cluster_sizes.get(&read_id).unwrap_or(&1u64);
+        let cluster_size = duplicate_clusters
+            .get(&read_id)
+            .map(|cluster| cluster.size)
+            .unwrap_or(1u64);
 
         // Metrics are guaranteed to exist because the m8 line came from the same read
         if let Some((pident, alen, mut raw_evalue)) = read_metrics.get(&read_id).cloned() {
@@ -2782,7 +2799,7 @@ pub async fn process_assembly(
     out_dir: &PathBuf,
     work_dir: &PathBuf,
     bowtie_stream: ReceiverStream<ParseOutput>,
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     paired: bool,
     assembly_headroom: u64,
 ) -> Result<(
@@ -3058,7 +3075,7 @@ pub async fn process_assembly(
 
     let (read2contig, contig_stats) = generate_info_from_bam_stream(
         bam_for_stats,
-        &duplicate_cluster_sizes,
+        &duplicate_clusters,
         config.args.min_contig_length,
     )
         .await?;
@@ -3776,7 +3793,7 @@ pub async fn generate_contig_summary_json(
     contig2lineage: AHashMap<String, [i32; 3]>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     db_type: &str,
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     min_contig_size: u64,
     mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
@@ -3805,10 +3822,11 @@ pub async fn generate_contig_summary_json(
                 (hit.species_taxid, hit.genus_taxid)
             };
 
-            let cluster_size = duplicate_cluster_sizes
-                .get(read_id)
-                .copied()
-                .unwrap_or(1);
+
+            let cluster_size = duplicate_clusters
+                .get(read_id.as_str())
+                .map(|cluster| cluster.size)
+                .unwrap_or(1u64);
 
             // Species-level aggregation
             let sp_entry = species_summary
@@ -3944,7 +3962,7 @@ pub async fn blast_contigs(
     assembled_contig_fasta: &PathBuf,
     read2contig: Arc<HashMap<String, String>>,
     reference_fasta: &PathBuf,
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     blast_headroom: u64,
@@ -4219,7 +4237,7 @@ pub async fn blast_contigs(
         db_type,
         lineage_map.clone(),
         should_keep_filter.clone(),
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         refined_counts_tx,
     ));
 
@@ -4246,7 +4264,7 @@ pub async fn blast_contigs(
         contig2lineage,
         read_dict.clone(),
         db_type,
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         4,
         contig_summary_tx,
     ));
@@ -4502,7 +4520,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_cluster_sizes_noarc, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
@@ -4514,7 +4532,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
-    let duplicate_cluster_sizes = Arc::new(duplicate_cluster_sizes_noarc);
 
     // *******************
     // Non host Alignment
@@ -4666,7 +4683,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(nt_call_stream),
         ReceiverStream::new(nt_summary_taxon_stream),
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         should_keep_filter.clone(),
         "NT".to_string(),
         None,
@@ -4746,7 +4763,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(nr_call_stream),
         ReceiverStream::new(nr_summary_taxon_stream),
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         should_keep_filter.clone(),
         "NR".to_string(),
         None,
@@ -4865,7 +4882,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         assembly_out_dir,
         assembly_work_dir,
         ReceiverStream::new(non_host_coverage_bt2_stream),
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         paired,
         4 // this can become as CLI arg if needed
     ).await?;
@@ -4984,7 +5001,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let lineage_map = lineage_map.clone();
         let should_keep_filter = should_keep_filter.clone();
-        let duplicate_cluster_sizes = duplicate_cluster_sizes.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
 
         async move {
@@ -4999,7 +5016,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 &contigs_fasta_path.clone(),
                 read2contig,
                 &nt_ref_fasta_path,
-                duplicate_cluster_sizes,
+                duplicate_clusters,
                 lineage_map,
                 should_keep_filter,
                 4,
@@ -5012,7 +5029,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let lineage_map = lineage_map.clone();
         let should_keep_filter = should_keep_filter.clone();
-        let duplicate_cluster_sizes = duplicate_cluster_sizes.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
 
         async move {
@@ -5027,7 +5044,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 &contigs_fasta_path.clone(),
                 read2contig,
                 &nr_ref_fasta_path,
-                duplicate_cluster_sizes,
+                duplicate_clusters,
                 lineage_map,
                 should_keep_filter,
                 4,
@@ -5187,7 +5204,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_contig_summary,
         lineage_map.clone(),
         should_keep_filter.clone(),
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         out_dir.join("refined.m8"),
         out_dir.join("refined.hitsummary.tab"),
         out_dir.join("refined_taxon_counts_with_dcr.json"),

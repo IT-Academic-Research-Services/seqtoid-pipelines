@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
 use tokio_stream::wrappers::BroadcastStream;
-use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig};
+use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
@@ -365,7 +365,7 @@ pub async fn generate_taxon_count_json_from_m8(
     db_type: &str,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
     let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
@@ -463,7 +463,10 @@ pub async fn generate_taxon_count_json_from_m8(
 
         let bucket = buckets.entry(taxid).or_default();
         bucket.nonunique_count += 1;
-        bucket.unique_count += duplicate_cluster_sizes.get(&m8.qname).cloned().unwrap_or(1);
+        bucket.unique_count +=  duplicate_clusters
+            .get(&m8.qname)
+            .map(|cluster| cluster.size)
+            .unwrap_or(1u64);
         bucket.base_count += 1;
         bucket.sum_percent_identity += m8.pident;
         bucket.sum_alignment_length += m8.alen as f64;
@@ -549,7 +552,7 @@ pub async fn compute_merged_taxon_counts(
 
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_cluster_sizes: Arc<HashMap<String, u64>>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
 
     merged_m8_path: PathBuf,
     merged_hitsummary_path: PathBuf,
@@ -690,7 +693,7 @@ pub async fn compute_merged_taxon_counts(
         "merged_NT_NR",
         lineage_map.clone(),
         should_keep_filter.clone(),
-        duplicate_cluster_sizes.clone(),
+        duplicate_clusters.clone(),
         json_tx,
     )
         .await?;
