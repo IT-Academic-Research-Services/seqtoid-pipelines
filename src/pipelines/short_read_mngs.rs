@@ -5435,19 +5435,52 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nt_info.tab"));
 
-    let coverage_result = generate_coverage_viz(
-        ReceiverStream::new(nt_hit_summary_coverage),
-        ReceiverStream::new(nt_refined_m8_top_stream_out),
-        assembly_outputs.coverage_json,
-        assembly_outputs.contig_stats_json,
-        ReceiverStream::new(non_host_coverage_viz_stream),
-        nt_info_db_path,
-        out_dir.clone(),
-        Some(MAX_NUM_BINS_COVERAGE),
-        Some(NUM_ACCESSIONS_PER_TAXON),
-        Some(MIN_CONTIG_SIZE),
-        false,
-    );
+
+    let skip_coverage_viz = {
+        let mut skip = false;
+
+        if !assembly_outputs.coverage_json.exists() {
+            warn!("Skipping coverage viz: contig_coverage_json missing (likely due to SPAdes assembly failure)");
+            skip = true;
+        } else if assembly_outputs.coverage_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+            warn!("Skipping coverage viz: contig_coverage_json is empty");
+            skip = true;
+        }
+
+        if !assembly_outputs.contig_stats_json.exists() {
+            warn!("Skipping coverage viz: contig_stats_json missing");
+            skip = true;
+        } else if assembly_outputs.contig_stats_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+            warn!("Skipping coverage viz: contig_stats_json is empty");
+            skip = true;
+        }
+
+        skip
+    };
+
+    let out_dir_for_viz = out_dir.clone();
+    let coverage_task = if !skip_coverage_viz {
+        info!("All coverage viz inputs present — spawning visualization task");
+        Some(tokio::spawn(async move {
+            generate_coverage_viz(
+                ReceiverStream::new(nt_hit_summary_coverage),
+                ReceiverStream::new(nt_refined_m8_top_stream_out),
+                assembly_outputs.coverage_json,
+                assembly_outputs.contig_stats_json,
+                ReceiverStream::new(non_host_coverage_viz_stream),
+                nt_info_db_path,
+                out_dir_for_viz,
+                Some(MAX_NUM_BINS_COVERAGE),
+                Some(NUM_ACCESSIONS_PER_TAXON),
+                Some(MIN_CONTIG_SIZE),
+                false,
+            )
+                .await
+        }))
+    } else {
+        warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
+        None
+    };
 
 
     // *******************
@@ -5558,6 +5591,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e))?;
     }
 
+    if let Some(coverage_task) = coverage_task {
+        match coverage_task.await {
+            Ok(result) => match result {
+                Ok(_) => info!("Coverage visualization completed successfully"),
+                Err(e) => warn!("Coverage viz failed (non-fatal): {}", e),
+            },
+            Err(e) => warn!("Coverage viz task panicked: {}", e),
+        }
+    }
 
     drop(temp_files);
     drop(temp_dirs);
