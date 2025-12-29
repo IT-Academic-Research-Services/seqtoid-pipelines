@@ -4316,6 +4316,165 @@ pub async fn blast_contigs(
 }
 
 
+/// Extract original read ID from refined taxid-annotated FASTA header
+/// # Arguments
+/// * `id` -header id line
+
+/// # Returns
+/// result of id and reead index
+fn extract_original_id_from_taxid_fasta(id: &str) -> Result<(String, usize)> {
+    let mut header = id.to_string();
+    let mut read_index = 0;
+
+    if header.ends_with("/1") {
+        read_index = 0;
+        header.truncate(header.len() - 2);
+    } else if header.ends_with("/2") {
+        read_index = 1;
+        header.truncate(header.len() - 2);
+    }
+
+    let parts: Vec<&str> = header.split(':').collect();
+    let nt_pos = parts
+        .iter()
+        .position(|&p| p == "NT")
+        .ok_or_else(|| anyhow!("No 'NT' tag in taxid header: {}", id))?;
+
+    if nt_pos + 2 >= parts.len() {
+        return Err(anyhow!("Malformed header: not enough fields after NT"));
+    }
+
+    let original_id = parts[(nt_pos + 2)..].join(":");
+    let full_id = if read_index == 0 {
+        format!("{}/1", original_id)
+    } else {
+        format!("{}/2", original_id)
+    };
+
+    Ok((full_id, read_index))
+}
+
+
+/// Build R1 and R2 header sets from the taxid-annotated FASTA stream
+/// # Arguments
+/// * `taxid_mapped_stream` stream of
+
+/// # Returns
+/// result of id and reead index
+async fn build_nonhost_header_sets(
+    mut taxid_mapped_stream: ReceiverStream<ParseOutput>,
+    duplicate_clusters: Option<Arc<DuplicateClusters>>,
+) -> Result<(HashSet<String>, Option<HashSet<String>>)> {
+    tokio::task::spawn_blocking(move || {
+        let mut r1_set: HashSet<String> = HashSet::new();
+        let mut r2_set: HashSet<String> = HashSet::new();
+
+        while let Some(item) = futures::executor::block_on(taxid_mapped_stream.next()) {
+            if let ParseOutput::Fasta(record) = item {
+                if let Ok((full_id, read_index)) = extract_original_id_from_taxid_fasta(record.id()) {
+                    let target_set = if read_index == 0 { &mut r1_set } else { &mut r2_set };
+
+                    if READ_COUNTING_MODE == ReadCountingMode::CountAll {
+                        if let Some(clusters) = &duplicate_clusters {
+                            let mut rep_key = full_id.clone();
+                            if !clusters.contains_key(&rep_key) {
+                                rep_key = rep_key
+                                    .trim_end_matches("/1")
+                                    .trim_end_matches("/2")
+                                    .to_string();
+                            }
+
+                            if let Some(cluster) = clusters.get(&rep_key) {
+                                // Insert ALL members in the cluster
+                                for member in &cluster.members {
+                                    target_set.insert(member.clone());
+                                }
+                                continue; // skip single insertion below
+                            }
+                        }
+                    }
+                    target_set.insert(full_id);
+                }
+            }
+        }
+
+        let r2_opt = if r2_set.is_empty() { None } else { Some(r2_set) };
+        Ok((r1_set, r2_opt))
+    })
+        .await?
+}
+
+async fn filter_fastq_to_bytes_stream(
+    mut input_stream: ReceiverStream<ParseOutput>,
+    headers: Arc<HashSet<String>>,
+) -> ReceiverStream<ParseOutput> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2048);
+
+    tokio::spawn(async move {
+        while let Some(item) = input_stream.next().await {
+            if let ParseOutput::Fastq(record) = item {
+                if headers.contains(&record.id()[..]) {
+                    match record.to_bytes() {
+                        Ok(vec) => {
+                            let arc_data = Arc::new(vec);
+                            let _ = tx.send(ParseOutput::Bytes(arc_data)).await;
+                        }
+                        Err(e) => error!("Failed to serialize FASTQ record: {}", e),
+                    }
+                }
+                // else: explicitly skipped
+            }
+        }
+    });
+
+    ReceiverStream::new(rx)
+}
+
+pub async fn generate_nonhost_fastq(
+    config: Arc<RunConfig>,
+    fastq_r1_stream: ReceiverStream<ParseOutput>,
+    fastq_r2_stream: Option<ReceiverStream<ParseOutput>>,
+    taxid_mapped_stream: ReceiverStream<ParseOutput>,
+    duplicate_clusters: Option<Arc<DuplicateClusters>>,
+    output_dir: PathBuf,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let out_r1 = output_dir.join("nonhost_R1.fastq");
+    let out_r2 = fastq_r2_stream.is_some().then(|| output_dir.join("nonhost_R2.fastq"));
+
+    let (r1_headers, r2_headers_opt) = build_nonhost_header_sets(taxid_mapped_stream, duplicate_clusters).await?;
+
+    info!(
+        "Non-host header sets built: R1={} records, R2={:?}",
+        r1_headers.len(),
+        r2_headers_opt.as_ref().map(|s| s.len())
+    );
+
+    let r1_headers = Arc::new(r1_headers);
+    let r2_headers = r2_headers_opt.map(Arc::new);
+
+    let r1_bytes_stream = filter_fastq_to_bytes_stream(fastq_r1_stream, r1_headers).await;
+    let write_r1_task = write_byte_stream_to_file(&out_r1, r1_bytes_stream, Some(config.base_buffer_size)).await?;
+
+    let write_r2_task = if let (Some(r2_stream), Some(r2_headers)) = (fastq_r2_stream, r2_headers) {
+        let r2_bytes_stream = filter_fastq_to_bytes_stream(r2_stream, r2_headers).await;
+        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_bytes_stream, Some(config.base_buffer_size)).await?)
+    } else {
+        None
+    };
+
+    write_r1_task.await??;
+    if let Some(task) = write_r2_task {
+        task.await??;
+    }
+
+    info!(
+        "Non-host FASTQs generated: {} {:?}",
+        out_r1.display(),
+        out_r2.as_ref().map(|p| p.display())
+    );
+
+    Ok((out_r1, out_r2))
+}
 
 
 /// Run function for Short Read mNGS pipelines
@@ -4638,7 +4797,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
-        4,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -4654,7 +4813,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_streams_iter =nt_streams.into_iter();
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_acc_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
@@ -5311,6 +5469,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut taxid_mapped_streams_iter = taxid_mapped_streams.into_iter();
     let taxid_mapped_file = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let taxid_mapped_locator = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let taxid_mapped_nonhost = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
@@ -5498,6 +5657,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
         None
     };
+
+
+
+
+
+    // let (nonhost_r1_path, nonhost_r2_path) = generate_nonhost_fastq(
+    //     config.clone(),
+    //     //original R1 FASTQ,
+    //     // original R2 FASTQ,
+    //     taxid_mapped_nonhost,
+    //     duplicate_clusters.clone(),
+    //
+    //     out_dir.clone()
+    // )
+
 
 
     // *******************
