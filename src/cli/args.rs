@@ -212,4 +212,7 @@ pub struct Arguments {
 
     #[arg(long, default_value = "nr_index.fst")]
     pub nr_offset_db : Option<String>,
+
+    #[arg(long, default_value = "nt_info.tab")]
+    pub nt_info_tab: Option<String>,
 }

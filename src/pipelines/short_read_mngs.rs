@@ -30,7 +30,7 @@ use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use tokio::fs;
 use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::try_join;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
 use twox_hash::XxHash64;
 
@@ -67,6 +67,7 @@ use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2ArgGenerator,
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::{check_versions, generate_cli};
+use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file, SequenceRecord, generate_taxid_fasta, generate_taxid_locator};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
@@ -91,6 +92,10 @@ const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
 const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
 const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
 const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
+
+const MAX_NUM_BINS_COVERAGE: usize = 500;
+const NUM_ACCESSIONS_PER_TAXON: usize = 10;
+const MIN_CONTIG_SIZE: u64 = 500;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
@@ -3947,8 +3952,9 @@ pub async fn blast_contigs(
     AHashMap<String, Arc<ReadHit>>,
     Vec<TaxonCount>,
     Vec<ContigSummaryEntry>,
-    mpsc::Receiver<ParseOutput>,   // ← plain mpsc, no broadcast
-    mpsc::Receiver<ParseOutput>,   // ← plain mpsc
+    mpsc::Receiver<ParseOutput>,   // refined reassigned M8
+    mpsc::Receiver<ParseOutput>,   // refined hit summary
+    mpsc::Receiver<ParseOutput>,   // top hit per contig M8 (blast_top_m8)
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
@@ -3984,6 +3990,7 @@ pub async fn blast_contigs(
 
         let (_m8_tx, m8_rx) = mpsc::channel(1);
         let (_hit_tx, hit_rx) = mpsc::channel(1);
+        let (_top_tx, top_rx) = mpsc::channel(1);
 
         return Ok((
             final_read_dict,
@@ -3991,6 +3998,7 @@ pub async fn blast_contigs(
             vec![],
             m8_rx,
             hit_rx,
+            top_rx,
             cleanup_tasks,
             cleanup_receivers,
             temp_files,
@@ -4105,12 +4113,33 @@ pub async fn blast_contigs(
             error: e.to_string(),
         })?;
 
-    let (top_tx, top_rx) = mpsc::channel(1024);
+    // Internal channel: get_top_m8_* writes here
+    let (top_internal_tx, top_internal_rx) = mpsc::channel(1024);
+
+    // Public channels: one for update_read_dict, one for caller (coverage viz)
+    let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
+    let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
+
     let top_handle = if db_type == NT_TAG {
-        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_tx))
+        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_internal_tx))
     } else {
-        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_tx))
+        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_internal_tx))
     };
+
+    // Forward top hits to both consumers (update_read_dict and caller)
+    let forward_handle = tokio::spawn({
+        let mut rx = top_internal_rx;
+        let tx_update = top_for_update_tx;
+        let tx_caller = top_for_caller_tx;
+        async move {
+            while let Some(item) = rx.recv().await {
+                let _ = tx_update.send(item.clone()).await;
+                let _ = tx_caller.send(item).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    cleanup_tasks.push(forward_handle);
 
     let (contig2lineage_tx, contig2lineage_rx) = mpsc::channel(1024);
     let (read2blastm8_tx, read2blastm8_rx) = mpsc::channel(1024);
@@ -4119,7 +4148,7 @@ pub async fn blast_contigs(
 
     let update_handle = tokio::spawn(update_read_dict(
         read2contig.clone(),
-        ReceiverStream::new(top_rx),
+        ReceiverStream::new(top_for_update_rx),  // top hits only — matches Python
         read_dict.clone(),
         lineage_map.clone(),
         accession_map.clone(),
@@ -4149,7 +4178,7 @@ pub async fn blast_contigs(
     let (refined_m8_tx, refined_m8_rx) = mpsc::channel(2_000_000);
     let (refined_hit_summary_tx, refined_hit_summary_rx) = mpsc::channel(2_000_000);
 
-    // Internal channels for taxon counting (still needed)
+    // Internal channels for taxon counting
     let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
     let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
 
@@ -4261,6 +4290,7 @@ pub async fn blast_contigs(
         contig_summary,
         refined_m8_rx,
         refined_hit_summary_rx,
+        top_for_caller_rx,  // blast_top_m8 — ready for generate_coverage_viz
         cleanup_tasks,
         cleanup_receivers,
         temp_files,
@@ -4509,7 +4539,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
         dedup_stream,
-        5,
+        6,
         config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
         config.args.stall_threshold,
         None,
@@ -4528,7 +4558,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
+    let non_host_coverage_viz_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     // This is part of post-process starting here for concurrency
@@ -5015,7 +5045,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_read_dict, nt_refined_counts,
         nt_contig_summary,  nt_refined_m8_stream_out,
-        nt_refined_hit_summary_stream_out,
+        nt_refined_hit_summary_stream_out, nt_refined_m8_top_stream_out,
         nt_cleanup_tasks, nt_cleanup_receivers,
         nt_temp_files) = nt_res?;
 
@@ -5045,7 +5075,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
         ReceiverStream::new(nt_refined_hit_summary_stream_out),
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -5061,11 +5091,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
     let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     let (nr_read_dict, nr_refined_counts,
         nr_contig_summary, nr_refined_m8_stream_out,
-        nr_refined_hit_summary_stream_out,
+        nr_refined_hit_summary_stream_out, nr_refined_m8_top_stream_out,
         nr_cleanup_tasks, nr_cleanup_receivers,
         nr_temp_files) = nr_res?;
     cleanup_tasks.extend(nr_cleanup_tasks);
@@ -5399,6 +5430,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut initial_locator_tasks);
     info!("Experimental taxid locator files generated: {:?}", initial_locator_outputs);
 
+    let nt_info_db_path = config.args.nt_info_tab
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nt_info.tab"));
+
+    let coverage_result = generate_coverage_viz(
+        ReceiverStream::new(nt_hit_summary_coverage),
+        ReceiverStream::new(nt_refined_m8_top_stream_out),
+        assembly_outputs.coverage_json,
+        assembly_outputs.contig_stats_json,
+        ReceiverStream::new(non_host_coverage_viz_stream),
+        nt_info_db_path,
+        out_dir.clone(),
+        Some(MAX_NUM_BINS_COVERAGE),
+        Some(NUM_ACCESSIONS_PER_TAXON),
+        Some(MIN_CONTIG_SIZE),
+        false,
+    );
 
 
     // *******************
