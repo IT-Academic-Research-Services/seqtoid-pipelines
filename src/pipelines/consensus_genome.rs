@@ -1909,7 +1909,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         MAFFT_TAG,
         SEQKIT_TAG,
         QUAST_TAG,
-    ])
+    ], &out_dir.clone())
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 

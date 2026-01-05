@@ -4511,7 +4511,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // External tools check
     check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
-                        BLASTN_TAG, BLASTX_TAG])
+                        BLASTN_TAG, BLASTX_TAG], &out_dir.clone())
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
