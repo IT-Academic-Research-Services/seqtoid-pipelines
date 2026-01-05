@@ -161,6 +161,7 @@ pub struct ReadStats {
 pub struct SamtoolsStats {
     pub summary: HashMap<String, String>,
     pub insert_sizes: Vec<(u32, u64)>,
+    pub total_pairs: u64
 }
 
 // Static Filenames

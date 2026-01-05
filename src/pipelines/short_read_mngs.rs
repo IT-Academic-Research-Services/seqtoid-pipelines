@@ -639,6 +639,7 @@ async fn bowtie2_filter(
                 .send(SamtoolsStats {
                     summary: HashMap::new(),
                     insert_sizes: Vec::new(),
+                    total_pairs: 0
                 })
                 .map_err(|_| PipelineError::Other(anyhow!("Failed to send empty stats")))?;
             Some(stats_rx)
@@ -5529,12 +5530,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(initial_load_nr_task);
     cleanup_tasks.push(initial_taxid_main_task);
 
-    let experimental_dir = out_dir.join("experimental");
-    tokio::fs::create_dir_all(&experimental_dir).await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create experimental dir: {}", e)))?;
-
-    let initial_mapped_path = experimental_dir.join("taxid_annot_mapped_only.fasta");
-    let initial_combined_path = experimental_dir.join("taxid_annot.fasta");
+    let initial_mapped_path = out_dir.join("taxid_annot_mapped_only.fasta");
+    let initial_combined_path = out_dir.join("taxid_annot.fasta");
 
     let (initial_taxid_mapped_streams, initial_taxid_mapped_rx) = t_junction(
         ReceiverStream::new(initial_taxid_mapped_rx),
@@ -5599,7 +5596,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
         initial_taxid_mapped_locator,
-        experimental_dir.clone(),
+        out_dir.clone(),
     )
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e)))?;
@@ -5728,21 +5725,47 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     if let Some(insert_stats_rx) = host_bt2_insert_stats_rx {
         match insert_stats_rx.await {
             Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
-                info!("Host bt2 insert size stats: {:?}", insert_stats.insert_sizes);
-                let output_path = out_dir.join("insert_size_histogram.png");
+                info!("Host bt2 insert size stats available – generating Picard files");
+
+                let metrics_path = out_dir.join("picard_insert_metrics.txt");
+                let mut metrics_file = std::fs::File::create(&metrics_path)
+                    .context("Failed to create picard_insert_metrics.txt")?;
+
+
+                writeln!(metrics_file, "## HISTOGRAM\tinsert_size")?;
+                for &(size, count) in &insert_stats.insert_sizes {
+                    writeln!(metrics_file, "{}\t{}", size, count)?;
+                }
+                //  minimal summary line that matches real Picard output format
+                let mean: f64 = insert_stats.insert_sizes.iter()
+                    .map(|&(s, c)| s as f64 * c as f64)
+                    .sum::<f64>() / insert_stats.total_pairs as f64;
+                let variance: f64 = insert_stats.insert_sizes.iter()
+                    .map(|&(s, c)| {
+                        let dev = s as f64 - mean;
+                        dev * dev * c as f64
+                    })
+                    .sum::<f64>() / insert_stats.total_pairs as f64;
+                let stddev = variance.sqrt();
+
+                writeln!(metrics_file, "## METRICS\tMEAN_INSERT_SIZE\t{:.2}\tMEDIAN_INSERT_SIZE\t{:.0}\tSTANDARD_DEVIATION\t{:.2}",
+                         mean, mean, stddev)?;  // median approximated as mean for simplicity
+
+                let histogram_path = out_dir.join("insert_size_histogram.png");
                 let sample_name = sample_base_buf
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("sample")
                     .to_string();
+
                 let plot_task = tokio::spawn(async move {
-                    plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &output_path)
+                    plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &histogram_path)
                         .map_err(|e| anyhow!("Failed to plot insert sizes: {}", e))?;
                     Ok(())
                 });
                 cleanup_tasks.push(plot_task);
             }
-            Ok(_) => warn!("No insert size stats available; skipping plotting"),
+            Ok(_) => warn!("No insert size stats available; skipping Picard metrics"),
             Err(e) => error!("Host bt2 insert stats receiver failed: {}", e),
         }
     }
