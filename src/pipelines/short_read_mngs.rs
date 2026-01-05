@@ -5800,8 +5800,39 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let kallisto_ercc_counts = kallisto_ercc_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
-    // info!("Kallisto ERCC counts: {:?}", kallisto_ercc_counts);
 
+    let kallisto_dir = out_dir.join("kallisto");
+    tokio::fs::create_dir_all(&kallisto_dir).await?;
+
+    let abundance_path = kallisto_dir.join("abundance.tsv");
+    let abundance_file = TokioFile::create(&abundance_path).await?;
+    let mut abundance_writer = BufWriter::new(abundance_file);
+
+    abundance_writer
+        .write_all(b"target_id\tlength\teff_length\test_counts\ttpm\n")
+        .await?;
+
+    for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
+        let line = format!("{}\t0\t0\t{:.6}\t0.000000\n", target_id, est_counts);
+        abundance_writer.write_all(line.as_bytes()).await?;
+    }
+    abundance_writer.flush().await?;
+    info!("Wrote Kallisto abundance.tsv with {} ERCC transcripts", kallisto_ercc_counts.ercc_counts.len());
+
+    let ercc_path = out_dir.join("kallisto_ERCC_counts_tsv");
+    let ercc_file = TokioFile::create(&ercc_path).await?;
+    let mut ercc_writer = BufWriter::new(ercc_file);
+
+    ercc_writer
+        .write_all(b"target_id\test_counts\n")
+        .await?;
+
+    for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
+        let line = format!("{}\t{:.6}\n", target_id, est_counts);
+        ercc_writer.write_all(line.as_bytes()).await?;
+    }
+    ercc_writer.flush().await?;
+    info!("Wrote kallisto_ERCC_counts_tsv");
 
     let compute_merged_taxon_result = compute_merged_taxon_handle.await??;
 
