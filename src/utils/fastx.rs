@@ -1555,7 +1555,31 @@ pub async fn generate_taxid_locator(
     Ok((output_paths, locator_tasks, vec![]))
 }
 
+pub async fn filter_fastq_to_bytes_stream(
+    mut input_stream: ReceiverStream<ParseOutput>,
+    headers: Arc<HashSet<String>>,
+) -> ReceiverStream<ParseOutput> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2048);
 
+    tokio::spawn(async move {
+        while let Some(item) = input_stream.next().await {
+            if let ParseOutput::Fastq(record) = item {
+                if headers.contains(&record.id()[..]) {
+                    match record.to_bytes() {
+                        Ok(vec) => {
+                            let arc_data = Arc::new(vec);
+                            let _ = tx.send(ParseOutput::Bytes(arc_data)).await;
+                        }
+                        Err(e) => error!("Failed to serialize FASTQ record: {}", e),
+                    }
+                }
+                // else: explicitly skipped
+            }
+        }
+    });
+
+    ReceiverStream::new(rx)
+}
 
 
 #[cfg(test)]

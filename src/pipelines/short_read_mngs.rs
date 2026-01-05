@@ -69,7 +69,9 @@ use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
-                          read_fastq, stream_record_counter, write_fasta_stream_to_file, SequenceRecord, generate_taxid_fasta, generate_taxid_locator};
+                          read_fastq, stream_record_counter, write_fasta_stream_to_file,
+                          SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
+                          filter_fastq_to_bytes_stream};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
@@ -4385,11 +4387,10 @@ async fn build_nonhost_header_sets(
                             }
 
                             if let Some(cluster) = clusters.get(&rep_key) {
-                                // Insert ALL members in the cluster
                                 for member in &cluster.members {
                                     target_set.insert(member.clone());
                                 }
-                                continue; // skip single insertion below
+                                continue;
                             }
                         }
                     }
@@ -4404,43 +4405,20 @@ async fn build_nonhost_header_sets(
         .await?
 }
 
-async fn filter_fastq_to_bytes_stream(
-    mut input_stream: ReceiverStream<ParseOutput>,
-    headers: Arc<HashSet<String>>,
-) -> ReceiverStream<ParseOutput> {
-    let (tx, rx) = tokio::sync::mpsc::channel(2048);
 
-    tokio::spawn(async move {
-        while let Some(item) = input_stream.next().await {
-            if let ParseOutput::Fastq(record) = item {
-                if headers.contains(&record.id()[..]) {
-                    match record.to_bytes() {
-                        Ok(vec) => {
-                            let arc_data = Arc::new(vec);
-                            let _ = tx.send(ParseOutput::Bytes(arc_data)).await;
-                        }
-                        Err(e) => error!("Failed to serialize FASTQ record: {}", e),
-                    }
-                }
-                // else: explicitly skipped
-            }
-        }
-    });
 
-    ReceiverStream::new(rx)
-}
-
-pub async fn generate_nonhost_fastq(
+pub async fn generate_nonhost_fastq_from_files(
     config: Arc<RunConfig>,
-    fastq_r1_stream: ReceiverStream<ParseOutput>,
-    fastq_r2_stream: Option<ReceiverStream<ParseOutput>>,
+    original_r1_path: PathBuf,
+    original_r2_path: Option<PathBuf>,
     taxid_mapped_stream: ReceiverStream<ParseOutput>,
     duplicate_clusters: Option<Arc<DuplicateClusters>>,
     output_dir: PathBuf,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
     let out_r1 = output_dir.join("nonhost_R1.fastq");
-    let out_r2 = fastq_r2_stream.is_some().then(|| output_dir.join("nonhost_R2.fastq"));
+    let out_r2 = original_r2_path.is_some().then(|| output_dir.join("nonhost_R2.fastq"));
 
+    // Build header sets from taxid FASTA
     let (r1_headers, r2_headers_opt) = build_nonhost_header_sets(taxid_mapped_stream, duplicate_clusters).await?;
 
     info!(
@@ -4452,18 +4430,41 @@ pub async fn generate_nonhost_fastq(
     let r1_headers = Arc::new(r1_headers);
     let r2_headers = r2_headers_opt.map(Arc::new);
 
-    let r1_bytes_stream = filter_fastq_to_bytes_stream(fastq_r1_stream, r1_headers).await;
-    let write_r1_task = write_byte_stream_to_file(&out_r1, r1_bytes_stream, Some(config.base_buffer_size)).await?;
+    // Stream and filter R1
+    let (r1_rx, _r1_stats_task) = read_fastq(
+        original_r1_path.clone(),
+        None,
+        None,
+        u64::MAX,
+        None,
+        None,
+        config.base_buffer_size * 4, // Large chunks for speed
+    )?;
+    let r1_input_stream = ReceiverStream::new(r1_rx);
+    let r1_filtered = filter_fastq_to_bytes_stream(r1_input_stream, r1_headers).await;
+    let write_r1 = write_byte_stream_to_file(&out_r1, r1_filtered, Some(config.base_buffer_size)).await?;
 
-    let write_r2_task = if let (Some(r2_stream), Some(r2_headers)) = (fastq_r2_stream, r2_headers) {
-        let r2_bytes_stream = filter_fastq_to_bytes_stream(r2_stream, r2_headers).await;
-        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_bytes_stream, Some(config.base_buffer_size)).await?)
+    // Stream and filter R2 if present
+    let write_r2 = if let (Some(r2_path), Some(r2_headers)) = (original_r2_path, r2_headers) {
+        let (r2_rx, _r2_stats_task) = read_fastq(
+            r2_path.clone(),
+            None,
+            None,
+            u64::MAX,
+            None,
+            None,
+            config.base_buffer_size * 4,
+        )?;
+        let r2_input_stream = ReceiverStream::new(r2_rx);
+        let r2_filtered = filter_fastq_to_bytes_stream(r2_input_stream, r2_headers).await;
+        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_filtered, Some(config.base_buffer_size)).await?)
     } else {
         None
     };
 
-    write_r1_task.await??;
-    if let Some(task) = write_r2_task {
+    // Await writes
+    write_r1.await??;
+    if let Some(task) = write_r2 {
         task.await??;
     }
 
@@ -4532,8 +4533,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Input Validation
     let (val_out_stream, validate_cleanup_tasks, validate_cleanup_receivers, raw_count_task, val_count_task) = validate_input(
         config.clone(),
-        file1_path,
-        file2_path,
+        file1_path.clone(),
+        file2_path.clone(),
         sample_base_buf.clone(),
         &out_dir,
     ).await?;
@@ -5659,6 +5660,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
+
+    let clusters_opt = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
+        Some(duplicate_clusters.clone())
+    } else {
+        None
+    };
+
+    let (nonhost_r1, nonhost_r2_opt) = generate_nonhost_fastq_from_files(
+        config.clone(),
+        file1_path.clone(),
+        file2_path.clone(),
+        ReceiverStream::new(taxid_mapped_nonhost),
+        clusters_opt,
+        out_dir.clone(),
+    ).await?;
 
 
 
