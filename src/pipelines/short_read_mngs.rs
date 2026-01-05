@@ -5035,6 +5035,78 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     assembly_handle.spades_task.await??;
 
+    let contigs_path = assembly_out_dir.join("contigs.fasta");
+    let scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
+
+    let contigs_size = file_size(&contigs_path).await.unwrap_or(0);
+    let scaffolds_size = file_size(&scaffolds_path).await.unwrap_or(0);
+
+    let assembly_failed = contigs_size < MIN_REF_FASTA_SIZE && scaffolds_size < MIN_REF_FASTA_SIZE;
+
+    if assembly_failed {
+        warn!("SPAdes assembly failed or produced no usable contigs/scaffolds (contigs: {} bytes, scaffolds: {} bytes)",
+      contigs_size, scaffolds_size);
+
+        let mut failure_info = json!({
+    "assembly_failed": true,
+    "reason": "No contigs or scaffolds >= 25 bp produced",
+    "contigs_size_bytes": contigs_size,
+    "scaffolds_size_bytes": scaffolds_size,
+    "spades_log_excerpt": [],
+    "warnings_log_excerpt": []
+});
+
+        async fn tail_log(path: PathBuf, max_lines: usize) -> Vec<String> {
+            if let Ok(file) = TokioFile::open(&path).await {
+                let mut reader = TokioBufReader::new(file);
+                let mut content = Vec::new();
+                if reader.read_to_end(&mut content).await.is_ok() {
+                    if let Ok(text) = String::from_utf8(content) {
+                        return text.lines()
+                            .rev()
+                            .take(max_lines)
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                    }
+                }
+            }
+            vec![format!("Warning: Could not read log file: {}", path.display())]
+        }
+
+        // Check spades.log for errors
+        let spades_log = assembly_out_dir.join("spades/spades.log");
+        let spades_lines = tail_log(spades_log, 50).await;
+        let has_error = spades_lines.iter().any(|l| l.contains("ERROR") || l.contains("Exception") || l.contains("CRITICAL"));
+
+        if has_error {
+            failure_info["reason"] = json!("SPAdes reported ERROR, CRITICAL, or Exception in log");
+        }
+        failure_info["spades_log_excerpt"] = json!(spades_lines);
+
+        // warnings.log
+        let warnings_log = assembly_out_dir.join("spades/warnings.log");
+        let warnings_lines = tail_log(warnings_log, 30).await;
+        failure_info["warnings_log_excerpt"] = json!(warnings_lines);
+
+        // Write final failure report
+        let failure_path = out_dir.join("spades_failure.json");
+        let failure_json = serde_json::to_vec_pretty(&failure_info)
+            .context("Failed to serialize spades_failure.json")?;
+
+        let write_task = write_vecu8_to_file(Arc::new(failure_json), &failure_path, config.base_buffer_size).await
+            .context("Failed to spawn write task for spades_failure.json")?;
+        write_task.await??;  // Await inline since small file
+
+        warn!("Assembly failure details written to {:?}", failure_path);
+    } else {
+        info!("SPAdes assembly succeeded (contigs: {} bytes, scaffolds: {} bytes)",
+      contigs_size, scaffolds_size);
+    }
+
+
     let (assembly_outputs, assembly_bam_out_stream,
         mut post_assembly_cleanup_tasks,
         mut post_assembly_cleanup_receivers, mut post_assemly_temp_files) = process_assembly(
