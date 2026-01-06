@@ -1766,25 +1766,31 @@ pub mod diamond {
         let scratch_path = PathBuf::from(scratch_path_str);
         let scratch_space = available_space_for_path(&scratch_path).await?;
 
-        let db_stats = get_diamond_db_stats(db_path).await
-            .inspect_err(|e| warn!("Diamond dbinfo failed: {}", e))
-            .unwrap_or((0, 0));
-
-        let total_letters_billions = if db_stats.1 == 0 {
-            warn!("DB stats failed — assuming full NR size (300B letters)");
-            300.0
-        } else {
-            db_stats.1 as f64 / 1_000_000_000.0
+        let db_stats = match get_diamond_db_stats(&db_path).await {
+            Ok(stats) => stats,
+            Err(e) => {
+                warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
+                (0, 300_000_000_000)  // fallback letters for full NR
+            }
         };
 
-        let ram_based_b = available_ram_gb / 20.0;  // tuned divisor
+        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
+
+        let ram_based_b = available_ram_gb / 20.0;  // tuned divisor for realism (~18-22 GB/billion)
 
         let mut block_size = ram_based_b
             .min(total_letters_billions)
             .max(6.0)
             .floor();
 
-        let db_file_gb = std::fs::metadata(db_path)?.len() as f64 / 1_073_741_824.0;
+        let db_file_gb = match std::fs::metadata(&db_path) {
+            Ok(meta) => meta.len() as f64 / 1_073_741_824.0,
+            Err(e) => {
+                warn!("Failed to get DB file size: {}. Skipping scratch derate.", e);
+                0.0  // skip derate
+            }
+        };
+
         if scratch_space < (db_file_gb * 2.0) as u64 {
             warn!("Low scratch; reducing block size by 40%");
             block_size *= 0.6;
