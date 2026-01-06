@@ -1747,52 +1747,48 @@ pub mod diamond {
     }
 
     pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
-        let db_path = run_config
-            .args
-            .diamond_db
-            .as_deref()
+        let db_path = run_config.args.diamond_db.as_deref()
             .ok_or_else(|| anyhow!("--diamond-db not provided"))?;
+
+        debug!("Computing block size for DB: {}", db_path);
 
         let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
 
-        let scratch_path_str = run_config
-            .args
-            .nvme_scratch
-            .as_deref()
-            .unwrap_or(".");
-
+        let scratch_path_str = run_config.args.nvme_scratch.as_deref().unwrap_or(".");
         let scratch_path = PathBuf::from(scratch_path_str);
         let scratch_space = available_space_for_path(&scratch_path).await?;
 
-        let db_stats = get_diamond_db_stats(db_path).await?;
-        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
+        let db_stats = get_diamond_db_stats(db_path).await
+            .inspect_err(|e| warn!("Diamond dbinfo failed: {}", e))
+            .unwrap_or((0, 0));
 
-        let ram_based_b = available_ram_gb / 25.0;
+        let total_letters_billions = if db_stats.1 == 0 {
+            warn!("DB stats failed — assuming full NR size (300B letters)");
+            300.0
+        } else {
+            db_stats.1 as f64 / 1_000_000_000.0
+        };
+
+        let ram_based_b = available_ram_gb / 20.0;  // tuned divisor
 
         let mut block_size = ram_based_b
             .min(total_letters_billions)
-            .max(2.0)
+            .max(6.0)
             .floor();
 
         let db_file_gb = std::fs::metadata(db_path)?.len() as f64 / 1_073_741_824.0;
         if scratch_space < (db_file_gb * 2.0) as u64 {
-            warn!(
-                "Low scratch space (~{:.1} GiB); reducing block size by 40%",
-                scratch_space as f64 / 1_073_741_824.0
-            );
+            warn!("Low scratch; reducing block size by 40%");
             block_size *= 0.6;
         }
 
         debug!(
-            "Computed Diamond --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
-            block_size,
-            available_ram_gb,
-            db_stats.1 as f64 / 1e9,
-            scratch_space as f64 / 1_073_741_824.0
-        );
+        "Computed --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
+        block_size, available_ram_gb, db_stats.1 as f64 / 1e9, scratch_space as f64 / 1_073_741_824.0
+    );
 
-        Ok(block_size.max(2.0))
+        Ok(block_size.max(6.0))
     }
 
     async fn get_diamond_db_stats(db_path: &str) -> AnyhowResult<(u64, u64)> {
