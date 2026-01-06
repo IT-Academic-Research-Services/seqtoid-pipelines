@@ -1638,18 +1638,23 @@ pub mod czid_dedup {
 
 
 pub mod diamond {
+
+    const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
+
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::path::Path;
-    use anyhow::anyhow;
+    use regex::Regex;
     use log::{debug, info, error, warn};
     use tokio::fs::{self, DirEntry};
     use tokio::task::JoinHandle;
     use tokio::process::Command;
     use tempfile::{NamedTempFile, TempDir};
+    use anyhow::{anyhow, Result as AnyhowResult};
     use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, PipelineError};
-    use crate::utils::file::available_space_for_path;
+    use crate::utils::file::{available_space_for_path, choose_temp_dir};
+    use crate::utils::system::detect_ram;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream, spawn_cmd};
     use crate::utils::command::{version_check, ArgGenerator};
 
@@ -1704,34 +1709,33 @@ pub mod diamond {
     }
 
     impl ArgGenerator for DiamondArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> AnyhowResult<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<DiamondConfig>())
-                .ok_or_else(|| anyhow!("Diamond requires a DiamondConfig as extra argument"))?;
+                .ok_or_else(|| anyhow!("Diamond requires DiamondConfig in extra"))?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = vec![];
 
             match config.subcommand {
-                DiamondSubcommand::Blastx => {
-                    args_vec.push("blastx".to_string());
-                }
-
+                DiamondSubcommand::Blastx => args_vec.push("blastx".to_string()),
             }
 
             args_vec.push("-d".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
 
+            let threads = run_config.thread_allocation(DIAMOND_TAG, None);
             args_vec.push("--threads".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, DIAMOND_TAG, None);
-            args_vec.push(num_cores.to_string());
+            args_vec.push(threads.to_string());
 
-            args_vec.push("--block-size".to_string());
-            args_vec.push("8.0".to_string());  // 8 GB blocks —
+            let index_chunks = if threads >= 96 { 12 } else if threads >= 64 { 8 } else { 4 };
             args_vec.push("-c".to_string());
-            args_vec.push("8".to_string());
+            args_vec.push(index_chunks.to_string());
 
-            for (key, value) in config.subcommand_fields.iter() {
+            for (key, value) in &config.subcommand_fields {
                 args_vec.push(key.clone());
                 if let Some(v) = value {
                     args_vec.push(v.clone());
@@ -1741,6 +1745,91 @@ pub mod diamond {
             Ok(args_vec)
         }
     }
+
+    pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
+        let db_path = run_config
+            .args
+            .diamond_db
+            .as_deref()
+            .ok_or_else(|| anyhow!("--diamond-db not provided"))?;
+
+        let (_, available_ram) = detect_ram()?;
+        let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
+
+        let scratch_path_str = run_config
+            .args
+            .nvme_scratch
+            .as_deref()
+            .unwrap_or(".");
+
+        let scratch_path = PathBuf::from(scratch_path_str);
+        let scratch_space = available_space_for_path(&scratch_path).await?;
+
+        let db_stats = get_diamond_db_stats(db_path).await?;
+        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
+
+        let ram_based_b = available_ram_gb / 25.0;
+
+        let mut block_size = ram_based_b
+            .min(total_letters_billions)
+            .max(2.0)
+            .floor();
+
+        let db_file_gb = std::fs::metadata(db_path)?.len() as f64 / 1_073_741_824.0;
+        if scratch_space < (db_file_gb * 2.0) as u64 {
+            warn!(
+                "Low scratch space (~{:.1} GiB); reducing block size by 40%",
+                scratch_space as f64 / 1_073_741_824.0
+            );
+            block_size *= 0.6;
+        }
+
+        debug!(
+            "Computed Diamond --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
+            block_size,
+            available_ram_gb,
+            db_stats.1 as f64 / 1e9,
+            scratch_space as f64 / 1_073_741_824.0
+        );
+
+        Ok(block_size.max(2.0))
+    }
+
+    async fn get_diamond_db_stats(db_path: &str) -> AnyhowResult<(u64, u64)> {
+        let output = Command::new("diamond")
+            .args(["dbinfo", "--db", db_path])
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to spawn diamond dbinfo: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "diamond dbinfo failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        let seq_re = Regex::new(r"Number of sequences:\s+(\d+)")?;
+        let letters_re = Regex::new(r"Number of letters:\s+(\d+)")?;
+
+        let sequences = seq_re
+            .captures(&stdout)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("Failed to parse sequences"))?;
+
+        let letters = letters_re
+            .captures(&stdout)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("Failed to parse letters"))?;
+
+        Ok((sequences, letters))
+    }
+
+
 }
 
 

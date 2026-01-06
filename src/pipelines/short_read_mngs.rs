@@ -58,7 +58,7 @@ use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
 use crate::utils::command::czid_dedup::CzidDedupConfig;
-use crate::utils::command::diamond::{diamond_index_prep, DiamondArgGenerator, DiamondConfig};
+use crate::utils::command::diamond::{diamond_index_prep, DiamondArgGenerator, DiamondConfig, compute_optimal_block_size};
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::hisat2::{hisat2_index_prep, Hisat2Config};
 use crate::utils::command::kallisto::KallistoConfig;
@@ -101,6 +101,8 @@ const MIN_CONTIG_SIZE: u64 = 500;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
+
+const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r",(?=[^\s])").unwrap()
@@ -2088,11 +2090,26 @@ async fn diamond_non_host_align(
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file: {}", e)))?;
     let temp_path = temp_output.path().to_path_buf();
 
+    let optimal_block_size = compute_optimal_block_size(&config)
+        .await
+        .unwrap_or(8.0);
+
+    info!("Using optimal Diamond block size: {:.1}", optimal_block_size);
+
+    let diamond_tmpdir = choose_temp_dir(
+        DIAMOND_TEMP,
+        &config.ram_temp_dir,           // /dev/shm
+        &config.args.nvme_scratch,      // user-provided NVMe path
+        4,                   // use at most 1/4 of available space → safe headroom
+    ) .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
+        ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
         ("-f".to_string(), Some("6".to_string())),
-        ("-o".to_string(), Some(temp_path.to_string_lossy().to_string())),
+        ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
+        ("--tmpdir".to_string(), Some(diamond_tmpdir.to_string_lossy().into_owned())),
     ]);
 
     let diamond_config = DiamondConfig {
