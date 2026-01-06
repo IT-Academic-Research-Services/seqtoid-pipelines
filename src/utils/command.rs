@@ -1759,24 +1759,20 @@ pub mod diamond {
 
         debug!("Using DB path for stats: {}", db_path);
 
-        let (_, available_ram) = detect_ram()
-            .map_err(|e| anyhow!("detect_ram failed: {}", e))?;
+        let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
 
         let scratch_path_str = run_config.args.nvme_scratch.as_deref().unwrap_or(".");
         let scratch_path = PathBuf::from(scratch_path_str);
-        let scratch_space = available_space_for_path(&scratch_path).await
-            .map_err(|e| anyhow!("available_space_for_path failed: {}", e))?;
+        let scratch_space = available_space_for_path(&scratch_path).await?;
 
         let db_stats = get_diamond_db_stats(&db_path).await
-            .map_err(|e| anyhow!("get_diamond_db_stats failed: {}", e))?;
+            .map_err(|e| {
+                warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
+                (0, 300_000_000_000)
+            });
 
-        let total_letters_billions = if db_stats.1 == 0 {
-            warn!("DB stats returned 0 letters — assuming full NR size (300B letters)");
-            300.0
-        } else {
-            db_stats.1 as f64 / 1_000_000_000.0
-        };
+        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
 
         let ram_based_b = available_ram_gb / 20.0;
 
@@ -1787,7 +1783,11 @@ pub mod diamond {
 
         let db_file_gb = std::fs::metadata(&db_path)
             .map(|m| m.len() as f64 / 1_073_741_824.0)
-            .map_err(|e| anyhow!("fs::metadata failed: {}", e))?;
+            .unwrap_or_else(|e| {
+                warn!("Failed to get DB file size: {}. Skipping scratch derate.", e);
+                0.0
+            });
+
         if scratch_space < (db_file_gb * 2.0) as u64 {
             warn!("Low scratch; reducing block size by 40%");
             block_size *= 0.6;
@@ -1810,13 +1810,13 @@ pub mod diamond {
 
         if !output.status.success() {
             return Err(anyhow!(
-                "diamond dbinfo failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            "diamond dbinfo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        eprintln!("WTF diamond db stats: {}", stdout);
+        debug!("Diamond dbinfo output: {}", stdout);
 
         let seq_re = Regex::new(r"Sequences\s+(\d+)")?;
         let letters_re = Regex::new(r"Letters\s+(\d+)")?;
@@ -1825,13 +1825,13 @@ pub mod diamond {
             .captures(&stdout)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<u64>().ok())
-            .ok_or_else(|| anyhow!("Failed to parse sequences"))?;
+            .ok_or_else(|| anyhow!("Failed to parse sequences from: {}", stdout))?;
 
         let letters = letters_re
             .captures(&stdout)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<u64>().ok())
-            .ok_or_else(|| anyhow!("Failed to parse letters"))?;
+            .ok_or_else(|| anyhow!("Failed to parse letters from: {}", stdout))?;
 
         Ok((sequences, letters))
     }
