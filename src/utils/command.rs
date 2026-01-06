@@ -1747,10 +1747,17 @@ pub mod diamond {
     }
 
     pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
-        let db_path = run_config.args.diamond_db.as_deref()
+        let db_path_base = run_config.args.diamond_db.as_deref()
             .ok_or_else(|| anyhow!("--diamond-db not provided"))?;
 
-        debug!("Computing block size for DB: {}", db_path);
+        // Auto-append .dmnd if missing
+        let db_path = if db_path_base.ends_with(".dmnd") {
+            db_path_base.to_string()
+        } else {
+            format!("{}.dmnd", db_path_base)
+        };
+
+        debug!("Using DB path for stats: {}", db_path);
 
         let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
