@@ -1767,9 +1767,9 @@ pub mod diamond {
         let scratch_space = available_space_for_path(&scratch_path).await?;
 
         let db_stats = get_diamond_db_stats(&db_path).await
-            .map_err(|e| {
+            .unwrap_or_else(|e| {
                 warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
-                (0, 300_000_000_000)
+                (0, 300_000_000_000)  // sequences, letters
             });
 
         let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
@@ -1794,9 +1794,12 @@ pub mod diamond {
         }
 
         debug!(
-        "Computed --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
-        block_size, available_ram_gb, db_stats.1 as f64 / 1e9, scratch_space as f64 / 1_073_741_824.0
-    );
+    "Computed --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
+    block_size,
+    available_ram_gb,
+    db_stats.1 as f64 / 1e9,
+    scratch_space as f64 / 1_073_741_824.0
+);
 
         Ok(block_size.max(6.0))
     }
