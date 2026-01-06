@@ -1816,6 +1816,7 @@ pub mod diamond {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("WTF diamond db stats: {}", stdout);
 
         let seq_re = Regex::new(r"Sequences\s+(\d+)")?;
         let letters_re = Regex::new(r"Letters\s+(\d+)")?;
