@@ -1759,38 +1759,35 @@ pub mod diamond {
 
         debug!("Using DB path for stats: {}", db_path);
 
-        let (_, available_ram) = detect_ram()?;
+        let (_, available_ram) = detect_ram()
+            .map_err(|e| anyhow!("detect_ram failed: {}", e))?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
 
         let scratch_path_str = run_config.args.nvme_scratch.as_deref().unwrap_or(".");
         let scratch_path = PathBuf::from(scratch_path_str);
-        let scratch_space = available_space_for_path(&scratch_path).await?;
+        let scratch_space = available_space_for_path(&scratch_path).await
+            .map_err(|e| anyhow!("available_space_for_path failed: {}", e))?;
 
-        let db_stats = match get_diamond_db_stats(&db_path).await {
-            Ok(stats) => stats,
-            Err(e) => {
-                warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
-                (0, 300_000_000_000)  // fallback letters for full NR
-            }
+        let db_stats = get_diamond_db_stats(&db_path).await
+            .map_err(|e| anyhow!("get_diamond_db_stats failed: {}", e))?;
+
+        let total_letters_billions = if db_stats.1 == 0 {
+            warn!("DB stats returned 0 letters — assuming full NR size (300B letters)");
+            300.0
+        } else {
+            db_stats.1 as f64 / 1_000_000_000.0
         };
 
-        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
-
-        let ram_based_b = available_ram_gb / 20.0;  // tuned divisor for realism (~18-22 GB/billion)
+        let ram_based_b = available_ram_gb / 20.0;
 
         let mut block_size = ram_based_b
             .min(total_letters_billions)
             .max(6.0)
             .floor();
 
-        let db_file_gb = match std::fs::metadata(&db_path) {
-            Ok(meta) => meta.len() as f64 / 1_073_741_824.0,
-            Err(e) => {
-                warn!("Failed to get DB file size: {}. Skipping scratch derate.", e);
-                0.0  // skip derate
-            }
-        };
-
+        let db_file_gb = std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1_073_741_824.0)
+            .map_err(|e| anyhow!("fs::metadata failed: {}", e))?;
         if scratch_space < (db_file_gb * 2.0) as u64 {
             warn!("Low scratch; reducing block size by 40%");
             block_size *= 0.6;
@@ -1820,8 +1817,8 @@ pub mod diamond {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let seq_re = Regex::new(r"Number of sequences:\s+(\d+)")?;
-        let letters_re = Regex::new(r"Number of letters:\s+(\d+)")?;
+        let seq_re = Regex::new(r"Sequences\s+(\d+)")?;
+        let letters_re = Regex::new(r"Letters\s+(\d+)")?;
 
         let sequences = seq_re
             .captures(&stdout)
