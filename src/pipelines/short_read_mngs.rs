@@ -2112,7 +2112,7 @@ async fn diamond_non_host_align(
         ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
         ("--tmpdir".to_string(), Some(diamond_tmpdir.to_string_lossy().into_owned())),
         ("--hit-membuf".to_string(), None),
-        ("--range-culling".to_string(), None),
+        // ("--range-culling".to_string(), None),
         ("--verbose".to_string(), None),
     ]);
 
