@@ -2106,7 +2106,7 @@ async fn diamond_non_host_align(
 
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
-        ("--block-size".to_string(), Some("100".to_string())),
+        ("--block-size".to_string(), Some("20".to_string())),
         ("--bin".to_string(), Some("1".to_string())),
         // ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
         ("-f".to_string(), Some("6".to_string())),
