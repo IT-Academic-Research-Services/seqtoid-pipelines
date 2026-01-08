@@ -785,19 +785,32 @@ async fn hisat2_filter(
     paired: bool,
     hisat2_options: HashMap<String, Option<String>>,
     output_bam_path: Option<PathBuf>,
+    estimated_input_size_bytes: u64,
+    headroom: u64,
 ) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    // Deinterleave and write to files in CWD
-    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+    let required_space = estimated_input_size_bytes * headroom;
+    let ram_available = available_space_for_path(&config.ram_temp_dir).await.unwrap_or(0);
+    let use_ram = required_space <= ram_available;
+
+    let temp_dir = if use_ram {
+        config.ram_temp_dir.clone()
+    } else {
+        config.args.nvme_scratch.as_ref()
+            .map(|s| PathBuf::from(s))
+            .unwrap_or(PathBuf::from("."))
+    };
+
+
     let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
         input_stream,
         paired,
         config.base_buffer_size,
     ).await.map_err(|e| PipelineError::Other(e))?;
 
-    let r1_path = cwd.join("unmapped_r1.fq");
+    let r1_path = temp_dir.join("hisat-unmapped_r1.fq");
     let r1_write_task = write_byte_stream_to_file(
         &r1_path,
         ReceiverStream::new(r1_rx),
@@ -806,7 +819,7 @@ async fn hisat2_filter(
     cleanup_tasks.push(r1_write_task);
 
     let r2_path_opt = if paired {
-        let r2_path = cwd.join("unmapped_r2.fq");
+        let r2_path = temp_dir.join("unmapped_r2.fq");
         let r2_write_task = write_byte_stream_to_file(
             &r2_path,
             ReceiverStream::new(r2_rx_opt.unwrap()),
@@ -917,7 +930,6 @@ async fn hisat2_filter(
 
     let mut bam_streams_iter = bam_streams.into_iter();
 
-    // Optional: Write BAM to file
     if let Some(bam_path) = output_bam_path {
         let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
         let bam_write_task = write_byte_stream_to_file(
