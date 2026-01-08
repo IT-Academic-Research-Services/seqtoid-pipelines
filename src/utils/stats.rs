@@ -73,6 +73,7 @@ pub fn compute_lx(lengths: &[u64], fraction: f64) -> u32 {
 pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<SamtoolsStats> {
     let mut summary = HashMap::new();
     let mut insert_sizes = Vec::new();
+    let mut total_pairs: u64 = 0;
     let mut stream = ReceiverStream::new(rx);
 
     while let Some(item) = stream.next().await {
@@ -83,9 +84,7 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                     continue;
                 }
 
-                // Remove leading '# '
                 let line = line.trim_start_matches('#').trim();
-
                 let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
 
                 if parts.is_empty() {
@@ -94,12 +93,22 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
 
                 match parts[0] {
                     "SN" => {
-                        if parts.len() >= 2 {
-                            let key = parts[0].trim_end_matches(':').to_string();
-                            let value = parts[1].to_string();
-                            summary.insert(key, value);
+                        if parts.len() >= 3 {
+                            let key = parts[1].trim_end_matches(':').to_string();
+                            let value = parts[2].to_string();
+
+                            summary.insert(key.to_string(), value);
+
+                            // xtract total properly paired read pairs
+                            if key == "reads mapped and paired" {
+                                if let Ok(count) = parts[2].parse::<u64>() {
+                                    total_pairs = count;
+                                } else {
+                                    warn!("Failed to parse 'reads mapped and paired' count: {}", parts[2]);
+                                }
+                            }
                         } else {
-                            warn!("Malformed SN line (expected >=2 fields): {}", line);
+                            warn!("Malformed SN line (expected >=3 fields): {}", line);
                         }
                     }
                     "IS" => {
@@ -107,32 +116,18 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                             let size: u32 = match parts[1].parse() {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    warn!("Failed to parse insert size '{}' in IS line: {} (line: {})", parts[1], e, line);
+                                    warn!("Failed to parse insert size: {} (line: {})", e, line);
                                     continue;
                                 }
                             };
-                            let inward: u64 = match parts[2].parse() {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    warn!("Failed to parse inward count '{}' in IS line: {} (line: {})", parts[2], e, line);
-                                    continue;
-                                }
-                            };
-                            let outward: u64 = match parts[3].parse() {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    warn!("Failed to parse outward count '{}' in IS line: {} (line: {})", parts[3], e, line);
-                                    continue;
-                                }
-                            };
-                            let other: u64 = match parts[4].parse() {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    warn!("Failed to parse other count '{}' in IS line: {} (line: {})", parts[4], e, line);
-                                    continue;
-                                }
-                            };
-                            insert_sizes.push((size, inward + outward + other));
+                            let inward: u64 = parts[2].parse().unwrap_or(0);
+                            let outward: u64 = parts[3].parse().unwrap_or(0);
+                            let other: u64 = parts[4].parse().unwrap_or(0);
+                            let count = inward + outward + other;
+
+                            if count > 0 {
+                                insert_sizes.push((size, count));
+                            }
                         } else {
                             warn!("Malformed IS line (expected 5 fields, got {}): {}", parts.len(), line);
                         }
@@ -148,12 +143,16 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
     }
 
     if insert_sizes.is_empty() {
-        warn!("No valid IS (insert size) lines parsed from samtools stats — check if BAM is paired-end and samtools version >=1.6");
+        warn!("No valid IS lines parsed — likely single-end or no mapped pairs");
     } else {
-        info!("Parsed {} insert size entries from samtools stats", insert_sizes.len());
+        info!("Parsed {} insert size bins, total_pairs = {}", insert_sizes.len(), total_pairs);
     }
 
-    Ok(SamtoolsStats { summary, insert_sizes })
+    Ok(SamtoolsStats {
+        summary,
+        insert_sizes,
+        total_pairs,
+    })
 }
 
 

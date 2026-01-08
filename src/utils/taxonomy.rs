@@ -1,6 +1,7 @@
 use tokio_stream::StreamExt;
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
+use std::fs::{self as StdFS};
 use std::fs::File as StdFile;
 use std::io::{BufReader as StdBufReader};
 use std::sync::Arc;
@@ -20,9 +21,17 @@ use bincode::{encode_into_std_write, decode_from_std_read};
 use serde::{Serialize, Deserialize};
 use ahash::AHashMap;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID};
+use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID, TaxonSeqLocation};
 use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
 use crate::utils::streams::ParseOutput;
+
+const SPECIES_NON_SPECIFIC: Taxid = -100;
+const GENUS_NON_SPECIFIC: Taxid = -200;
+const FAMILY_NON_SPECIFIC: Taxid = -300;
+
+const NULL_TAXID: Taxid = -1;
+const NULL_LINEAGE: Lineage = [NULL_TAXID; 3];
+
 // *******************
 // DB creation functions
 // *******************
@@ -575,4 +584,133 @@ pub fn validate_taxid_lineage(
     }
 
     cleaned
+}
+
+
+pub fn get_valid_lineage(
+    hits_by_read_id: &AHashMap<String, (Taxid, u8)>,     // contig_id → (taxid, level)
+    lineage_map: &Arc<AHashMap<Taxid, Lineage>>,
+    read_id: &str,
+) -> Lineage {
+    let (hit_taxid, hit_level) = hits_by_read_id
+        .get(read_id)
+        .copied()
+        .unwrap_or((-1, 255)); // 255 = invalid level
+
+    if hit_taxid <= 0 {
+        return NULL_LINEAGE;
+    }
+
+    if hit_level == 1 {
+
+        lineage_map
+            .get(&hit_taxid)
+            .copied()
+            .unwrap_or(NULL_LINEAGE)
+    } else {
+
+        [SPECIES_NON_SPECIFIC, GENUS_NON_SPECIFIC, FAMILY_NON_SPECIFIC]
+    }
+}
+
+pub fn generate_locator_work(
+    records: Arc<Vec<(String, String)>>, // (header_without_>, sequence)
+    taxid_field: String,
+    hit_type: String,
+    output_fa: PathBuf,
+    output_json: PathBuf,
+) -> Result<()> {
+    if records.is_empty() {
+        StdFS::write(&output_fa, b"")?;
+        StdFS::write(&output_json, b"[]")?;
+        return Ok(());
+    }
+
+
+    let mut indices: Vec<usize> = (0..records.len()).collect();
+    indices.sort_unstable_by_key(|&i| {
+        get_taxid(&records[i].0, &taxid_field).unwrap_or(-1)
+    });
+
+
+    let std_file = std::fs::File::create(&output_fa)?;
+    let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, std_file); // 8 MiB
+
+    let mut locations = Vec::with_capacity(100_000);
+    let mut current_taxid: i32 = -1;
+    let mut first_byte: u64 = 0;
+    let mut pos: u64 = 0;
+
+    for &idx in &indices {
+        let (header, seq) = &records[idx];
+        let taxid = get_taxid(header, &taxid_field).unwrap_or(-1);
+
+        // New taxid block → close previous
+        if taxid != current_taxid && current_taxid != -1 {
+            locations.push(TaxonSeqLocation {
+                taxid: current_taxid,
+                first_byte,
+                last_byte: pos - 1,
+                hit_type: hit_type.clone(),
+            });
+            first_byte = pos;
+        }
+        current_taxid = taxid;
+        
+        let header_line = format!(">{header}\n");
+        let seq_line = format!("{seq}\n");
+
+        writer.write_all(header_line.as_bytes())?;
+        pos += header_line.len() as u64;
+
+        writer.write_all(seq_line.as_bytes())?;
+        pos += seq_line.len() as u64;
+    }
+
+    // loop and a half
+    if current_taxid != -1 {
+        locations.push(TaxonSeqLocation {
+            taxid: current_taxid,
+            first_byte,
+            last_byte: pos - 1,
+            hit_type: hit_type.clone(),
+        });
+    }
+
+    writer.flush()?;
+
+    // 3. Write JSON locator
+    let json_bytes = serde_json::to_vec(&locations)?;
+    StdFS::write(&output_json, json_bytes)?;
+
+    Ok(())
+}
+
+
+fn get_taxid(header: &str, field: &str) -> Result<i32> {
+    let parts: Vec<&str> = header.split(':').collect();
+    let pos = parts
+        .iter()
+        .position(|&p| p == field)
+        .ok_or_else(|| anyhow!("Field '{field}' not found in header: {header}"))?;
+
+    let taxid_str = parts
+        .get(pos + 1)
+        .ok_or_else(|| anyhow!("No value after field '{field}' in header: {header}"))?;
+
+    taxid_str
+        .parse::<i32>()
+        .map_err(|e| anyhow!("Failed to parse taxid '{taxid_str}' for field '{field}': {e}"))
+}
+
+pub fn combine_taxon_loc_json(input_jsons: Vec<PathBuf>, output_json: PathBuf) -> Result<()> {
+    let mut combined: Vec<TaxonSeqLocation> = Vec::new();
+    for path in input_jsons {
+        let data = StdFS::read(&path)?;
+        let mut locs: Vec<TaxonSeqLocation> = serde_json::from_slice(&data)?;
+        combined.append(&mut locs);
+    }
+    let json_data = serde_json::to_vec(&combined)?;
+    StdFS::write(output_json, json_data)?;
+    Ok(())
 }

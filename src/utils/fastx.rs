@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow, Context};
 use log::{self, debug, info, error, warn};
 
 use std::collections::HashMap;
+use ahash::AHashMap;
 use lazy_static::lazy_static;
 use crate::utils::sequence::{DNA, normal_phred_qual_string}; 
 use futures::Stream;
@@ -24,13 +25,15 @@ use tokio::fs::File as TokioFile;
 use futures::future::try_join_all;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
+use tokio::sync::mpsc::Receiver;
 use memchr::memmem;
 use fst::{MapBuilder};
 
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError};
+use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -733,37 +736,41 @@ pub fn read_fasta(
 /// * `stream` - ParseOutput stream, must eb fASTA foirmat
 /// * 'dest_path' - location to write to
 /// * 'mbuffer_capacity'
-/// # Returns
-///  Result<(JoinHandle<Result<u64>>, PathBuf)>
-pub async fn write_fasta_stream_to_file(
-    mut stream: ReceiverStream<ParseOutput>,
+/// # Returns      Vec<JoinHandle<Result<()>>>,
+pub fn write_fasta_stream_to_file(
+    stream: ReceiverStream<ParseOutput>,
     dest_path: PathBuf,
     buffer_capacity: usize,
-) -> Result<(JoinHandle<Result<u64>>, PathBuf)> {
+) -> JoinHandle<Result<()>> {
     let dest_path_clone = dest_path.clone();
 
-    let task = tokio::spawn(async move {
-        let file = TokioFile::create(&dest_path_clone).await
+    tokio::spawn(async move {
+        let file = TokioFile::create(&dest_path_clone)
+            .await
             .map_err(|e| anyhow!("Cannot create FASTA file {}: {}", dest_path_clone.display(), e))?;
-        let mut writer = tokio::io::BufWriter::with_capacity(buffer_capacity, file);
-        let mut total_bytes = 0u64;
 
+        let mut writer = tokio::io::BufWriter::with_capacity(buffer_capacity, file);
+
+        let mut stream = stream;
         while let Some(item) = stream.next().await {
-            let bytes = item.to_bytes()
+            let bytes = item
+                .to_bytes()
                 .map_err(|e| anyhow!("Failed to convert FASTA record to bytes: {}", e))?;
-            writer.write_all(&bytes).await
+
+            writer
+                .write_all(&bytes)
+                .await
                 .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
-            total_bytes += bytes.len() as u64;
         }
 
-        writer.flush().await
+        writer
+            .flush()
+            .await
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
-        info!("FASTA written to {} ({} bytes)", dest_path_clone.display(), total_bytes);
-        Ok(total_bytes)
-    });
-
-    Ok((task, dest_path))
+        info!("FASTA written to {}", dest_path_clone.display());
+        Ok(())
+    })
 }
 
 fn compare_read_ids_bytes(head1: &[u8], head2: &[u8]) -> bool {
@@ -1274,6 +1281,304 @@ pub fn build_fasta_index(
     info!("FST index built successfully");
 
     Ok(())
+}
+
+
+pub async fn generate_taxid_fasta(
+    mapped_contigs_stream: ReceiverStream<ParseOutput>,
+    unidentified_contigs_stream: ReceiverStream<ParseOutput>,
+    nt_hit_summary_stream: ReceiverStream<ParseOutput>,
+    nr_hit_summary_stream: ReceiverStream<ParseOutput>,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+) -> Result<(
+    mpsc::Receiver<ParseOutput>,           // mapped contigs with taxid headers
+    mpsc::Receiver<ParseOutput>,           // combined (mapped + conformed unmapped)
+    JoinHandle<Result<()>>,                // load_nt_task
+    JoinHandle<Result<()>>,                // load_nr_task
+    JoinHandle<Result<()>>,                // main_task
+)> {
+    // Output channels
+    let (mapped_tx, mapped_rx) = mpsc::channel(1024);
+    let (combined_tx, combined_rx) = mpsc::channel(2048);
+
+    // Channels for completed hit maps
+    let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<AHashMap<String, (Taxid, u8)>>(1);
+    let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<AHashMap<String, (Taxid, u8)>>(1);
+
+    // Load NT hit summary → build map
+    let load_nt_task = tokio::spawn({
+        let nt_stream = nt_hit_summary_stream;
+        async move {
+            let mut hits = AHashMap::with_capacity(100_000);
+            let mut stream = nt_stream;
+            while let Some(item) = stream.next().await {
+                if let ParseOutput::Bytes(bytes) = item {
+                    let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                    if line.is_empty() { continue; }
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if fields.len() < 4 { continue; }
+                    let read_id = fields[0].to_string();
+                    let level: u8 = fields[1].parse().unwrap_or(255);
+                    let taxid: Taxid = fields[3].parse().unwrap_or(-1);
+                    hits.insert(read_id, (taxid, level));
+                }
+            }
+            nt_hits_tx.send(hits).await.map_err(|_| anyhow!("NT hits tx dropped"))?;
+            Ok(())
+        }
+    });
+
+    // Load NR hit summary → build map
+    let load_nr_task = tokio::spawn({
+        let nr_stream = nr_hit_summary_stream;
+        async move {
+            let mut hits = AHashMap::with_capacity(100_000);
+            let mut stream = nr_stream;
+            while let Some(item) = stream.next().await {
+                if let ParseOutput::Bytes(bytes) = item {
+                    let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                    if line.is_empty() { continue; }
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if fields.len() < 4 { continue; }
+                    let read_id = fields[0].to_string();
+                    let level: u8 = fields[1].parse().unwrap_or(255);
+                    let taxid: Taxid = fields[3].parse().unwrap_or(-1);
+                    hits.insert(read_id, (taxid, level));
+                }
+            }
+            nr_hits_tx.send(hits).await.map_err(|_| anyhow!("NR hits tx dropped"))?;
+            Ok(())
+        }
+    });
+
+    // Main processing task
+    let main_task = tokio::spawn(async move {
+        // Wait for both maps
+        let nt_hits = nt_hits_rx.recv().await.ok_or(anyhow!("NT hits map not received"))?;
+        let nr_hits = nr_hits_rx.recv().await.ok_or(anyhow!("NR hits map not received"))?;
+
+        // Process annotated (mapped) contigs
+        let mut mapped_stream = mapped_contigs_stream;
+        while let Some(item) = mapped_stream.next().await {
+            if let ParseOutput::Fasta(rec) = item {
+                let annotated_id = rec.id();
+                let parts: Vec<&str> = annotated_id.split(':').collect();
+                let contig_id = parts.last().unwrap_or(&"").to_string();
+
+                let nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
+                let nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+
+                let new_header = format!(
+                    ">family_nr:{}:family_nt:{}:genus_nr:{}:genus_nt:{}:species_nr:{}:species_nt:{}:{}\n",
+                    nr_lineage[2], nt_lineage[2],
+                    nr_lineage[1], nt_lineage[1],
+                    nr_lineage[0], nt_lineage[0],
+                    annotated_id
+                );
+
+                let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
+                let seq_arc = match rec {
+                    SequenceRecord::Fasta { seq, .. } => seq,
+                    _ => unreachable!(),
+                };
+                let new_rec = SequenceRecord::Fasta {
+                    id: new_id,
+                    desc: new_desc,
+                    seq: seq_arc,
+                };
+
+                mapped_tx.send(ParseOutput::Fasta(new_rec.clone())).await?;
+                combined_tx.send(ParseOutput::Fasta(new_rec)).await?;
+            }
+        }
+
+        // Process unidentified contigs → conform headers
+        let mut unid_stream = unidentified_contigs_stream;
+        while let Some(item) = unid_stream.next().await {
+            if let ParseOutput::Fasta(rec) = item {
+                let conformed_header = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
+                let (new_id, new_desc) = parse_header(conformed_header.as_bytes(), '>');
+                let seq_arc = match rec {
+                    SequenceRecord::Fasta { seq, .. } => seq,
+                    _ => unreachable!(),
+                };
+                let new_rec = SequenceRecord::Fasta {
+                    id: new_id,
+                    desc: new_desc,
+                    seq: seq_arc,
+                };
+                combined_tx.send(ParseOutput::Fasta(new_rec)).await?;
+            }
+        }
+
+        drop(mapped_tx);
+        drop(combined_tx);
+        Ok(())
+    });
+
+    Ok((
+        mapped_rx,
+        combined_rx,
+        load_nt_task,
+        load_nr_task,
+        main_task,
+    ))
+}
+
+
+
+pub async fn generate_taxid_locator(
+    fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
+    assembly_dir: PathBuf,
+) -> Result<
+    (
+        Vec<PathBuf>,
+        Vec<JoinHandle<Result<()>>>,
+        Vec<Receiver<Result<()>>>,
+    ),
+    PipelineError,
+> {
+
+    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
+    let mut records: Vec<(String, String)> = Vec::with_capacity(1_000_000);
+
+    while let Some(item) = fasta_stream.next().await {
+        let bytes = item
+            .to_bytes()
+            .map_err(|e| PipelineError::Other(anyhow!("ParseOutput to_bytes failed: {}", e)))?;
+
+        if bytes.is_empty() {
+            continue;
+        }
+
+        let record_str = String::from_utf8(bytes.to_vec())
+            .map_err(|e| PipelineError::Other(anyhow!("Invalid UTF-8 in FASTA record: {}", e)))?;
+
+        let mut lines = record_str.lines();
+        let header_line = match lines.next() {
+            Some(l) => l,
+            None => continue,
+        };
+        let seq_line = match lines.next() {
+            Some(l) => l,
+            None => {
+                warn!("FASTA record missing sequence line");
+                continue;
+            }
+        };
+
+        if !header_line.starts_with('>') {
+            warn!("Invalid FASTA header (missing '>'): {}", header_line);
+            continue;
+        }
+
+        let header = header_line[1..].trim().to_string(); // strip '>'
+        let seq = seq_line.trim().to_string();
+
+        records.push((header, seq));
+    }
+
+    info!("Collected {} mapped contigs for taxid locator generation", records.len());
+
+    if records.is_empty() {
+        // Write empty outputs
+        let empty_paths = vec![
+            assembly_dir.join("refined_taxid_annot_sorted_nt.fasta"),
+            assembly_dir.join("refined_taxid_annot_sorted_nr.fasta"),
+        ];
+        return Ok((empty_paths, vec![], vec![]));
+    }
+
+    let records_arc = Arc::new(records);
+
+    let levels = ["species", "genus", "family"];
+    let hit_types = ["NT", "NR"];
+
+    let mut output_paths: Vec<PathBuf> = Vec::new();
+    let mut locator_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+
+    for &level in &levels {
+        for &hit_type in &hit_types {
+            let taxid_field = format!("{}_{}", level, hit_type.to_lowercase());
+
+            let fa_name = if level == "species" {
+                format!("refined_taxid_annot_sorted_{}.fasta", hit_type.to_lowercase())
+            } else {
+                format!("refined_taxid_annot_sorted_{}_{}.fasta", level, hit_type.to_lowercase())
+            };
+            let output_fa = assembly_dir.join(&fa_name);
+            let output_json = assembly_dir.join(format!(
+                "refined_taxid_locations_{}_{}.json",
+                level,
+                hit_type.to_lowercase()
+            ));
+
+            let records_clone = records_arc.clone();
+            let taxid_field_clone = taxid_field.clone();
+            let hit_type_clone = hit_type.to_string();
+            let output_fa_clone = output_fa.clone();
+            let output_json_clone = output_json.clone();
+
+            let handle = tokio::task::spawn_blocking(move || {
+                generate_locator_work(
+                    records_clone,
+                    taxid_field_clone,
+                    hit_type_clone,
+                    output_fa_clone,
+                    output_json_clone,
+                )
+            });
+
+            locator_tasks.push(handle);
+
+            output_paths.push(output_fa);
+            output_paths.push(output_json);
+        }
+    }
+
+    let json_paths: Vec<PathBuf> = output_paths
+        .iter()
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .cloned()
+        .collect();
+
+    let combined_path = assembly_dir.join("refined_taxid_locations_combined.json");
+    let combined_path_for_worker = combined_path.clone(); // ← explicit clone
+
+    let combine_handle = tokio::task::spawn_blocking(move || {
+        combine_taxon_loc_json(json_paths, combined_path_for_worker)
+    });
+
+    locator_tasks.push(combine_handle);
+    output_paths.push(combined_path);
+
+    Ok((output_paths, locator_tasks, vec![]))
+}
+
+pub async fn filter_fastq_to_bytes_stream(
+    mut input_stream: ReceiverStream<ParseOutput>,
+    headers: Arc<HashSet<String>>,
+) -> ReceiverStream<ParseOutput> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2048);
+
+    tokio::spawn(async move {
+        while let Some(item) = input_stream.next().await {
+            if let ParseOutput::Fastq(record) = item {
+                if headers.contains(&record.id()[..]) {
+                    match record.to_bytes() {
+                        Ok(vec) => {
+                            let arc_data = Arc::new(vec);
+                            let _ = tx.send(ParseOutput::Bytes(arc_data)).await;
+                        }
+                        Err(e) => error!("Failed to serialize FASTQ record: {}", e),
+                    }
+                }
+                // else: explicitly skipped
+            }
+        }
+    });
+
+    ReceiverStream::new(rx)
 }
 
 

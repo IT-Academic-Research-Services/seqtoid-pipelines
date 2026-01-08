@@ -529,6 +529,7 @@ pub async fn spawn_cmd(
     };
 
     let cmd_tag_owned = cmd_tag.to_string();
+    eprintln!("[{} cmd]: {}", cmd_tag, args.join(" "));
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
         .stdin(std::process::Stdio::null())

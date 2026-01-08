@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use rand::rngs::StdRng;
 use tokio::task::JoinError;
 use serde_json::Error as SerdeJsonError;
+use serde::{Deserialize, Serialize};
 use log::LevelFilter;
 
 use crate::cli::Arguments;
@@ -51,6 +52,8 @@ pub const INVALID_CALL_BASE_ID: i32 = -100;
 
 pub const LOG_NORMAL_POSITIVE_DOUBLE: f64 = 1e-200;
 pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
+
+pub const CONFORMING_PREAMBLE: &str = ">family_nr:-300:family_nt:-300:genus_nr:-200:genus_nt:-200:species_nr:-100:species_nt:-100:";
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -158,6 +161,7 @@ pub struct ReadStats {
 pub struct SamtoolsStats {
     pub summary: HashMap<String, String>,
     pub insert_sizes: Vec<(u32, u64)>,
+    pub total_pairs: u64
 }
 
 // Static Filenames
@@ -186,6 +190,22 @@ pub struct RunConfig {
     pub rng: StdRng,
     pub log_level: LevelFilter,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaxonSeqLocation {
+    pub taxid: i32,
+    pub first_byte: u64,
+    pub last_byte: u64,
+    pub hit_type: String,
+}
+
+#[derive(Clone)]
+pub struct ClusterInfo {
+    pub size: u64,                  // Cluster size (used by generate_taxon_counts, process_assembly)
+    pub members: Vec<String>,       // All member IDs (rep at [0]) — used by non-host in CountAll
+}
+
+pub type DuplicateClusters = HashMap<String, ClusterInfo>;
 
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {

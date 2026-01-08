@@ -35,7 +35,14 @@ pub trait ArgGenerator {
 ///
 /// # Returns
 /// Result<f32>major/minor version number
-pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_line: usize, version_column: usize, child_stream: ChildStream) -> Result<f32> {
+pub async fn version_check(
+    command_tag: &str,
+    version_args: Vec<&str>,
+    version_line: usize,
+    version_column: usize,
+    child_stream: ChildStream,
+    version_file: Option<PathBuf>,
+) -> Result<f32> {
     let cmd_tag_owned = command_tag.to_string();
     debug!("Running command: {}", &cmd_tag_owned);
     let args: Vec<&str> = version_args;
@@ -49,6 +56,18 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
         .map_err(|e| anyhow!("Failed to spawn {}. Is it installed? Error: {}.", cmd_tag_owned.clone(), e))?;
 
     let lines = read_child_output_to_vec(&mut child, child_stream).await?;
+
+    if let Some(file_path) = version_file {
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).await
+                .map_err(|e| anyhow!("Failed to create directory for version file: {}", e))?;
+        }
+        let full_output = lines.join("\n");
+        fs::write(&file_path, full_output.as_bytes()).await
+            .map_err(|e| anyhow!("Failed to write version file {:?}: {}", file_path, e))?;
+        info!("Wrote version output to {:?}", file_path);
+    }
+
     let line_w_version = lines
         .get(version_line)
         .ok_or_else(|| anyhow!("No line {} in {} version output", version_line, cmd_tag_owned.clone()))?;
@@ -62,12 +81,12 @@ pub async fn version_check(command_tag: &str, version_args: Vec<&str>, version_l
         return Err(anyhow!("Empty version number string in {} version output: {}", cmd_tag_owned.clone(), line_w_version));
     }
 
-    let version_parts:  Vec<_>  = version_string.split(".").collect();
+    let version_parts: Vec<_> = version_string.split(".").collect();
     let major_version = version_parts[0];
     let major_version_digits: String = major_version.chars().filter(|c| c.is_digit(10)).collect();
     let mut minor_version = "0";
     if version_parts.len() > 1 {
-        minor_version = version_parts[1];  // To avoid problems with things like version 2.15.1, only going to track major/minor a la 2.15
+        minor_version = version_parts[1];
     }
     let minor_version_digits: String = minor_version.chars().filter(|c| c.is_digit(10)).collect();
     let version_string_formatted = format!("{}.{}", major_version_digits, minor_version_digits);
@@ -92,7 +111,7 @@ pub mod fastp {
     pub struct FastpArgGenerator;
 
     pub async fn fastp_presence_check() -> Result<f32> {
-        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -151,7 +170,7 @@ mod pigz {
     pub struct PigzArgGenerator;
 
     pub async fn pigz_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -174,7 +193,7 @@ mod h5dump {
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub async fn h5dump_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout).await?;
+        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 }
@@ -194,11 +213,10 @@ pub mod minimap2 {
     }
     pub struct Minimap2ArgGenerator;
 
-    pub async fn minimap2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout).await?;
+    pub async fn minimap2_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
+        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file).await?;
         Ok(version)
     }
-
     pub async fn minimap2_index_prep(
         config: &RunConfig,
         ram_temp_dir: &PathBuf,
@@ -471,7 +489,7 @@ pub mod samtools {
     pub struct SamtoolsArgGenerator;
 
     pub async fn samtools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout).await?;
+        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -568,7 +586,7 @@ pub mod bcftools {
     pub struct BcftoolsArgGenerator;
 
     pub async fn bcftools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -639,7 +657,7 @@ pub mod kraken2 {
     pub struct Kraken2ArgGenerator;
 
     pub async fn kraken2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout).await?;
+        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -702,7 +720,7 @@ pub mod ivar {
     pub struct IvarArgGenerator;
 
     pub async fn ivar_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout).await?;
+        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -748,7 +766,7 @@ pub mod muscle {
 
     pub struct MuscleArgGenerator;
     pub async fn muscle_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 }
@@ -762,7 +780,7 @@ pub mod mafft {
 
     pub struct MafftArgGenerator;
     pub async fn mafft_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr).await?;
+        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None).await?;
         Ok(version)
     }
 
@@ -797,7 +815,7 @@ pub mod quast {
     }
 
     pub async fn quast_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -846,7 +864,7 @@ pub mod nucmer {
     }
 
     pub async fn nucmer_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout).await?;
+        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -909,7 +927,7 @@ pub mod seqkit {
     pub struct SeqkitArgGenerator;
 
     pub async fn seqkit_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout).await?;
+        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -969,7 +987,7 @@ pub mod bowtie2 {
     pub struct Bowtie2ArgGenerator;
 
     pub async fn bowtie2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout).await?;
+        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1145,7 +1163,7 @@ pub mod hisat2 {
     pub struct Hisat2ArgGenerator;
 
     pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout).await?;
+        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1327,7 +1345,7 @@ pub mod kallisto {
     pub struct KallistoArgGenerator;
 
     pub async fn kallisto_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout).await?;
+        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1408,7 +1426,7 @@ pub mod star {
     pub struct StarArgGenerator;
 
     pub async fn star_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout).await?;
+        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1572,7 +1590,7 @@ pub mod czid_dedup {
     pub struct CzidDedupArgGenerator;
 
     pub async fn czid_dedup_presence_check() -> Result<f32> {
-        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout).await?;
+        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1620,18 +1638,23 @@ pub mod czid_dedup {
 
 
 pub mod diamond {
+
+    const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
+
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::path::Path;
-    use anyhow::anyhow;
+    use regex::Regex;
     use log::{debug, info, error, warn};
     use tokio::fs::{self, DirEntry};
     use tokio::task::JoinHandle;
     use tokio::process::Command;
     use tempfile::{NamedTempFile, TempDir};
+    use anyhow::{anyhow, Result as AnyhowResult};
     use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, PipelineError};
-    use crate::utils::file::available_space_for_path;
+    use crate::utils::file::{available_space_for_path, choose_temp_dir};
+    use crate::utils::system::detect_ram;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream, spawn_cmd};
     use crate::utils::command::{version_check, ArgGenerator};
 
@@ -1644,8 +1667,8 @@ pub mod diamond {
 
     pub struct DiamondArgGenerator;
 
-    pub async fn diamond_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout).await?;
+    pub async fn diamond_presence_check(version_file: Option<PathBuf>) -> anyhow::Result<f32> {
+        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file).await?;
         Ok(version)
     }
 
@@ -1686,34 +1709,33 @@ pub mod diamond {
     }
 
     impl ArgGenerator for DiamondArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> AnyhowResult<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<DiamondConfig>())
-                .ok_or_else(|| anyhow!("Diamond requires a DiamondConfig as extra argument"))?;
+                .ok_or_else(|| anyhow!("Diamond requires DiamondConfig in extra"))?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = vec![];
 
             match config.subcommand {
-                DiamondSubcommand::Blastx => {
-                    args_vec.push("blastx".to_string());
-                }
-
+                DiamondSubcommand::Blastx => args_vec.push("blastx".to_string()),
             }
 
             args_vec.push("-d".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
 
+            let threads = run_config.thread_allocation(DIAMOND_TAG, None);
             args_vec.push("--threads".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, DIAMOND_TAG, None);
-            args_vec.push(num_cores.to_string());
+            args_vec.push(threads.to_string());
 
-            args_vec.push("--block-size".to_string());
-            args_vec.push("8.0".to_string());  // 8 GB blocks —
+            let index_chunks = if threads >= 96 { 12 } else if threads >= 64 { 8 } else { 4 };
             args_vec.push("-c".to_string());
-            args_vec.push("8".to_string());
+            args_vec.push(index_chunks.to_string());
 
-            for (key, value) in config.subcommand_fields.iter() {
+            for (key, value) in &config.subcommand_fields {
                 args_vec.push(key.clone());
                 if let Some(v) = value {
                     args_vec.push(v.clone());
@@ -1723,6 +1745,101 @@ pub mod diamond {
             Ok(args_vec)
         }
     }
+
+    pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
+        let db_path_base = run_config.args.diamond_db.as_deref()
+            .ok_or_else(|| anyhow!("--diamond-db not provided"))?;
+
+        // Auto-append .dmnd if missing
+        let db_path = if db_path_base.ends_with(".dmnd") {
+            db_path_base.to_string()
+        } else {
+            format!("{}.dmnd", db_path_base)
+        };
+
+        debug!("Using DB path for stats: {}", db_path);
+
+        let (_, available_ram) = detect_ram()?;
+        let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
+
+        let scratch_path_str = run_config.args.nvme_scratch.as_deref().unwrap_or(".");
+        let scratch_path = PathBuf::from(scratch_path_str);
+        let scratch_space = available_space_for_path(&scratch_path).await?;
+
+        let db_stats = get_diamond_db_stats(&db_path).await
+            .unwrap_or_else(|e| {
+                warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
+                (0, 300_000_000_000)  // sequences, letters
+            });
+
+        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
+
+        let ram_based_b = available_ram_gb / 20.0;
+
+        let mut block_size = ram_based_b
+            .min(total_letters_billions)
+            .max(6.0)
+            .floor();
+
+        let db_file_gb = std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1_073_741_824.0)
+            .unwrap_or_else(|e| {
+                warn!("Failed to get DB file size: {}. Skipping scratch derate.", e);
+                0.0
+            });
+
+        if scratch_space < (db_file_gb * 2.0) as u64 {
+            warn!("Low scratch; reducing block size by 40%");
+            block_size *= 0.6;
+        }
+
+        debug!(
+    "Computed --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
+    block_size,
+    available_ram_gb,
+    db_stats.1 as f64 / 1e9,
+    scratch_space as f64 / 1_073_741_824.0
+);
+
+        Ok(block_size.max(6.0))
+    }
+
+    async fn get_diamond_db_stats(db_path: &str) -> AnyhowResult<(u64, u64)> {
+        let output = Command::new("diamond")
+            .args(["dbinfo", "--db", db_path])
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to spawn diamond dbinfo: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+            "diamond dbinfo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        debug!("Diamond dbinfo output: {}", stdout);
+
+        let seq_re = Regex::new(r"Sequences\s+(\d+)")?;
+        let letters_re = Regex::new(r"Letters\s+(\d+)")?;
+
+        let sequences = seq_re
+            .captures(&stdout)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("Failed to parse sequences from: {}", stdout))?;
+
+        let letters = letters_re
+            .captures(&stdout)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .ok_or_else(|| anyhow!("Failed to parse letters from: {}", stdout))?;
+
+        Ok((sequences, letters))
+    }
+
+
 }
 
 
@@ -1739,8 +1856,8 @@ pub mod spades {
     }
     pub struct SpadesArgGenerator;
 
-    pub async fn spades_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout).await?;
+    pub async fn spades_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
+        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file).await?;
         Ok(version)
     }
 
@@ -1806,7 +1923,7 @@ pub mod makeblastdb {
     pub struct MakeblastdbArgGenerator;
 
     pub async fn makeblastdb_presence_check() -> Result<f32> {
-        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout).await?;
+        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1860,7 +1977,7 @@ pub mod blastn {
     pub struct BlastnArgGenerator;
 
     pub async fn blastn_presence_check() -> Result<f32> {
-        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout).await?;
+        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -1927,7 +2044,7 @@ pub mod blastx {
     pub struct BlastxArgGenerator;
 
     pub async fn blastx_presence_check() -> Result<f32> {
-        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout).await?;
+        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
         Ok(version)
     }
 
@@ -2001,36 +2118,53 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
     generator.generate_args(run_config, extra)
 }
 
-pub async fn check_versions(tools: Vec<&str>) -> Result<()> {
-    let checks = tools.into_iter().map(|tool| async move {
-        let version = match tool {
-            FASTP_TAG => fastp::fastp_presence_check().await,
-            H5DUMP_TAG => h5dump::h5dump_presence_check().await,
-            MINIMAP2_TAG => minimap2::minimap2_presence_check().await,
-            SAMTOOLS_TAG => samtools::samtools_presence_check().await,
-            KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
-            BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
-            IVAR_TAG => ivar::ivar_presence_check().await,
-            MUSCLE_TAG => muscle::muscle_presence_check().await,
-            MAFFT_TAG => mafft::mafft_presence_check().await,
-            QUAST_TAG => quast::quast_presence_check().await,
-            NUCMER_TAG => nucmer::nucmer_presence_check().await,
-            SEQKIT_TAG => seqkit::seqkit_presence_check().await,
-            BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
-            HISAT2_TAG => hisat2::hisat2_presence_check().await,
-            KALLISTO_TAG => kallisto::kallisto_presence_check().await,
-            STAR_TAG => star::star_presence_check().await,
-            CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
-            DIAMOND_TAG => diamond::diamond_presence_check().await,
-            SPADES_TAG => spades::spades_presence_check().await,
-            BLASTN_TAG => blastn::blastn_presence_check().await,
-            BLASTX_TAG => blastx::blastx_presence_check().await,
-            MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
+pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
+    let assembly_dir = out_dir.join("assembly");
+    fs::create_dir_all(&assembly_dir).await
+        .map_err(|e| anyhow!("Failed to create assembly directory: {}", e))?;
 
+    let out_dir_cloned = out_dir.clone();
+    let assembly_dir_cloned = assembly_dir.clone();
 
-            _ => return Err(anyhow!("Unknown tool: {}", tool)),
-        }?;
-        Ok((tool.to_string(), version))
+    let checks = tools.into_iter().map(move |tool| {
+        let out_dir = out_dir_cloned.clone();
+        let assembly_dir = assembly_dir_cloned.clone();
+
+        async move {
+            let version_file = match tool {
+                SPADES_TAG => Some(assembly_dir.join("assembly_version.txt")),
+                MINIMAP2_TAG => Some(out_dir.join("minimap2_version.txt")),
+                DIAMOND_TAG => Some(out_dir.join("diamond_version.txt")),
+                _ => None,
+            };
+
+            let version = match tool {
+                FASTP_TAG => fastp::fastp_presence_check().await,
+                H5DUMP_TAG => h5dump::h5dump_presence_check().await,
+                MINIMAP2_TAG => minimap2::minimap2_presence_check(version_file).await,
+                SAMTOOLS_TAG => samtools::samtools_presence_check().await,
+                KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
+                BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
+                IVAR_TAG => ivar::ivar_presence_check().await,
+                MUSCLE_TAG => muscle::muscle_presence_check().await,
+                MAFFT_TAG => mafft::mafft_presence_check().await,
+                QUAST_TAG => quast::quast_presence_check().await,
+                NUCMER_TAG => nucmer::nucmer_presence_check().await,
+                SEQKIT_TAG => seqkit::seqkit_presence_check().await,
+                BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
+                HISAT2_TAG => hisat2::hisat2_presence_check().await,
+                KALLISTO_TAG => kallisto::kallisto_presence_check().await,
+                STAR_TAG => star::star_presence_check().await,
+                CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
+                DIAMOND_TAG => diamond::diamond_presence_check(version_file).await,
+                SPADES_TAG => spades::spades_presence_check(version_file).await,
+                BLASTN_TAG => blastn::blastn_presence_check().await,
+                BLASTX_TAG => blastx::blastx_presence_check().await,
+                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
+                _ => return Err(anyhow!("Unknown tool: {}", tool)),
+            }?;
+            Ok((tool.to_string(), version))
+        }
     });
 
     let results = try_join_all(checks).await?;
