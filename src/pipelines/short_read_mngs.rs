@@ -760,6 +760,264 @@ async fn bowtie2_filter(
     ))
 }
 
+/// HISAT2 filter
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Raw byte FASTQ stream.
+/// * `hisat2_index_path` - Path to HISAT2 index.
+/// * `paired` - Whether the input is paired-end.
+/// * `hisat2_options` - Additional HISAT2 options as a HashMap (e.g., HashMap::from([("--no-spliced-alignment".to_string(), None)])).
+/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
+///
+/// # Returns
+/// Tuple:
+/// - Unmapped FASTQ stream.
+/// - Optional receiver for the total mapped count (u64) if count is needed.
+/// - Vector of cleanup tasks.
+/// - Vector of cleanup receivers.
+
+async fn hisat2_filter(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    hisat2_index_path: PathBuf,
+    paired: bool,
+    hisat2_options: HashMap<String, Option<String>>,
+    output_bam_path: Option<PathBuf>,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    // Deinterleave and write to files in CWD
+    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+    let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
+        input_stream,
+        paired,
+        config.base_buffer_size,
+    ).await.map_err(|e| PipelineError::Other(e))?;
+
+    let r1_path = cwd.join("unmapped_r1.fq");
+    let r1_write_task = write_byte_stream_to_file(
+        &r1_path,
+        ReceiverStream::new(r1_rx),
+        Some(config.base_buffer_size),
+    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(r1_write_task);
+
+    let r2_path_opt = if paired {
+        let r2_path = cwd.join("unmapped_r2.fq");
+        let r2_write_task = write_byte_stream_to_file(
+            &r2_path,
+            ReceiverStream::new(r2_rx_opt.unwrap()),
+            Some(config.base_buffer_size),
+        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+        cleanup_tasks.push(r2_write_task);
+        Some(r2_path)
+    } else {
+        None
+    };
+
+    deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
+
+    let hisat2_config = Hisat2Config {
+        hisat2_index_path: hisat2_index_path.clone(),
+        option_fields: hisat2_options,
+        r1_path: r1_path.to_string_lossy().to_string(),
+        r2_path: r2_path_opt.as_ref().map(|p| p.to_string_lossy().to_string()),
+    };
+
+    let hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: HISAT2_TAG.to_string(), error: e.to_string() })?;
+
+    let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
+        config.clone(),
+        HISAT2_TAG,
+        hisat2_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: HISAT2_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+
+    let hisat2_out_stream = parse_child_output(
+        &mut hisat2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: HISAT2_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+
+    // Sort, output uncompressed BAM
+    let samtools_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
+            ("-u".to_string(), None),
+            ("-O".to_string(), Some("bam".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+        config.clone(),
+        hisat2_out_stream,
+        SAMTOOLS_TAG,
+        samtools_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: SAMTOOLS_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+    cleanup_tasks.push(samtools_sort_task);
+    cleanup_tasks.push(samtools_sort_err_task);
+
+    let samtools_sort_out_stream = {
+        let mut guard = samtools_sort_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            config.base_buffer_size,
+        ).await.map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?
+    };
+
+    // number of streams for t_junction (unmapped + count + optional BAM)
+    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 };
+
+    let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
+
+    let (bam_streams, bam_done_rx) = if num_tees > 1 {
+        t_junction(
+            bam_rx_stream,
+            num_tees,
+            config.base_buffer_size,
+            config.args.stall_threshold,
+            None,
+            100,
+            StreamDataType::JustBytes,
+            "hisat2_bam_split".to_string(),
+            None,
+        ).await.map_err(|_| PipelineError::StreamDataDropped)?
+    } else {
+        (vec![bam_rx_stream.into_inner()], oneshot::channel::<Result<(), anyhow::Error>>().1)
+    };
+    cleanup_receivers.push(bam_done_rx);
+
+    let mut bam_streams_iter = bam_streams.into_iter();
+
+    // Optional: Write BAM to file
+    if let Some(bam_path) = output_bam_path {
+        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+        let bam_write_task = write_byte_stream_to_file(
+            &bam_path,
+            ReceiverStream::new(stream),
+            Some(config.base_buffer_size),
+        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+        cleanup_tasks.push(bam_write_task);
+    }
+
+    // Count total mapped reads
+    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
+    let samtools_count_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([
+            ("-c".to_string(), None), // Count
+            (mapped_flag, None),
+            ("-".to_string(), None),
+        ]),
+    };
+    let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
+        config.clone(),
+        bam_count_stream,
+        SAMTOOLS_TAG,
+        samtools_count_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: SAMTOOLS_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+    cleanup_tasks.push(count_stream_task);
+    cleanup_tasks.push(count_err_task);
+
+    let (count_tx, count_rx) = oneshot::channel::<u64>();
+
+    let count_future = tokio::spawn(async move {
+        let mut count_child = count_child_arc.lock().await;
+        let count_lines = read_child_output_to_vec(&mut count_child, ChildStream::Stdout).await?;
+        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
+        let _ = count_tx.send(mapped_count);
+        Ok(())
+    });
+    cleanup_tasks.push(count_future);
+
+    // Unmapped stream
+    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // Extract unmapped FASTQ
+    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
+    let samtools_fastq_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([
+            (unmapped_flag, None),
+            ("-".to_string(), None), // Output to stdout (interleaved for paired)
+        ]),
+    };
+    let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
+        config.clone(),
+        unmapped_stream,
+        SAMTOOLS_TAG,
+        samtools_fastq_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: SAMTOOLS_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+    cleanup_tasks.push(fastq_stream_task);
+    cleanup_tasks.push(fastq_err_task);
+
+    let unmapped_fastq_stream = {
+        let mut guard = fastq_child.lock().await;
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Fastq,
+            config.base_buffer_size,
+        ).await.map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?
+    };
+
+
+    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
+}
 
 /// QC's input stream using FASTP
 ///
