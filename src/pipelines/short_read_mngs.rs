@@ -4908,6 +4908,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
 
+
+    //host filtering hisat2
+    // let hisat2_options = HashMap::from([]);
+    // let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers) = hisat2_filter(
+    //     config.clone(),
+    //     host_bt2_out_stream,
+    //     host_hisat2_index_path,
+    //     paired,
+    //     hisat2_options,
+    //     hisat2_out_path,
+    //     input_size,
+    //     4
+    //
+    // )
+    //     .await?;
+    // cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
+    // cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
+
+
+
     // Host filtering: mm2
     let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp, host_temp_dir) = minimap2_filter(
         config.clone(),
@@ -4949,6 +4969,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             false
         ).await?;
         cleanup_receivers.extend(human_bt2_cleanup_receivers);
+
+        //host filtering hisat2
 
         // human filtering: mm2
         let (human_mm2_out_stream, human_mm2_count_rx, mut human_mm2_cleanup_tasks, mut human_mm2_cleanup_receivers, human_ref_temp, human_index_temp, human_index_dir) = minimap2_filter(
@@ -6038,18 +6060,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         clusters_opt,
         out_dir.clone(),
     ).await?;
-
-
-
-    // let (nonhost_r1_path, nonhost_r2_path) = generate_nonhost_fastq(
-    //     config.clone(),
-    //     //original R1 FASTQ,
-    //     // original R2 FASTQ,
-    //     taxid_mapped_nonhost,
-    //     duplicate_clusters.clone(),
-    //
-    //     out_dir.clone()
-    // )
 
 
 
