@@ -530,10 +530,11 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
     Ok((task, temp_path, temp_name))
 }
 
-pub fn validate_file_inputs(
+pub async fn validate_file_inputs(
     config: &RunConfig,
     cwd: &PathBuf,
-) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
+) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String, u64), PipelineError> {
+    // Resolve and validate file1 (required)
     let file1_path: PathBuf = match &config.args.file1 {
         Some(file) => {
             let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
@@ -546,6 +547,7 @@ pub fn validate_file_inputs(
         None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
     };
 
+    // Compute sample_base (same as before)
     let sample_base: String;
     let file1_r1r2 = r1r2_base(&file1_path);
     sample_base = match file1_r1r2.prefix {
@@ -556,17 +558,19 @@ pub fn validate_file_inputs(
         }
     };
 
-    if !file1_path.exists() {
-        return Err(PipelineError::FileNotFound(file1_path));
-    }
-
     let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
     let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
     let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
 
+    // Validate file1 exists (redundant but kept for safety)
+    if !file1_path.exists() {
+        return Err(PipelineError::FileNotFound(file1_path));
+    }
+
+    // Resolve and validate file2 (optional)
     let file2_path: Option<PathBuf> = match &config.args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(&cwd.clone()), None, None, "");
+            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
             if file2_full_path.exists() {
                 Some(file2_full_path)
             } else {
@@ -577,7 +581,18 @@ pub fn validate_file_inputs(
         None => None,
     };
 
-    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base))
+    // Compute total input size (async, accurate)
+    let mut total_size_bytes: u64 = file_size(&file1_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    if let Some(ref file2) = file2_path {
+        let file2_size = file_size(file2).await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        total_size_bytes += file2_size;
+    }
+    
+
+    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base, total_size_bytes))
 }
 
 

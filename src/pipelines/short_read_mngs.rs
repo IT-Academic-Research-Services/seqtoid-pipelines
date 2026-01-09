@@ -4813,7 +4813,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone()
         .ok_or_else(|| PipelineError::MissingArgument("host_bowtie2_index is required".to_string()))?;
 
-    let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd)?;
+    let host_hisat2_index: String = config.args.host_hisat2_index.clone()
+        .ok_or_else(|| PipelineError::MissingArgument("host_hisat2_index is required".to_string()))?;
+
+    let (file1_path, file2_path, sample_base_buf, sample_base, total_input_size) = validate_file_inputs(&config, &cwd).await?;
     let paired = file2_path.is_some();
 
     let seed = config.args.seed.unwrap_or_else(|| {
@@ -4910,6 +4913,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     //host filtering hisat2
+    // let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
     // let hisat2_options = HashMap::from([]);
     // let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers) = hisat2_filter(
     //     config.clone(),
@@ -4917,8 +4921,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //     host_hisat2_index_path,
     //     paired,
     //     hisat2_options,
-    //     hisat2_out_path,
-    //     input_size,
+    //     None,
+    //     total_input_size,
     //     4
     //
     // )
