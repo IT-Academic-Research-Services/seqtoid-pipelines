@@ -787,9 +787,10 @@ async fn hisat2_filter(
     output_bam_path: Option<PathBuf>,
     estimated_input_size_bytes: u64,
     headroom: u64,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<PathBuf>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
+    let mut temp_files = Vec::new();
 
     let required_space = estimated_input_size_bytes * headroom;
     let ram_available = available_space_for_path(&config.ram_temp_dir).await.unwrap_or(0);
@@ -803,14 +804,14 @@ async fn hisat2_filter(
             .unwrap_or(PathBuf::from("."))
     };
 
-
     let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
         input_stream,
         paired,
         config.base_buffer_size,
     ).await.map_err(|e| PipelineError::Other(e))?;
 
-    let r1_path = temp_dir.join("hisat-unmapped_r1.fq");
+    let r1_path = temp_dir.join("hisat2-unmapped_r1.fq");
+    temp_files.push(r1_path.clone());
     let r1_write_task = write_byte_stream_to_file(
         &r1_path,
         ReceiverStream::new(r1_rx),
@@ -819,7 +820,8 @@ async fn hisat2_filter(
     cleanup_tasks.push(r1_write_task);
 
     let r2_path_opt = if paired {
-        let r2_path = temp_dir.join("unmapped_r2.fq");
+        let r2_path = temp_dir.join("hisat2-unmapped_r2.fq");
+        temp_files.push(r2_path.clone());
         let r2_write_task = write_byte_stream_to_file(
             &r2_path,
             ReceiverStream::new(r2_rx_opt.unwrap()),
@@ -1028,7 +1030,7 @@ async fn hisat2_filter(
     };
 
 
-    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers))
+    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers, temp_files))
 }
 
 /// QC's input stream using FASTP
@@ -4796,6 +4798,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
     let mut temp_dirs: Vec<TempDir> = Vec::new();
+    let mut temp_paths: Vec<PathBuf> = Vec::new();
 
     info!("Starting short read mNGS pipeline.");
 
@@ -4913,59 +4916,39 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     //host filtering hisat2
-    // let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
-    // let hisat2_options = HashMap::from([]);
-    // let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers) = hisat2_filter(
-    //     config.clone(),
-    //     host_bt2_out_stream,
-    //     host_hisat2_index_path,
-    //     paired,
-    //     hisat2_options,
-    //     None,
-    //     total_input_size,
-    //     4
-    //
-    // )
-    //     .await?;
-    // cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
-    // cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
-
-
-
-    // Host filtering: mm2
-    let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp, host_temp_dir) = minimap2_filter(
+    let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
+    let hisat2_options = HashMap::from([]);
+    let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
         config.clone(),
         host_bt2_out_stream,
+        host_hisat2_index_path,
         paired,
-        None, // No BAM output; set to Some(PathBuf::from("host_mm2.bam")) if needed
+        hisat2_options,
+        None,
+        total_input_size,
+        4
+
     )
         .await?;
-    cleanup_tasks.append(&mut host_mm2_cleanup_tasks);
-    cleanup_receivers.append(&mut host_mm2_cleanup_receivers);
+    cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
+    cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
+    temp_paths.extend(hisat_input_files);
 
-    if let Some(temp) = host_ref_temp {
-        temp_files.push(temp);
-    }
-    if let Some(temp) = host_index_temp {
-        temp_files.push(temp);
-    }
-    if let Some(temp) = host_temp_dir {
-        temp_dirs.push(temp);
-    }
 
     // If host is no huma, run an additional filter stage using a human reference
     let post_filter_stream  = if config.args.human_host {
-        host_mm2_out_stream
+        host_hisat2_out_stream
     }
     else {
         let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
+        let human_hisat2_index: String = config.args.human_hisat2_index.clone();
 
         // human filtering: bt2
         let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
         let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
         let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers, _human_bt2_insert_stats_rx) = bowtie2_filter(
             config.clone(),
-            host_mm2_out_stream,
+            host_hisat2_out_stream,
             human_bt2_index_path,
             paired,
             human_bt2_options,
@@ -4976,28 +4959,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         //host filtering hisat2
 
-        // human filtering: mm2
-        let (human_mm2_out_stream, human_mm2_count_rx, mut human_mm2_cleanup_tasks, mut human_mm2_cleanup_receivers, human_ref_temp, human_index_temp, human_index_dir) = minimap2_filter(
+        let human_hisat2_index_path = hisat2_index_prep(human_hisat2_index, &cwd)?;
+        let hisat2_options = HashMap::from([]);
+        let (human_hisat2_out_stream, _human_hisat2_count_rx, mut human_hisat2_cleanup_tasks, mut human_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
             config.clone(),
             human_bt2_out_stream,
+            human_hisat2_index_path,
             paired,
-            None, // No BAM output; set to Some(PathBuf::from("human_mm2.bam")) if needed
+            hisat2_options,
+            None,
+            total_input_size,
+            4
+
         )
             .await?;
-        cleanup_tasks.append(&mut human_mm2_cleanup_tasks);
-        cleanup_receivers.append(&mut human_mm2_cleanup_receivers);
+        cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
+        cleanup_receivers.append(&mut human_hisat2_cleanup_receivers);
+        temp_paths.extend(hisat_input_files);
 
-        if let Some(temp) = human_ref_temp {
-            temp_files.push(temp);
-        }
-        if let Some(temp) = human_index_temp {
-            temp_files.push(temp);
-        }
-        if let Some(temp) = human_index_dir {
-            temp_dirs.push(temp);
-        }
-
-        human_mm2_out_stream
+        human_hisat2_out_stream
 
     };
 
@@ -6150,10 +6130,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
 
-    let host_mm2_counts = host_mm2_count_rx
+    let host_hisat2_counts = host_hisat2_count_rx
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;
-    info!("Host minimap2: mapped counts: {:?}", host_mm2_counts);
+        .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
+    info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
 
     let dedup_count = dedup_count_rx
         .await
@@ -6244,6 +6224,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     drop(temp_files);
     drop(temp_dirs);
+    drop(temp_paths);
 
     info!("Finished short read mNGS pipeline.");
     Ok(())
