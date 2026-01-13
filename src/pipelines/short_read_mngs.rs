@@ -840,6 +840,13 @@ async fn hisat2_filter(
 
     deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
 
+    // 2. Prepare HISAT2 config & args
+    let sam_path = temp_dir.join("hisat2.sam");
+    temp_files.push(sam_path.clone());
+
+    let mut hisat2_options = hisat2_options.clone();
+    hisat2_options.insert("-S".to_string(), Some(sam_path.to_string_lossy().to_string()));
+
     let hisat2_config = Hisat2Config {
         hisat2_index_path: hisat2_index_path.clone(),
         option_fields: hisat2_options,
@@ -861,28 +868,10 @@ async fn hisat2_filter(
     })?;
     cleanup_tasks.push(hisat2_err_task);
 
-    let hisat2_out_stream = parse_child_output(
-        &mut hisat2_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: HISAT2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-
-    let sam_path = temp_dir.join("hisat2.sam");
-    temp_files.push(sam_path.clone());
-
-    let sam_write_task = write_byte_stream_to_file(
-        &sam_path,
-        ReceiverStream::new(hisat2_out_stream),
-        Some(config.base_buffer_size),
-    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(sam_write_task);
-
+    // Wait for HISAT2 to finish writing SAM file
     hisat2_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
 
+    // 3. Sort SAM file → temporary BAM file (exact WDL style: -n -o file -@ 8 -l 1 -T prefix)
     let bam_path = temp_dir.join("hisat2_sorted.bam");
     temp_files.push(bam_path.clone());
 
@@ -913,12 +902,15 @@ async fn hisat2_filter(
     })?;
     cleanup_tasks.push(sort_err_task);
 
+    // Wait for sort to finish writing BAM
     sort_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
 
+    // Optional: write BAM if caller requested it
     if let Some(bam_out) = output_bam_path {
         tokio::fs::copy(&bam_path, &bam_out).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
     }
 
+    // 4. Extract unmapped FASTQ using samtools fastq -f 13/-f 4 to separate files (exact WDL)
     let fq1_path = temp_dir.join("hisat2_host_filtered1.fastq");
     temp_files.push(fq1_path.clone());
 
@@ -942,7 +934,7 @@ async fn hisat2_filter(
         None
     };
 
-    fastq_subcommand_fields.insert(bam_path.to_string_lossy().to_string(), None);
+    fastq_subcommand_fields.insert(bam_path.to_string_lossy().to_string(), None);  // Input BAM as last arg
 
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
@@ -966,8 +958,10 @@ async fn hisat2_filter(
     })?;
     cleanup_tasks.push(fastq_err_task);
 
+    // Wait for fastq extraction to complete
     fastq_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
 
+    // 5. Read the output FASTQ files back into a ParseOutput stream
     let (unmapped_receiver, read_task) = read_fastq(
         fq1_path,
         fq2_path_opt,
@@ -980,6 +974,7 @@ async fn hisat2_filter(
 
     let unmapped_stream = ReceiverStream::new(unmapped_receiver);
 
+    // Wrap read_task to match cleanup_tasks type (ignore ReadStats or log it)
     let read_task_wrapped = tokio::spawn(async move {
         match read_task.await {
             Ok(Ok(stats)) => {
@@ -992,7 +987,7 @@ async fn hisat2_filter(
     });
     cleanup_tasks.push(read_task_wrapped);
 
-
+    // 6. Count mapped reads (optional, from BAM - same logic as before)
     let (count_tx, count_rx) = oneshot::channel::<u64>();
 
     let bam_count_task = tokio::spawn(async move {
