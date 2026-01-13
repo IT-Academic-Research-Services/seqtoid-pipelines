@@ -840,22 +840,23 @@ async fn hisat2_filter(
 
     deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
 
-    // 2. Prepare HISAT2 config & args
+    // 2. Prepare HISAT2 config & args (with -S to temp SAM file, matching WDL)
     let sam_path = temp_dir.join("hisat2.sam");
     temp_files.push(sam_path.clone());
 
-    let mut hisat2_options = hisat2_options.clone();
-    hisat2_options.insert("-S".to_string(), Some(sam_path.to_string_lossy().to_string()));
-
     let hisat2_config = Hisat2Config {
         hisat2_index_path: hisat2_index_path.clone(),
-        option_fields: hisat2_options,
+        option_fields: hisat2_options,  // Do NOT insert -S here
         r1_path: r1_path.to_string_lossy().to_string(),
         r2_path: r2_path_opt.as_ref().map(|p| p.to_string_lossy().to_string()),
     };
 
-    let hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config))
+    let mut hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config))
         .map_err(|e| PipelineError::ToolExecution { tool: HISAT2_TAG.to_string(), error: e.to_string() })?;
+
+    hisat2_args.push("-S".to_string());
+    hisat2_args.push(sam_path.to_string_lossy().to_string());
+    eprintln!("Hisat2 args: {:?}", hisat2_args);
 
     let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
         config.clone(),
@@ -868,8 +869,19 @@ async fn hisat2_filter(
     })?;
     cleanup_tasks.push(hisat2_err_task);
 
-    // Wait for HISAT2 to finish writing SAM file
-    hisat2_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
+    let hisat2_status = hisat2_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
+    if !hisat2_status.success() {
+        error!("HISAT2 failed with exit code {}", hisat2_status.code().unwrap_or(-1));
+        // Optionally read stderr for more info
+    } else {
+        info!("HISAT2 completed successfully");
+    }
+
+    let sam_size = tokio::fs::metadata(&sam_path).await?.len();
+    info!("HISAT2 SAM file size: {} bytes (should be >0)", sam_size);
+    if sam_size == 0 {
+        error!("HISAT2 did not write to SAM file - check args: {:?}", hisat2_args);
+    }
 
     // 3. Sort SAM file → temporary BAM file (exact WDL style: -n -o file -@ 8 -l 1 -T prefix)
     let bam_path = temp_dir.join("hisat2_sorted.bam");
@@ -878,10 +890,10 @@ async fn hisat2_filter(
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
+            ("-n".to_string(), None),                    // name sort - required by WDL
             ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
-            ("-@".to_string(), Some("8".to_string())),
-            ("-l".to_string(), Some("1".to_string())),
+            ("-@".to_string(), Some("8".to_string())),   // match WDL's 8 threads
+            ("-l".to_string(), Some("1".to_string())),   // compression level 1
             ("-T".to_string(), Some(temp_dir.join("sort_tmp_").to_string_lossy().to_string())),
         ]),
     };
