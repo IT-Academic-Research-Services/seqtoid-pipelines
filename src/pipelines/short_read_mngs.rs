@@ -42,8 +42,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
 use twox_hash::XxHash64;
-
-
+use crate::cli::Technology;
 use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode,
                           ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType,
                           Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG,
@@ -787,7 +786,13 @@ async fn hisat2_filter(
     output_bam_path: Option<PathBuf>,
     estimated_input_size_bytes: u64,
     headroom: u64,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<PathBuf>), PipelineError> {
+) -> Result<(
+    ReceiverStream<ParseOutput>,                     // unmapped FASTQ as ParseOutput stream
+    oneshot::Receiver<u64>,                          // mapped count
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,      // cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, // cleanup receivers
+    Vec<PathBuf>,                                    // temp files to clean up
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
     let mut temp_files = Vec::new();
@@ -801,7 +806,7 @@ async fn hisat2_filter(
     } else {
         config.args.nvme_scratch.as_ref()
             .map(|s| PathBuf::from(s))
-            .unwrap_or(PathBuf::from("."))
+            .unwrap_or_else(|| PathBuf::from("."))
     };
 
     let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
@@ -810,7 +815,7 @@ async fn hisat2_filter(
         config.base_buffer_size,
     ).await.map_err(|e| PipelineError::Other(e))?;
 
-    let r1_path = temp_dir.join("hisat2-unmapped_r1.fq");
+    let r1_path = temp_dir.join("hisat2_input_r1.fastq");
     temp_files.push(r1_path.clone());
     let r1_write_task = write_byte_stream_to_file(
         &r1_path,
@@ -820,7 +825,7 @@ async fn hisat2_filter(
     cleanup_tasks.push(r1_write_task);
 
     let r2_path_opt = if paired {
-        let r2_path = temp_dir.join("hisat2-unmapped_r2.fq");
+        let r2_path = temp_dir.join("hisat2_input_r2.fastq");
         temp_files.push(r2_path.clone());
         let r2_write_task = write_byte_stream_to_file(
             &r2_path,
@@ -854,6 +859,7 @@ async fn hisat2_filter(
         tool: HISAT2_TAG.to_string(),
         error: e.to_string(),
     })?;
+    cleanup_tasks.push(hisat2_err_task);
 
     let hisat2_out_stream = parse_child_output(
         &mut hisat2_child,
@@ -865,23 +871,24 @@ async fn hisat2_filter(
         error: e.to_string(),
     })?;
 
-    // Sort, output uncompressed BAM
+    let bam_path = temp_dir.join("hisat2_sorted.bam");
+    temp_files.push(bam_path.clone());
+
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            // ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            ("-".to_string(), None),
+            ("-n".to_string(), None),
+            ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
+            ("-@".to_string(), Some("8".to_string())),
+            ("-l".to_string(), Some("1".to_string())),
+            ("-T".to_string(), Some(temp_dir.join("sort_tmp_").to_string_lossy().to_string())),
         ]),
     };
-    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
 
-    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    let (mut sort_child, sort_task, sort_err_task) = stream_to_cmd(
         config.clone(),
         hisat2_out_stream,
         SAMTOOLS_TAG,
@@ -892,145 +899,117 @@ async fn hisat2_filter(
         tool: SAMTOOLS_TAG.to_string(),
         error: e.to_string(),
     })?;
-    cleanup_tasks.push(samtools_sort_task);
-    cleanup_tasks.push(samtools_sort_err_task);
+    cleanup_tasks.push(sort_task);
+    cleanup_tasks.push(sort_err_task);
 
-    let samtools_sort_out_stream = {
-        let mut guard = samtools_sort_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        ).await.map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?
-    };
-
-    // number of streams for t_junction (unmapped + count + optional BAM)
-    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 };
-
-    let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
-
-    let (bam_streams, bam_done_rx) = if num_tees > 1 {
-        t_junction(
-            bam_rx_stream,
-            num_tees,
-            config.base_buffer_size,
-            config.args.stall_threshold,
-            None,
-            100,
-            StreamDataType::JustBytes,
-            "hisat2_bam_split".to_string(),
-            None,
-        ).await.map_err(|_| PipelineError::StreamDataDropped)?
-    } else {
-        (vec![bam_rx_stream.into_inner()], oneshot::channel::<Result<(), anyhow::Error>>().1)
-    };
-    cleanup_receivers.push(bam_done_rx);
-
-    let mut bam_streams_iter = bam_streams.into_iter();
-
-    if let Some(bam_path) = output_bam_path {
-        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-        let bam_write_task = write_byte_stream_to_file(
-            &bam_path,
-            ReceiverStream::new(stream),
-            Some(config.base_buffer_size),
-        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
-        cleanup_tasks.push(bam_write_task);
+    {
+        let mut sort_guard = sort_child.lock().await;
+        sort_guard.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
     }
 
-    // Count total mapped reads
-    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mapped_flag = if paired { "-F13".to_string() } else { "-F4".to_string() };
-    let samtools_count_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-c".to_string(), None), // Count
-            (mapped_flag, None),
-            ("-".to_string(), None),
-        ]),
+    if let Some(bam_out) = output_bam_path {
+        tokio::fs::copy(&bam_path, &bam_out).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    }
+
+    let fq1_path = temp_dir.join("hisat2_host_filtered1.fastq");
+    temp_files.push(fq1_path.clone());
+
+    let mut fastq_subcommand_fields: HashMap<String, Option<String>> = HashMap::new();
+
+
+    fastq_subcommand_fields.insert(
+        "-f".to_string(),
+        Some(if paired { "13" } else { "4" }.to_string()),
+    );
+
+    fastq_subcommand_fields.insert("-1".to_string(), Some(fq1_path.to_string_lossy().to_string()));
+    fastq_subcommand_fields.insert("-0".to_string(), Some("/dev/null".to_string()));
+    fastq_subcommand_fields.insert("-s".to_string(), Some("/dev/null".to_string()));
+
+    let fq2_path_opt = if paired {
+        let fq2 = temp_dir.join("hisat2_host_filtered2.fastq");
+        temp_files.push(fq2.clone());
+        fastq_subcommand_fields.insert("-2".to_string(), Some(fq2.to_string_lossy().to_string()));
+        Some(fq2)
+    } else {
+        None
     };
-    let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
 
-    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
-        config.clone(),
-        bam_count_stream,
-        SAMTOOLS_TAG,
-        samtools_count_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(count_stream_task);
-    cleanup_tasks.push(count_err_task);
+    // Input BAM file (last argument, no flag)
+    fastq_subcommand_fields.insert(bam_path.to_string_lossy().to_string(), None);
 
-    let (count_tx, count_rx) = oneshot::channel::<u64>();
-
-    let count_future = tokio::spawn(async move {
-        let mut count_child = count_child_arc.lock().await;
-        let count_lines = read_child_output_to_vec(&mut count_child, ChildStream::Stdout).await?;
-        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        let _ = count_tx.send(mapped_count);
-        Ok(())
-    });
-    cleanup_tasks.push(count_future);
-
-    // Unmapped stream
-    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    // Extract unmapped FASTQ
-    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            (unmapped_flag, None),
-            ("-".to_string(), None), // Output to stdout (interleaved for paired)
-        ]),
+        subcommand_fields: fastq_subcommand_fields,
     };
+
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
 
-    let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
+    let (mut fastq_child, fastq_err_task) = spawn_cmd(
         config.clone(),
-        unmapped_stream,
         SAMTOOLS_TAG,
         samtools_fastq_args,
-        StreamDataType::JustBytes,
         config.args.verbose,
     ).await.map_err(|e| PipelineError::ToolExecution {
         tool: SAMTOOLS_TAG.to_string(),
         error: e.to_string(),
     })?;
-    cleanup_tasks.push(fastq_stream_task);
     cleanup_tasks.push(fastq_err_task);
 
-    let unmapped_fastq_stream = {
-        let mut guard = fastq_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Fastq,
-            config.base_buffer_size,
-        ).await.map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?
-    };
+    fastq_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
+
+    let (unmapped_stream, read_task) = read_fastq(
+        fq1_path,
+        fq2_path_opt,
+        None,
+        u64::MAX,
+        None,
+        None,
+        config.base_buffer_size,
+    )?;
 
 
-    Ok((ReceiverStream::new(unmapped_fastq_stream), count_rx, cleanup_tasks, cleanup_receivers, temp_files))
+    let read_task_wrapped = tokio::spawn(async move {
+        match read_task.await {
+            Ok(Ok(stats)) => {
+                info!("read_fastq completed with stats: {:?}", stats);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(join_err) => Err(anyhow::anyhow!("read_task join failed: {}", join_err)),
+        }
+    });
+    cleanup_tasks.push(read_task_wrapped);
+
+
+    let (count_tx, count_rx) = oneshot::channel::<u64>();
+
+    let bam_count_task = tokio::spawn(async move {
+        let flag = if paired { "-F13" } else { "-F4" };
+        let count_args = vec!["view".to_string(), "-c".to_string(), flag.to_string(), bam_path.to_string_lossy().to_string()];
+        let output = Command::new("samtools")
+            .args(&count_args)
+            .output()
+            .await
+            .map_err(|e| anyhow!("samtools count failed: {}", e))?;
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let count: u64 = count_str.parse().unwrap_or(0);
+        let _ = count_tx.send(count);
+        Ok(())
+    });
+    cleanup_tasks.push(bam_count_task);
+
+    Ok((
+        ReceiverStream::new(unmapped_stream),
+        count_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+        temp_files,
+    ))
 }
 
 /// QC's input stream using FASTP
