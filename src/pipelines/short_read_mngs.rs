@@ -861,7 +861,7 @@ async fn hisat2_filter(
     let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
         config.clone(),
         HISAT2_TAG,
-        hisat2_args,
+        hisat2_args.clone(),
         config.args.verbose,
     ).await.map_err(|e| PipelineError::ToolExecution {
         tool: HISAT2_TAG.to_string(),
@@ -880,7 +880,7 @@ async fn hisat2_filter(
     let sam_size = tokio::fs::metadata(&sam_path).await?.len();
     info!("HISAT2 SAM file size: {} bytes (should be >0)", sam_size);
     if sam_size == 0 {
-        error!("HISAT2 did not write to SAM file - check args: {:?}", hisat2_args);
+        error!("HISAT2 did not write to SAM file - check args: {:?}", hisat2_args.clone());
     }
 
     // 3. Sort SAM file → temporary BAM file (exact WDL style: -n -o file -@ 8 -l 1 -T prefix)
