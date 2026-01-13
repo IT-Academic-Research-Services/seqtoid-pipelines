@@ -869,7 +869,7 @@ async fn hisat2_filter(
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
+            // ("-n".to_string(), None), // Name-sorted (required for paired-end fastq extraction)
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
             ("-".to_string(), None),
