@@ -840,12 +840,6 @@ async fn hisat2_filter(
 
     deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
 
-    let sam_path = temp_dir.join("hisat2.sam");
-    temp_files.push(sam_path.clone());
-
-    let mut hisat2_options = hisat2_options.clone();
-    hisat2_options.insert("-S".to_string(), Some(sam_path.to_string_lossy().to_string()));
-
     let hisat2_config = Hisat2Config {
         hisat2_index_path: hisat2_index_path.clone(),
         option_fields: hisat2_options,
@@ -866,6 +860,26 @@ async fn hisat2_filter(
         error: e.to_string(),
     })?;
     cleanup_tasks.push(hisat2_err_task);
+
+    let hisat2_out_stream = parse_child_output(
+        &mut hisat2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: HISAT2_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+
+    let sam_path = temp_dir.join("hisat2.sam");
+    temp_files.push(sam_path.clone());
+
+    let sam_write_task = write_byte_stream_to_file(
+        &sam_path,
+        ReceiverStream::new(hisat2_out_stream),
+        Some(config.base_buffer_size),
+    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(sam_write_task);
 
     hisat2_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
 
@@ -928,7 +942,6 @@ async fn hisat2_filter(
         None
     };
 
-    // Input BAM file (last argument, no flag)
     fastq_subcommand_fields.insert(bam_path.to_string_lossy().to_string(), None);
 
     let samtools_fastq_config = SamtoolsConfig {
@@ -937,7 +950,10 @@ async fn hisat2_filter(
     };
 
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
-        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     let (mut fastq_child, fastq_err_task) = spawn_cmd(
         config.clone(),
