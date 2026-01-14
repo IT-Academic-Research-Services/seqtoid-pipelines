@@ -556,6 +556,12 @@ pub mod samtools {
                     args_vec.push("-@".to_string());
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("ampliconclip")).to_string());
                 }
+                SamtoolsSubcommand::Fixmate => {
+                    args_vec.push("fixmate".to_string());
+                    args_vec.push("-m".to_string());  // Add mate info
+                    args_vec.push("-@".to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fixmate")).to_string());
+                }
             }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(key.clone());
