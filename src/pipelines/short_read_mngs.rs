@@ -809,6 +809,7 @@ async fn hisat2_filter(
             .unwrap_or_else(|| PathBuf::from("."))
     };
 
+    // 1. Deinterleave input to files for HISAT2 input
     let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
         input_stream,
         paired,
@@ -840,13 +841,13 @@ async fn hisat2_filter(
 
     deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
 
-    // 2. Prepare HISAT2 config & args (with -S to temp SAM file, matching WDL)
+    // 2. HISAT2 alignment to temp SAM
     let sam_path = temp_dir.join("hisat2.sam");
     temp_files.push(sam_path.clone());
 
     let hisat2_config = Hisat2Config {
         hisat2_index_path: hisat2_index_path.clone(),
-        option_fields: hisat2_options,  // Do NOT insert -S here
+        option_fields: hisat2_options,
         r1_path: r1_path.to_string_lossy().to_string(),
         r2_path: r2_path_opt.as_ref().map(|p| p.to_string_lossy().to_string()),
     };
@@ -856,7 +857,7 @@ async fn hisat2_filter(
 
     hisat2_args.push("-S".to_string());
     hisat2_args.push(sam_path.to_string_lossy().to_string());
-    eprintln!("Hisat2 args: {:?}", hisat2_args);
+    info!("Hisat2 args: {:?}", hisat2_args);
 
     let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
         config.clone(),
@@ -869,10 +870,10 @@ async fn hisat2_filter(
     })?;
     cleanup_tasks.push(hisat2_err_task);
 
-    let hisat2_status = hisat2_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
+    let hisat2_status = hisat2_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?;
     if !hisat2_status.success() {
         error!("HISAT2 failed with exit code {}", hisat2_status.code().unwrap_or(-1));
-        // Optionally read stderr for more info
+        return Err(PipelineError::ToolExecution { tool: HISAT2_TAG.to_string(), error: "HISAT2 execution failed".to_string() });
     } else {
         info!("HISAT2 completed successfully");
     }
@@ -881,19 +882,20 @@ async fn hisat2_filter(
     info!("HISAT2 SAM file size: {} bytes (should be >0)", sam_size);
     if sam_size == 0 {
         error!("HISAT2 did not write to SAM file - check args: {:?}", hisat2_args.clone());
+        return Err(PipelineError::Other(anyhow!("Empty SAM output from HISAT2")));
     }
 
-    // 3. Sort SAM file → temporary BAM file (exact WDL style: -n -o file -@ 8 -l 1 -T prefix)
+    // 3. samtools sort -n SAM → BAM
     let bam_path = temp_dir.join("hisat2_sorted.bam");
     temp_files.push(bam_path.clone());
 
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),                    // name sort - required by WDL
+            ("-n".to_string(), None),
             ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
-            ("-@".to_string(), Some("8".to_string())),   // match WDL's 8 threads
-            ("-l".to_string(), Some("1".to_string())),   // compression level 1
+            ("-@".to_string(), Some("8".to_string())),
+            ("-l".to_string(), Some("1".to_string())),
             ("-T".to_string(), Some(temp_dir.join("sort_tmp_").to_string_lossy().to_string())),
         ]),
     };
@@ -914,14 +916,13 @@ async fn hisat2_filter(
     })?;
     cleanup_tasks.push(sort_err_task);
 
-    // Wait for sort to finish writing BAM
-    sort_child.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
+    sort_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?;
 
     if let Some(bam_out) = output_bam_path {
         tokio::fs::copy(&bam_path, &bam_out).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
     }
 
-    // 4. Pipe: samtools fixmate -m (name-sorted BAM) → samtools fastq -f 13 (to separate FASTQ files)
+    // 4. Pipe: sorted BAM → fixmate -m → fastq -f 13/-f 4 (to files)
     let fq1_path = temp_dir.join("hisat2_host_filtered1.fastq");
     temp_files.push(fq1_path.clone());
 
@@ -933,19 +934,46 @@ async fn hisat2_filter(
         None
     };
 
+    // Fixmate config and args
+    let fixmate_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fixmate,
+        subcommand_fields: HashMap::from([
+            ("-m".to_string(), None),
+        ]),
+    };
+
+    let mut fixmate_args = generate_cli(SAMTOOLS_TAG, &config, Some(&fixmate_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    fixmate_args.push(bam_path.to_string_lossy().to_string());  // input
+    fixmate_args.push("-".to_string());  // stdout
+
+    let (mut fixmate_child, fixmate_err_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        fixmate_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+    cleanup_tasks.push(fixmate_err_task);
+
+    // Parse fixmate stdout (BAM) as stream
+    let fixmate_out_stream = parse_child_output(
+        &mut fixmate_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    // Fastq config and args
     let mut fastq_subcommand_fields: HashMap<String, Option<String>> = HashMap::new();
-
-    fastq_subcommand_fields.insert(
-        "-f".to_string(),
-        Some(if paired { "13" } else { "4" }.to_string()),
-    );
-
-    fastq_subcommand_fields.insert("-1".to_string(), Some(fq1_path.to_string_lossy().to_string()));
-    fastq_subcommand_fields.insert("-0".to_string(), Some("/dev/null".to_string()));
-    fastq_subcommand_fields.insert("-s".to_string(), Some("/dev/null".to_string()));
-
-    if let Some(ref fq2_path) = fq2_path_opt {
-        fastq_subcommand_fields.insert("-2".to_string(), Some(fq2_path.to_string_lossy().to_string()));
+    fastq_subcommand_fields.insert("-f".to_string(), Some(if paired { "13".to_string() } else { "4".to_string() }));
+    if paired {
+        fastq_subcommand_fields.insert("-1".to_string(), Some(fq1_path.to_string_lossy().to_string()));
+        fastq_subcommand_fields.insert("-2".to_string(), Some(fq2_path_opt.as_ref().unwrap().to_string_lossy().to_string()));
+        fastq_subcommand_fields.insert("-0".to_string(), Some("/dev/null".to_string()));
+        fastq_subcommand_fields.insert("-s".to_string(), Some("/dev/null".to_string()));
+    } else {
+        fastq_subcommand_fields.insert("-o".to_string(), Some(fq1_path.to_string_lossy().to_string()));
     }
 
     let samtools_fastq_config = SamtoolsConfig {
@@ -956,41 +984,6 @@ async fn hisat2_filter(
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
         .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
 
-    let fixmate_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fixmate,
-        subcommand_fields: HashMap::from([
-            ("-m".to_string(), None),  // Add mate info
-        ]),
-    };
-
-    let fixmate_args = generate_cli(SAMTOOLS_TAG, &config, Some(&fixmate_config))
-        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
-
-    let mut fixmate_args_full = fixmate_args;
-    fixmate_args_full.push(bam_path.to_string_lossy().to_string());  // Input BAM
-    fixmate_args_full.push("-".to_string());  // Output to stdout
-
-    let (mut fixmate_child, fixmate_err_task) = spawn_cmd(
-        config.clone(),
-        SAMTOOLS_TAG,
-        fixmate_args_full,
-        config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-    cleanup_tasks.push(fixmate_err_task);
-
-    let fixmate_out_stream = parse_child_output(
-        &mut fixmate_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        config.base_buffer_size,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
-
     let (mut fastq_child, fastq_stdin_task, fastq_err_task) = stream_to_cmd(
         config.clone(),
         fixmate_out_stream,
@@ -998,10 +991,7 @@ async fn hisat2_filter(
         samtools_fastq_args,
         StreamDataType::JustBytes,
         config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
     cleanup_tasks.push(fastq_stdin_task);
     cleanup_tasks.push(fastq_err_task);
 
@@ -1009,16 +999,34 @@ async fn hisat2_filter(
         let mut fastq_guard = fastq_child.lock().await;
         fastq_guard.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
     }
+    // Debug: Count lines in FASTQ to check for uneven R1/R2 (4 lines per read)
+    let r1_lines = Command::new("wc").arg("-l").arg(&fq1_path).output().await?;
+    let r1_line_str = String::from_utf8_lossy(&r1_lines.stdout).trim().to_string();
+    let r1_records = r1_line_str.parse::<u64>().unwrap_or(0) / 4;
 
-    // Debug: Log FASTQ sizes
+    let (r2_records, r2_line_str) = if let Some(ref fq2_path) = fq2_path_opt {
+        let r2_lines = Command::new("wc").arg("-l").arg(fq2_path).output().await?;
+        let r2_str = String::from_utf8_lossy(&r2_lines.stdout).trim().to_string();
+        (r2_str.parse::<u64>().unwrap_or(0) / 4, r2_str)
+    } else {
+        (0, "0".to_string())
+    };
+
+    info!("FASTQ debug: R1 lines={}, est. records={}; R2 lines={}, est. records={}", r1_line_str, r1_records, r2_line_str, r2_records);
+
+    if paired && r1_records != r2_records {
+        warn!("Uneven FASTQ records: R1={}, R2={} — possible truncation in samtools fastq", r1_records, r2_records);
+    }
+
+    // Debug FASTQ sizes
     let fq1_size = tokio::fs::metadata(&fq1_path).await?.len();
     info!("Extracted FASTQ1 size: {} bytes (~{} reads est.)", fq1_size, fq1_size / 600);
     if let Some(ref fq2_path) = fq2_path_opt {
-        let fq2_size = tokio::fs::metadata(&fq2_path).await?.len();
+        let fq2_size = tokio::fs::metadata(fq2_path).await?.len();
         info!("Extracted FASTQ2 size: {} bytes (~{} reads est.)", fq2_size, fq2_size / 600);
     }
 
-    // 5. Read the output FASTQ files back into a ParseOutput stream
+    // 5. Read FASTQ files into stream
     let (unmapped_receiver, read_task) = read_fastq(
         fq1_path,
         fq2_path_opt,
@@ -1031,7 +1039,6 @@ async fn hisat2_filter(
 
     let unmapped_stream = ReceiverStream::new(unmapped_receiver);
 
-    // Wrap read_task to match cleanup_tasks type
     let read_task_wrapped = tokio::spawn(async move {
         match read_task.await {
             Ok(Ok(stats)) => {
@@ -1044,7 +1051,7 @@ async fn hisat2_filter(
     });
     cleanup_tasks.push(read_task_wrapped);
 
-    // 6. Count mapped reads (optional, from original BAM)
+    // 6. Count mapped reads from BAM
     let (count_tx, count_rx) = oneshot::channel::<u64>();
 
     let bam_count_task = tokio::spawn(async move {
@@ -1077,6 +1084,7 @@ async fn hisat2_filter(
 ///
 /// * `config` - RunConfig struct from main.
 /// * `input_stream` - Raw byte FASTQ stream
+///
 ///
 /// # Returns
 ///
@@ -1740,11 +1748,18 @@ async fn dedup_and_subsample(
     config: Arc<RunConfig>,
     input_stream: mpsc::Receiver<ParseOutput>,
     paired: bool,
-    seed: u64, // Used for hashing, rng from config
+    seed: u64,
     max_subsample: u64,
     prefix_len: Option<usize>,
     out_dir: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, ReceiverStream<ParseOutput>, Arc<HashMap<String, ClusterInfo>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    oneshot::Receiver<u64>,
+    ReceiverStream<ParseOutput>,
+    Arc<HashMap<String, ClusterInfo>>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -1752,49 +1767,121 @@ async fn dedup_and_subsample(
     let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
     let mut total_count = 0u64;
 
-    // RAM-based deduplication
     let mut stream = ReceiverStream::new(input_stream);
+    let mut first_chunk = true;
+    let mut orphan_r1: Option<SequenceRecord> = None;
+    let mut r1_count: u64 = 0;
+    let mut r2_count: u64 = 0;
+
     while let Some(item) = stream.next().await {
-        match item {
-            ParseOutput::Fastq(record) => {
-                let mut records = vec![record.clone()];
-                let mut seq_bytes = (*record.seq()).to_vec(); // Clone Vec<u8> to owned Vec<u8>
-                if paired {
-                    if let Some(next_item) = stream.next().await {
-                        match next_item {
-                            ParseOutput::Fastq(next_record) => {
-                                records.push(next_record.clone());
-                                seq_bytes.extend_from_slice(&next_record.seq()); // Extend with &[u8]
-                            }
-                            _ => {
-                                return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in paired stream".to_string()));
-                            }
-                        }
-                    } else {
-                        return Err(PipelineError::InvalidFastqFormat("Unpaired read in paired stream".to_string()));
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            ParseOutput::Bytes(bytes) => {
+                if first_chunk {
+                    if !bytes.starts_with(b"@") {
+                        return Err(PipelineError::InvalidFastqFormat("Raw byte stream does not start with FASTQ header '@'".to_string()));
                     }
+                    first_chunk = false;
                 }
+
+                let cursor = std::io::Cursor::new(&*bytes);
+                let mut parser = needletail::parse_fastx_reader(cursor)
+                    .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+
+                if let Some(rec_res) = parser.next() {
+                    let rec = rec_res.map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+                    SequenceRecord::from(rec)
+                } else {
+                    continue;
+                }
+            }
+            _ => {
+                warn!("Skipping unexpected ParseOutput variant in dedup stream");
+                continue;
+            }
+        };
+
+        if paired {
+            if let Some(r1) = orphan_r1.take() {
+                r1_count += 1;
+                r2_count += 1;
+
+                let mut records = vec![r1.clone(), record.clone()];
+                let mut seq_bytes = r1.seq().to_vec();
+                seq_bytes.extend_from_slice(record.seq());
+
                 let mut hasher = XxHash64::with_seed(seed);
-                let write_len = prefix_len.map(|len| len.min(seq_bytes.len())).unwrap_or(seq_bytes.len());
+                let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
                 hasher.write(&seq_bytes[0..write_len]);
                 let hash_key = hasher.finish();
+
                 let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
                 entry.0 += 1;
                 entry.1 = records;
+
                 total_count += 1;
+            } else {
+                // Store as pending R1
+                orphan_r1 = Some(record);
             }
-            _ => {
-                return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in dedup stream".to_string()));
-            }
+        } else {
+            let mut records = vec![record.clone()];
+            let seq_bytes = record.seq().to_vec();
+
+            let mut hasher = XxHash64::with_seed(seed);
+            let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
+            hasher.write(&seq_bytes[0..write_len]);
+            let hash_key = hasher.finish();
+
+            let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
+            entry.0 += 1;
+            entry.1 = records;
+
+            total_count += 1;
         }
     }
+
+    // Handle any final orphan R1 (e.g., uneven small file)
+    if let Some(orphan) = orphan_r1 {
+        warn!("Orphan R1 at end of paired stream: {} (skipped)", orphan.id());
+    }
+
+    // Fail on severe imbalance (real corruption)
+    let imbalance = (r1_count as i64 - r2_count as i64).abs();
+    if imbalance > 1 {
+        error!("Severe paired stream imbalance: R1={}, R2={} (diff={})", r1_count, r2_count, imbalance);
+        return Err(PipelineError::InvalidFastqFormat(format!(
+            "Paired stream imbalance: R1={}, R2={}, diff={}",
+            r1_count, r2_count, imbalance
+        )));
+    }
+
+    info!(
+        "Dedup complete: {} valid pairs processed (R1={}, R2={}), {} unique hashes",
+        r1_count.min(r2_count),
+        r1_count,
+        r2_count,
+        dedup_map.len()
+    );
+
+    if total_count == 0 {
+        info!("No reads in dedup input — returning empty outputs");
+        let (empty_tx, empty_rx) = mpsc::channel(1);
+        drop(empty_tx);
+        let (cluster_tx, cluster_rx) = mpsc::channel(1);
+        drop(cluster_tx);
+        let (count_tx, count_rx) = oneshot::channel();
+        let _ = count_tx.send(0);
+        return Ok((ReceiverStream::new(empty_rx), count_rx, ReceiverStream::new(cluster_rx), Arc::new(HashMap::new()), cleanup_tasks, cleanup_receivers));
+    }
+
     count_map = dedup_map.iter().map(|(&k, &(w, _))| (k, w)).collect();
-    debug!("RAM-based count complete: {} unique hashes from {} total {}", count_map.len(), total_count, if paired { "pairs" } else { "reads" });
 
     let subsample_size = max_subsample.min(count_map.len() as u64);
+    info!("Subsampling {} items (max_subsample={}, unique hashes={})", subsample_size, max_subsample, count_map.len());
 
     let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
-    let mut rng = config.rng.clone(); // Clone the seeded RNG from config
+    let mut rng = config.rng.clone();
 
     if subsample_size < count_map.len() as u64 {
         for (&hash_key, &weight) in &count_map {
@@ -1807,7 +1894,6 @@ async fn dedup_and_subsample(
             }
         }
     } else {
-        // All uniques
         for (&hash_key, &weight) in &count_map {
             heap.push(Reverse(SampleItem { key: 0.0, records: vec![], weight, hash_key: Some(hash_key) }));
         }
@@ -1824,38 +1910,28 @@ async fn dedup_and_subsample(
         }
     }
 
+    info!("Sampled {} items; first has {} records", sampled.len(), sampled.get(0).map_or(0, |i| i.records.len()));
+
     let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
     for (&_hash_key, &(size, ref records)) in &dedup_map {
-        if records.is_empty() {
-            continue;
-        }
+        if records.is_empty() { continue; }
         let rep_id = records[0].id().to_string();
         let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
 
-        duplicate_clusters.insert(
-            rep_id,
-            ClusterInfo {
-                size,
-                members,
-            },
-        );
+        duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
     }
 
     let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
 
     tokio::spawn(async move {
-        for (&hash_key, &(weight, ref records)) in &dedup_map {
+        for (&_hash_key, &(weight, ref records)) in &dedup_map {
             if records.is_empty() { continue; }
             let rep_id = records[0].id();
             let rep_line = format!("{},{}\n", rep_id, rep_id);
-            if cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await.is_err() {
-                break;
-            }
+            let _ = cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await;
             for rec in records.iter().skip(1) {
                 let line = format!("{},{}\n", rec.id(), rep_id);
-                if cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
-                    break;
-                }
+                let _ = cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await;
             }
         }
     });
@@ -1871,7 +1947,6 @@ async fn dedup_and_subsample(
             .await
             .map_err(|e| anyhow!("TSV open error: {}", e))?;
 
-        // Iterate over entries and extract rep_id + size only
         for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
             file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes())
                 .await
@@ -1897,7 +1972,14 @@ async fn dedup_and_subsample(
     });
     cleanup_tasks.push(send_task);
 
-    Ok((ReceiverStream::new(rx), count_rx, ReceiverStream::new(cluster_rx), Arc::new(duplicate_clusters), cleanup_tasks, cleanup_receivers))
+    Ok((
+        ReceiverStream::new(rx),
+        count_rx,
+        ReceiverStream::new(cluster_rx),
+        Arc::new(duplicate_clusters),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
