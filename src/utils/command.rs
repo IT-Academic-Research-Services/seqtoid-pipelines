@@ -1321,7 +1321,6 @@ pub mod hisat2 {
                 args_vec.push(config.r1_path.clone());
             }
 
-            args_vec.push("-".to_string());
 
             Ok(args_vec)
         }
