@@ -3093,24 +3093,33 @@ async fn spades_assembly(
     out_dir: PathBuf,
     paired: bool,
     sample_base_buf: PathBuf,
-)  -> Result<(
+    estimated_input_size_bytes: u64,
+) -> Result<(
     AssemblyHandle,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
-),  PipelineError>
-
-{
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
     let spades_out_dir = out_dir.join("assembly");
     fs::create_dir_all(&spades_out_dir).await?;
-    let spades_work_dir =  config.ram_temp_dir.join("spades");
+
+    let ram_safe_threshold = 64 * 1024 * 1024 * 1024u64; // 64 GB - safe for laptop & test instance
+    let spades_work_dir = if estimated_input_size_bytes <= ram_safe_threshold {
+        config.ram_temp_dir.join("spades")
+    } else {
+        warn!(
+            "Estimated input {} bytes ({:.1} GB) > RAM threshold ({:.1} GB) — using disk temp",
+            estimated_input_size_bytes,
+            estimated_input_size_bytes as f64 / 1_073_741_824.0,
+            ram_safe_threshold as f64 / 1_073_741_824.0
+        );
+        std::env::temp_dir().join("spades")
+    };
     fs::create_dir_all(&spades_work_dir).await?;
 
     let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
-
-    let mut total_input_bytes : u64 = 0;
 
     let write_input_task = tokio::spawn({
         let input_file_path = input_file_path.clone();
@@ -3124,7 +3133,6 @@ async fn spades_assembly(
             let mut total_bytes = 0u64;
 
             while let Some(item) = stream.next().await {
-
                 let bytes = item.to_bytes()
                     .map_err(|e| anyhow!("Failed to convert ParseOutput to FASTQ bytes: {}", e))?;
 
@@ -3138,32 +3146,19 @@ async fn spades_assembly(
                 .map_err(|e| anyhow!("Flush error to {}: {}", input_file_path.display(), e))?;
 
             info!(
-            "SPAdes input written: {} ({} bytes)",
-            input_file_path.display(),
-            total_bytes
-        );
+                "SPAdes input written: {} ({} bytes)",
+                input_file_path.display(),
+                total_bytes
+            );
 
             if total_bytes == 0 {
                 warn!("SPAdes input file is empty – no non-host reads");
             }
-            total_input_bytes = total_bytes;
-            Ok::<PathBuf, anyhow::Error>(input_file_path)
+            Ok::<u64, anyhow::Error>(total_bytes)
         }
-
     });
 
-    // Decide SPAdes work dir based on actual input size
-    let spades_work_dir = if total_input_bytes <= MAX_SPADES_WORK_DIR {
-        config.ram_temp_dir.join("spades")
-    } else {
-        warn!("SPAdes input {} bytes ({:.1} MB) → too large for RAM, using disk temp",
-          total_input_bytes, total_input_bytes as f64 / 1e6);
-        std::env::temp_dir().join("spades")
-    };
-
-    fs::create_dir_all(&spades_work_dir).await?;
-
-    let input_file_path = write_input_task.await??;
+    let total_input_bytes = write_input_task.await??;
 
     let spades_config = SpadesConfig {
         input_path: input_file_path.clone(),
@@ -5167,6 +5162,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.clone(),
         paired,
         sample_base_buf.clone(),
+        total_input_size
     ).await?;
 
     cleanup_tasks.append(&mut assembly_cleanup_tasks);
