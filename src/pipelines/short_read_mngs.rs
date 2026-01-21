@@ -3078,6 +3078,26 @@ pub async fn generate_annotated_fasta(
     ))
 }
 
+async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow::Error> {
+    let contigs     = assembly_dir.join("contigs.fasta");
+    let contigs_all = assembly_dir.join("contigs_all.fasta");
+    let scaffolds   = assembly_dir.join("scaffolds.fasta");
+    let bowtie_sam  = assembly_dir.join("read-contig.sam");  // or wherever you place it
+    let stats_json  = assembly_dir.join("contig_stats.json");
+
+    let failed_marker = b";ASSEMBLY FAILED\n";
+    let no_info       = b"@NO INFO\n";
+    let empty_json    = b"{}";
+
+    tokio::fs::write(&contigs, failed_marker).await?;
+    tokio::fs::write(&contigs_all, failed_marker).await?;
+    tokio::fs::write(&scaffolds, failed_marker).await?;
+    tokio::fs::write(&bowtie_sam, no_info).await?;
+    tokio::fs::write(&stats_json, empty_json).await?;
+
+    info!("Wrote dummy assembly files after SPAdes failure");
+    Ok(())
+}
 
 /// Runs spades assembler
 ///
@@ -3188,14 +3208,34 @@ async fn spades_assembly(
         })?;
     cleanup_tasks.push(spades_err_task);
 
+    let spades_out_dir_clone = spades_out_dir.clone();
+
     let spades_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
+
         eprintln!("SPAdes exit: {:?}", output.status);
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             eprintln!("SPAdes FAILED:\n{}", stderr);
-            return Err(anyhow!("SPAdes failed: {}", stderr));
+
+            let contigs_path     = spades_out_dir_clone.join("contigs.fasta");
+            let contigs_all_path = spades_out_dir_clone.join("contigs_all.fasta");
+            let scaffolds_path   = spades_out_dir_clone.join("scaffolds.fasta");
+
+            let failed_marker = b";ASSEMBLY FAILED\n";
+
+            tokio::fs::write(&contigs_path, failed_marker).await?;
+            tokio::fs::write(&contigs_all_path, failed_marker).await?;
+            tokio::fs::write(&scaffolds_path, failed_marker).await?;
+
+            let sam_path = spades_out_dir_clone.join("read-contig.sam");
+            tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
+
+            return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr));
         }
+
+        info!("SPAdes completed successfully");
         Ok(())
     });
 
