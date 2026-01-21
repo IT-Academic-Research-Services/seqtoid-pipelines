@@ -92,6 +92,7 @@ pub enum SamtoolsSubcommand {
     Consensus,
     Depth,
     Ampliconclip,
+    Fixmate
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

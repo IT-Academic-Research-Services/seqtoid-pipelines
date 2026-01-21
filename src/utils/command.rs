@@ -556,6 +556,11 @@ pub mod samtools {
                     args_vec.push("-@".to_string());
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("ampliconclip")).to_string());
                 }
+                SamtoolsSubcommand::Fixmate => {
+                    args_vec.push("fixmate".to_string());
+                    args_vec.push("-@".to_string());
+                    args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fixmate")).to_string());
+                }
             }
             for (key, value) in config.subcommand_fields.iter() {
                 args_vec.push(key.clone());
@@ -1316,8 +1321,6 @@ pub mod hisat2 {
                 args_vec.push(config.r1_path.clone());
             }
 
-            args_vec.push("-S".to_string());
-            args_vec.push("-".to_string());
 
             Ok(args_vec)
         }
@@ -1871,30 +1874,41 @@ pub mod spades {
 
             if config.paired {
                 args_vec.push("--pe1-12".to_string());
-            }
-            else {
+            } else {
                 args_vec.push("-s".to_string());
             }
             args_vec.push(config.input_path.display().to_string());
 
+            // Threads: use what the config allocates (already safe/adaptive)
             let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
             args_vec.push("-m".to_string());
 
+            // Conservative memory cap — never give SPAdes more than 256 GB
+            // FScale down aggressively on smaller machines (laptop/test instance)
             let available_gb = (run_config.available_ram as f64 / 1_000_000_000.0) as u64;
-            let spades_gb = (available_gb * 3 / 4).max(8);
+            let spades_gb = match available_gb {
+                0..=64 => available_gb / 2,           // laptop: 50% (max ~32 GB)
+                65..=256 => available_gb / 3,         // test instance: ~33% (max ~85 GB)
+                _ => 256,                             // cluster: hard cap at 256 GB (SPAdes doesn't need more)
+            }.max(8);  // minimum 8 GB to avoid SPAdes complaining
+
+            info!(
+            "SPAdes memory allocation: {} GB (available: {} GB, capped for safety)",
+            spades_gb, available_gb
+        );
 
             args_vec.push(spades_gb.to_string());
 
+            // Custom flags from config (unchanged)
             for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
+                args_vec.push(key.clone());
                 if let Some(v) = value {
-                    args_vec.push(format!("{}", v));
+                    args_vec.push(v.clone());
                 }
             }
-
 
             args_vec.push("-o".to_string());
             args_vec.push(config.outdir_path.display().to_string());

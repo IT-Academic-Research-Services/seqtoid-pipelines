@@ -42,8 +42,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
 use twox_hash::XxHash64;
-
-
+use crate::cli::Technology;
 use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode,
                           ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType,
                           Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG,
@@ -760,6 +759,324 @@ async fn bowtie2_filter(
     ))
 }
 
+/// HISAT2 filter
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct from main.
+/// * `input_stream` - Raw byte FASTQ stream.
+/// * `hisat2_index_path` - Path to HISAT2 index.
+/// * `paired` - Whether the input is paired-end.
+/// * `hisat2_options` - Additional HISAT2 options as a HashMap (e.g., HashMap::from([("--no-spliced-alignment".to_string(), None)])).
+/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
+///
+/// # Returns
+/// Tuple:
+/// - Unmapped FASTQ stream.
+/// - Optional receiver for the total mapped count (u64) if count is needed.
+/// - Vector of cleanup tasks.
+/// - Vector of cleanup receivers.
+
+async fn hisat2_filter(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    hisat2_index_path: PathBuf,
+    paired: bool,
+    hisat2_options: HashMap<String, Option<String>>,
+    output_bam_path: Option<PathBuf>,
+    estimated_input_size_bytes: u64,
+    headroom: u64,
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    oneshot::Receiver<u64>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    Vec<PathBuf>,
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+    let mut temp_files = Vec::new();
+
+    let required_space = estimated_input_size_bytes * headroom;
+    let ram_available = available_space_for_path(&config.ram_temp_dir).await.unwrap_or(0);
+    let use_ram = required_space <= ram_available;
+
+    let temp_dir = if use_ram {
+        config.ram_temp_dir.clone()
+    } else {
+        config.args.nvme_scratch.as_ref()
+            .map(|s| PathBuf::from(s))
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+
+    // 1. Deinterleave input to files for HISAT2 input
+    let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
+        input_stream,
+        paired,
+        config.base_buffer_size,
+    ).await.map_err(|e| PipelineError::Other(e))?;
+
+    let r1_path = temp_dir.join("hisat2_input_r1.fastq");
+    temp_files.push(r1_path.clone());
+    let r1_write_task = write_byte_stream_to_file(
+        &r1_path,
+        ReceiverStream::new(r1_rx),
+        Some(config.base_buffer_size),
+    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(r1_write_task);
+
+    let r2_path_opt = if paired {
+        let r2_path = temp_dir.join("hisat2_input_r2.fastq");
+        temp_files.push(r2_path.clone());
+        let r2_write_task = write_byte_stream_to_file(
+            &r2_path,
+            ReceiverStream::new(r2_rx_opt.unwrap()),
+            Some(config.base_buffer_size),
+        ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+        cleanup_tasks.push(r2_write_task);
+        Some(r2_path)
+    } else {
+        None
+    };
+
+    deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
+
+    // 2. HISAT2 alignment to temp SAM
+    let sam_path = temp_dir.join("hisat2.sam");
+    temp_files.push(sam_path.clone());
+
+    let hisat2_config = Hisat2Config {
+        hisat2_index_path: hisat2_index_path.clone(),
+        option_fields: hisat2_options,
+        r1_path: r1_path.to_string_lossy().to_string(),
+        r2_path: r2_path_opt.as_ref().map(|p| p.to_string_lossy().to_string()),
+    };
+
+    let mut hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: HISAT2_TAG.to_string(), error: e.to_string() })?;
+
+    hisat2_args.push("-S".to_string());
+    hisat2_args.push(sam_path.to_string_lossy().to_string());
+    info!("Hisat2 args: {:?}", hisat2_args);
+
+    let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
+        config.clone(),
+        HISAT2_TAG,
+        hisat2_args.clone(),
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: HISAT2_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+    cleanup_tasks.push(hisat2_err_task);
+
+    let hisat2_status = hisat2_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?;
+    if !hisat2_status.success() {
+        error!("HISAT2 failed with exit code {}", hisat2_status.code().unwrap_or(-1));
+        return Err(PipelineError::ToolExecution { tool: HISAT2_TAG.to_string(), error: "HISAT2 execution failed".to_string() });
+    } else {
+        info!("HISAT2 completed successfully");
+    }
+
+    let sam_size = tokio::fs::metadata(&sam_path).await?.len();
+    info!("HISAT2 SAM file size: {} bytes (should be >0)", sam_size);
+    if sam_size == 0 {
+        error!("HISAT2 did not write to SAM file - check args: {:?}", hisat2_args.clone());
+        return Err(PipelineError::Other(anyhow!("Empty SAM output from HISAT2")));
+    }
+
+    // 3. samtools sort -n SAM → BAM
+    let bam_path = temp_dir.join("hisat2_sorted.bam");
+    temp_files.push(bam_path.clone());
+
+    let samtools_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
+            ("-@".to_string(), Some("8".to_string())),
+            ("-l".to_string(), Some("1".to_string())),
+            ("-T".to_string(), Some(temp_dir.join("sort_tmp_").to_string_lossy().to_string())),
+        ]),
+    };
+
+    let mut samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    samtools_sort_args.push(sam_path.to_string_lossy().to_string());
+
+    let (mut sort_child, sort_err_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        samtools_sort_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: SAMTOOLS_TAG.to_string(),
+        error: e.to_string(),
+    })?;
+    cleanup_tasks.push(sort_err_task);
+
+    sort_child.wait().await.map_err(|e| PipelineError::Other(e.into()))?;
+
+    if let Some(bam_out) = output_bam_path {
+        tokio::fs::copy(&bam_path, &bam_out).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    }
+
+    // 4. Pipe: sorted BAM → fixmate -m → fastq -f 13/-f 4 (to files)
+    let fq1_path = temp_dir.join("hisat2_host_filtered1.fastq");
+    temp_files.push(fq1_path.clone());
+
+    let fq2_path_opt = if paired {
+        let fq2 = temp_dir.join("hisat2_host_filtered2.fastq");
+        temp_files.push(fq2.clone());
+        Some(fq2)
+    } else {
+        None
+    };
+
+    // Fixmate config and args
+    let fixmate_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fixmate,
+        subcommand_fields: HashMap::from([
+            ("-m".to_string(), None),
+        ]),
+    };
+
+    let mut fixmate_args = generate_cli(SAMTOOLS_TAG, &config, Some(&fixmate_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    fixmate_args.push(bam_path.to_string_lossy().to_string());  // input
+    fixmate_args.push("-".to_string());  // stdout
+
+    let (mut fixmate_child, fixmate_err_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        fixmate_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+    cleanup_tasks.push(fixmate_err_task);
+
+    // Parse fixmate stdout (BAM) as stream
+    let fixmate_out_stream = parse_child_output(
+        &mut fixmate_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    // Fastq config and args
+    let mut fastq_subcommand_fields: HashMap<String, Option<String>> = HashMap::new();
+    fastq_subcommand_fields.insert("-f".to_string(), Some(if paired { "13".to_string() } else { "4".to_string() }));
+    if paired {
+        fastq_subcommand_fields.insert("-1".to_string(), Some(fq1_path.to_string_lossy().to_string()));
+        fastq_subcommand_fields.insert("-2".to_string(), Some(fq2_path_opt.as_ref().unwrap().to_string_lossy().to_string()));
+        fastq_subcommand_fields.insert("-0".to_string(), Some("/dev/null".to_string()));
+        fastq_subcommand_fields.insert("-s".to_string(), Some("/dev/null".to_string()));
+    } else {
+        fastq_subcommand_fields.insert("-o".to_string(), Some(fq1_path.to_string_lossy().to_string()));
+    }
+
+    let samtools_fastq_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: fastq_subcommand_fields,
+    };
+
+    let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
+        .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+
+    let (mut fastq_child, fastq_stdin_task, fastq_err_task) = stream_to_cmd(
+        config.clone(),
+        fixmate_out_stream,
+        SAMTOOLS_TAG,
+        samtools_fastq_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
+    cleanup_tasks.push(fastq_stdin_task);
+    cleanup_tasks.push(fastq_err_task);
+
+    {
+        let mut fastq_guard = fastq_child.lock().await;
+        fastq_guard.wait().await.map_err(|e: std::io::Error| PipelineError::Other(e.into()))?;
+    }
+    // Debug: Count lines in FASTQ to check for uneven R1/R2 (4 lines per read)
+    let r1_lines = Command::new("wc").arg("-l").arg(&fq1_path).output().await?;
+    let r1_line_str = String::from_utf8_lossy(&r1_lines.stdout).trim().to_string();
+    let r1_records = r1_line_str.parse::<u64>().unwrap_or(0) / 4;
+
+    let (r2_records, r2_line_str) = if let Some(ref fq2_path) = fq2_path_opt {
+        let r2_lines = Command::new("wc").arg("-l").arg(fq2_path).output().await?;
+        let r2_str = String::from_utf8_lossy(&r2_lines.stdout).trim().to_string();
+        (r2_str.parse::<u64>().unwrap_or(0) / 4, r2_str)
+    } else {
+        (0, "0".to_string())
+    };
+
+    info!("FASTQ debug: R1 lines={}, est. records={}; R2 lines={}, est. records={}", r1_line_str, r1_records, r2_line_str, r2_records);
+
+    if paired && r1_records != r2_records {
+        warn!("Uneven FASTQ records: R1={}, R2={} — possible truncation in samtools fastq", r1_records, r2_records);
+    }
+
+    // Debug FASTQ sizes
+    let fq1_size = tokio::fs::metadata(&fq1_path).await?.len();
+    info!("Extracted FASTQ1 size: {} bytes (~{} reads est.)", fq1_size, fq1_size / 600);
+    if let Some(ref fq2_path) = fq2_path_opt {
+        let fq2_size = tokio::fs::metadata(fq2_path).await?.len();
+        info!("Extracted FASTQ2 size: {} bytes (~{} reads est.)", fq2_size, fq2_size / 600);
+    }
+
+    // 5. Read FASTQ files into stream
+    let (unmapped_receiver, read_task) = read_fastq(
+        fq1_path,
+        fq2_path_opt,
+        None,
+        u64::MAX,
+        None,
+        None,
+        config.base_buffer_size,
+    ).map_err(|e| PipelineError::Other(e))?;
+
+    let unmapped_stream = ReceiverStream::new(unmapped_receiver);
+
+    let read_task_wrapped = tokio::spawn(async move {
+        match read_task.await {
+            Ok(Ok(stats)) => {
+                info!("read_fastq completed with stats: {:?}", stats);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(join_err) => Err(anyhow::anyhow!("read_task join failed: {}", join_err)),
+        }
+    });
+    cleanup_tasks.push(read_task_wrapped);
+
+    // 6. Count mapped reads from BAM
+    let (count_tx, count_rx) = oneshot::channel::<u64>();
+
+    let bam_count_task = tokio::spawn(async move {
+        let flag = if paired { "-F13" } else { "-F4" };
+        let count_args = vec!["view".to_string(), "-c".to_string(), flag.to_string(), bam_path.to_string_lossy().to_string()];
+        let output = Command::new("samtools")
+            .args(&count_args)
+            .output()
+            .await
+            .map_err(|e| anyhow!("samtools count failed: {}", e))?;
+        let count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let count: u64 = count_str.parse().unwrap_or(0);
+        let _ = count_tx.send(count);
+        Ok(())
+    });
+    cleanup_tasks.push(bam_count_task);
+
+    Ok((
+        unmapped_stream,
+        count_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+        temp_files,
+    ))
+}
 
 /// QC's input stream using FASTP
 ///
@@ -767,6 +1084,7 @@ async fn bowtie2_filter(
 ///
 /// * `config` - RunConfig struct from main.
 /// * `input_stream` - Raw byte FASTQ stream
+///
 ///
 /// # Returns
 ///
@@ -1430,11 +1748,18 @@ async fn dedup_and_subsample(
     config: Arc<RunConfig>,
     input_stream: mpsc::Receiver<ParseOutput>,
     paired: bool,
-    seed: u64, // Used for hashing, rng from config
+    seed: u64,
     max_subsample: u64,
     prefix_len: Option<usize>,
     out_dir: PathBuf,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, ReceiverStream<ParseOutput>, Arc<HashMap<String, ClusterInfo>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    oneshot::Receiver<u64>,
+    ReceiverStream<ParseOutput>,
+    Arc<HashMap<String, ClusterInfo>>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
@@ -1442,49 +1767,121 @@ async fn dedup_and_subsample(
     let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
     let mut total_count = 0u64;
 
-    // RAM-based deduplication
     let mut stream = ReceiverStream::new(input_stream);
+    let mut first_chunk = true;
+    let mut orphan_r1: Option<SequenceRecord> = None;
+    let mut r1_count: u64 = 0;
+    let mut r2_count: u64 = 0;
+
     while let Some(item) = stream.next().await {
-        match item {
-            ParseOutput::Fastq(record) => {
-                let mut records = vec![record.clone()];
-                let mut seq_bytes = (*record.seq()).to_vec(); // Clone Vec<u8> to owned Vec<u8>
-                if paired {
-                    if let Some(next_item) = stream.next().await {
-                        match next_item {
-                            ParseOutput::Fastq(next_record) => {
-                                records.push(next_record.clone());
-                                seq_bytes.extend_from_slice(&next_record.seq()); // Extend with &[u8]
-                            }
-                            _ => {
-                                return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in paired stream".to_string()));
-                            }
-                        }
-                    } else {
-                        return Err(PipelineError::InvalidFastqFormat("Unpaired read in paired stream".to_string()));
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            ParseOutput::Bytes(bytes) => {
+                if first_chunk {
+                    if !bytes.starts_with(b"@") {
+                        return Err(PipelineError::InvalidFastqFormat("Raw byte stream does not start with FASTQ header '@'".to_string()));
                     }
+                    first_chunk = false;
                 }
+
+                let cursor = std::io::Cursor::new(&*bytes);
+                let mut parser = needletail::parse_fastx_reader(cursor)
+                    .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+
+                if let Some(rec_res) = parser.next() {
+                    let rec = rec_res.map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+                    SequenceRecord::from(rec)
+                } else {
+                    continue;
+                }
+            }
+            _ => {
+                warn!("Skipping unexpected ParseOutput variant in dedup stream");
+                continue;
+            }
+        };
+
+        if paired {
+            if let Some(r1) = orphan_r1.take() {
+                r1_count += 1;
+                r2_count += 1;
+
+                let mut records = vec![r1.clone(), record.clone()];
+                let mut seq_bytes = r1.seq().to_vec();
+                seq_bytes.extend_from_slice(record.seq());
+
                 let mut hasher = XxHash64::with_seed(seed);
-                let write_len = prefix_len.map(|len| len.min(seq_bytes.len())).unwrap_or(seq_bytes.len());
+                let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
                 hasher.write(&seq_bytes[0..write_len]);
                 let hash_key = hasher.finish();
+
                 let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
                 entry.0 += 1;
                 entry.1 = records;
+
                 total_count += 1;
+            } else {
+                // Store as pending R1
+                orphan_r1 = Some(record);
             }
-            _ => {
-                return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in dedup stream".to_string()));
-            }
+        } else {
+            let mut records = vec![record.clone()];
+            let seq_bytes = record.seq().to_vec();
+
+            let mut hasher = XxHash64::with_seed(seed);
+            let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
+            hasher.write(&seq_bytes[0..write_len]);
+            let hash_key = hasher.finish();
+
+            let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
+            entry.0 += 1;
+            entry.1 = records;
+
+            total_count += 1;
         }
     }
+
+    // Handle any final orphan R1 (e.g., uneven small file)
+    if let Some(orphan) = orphan_r1 {
+        warn!("Orphan R1 at end of paired stream: {} (skipped)", orphan.id());
+    }
+
+    // Fail on severe imbalance (real corruption)
+    let imbalance = (r1_count as i64 - r2_count as i64).abs();
+    if imbalance > 1 {
+        error!("Severe paired stream imbalance: R1={}, R2={} (diff={})", r1_count, r2_count, imbalance);
+        return Err(PipelineError::InvalidFastqFormat(format!(
+            "Paired stream imbalance: R1={}, R2={}, diff={}",
+            r1_count, r2_count, imbalance
+        )));
+    }
+
+    info!(
+        "Dedup complete: {} valid pairs processed (R1={}, R2={}), {} unique hashes",
+        r1_count.min(r2_count),
+        r1_count,
+        r2_count,
+        dedup_map.len()
+    );
+
+    if total_count == 0 {
+        info!("No reads in dedup input — returning empty outputs");
+        let (empty_tx, empty_rx) = mpsc::channel(1);
+        drop(empty_tx);
+        let (cluster_tx, cluster_rx) = mpsc::channel(1);
+        drop(cluster_tx);
+        let (count_tx, count_rx) = oneshot::channel();
+        let _ = count_tx.send(0);
+        return Ok((ReceiverStream::new(empty_rx), count_rx, ReceiverStream::new(cluster_rx), Arc::new(HashMap::new()), cleanup_tasks, cleanup_receivers));
+    }
+
     count_map = dedup_map.iter().map(|(&k, &(w, _))| (k, w)).collect();
-    debug!("RAM-based count complete: {} unique hashes from {} total {}", count_map.len(), total_count, if paired { "pairs" } else { "reads" });
 
     let subsample_size = max_subsample.min(count_map.len() as u64);
+    info!("Subsampling {} items (max_subsample={}, unique hashes={})", subsample_size, max_subsample, count_map.len());
 
     let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
-    let mut rng = config.rng.clone(); // Clone the seeded RNG from config
+    let mut rng = config.rng.clone();
 
     if subsample_size < count_map.len() as u64 {
         for (&hash_key, &weight) in &count_map {
@@ -1497,7 +1894,6 @@ async fn dedup_and_subsample(
             }
         }
     } else {
-        // All uniques
         for (&hash_key, &weight) in &count_map {
             heap.push(Reverse(SampleItem { key: 0.0, records: vec![], weight, hash_key: Some(hash_key) }));
         }
@@ -1514,38 +1910,28 @@ async fn dedup_and_subsample(
         }
     }
 
+    info!("Sampled {} items; first has {} records", sampled.len(), sampled.get(0).map_or(0, |i| i.records.len()));
+
     let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
     for (&_hash_key, &(size, ref records)) in &dedup_map {
-        if records.is_empty() {
-            continue;
-        }
+        if records.is_empty() { continue; }
         let rep_id = records[0].id().to_string();
         let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
 
-        duplicate_clusters.insert(
-            rep_id,
-            ClusterInfo {
-                size,
-                members,
-            },
-        );
+        duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
     }
 
     let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
 
     tokio::spawn(async move {
-        for (&hash_key, &(weight, ref records)) in &dedup_map {
+        for (&_hash_key, &(weight, ref records)) in &dedup_map {
             if records.is_empty() { continue; }
             let rep_id = records[0].id();
             let rep_line = format!("{},{}\n", rep_id, rep_id);
-            if cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await.is_err() {
-                break;
-            }
+            let _ = cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await;
             for rec in records.iter().skip(1) {
                 let line = format!("{},{}\n", rec.id(), rep_id);
-                if cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
-                    break;
-                }
+                let _ = cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await;
             }
         }
     });
@@ -1561,7 +1947,6 @@ async fn dedup_and_subsample(
             .await
             .map_err(|e| anyhow!("TSV open error: {}", e))?;
 
-        // Iterate over entries and extract rep_id + size only
         for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
             file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes())
                 .await
@@ -1587,7 +1972,14 @@ async fn dedup_and_subsample(
     });
     cleanup_tasks.push(send_task);
 
-    Ok((ReceiverStream::new(rx), count_rx, ReceiverStream::new(cluster_rx), Arc::new(duplicate_clusters), cleanup_tasks, cleanup_receivers))
+    Ok((
+        ReceiverStream::new(rx),
+        count_rx,
+        ReceiverStream::new(cluster_rx),
+        Arc::new(duplicate_clusters),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -2686,6 +3078,26 @@ pub async fn generate_annotated_fasta(
     ))
 }
 
+async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow::Error> {
+    let contigs     = assembly_dir.join("contigs.fasta");
+    let contigs_all = assembly_dir.join("contigs_all.fasta");
+    let scaffolds   = assembly_dir.join("scaffolds.fasta");
+    let bowtie_sam  = assembly_dir.join("read-contig.sam");  // or wherever you place it
+    let stats_json  = assembly_dir.join("contig_stats.json");
+
+    let failed_marker = b";ASSEMBLY FAILED\n";
+    let no_info       = b"@NO INFO\n";
+    let empty_json    = b"{}";
+
+    tokio::fs::write(&contigs, failed_marker).await?;
+    tokio::fs::write(&contigs_all, failed_marker).await?;
+    tokio::fs::write(&scaffolds, failed_marker).await?;
+    tokio::fs::write(&bowtie_sam, no_info).await?;
+    tokio::fs::write(&stats_json, empty_json).await?;
+
+    info!("Wrote dummy assembly files after SPAdes failure");
+    Ok(())
+}
 
 /// Runs spades assembler
 ///
@@ -2701,24 +3113,33 @@ async fn spades_assembly(
     out_dir: PathBuf,
     paired: bool,
     sample_base_buf: PathBuf,
-)  -> Result<(
+    estimated_input_size_bytes: u64,
+) -> Result<(
     AssemblyHandle,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
-),  PipelineError>
-
-{
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
     let spades_out_dir = out_dir.join("assembly");
     fs::create_dir_all(&spades_out_dir).await?;
-    let spades_work_dir =  config.ram_temp_dir.join("spades");
+
+    let ram_safe_threshold = 64 * 1024 * 1024 * 1024u64; // 64 GB
+    let spades_work_dir = if estimated_input_size_bytes <= ram_safe_threshold {
+        config.ram_temp_dir.join("spades")
+    } else {
+        warn!(
+            "Estimated input {} bytes ({:.1} GB) > RAM threshold ({:.1} GB) — using disk temp",
+            estimated_input_size_bytes,
+            estimated_input_size_bytes as f64 / 1_073_741_824.0,
+            ram_safe_threshold as f64 / 1_073_741_824.0
+        );
+        std::env::temp_dir().join("spades")
+    };
     fs::create_dir_all(&spades_work_dir).await?;
 
     let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
-
-    let mut total_input_bytes : u64 = 0;
 
     let write_input_task = tokio::spawn({
         let input_file_path = input_file_path.clone();
@@ -2732,7 +3153,6 @@ async fn spades_assembly(
             let mut total_bytes = 0u64;
 
             while let Some(item) = stream.next().await {
-
                 let bytes = item.to_bytes()
                     .map_err(|e| anyhow!("Failed to convert ParseOutput to FASTQ bytes: {}", e))?;
 
@@ -2746,32 +3166,19 @@ async fn spades_assembly(
                 .map_err(|e| anyhow!("Flush error to {}: {}", input_file_path.display(), e))?;
 
             info!(
-            "SPAdes input written: {} ({} bytes)",
-            input_file_path.display(),
-            total_bytes
-        );
+                "SPAdes input written: {} ({} bytes)",
+                input_file_path.display(),
+                total_bytes
+            );
 
             if total_bytes == 0 {
                 warn!("SPAdes input file is empty – no non-host reads");
             }
-            total_input_bytes = total_bytes;
-            Ok::<PathBuf, anyhow::Error>(input_file_path)
+            Ok::<u64, anyhow::Error>(total_bytes)
         }
-
     });
 
-    // Decide SPAdes work dir based on actual input size
-    let spades_work_dir = if total_input_bytes <= MAX_SPADES_WORK_DIR {
-        config.ram_temp_dir.join("spades")
-    } else {
-        warn!("SPAdes input {} bytes ({:.1} MB) → too large for RAM, using disk temp",
-          total_input_bytes, total_input_bytes as f64 / 1e6);
-        std::env::temp_dir().join("spades")
-    };
-
-    fs::create_dir_all(&spades_work_dir).await?;
-
-    let input_file_path = write_input_task.await??;
+    let total_input_bytes = write_input_task.await??;
 
     let spades_config = SpadesConfig {
         input_path: input_file_path.clone(),
@@ -2789,7 +3196,6 @@ async fn spades_assembly(
             error: e.to_string(),
         })?;
 
-
     let (mut spades_child, spades_err_task) = spawn_cmd(
         config.clone(),
         SPADES_TAG,
@@ -2802,15 +3208,34 @@ async fn spades_assembly(
         })?;
     cleanup_tasks.push(spades_err_task);
 
+    let spades_out_dir_clone = spades_out_dir.clone();
 
     let spades_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
+
         eprintln!("SPAdes exit: {:?}", output.status);
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             eprintln!("SPAdes FAILED:\n{}", stderr);
-            return Err(anyhow!("SPAdes failed: {}", stderr));
+
+            let contigs_path     = spades_out_dir_clone.join("contigs.fasta");
+            let contigs_all_path = spades_out_dir_clone.join("contigs_all.fasta");
+            let scaffolds_path   = spades_out_dir_clone.join("scaffolds.fasta");
+
+            let failed_marker = b";ASSEMBLY FAILED\n";
+
+            tokio::fs::write(&contigs_path, failed_marker).await?;
+            tokio::fs::write(&contigs_all_path, failed_marker).await?;
+            tokio::fs::write(&scaffolds_path, failed_marker).await?;
+
+            let sam_path = spades_out_dir_clone.join("read-contig.sam");
+            tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
+
+            return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr));
         }
+
+        info!("SPAdes completed successfully");
         Ok(())
     });
 
@@ -4526,6 +4951,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
     let mut temp_dirs: Vec<TempDir> = Vec::new();
+    let mut temp_paths: Vec<PathBuf> = Vec::new();
 
     info!("Starting short read mNGS pipeline.");
 
@@ -4543,7 +4969,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone()
         .ok_or_else(|| PipelineError::MissingArgument("host_bowtie2_index is required".to_string()))?;
 
-    let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd)?;
+    let host_hisat2_index: String = config.args.host_hisat2_index.clone()
+        .ok_or_else(|| PipelineError::MissingArgument("host_hisat2_index is required".to_string()))?;
+
+    let (file1_path, file2_path, sample_base_buf, sample_base, total_input_size) = validate_file_inputs(&config, &cwd).await?;
     let paired = file2_path.is_some();
 
     let seed = config.args.seed.unwrap_or_else(|| {
@@ -4638,40 +5067,41 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
 
-    // Host filtering: mm2
-    let (host_mm2_out_stream, host_mm2_count_rx, mut host_mm2_cleanup_tasks, mut host_mm2_cleanup_receivers, host_ref_temp, host_index_temp, host_temp_dir) = minimap2_filter(
+
+    //host filtering hisat2
+    let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
+    let hisat2_options = HashMap::from([]);
+    let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
         config.clone(),
         host_bt2_out_stream,
+        host_hisat2_index_path,
         paired,
-        None, // No BAM output; set to Some(PathBuf::from("host_mm2.bam")) if needed
+        hisat2_options,
+        None,
+        total_input_size,
+        4
+
     )
         .await?;
-    cleanup_tasks.append(&mut host_mm2_cleanup_tasks);
-    cleanup_receivers.append(&mut host_mm2_cleanup_receivers);
+    cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
+    cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
+    temp_paths.extend(hisat_input_files);
 
-    if let Some(temp) = host_ref_temp {
-        temp_files.push(temp);
-    }
-    if let Some(temp) = host_index_temp {
-        temp_files.push(temp);
-    }
-    if let Some(temp) = host_temp_dir {
-        temp_dirs.push(temp);
-    }
 
     // If host is no huma, run an additional filter stage using a human reference
     let post_filter_stream  = if config.args.human_host {
-        host_mm2_out_stream
+        host_hisat2_out_stream
     }
     else {
         let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
+        let human_hisat2_index: String = config.args.human_hisat2_index.clone();
 
         // human filtering: bt2
         let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
         let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
         let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers, _human_bt2_insert_stats_rx) = bowtie2_filter(
             config.clone(),
-            host_mm2_out_stream,
+            host_hisat2_out_stream,
             human_bt2_index_path,
             paired,
             human_bt2_options,
@@ -4680,28 +5110,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ).await?;
         cleanup_receivers.extend(human_bt2_cleanup_receivers);
 
-        // human filtering: mm2
-        let (human_mm2_out_stream, human_mm2_count_rx, mut human_mm2_cleanup_tasks, mut human_mm2_cleanup_receivers, human_ref_temp, human_index_temp, human_index_dir) = minimap2_filter(
+        //host filtering hisat2
+
+        let human_hisat2_index_path = hisat2_index_prep(human_hisat2_index, &cwd)?;
+        let hisat2_options = HashMap::from([]);
+        let (human_hisat2_out_stream, _human_hisat2_count_rx, mut human_hisat2_cleanup_tasks, mut human_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
             config.clone(),
             human_bt2_out_stream,
+            human_hisat2_index_path,
             paired,
-            None, // No BAM output; set to Some(PathBuf::from("human_mm2.bam")) if needed
+            hisat2_options,
+            None,
+            total_input_size,
+            4
+
         )
             .await?;
-        cleanup_tasks.append(&mut human_mm2_cleanup_tasks);
-        cleanup_receivers.append(&mut human_mm2_cleanup_receivers);
+        cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
+        cleanup_receivers.append(&mut human_hisat2_cleanup_receivers);
+        temp_paths.extend(hisat_input_files);
 
-        if let Some(temp) = human_ref_temp {
-            temp_files.push(temp);
-        }
-        if let Some(temp) = human_index_temp {
-            temp_files.push(temp);
-        }
-        if let Some(temp) = human_index_dir {
-            temp_dirs.push(temp);
-        }
-
-        human_mm2_out_stream
+        human_hisat2_out_stream
 
     };
 
@@ -4771,6 +5200,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.clone(),
         paired,
         sample_base_buf.clone(),
+        total_input_size
     ).await?;
 
     cleanup_tasks.append(&mut assembly_cleanup_tasks);
@@ -5771,18 +6201,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    // let (nonhost_r1_path, nonhost_r2_path) = generate_nonhost_fastq(
-    //     config.clone(),
-    //     //original R1 FASTQ,
-    //     // original R2 FASTQ,
-    //     taxid_mapped_nonhost,
-    //     duplicate_clusters.clone(),
-    //
-    //     out_dir.clone()
-    // )
-
-
-
     // *******************
     // Results retrieval
     // *******************
@@ -5866,10 +6284,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
 
-    let host_mm2_counts = host_mm2_count_rx
+    let host_hisat2_counts = host_hisat2_count_rx
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("Host minimap2 counts receiver failed: {}", e)))?;
-    info!("Host minimap2: mapped counts: {:?}", host_mm2_counts);
+        .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
+    info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
 
     let dedup_count = dedup_count_rx
         .await
@@ -5960,6 +6378,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     drop(temp_files);
     drop(temp_dirs);
+    drop(temp_paths);
 
     info!("Finished short read mNGS pipeline.");
     Ok(())
