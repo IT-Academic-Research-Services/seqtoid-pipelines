@@ -3105,7 +3105,7 @@ async fn spades_assembly(
     let spades_out_dir = out_dir.join("assembly");
     fs::create_dir_all(&spades_out_dir).await?;
 
-    let ram_safe_threshold = 64 * 1024 * 1024 * 1024u64; // 64 GB - safe for laptop & test instance
+    let ram_safe_threshold = 64 * 1024 * 1024 * 1024u64; // 64 GB
     let spades_work_dir = if estimated_input_size_bytes <= ram_safe_threshold {
         config.ram_temp_dir.join("spades")
     } else {
@@ -3176,7 +3176,6 @@ async fn spades_assembly(
             error: e.to_string(),
         })?;
 
-
     let (mut spades_child, spades_err_task) = spawn_cmd(
         config.clone(),
         SPADES_TAG,
@@ -3188,7 +3187,6 @@ async fn spades_assembly(
             error: e.to_string(),
         })?;
     cleanup_tasks.push(spades_err_task);
-
 
     let spades_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
