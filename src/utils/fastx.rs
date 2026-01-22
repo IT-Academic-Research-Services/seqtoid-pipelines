@@ -1607,18 +1607,18 @@ pub async fn fastq_to_fasta(
     tokio_stream::wrappers::ReceiverStream<ParseOutput>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
-    let (tx, rx) = mpsc::channel(8192);  // buffer size can be tuned
+    let (tx, rx) = mpsc::channel(8192);
 
     let handle = tokio::spawn(async move {
         while let Some(record) = input.next().await {
             let fasta_rec = match record {
                 ParseOutput::Fastq(fq) => ParseOutput::Fasta(SequenceRecord::Fasta {
-                    id: fq.id,
-                    desc: fq.desc,
-                    seq: fq.seq,
+                    id: fq.id().to_string(),
+                    desc: fq.desc().map(|s| s.to_string()),
+                    seq: fq.seq().to_vec().into(),
                 }),
                 ParseOutput::Fasta(fa) => ParseOutput::Fasta(fa),
-                ParseOutput::Bytes(_) => continue,  // ignore raw bytes
+                ParseOutput::Bytes(_) => continue,
             };
 
             if tx.send(fasta_rec).await.is_err() {
