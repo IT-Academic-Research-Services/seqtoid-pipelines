@@ -5,7 +5,13 @@ use log::{self, LevelFilter, debug, info, error, warn};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG,
+                          MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG,
+                          MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG,
+                          BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS,
+                          CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG,
+                          MAKEBLASTDB_TAG, SEQTOID_DEDUP_TAG};
+
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -2102,6 +2108,95 @@ pub mod blastx {
     }
 }
 
+pub mod seqtoid_dedup {
+    use std::path::PathBuf;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{RunConfig, SEQTOID_DEDUP_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct SeqtoidDedupConfig {
+        pub input_paths: Vec<PathBuf>,      // 1 for SE, 2 for PE
+        pub output_paths: Vec<PathBuf>,     // matching number of inputs
+        pub prefix_length: Option<u32>,     // -l 70 by default
+        pub cluster_output: Option<PathBuf>, // -c clusters.csv (full membership)
+        pub cluster_size_output: Option<PathBuf>, // duplicate_cluster_sizes.tsv
+    }
+
+    pub struct SeqtoidDedupArgGenerator;
+
+    pub async fn seqtoid_dedup_presence_check() -> Result<f32> {
+        let version = version_check(
+            SEQTOID_DEDUP_TAG,
+            vec!["--help"],
+            0,
+            1,
+            ChildStream::Stdout,
+            None,
+        )
+            .await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for SeqtoidDedupArgGenerator {
+        fn generate_args(
+            &self,
+            _run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<SeqtoidDedupConfig>())
+                .ok_or_else(|| anyhow!("seqtoid-dedup requires SeqtoidDedupConfig as extra argument"))?;
+
+            if config.input_paths.len() != config.output_paths.len() {
+                return Err(anyhow!(
+                    "Number of inputs ({}) must match outputs ({}) for seqtoid-dedup",
+                    config.input_paths.len(),
+                    config.output_paths.len()
+                ));
+            }
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            // Inputs
+            for input in &config.input_paths {
+                args_vec.push("-i".to_string());
+                args_vec.push(input.to_string_lossy().into_owned());
+            }
+
+            // Outputs
+            for output in &config.output_paths {
+                args_vec.push("-o".to_string());
+                args_vec.push(output.to_string_lossy().into_owned());
+            }
+
+            // Prefix length (default 70 in original CZID)
+            if let Some(len) = config.prefix_length {
+                args_vec.push("-l".to_string());
+                args_vec.push(len.to_string());
+            } else {
+                args_vec.push("-l".to_string());
+                args_vec.push("70".to_string());
+            }
+
+            // Cluster membership CSV (-c)
+            if let Some(cluster) = &config.cluster_output {
+                args_vec.push("-c".to_string());
+                args_vec.push(cluster.to_string_lossy().into_owned());
+            }
+
+            // Cluster sizes TSV
+            if let Some(size) = &config.cluster_size_output {
+                args_vec.push("--cluster-size-output".to_string());
+                args_vec.push(size.to_string_lossy().into_owned());
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -2126,6 +2221,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         BLASTN_TAG => Box::new(blastn::BlastnArgGenerator),
         BLASTX_TAG => Box::new(blastx::BlastxArgGenerator),
         MAKEBLASTDB_TAG => {Box::new(makeblastdb::MakeblastdbArgGenerator)},
+        SEQTOID_DEDUP_TAG => Box::new(seqtoid_dedup::SeqtoidDedupArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -2175,6 +2271,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
                 BLASTN_TAG => blastn::blastn_presence_check().await,
                 BLASTX_TAG => blastx::blastx_presence_check().await,
                 MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
+                SEQTOID_DEDUP_TAG => seqtoid_dedup::seqtoid_dedup_presence_check().await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

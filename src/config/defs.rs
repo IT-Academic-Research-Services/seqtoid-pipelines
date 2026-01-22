@@ -41,6 +41,7 @@ pub const SPADES_TAG: &str = "spades.py";
 pub const BLASTN_TAG: &str = "blastn";
 pub const BLASTX_TAG: &str = "blastx";
 pub const MAKEBLASTDB_TAG: &str = "makeblastdb";
+pub const SEQTOID_DEDUP_TAG: &str = "seqtoid-dedup";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";
