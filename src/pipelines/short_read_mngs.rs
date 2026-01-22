@@ -50,7 +50,8 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG,
                           MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
-                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters};
+                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, SEQTOID_DEDUP_TAG,
+                          ClusterInfo, DuplicateClusters};
 use crate::utils::blast::{consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
@@ -65,6 +66,7 @@ use crate::utils::command::makeblastdb::{MakeblastdbArgGenerator, MakeblastdbCon
 use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2ArgGenerator, Minimap2Config};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
+use crate::utils::command::seqtoid_dedup::{SeqtoidDedupConfig};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
@@ -93,15 +95,13 @@ const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
 const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
 const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
 const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
-
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
 const MIN_CONTIG_SIZE: u64 = 500;
-
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
-
 const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
+const DEFAULT_PREFIX_LEN: u32 = 70;
 
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r",(?=[^\s])").unwrap()
@@ -1977,6 +1977,134 @@ async fn dedup_and_subsample(
         count_rx,
         ReceiverStream::new(cluster_rx),
         Arc::new(duplicate_clusters),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
+pub async fn dedup_with_seqtoid_dedup(
+    config: Arc<RunConfig>,
+    input_stream_rx: mpsc::Receiver<ParseOutput>,
+    paired: bool,
+    _seed: u64,
+    _max_subsample: u64,
+    prefix_len: Option<usize>,
+    out_dir: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,                  // deduped FASTQ stream
+    mpsc::Receiver<u64>,                          // unique count
+    mpsc::Receiver<()>,                           // cluster placeholder
+    PathBuf,                                      // clusters.csv
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,   // cleanup tasks
+    Vec<mpsc::Receiver<Result<(), anyhow::Error>>>,
+)> {
+
+    // 1. choose a temp dir
+    let estimated_bytes = (config.input_size_mb as u64) * 1_000_000 * 2;
+    let temp_dir = choose_temp_dir(
+        estimated_bytes,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    )
+        .await
+        .context("Failed to choose temp dir for dedup")?;
+
+    let input_fastq = temp_dir.join("dedup_input.fastq");
+
+    // 2. stream to temp FASTQ
+    let input_fastq_clone = input_fastq.clone();
+    let write_handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let file = TokioFile::create(&input_fastq_clone).await?;
+        let mut writer = BufWriter::new(file);
+        let mut stream = ReceiverStream::new(input_stream_rx);
+        while let Some(item) = stream.next().await {
+            writer.write_all(&item.to_bytes()?).await?;
+        }
+        writer.flush().await?;
+        Ok(())
+    });
+    write_handle.await??;
+
+    //3. run seqtoid-dedup
+    let dedup_r1 = out_dir.join("dedup1.fastq");
+    let dedup_r2 = if paired { Some(out_dir.join("dedup2.fastq")) } else { None };
+    let clusters_csv = out_dir.join("clusters.csv");
+    let cluster_sizes_tsv = out_dir.join("duplicate_cluster_sizes.tsv");
+
+    let prefix = prefix_len.unwrap_or(70) as u32;
+
+    let dedup_config = SeqtoidDedupConfig {
+        input_paths: if paired {
+            vec![input_fastq.clone(), input_fastq.clone()]
+        } else {
+            vec![input_fastq.clone()]
+        },
+        output_paths: if paired {
+            vec![dedup_r1.clone(), dedup_r2.clone().unwrap()]
+        } else {
+            vec![dedup_r1.clone()]
+        },
+        prefix_length: Some(prefix),
+        cluster_output: Some(clusters_csv.clone()),
+        cluster_size_output: Some(cluster_sizes_tsv.clone()),
+    };
+
+    let args = generate_cli(SEQTOID_DEDUP_TAG, &config, Some(&dedup_config))
+        .context("Failed to generate seqtoid-dedup args")?;
+
+    info!("seqtoid-dedup args: {:?}", args);
+
+    let status = Command::new("seqtoid-dedup")
+        .args(&args)
+        .status()
+        .await
+        .context("Failed to spawn seqtoid-dedup")?;
+
+    if !status.success() {
+        return Err(anyhow!("seqtoid-dedup failed with code {:?}", status.code()));
+    }
+
+    // 4. get out stream
+    let (dedup_stream, stats_handle) = read_fastq(
+        dedup_r1.clone(),
+        dedup_r2.clone(),
+        None,
+        u64::MAX,
+        None,
+        None,
+        config.base_buffer_size,
+    )
+        .context("Failed to open deduplicated FASTQ")?;
+
+    // 5. count
+    let (count_tx, count_rx) = mpsc::channel(1);
+    let count_handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let stats = stats_handle.await??;
+        let _ = count_tx.send(stats.validated).await;
+        Ok(())
+    });
+
+    // 8. Cluster placeholder
+    let (cluster_tx, cluster_rx) = mpsc::channel(1);
+    let _ = cluster_tx.send(()).await;
+
+    // 9. Cleanup
+    let cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = vec![
+        tokio::spawn(async move {
+            let _ = fs::remove_file(&input_fastq).await;
+            Ok(())
+        }),
+        count_handle,
+    ];
+
+    let cleanup_receivers = vec![];
+
+    Ok((
+        ReceiverStream::new(dedup_stream),
+        count_rx,
+        cluster_rx,
+        clusters_csv,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -5145,6 +5273,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
+
+    // let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters_csv, dedup_cleanup_tasks, dedup_cleanup_receivers) =
+    //     dedup_with_seqtoid(
+    //         config.clone(),
+    //         post_filter_stream.into_inner(),
+    //         paired,
+    //         seed,
+    //         config.args.max_subsample as u64,
+    //         Some(70),
+    //         out_dir.clone(),
+    //     )
+    //         .await?;
 
 
     // *******************
