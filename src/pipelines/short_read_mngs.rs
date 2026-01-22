@@ -5275,7 +5275,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
     // let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters_csv, dedup_cleanup_tasks, dedup_cleanup_receivers) =
-    //     dedup_with_seqtoid(
+    //     dedup_with_seqtoid_dedup(
     //         config.clone(),
     //         post_filter_stream.into_inner(),
     //         paired,
@@ -5285,6 +5285,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //         out_dir.clone(),
     //     )
     //         .await?;
+    // cleanup_tasks.extend(dedup_cleanup_tasks);
+    // cleanup_receivers.extend(dedup_cleanup_receivers);
+    //
+    // let (fasta_tx, fasta_rx) = mpsc::channel(8192);
+    // let convert_handle = tokio::spawn(async move {
+    //     let mut stream = dedup_stream;
+    //     while let Some(record) = stream.next().await {
+    //         let fasta_rec = match record {
+    //             ParseOutput::Fastq(fq) => ParseOutput::Fasta(SequenceRecord::Fasta {
+    //                 id: fq.id,
+    //                 desc: fq.desc,
+    //                 seq: fq.seq,
+    //             }),
+    //             ParseOutput::Fasta(fa) => ParseOutput::Fasta(fa),
+    //             ParseOutput::Bytes(_) => continue,
+    //         };
+    //         if fasta_tx.send(fasta_rec).await.is_err() {
+    //             break;
+    //         }
+    //     }
+    //     Ok(())
+    // });
 
 
     // *******************

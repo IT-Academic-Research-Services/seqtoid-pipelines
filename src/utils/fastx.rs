@@ -12,6 +12,7 @@ use log::{self, debug, info, error, warn};
 
 use std::collections::HashMap;
 use ahash::AHashMap;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use lazy_static::lazy_static;
 use crate::utils::sequence::{DNA, normal_phred_qual_string};
 use futures::Stream;
@@ -1695,6 +1696,165 @@ pub async fn convert_fastq_file_to_fasta_file(
     convert_fastq_to_fasta(input_file, output_file).await
 }
 
+/// Weighted A-Res reservoir sampling over a stream of ParseOutput (Fastq or Fasta).
+///
+/// - Weights are looked up using normalize_read_id_for_cluster on the record ID
+/// - If no weight found → defaults to 1
+/// - Deterministic (fixed seed)
+/// - Streaming: reservoir size bounded by max_fragments
+/// - Preserves FASTQ quality when present
+/// - Outputs kept records in roughly original order (sorted by key descending)
+///
+/// Returns:
+/// - ReceiverStream<ParseOutput> of the subsampled records
+/// - JoinHandle<Result<u64>> that resolves to the final number of kept fragments
+pub async fn subsample_weighted_stream(
+    mut input: impl Stream<Item = ParseOutput> + Unpin + Send + 'static,
+    cluster_weights: &HashMap<String, u64>,   // base_id → cluster size
+    max_fragments: u64,
+    seed: u64,
+) -> Result<(
+    tokio_stream::wrappers::ReceiverStream<ParseOutput>,
+    tokio::task::JoinHandle<Result<u64>>,
+)> {
+    if max_fragments == u64::MAX {
+        // No subsampling — passthrough with count
+        let (tx, rx) = mpsc::channel(8192);
+        let handle = tokio::spawn(async move {
+            let mut count = 0u64;
+            while let Some(item) = input.next().await {
+                if tx.send(item).await.is_err() {
+                    return Err(anyhow!("Downstream receiver dropped during passthrough"));
+                }
+                count += 1;
+            }
+            Ok(count)
+        });
+        return Ok((tokio_stream::wrappers::ReceiverStream::new(rx), handle));
+    }
+
+    let (tx, rx) = mpsc::channel(8192);
+
+    let weights = cluster_weights.clone();
+    let handle = tokio::spawn(async move {
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        // Reservoir: (key, record, weight)
+        let mut reservoir: Vec<(f64, ParseOutput, u64)> = Vec::with_capacity(max_fragments as usize);
+        let mut total_seen = 0u64;
+
+        while let Some(item) = input.next().await {
+            total_seen += 1;
+
+            let record = match &item {
+                ParseOutput::Fastq(fq) | ParseOutput::Fasta(fq) => fq,
+                ParseOutput::Bytes(_) => continue,
+            };
+
+            let base_id = normalize_read_id_for_cluster(&record.id());
+            let weight = weights.get(&base_id).copied().unwrap_or(1);
+
+            // A-Res: key = uniform_random ^ (1 / weight)
+            let key = rng.gen::<f64>().powf(1.0 / weight as f64);
+
+            if reservoir.len() < max_fragments as usize {
+                reservoir.push((key, item, weight));
+            } else if let Some((worst_key, _, _)) = reservoir.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)) {
+                if key > *worst_key {
+                    if let Some(idx) = reservoir.iter().position(|(k, _, _)| k == worst_key) {
+                        reservoir[idx] = (key, item, weight);
+                    }
+                }
+            }
+        }
+
+        // Sort descending by key to approximate stable-ish order
+        reservoir.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut kept = 0u64;
+        for (_, record, _) in reservoir {
+            if tx.send(record).await.is_err() {
+                return Err(anyhow!("Downstream receiver dropped during emission"));
+            }
+            kept += 1;
+        }
+
+        Ok(kept)
+    });
+
+    Ok((
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+        handle,
+    ))
+}
+
+/// Normalize a read ID by stripping common trailing pair suffixes so we can
+/// look up the correct cluster weight / representative.
+///
+/// Handles the most common Illumina / CZID-style suffixes:
+///   /1  /2   _1  _2   .1  .2   /R1 /R2  _R1 _R2  etc.
+///
+/// Returns the base ID string that should match keys in duplicate_cluster_sizes.tsv
+pub fn normalize_read_id_for_cluster(id: &str) -> String {
+    let suffixes = [
+        "/1", "/2", "_1", "_2", ".1", ".2",
+        "/R1", "/R2", "_R1", "_R2",
+        "/fwd", "/rev", "_fwd", "_rev",
+    ];
+
+    let mut cleaned = id.to_string();
+
+    // Fast path: exact suffix match
+    for suffix in suffixes {
+        if cleaned.ends_with(suffix) {
+            return cleaned[..cleaned.len() - suffix.len()].to_string();
+        }
+    }
+
+    // Fallback: look for last delimiter + single digit 1 or 2
+    if let Some(pos) = cleaned.rfind(|c: char| matches!(c, '/' | '_' | '.')) {
+        let after = &cleaned[pos + 1..];
+        if after.len() <= 2 && (after == "1" || after == "2") {
+            return cleaned[..pos].to_string();
+        }
+    }
+
+    // No recognizable pair suffix → return as-is
+    cleaned
+}
+
+pub async fn parse_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let file = TokioFile::open(path).await?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    let mut map = HashMap::new();
+
+    // Skip header if present
+    reader.read_line(&mut line).await?;
+    line.clear();
+
+    while reader.read_line(&mut line).await? > 0 {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            line.clear();
+            continue;
+        }
+
+        let parts: Vec<&str> = trimmed.split('\t').collect();
+        if parts.len() >= 2 {
+            let rep_id = parts[0].trim().to_string();
+            if let Ok(size) = parts[1].trim().parse::<u64>() {
+                map.insert(rep_id, size);
+            }
+        }
+        line.clear();
+    }
+
+    Ok(map)
+}
 
 #[cfg(test)]
 mod tests {
