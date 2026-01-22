@@ -1591,109 +1591,47 @@ pub async fn filter_fastq_to_bytes_stream(
 }
 
 
-
-/// Streaming byte-level FASTQ → FASTA converter
-/// Input: any AsyncRead (file, pipe, etc.)
-/// Output: any AsyncWrite (file, buffer, etc.)
-pub async fn convert_fastq_to_fasta<R, W>(
-    reader: R,
-    mut writer: W,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut buf_reader = TokioBufReader::new(reader);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes_read = buf_reader.read_line(&mut line).await
-            .context("Failed to read FASTQ line")?;
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        // Trim trailing \n or \r\n
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-
-        if trimmed.starts_with('@') {
-            // Header: @id → >id
-            writer.write_all(b">").await?;
-            writer.write_all(trimmed[1..].as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-        } else if trimmed == "+" {
-            // Skip quality header and quality line
-            line.clear();
-            buf_reader.read_line(&mut line).await
-                .context("Failed to skip quality header")?;
-            line.clear();
-            buf_reader.read_line(&mut line).await
-                .context("Failed to skip quality scores")?;
-        } else if !trimmed.is_empty() {
-            // Sequence line
-            writer.write_all(trimmed.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-        }
-    }
-
-    writer.flush().await.context("Failed to flush FASTA output")?;
-    Ok(())
-}
-
-/// Convert a stream of ParseOutput (containing Fastq records) → stream of ParseOutput (Fasta records)
-/// Drops quality scores, preserves id/desc/seq
-pub async fn convert_fastq_parse_output_stream(
+/// Converts a stream of ParseOutput (containing FASTQ records) into a stream
+/// of ParseOutput containing FASTA records by dropping quality scores.
+///
+/// - Preserves FASTA records as-is (passthrough)
+/// - Ignores Bytes variant (or you can add logging if needed)
+/// - Backpressure-aware: will stop if downstream doesn't consume
+///
+/// Returns:
+/// - ReceiverStream<ParseOutput> of FASTA records
+/// - JoinHandle<Result<()>> for error propagation / cleanup
+pub async fn fastq_to_fasta(
     mut input: impl Stream<Item = ParseOutput> + Unpin + Send + 'static,
-) -> (tokio::sync::mpsc::Receiver<ParseOutput>, tokio::task::JoinHandle<Result<()>>) {
-    let (tx, rx) = tokio::sync::mpsc::channel(4096);
+) -> (
+    tokio_stream::wrappers::ReceiverStream<ParseOutput>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let (tx, rx) = mpsc::channel(8192);  // buffer size can be tuned
 
     let handle = tokio::spawn(async move {
-        while let Some(item) = input.next().await {
-            match item {
-                ParseOutput::Fastq(record) => {
-                    // Convert Fastq → Fasta (drop qual)
-                    let fasta_record = match record {
-                        SequenceRecord::Fastq { id, desc, seq, .. } => {
-                            SequenceRecord::Fasta { id, desc, seq }
-                        }
-                        SequenceRecord::Fasta { .. } => record, // passthrough if already FASTA
-                    };
-                    if tx.send(ParseOutput::Fasta(fasta_record)).await.is_err() {
-                        return Err(anyhow::anyhow!("Receiver dropped during FASTQ→FASTA conversion"));
-                    }
-                }
-                ParseOutput::Fasta(fa) => {
-                    if tx.send(ParseOutput::Fasta(fa)).await.is_err() {
-                        return Err(anyhow::anyhow!("Receiver dropped during passthrough"));
-                    }
-                }
-                ParseOutput::Bytes(_) => {
-                    // Ignore raw bytes (or log warning if you want)
-                }
+        while let Some(record) = input.next().await {
+            let fasta_rec = match record {
+                ParseOutput::Fastq(fq) => ParseOutput::Fasta(SequenceRecord::Fasta {
+                    id: fq.id,
+                    desc: fq.desc,
+                    seq: fq.seq,
+                }),
+                ParseOutput::Fasta(fa) => ParseOutput::Fasta(fa),
+                ParseOutput::Bytes(_) => continue,  // ignore raw bytes
+            };
+
+            if tx.send(fasta_rec).await.is_err() {
+                return Err(anyhow::anyhow!("Downstream receiver dropped during FASTQ→FASTA conversion"));
             }
         }
         Ok(())
     });
 
-    (rx, handle)
-}
-
-/// File-to-file convenience wrapper
-pub async fn convert_fastq_file_to_fasta_file(
-    input_path: impl AsRef<Path>,
-    output_path: impl AsRef<Path>,
-) -> Result<()> {
-    let input_file = TokioFile::open(input_path.as_ref())
-        .await
-        .with_context(|| format!("Failed to open input FASTQ: {}", input_path.as_ref().display()))?;
-
-    let output_file = TokioFile::create(output_path.as_ref())
-        .await
-        .with_context(|| format!("Failed to create output FASTA: {}", output_path.as_ref().display()))?;
-
-    convert_fastq_to_fasta(input_file, output_file).await
+    (
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+        handle,
+    )
 }
 
 /// Weighted A-Res reservoir sampling over a stream of ParseOutput (Fastq or Fasta).
