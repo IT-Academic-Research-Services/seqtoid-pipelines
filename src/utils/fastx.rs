@@ -41,7 +41,8 @@ use fst::MapBuilder;
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage,
+                          CONFORMING_PREAMBLE, PipelineError, ClusterInfo};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 
 lazy_static! {
@@ -1591,12 +1592,16 @@ pub async fn filter_fastq_to_bytes_stream(
 }
 
 
+
+
 /// Converts a stream of ParseOutput (containing FASTQ records) into a stream
 /// of ParseOutput containing FASTA records by dropping quality scores.
 ///
 /// - Preserves FASTA records as-is (passthrough)
 /// - Ignores Bytes variant (or you can add logging if needed)
 /// - Backpressure-aware: will stop if downstream doesn't consume
+/// # Arguments
+/// * `finput` - FASTQ stream input
 ///
 /// Returns:
 /// - ReceiverStream<ParseOutput> of FASTA records
@@ -1642,13 +1647,17 @@ pub async fn fastq_to_fasta(
 /// - Streaming: reservoir size bounded by max_fragments
 /// - Preserves FASTQ quality when present
 /// - Outputs kept records in roughly original order (sorted by key descending)
+/// # Arguments
+/// * `input` - FASTX sgtream input
+/// * `cluster_info` - duplicate cluster weightsa
+/// * `max_fragments` -
 ///
 /// Returns:
 /// - ReceiverStream<ParseOutput> of the subsampled records
 /// - JoinHandle<Result<u64>> that resolves to the final number of kept fragments
 pub async fn subsample_weighted_stream(
     mut input: impl Stream<Item = ParseOutput> + Unpin + Send + 'static,
-    cluster_weights: &HashMap<String, u64>,   // base_id → cluster size
+    cluster_info: &Arc<HashMap<String, ClusterInfo>>,
     max_fragments: u64,
     seed: u64,
 ) -> Result<(
@@ -1656,7 +1665,6 @@ pub async fn subsample_weighted_stream(
     tokio::task::JoinHandle<Result<u64>>,
 )> {
     if max_fragments == u64::MAX {
-        // No subsampling — passthrough with count
         let (tx, rx) = mpsc::channel(8192);
         let handle = tokio::spawn(async move {
             let mut count = 0u64;
@@ -1673,7 +1681,7 @@ pub async fn subsample_weighted_stream(
 
     let (tx, rx) = mpsc::channel(8192);
 
-    let weights = cluster_weights.clone();
+    let cluster_info = Arc::clone(cluster_info);
     let handle = tokio::spawn(async move {
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -1690,14 +1698,18 @@ pub async fn subsample_weighted_stream(
             };
 
             let base_id = normalize_read_id_for_cluster(&record.id());
-            let weight = weights.get(&base_id).copied().unwrap_or(1);
+            let weight = cluster_info.get(&base_id)
+                .map(|info| info.size)
+                .unwrap_or(1);
 
             // A-Res: key = uniform_random ^ (1 / weight)
             let key = rng.gen::<f64>().powf(1.0 / weight as f64);
 
             if reservoir.len() < max_fragments as usize {
                 reservoir.push((key, item, weight));
-            } else if let Some((worst_key, _, _)) = reservoir.iter().min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)) {
+            } else if let Some((worst_key, _, _)) = reservoir.iter().min_by(|a, b| {
+                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            }) {
                 if key > *worst_key {
                     if let Some(idx) = reservoir.iter().position(|(k, _, _)| k == worst_key) {
                         reservoir[idx] = (key, item, weight);
@@ -1761,17 +1773,23 @@ pub fn normalize_read_id_for_cluster(id: &str) -> String {
     cleaned
 }
 
-pub async fn parse_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+/// Parse czid-dedup / seqtoid-dedup clusters.csv into Arc<HashMap<String, ClusterInfo>>
+/// - Key: representative ID
+/// - ClusterInfo.size: number of members
+/// - ClusterInfo.members: vec of all IDs in cluster (rep first, then members)
+///
+/// Assumes CSV format: "representative read id,read id" with rep self-referencing.
+pub async fn parse_duplicate_clusters_csv(path: &PathBuf) -> Result<Arc<HashMap<String, ClusterInfo>>> {
+    let file = TokioFile::open(path).await
+        .with_context(|| format!("Failed to open clusters CSV: {}", path.display()))?;
 
-    let file = TokioFile::open(path).await?;
-    let mut reader = BufReader::new(file);
+    let mut reader = TokioBufReader::new(file);
     let mut line = String::new();
 
-    let mut map = HashMap::new();
+    let mut map: HashMap<String, ClusterInfo> = HashMap::new();
 
     // Skip header if present
-    reader.read_line(&mut line).await?;
+    let _ = reader.read_line(&mut line).await;
     line.clear();
 
     while reader.read_line(&mut line).await? > 0 {
@@ -1781,17 +1799,63 @@ pub async fn parse_cluster_sizes(path: &PathBuf) -> Result<HashMap<String, u64>>
             continue;
         }
 
-        let parts: Vec<&str> = trimmed.split('\t').collect();
-        if parts.len() >= 2 {
-            let rep_id = parts[0].trim().to_string();
-            if let Ok(size) = parts[1].trim().parse::<u64>() {
-                map.insert(rep_id, size);
-            }
+        let parts: Vec<&str> = trimmed.split(',').collect();
+        if parts.len() < 2 {
+            continue;
         }
+
+        let rep = parts[0].trim().to_string();
+        let member = parts[1].trim().to_string();
+
+        let entry = map.entry(rep.clone()).or_insert_with(|| ClusterInfo {
+            size: 0,
+            members: Vec::new(),
+        });
+
+        if entry.members.is_empty() {
+            // First entry for this rep — add rep as first member
+            entry.members.push(rep.clone());
+            entry.size += 1;
+        }
+
+        // Add member (skip if it's the rep self-reference)
+        if member != rep {
+            entry.members.push(member);
+            entry.size += 1;
+        }
+
         line.clear();
     }
 
-    Ok(map)
+    Ok(Arc::new(map))
+}
+
+pub fn cluster_csv_to_stream(
+    csv_path: PathBuf,
+    buffer_size: usize,
+) -> (ReceiverStream<ParseOutput>, JoinHandle<Result<()>>) {
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let handle = tokio::spawn(async move {
+        let file = TokioFile::open(&csv_path)
+            .await
+            .with_context(|| format!("Failed to open clusters.csv: {}", csv_path.display()))?;
+
+        let mut reader = TokioBufReader::new(file);
+        let mut line = String::new();
+
+        while reader.read_line(&mut line).await? > 0 {
+            let bytes = line.as_bytes().to_vec();
+            if tx.send(ParseOutput::Bytes(bytes.into())).await.is_err() {
+                return Err(anyhow!("cluster_stream receiver dropped"));
+            }
+            line.clear();
+        }
+
+        Ok(())
+    });
+
+    (ReceiverStream::new(rx), handle)
 }
 
 #[cfg(test)]

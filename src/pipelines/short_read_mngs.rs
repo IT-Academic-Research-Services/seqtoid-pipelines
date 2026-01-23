@@ -72,7 +72,8 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file,
                           SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
-                          filter_fastq_to_bytes_stream};
+                          filter_fastq_to_bytes_stream, fastq_to_fasta, subsample_weighted_stream,
+                            parse_duplicate_clusters_csv, cluster_csv_to_stream};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
@@ -1991,15 +1992,14 @@ pub async fn dedup_with_seqtoid_dedup(
     prefix_len: Option<usize>,
     out_dir: PathBuf,
 ) -> Result<(
-    ReceiverStream<ParseOutput>,                  // deduped FASTQ stream
-    mpsc::Receiver<u64>,                          // unique count
-    mpsc::Receiver<()>,                           // cluster placeholder
-    PathBuf,                                      // clusters.csv
-    Vec<JoinHandle<Result<(), anyhow::Error>>>,   // cleanup tasks
-    Vec<mpsc::Receiver<Result<(), anyhow::Error>>>,
+    ReceiverStream<ParseOutput>,                        // deduped FASTQ stream
+    mpsc::Receiver<u64>,                                // unique count
+    oneshot::Receiver<anyhow::Result<(), anyhow::Error>>, // cluster placeholder
+    PathBuf,                                            // clusters.csv
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,         // cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup receivers
 )> {
-
-    // 1. choose a temp dir
+    // 1. Choose temp dir
     let estimated_bytes = (config.input_size_mb as u64) * 1_000_000 * 2;
     let temp_dir = choose_temp_dir(
         estimated_bytes,
@@ -2012,7 +2012,7 @@ pub async fn dedup_with_seqtoid_dedup(
 
     let input_fastq = temp_dir.join("dedup_input.fastq");
 
-    // 2. stream to temp FASTQ
+    // 2. Stream input to temp FASTQ
     let input_fastq_clone = input_fastq.clone();
     let write_handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
         let file = TokioFile::create(&input_fastq_clone).await?;
@@ -2024,9 +2024,10 @@ pub async fn dedup_with_seqtoid_dedup(
         writer.flush().await?;
         Ok(())
     });
+
     write_handle.await??;
 
-    //3. run seqtoid-dedup
+    // 3. Prepare output paths
     let dedup_r1 = out_dir.join("dedup1.fastq");
     let dedup_r2 = if paired { Some(out_dir.join("dedup2.fastq")) } else { None };
     let clusters_csv = out_dir.join("clusters.csv");
@@ -2034,6 +2035,7 @@ pub async fn dedup_with_seqtoid_dedup(
 
     let prefix = prefix_len.unwrap_or(70) as u32;
 
+    // 4. Build config and args
     let dedup_config = SeqtoidDedupConfig {
         input_paths: if paired {
             vec![input_fastq.clone(), input_fastq.clone()]
@@ -2055,6 +2057,7 @@ pub async fn dedup_with_seqtoid_dedup(
 
     info!("seqtoid-dedup args: {:?}", args);
 
+    // 5. Run seqtoid-dedup
     let status = Command::new("seqtoid-dedup")
         .args(&args)
         .status()
@@ -2065,7 +2068,7 @@ pub async fn dedup_with_seqtoid_dedup(
         return Err(anyhow!("seqtoid-dedup failed with code {:?}", status.code()));
     }
 
-    // 4. get out stream
+    // 6. Read deduplicated FASTQ back into stream
     let (dedup_stream, stats_handle) = read_fastq(
         dedup_r1.clone(),
         dedup_r2.clone(),
@@ -2077,7 +2080,7 @@ pub async fn dedup_with_seqtoid_dedup(
     )
         .context("Failed to open deduplicated FASTQ")?;
 
-    // 5. count
+    // 7. Unique count channel
     let (count_tx, count_rx) = mpsc::channel(1);
     let count_handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
         let stats = stats_handle.await??;
@@ -2085,11 +2088,11 @@ pub async fn dedup_with_seqtoid_dedup(
         Ok(())
     });
 
-    // 8. Cluster placeholder
-    let (cluster_tx, cluster_rx) = mpsc::channel(1);
-    let _ = cluster_tx.send(()).await;
+    // 8. Cluster placeholder - use oneshot
+    let (cluster_tx, cluster_rx) = oneshot::channel::<Result<()>>();
+    let _ = cluster_tx.send(Ok(()));  // dummy success
 
-    // 9. Cleanup
+    // 9. Cleanup tasks
     let cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = vec![
         tokio::spawn(async move {
             let _ = fs::remove_file(&input_fastq).await;
@@ -2098,15 +2101,16 @@ pub async fn dedup_with_seqtoid_dedup(
         count_handle,
     ];
 
+    // Cleanup receivers - empty, because cluster_rx is returned separately
     let cleanup_receivers = vec![];
 
     Ok((
         ReceiverStream::new(dedup_stream),
         count_rx,
-        cluster_rx,
+        cluster_rx,               // ← returned here
         clusters_csv,
         cleanup_tasks,
-        cleanup_receivers,
+        cleanup_receivers,        // ← empty
     ))
 }
 
@@ -5262,51 +5266,53 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
-        config.clone(),
-        post_filter_stream.into_inner(),
-        paired,
-        seed,
-        config.args.max_subsample as u64,
-        Some(75), // Prefix length for deduplication. Hardcoded fior now
-        out_dir.clone(),
-    ).await?;
+    // let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    //     config.clone(),
+    //     post_filter_stream.into_inner(),
+    //     paired,
+    //     seed,
+    //     config.args.max_subsample as u64,
+    //     Some(75), // Prefix length for deduplication. Hardcoded fior now
+    //     out_dir.clone(),
+    // ).await?;
+    // cleanup_tasks.extend(dedup_cleanup_tasks);
+    // cleanup_receivers.extend(dedup_cleanup_receivers);
+
+    let (dedup_stream, mut dedup_count_rx, _dummy_cluster_rx, duplicate_clusters_csv, dedup_cleanup_tasks, dedup_cleanup_receivers) =
+        dedup_with_seqtoid_dedup(
+            config.clone(),
+            post_filter_stream.into_inner(),
+            paired,
+            seed,
+            config.args.max_subsample as u64,
+            Some(70),
+            out_dir.clone(),
+        )
+            .await?;
+
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
-    // let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters_csv, dedup_cleanup_tasks, dedup_cleanup_receivers) =
-    //     dedup_with_seqtoid_dedup(
-    //         config.clone(),
-    //         post_filter_stream.into_inner(),
-    //         paired,
-    //         seed,
-    //         config.args.max_subsample as u64,
-    //         Some(70),
-    //         out_dir.clone(),
-    //     )
-    //         .await?;
-    // cleanup_tasks.extend(dedup_cleanup_tasks);
-    // cleanup_receivers.extend(dedup_cleanup_receivers);
-    //
-    // let (fasta_tx, fasta_rx) = mpsc::channel(8192);
-    // let convert_handle = tokio::spawn(async move {
-    //     let mut stream = dedup_stream;
-    //     while let Some(record) = stream.next().await {
-    //         let fasta_rec = match record {
-    //             ParseOutput::Fastq(fq) => ParseOutput::Fasta(SequenceRecord::Fasta {
-    //                 id: fq.id,
-    //                 desc: fq.desc,
-    //                 seq: fq.seq,
-    //             }),
-    //             ParseOutput::Fasta(fa) => ParseOutput::Fasta(fa),
-    //             ParseOutput::Bytes(_) => continue,
-    //         };
-    //         if fasta_tx.send(fasta_rec).await.is_err() {
-    //             break;
-    //         }
-    //     }
-    //     Ok(())
-    // });
+    let duplicate_clusters: Arc<HashMap<String, ClusterInfo>> = parse_duplicate_clusters_csv(&duplicate_clusters_csv)
+        .await
+        .context("Failed to parse clusters.csv into ClusterInfo map")?;
+
+    let (fasta_stream, convert_handle) = fastq_to_fasta(dedup_stream).await;
+    cleanup_tasks.push(convert_handle);
+
+    let (cluster_stream, cluster_parse_handle) = cluster_csv_to_stream(duplicate_clusters_csv.clone(), config.base_buffer_size);
+    cleanup_tasks.push(cluster_parse_handle);
+
+    let (subsampled_stream, subsample_handle) =
+        subsample_weighted_stream(
+            fasta_stream,
+            &duplicate_clusters,
+            config.args.max_subsample as u64,
+            seed,
+        )
+            .await?;
+
+
 
 
     // *******************
@@ -5331,7 +5337,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
-        dedup_stream,
+        subsampled_stream,
         6,
         config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
         config.args.stall_threshold,
@@ -6452,9 +6458,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
 
     let dedup_count = dedup_count_rx
+        .recv()
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
+        .ok_or_else(|| PipelineError::Other(anyhow!("dedup count channel closed without value")))?;
+
     info!("Dedup: unique reads/pairs: {}", dedup_count);
+
+    let subsample_count = subsample_handle.await??;
+    info!("Subsampled count: {}", subsample_count);
 
     // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
     // Cannot asusme ERCC's spiked in.
