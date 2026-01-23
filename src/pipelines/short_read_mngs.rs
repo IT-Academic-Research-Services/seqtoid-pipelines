@@ -5300,10 +5300,38 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // cleanup_tasks.extend(dedup_cleanup_tasks);
     // cleanup_receivers.extend(dedup_cleanup_receivers);
 
+
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        post_filter_stream,
+        2,
+        config.base_buffer_size * 4,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "non_host_output".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(non_host_done_rx);
+
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let mut debug_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let passthrough_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    ; // or fork if not cloneable
+    while let Some(item) = debug_stream.next().await {
+        if !matches!(item, ParseOutput::Fastq(_)) {
+            error!("Bad item in post_filter_stream: {:?}", item);
+            break;
+        }
+    }
+
     let (dedup_stream, mut dedup_count_rx, _dummy_cluster_rx, duplicate_clusters_csv, dedup_cleanup_tasks, dedup_cleanup_receivers) =
         dedup_with_seqtoid_dedup(
             config.clone(),
-            post_filter_stream.into_inner(),
+            passthrough_stream,
             paired,
             seed,
             config.args.max_subsample as u64,
