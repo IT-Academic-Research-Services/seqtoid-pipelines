@@ -5319,9 +5319,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut non_host_streams_iter = non_host_streams.into_iter();
     let mut debug_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let passthrough_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mut debug_receiverstream = ReceiverStream::new(debug_stream);
 
-    ; // or fork if not cloneable
-    while let Some(item) = debug_stream.next().await {
+
+    while let Some(item) = debug_receiverstream.next().await {
         if !matches!(item, ParseOutput::Fastq(_)) {
             error!("Bad item in post_filter_stream: {:?}", item);
             break;
