@@ -1999,7 +1999,7 @@ pub async fn dedup_with_seqtoid_dedup(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,         // cleanup tasks
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup receivers
 )> {
-    // tempo dir
+    // 1. Choose temp dir for R1/R2 files
     let estimated_bytes = (config.input_size_mb as u64) * 1_000_000 * 2;
     let temp_dir = choose_temp_dir(
         estimated_bytes,
@@ -2010,12 +2010,12 @@ pub async fn dedup_with_seqtoid_dedup(
         .await
         .context("Failed to choose temp dir for dedup")?;
 
-    // Deinterleave
+    // 2. Deinterleave directly from the incoming stream (no disk write yet)
     let input_stream = ReceiverStream::new(input_stream_rx);
     let (r1_stream, r2_stream_opt, deinterleave_handle) = deinterleave_fastq_stream(
         input_stream,
         paired,
-        config.base_buffer_size * 4,
+        config.base_buffer_size * 4,  // generous buffer for deinterleaving
     )
         .await
         .context("Failed to deinterleave input stream")?;
@@ -2024,12 +2024,13 @@ pub async fn dedup_with_seqtoid_dedup(
     let dedup_input_r1 = temp_dir.join("dedup_input_r1.fastq");
     let dedup_input_r2 = if paired { Some(temp_dir.join("dedup_input_r2.fastq")) } else { None };
 
+    // 4. Write R1 stream to disk
     let r1_write_handle = tokio::spawn(stream_to_file(
         r1_stream,
         dedup_input_r1.clone(),
-
     ));
 
+    // 5. Write R2 stream to disk if paired
     let r2_write_handle = if paired {
         Some(tokio::spawn(stream_to_file(
             r2_stream_opt.unwrap(),
@@ -2039,12 +2040,14 @@ pub async fn dedup_with_seqtoid_dedup(
         None
     };
 
+    // 6. Await writes and deinterleave completion
     r1_write_handle.await??;
     if let Some(handle) = r2_write_handle {
         handle.await??;
     }
     deinterleave_handle.await??;
 
+    // 7. Prepare output paths
     let dedup_r1 = out_dir.join("dedup1.fastq");
     let dedup_r2 = if paired { Some(out_dir.join("dedup2.fastq")) } else { None };
     let clusters_csv = out_dir.join("clusters.csv");
@@ -2052,7 +2055,7 @@ pub async fn dedup_with_seqtoid_dedup(
 
     let prefix = prefix_len.unwrap_or(70) as u32;
 
-    // seqtoid-dedup
+    // 8. Build config with two distinct files
     let dedup_config = SeqtoidDedupConfig {
         input_paths: if paired {
             vec![dedup_input_r1.clone(), dedup_input_r2.clone().unwrap()]
@@ -2074,6 +2077,7 @@ pub async fn dedup_with_seqtoid_dedup(
 
     info!("seqtoid-dedup args: {:?}", args);
 
+    // 9. Run seqtoid-dedup
     let status = Command::new("seqtoid-dedup")
         .args(&args)
         .status()
@@ -2084,7 +2088,7 @@ pub async fn dedup_with_seqtoid_dedup(
         return Err(anyhow!("seqtoid-dedup failed with code {:?}", status.code()));
     }
 
-    // Read deduplicated FASTQ back into stream (interleaved output)
+    // 10. Read deduplicated FASTQ back into stream (interleaved output)
     let (dedup_stream, stats_handle) = read_fastq(
         dedup_r1.clone(),
         dedup_r2.clone(),
@@ -2096,7 +2100,7 @@ pub async fn dedup_with_seqtoid_dedup(
     )
         .context("Failed to open deduplicated FASTQ")?;
 
-    // coiunt
+    // 11. Unique count channel
     let (count_tx, count_rx) = mpsc::channel(1);
     let count_handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
         let stats = stats_handle.await??;
@@ -2104,11 +2108,11 @@ pub async fn dedup_with_seqtoid_dedup(
         Ok(())
     });
 
-    // Cluster placeholder - use oneshot
+    // 12. Cluster placeholder - use oneshot
     let (cluster_tx, cluster_rx) = oneshot::channel::<Result<()>>();
-    let _ = cluster_tx.send(Ok(()));
+    let _ = cluster_tx.send(Ok(()));  // dummy success
 
-    // cleanup
+    // 13. Cleanup tasks (remove temp R1/R2 files)
     let cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = vec![
         tokio::spawn(async move {
             let _ = fs::remove_file(&dedup_input_r1).await;
