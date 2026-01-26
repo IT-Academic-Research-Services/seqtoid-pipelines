@@ -5288,51 +5288,54 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    // let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
-    //     config.clone(),
-    //     post_filter_stream.into_inner(),
-    //     paired,
-    //     seed,
-    //     config.args.max_subsample as u64,
-    //     Some(75), // Prefix length for deduplication. Hardcoded fior now
-    //     out_dir.clone(),
-    // ).await?;
-    // cleanup_tasks.extend(dedup_cleanup_tasks);
-    // cleanup_receivers.extend(dedup_cleanup_receivers);
 
 
-    let (non_host_streams, non_host_done_rx) = t_junction(
-        post_filter_stream,
-        2,
-        config.base_buffer_size * 4,
-        config.args.stall_threshold,
-        None,
-        100,
-        StreamDataType::IlluminaFastq,
-        "non_host_output".to_string(),
-        None,
+    // Branch 1 : Mimic CZID, call seqtoid_dedup (nee czid_dedup) using temp files
+
+    let estimated_bytes = (config.input_size_mb as u64) * 1_000_000 * 2;
+    let temp_dir = choose_temp_dir(
+        estimated_bytes,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
     )
         .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(non_host_done_rx);
+        .context("Failed to choose temp dir for dedup")?;
 
-    let mut non_host_streams_iter = non_host_streams.into_iter();
-    let mut debug_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let passthrough_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let mut debug_receiverstream = ReceiverStream::new(debug_stream);
+    let bytes_to_fastq_temp = NamedTempFile::with_suffix_in(".fq", &temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let bytes_to_fastq_temp_path = bytes_to_fastq_temp.path().to_owned();
+    let bytes_to_fastq_temp_path_for_write = bytes_to_fastq_temp_path.clone();
 
-
-    while let Some(item) = debug_receiverstream.next().await {
-        if !matches!(item, ParseOutput::Fastq(_)) {
-            error!("Bad item in post_filter_stream: {:?}", item);
-            break;
+    let write_handle: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let file = TokioFile::create(&bytes_to_fastq_temp_path_for_write).await?;
+        let mut writer = BufWriter::new(file);
+        let mut stream = ReceiverStream::new(post_filter_stream.into_inner());
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Bytes(bytes) = item {
+                writer.write_all(&bytes).await?;
+            }
         }
-    }
+        writer.flush().await?;
+        Ok(())
+    });
+
+    write_handle.await??;
+
+
+    let parsed_file = TokioFile::open(bytes_to_fastq_temp_path.clone())
+        .await
+        .context("Failed to open temp FASTQ for parsing")?;
+
+    let post_filter_parsed_rx = parse_fastq(parsed_file, config.base_buffer_size).await
+        .context("Failed to parse host-filtered FASTQ to structured records")?;
+    temp_files.push(bytes_to_fastq_temp);
+
 
     let (dedup_stream, mut dedup_count_rx, _dummy_cluster_rx, duplicate_clusters_csv, dedup_cleanup_tasks, dedup_cleanup_receivers) =
         dedup_with_seqtoid_dedup(
             config.clone(),
-            passthrough_stream,
+            post_filter_parsed_rx,  // ← raw mpsc::Receiver<ParseOutput>
             paired,
             seed,
             config.args.max_subsample as u64,
@@ -5344,12 +5347,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(dedup_cleanup_tasks);
     cleanup_receivers.extend(dedup_cleanup_receivers);
 
+    let (fasta_stream, convert_handle) = fastq_to_fasta(dedup_stream).await;
+    cleanup_tasks.push(convert_handle);
+
+
     let duplicate_clusters: Arc<HashMap<String, ClusterInfo>> = parse_duplicate_clusters_csv(&duplicate_clusters_csv)
         .await
         .context("Failed to parse clusters.csv into ClusterInfo map")?;
-
-    let (fasta_stream, convert_handle) = fastq_to_fasta(dedup_stream).await;
-    cleanup_tasks.push(convert_handle);
 
     let (cluster_stream, cluster_parse_handle) = cluster_csv_to_stream(duplicate_clusters_csv.clone(), config.base_buffer_size);
     cleanup_tasks.push(cluster_parse_handle);
@@ -5365,6 +5369,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
+    // Branch 2. use new dedup_and_subsample
+
+    // let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    //     config.clone(),
+    //     post_filter_stream.into_inner(),
+    //     paired,
+    //     seed,
+    //     config.args.max_subsample as u64,
+    //     Some(75), // Prefix length for deduplication. Hardcoded fior now
+    //     out_dir.clone(),
+    // ).await?;
+    // cleanup_tasks.extend(dedup_cleanup_tasks);
+    // cleanup_receivers.extend(dedup_cleanup_receivers);
 
     // *******************
     // Non host Alignment
