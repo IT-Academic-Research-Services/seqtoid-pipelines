@@ -85,6 +85,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             ChannelReader, ChildStream, ParseMode,
                             ParseOutput, ToBytes};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
+use crate::utils::system::detect_ram;
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
                              get_top_m8_nt, load_taxid_lineages_db, validate_taxid_lineage};
 
@@ -3112,151 +3113,148 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
 /// # Returns
 async fn spades_assembly(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    out_dir: PathBuf,
+    subsampled_stream: impl Stream<Item = ParseOutput> + Send + 'static + Unpin,
     paired: bool,
-    sample_base_buf: PathBuf,
-    estimated_input_size_bytes: u64,
-) -> Result<(
-    AssemblyHandle,
-    Vec<JoinHandle<Result<()>>>,
-    Vec<oneshot::Receiver<Result<()>>>,
-), PipelineError> {
+    sample_base: &str,
+    out_dir: PathBuf,
+) -> Result<(oneshot::Receiver<Result<()>>, Option<JoinHandle<Result<()>>>, Vec<JoinHandle<Result<()>>>,
+             Vec<oneshot::Receiver<Result<()>>>,), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let spades_out_dir = out_dir.join("assembly");
-    fs::create_dir_all(&spades_out_dir).await?;
+    let assembly_dir = out_dir.join("assembly");
+    fs::create_dir_all(&assembly_dir).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
 
-    let ram_safe_threshold = 64 * 1024 * 1024 * 1024u64; // 64 GB
-    let spades_work_dir = if estimated_input_size_bytes <= ram_safe_threshold {
-        config.ram_temp_dir.join("spades")
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        subsampled_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "spades_assembly".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(non_host_done_rx);
+
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let count_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (_total_ram, available_ram) = detect_ram()
+        .map_err(|e| PipelineError::Other(anyhow!("detect_ram failed: {}", e)))?;
+    let avail_ram_gb = available_ram / (1024 * 1024 * 1024);
+    let capped_threads = std::cmp::min(64, config.args.threads);  // Avoid libgomp fails high core systems
+
+    // Pre-SPAdes validation: Count records (pairs if paired)
+    // Skip if <500 to avoid aborts on small data (e.g., viral amplicon); write dummies.
+    let pre_count = stream_record_counter(count_stream, false).await?;
+    info!("Pre-SPAdes non-host subsampled count: {}", pre_count);
+
+    if pre_count < 500 {
+        warn!("Skipping SPAdes: too few reads ({})", pre_count);
+        let contigs_path     = assembly_dir.join("contigs.fasta");
+        let contigs_all_path = assembly_dir.join("contigs_all.fasta");
+        let scaffolds_path   = assembly_dir.join("scaffolds.fasta");
+        let sam_path         = assembly_dir.join("read-contig.sam");
+
+        let failed_marker = b";ASSEMBLY SKIPPED: TOO FEW READS\n";
+        let dummy_task = tokio::spawn(async move {
+            tokio::fs::write(&contigs_path, failed_marker).await?;
+            tokio::fs::write(&contigs_all_path, failed_marker).await?;
+            tokio::fs::write(&scaffolds_path, failed_marker).await?;
+            tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
+            Ok(())
+        });
+
+        let (skip_tx, skip_rx) = oneshot::channel();
+        let _ = skip_tx.send(Ok(()));
+        return Ok((skip_rx, Some(dummy_task), cleanup_tasks, cleanup_receivers));
+    }
+
+    let (r1_fifo, r2_fifo_opt, deint_handle, r1_write, r2_write_opt) =
+        deinterleave_fastq_stream_to_fifos(
+            config.clone(),
+            ReceiverStream::new(assembly_stream),
+            sample_base,
+            paired,
+        ).await?;
+
+    let input_file_path = if paired {
+        format!("-1 {} -2 {}", r1_fifo.display(), r2_fifo_opt.as_ref().unwrap().display())
     } else {
-        warn!(
-            "Estimated input {} bytes ({:.1} GB) > RAM threshold ({:.1} GB) — using disk temp",
-            estimated_input_size_bytes,
-            estimated_input_size_bytes as f64 / 1_073_741_824.0,
-            ram_safe_threshold as f64 / 1_073_741_824.0
-        );
-        std::env::temp_dir().join("spades")
+        format!("-s {}", r1_fifo.display())
     };
-    fs::create_dir_all(&spades_work_dir).await?;
-
-    let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
-
-    let write_input_task = tokio::spawn({
-        let input_file_path = input_file_path.clone();
-
-        async move {
-            let file = TokioFile::create(&input_file_path).await
-                .map_err(|e| anyhow!("Cannot create SPAdes input file {}: {}", input_file_path.display(), e))?;
-            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
-
-            let mut stream = input_stream;
-            let mut total_bytes = 0u64;
-
-            while let Some(item) = stream.next().await {
-                let bytes = item.to_bytes()
-                    .map_err(|e| anyhow!("Failed to convert ParseOutput to FASTQ bytes: {}", e))?;
-
-                writer.write_all(&bytes).await
-                    .map_err(|e| anyhow!("Write error to {}: {}", input_file_path.display(), e))?;
-
-                total_bytes += bytes.len() as u64;
-            }
-
-            writer.flush().await
-                .map_err(|e| anyhow!("Flush error to {}: {}", input_file_path.display(), e))?;
-
-            info!(
-                "SPAdes input written: {} ({} bytes)",
-                input_file_path.display(),
-                total_bytes
-            );
-
-            if total_bytes == 0 {
-                warn!("SPAdes input file is empty – no non-host reads");
-            }
-            Ok::<u64, anyhow::Error>(total_bytes)
-        }
-    });
-
-    let total_input_bytes = write_input_task.await??;
 
     let spades_config = SpadesConfig {
-        input_path: input_file_path.clone(),
-        outdir_path: spades_out_dir.clone(),
-        paired: paired,
+        input_path: input_file_path.clone().into(),  // String to PathBuf
+        outdir_path: assembly_dir.clone(),
+        paired,
         option_fields: HashMap::from([
             ("--only-assembler".to_string(), None),
-            ("--isolate".to_string(), None),
+            ("-m".to_string(), Some(avail_ram_gb.to_string())),   // fresh value
+            ("-t".to_string(), Some(capped_threads.to_string())),
         ]),
     };
+
     let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SPADES_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::ToolExecution { tool: SPADES_TAG.to_string(), error: e.to_string() })?;
 
-    let (mut spades_child, spades_err_task) = spawn_cmd(
-        config.clone(),
-        SPADES_TAG,
-        spades_args,
-        true,  // Force verbose to true for debugging
-    ).await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SPADES_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(spades_err_task);
+    let (mut spades_child, err_task) = spawn_cmd(config.clone(),
+                                                 SPADES_TAG, spades_args, true).await?;
+    cleanup_tasks.push(err_task);
 
-    let spades_out_dir_clone = spades_out_dir.clone();
-    let spades_log_path = out_dir.clone().join("spades_stderr.log");
+    let spades_out_dir_clone = assembly_dir.clone();
+    let spades_log_path = spades_out_dir_clone.join("spades_stderr.log");
+    let stdout_log_path = spades_out_dir_clone.join("spades_stdout.log");
+    let internal_log_path = spades_out_dir_clone.join("spades.log");  // SPAdes auto-writes
 
-    let spades_task = tokio::spawn(async move {
+    let spades_exit_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
 
-        // Always write full stderr to log file
-        let stderr_bytes = output.stderr.clone();  // Clone to avoid move issues
-        tokio::fs::write(&spades_log_path, &stderr_bytes).await
-            .map_err(|e| anyhow!("Failed to write SPAdes stderr log: {}", e))?;
+        tokio::fs::write(&spades_log_path, &output.stderr).await?;
         info!("SPAdes stderr written to {:?}", spades_log_path);
+        tokio::fs::write(&stdout_log_path, &output.stdout).await?;
+        info!("SPAdes stdout written to {:?}", stdout_log_path);
 
-        // Log excerpts or full if verbose
-        let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
-        if config.args.verbose {
-            eprintln!("SPAdes full stderr:\n{}", stderr_str);
-        } else {
-            // Log first/last few lines for summary
-            let lines: Vec<&str> = stderr_str.lines().collect();
-            let summary = if lines.len() > 10 {
-                format!(
-                    "SPAdes stderr summary (first 5 + last 5 lines):\n{}\n...\n{}",
-                    lines[0..5].join("\n"),
-                    lines[lines.len()-5..].join("\n")
-                )
+        if let Ok(log_contents) = tokio::fs::read(&internal_log_path).await {
+            let copied_log_path = spades_out_dir_clone.join("spades_copied.log");
+            tokio::fs::write(&copied_log_path, &log_contents).await?;
+            let log_str = String::from_utf8_lossy(&log_contents).to_string();
+            if config.args.verbose {
+                eprintln!("SPAdes internal log:\n{}", log_str);
             } else {
-                stderr_str.clone()
-            };
-            info!("SPAdes stderr summary:\n{}", summary);
+                let lines: Vec<&str> = log_str.lines().collect();
+                let summary = if lines.len() > 20 {
+                    format!("SPAdes log summary (first 10 + last 10):\n{}\n...\n{}",
+                            lines[0..10].join("\n"), lines[lines.len()-10..].join("\n"))
+                } else { log_str.clone() };
+                info!("SPAdes log summary:\n{}", summary);
+            }
+        } else {
+            warn!("No spades.log found—possible early abort");
         }
 
         eprintln!("SPAdes exit: {:?}", output.status);
 
         if !output.status.success() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
             eprintln!("SPAdes FAILED:\n{}", stderr_str);
 
-            let contigs_path     = spades_out_dir_clone.join("contigs.fasta");
+            let contigs_path = spades_out_dir_clone.join("contigs.fasta");
             let contigs_all_path = spades_out_dir_clone.join("contigs_all.fasta");
-            let scaffolds_path   = spades_out_dir_clone.join("scaffolds.fasta");
+            let scaffolds_path = spades_out_dir_clone.join("scaffolds.fasta");
+            let sam_path = spades_out_dir_clone.join("read-contig.sam");
 
             let failed_marker = b";ASSEMBLY FAILED\n";
-
             tokio::fs::write(&contigs_path, failed_marker).await?;
             tokio::fs::write(&contigs_all_path, failed_marker).await?;
             tokio::fs::write(&scaffolds_path, failed_marker).await?;
-
-            let sam_path = spades_out_dir_clone.join("read-contig.sam");
             tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
 
             return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr_str));
@@ -3266,12 +3264,11 @@ async fn spades_assembly(
         Ok(())
     });
 
-    Ok((AssemblyHandle {
-        spades_task,
-        work_dir: spades_work_dir,
-        out_dir: spades_out_dir}, cleanup_tasks, cleanup_receivers))
-}
+    let (spades_exit_tx, spades_exit_rx) = oneshot::channel();
+    spades_exit_tx.send(Ok(())).map_err(|_| PipelineError::Other(anyhow!("SPAdes exit sender failed")))?;
 
+    Ok((spades_exit_rx, Some(spades_exit_task), cleanup_tasks, cleanup_receivers))
+}
 
 pub async fn process_assembly(
     config: Arc<RunConfig>,
@@ -5221,13 +5218,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // This is part of post-process starting here for concurrency
 
-    let (assembly_handle, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
+    let (spades_exit_rx, spades_exit_task, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
         config.clone(),
         ReceiverStream::new(non_host_assembly_stream),
-        out_dir.clone(),
         paired,
-        sample_base_buf.clone(),
-        total_input_size
+        &sample_base,
+        out_dir.clone(),
     ).await?;
 
     cleanup_tasks.append(&mut assembly_cleanup_tasks);
@@ -5511,10 +5507,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Assembly stats
 
-    let assembly_out_dir = &assembly_handle.out_dir;
-    let assembly_work_dir =  &assembly_handle.work_dir;
+    if let Some(task) = spades_exit_task {
+        task.await??;
+    }
+    spades_exit_rx.await??;
 
-    assembly_handle.spades_task.await??;
+    let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
+    let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
 
     let contigs_path = assembly_out_dir.join("contigs.fasta");
     let scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
@@ -5526,16 +5525,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     if assembly_failed {
         warn!("SPAdes assembly failed or produced no usable contigs/scaffolds (contigs: {} bytes, scaffolds: {} bytes)",
-      contigs_size, scaffolds_size);
+          contigs_size, scaffolds_size);
 
         let mut failure_info = json!({
-    "assembly_failed": true,
-    "reason": "No contigs or scaffolds >= 25 bp produced",
-    "contigs_size_bytes": contigs_size,
-    "scaffolds_size_bytes": scaffolds_size,
-    "spades_log_excerpt": [],
-    "warnings_log_excerpt": []
-});
+        "assembly_failed": true,
+        "reason": "No contigs or scaffolds >= 25 bp produced",
+        "contigs_size_bytes": contigs_size,
+        "scaffolds_size_bytes": scaffolds_size,
+        "spades_log_excerpt": [],
+        "warnings_log_excerpt": []
+    });
 
         async fn tail_log(path: PathBuf, max_lines: usize) -> Vec<String> {
             if let Ok(file) = TokioFile::open(&path).await {
@@ -5558,7 +5557,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
 
         // Check spades.log for errors
-        let spades_log = assembly_out_dir.join("spades/spades.log");
+        let spades_log = assembly_work_dir.join("spades.log");
         let spades_lines = tail_log(spades_log, 50).await;
         let has_error = spades_lines.iter().any(|l| l.contains("ERROR") || l.contains("Exception") || l.contains("CRITICAL"));
 
@@ -5568,7 +5567,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         failure_info["spades_log_excerpt"] = json!(spades_lines);
 
         // warnings.log
-        let warnings_log = assembly_out_dir.join("spades/warnings.log");
+        let warnings_log = assembly_work_dir.join("warnings.log");
         let warnings_lines = tail_log(warnings_log, 30).await;
         failure_info["warnings_log_excerpt"] = json!(warnings_lines);
 
@@ -5584,7 +5583,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         warn!("Assembly failure details written to {:?}", failure_path);
     } else {
         info!("SPAdes assembly succeeded (contigs: {} bytes, scaffolds: {} bytes)",
-      contigs_size, scaffolds_size);
+          contigs_size, scaffolds_size);
     }
 
 
@@ -5592,8 +5591,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut post_assembly_cleanup_tasks,
         mut post_assembly_cleanup_receivers, mut post_assemly_temp_files) = process_assembly(
         config.clone(),
-        assembly_out_dir,
-        assembly_work_dir,
+        &assembly_out_dir,
+        &assembly_work_dir,
         ReceiverStream::new(non_host_coverage_bt2_stream),
         duplicate_clusters.clone(),
         paired,
