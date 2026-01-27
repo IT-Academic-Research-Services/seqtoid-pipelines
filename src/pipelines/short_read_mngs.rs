@@ -3187,7 +3187,6 @@ async fn spades_assembly(
         input_path: input_file_path.clone(),
         outdir_path: spades_out_dir.clone(),
         paired: paired,
-
         option_fields: HashMap::from([
             ("--only-assembler".to_string(), None),
             ("--isolate".to_string(), None),
@@ -3203,7 +3202,7 @@ async fn spades_assembly(
         config.clone(),
         SPADES_TAG,
         spades_args,
-        config.args.verbose,
+        true,  // Force verbose to true for debugging
     ).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: SPADES_TAG.to_string(),
@@ -3212,15 +3211,40 @@ async fn spades_assembly(
     cleanup_tasks.push(spades_err_task);
 
     let spades_out_dir_clone = spades_out_dir.clone();
+    let spades_log_path = spades_out_dir_clone.join("spades_stderr.log");
 
     let spades_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
 
+        // Always write full stderr to log file
+        let stderr_bytes = output.stderr.clone();  // Clone to avoid move issues
+        tokio::fs::write(&spades_log_path, &stderr_bytes).await
+            .map_err(|e| anyhow!("Failed to write SPAdes stderr log: {}", e))?;
+        info!("SPAdes stderr written to {:?}", spades_log_path);
+
+        // Log excerpts or full if verbose
+        let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
+        if config.args.verbose {
+            eprintln!("SPAdes full stderr:\n{}", stderr_str);
+        } else {
+            // Log first/last few lines for summary
+            let lines: Vec<&str> = stderr_str.lines().collect();
+            let summary = if lines.len() > 10 {
+                format!(
+                    "SPAdes stderr summary (first 5 + last 5 lines):\n{}\n...\n{}",
+                    lines[0..5].join("\n"),
+                    lines[lines.len()-5..].join("\n")
+                )
+            } else {
+                stderr_str.clone()
+            };
+            info!("SPAdes stderr summary:\n{}", summary);
+        }
+
         eprintln!("SPAdes exit: {:?}", output.status);
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            eprintln!("SPAdes FAILED:\n{}", stderr);
+            eprintln!("SPAdes FAILED:\n{}", stderr_str);
 
             let contigs_path     = spades_out_dir_clone.join("contigs.fasta");
             let contigs_all_path = spades_out_dir_clone.join("contigs_all.fasta");
@@ -3235,7 +3259,7 @@ async fn spades_assembly(
             let sam_path = spades_out_dir_clone.join("read-contig.sam");
             tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
 
-            return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr));
+            return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr_str));
         }
 
         info!("SPAdes completed successfully");
