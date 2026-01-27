@@ -3211,7 +3211,7 @@ async fn spades_assembly(
     cleanup_tasks.push(spades_err_task);
 
     let spades_out_dir_clone = spades_out_dir.clone();
-    let spades_log_path = "spades_stderr.log";
+    let spades_log_path = out_dir.clone().join("spades_stderr.log");
 
     let spades_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
