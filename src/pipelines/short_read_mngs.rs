@@ -1864,6 +1864,8 @@ async fn dedup_and_subsample(
         dedup_map.len()
     );
 
+    eprintln!("total count for input {}", total_count);
+
     if total_count == 0 {
         info!("No reads in dedup input — returning empty outputs");
         let (empty_tx, empty_rx) = mpsc::channel(1);
@@ -1958,6 +1960,7 @@ async fn dedup_and_subsample(
     cleanup_tasks.push(tsv_write_task);
 
     let unique_count = sampled.len() as u64;
+    eprintln!("unique count = {}", unique_count);
     let (count_tx, count_rx) = oneshot::channel();
     count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Failed to send subsample count")))?;
 
