@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, ErrorKind};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::collections::hash_map::DefaultHasher;
 
 use ahash::AHashMap;
 use anyhow::{anyhow, Context, Result};
@@ -1984,6 +1985,209 @@ async fn dedup_and_subsample(
         cleanup_tasks,
         cleanup_receivers,
     ))
+}
+
+
+async fn dedup(
+    config: Arc<RunConfig>,
+    input_stream: mpsc::Receiver<ParseOutput>,
+    paired: bool,
+    prefix_len: Option<usize>,
+    out_dir: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,  // uniques stream
+    oneshot::Receiver<u64>,      // unique count rx
+    ReceiverStream<ParseOutput>,  // duplice cluster stream
+    Arc<HashMap<String, ClusterInfo>>,  // duplicate_clusters
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,  // cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup rx
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
+    let mut total_count = 0u64;
+
+    let mut stream = ReceiverStream::new(input_stream);
+    let mut orphan_r1: Option<SequenceRecord> = None;
+    let mut r1_count: u64 = 0;
+    let mut r2_count: u64 = 0;
+
+    while let Some(item) = stream.next().await {
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            _ => continue,  // Skip non-Fastq (warn if needed)
+        };
+
+        if paired {
+            if let Some(r1) = orphan_r1.take() {
+                r1_count += 1;
+                r2_count += 1;
+
+                let mut seq_bytes = r1.seq().to_vec();
+                seq_bytes.extend_from_slice(record.seq());  // Concat without 'N', like czid-dedup
+
+                let mut hasher = DefaultHasher::new();  // sipHash
+                let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
+                hasher.write(&seq_bytes[0..write_len]);
+                let hash_key = hasher.finish();
+
+                let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
+                entry.0 += 1;
+                entry.1.push(r1.clone());
+                entry.1.push(record.clone());
+
+                total_count += 1;
+            } else {
+                orphan_r1 = Some(record);
+            }
+        } else {
+            let seq_bytes = record.seq().to_vec();
+
+            let mut hasher = DefaultHasher::new();
+            let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
+            hasher.write(&seq_bytes[0..write_len]);
+            let hash_key = hasher.finish();
+
+            let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
+            entry.0 += 1;
+            entry.1.push(record.clone());
+
+            total_count += 1;
+        }
+    }
+
+    // Align orphan/imbalance: Error on >1 diff (no skip, like czid-dedup TryFrom)
+    if orphan_r1.is_some() || (r1_count as i64 - r2_count as i64).abs() > 1 {
+        return Err(PipelineError::InvalidFastqFormat(format!(
+            "Paired imbalance: R1={}, R2={}, orphan={}",
+            r1_count, r2_count, orphan_r1.is_some() as u8
+        )));
+    }
+
+    info!("Dedup complete: {} valid pairs, {} unique hashes", total_count, dedup_map.len());
+
+    let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
+    for (&_hash, &(size, ref records)) in &dedup_map {
+        if records.is_empty() { continue; }
+        let rep_id = records[0].id().to_string();
+        let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
+        duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
+    }
+
+    // writeduplicate_cluster_sizes
+    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
+    let duplicate_clusters_for_tsv = duplicate_clusters.clone();
+    let tsv_task = tokio::spawn(async move {
+        let mut file = BufWriter::new(TokioFile::create(&tsv_path).await?);
+        for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
+            file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes()).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    });
+    cleanup_tasks.push(tsv_task);
+
+    // Uniques stream: First rep per cluster
+
+    let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size);
+    let value = dedup_map.clone();
+    let uniques_task = tokio::spawn(async move {
+        for (&_hash, &(_, ref records)) in &value {
+            if !records.is_empty() {
+                uniques_tx.send(ParseOutput::Fastq(records[0].clone())).await?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(uniques_task);
+
+    // Cluster stream
+    let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
+    let dedup_map_for_cluster = dedup_map.clone();
+    let cluster_task = tokio::spawn(async move {
+        for (&_hash, &(_, ref records)) in &dedup_map_for_cluster {
+            if records.is_empty() { continue; }
+            let rep_id = records[0].id();
+            let rep_line = format!("{},{}\n", rep_id, rep_id);
+            cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await?;
+            for rec in records.iter().skip(1) {
+                let line = format!("{},{}\n", rec.id(), rep_id);
+                cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(cluster_task);
+
+    let unique_count = dedup_map.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    Ok((
+        ReceiverStream::new(uniques_rx),
+        count_rx,
+        ReceiverStream::new(cluster_rx),
+        Arc::new(duplicate_clusters),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
+async fn subsample_weighted(
+    config: Arc<RunConfig>,
+    uniques_stream: mpsc::Receiver<ParseOutput>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    seed: u64,
+    max_subsample: u64,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
+    let mut rng = config.rng.clone();
+
+    let mut stream = ReceiverStream::new(uniques_stream);
+    let mut sampled_items = Vec::new();
+
+    while let Some(item) = stream.next().await {
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            _ => continue,
+        };
+
+        let rep_id = record.id().to_string();
+        let weight = duplicate_clusters.get(&rep_id).map_or(1, |c| c.size);
+
+        let key = rng.random::<f64>().powf(1.0 / weight as f64);
+        sampled_items.push(SampleItem { key, records: vec![record], weight, hash_key: None });
+    }
+
+    let subsample_size = max_subsample.min(sampled_items.len() as u64);
+    for mut item in sampled_items.into_iter() {
+        if heap.len() < subsample_size as usize {
+            heap.push(Reverse(item));
+        } else if item.key > heap.peek().unwrap().0.key {
+            heap.pop();
+            heap.push(Reverse(item));
+        }
+    }
+
+    let mut sampled = heap.into_iter().map(|r| r.0).collect::<Vec<_>>();
+    sampled.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(Ordering::Equal));
+
+    let count = sampled.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        for item in sampled {
+            for rec in item.records {
+                tx.send(ParseOutput::Fastq(rec)).await?;
+            }
+        }
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(rx), count_rx, send_task))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -5158,17 +5362,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
+    let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
         post_filter_stream.into_inner(),
         paired,
-        seed,
-        config.args.max_subsample as u64,
-        Some(75), // Prefix length for deduplication. Hardcoded fior now
+        Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
     ).await?;
-    cleanup_tasks.extend(dedup_cleanup_tasks);
-    cleanup_receivers.extend(dedup_cleanup_receivers);
+    cleanup_tasks.append(&mut dedup_cleanup_tasks);
+    cleanup_receivers.append(&mut dedup_cleanup_receivers);
+
+    let uniques_count = dedup_count_rx.await?;
+    info!("Uniques count after dedup: {}", uniques_count);
+
+    // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
+    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_weighted(
+        config.clone(),
+        dedup_stream.into_inner(),
+        duplicate_clusters.clone(),
+        seed,
+        config.args.max_subsample as u64,
+    ).await?;
+
+    // Add subsample task to cleanup (speed: async join on dual AMD EPYC 84c/336 logical threads minimizes stall; correctness: awaited to prevent drops)
+    cleanup_tasks.push(subsample_send_task);
+
+    // Await subsample count (correctness: blocks only for count, stream flows concurrently)
+    let subsample_count = subsample_count_rx.await?;
+    info!("Count after subsmapling: {}", subsample_count);
 
 
     // *******************
@@ -5193,7 +5414,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
-        dedup_stream,
+        subsampled_stream,
         6,
         config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
         config.args.stall_threshold,
@@ -6315,10 +6536,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
     info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
 
-    let dedup_count = dedup_count_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
-    info!("Dedup: unique reads/pairs: {}", dedup_count);
 
     // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
     // Cannot asusme ERCC's spiked in.
