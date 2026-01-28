@@ -2508,7 +2508,7 @@ async fn diamond_non_host_align(
         ("--mid-sensitive".to_string(), None),
         ("--block-size".to_string(), Some("100".to_string())),
         ("-c".to_string(), Some("12".to_string())),
-        ("--hit-membuf".to_string(), None),
+        // ("--hit-membuf".to_string(), None),
         ("-f".to_string(), Some("6".to_string())),
         ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
         ("--tmpdir".to_string(), Some(diamond_tmpdir.to_string_lossy().into_owned())),
