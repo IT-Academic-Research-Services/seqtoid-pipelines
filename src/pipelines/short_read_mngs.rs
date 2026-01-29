@@ -2013,12 +2013,16 @@ async fn dedup(
     let mut r1_count: u64 = 0;
     let mut r2_count: u64 = 0;
 
+    let mut test_count: u64 = 0;
     while let Some(item) = stream.next().await {
         let record = match item {
             ParseOutput::Fastq(rec) => rec,
             _ => continue,  // Skip non-Fastq (warn if needed)
         };
 
+        if test_count < 100 {
+            eprintln!("{}", record.id());
+        }
         if paired {
             if let Some(r1) = orphan_r1.take() {
                 r1_count += 1;
