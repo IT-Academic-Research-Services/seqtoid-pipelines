@@ -1997,7 +1997,7 @@ async fn dedup(
 ) -> Result<(
     ReceiverStream<ParseOutput>,  // uniques stream
     oneshot::Receiver<u64>,      // unique count rx
-    ReceiverStream<ParseOutput>,  // duplice cluster stream
+    ReceiverStream<ParseOutput>,  // cluster stream (for CSV-like)
     Arc<HashMap<String, ClusterInfo>>,  // duplicate_clusters
     Vec<JoinHandle<Result<(), anyhow::Error>>>,  // cleanup tasks
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup rx
@@ -2008,30 +2008,39 @@ async fn dedup(
     let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
     let mut total_count = 0u64;
 
+    // ───────────────────────────────────────────────────────────────
+    // Debug: counters + hash key log
+    // ───────────────────────────────────────────────────────────────
+    let mut fastq_count: u64 = 0;           // Total Fastq records seen
+    let mut pair_count: u64 = 0;            // Successful pairs formed
+    let mut hash_keys: Vec<u64> = Vec::with_capacity(1_000_000);  // Pre-alloc
+
     let mut stream = ReceiverStream::new(input_stream);
     let mut orphan_r1: Option<SequenceRecord> = None;
     let mut r1_count: u64 = 0;
     let mut r2_count: u64 = 0;
 
-
     while let Some(item) = stream.next().await {
         let record = match item {
             ParseOutput::Fastq(rec) => rec,
-            _ => continue,  // Skip non-Fastq (warn if needed)
+            _ => continue,
         };
+
+        fastq_count += 1;  // 1. Count every Fastq record
 
         if paired {
             if let Some(r1) = orphan_r1.take() {
-                r1_count += 1;
-                r2_count += 1;
+                pair_count += 1;  // 2. Count successful pairing
 
                 let mut seq_bytes = r1.seq().to_vec();
-                seq_bytes.extend_from_slice(record.seq());  // Concat without 'N', like czid-dedup
+                seq_bytes.extend_from_slice(record.seq());  // Concat without 'N'
 
-                let mut hasher = DefaultHasher::new();  // sipHash
+                let mut hasher = DefaultHasher::new();
                 let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
                 hasher.write(&seq_bytes[0..write_len]);
                 let hash_key = hasher.finish();
+
+                hash_keys.push(hash_key);  // 3. Collect every hash key
 
                 let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
                 entry.0 += 1;
@@ -2050,6 +2059,8 @@ async fn dedup(
             hasher.write(&seq_bytes[0..write_len]);
             let hash_key = hasher.finish();
 
+            hash_keys.push(hash_key);  // 3. Collect every hash key
+
             let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
             entry.0 += 1;
             entry.1.push(record.clone());
@@ -2057,6 +2068,24 @@ async fn dedup(
             total_count += 1;
         }
     }
+
+    // Log counts to console immediately (before any failure)
+    eprintln!("DEBUG: Total Fastq records seen: {}", fastq_count);
+    eprintln!("DEBUG: Successful pairs formed: {}", pair_count);
+    eprintln!("DEBUG: Total hash keys collected: {}", hash_keys.len());
+
+    // Write hash keys to file (async, no blocking)
+    let hash_path = out_dir.join("dedup_hash_keys.txt");
+    let hash_keys_clone = hash_keys.clone();  // Clone for move
+    let hash_write_task = tokio::spawn(async move {
+        let mut file = BufWriter::new(TokioFile::create(&hash_path).await?);
+        for key in hash_keys_clone {
+            file.write_all(format!("{}\n", key).as_bytes()).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    });
+    cleanup_tasks.push(hash_write_task);
 
     // Align orphan/imbalance: Error on >1 diff (no skip, like czid-dedup TryFrom)
     if orphan_r1.is_some() || (r1_count as i64 - r2_count as i64).abs() > 1 {
@@ -2076,7 +2105,7 @@ async fn dedup(
         duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
     }
 
-    // writeduplicate_cluster_sizes
+    // Write cluster sizes TSV
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
     let duplicate_clusters_for_tsv = duplicate_clusters.clone();
     let tsv_task = tokio::spawn(async move {
@@ -2090,7 +2119,6 @@ async fn dedup(
     cleanup_tasks.push(tsv_task);
 
     // Uniques stream: First rep per cluster
-
     let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size);
     let value = dedup_map.clone();
     let uniques_task = tokio::spawn(async move {
