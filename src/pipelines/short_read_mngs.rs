@@ -71,7 +71,7 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file,
                           SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
-                          filter_fastq_to_bytes_stream};
+                          filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
@@ -5417,10 +5417,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ));
     test_write_task.await??;
 
+    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
+        pre_dedup_bypass_stream,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    ).await?;
+
+    cleanup_tasks.push(parse_task);
 
     let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
-        pre_dedup_bypass_stream,
+        pre_dedup_parsed_stream,
         paired,
         Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
