@@ -5431,6 +5431,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let uniques_count = dedup_count_rx.await?;
     info!("Uniques count after dedup: {}", uniques_count);
 
+    info!("=== DEBUG: Early return after dedup — downstream disabled ===");
+    return Ok(());
+
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
     let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_weighted(
         config.clone(),
