@@ -2013,16 +2013,13 @@ async fn dedup(
     let mut r1_count: u64 = 0;
     let mut r2_count: u64 = 0;
 
-    let mut test_count: u64 = 0;
+
     while let Some(item) = stream.next().await {
         let record = match item {
             ParseOutput::Fastq(rec) => rec,
             _ => continue,  // Skip non-Fastq (warn if needed)
         };
 
-        if test_count < 100 {
-            eprintln!("{}", record.id());
-        }
         if paired {
             if let Some(r1) = orphan_r1.take() {
                 r1_count += 1;
@@ -5366,9 +5363,36 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
+
+
+
+    let (mut pre_dedup_streams,  pre_dedup_done_rx) = t_junction(
+        post_filter_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::JustBytes,
+        "pre_dedup".to_string(),
+        None,
+    ).await?;
+    cleanup_receivers.push(pre_dedup_done_rx);
+
+    let mut pre_dedup_streams_iter = pre_dedup_streams.into_iter();
+    let pre_dedup_bypass_stream = pre_dedup_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let pre_dedup_check_stream = pre_dedup_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let test_write_task = tokio::spawn(stream_to_file(
+        pre_dedup_check_stream,
+        PathBuf::from("test_pre_dedup.fq"),
+    ));
+    test_write_task.await??;
+
+
     let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
-        post_filter_stream.into_inner(),
+        pre_dedup_bypass_stream,
         paired,
         Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
