@@ -2030,6 +2030,14 @@ async fn dedup(
 
         if paired {
             if let Some(r1) = orphan_r1.take() {
+
+                if r1.id() != record.id() {
+                    return Err(PipelineError::InvalidFastqFormat(format!(
+                        "Mismatched pair IDs: R1={}, R2={}",
+                        r1.id(), record.id()
+                    )));
+                }
+
                 pair_count += 1;  // 2. Count successful pairing
 
                 let mut seq_bytes = r1.seq().to_vec();
@@ -5434,7 +5442,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         pre_dedup_parsed_stream,
         paired,
-        None,
+        Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
     ).await?;
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
