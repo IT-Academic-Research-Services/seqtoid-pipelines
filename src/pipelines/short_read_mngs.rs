@@ -2035,6 +2035,11 @@ async fn dedup(
                 let mut seq_bytes = r1.seq().to_vec();
                 seq_bytes.extend_from_slice(record.seq());  // Concat without 'N'
 
+                let concat_len = seq_bytes.len();
+                if concat_len < 70 {
+                    eprintln!("Short concat ({} bp): R1={}, R2={}", concat_len, r1.id(), record.id());
+                }
+
                 let mut hasher = DefaultHasher::new();
                 let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
                 hasher.write(&seq_bytes[0..write_len]);
