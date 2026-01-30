@@ -2037,7 +2037,7 @@ async fn dedup(
 
                 let concat_len = seq_bytes.len();
                 if concat_len < 70 {
-                    eprintln!("Short concat ({} bp): R1={}, R2={}", concat_len, r1.id(), record.id());
+                    eprintln!("Short concat: {} bases for pair {}", concat_len, r1.id());
                 }
 
                 let mut hasher = DefaultHasher::new();
