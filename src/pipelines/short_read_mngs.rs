@@ -5434,7 +5434,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         pre_dedup_parsed_stream,
         paired,
-        Some(70), // Prefix length for deduplication. Hardcoded for now
+        None,
         out_dir.clone(),
     ).await?;
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
