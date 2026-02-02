@@ -2040,8 +2040,8 @@ async fn dedup(
 
                 pair_count += 1;  // 2. Count successful pairing
 
-                let mut seq_bytes = r1.seq().to_vec().iter().map(|&b| b.to_ascii_uppercase()).collect::<Vec<u8>>();
-                seq_bytes.extend(record.seq().iter().map(|&b| b.to_ascii_uppercase()).collect::<Vec<u8>>());
+                let mut seq_bytes = r1.seq().to_vec().iter().map(|&b| b.to_ascii_uppercase()).filter(|&&b| b != b'N').cloned().collect::<Vec<u8>>();
+                seq_bytes.extend(record.seq().iter().map(|&b| b.to_ascii_uppercase()).filter(|&&b| b != b'N').cloned().collect::<Vec<u8>>());
 
                 let concat_len = seq_bytes.len();
                 if concat_len < 70 {
