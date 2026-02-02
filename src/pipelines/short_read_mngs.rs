@@ -13,6 +13,7 @@ use ahash::AHashMap;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
+use rand::seq::SliceRandom;
 use fst::Map;
 use futures::future::try_join_all;
 use log::{self, debug, error, info, warn, LevelFilter};
@@ -2221,6 +2222,42 @@ async fn subsample_weighted(
             for rec in item.records {
                 tx.send(ParseOutput::Fastq(rec)).await?;
             }
+        }
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(rx), count_rx, send_task))
+}
+
+async fn subsample_uniform(
+    config: Arc<RunConfig>,
+    uniques_stream: mpsc::Receiver<ParseOutput>,
+    max_subsample: u64,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let mut records = Vec::new();
+    let mut stream = ReceiverStream::new(uniques_stream);
+    while let Some(item) = stream.next().await {
+        if let ParseOutput::Fastq(rec) = item {
+            records.push(rec);
+        }
+    }
+
+    let subsample_size = max_subsample.min(records.len() as u64) as usize;
+
+    // Uniform random sampling: shuffle indices and take first N
+    let mut rng = config.rng.clone();
+    let mut indices: Vec<usize> = (0..records.len()).collect();
+    indices.shuffle(&mut rng);  // Shuffle all indices randomly
+    let sampled_indices: Vec<usize> = indices.into_iter().take(subsample_size).collect();
+
+    let count = sampled_indices.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        for idx in sampled_indices {
+            tx.send(ParseOutput::Fastq(records[idx].clone())).await?;
         }
         Ok(())
     });
@@ -5400,34 +5437,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-
-
-
-    let (mut pre_dedup_streams,  pre_dedup_done_rx) = t_junction(
-        post_filter_stream,
-        2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        100,
-        StreamDataType::JustBytes,
-        "pre_dedup".to_string(),
-        None,
-    ).await?;
-    cleanup_receivers.push(pre_dedup_done_rx);
-
-    let mut pre_dedup_streams_iter = pre_dedup_streams.into_iter();
-    let pre_dedup_bypass_stream = pre_dedup_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let pre_dedup_check_stream = pre_dedup_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    let test_write_task = tokio::spawn(stream_to_file(
-        pre_dedup_check_stream,
-        PathBuf::from("test_pre_dedup.fq"),
-    ));
-    test_write_task.await??;
-
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
-        pre_dedup_bypass_stream,
+        post_filter_stream.into_inner(),
         config.base_buffer_size,
         config.args.stall_threshold,
     ).await?;
@@ -5447,22 +5458,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let uniques_count = dedup_count_rx.await?;
     info!("Uniques count after dedup: {}", uniques_count);
 
-    info!("=== DEBUG: Early return after dedup — downstream disabled ===");
-    return Ok(());
-
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
-    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_weighted(
+    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
         config.clone(),
         dedup_stream.into_inner(),
-        duplicate_clusters.clone(),
-        seed,
         config.args.max_subsample as u64,
     ).await?;
 
-    // Add subsample task to cleanup (speed: async join on dual AMD EPYC 84c/336 logical threads minimizes stall; correctness: awaited to prevent drops)
     cleanup_tasks.push(subsample_send_task);
-
-    // Await subsample count (correctness: blocks only for count, stream flows concurrently)
+    
     let subsample_count = subsample_count_rx.await?;
     info!("Count after subsmapling: {}", subsample_count);
 
