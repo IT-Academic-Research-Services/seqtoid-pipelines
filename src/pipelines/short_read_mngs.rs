@@ -2040,29 +2040,13 @@ async fn dedup(
 
                 pair_count += 1;  // 2. Count successful pairing
 
-                let mut seq_bytes = r1.seq().to_vec()
-                    .iter()
-                    .map(|&b| b.to_ascii_uppercase())
-                    .filter(|&b| b != b'N')
-                    .collect::<Vec<u8>>();
-
-                seq_bytes.extend(
-                    record.seq()
-                        .iter()
-                        .map(|&b| b.to_ascii_uppercase())
-                        .filter(|&b| b != b'N')
-                        .collect::<Vec<u8>>()
-                );
-
-
-                let concat_len = seq_bytes.len();
-                if concat_len < 70 {
-                    eprintln!("Short concat: {} bases for pair {}", concat_len, r1.id());
-                }
+                let r1_prefix = &r1.seq()[..prefix_len.map_or(r1.seq().len(), |l| l.min(r1.seq().len()))]; //prefix length limitation
+                let r2_prefix = &record.seq()[..prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()))];
 
                 let mut hasher = DefaultHasher::new();
-                let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
-                hasher.write(&seq_bytes[0..write_len]);
+                hasher.write(r1_prefix);
+                hasher.write(&[0u8]);
+                hasher.write(r2_prefix);
                 let hash_key = hasher.finish();
 
                 hash_keys.push(hash_key);  // 3. Collect every hash key
