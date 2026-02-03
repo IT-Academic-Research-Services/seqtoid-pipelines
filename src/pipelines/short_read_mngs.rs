@@ -7,11 +7,13 @@ use std::io::{BufRead, BufReader, ErrorKind};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::collections::hash_map::DefaultHasher;
 
 use ahash::AHashMap;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
+use rand::seq::SliceRandom;
 use fst::Map;
 use futures::future::try_join_all;
 use log::{self, debug, error, info, warn, LevelFilter};
@@ -70,7 +72,7 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file,
                           SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
-                          filter_fastq_to_bytes_stream};
+                          filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
@@ -85,6 +87,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             ChannelReader, ChildStream, ParseMode,
                             ParseOutput, ToBytes};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
+use crate::utils::system::detect_ram;
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
                              get_top_m8_nt, load_taxid_lineages_db, validate_taxid_lineage};
 
@@ -1864,6 +1867,8 @@ async fn dedup_and_subsample(
         dedup_map.len()
     );
 
+    eprintln!("total count for input {}", total_count);
+
     if total_count == 0 {
         info!("No reads in dedup input — returning empty outputs");
         let (empty_tx, empty_rx) = mpsc::channel(1);
@@ -1958,6 +1963,7 @@ async fn dedup_and_subsample(
     cleanup_tasks.push(tsv_write_task);
 
     let unique_count = sampled.len() as u64;
+    eprintln!("unique count = {}", unique_count);
     let (count_tx, count_rx) = oneshot::channel();
     count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Failed to send subsample count")))?;
 
@@ -1980,6 +1986,283 @@ async fn dedup_and_subsample(
         cleanup_tasks,
         cleanup_receivers,
     ))
+}
+
+
+async fn dedup(
+    config: Arc<RunConfig>,
+    input_stream: mpsc::Receiver<ParseOutput>,
+    paired: bool,
+    prefix_len: Option<usize>,
+    out_dir: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,  // uniques stream
+    oneshot::Receiver<u64>,      // unique count rx
+    ReceiverStream<ParseOutput>,  // cluster stream (for CSV-like)
+    Arc<HashMap<String, ClusterInfo>>,  // duplicate_clusters
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,  // cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup rx
+), PipelineError> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
+    let mut total_count = 0u64;
+
+    // ───────────────────────────────────────────────────────────────
+    // Debug: counters + hash key log
+    // ───────────────────────────────────────────────────────────────
+    let mut fastq_count: u64 = 0;           // Total Fastq records seen
+    let mut pair_count: u64 = 0;            // Successful pairs formed
+    let mut hash_keys: Vec<u64> = Vec::with_capacity(1_000_000);  // Pre-alloc
+
+    let mut stream = ReceiverStream::new(input_stream);
+    let mut orphan_r1: Option<SequenceRecord> = None;
+    let mut r1_count: u64 = 0;
+    let mut r2_count: u64 = 0;
+
+    while let Some(item) = stream.next().await {
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            _ => continue,
+        };
+
+        fastq_count += 1;  // 1. Count every Fastq record
+
+        if paired {
+            if let Some(r1) = orphan_r1.take() {
+
+                if r1.id() != record.id() {
+                    return Err(PipelineError::InvalidFastqFormat(format!(
+                        "Mismatched pair IDs: R1={}, R2={}",
+                        r1.id(), record.id()
+                    )));
+                }
+
+                pair_count += 1;  // 2. Count successful pairing
+
+                let r1_prefix = &r1.seq()[..prefix_len.map_or(r1.seq().len(), |l| l.min(r1.seq().len()))]; //prefix length limitation
+                let r2_prefix = &record.seq()[..prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()))];
+
+                let mut hasher = DefaultHasher::new();
+                hasher.write(r1_prefix);
+                hasher.write(&[0u8]);
+                hasher.write(r2_prefix);
+                let hash_key = hasher.finish();
+
+                hash_keys.push(hash_key);  // 3. Collect every hash key
+
+                let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
+                entry.0 += 1;
+                entry.1.push(r1.clone());
+                entry.1.push(record.clone());
+
+                total_count += 1;
+            } else {
+                orphan_r1 = Some(record);
+            }
+        } else {
+            let seq_bytes = record.seq().to_vec();
+
+            let mut hasher = DefaultHasher::new();
+            let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
+            hasher.write(&seq_bytes[0..write_len]);
+            let hash_key = hasher.finish();
+
+            hash_keys.push(hash_key);  // 3. Collect every hash key
+
+            let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
+            entry.0 += 1;
+            entry.1.push(record.clone());
+
+            total_count += 1;
+        }
+    }
+
+    // Log counts to console immediately (before any failure)
+    eprintln!("DEBUG: Total Fastq records seen: {}", fastq_count);
+    eprintln!("DEBUG: Successful pairs formed: {}", pair_count);
+    eprintln!("DEBUG: Total hash keys collected: {}", hash_keys.len());
+
+    // Write hash keys to file (async, no blocking)
+    let hash_path = out_dir.join("dedup_hash_keys.txt");
+    let hash_keys_clone = hash_keys.clone();  // Clone for move
+    let hash_write_task = tokio::spawn(async move {
+        let mut file = BufWriter::new(TokioFile::create(&hash_path).await?);
+        for key in hash_keys_clone {
+            file.write_all(format!("{}\n", key).as_bytes()).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    });
+    cleanup_tasks.push(hash_write_task);
+
+    // Align orphan/imbalance: Error on >1 diff (no skip, like czid-dedup TryFrom)
+    if orphan_r1.is_some() || (r1_count as i64 - r2_count as i64).abs() > 1 {
+        return Err(PipelineError::InvalidFastqFormat(format!(
+            "Paired imbalance: R1={}, R2={}, orphan={}",
+            r1_count, r2_count, orphan_r1.is_some() as u8
+        )));
+    }
+
+    info!("Dedup complete: {} valid pairs, {} unique hashes", total_count, dedup_map.len());
+
+    let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
+    for (&_hash, &(size, ref records)) in &dedup_map {
+        if records.is_empty() { continue; }
+        let rep_id = records[0].id().to_string();
+        let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
+        duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
+    }
+
+    // Write cluster sizes TSV
+    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
+    let duplicate_clusters_for_tsv = duplicate_clusters.clone();
+    let tsv_task = tokio::spawn(async move {
+        let mut file = BufWriter::new(TokioFile::create(&tsv_path).await?);
+        for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
+            file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes()).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    });
+    cleanup_tasks.push(tsv_task);
+
+    // Uniques stream: First rep per cluster
+    let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size);
+    let value = dedup_map.clone();
+    let uniques_task = tokio::spawn(async move {
+        for (&_hash, &(_, ref records)) in &value {
+            if !records.is_empty() {
+                uniques_tx.send(ParseOutput::Fastq(records[0].clone())).await?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(uniques_task);
+
+    // Cluster stream
+    let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
+    let dedup_map_for_cluster = dedup_map.clone();
+    let cluster_task = tokio::spawn(async move {
+        for (&_hash, &(_, ref records)) in &dedup_map_for_cluster {
+            if records.is_empty() { continue; }
+            let rep_id = records[0].id();
+            let rep_line = format!("{},{}\n", rep_id, rep_id);
+            cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await?;
+            for rec in records.iter().skip(1) {
+                let line = format!("{},{}\n", rec.id(), rep_id);
+                cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
+            }
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(cluster_task);
+
+    let unique_count = dedup_map.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    Ok((
+        ReceiverStream::new(uniques_rx),
+        count_rx,
+        ReceiverStream::new(cluster_rx),
+        Arc::new(duplicate_clusters),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
+async fn subsample_weighted(
+    config: Arc<RunConfig>,
+    uniques_stream: mpsc::Receiver<ParseOutput>,
+    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    seed: u64,
+    max_subsample: u64,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
+    let mut rng = config.rng.clone();
+
+    let mut stream = ReceiverStream::new(uniques_stream);
+    let mut sampled_items = Vec::new();
+
+    while let Some(item) = stream.next().await {
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            _ => continue,
+        };
+
+        let rep_id = record.id().to_string();
+        let weight = duplicate_clusters.get(&rep_id).map_or(1, |c| c.size);
+
+        let key = rng.random::<f64>().powf(1.0 / weight as f64);
+        sampled_items.push(SampleItem { key, records: vec![record], weight, hash_key: None });
+    }
+
+    let subsample_size = max_subsample.min(sampled_items.len() as u64);
+    for mut item in sampled_items.into_iter() {
+        if heap.len() < subsample_size as usize {
+            heap.push(Reverse(item));
+        } else if item.key > heap.peek().unwrap().0.key {
+            heap.pop();
+            heap.push(Reverse(item));
+        }
+    }
+
+    let mut sampled = heap.into_iter().map(|r| r.0).collect::<Vec<_>>();
+    sampled.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(Ordering::Equal));
+
+    let count = sampled.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        for item in sampled {
+            for rec in item.records {
+                tx.send(ParseOutput::Fastq(rec)).await?;
+            }
+        }
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(rx), count_rx, send_task))
+}
+
+async fn subsample_uniform(
+    config: Arc<RunConfig>,
+    uniques_stream: mpsc::Receiver<ParseOutput>,
+    max_subsample: u64,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let mut records = Vec::new();
+    let mut stream = ReceiverStream::new(uniques_stream);
+    while let Some(item) = stream.next().await {
+        if let ParseOutput::Fastq(rec) = item {
+            records.push(rec);
+        }
+    }
+
+    let subsample_size = max_subsample.min(records.len() as u64) as usize;
+
+    // Uniform random sampling: shuffle indices and take first N
+    let mut rng = config.rng.clone();
+    let mut indices: Vec<usize> = (0..records.len()).collect();
+    indices.shuffle(&mut rng);  // Shuffle all indices randomly
+    let sampled_indices: Vec<usize> = indices.into_iter().take(subsample_size).collect();
+
+    let count = sampled_indices.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        for idx in sampled_indices {
+            tx.send(ParseOutput::Fastq(records[idx].clone())).await?;
+        }
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(rx), count_rx, send_task))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -2504,7 +2787,7 @@ async fn diamond_non_host_align(
         ("--mid-sensitive".to_string(), None),
         ("--block-size".to_string(), Some("100".to_string())),
         ("-c".to_string(), Some("12".to_string())),
-        ("--hit-membuf".to_string(), None),
+        // ("--hit-membuf".to_string(), None),
         ("-f".to_string(), Some("6".to_string())),
         ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
         ("--tmpdir".to_string(), Some(diamond_tmpdir.to_string_lossy().into_owned())),
@@ -3109,142 +3392,162 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
 /// # Returns
 async fn spades_assembly(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    out_dir: PathBuf,
+    subsampled_stream: impl Stream<Item = ParseOutput> + Send + 'static + Unpin,
     paired: bool,
-    sample_base_buf: PathBuf,
-    estimated_input_size_bytes: u64,
-) -> Result<(
-    AssemblyHandle,
-    Vec<JoinHandle<Result<()>>>,
-    Vec<oneshot::Receiver<Result<()>>>,
-), PipelineError> {
+    sample_base: &str,
+    out_dir: PathBuf,
+) -> Result<(oneshot::Receiver<Result<()>>, Option<JoinHandle<Result<()>>>, Vec<JoinHandle<Result<()>>>,
+             Vec<oneshot::Receiver<Result<()>>>,), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let spades_out_dir = out_dir.join("assembly");
-    fs::create_dir_all(&spades_out_dir).await?;
+    let assembly_dir = out_dir.join("assembly");
+    fs::create_dir_all(&assembly_dir).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
 
-    let ram_safe_threshold = 64 * 1024 * 1024 * 1024u64; // 64 GB
-    let spades_work_dir = if estimated_input_size_bytes <= ram_safe_threshold {
-        config.ram_temp_dir.join("spades")
+    let (non_host_streams, non_host_done_rx) = t_junction(
+        subsampled_stream,
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        100,
+        StreamDataType::IlluminaFastq,
+        "spades_assembly".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(non_host_done_rx);
+
+    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let count_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (_total_ram, available_ram) = detect_ram()
+        .map_err(|e| PipelineError::Other(anyhow!("detect_ram failed: {}", e)))?;
+    let avail_ram_gb = available_ram / (1024 * 1024 * 1024);
+    let capped_threads = std::cmp::min(64, config.args.threads);  // Avoid libgomp fails high core systems
+
+    // Pre-SPAdes validation: Count records (pairs if paired)
+    // Skip if <500 to avoid aborts on small data (e.g., viral amplicon); write dummies.
+    let pre_count = stream_record_counter(count_stream, false).await?;
+    info!("Pre-SPAdes non-host subsampled count: {}", pre_count);
+
+    if pre_count < 500 {
+        warn!("Skipping SPAdes: too few reads ({})", pre_count);
+        let contigs_path     = assembly_dir.join("contigs.fasta");
+        let contigs_all_path = assembly_dir.join("contigs_all.fasta");
+        let scaffolds_path   = assembly_dir.join("scaffolds.fasta");
+        let sam_path         = assembly_dir.join("read-contig.sam");
+
+        let failed_marker = b";ASSEMBLY SKIPPED: TOO FEW READS\n";
+        let dummy_task = tokio::spawn(async move {
+            tokio::fs::write(&contigs_path, failed_marker).await?;
+            tokio::fs::write(&contigs_all_path, failed_marker).await?;
+            tokio::fs::write(&scaffolds_path, failed_marker).await?;
+            tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
+            Ok(())
+        });
+
+        let (skip_tx, skip_rx) = oneshot::channel();
+        let _ = skip_tx.send(Ok(()));
+        return Ok((skip_rx, Some(dummy_task), cleanup_tasks, cleanup_receivers));
+    }
+
+    let (r1_fifo, r2_fifo_opt, deint_handle, r1_write, r2_write_opt) =
+        deinterleave_fastq_stream_to_fifos(
+            config.clone(),
+            ReceiverStream::new(assembly_stream),
+            sample_base,
+            paired,
+        ).await?;
+
+    let input_file_path = if paired {
+        format!("-1 {} -2 {}", r1_fifo.display(), r2_fifo_opt.as_ref().unwrap().display())
     } else {
-        warn!(
-            "Estimated input {} bytes ({:.1} GB) > RAM threshold ({:.1} GB) — using disk temp",
-            estimated_input_size_bytes,
-            estimated_input_size_bytes as f64 / 1_073_741_824.0,
-            ram_safe_threshold as f64 / 1_073_741_824.0
-        );
-        std::env::temp_dir().join("spades")
+        format!("-s {}", r1_fifo.display())
     };
-    fs::create_dir_all(&spades_work_dir).await?;
-
-    let input_file_path = spades_work_dir.join(rename_file_path(&sample_base_buf, None, Some("assembly_input.fq"), "_"));
-
-    let write_input_task = tokio::spawn({
-        let input_file_path = input_file_path.clone();
-
-        async move {
-            let file = TokioFile::create(&input_file_path).await
-                .map_err(|e| anyhow!("Cannot create SPAdes input file {}: {}", input_file_path.display(), e))?;
-            let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
-
-            let mut stream = input_stream;
-            let mut total_bytes = 0u64;
-
-            while let Some(item) = stream.next().await {
-                let bytes = item.to_bytes()
-                    .map_err(|e| anyhow!("Failed to convert ParseOutput to FASTQ bytes: {}", e))?;
-
-                writer.write_all(&bytes).await
-                    .map_err(|e| anyhow!("Write error to {}: {}", input_file_path.display(), e))?;
-
-                total_bytes += bytes.len() as u64;
-            }
-
-            writer.flush().await
-                .map_err(|e| anyhow!("Flush error to {}: {}", input_file_path.display(), e))?;
-
-            info!(
-                "SPAdes input written: {} ({} bytes)",
-                input_file_path.display(),
-                total_bytes
-            );
-
-            if total_bytes == 0 {
-                warn!("SPAdes input file is empty – no non-host reads");
-            }
-            Ok::<u64, anyhow::Error>(total_bytes)
-        }
-    });
-
-    let total_input_bytes = write_input_task.await??;
 
     let spades_config = SpadesConfig {
-        input_path: input_file_path.clone(),
-        outdir_path: spades_out_dir.clone(),
-        paired: paired,
-
+        input_path: input_file_path.clone().into(),  // String to PathBuf
+        outdir_path: assembly_dir.clone(),
+        paired,
         option_fields: HashMap::from([
             ("--only-assembler".to_string(), None),
-            ("--isolate".to_string(), None),
+            ("-m".to_string(), Some(avail_ram_gb.to_string())),   // fresh value
+            ("-t".to_string(), Some(capped_threads.to_string())),
         ]),
     };
+
     let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SPADES_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::ToolExecution { tool: SPADES_TAG.to_string(), error: e.to_string() })?;
 
-    let (mut spades_child, spades_err_task) = spawn_cmd(
-        config.clone(),
-        SPADES_TAG,
-        spades_args,
-        config.args.verbose,
-    ).await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SPADES_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(spades_err_task);
+    let (mut spades_child, err_task) = spawn_cmd(config.clone(),
+                                                 SPADES_TAG, spades_args, true).await?;
+    cleanup_tasks.push(err_task);
 
-    let spades_out_dir_clone = spades_out_dir.clone();
+    let spades_out_dir_clone = assembly_dir.clone();
+    let spades_log_path = spades_out_dir_clone.join("spades_stderr.log");
+    let stdout_log_path = spades_out_dir_clone.join("spades_stdout.log");
+    let internal_log_path = spades_out_dir_clone.join("spades.log");  // SPAdes auto-writes
 
-    let spades_task = tokio::spawn(async move {
+    let spades_exit_task = tokio::spawn(async move {
         let output = spades_child.wait_with_output().await?;
+
+        tokio::fs::write(&spades_log_path, &output.stderr).await?;
+        info!("SPAdes stderr written to {:?}", spades_log_path);
+        tokio::fs::write(&stdout_log_path, &output.stdout).await?;
+        info!("SPAdes stdout written to {:?}", stdout_log_path);
+
+        if let Ok(log_contents) = tokio::fs::read(&internal_log_path).await {
+            let copied_log_path = spades_out_dir_clone.join("spades_copied.log");
+            tokio::fs::write(&copied_log_path, &log_contents).await?;
+            let log_str = String::from_utf8_lossy(&log_contents).to_string();
+            if config.args.verbose {
+                eprintln!("SPAdes internal log:\n{}", log_str);
+            } else {
+                let lines: Vec<&str> = log_str.lines().collect();
+                let summary = if lines.len() > 20 {
+                    format!("SPAdes log summary (first 10 + last 10):\n{}\n...\n{}",
+                            lines[0..10].join("\n"), lines[lines.len()-10..].join("\n"))
+                } else { log_str.clone() };
+                info!("SPAdes log summary:\n{}", summary);
+            }
+        } else {
+            warn!("No spades.log found—possible early abort");
+        }
 
         eprintln!("SPAdes exit: {:?}", output.status);
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            eprintln!("SPAdes FAILED:\n{}", stderr);
+            let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+            eprintln!("SPAdes FAILED:\n{}", stderr_str);
 
-            let contigs_path     = spades_out_dir_clone.join("contigs.fasta");
+            let contigs_path = spades_out_dir_clone.join("contigs.fasta");
             let contigs_all_path = spades_out_dir_clone.join("contigs_all.fasta");
-            let scaffolds_path   = spades_out_dir_clone.join("scaffolds.fasta");
+            let scaffolds_path = spades_out_dir_clone.join("scaffolds.fasta");
+            let sam_path = spades_out_dir_clone.join("read-contig.sam");
 
             let failed_marker = b";ASSEMBLY FAILED\n";
-
             tokio::fs::write(&contigs_path, failed_marker).await?;
             tokio::fs::write(&contigs_all_path, failed_marker).await?;
             tokio::fs::write(&scaffolds_path, failed_marker).await?;
-
-            let sam_path = spades_out_dir_clone.join("read-contig.sam");
             tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
 
-            return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr));
+            return Err(anyhow!("SPAdes failed with exit code {:?}: {}", output.status.code(), stderr_str));
         }
 
         info!("SPAdes completed successfully");
         Ok(())
     });
 
-    Ok((AssemblyHandle {
-        spades_task,
-        work_dir: spades_work_dir,
-        out_dir: spades_out_dir}, cleanup_tasks, cleanup_receivers))
-}
+    let (spades_exit_tx, spades_exit_rx) = oneshot::channel();
+    spades_exit_tx.send(Ok(())).map_err(|_| PipelineError::Other(anyhow!("SPAdes exit sender failed")))?;
 
+    Ok((spades_exit_rx, Some(spades_exit_task), cleanup_tasks, cleanup_receivers))
+}
 
 pub async fn process_assembly(
     config: Arc<RunConfig>,
@@ -5134,17 +5437,40 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     };
 
-    let (dedup_stream, dedup_count_rx, cluster_stream,duplicate_clusters, dedup_cleanup_tasks, dedup_cleanup_receivers) = dedup_and_subsample(
-        config.clone(),
+    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
         post_filter_stream.into_inner(),
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    ).await?;
+
+    cleanup_tasks.push(parse_task);
+
+    let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
+        config.clone(),
+        pre_dedup_parsed_stream,
         paired,
-        seed,
-        config.args.max_subsample as u64,
-        Some(75), // Prefix length for deduplication. Hardcoded fior now
+        Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
     ).await?;
-    cleanup_tasks.extend(dedup_cleanup_tasks);
-    cleanup_receivers.extend(dedup_cleanup_receivers);
+    cleanup_tasks.append(&mut dedup_cleanup_tasks);
+    cleanup_receivers.append(&mut dedup_cleanup_receivers);
+
+    let uniques_count = dedup_count_rx.await?;
+    let unique_reads = uniques_count * if paired { 2 } else { 1 };
+    info!("Uniques count after dedup (pairs counted separately): {}", unique_reads);
+
+    // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
+    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
+        config.clone(),
+        dedup_stream.into_inner(),
+        config.args.max_subsample as u64,
+    ).await?;
+
+    cleanup_tasks.push(subsample_send_task);
+    
+    let subsample_count = subsample_count_rx.await?;
+    let subsample_reads = subsample_count * if paired { 2 } else { 1 };
+    info!("Subsampled reads (pairs counted separately): {}", subsample_reads);
 
 
     // *******************
@@ -5169,7 +5495,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // split inpout stream for mm2 and dmnd
     let (non_host_streams, non_host_done_rx) = t_junction(
-        dedup_stream,
+        subsampled_stream,
         6,
         config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
         config.args.stall_threshold,
@@ -5194,13 +5520,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // This is part of post-process starting here for concurrency
 
-    let (assembly_handle, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
+    let (spades_exit_rx, spades_exit_task, mut assembly_cleanup_tasks, mut assembly_cleanup_receivers) = spades_assembly(
         config.clone(),
         ReceiverStream::new(non_host_assembly_stream),
-        out_dir.clone(),
         paired,
-        sample_base_buf.clone(),
-        total_input_size
+        &sample_base,
+        out_dir.clone(),
     ).await?;
 
     cleanup_tasks.append(&mut assembly_cleanup_tasks);
@@ -5484,10 +5809,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Assembly stats
 
-    let assembly_out_dir = &assembly_handle.out_dir;
-    let assembly_work_dir =  &assembly_handle.work_dir;
+    if let Some(task) = spades_exit_task {
+        task.await??;
+    }
+    spades_exit_rx.await??;
 
-    assembly_handle.spades_task.await??;
+    let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
+    let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
 
     let contigs_path = assembly_out_dir.join("contigs.fasta");
     let scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
@@ -5499,16 +5827,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     if assembly_failed {
         warn!("SPAdes assembly failed or produced no usable contigs/scaffolds (contigs: {} bytes, scaffolds: {} bytes)",
-      contigs_size, scaffolds_size);
+          contigs_size, scaffolds_size);
 
         let mut failure_info = json!({
-    "assembly_failed": true,
-    "reason": "No contigs or scaffolds >= 25 bp produced",
-    "contigs_size_bytes": contigs_size,
-    "scaffolds_size_bytes": scaffolds_size,
-    "spades_log_excerpt": [],
-    "warnings_log_excerpt": []
-});
+        "assembly_failed": true,
+        "reason": "No contigs or scaffolds >= 25 bp produced",
+        "contigs_size_bytes": contigs_size,
+        "scaffolds_size_bytes": scaffolds_size,
+        "spades_log_excerpt": [],
+        "warnings_log_excerpt": []
+    });
 
         async fn tail_log(path: PathBuf, max_lines: usize) -> Vec<String> {
             if let Ok(file) = TokioFile::open(&path).await {
@@ -5531,7 +5859,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
 
         // Check spades.log for errors
-        let spades_log = assembly_out_dir.join("spades/spades.log");
+        let spades_log = assembly_work_dir.join("spades.log");
         let spades_lines = tail_log(spades_log, 50).await;
         let has_error = spades_lines.iter().any(|l| l.contains("ERROR") || l.contains("Exception") || l.contains("CRITICAL"));
 
@@ -5541,7 +5869,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         failure_info["spades_log_excerpt"] = json!(spades_lines);
 
         // warnings.log
-        let warnings_log = assembly_out_dir.join("spades/warnings.log");
+        let warnings_log = assembly_work_dir.join("warnings.log");
         let warnings_lines = tail_log(warnings_log, 30).await;
         failure_info["warnings_log_excerpt"] = json!(warnings_lines);
 
@@ -5557,7 +5885,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         warn!("Assembly failure details written to {:?}", failure_path);
     } else {
         info!("SPAdes assembly succeeded (contigs: {} bytes, scaffolds: {} bytes)",
-      contigs_size, scaffolds_size);
+          contigs_size, scaffolds_size);
     }
 
 
@@ -5565,8 +5893,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut post_assembly_cleanup_tasks,
         mut post_assembly_cleanup_receivers, mut post_assemly_temp_files) = process_assembly(
         config.clone(),
-        assembly_out_dir,
-        assembly_work_dir,
+        &assembly_out_dir,
+        &assembly_work_dir,
         ReceiverStream::new(non_host_coverage_bt2_stream),
         duplicate_clusters.clone(),
         paired,
@@ -6289,10 +6617,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
     info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
 
-    let dedup_count = dedup_count_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("dedup count receiver failed: {}", e)))?;
-    info!("Dedup: unique reads/pairs: {}", dedup_count);
 
     // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
     // Cannot asusme ERCC's spiked in.

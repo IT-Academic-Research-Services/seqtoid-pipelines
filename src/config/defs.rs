@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::cmp::min;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use lazy_static::lazy_static;
 use rayon::ThreadPool;
 use tokio::sync::Semaphore;
@@ -320,5 +321,11 @@ impl From<JoinError> for PipelineError {
 impl From<SerdeJsonError> for PipelineError {
     fn from(err: SerdeJsonError) -> Self {
         PipelineError::Other(anyhow::Error::new(err))
+    }
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for PipelineError {
+    fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
+        PipelineError::Other(anyhow!("Oneshot receive failed: {}", err))
     }
 }
