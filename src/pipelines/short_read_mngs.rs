@@ -5456,7 +5456,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
 
     let uniques_count = dedup_count_rx.await?;
-    info!("Uniques count after dedup: {}", uniques_count);
+    let unique_reads = uniques_count * if paired { 2 } else { 1 };
+    info!("Uniques count after dedup (pairs counted separately): {}", unique_reads);
 
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
     let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
@@ -5468,7 +5469,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(subsample_send_task);
     
     let subsample_count = subsample_count_rx.await?;
-    info!("Count after subsmapling: {}", subsample_count);
+    let subsample_reads = subsample_count * if paired { 2 } else { 1 };
+    info!("Subsampled reads (pairs counted separately): {}", subsample_reads);
 
 
     // *******************
