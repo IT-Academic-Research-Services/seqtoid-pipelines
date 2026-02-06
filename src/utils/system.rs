@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
+use std::collections::HashMap;
 
 use log::{self, LevelFilter, debug, info, error, warn};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
@@ -18,6 +19,38 @@ use rand_core::{OsRng, RngCore};
 use crate::cli::args::{Arguments, Technology};
 use crate::config::defs::{RunConfig, StreamDataType};
 
+
+
+
+/// Detects physical cores (not logical) — fallback to lscpu if sysinfo doesn't distinguish
+async fn detect_physical_cores() -> Result<usize> {
+    let mut system = System::new_all();
+    system.refresh_cpu_specifics(CpuRefreshKind::everything());
+    let logical = system.cpus().len();
+
+    // Use lscpu for physical core count
+    let output = TokioCommand::new("lscpu")
+        .output()
+        .await
+        .map_err(|e| anyhow!("Failed to run lscpu: {}", e))?;
+
+    let lscpu_str = String::from_utf8_lossy(&output.stdout).to_string();
+    let mut physical = logical / 2;  // Assume SMT=2
+
+    for line in lscpu_str.lines() {
+        if line.starts_with("Core(s) per socket:") {
+            let cores_per_socket = line.split_whitespace().last().unwrap_or("1").parse::<usize>().unwrap_or(1);
+            if line.starts_with("Socket(s):") {
+                let sockets = line.split_whitespace().last().unwrap_or("1").parse::<usize>().unwrap_or(1);
+                physical = cores_per_socket * sockets;
+                break;
+            }
+        }
+    }
+
+    info!("Detected {} physical cores ({} logical)", physical, logical);
+    Ok(physical)
+}
 
 /// Determines number of cores that can be used for CPU based tasks
 ///
@@ -34,22 +67,28 @@ pub async fn detect_cores_and_load(args_threads: usize, use_smt: bool) -> Result
     let mut system = System::new_with_specifics(refresh_kind);
     system.refresh_cpu_all();
 
-    let cores = if use_smt {
-        system.cpus().len()
+    let logical_cores = system.cpus().len();
+    let physical_cores = detect_physical_cores().await?;
+
+    let max_cores = if use_smt {
+        logical_cores
     } else {
-        System::physical_core_count().unwrap_or(1)
+        physical_cores
     };
 
-    system.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
-    sleep(Duration::from_millis(100)).await;
-    let cpu_load = system.global_cpu_usage();
+    let load = system.global_cpu_usage() / 100.0;
 
-    let max_cores = cores.min(args_threads);
-    debug!("Detected {} {} cores; CPU load {}%; using {} threads",
-           max_cores, if use_smt { "logical" } else { "physical" }, cpu_load, max_cores);
+    let effective_cores = if args_threads > 0 {
+        min(args_threads, max_cores)
+    } else {
+        max_cores
+    };
 
-    Ok((max_cores, cpu_load))
+    debug!("Detected {} logical cores ({} physical); CPU load {}%; using {} threads (use_smt={})", logical_cores, physical_cores, load * 100.0, effective_cores, use_smt);
+
+    Ok((effective_cores, load))
 }
+
 
 
 /// Computes the number of stream threads based on cores, load, and OS.
