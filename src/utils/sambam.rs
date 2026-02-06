@@ -50,10 +50,13 @@ pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
     duplicate_clusters: &Arc<HashMap<String, ClusterInfo>>,
     min_contig_size: usize,
-) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
-
+) -> Result<(
+    HashMap<String, String>,           // read2contig
+    HashMap<String, u64>,              // contig_stats (cluster-adjusted)
+    HashMap<String, usize>,            // contig_unique_counts (raw unique reads)
+)> {
     let byte_stream = ReceiverStream::new(rx).map(|item| match item {
-        ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())), // Clone Vec<u8>, then to Bytes
+        ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())),
         _ => Err(anyhow_to_io(anyhow!(
             "BAM stream received non-Bytes variant — data loss prevented"
         ))),
@@ -65,13 +68,14 @@ pub async fn generate_info_from_bam_stream(
     let header = bam_reader
         .read_header()
         .await
-        .map_err(|e| anyhow!("BAM header error: {e}"))?;
+        .map_err(|e| anyhow!("BAM header error: {}", e))?;
 
-    let mut read2contig = HashMap::with_capacity(20_000_000);
-    let mut contig_stats = HashMap::with_capacity(1024);
-    let mut contig_unique_counts = HashMap::with_capacity(1024);
-    let mut seen_reads = HashSet::with_capacity(20_000_000); // Scales to 100M+ reads, fits 1.5TB RAM
-    let mut record = Record::default(); // Reused: zero per-record allocs
+    let mut read2contig: HashMap<String, String> = HashMap::with_capacity(20_000_000);
+    let mut contig_stats: HashMap<String, u64> = HashMap::with_capacity(1024);
+    let mut contig_unique_counts: HashMap<String, usize> = HashMap::with_capacity(1024);
+    let mut seen_reads: HashSet<String> = HashSet::with_capacity(20_000_000);
+
+    let mut record = Record::default(); // Reused allocation
 
     loop {
         match bam_reader.read_record(&mut record).await {
@@ -99,29 +103,35 @@ pub async fn generate_info_from_bam_stream(
                 let contig_name = header
                     .reference_sequences()
                     .get_index(rid)
-                    .ok_or_else(|| anyhow!("Invalid reference ID {rid:?}"))?
+                    .ok_or_else(|| anyhow!("Invalid reference ID {:?}", rid))?
                     .0
                     .to_string();
+
                 read2contig.insert(read_name.clone(), contig_name.clone());
 
                 let cluster_size = duplicate_clusters
                     .get(&read_name)
                     .map(|cluster| cluster.size)
                     .unwrap_or(1u64);
-                
-                *contig_stats.entry(contig_name.clone()).or_insert(0u64) += cluster_size;
-                *contig_unique_counts.entry(contig_name).or_insert(0usize) += 1;
+
+                *contig_stats.entry(contig_name.clone()).or_insert(0) += cluster_size;
+                *contig_unique_counts.entry(contig_name).or_insert(0) += 1;
             }
-            Err(e) => return Err(anyhow!("BAM record error: {e}")), // Propagate: no silent drops
+            Err(e) => return Err(anyhow!("BAM record read error: {}", e)),
         }
     }
 
-    // Retain contigs with >= min_contig_size unique reads
+    // Apply minimum unique read count filter
     contig_stats.retain(|contig_name, _| {
         contig_unique_counts.get(contig_name).copied().unwrap_or(0) >= min_contig_size
     });
 
-    Ok((read2contig, contig_stats))
+    // Remove contigs that didn't meet the threshold from unique counts too (for consistency)
+    contig_unique_counts.retain(|contig_name, _| {
+        contig_stats.contains_key(contig_name)
+    });
+
+    Ok((read2contig, contig_stats, contig_unique_counts))
 }
 
 #[cfg(test)]
