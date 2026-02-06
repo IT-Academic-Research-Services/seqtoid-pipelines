@@ -82,6 +82,21 @@ lazy_static! {
     };
 }
 
+lazy_static! {
+    static ref TOOL_THREAD_CAPS: HashMap<&'static str, usize> = {
+        let mut m = HashMap::new();
+        m.insert("bowtie2", 64);
+        m.insert("minimap2", 64);
+        m.insert("samtools", 32);     // Sort is I/O-bound
+        m.insert("spades", 128);      // Compute-heavy
+        m.insert("diamond", 128);     // Compute-heavy
+        m.insert("fastp", 32);        // I/O-bound
+        m.insert("pigz", 16);         // Compression scales poorly >16
+        m.insert("kraken2", 64);      // Memory/I/O heavy
+        m
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
     View,
@@ -215,9 +230,9 @@ impl RunConfig {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
             (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _)
-            | (MAKEBLASTDB_TAG, _)=> CoreAllocation::Maximal,  // FULL POWER ─=≡Σ((( つ◕ل͜◕)つ
+            | (MAKEBLASTDB_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
-            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _)  => CoreAllocation::High,
+            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
             (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
@@ -226,7 +241,18 @@ impl RunConfig {
     }
 
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
-        let max_cores = min(num_cpus::get(), self.args.threads);
+        let logical_cores = num_cpus::get();
+        let physical_cores = num_cpus::get_physical(); // Preferred if num_cpus supports it
+
+        // Use physical cores as base for I/O-heavy tools to avoid SMT contention
+        let base_cores = if tag == BOWTIE2_TAG || tag == MINIMAP2_TAG || tag == SAMTOOLS_TAG {
+            physical_cores
+        } else {
+            logical_cores
+        };
+
+        let max_cores = min(base_cores, self.args.threads.max(1));
+
         let mut allocation = match self.get_core_allocation(tag, subcommand) {
             CoreAllocation::Maximal => max_cores,
             CoreAllocation::High => ((max_cores as f32 * 0.75) as usize).max(1),
@@ -234,10 +260,16 @@ impl RunConfig {
             CoreAllocation::Minimal => 1,
         };
 
+        // Apply tool-specific cap
+        if let Some(cap) = TOOL_THREAD_CAPS.get(tag) {
+            allocation = allocation.min(*cap);
+        }
+
+        // Per-tool overrides (your existing logic)
         match (tag, subcommand) {
-            (PIGZ_TAG, _) => allocation.min(16), // Cap at 16: Compression scales poorly >16
-            (FASTP_TAG, _) => allocation.min(32), // Cap at 32: QC/filtering I/O-bound
-            (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16), // Cap at 16: Diminishing returns for pileup
+            (PIGZ_TAG, _) => allocation.min(16),
+            (FASTP_TAG, _) => allocation.min(32),
+            (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16),
             _ => allocation,
         }
     }
