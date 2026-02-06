@@ -5798,7 +5798,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (assembly_outputs, assembly_bam_out_stream,
         mut post_assembly_cleanup_tasks,
-        mut post_assembly_cleanup_receivers, mut post_assemly_temp_files) = process_assembly(
+        mut post_assembly_cleanup_receivers,
+        mut post_assembly_temp_files) = process_assembly(
         config.clone(),
         &assembly_out_dir,
         &assembly_work_dir,
@@ -5810,7 +5811,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
-    temp_files.extend(post_assemly_temp_files);
+    temp_files.extend(post_assembly_temp_files);
 
     let _ = fs::remove_dir_all(assembly_work_dir).await;
 
