@@ -605,7 +605,6 @@ async fn bowtie2_filter(
     let insert_stats_rx = if paired_compute_insert_stats {
         let insert_stats_stream = insert_stats_stream.unwrap();
 
-        // Split insert_stats_stream for counting and processing
         let (mut stats_streams, stats_done_rx) = t_junction(
             ReceiverStream::new(insert_stats_stream),
             2,
@@ -625,18 +624,18 @@ async fn bowtie2_filter(
         let count_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
         let process_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-        // Count mapped reads in BAM
         let (count_tx, count_rx) = oneshot::channel();
         let count_task = tokio::spawn(async move {
             let mut stream = ReceiverStream::new(count_stream);
             let mut line_count = 0;
             while let Some(item) = stream.next().await {
-                match item {
-                    ParseOutput::Bytes(line) if !line.is_empty() => line_count += 1,
-                    _ => continue,
+                if let ParseOutput::Bytes(line) = item {
+                    if !line.is_empty() {
+                        line_count += 1;
+                    }
                 }
             }
-            count_tx.send(line_count).map_err(|_| anyhow!("Failed to send BAM line count"))?;
+            let _ = count_tx.send(line_count);
             Ok(())
         });
         cleanup_tasks.push(count_task);
@@ -648,16 +647,13 @@ async fn bowtie2_filter(
         if bam_line_count == 0 {
             warn!("No mapped reads in BAM for insert size stats; skipping samtools stats");
             let (stats_tx, stats_rx) = oneshot::channel();
-            stats_tx
-                .send(SamtoolsStats {
-                    summary: HashMap::new(),
-                    insert_sizes: Vec::new(),
-                    total_pairs: 0
-                })
-                .map_err(|_| PipelineError::Other(anyhow!("Failed to send empty stats")))?;
+            let _ = stats_tx.send(SamtoolsStats {
+                summary: HashMap::new(),
+                insert_sizes: Vec::new(),
+                total_pairs: 0,
+            });
             Some(stats_rx)
         } else {
-            // Coordinate-sort BAM for samtools stats
             let samtools_coord_sort_config = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Sort,
                 subcommand_fields: HashMap::from([
@@ -668,10 +664,7 @@ async fn bowtie2_filter(
                 ]),
             };
             let samtools_coord_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_coord_sort_config))
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+                .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
 
             let (mut coord_sort_child, coord_sort_task, coord_sort_err_task) = stream_to_cmd(
                 config.clone(),
@@ -681,11 +674,7 @@ async fn bowtie2_filter(
                 StreamDataType::JustBytes,
                 config.args.verbose,
             )
-                .await
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+                .await?;
             cleanup_tasks.push(coord_sort_task);
             cleanup_tasks.push(coord_sort_err_task);
 
@@ -698,22 +687,15 @@ async fn bowtie2_filter(
                     config.base_buffer_size,
                 )
                     .await
-                    .map_err(|e| PipelineError::ToolExecution {
-                        tool: SAMTOOLS_TAG.to_string(),
-                        error: e.to_string(),
-                    })?
+                    .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?
             };
 
-            // Run samtools stats
             let samtools_stats_config = SamtoolsConfig {
                 subcommand: SamtoolsSubcommand::Stats,
                 subcommand_fields: HashMap::new(),
             };
             let samtools_stats_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_stats_config))
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+                .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
 
             let (mut stats_child, stats_stream_task, stats_err_task) = stream_to_cmd(
                 config.clone(),
@@ -723,11 +705,7 @@ async fn bowtie2_filter(
                 StreamDataType::JustBytes,
                 config.args.verbose,
             )
-                .await
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+                .await?;
             cleanup_tasks.push(stats_stream_task);
             cleanup_tasks.push(stats_err_task);
 
@@ -740,19 +718,96 @@ async fn bowtie2_filter(
                     config.base_buffer_size,
                 )
                     .await
-                    .map_err(|e| PipelineError::ToolExecution {
-                        tool: SAMTOOLS_TAG.to_string(),
-                        error: e.to_string(),
-                    })?
+                    .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?
             };
 
-            // Parse samtools stats
             let (stats_tx, stats_rx) = oneshot::channel();
             let stats_task = tokio::spawn(async move {
-                let stats = parse_samtools_stats(stats_out_stream)
-                    .await
-                    .map_err(|e| anyhow!("Failed to parse samtools stats: {}", e))?;
-                stats_tx.send(stats).map_err(|_| anyhow!("Failed to send samtools stats"))?;
+                // 1. Collect all lines serially (fast, small data)
+                let mut stats_lines: Vec<String> = Vec::new();
+                let mut stream = ReceiverStream::new(stats_out_stream);
+                while let Some(item) = stream.next().await {
+                    if let ParseOutput::Bytes(b) = item {
+                        if let Ok(s) = String::from_utf8((*b).clone()) {
+                            stats_lines.push(s);
+                        }
+                    }
+                }
+
+                // 2. Parallel parse using thread_pool
+                let thread_pool = &config.thread_pool;
+                let parsed_stats = thread_pool.install(|| {
+                    stats_lines
+                        .par_iter()
+                        .fold(
+                            || SamtoolsStats {
+                                summary: HashMap::new(),
+                                insert_sizes: Vec::new(),
+                                total_pairs: 0,
+                            },
+                            |mut acc, line| {
+                                let line = line.trim();
+                                if line.is_empty() || !line.starts_with('#') {
+                                    return acc;
+                                }
+                                let line = line.trim_start_matches('#').trim();
+                                let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
+
+                                if parts.is_empty() {
+                                    return acc;
+                                }
+
+                                let key = parts[0].trim_end_matches(':');
+
+                                match key {
+                                    "SN" => {
+                                        if parts.len() >= 3 {
+                                            let key_str = parts[1].trim_end_matches(':').to_string();
+                                            let value = parts[2].to_string();
+
+                                            acc.summary.insert(key_str.clone(), value);
+
+                                            if key_str == "reads mapped and paired" {
+                                                if let Ok(count) = parts[2].parse::<u64>() {
+                                                    acc.total_pairs = count;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    "IS" => {
+                                        if parts.len() == 5 {
+                                            if let Ok(size) = parts[1].parse::<u32>() {
+                                                let inward = parts[2].parse::<u64>().unwrap_or(0);
+                                                let outward = parts[3].parse::<u64>().unwrap_or(0);
+                                                let other = parts[4].parse::<u64>().unwrap_or(0);
+                                                let count = inward + outward + other;
+                                                if count > 0 {
+                                                    acc.insert_sizes.push((size, count));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || SamtoolsStats {
+                                summary: HashMap::new(),
+                                insert_sizes: Vec::new(),
+                                total_pairs: 0,
+                            },
+                            |mut a, b| {
+                                a.summary.extend(b.summary);
+                                a.insert_sizes.extend(b.insert_sizes);
+                                a.total_pairs += b.total_pairs;
+                                a
+                            },
+                        )
+                });
+
+                let _ = stats_tx.send(parsed_stats);
                 Ok(())
             });
             cleanup_tasks.push(stats_task);
