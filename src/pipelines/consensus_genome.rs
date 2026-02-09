@@ -24,7 +24,7 @@ use tokio::io::{BufWriter, AsyncWriteExt};
 use crate::cli::Technology;
 use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -1035,6 +1035,13 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
+    let temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
+
 
     let mut minimap2_options = HashMap::new();
     match config.args.technology {
@@ -1092,6 +1099,7 @@ async fn align_to_target(
         subcommand_fields: HashMap::from([
             ("-u".to_string(), None), // Uncompressed
             ("-O".to_string(), Some("bam".to_string())), // BAM output
+            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
             ("-".to_string(), None)
         ]),
     };
