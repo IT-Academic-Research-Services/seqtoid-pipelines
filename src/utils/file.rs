@@ -533,7 +533,7 @@ pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
 pub async fn validate_file_inputs(
     config: &RunConfig,
     cwd: &PathBuf,
-) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String, u64), PipelineError> {
+) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
     // Resolve and validate file1 (required)
     let file1_path: PathBuf = match &config.args.file1 {
         Some(file) => {
@@ -580,19 +580,9 @@ pub async fn validate_file_inputs(
         }
         None => None,
     };
-
-    // Compute total input size (async, accurate)
-    let mut total_size_bytes: u64 = file_size(&file1_path).await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    if let Some(ref file2) = file2_path {
-        let file2_size = file_size(file2).await
-            .map_err(|e| PipelineError::IOError(e.to_string()))?;
-        total_size_bytes += file2_size;
-    }
     
 
-    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base, total_size_bytes))
+    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base))
 }
 
 

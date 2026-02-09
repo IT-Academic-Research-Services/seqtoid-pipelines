@@ -23,33 +23,21 @@ use crate::config::defs::{RunConfig, StreamDataType};
 
 
 /// Detects physical cores (not logical) — fallback to lscpu if sysinfo doesn't distinguish
-async fn detect_physical_cores() -> Result<usize> {
-    let mut system = System::new_all();
-    system.refresh_cpu_specifics(CpuRefreshKind::everything());
-    let logical = system.cpus().len();
+pub fn detect_physical_cores() -> usize {
+    let physical = num_cpus::get_physical();
 
-    // Use lscpu for physical core count
-    let output = TokioCommand::new("lscpu")
-        .output()
-        .await
-        .map_err(|e| anyhow!("Failed to run lscpu: {}", e))?;
-
-    let lscpu_str = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut physical = logical / 2;  // Assume SMT=2
-
-    for line in lscpu_str.lines() {
-        if line.starts_with("Core(s) per socket:") {
-            let cores_per_socket = line.split_whitespace().last().unwrap_or("1").parse::<usize>().unwrap_or(1);
-            if line.starts_with("Socket(s):") {
-                let sockets = line.split_whitespace().last().unwrap_or("1").parse::<usize>().unwrap_or(1);
-                physical = cores_per_socket * sockets;
-                break;
-            }
-        }
+    if physical > 0 {
+        info!("Detected {} physical cores", physical);
+        physical
+    } else {
+        let logical = num_cpus::get();
+        let fallback = logical / 2;
+        warn!(
+            "Failed to detect physical cores (num_cpus returned 0); falling back to {} (logical / 2)",
+            fallback
+        );
+        fallback
     }
-
-    info!("Detected {} physical cores ({} logical)", physical, logical);
-    Ok(physical)
 }
 
 /// Determines number of cores that can be used for CPU based tasks
@@ -68,7 +56,7 @@ pub async fn detect_cores_and_load(args_threads: usize, use_smt: bool) -> Result
     system.refresh_cpu_all();
 
     let logical_cores = system.cpus().len();
-    let physical_cores = detect_physical_cores().await?;
+    let physical_cores = detect_physical_cores();
 
     let max_cores = if use_smt {
         logical_cores
@@ -182,59 +170,24 @@ pub fn generate_rng(seed: Option<u64>) -> StdRng {
 /// # Returns
 ///
 /// Usize of basic buffer size per stream
-pub fn compute_base_buffer_size(available_ram: u64, total_ram: u64, data_type: StreamDataType, stream_threads: usize) -> usize {
-    let record_size = match data_type {
-        StreamDataType::IlluminaFastq => 1_000,    // ~1KB per FASTQ record
-        StreamDataType::OntFastq => 10_000,        // ~10KB for ONT
-        StreamDataType::JustBytes => 500,          // Generic
-    };
+pub fn compute_base_buffer_size(total_input_size_bytes: u64) -> usize {
+    let input_gb = total_input_size_bytes as f64 / 1_000_000_000.0;
 
-    let ram_fraction = if cfg!(target_os = "linux") { 0.5 } else { 0.3 };
-    let min_buffer = 100_000;  // ~100 MB Illumina, ~1 GB ONT
-    let max_buffer = 100_000_000;  // ~100 GB Illumina, ~1 TB ONT
+    // Base scaling: ~100k records per GB input
+    let mut records_per_channel = (input_gb * 100_000.0) as usize;
 
-    // linux trust available unless <10 GiB; macOS: fallback if <20% total
-    let effective_ram = if cfg!(target_os = "linux") && available_ram < 10 * 1_073_741_824 {
-        warn!(
-            "Critically low available RAM ({} GiB); using 50% total RAM",
-            available_ram / 1_073_741_824
-        );
-        total_ram / 2
-    } else if cfg!(target_os = "macos") && available_ram < total_ram / 5 {
-        warn!(
-            "Low available RAM ({} GiB) vs total ({} GiB); using total RAM",
-            available_ram / 1_073_741_824,
-            total_ram / 1_073_741_824
-        );
-        total_ram
-    } else {
-        available_ram
-    };
+    // Hard cap at 1M records/channel (~1 GB for typical reads) — prevents OOM/throttling
+    records_per_channel = records_per_channel.min(1_000_000);
 
-    let total_buffer_bytes = (effective_ram as f64 * ram_fraction) as usize;
-
-    // OOM guard: Cap if buffers exceed input size or minimum threshold
-    let low_ram_threshold = (min_buffer * record_size * stream_threads) as usize;
-    if total_buffer_bytes < low_ram_threshold {
-        warn!(
-            "Low RAM ({} GiB); capping at minimal buffer: {} records",
-            effective_ram / 1_073_741_824,
-            min_buffer
-        );
-        return min_buffer;
-    }
-
-    let max_records = (total_buffer_bytes / record_size) / stream_threads.max(1);
-    let buffer_size = max_records.clamp(min_buffer, max_buffer);
+    // Minimum 10k records/channel — avoid tiny buffers on small inputs
+    records_per_channel = records_per_channel.max(10_000);
 
     debug!(
-        "Computed base buffer size: {} records (~{} MB/channel, ~{} MB total est. for {} streams)",
-        buffer_size,
-        (buffer_size * record_size) / 1_048_576,
-        (buffer_size * record_size * stream_threads) / 1_048_576,
-        stream_threads
+        "Computed base buffer size: {} records/channel (input: {:.1} GB, capped at 1M)",
+        records_per_channel, input_gb
     );
-    buffer_size
+
+    records_per_channel
 }
 
 

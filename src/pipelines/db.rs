@@ -14,7 +14,7 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
 
 
 
-    let (taxid_dir_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base, _total_inuput_size) = validate_file_inputs(&config, &cwd).await?;
+    let (taxid_dir_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
 
     let metadata = fs::metadata(taxid_dir_path.clone())?;
     let file_type = metadata.file_type();
@@ -47,7 +47,7 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 
     info!("Building accession2taxid db.");
 
-    let (mandatory_path, _file2_path, _no_ext_sample_base_buf, _no_ext_sample_base,_total_input_size) = validate_file_inputs(&config, &cwd).await?;
+    let (mandatory_path, _file2_path, _no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
         validate_file_inputs(&config, &cwd).await?;
 
     let gz_paths: Vec<PathBuf> = if mandatory_path.is_dir() {
@@ -96,7 +96,7 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
 pub async fn fasta_offset_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
-    let (fasta_path, _file2_path, sample_base_buf, _no_ext_sample_base, _total_input_size) = validate_file_inputs(&config, &cwd).await?;
+    let (fasta_path, _file2_path, sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
     let fasta_index_path = cwd.join(rename_file_path(&sample_base_buf, None, Some("index.fst"), "_"));
 
     info!("Building FASTA offset {} db for {}", fasta_index_path.display(), fasta_path.display());

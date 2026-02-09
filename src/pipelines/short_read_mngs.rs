@@ -788,7 +788,6 @@ async fn hisat2_filter(
     paired: bool,
     hisat2_options: HashMap<String, Option<String>>,
     output_bam_path: Option<PathBuf>,
-    estimated_input_size_bytes: u64,
     headroom: u64,
 ) -> Result<(
     ReceiverStream<ParseOutput>,
@@ -801,7 +800,7 @@ async fn hisat2_filter(
     let mut cleanup_receivers = Vec::new();
     let mut temp_files = Vec::new();
 
-    let required_space = estimated_input_size_bytes * headroom;
+    let required_space = config.input_size * headroom;
     let ram_available = available_space_for_path(&config.ram_temp_dir).await.unwrap_or(0);
     let use_ram = required_space <= ram_available;
 
@@ -3392,11 +3391,10 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
 ///
 /// # Returns
 
-pub async fn spades_assembly(
+async fn spades_assembly(
     config: Arc<RunConfig>,
     dedup_stream: ReceiverStream<ParseOutput>,
     out_dir: &PathBuf,
-    estimated_input_size: u64,
 ) -> Result<JoinHandle<Result<()>>> {
     let assembly_dir = out_dir.join("assembly");
     fs::create_dir_all(&assembly_dir).await
@@ -3406,7 +3404,7 @@ pub async fn spades_assembly(
         let mut cleanup_tasks = Vec::new();
 
         // 1. Temp dir
-        let est_temp_bytes = estimated_input_size + MAX_SPADES_WORK_DIR;
+        let est_temp_bytes = config.input_size + MAX_SPADES_WORK_DIR;
         let temp_dir = choose_temp_dir(
             est_temp_bytes,
             &config.ram_temp_dir,
@@ -5239,7 +5237,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_hisat2_index: String = config.args.host_hisat2_index.clone()
         .ok_or_else(|| PipelineError::MissingArgument("host_hisat2_index is required".to_string()))?;
 
-    let (file1_path, file2_path, sample_base_buf, sample_base, total_input_size) = validate_file_inputs(&config, &cwd).await?;
+    let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd).await?;
     let paired = file2_path.is_some();
 
     let seed = config.args.seed.unwrap_or_else(|| {
@@ -5345,7 +5343,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         paired,
         hisat2_options,
         None,
-        total_input_size,
         4
 
     )
@@ -5388,7 +5385,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             paired,
             hisat2_options,
             None,
-            total_input_size,
             4
 
         )
@@ -5488,7 +5484,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(non_host_assembly_stream),
         &out_dir,
-        total_input_size,
     ).await?;
 
 

@@ -1913,7 +1913,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base, _total_input_size) = validate_file_inputs(&config, &cwd).await?;
+    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
 
     let technology = config.args.technology.clone();
     

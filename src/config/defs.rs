@@ -202,7 +202,8 @@ pub struct RunConfig {
     pub thread_pool: Arc<ThreadPool>,
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
-    pub input_size_mb: u64,
+    pub input_size: u64,
+    pub max_cores: usize,
     pub available_ram: u64,
     pub rng: StdRng,
     pub log_level: LevelFilter,
@@ -241,17 +242,7 @@ impl RunConfig {
     }
 
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
-        let logical_cores = num_cpus::get();
-        let physical_cores = num_cpus::get_physical(); // Preferred if num_cpus supports it
-
-        // Use physical cores as base for I/O-heavy tools to avoid SMT contention
-        let base_cores = if tag == BOWTIE2_TAG || tag == MINIMAP2_TAG || tag == SAMTOOLS_TAG {
-            physical_cores
-        } else {
-            logical_cores
-        };
-
-        let max_cores = min(base_cores, self.args.threads.max(1));
+        let max_cores = min(self.max_cores, self.args.threads.max(1));
 
         let mut allocation = match self.get_core_allocation(tag, subcommand) {
             CoreAllocation::Maximal => max_cores,
@@ -265,7 +256,7 @@ impl RunConfig {
             allocation = allocation.min(*cap);
         }
 
-        // Per-tool overrides (your existing logic)
+        // Per-tool overrides
         match (tag, subcommand) {
             (PIGZ_TAG, _) => allocation.min(16),
             (FASTP_TAG, _) => allocation.min(32),
@@ -274,13 +265,6 @@ impl RunConfig {
         }
     }
 
-    pub fn get_buffer_size(&self, file_size_mb: u64) -> usize {
-        if file_size_mb > 10_000 { // >10GB
-            (self.base_buffer_size / 10).max(5_000) // ~5k-50k records (~5-50MB for Illumina)
-        } else {
-            self.base_buffer_size // ~100k-1M records (~100MB-1GB)
-        }
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
