@@ -395,6 +395,13 @@ async fn bowtie2_filter(
 
     let paired_compute_insert_stats = paired && compute_insert_stats;
 
+    let temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
+
     // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
@@ -446,6 +453,7 @@ async fn bowtie2_filter(
             ("-n".to_string(), None), // Name-sorted for fastq extraction
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
+            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
             ("-".to_string(), None),
         ]),
     };
@@ -655,6 +663,7 @@ async fn bowtie2_filter(
                 subcommand_fields: HashMap::from([
                     ("-u".to_string(), None),
                     ("-O".to_string(), Some("bam".to_string())),
+                    ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
                     ("-".to_string(), None),
                 ]),
             };
@@ -804,13 +813,12 @@ async fn hisat2_filter(
     let ram_available = available_space_for_path(&config.ram_temp_dir).await.unwrap_or(0);
     let use_ram = required_space <= ram_available;
 
-    let temp_dir = if use_ram {
-        config.ram_temp_dir.clone()
-    } else {
-        config.args.nvme_scratch.as_ref()
-            .map(|s| PathBuf::from(s))
-            .unwrap_or_else(|| PathBuf::from("."))
-    };
+    let temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
 
     // 1. Deinterleave input to files for HISAT2 input
     let (r1_rx, r2_rx_opt, deint_handle) = deinterleave_fastq_stream(
@@ -899,7 +907,7 @@ async fn hisat2_filter(
             ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
             ("-@".to_string(), Some("8".to_string())),
             ("-l".to_string(), Some("1".to_string())),
-            ("-T".to_string(), Some(temp_dir.join("sort_tmp_").to_string_lossy().to_string())),
+            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
         ]),
     };
 
@@ -1481,6 +1489,13 @@ async fn minimap2_filter(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
+    let temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
+
     let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, host_temp_dir,  mut host_ref_tasks) =
         minimap2_index_prep(
             &config,
@@ -1550,6 +1565,7 @@ async fn minimap2_filter(
             ("-n".to_string(), None),
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
+            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
             ("-".to_string(), None),
         ]),
     };
@@ -3717,6 +3733,7 @@ pub async fn process_assembly(
             ("-n".to_string(), None),
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
+            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
             ("-".to_string(), None),
         ]),
     };
