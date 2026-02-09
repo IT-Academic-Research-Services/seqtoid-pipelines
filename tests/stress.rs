@@ -23,7 +23,7 @@ use rayon::ThreadPoolBuilder;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Semaphore};
 use seqtoid_pipelines::cli::Arguments;
-use seqtoid_pipelines::utils::system::{detect_ram, generate_rng};
+use seqtoid_pipelines::utils::system::{detect_cores_and_load, detect_ram, generate_rng};
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -143,7 +143,7 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
 // Helper function to create a RunConfig for tests
 fn create_test_run_config() -> Arc<RunConfig> {
     let args = Arguments {
-        threads: 84, // Matches dual socket AMD Epyc 84c
+        threads: 64,
         ..Default::default()
     };
     let (total_ram, available_ram) = detect_ram()
@@ -157,10 +157,12 @@ fn create_test_run_config() -> Arc<RunConfig> {
         thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(84).build().unwrap()),
         maximal_semaphore: Arc::new(Semaphore::new(84)),
         base_buffer_size: 5_000_000, // Reasonable for 1.5TB RAM
-        input_size_mb: 100,
+        input_size: 100 * 1_048_576,
+        max_cores: 64,
         available_ram: available_ram,
         rng: rng,
-        log_level: LevelFilter::Debug
+        log_level: LevelFilter::Debug,
+        base_backpressure_pause: 1000,
     })
 }
 

@@ -82,6 +82,21 @@ lazy_static! {
     };
 }
 
+lazy_static! {
+    static ref TOOL_THREAD_CAPS: HashMap<&'static str, usize> = {
+        let mut m = HashMap::new();
+        m.insert("bowtie2", 64);
+        m.insert("minimap2", 64);
+        m.insert("samtools", 32);     // Sort is I/O-bound
+        m.insert("spades", 128);      // Compute-heavy
+        m.insert("diamond", 128);     // Compute-heavy
+        m.insert("fastp", 32);        // I/O-bound
+        m.insert("pigz", 16);         // Compression scales poorly >16
+        m.insert("kraken2", 64);      // Memory/I/O heavy
+        m
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SamtoolsSubcommand {
     View,
@@ -187,10 +202,12 @@ pub struct RunConfig {
     pub thread_pool: Arc<ThreadPool>,
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
-    pub input_size_mb: u64,
+    pub input_size: u64,
+    pub max_cores: usize,
     pub available_ram: u64,
     pub rng: StdRng,
     pub log_level: LevelFilter,
+    pub base_backpressure_pause: u64
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -215,9 +232,9 @@ impl RunConfig {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
             (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _)
-            | (MAKEBLASTDB_TAG, _)=> CoreAllocation::Maximal,  // FULL POWER ─=≡Σ((( つ◕ل͜◕)つ
+            | (MAKEBLASTDB_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
-            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _)  => CoreAllocation::High,
+            (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
             (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
@@ -226,7 +243,8 @@ impl RunConfig {
     }
 
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
-        let max_cores = min(num_cpus::get(), self.args.threads);
+        let max_cores = min(self.max_cores, self.args.threads.max(1));
+
         let mut allocation = match self.get_core_allocation(tag, subcommand) {
             CoreAllocation::Maximal => max_cores,
             CoreAllocation::High => ((max_cores as f32 * 0.75) as usize).max(1),
@@ -234,19 +252,17 @@ impl RunConfig {
             CoreAllocation::Minimal => 1,
         };
 
-        match (tag, subcommand) {
-            (PIGZ_TAG, _) => allocation.min(16), // Cap at 16: Compression scales poorly >16
-            (FASTP_TAG, _) => allocation.min(32), // Cap at 32: QC/filtering I/O-bound
-            (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16), // Cap at 16: Diminishing returns for pileup
-            _ => allocation,
+        // Apply tool-specific cap
+        if let Some(cap) = TOOL_THREAD_CAPS.get(tag) {
+            allocation = allocation.min(*cap);
         }
-    }
 
-    pub fn get_buffer_size(&self, file_size_mb: u64) -> usize {
-        if file_size_mb > 10_000 { // >10GB
-            (self.base_buffer_size / 10).max(5_000) // ~5k-50k records (~5-50MB for Illumina)
-        } else {
-            self.base_buffer_size // ~100k-1M records (~100MB-1GB)
+        // Per-tool overrides
+        match (tag, subcommand) {
+            (PIGZ_TAG, _) => allocation.min(16),
+            (FASTP_TAG, _) => allocation.min(32),
+            (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16),
+            _ => allocation,
         }
     }
 }

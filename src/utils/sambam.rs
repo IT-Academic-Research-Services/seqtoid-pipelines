@@ -1,15 +1,18 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use noodles::bam::r#async::io::Reader as BamAsyncReader;
-use noodles::bam::record::Record;
-use noodles::sam::Header;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use rayon::prelude::*;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
+use noodles::bam::r#async::io::Reader as BamAsyncReader;
+use noodles::bam::record::Record;
+use noodles::bam::record::Record as BamRecord;
+use noodles::sam::Header;
 
 use crate::utils::streams::ParseOutput;
 use crate::config::defs::{ClusterInfo, DuplicateClusters};
@@ -46,37 +49,57 @@ fn anyhow_to_io(e: anyhow::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+
+
 pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
     duplicate_clusters: &Arc<HashMap<String, ClusterInfo>>,
     min_contig_size: usize,
-) -> Result<(HashMap<String, String>, HashMap<String, u64>)> {
-
+    thread_pool: &Arc<rayon::ThreadPool>,
+) -> Result<(
+    HashMap<String, String>,           // read2contig
+    HashMap<String, u64>,              // contig_stats (cluster-adjusted)
+    HashMap<String, usize>,            // contig_unique_counts
+)> {
     let byte_stream = ReceiverStream::new(rx).map(|item| match item {
-        ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())), // Clone Vec<u8>, then to Bytes
-        _ => Err(anyhow_to_io(anyhow!(
-            "BAM stream received non-Bytes variant — data loss prevented"
-        ))),
+        ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())),
+        _ => Err(anyhow_to_io(anyhow!("BAM stream received non-Bytes variant"))),
     });
 
     let stream_reader = StreamReader::new(byte_stream);
     let mut bam_reader = BamAsyncReader::new(stream_reader);
 
-    let header = bam_reader
-        .read_header()
-        .await
-        .map_err(|e| anyhow!("BAM header error: {e}"))?;
+    let header = bam_reader.read_header().await.map_err(|e| anyhow!("BAM header error: {}", e))?;
 
-    let mut read2contig = HashMap::with_capacity(20_000_000);
-    let mut contig_stats = HashMap::with_capacity(1024);
-    let mut contig_unique_counts = HashMap::with_capacity(1024);
-    let mut seen_reads = HashSet::with_capacity(20_000_000); // Scales to 100M+ reads, fits 1.5TB RAM
-    let mut record = Record::default(); // Reused: zero per-record allocs
+    // Shared structures
+    let read2contig = Arc::new(Mutex::new(HashMap::with_capacity(20_000_000)));
+    let contig_stats = Arc::new(Mutex::new(HashMap::with_capacity(1024)));
+    let contig_unique_counts = Arc::new(Mutex::new(HashMap::with_capacity(1024)));
+    let seen_reads = Arc::new(Mutex::new(HashSet::with_capacity(20_000_000)));
 
+    // Collect all records
+    let mut records: Vec<BamRecord> = Vec::new();
+    let mut record = BamRecord::default();
     loop {
         match bam_reader.read_record(&mut record).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
+            Ok(0) => break,
+            Ok(_) => records.push(record.clone()),
+            Err(e) => return Err(anyhow!("BAM record read error: {}", e)),
+        }
+    }
+
+    // Chunk and process in parallel
+    let chunk_size = (records.len() / 64).max(1); // Adjust divisor based on cores
+    let chunks: Vec<_> = records.chunks(chunk_size).collect();
+
+    thread_pool.install(|| {
+        chunks.par_iter().for_each(|chunk| {
+            let mut local_read2contig = HashMap::new();
+            let mut local_contig_stats = HashMap::new();
+            let mut local_contig_unique_counts = HashMap::new();
+            let mut local_seen = HashSet::new();
+
+            for record in chunk.iter() {  // ← .iter() gives &BamRecord
                 let flags = record.flags();
                 if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
                     continue;
@@ -88,40 +111,63 @@ pub async fn generate_info_from_bam_stream(
                     .unwrap_or("*")
                     .to_string();
 
-                if !seen_reads.insert(read_name.clone()) {
+                if !local_seen.insert(read_name.clone()) {
                     continue;
                 }
 
-                let rid = record
-                    .reference_sequence_id()
-                    .ok_or_else(|| anyhow!("Missing reference_sequence_id"))??;
+                let rid = match record.reference_sequence_id() {
+                    Some(Ok(rid)) => rid,
+                    _ => continue,
+                };
 
-                let contig_name = header
-                    .reference_sequences()
-                    .get_index(rid)
-                    .ok_or_else(|| anyhow!("Invalid reference ID {rid:?}"))?
-                    .0
-                    .to_string();
-                read2contig.insert(read_name.clone(), contig_name.clone());
+                let contig_name = match header.reference_sequences().get_index(rid) {
+                    Some((name, _)) => name.to_string(),
+                    None => continue,
+                };
+
+                local_read2contig.insert(read_name.clone(), contig_name.clone());
 
                 let cluster_size = duplicate_clusters
                     .get(&read_name)
                     .map(|cluster| cluster.size)
                     .unwrap_or(1u64);
-                
-                *contig_stats.entry(contig_name.clone()).or_insert(0u64) += cluster_size;
-                *contig_unique_counts.entry(contig_name).or_insert(0usize) += 1;
-            }
-            Err(e) => return Err(anyhow!("BAM record error: {e}")), // Propagate: no silent drops
-        }
-    }
 
-    // Retain contigs with >= min_contig_size unique reads
+                *local_contig_stats.entry(contig_name.clone()).or_insert(0) += cluster_size;
+                *local_contig_unique_counts.entry(contig_name).or_insert(0) += 1;
+            }
+
+            // Merge local into global (lock once per chunk)
+            {
+                let mut global_read2contig = read2contig.lock().unwrap();
+                let mut global_contig_stats = contig_stats.lock().unwrap();
+                let mut global_contig_unique_counts = contig_unique_counts.lock().unwrap();
+                let mut global_seen = seen_reads.lock().unwrap();
+
+                global_read2contig.extend(local_read2contig);
+                for (k, v) in local_contig_stats {
+                    *global_contig_stats.entry(k).or_insert(0) += v;
+                }
+                for (k, v) in local_contig_unique_counts {
+                    *global_contig_unique_counts.entry(k).or_insert(0) += v;
+                }
+                global_seen.extend(local_seen);
+            }
+        });
+    });
+
+    // Extract final results
+    let read2contig = Arc::try_unwrap(read2contig).unwrap().into_inner().unwrap();
+    let mut contig_stats = Arc::try_unwrap(contig_stats).unwrap().into_inner().unwrap();
+    let mut contig_unique_counts = Arc::try_unwrap(contig_unique_counts).unwrap().into_inner().unwrap();
+
+    // Apply min unique read filter
     contig_stats.retain(|contig_name, _| {
         contig_unique_counts.get(contig_name).copied().unwrap_or(0) >= min_contig_size
     });
 
-    Ok((read2contig, contig_stats))
+    contig_unique_counts.retain(|contig_name, _| contig_stats.contains_key(contig_name));
+
+    Ok((read2contig, contig_stats, contig_unique_counts))
 }
 
 #[cfg(test)]

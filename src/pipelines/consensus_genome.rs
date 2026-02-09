@@ -24,7 +24,7 @@ use tokio::io::{BufWriter, AsyncWriteExt};
 use crate::cli::Technology;
 use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file};
+use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir};
 use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand};
@@ -113,7 +113,7 @@ async fn validate_input(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::IlluminaFastq,  // Semantically FASTQ bytes
         "validate_input".to_string(),
         None,
@@ -339,7 +339,7 @@ async fn align_to_host(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "align_to_host".to_string(),
         None,
@@ -478,7 +478,7 @@ async fn process_ercc(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "process_ercc_bypass".to_string(),
         None,
@@ -551,7 +551,7 @@ async fn process_ercc(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "process_ercc_empty_check".to_string(),
         None,
@@ -721,7 +721,7 @@ async fn process_ercc(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "process_ercc_stats".to_string(),
         None,
@@ -949,7 +949,7 @@ async fn filter_with_kraken(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::IlluminaFastq,
         "filter_reads_output".to_string(),
         None,
@@ -1035,6 +1035,13 @@ async fn align_to_target(
     let mut cleanup_receivers = vec![];
     let mut quast_write_tasks = vec![];
 
+    let temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
+
 
     let mut minimap2_options = HashMap::new();
     match config.args.technology {
@@ -1092,6 +1099,7 @@ async fn align_to_target(
         subcommand_fields: HashMap::from([
             ("-u".to_string(), None), // Uncompressed
             ("-O".to_string(), Some("bam".to_string())), // BAM output
+            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
             ("-".to_string(), None)
         ]),
     };
@@ -1148,7 +1156,7 @@ async fn align_to_target(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "align_to_target".to_string(),
         None
@@ -1364,7 +1372,7 @@ async fn generate_consensus(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "generate_consensus".to_string(),
         None,
@@ -1511,7 +1519,7 @@ async fn call_variants(
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
-        100,
+        config.base_backpressure_pause,
         StreamDataType::JustBytes,
         "call_variants".to_string(),
         None
@@ -1913,7 +1921,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base, _total_input_size) = validate_file_inputs(&config, &cwd).await?;
+    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
 
     let technology = config.args.technology.clone();
     
@@ -2092,7 +2100,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 config.base_buffer_size,
                 config.args.stall_threshold,
                 None,
-                100,
+                config.base_backpressure_pause,
                 StreamDataType::JustBytes,
                 "pipeline_aligned_sam_split".to_string(),
                 None,

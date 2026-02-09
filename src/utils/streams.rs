@@ -1679,6 +1679,7 @@ mod tests {
             threads: 8, // Laptop
             ..Default::default()
         };
+
         let (total_ram, available_ram) = detect_ram()
             .unwrap_or((16u64 << 30, 8u64 << 30));
         let rng = generate_rng(Some(42));
@@ -1691,10 +1692,12 @@ mod tests {
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
             base_buffer_size: 5_000_000,
-            input_size_mb: 100,
+            input_size: 100 + 1_048_576,
+            max_cores: 8,
             available_ram: available_ram,
             rng: rng,
-            log_level: LevelFilter::Debug
+            log_level: LevelFilter::Debug,
+            base_backpressure_pause: 1000
         })
     }
 

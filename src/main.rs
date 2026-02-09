@@ -87,8 +87,8 @@ async fn main() -> Result<()> {
     debug!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
     debug!("Total RAM: {} bytes (~{} GiB)", total_ram, total_ram / 1_073_741_824);
 
-    let input_size_mb = get_input_size_mb(&args.file1, &args.file2).unwrap_or(0);
-    debug!("Total input file size: {} MB", input_size_mb);
+    let input_size = get_input_size(&args.file1, &args.file2).unwrap_or(0);
+    debug!("Total input file size: {} Bytes", input_size);
 
     let rng = generate_rng(args.seed);
 
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-    let base_buffer_size = compute_base_buffer_size(available_ram, total_ram, sdt, stream_threads);
+    let base_buffer_size = compute_base_buffer_size(input_size);
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
@@ -108,10 +108,13 @@ async fn main() -> Result<()> {
         thread_pool,
         maximal_semaphore,
         base_buffer_size,
-        input_size_mb,
+        input_size,
+        max_cores,
         available_ram,
         rng,
-        log_level
+        log_level,
+        base_backpressure_pause: 1000 // NB: hardcoded for testing
+
     });
 
     if let Err(e) = match module.as_str() {
@@ -239,7 +242,7 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
 ///
 /// # Returns
 /// size in MB
-fn get_input_size_mb(file1: &Option<String>, file2: &Option<String>) -> Result<u64> {
+fn get_input_size(file1: &Option<String>, file2: &Option<String>) -> Result<u64> {
     let mut total_size = 0u64;
     if let Some(f1) = file1 {
         total_size += fs::metadata(f1)?.len();
@@ -247,5 +250,5 @@ fn get_input_size_mb(file1: &Option<String>, file2: &Option<String>) -> Result<u
     if let Some(f2) = file2 {
         total_size += fs::metadata(f2)?.len();
     }
-    Ok(total_size / 1_048_576) // Bytes -> MB
+    Ok(total_size) // Bytes -> MB
 }

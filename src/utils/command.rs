@@ -1847,16 +1847,22 @@ pub mod diamond {
 
 
 pub mod spades {
+    // command.rs spades mod - no changes needed (presence check was not failing; kept as is with -v)
     use std::collections::HashMap;
-    use super::*;
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use std::path::PathBuf;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{SPADES_TAG, RunConfig};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+    use log::{debug, info, error, warn};
 
     pub struct SpadesConfig {
-        pub input_path: PathBuf,
+        pub r1_path: PathBuf,                // Always required (R1 or single-end)
+        pub r2_path_opt: Option<PathBuf>,    // Some(R2) for paired, None for single-end
         pub outdir_path: PathBuf,
-        pub paired: bool,
-        pub option_fields: HashMap<String, Option<String>>,
+        pub option_fields: HashMap<String, Option<String>>,  // e.g., {"--only-assembler": None}
     }
+
     pub struct SpadesArgGenerator;
 
     pub async fn spades_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
@@ -1868,41 +1874,43 @@ pub mod spades {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<SpadesConfig>())
-                .ok_or_else(|| anyhow!("Spades requires a SpadesConfig as extra argument"))?;
+                .ok_or_else(|| anyhow!("SPAdes requires a SpadesConfig as extra argument"))?;
 
             let mut args_vec: Vec<String> = Vec::new();
 
-            if config.paired {
-                args_vec.push("--pe1-12".to_string());
+            // Input flags: Separate R1/R2 for paired, single for unpaired
+            if let Some(r2_path) = &config.r2_path_opt {
+                args_vec.push("--pe1-1".to_string());
+                args_vec.push(config.r1_path.to_string_lossy().to_string());
+                args_vec.push("--pe1-2".to_string());
+                args_vec.push(r2_path.to_string_lossy().to_string());
             } else {
                 args_vec.push("-s".to_string());
+                args_vec.push(config.r1_path.to_string_lossy().to_string());
             }
-            args_vec.push(config.input_path.display().to_string());
 
-            // Threads: use what the config allocates (already safe/adaptive)
-            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None);
+            // Threads: Adaptive but capped at 64 (SPAdes doesn't scale well beyond ~32-64)
+            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None).min(64);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
-            args_vec.push("-m".to_string());
-
-            // Conservative memory cap — never give SPAdes more than 256 GB
-            // FScale down aggressively on smaller machines (laptop/test instance)
+            // Memory: Conservative cap — never give SPAdes more than 256 GB
+            // Scale down aggressively on smaller machines
             let available_gb = (run_config.available_ram as f64 / 1_000_000_000.0) as u64;
             let spades_gb = match available_gb {
                 0..=64 => available_gb / 2,           // laptop: 50% (max ~32 GB)
                 65..=256 => available_gb / 3,         // test instance: ~33% (max ~85 GB)
-                _ => 256,                             // cluster: hard cap at 256 GB (SPAdes doesn't need more)
+                _ => 256,                             // cluster: hard cap at 256 GB
             }.max(8);  // minimum 8 GB to avoid SPAdes complaining
 
             info!(
             "SPAdes memory allocation: {} GB (available: {} GB, capped for safety)",
             spades_gb, available_gb
         );
-
+            args_vec.push("-m".to_string());
             args_vec.push(spades_gb.to_string());
 
-            // Custom flags from config (unchanged)
+            // Custom flags from config (e.g., --only-assembler)
             for (key, value) in config.option_fields.iter() {
                 args_vec.push(key.clone());
                 if let Some(v) = value {
@@ -1910,8 +1918,9 @@ pub mod spades {
                 }
             }
 
+            // Output dir
             args_vec.push("-o".to_string());
-            args_vec.push(config.outdir_path.display().to_string());
+            args_vec.push(config.outdir_path.to_string_lossy().to_string());
 
             Ok(args_vec)
         }
