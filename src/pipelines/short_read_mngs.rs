@@ -3811,6 +3811,7 @@ pub async fn process_assembly(
         bam_for_stats,
         &duplicate_clusters,
         config.args.min_contig_length,
+        &config.thread_pool
     )
         .await?;
 
