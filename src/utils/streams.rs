@@ -1696,7 +1696,8 @@ mod tests {
             max_cores: 8,
             available_ram: available_ram,
             rng: rng,
-            log_level: LevelFilter::Debug
+            log_level: LevelFilter::Debug,
+            base_backpressure_pause: 1000
         })
     }
 

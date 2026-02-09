@@ -161,7 +161,8 @@ fn create_test_run_config() -> Arc<RunConfig> {
         max_cores: 64,
         available_ram: available_ram,
         rng: rng,
-        log_level: LevelFilter::Debug
+        log_level: LevelFilter::Debug,
+        base_backpressure_pause: 1000,
     })
 }
 

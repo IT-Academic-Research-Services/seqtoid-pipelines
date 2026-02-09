@@ -112,7 +112,9 @@ async fn main() -> Result<()> {
         max_cores,
         available_ram,
         rng,
-        log_level
+        log_level,
+        base_backpressure_pause: 1000 // NB: hardcoded for testing
+
     });
 
     if let Err(e) = match module.as_str() {

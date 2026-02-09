@@ -207,6 +207,7 @@ pub struct RunConfig {
     pub available_ram: u64,
     pub rng: StdRng,
     pub log_level: LevelFilter,
+    pub base_backpressure_pause: u64
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -264,7 +265,6 @@ impl RunConfig {
             _ => allocation,
         }
     }
-
 }
 
 #[derive(thiserror::Error, Debug)]
