@@ -90,7 +90,7 @@ lazy_static! {
         m.insert("minimap2", 64);
         m.insert("samtools", 32);     // Sort is I/O-bound
         m.insert("spades", 128);      // Compute-heavy
-        m.insert("diamond", 128);     // Compute-heavy
+        m.insert("diamond", 256);  // warp factor 10
         m.insert("fastp", 32);        // I/O-bound
         m.insert("pigz", 16);         // Compression scales poorly >16
         m.insert("kraken2", 64);      // Memory/I/O heavy
