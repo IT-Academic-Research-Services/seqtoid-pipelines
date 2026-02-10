@@ -1889,18 +1889,20 @@ pub mod spades {
                 args_vec.push(config.r1_path.to_string_lossy().to_string());
             }
 
-            // Threads: Adaptive but capped at 64 (SPAdes doesn't scale well beyond ~32-64)
-            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None).min(64);
+            // SPAdes scales decently up to ~80 threads on large machines
+            // Beyond that, memory contention + scheduling overhead usually hurts
+            //no minimum, to allow smaller machines to run
+            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None).min(80);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
-            // Memory: Conservative cap — never give SPAdes more than 256 GB
+            // Memory
             // Scale down aggressively on smaller machines
             let available_gb = (run_config.available_ram as f64 / 1_000_000_000.0) as u64;
             let spades_gb = match available_gb {
-                0..=64 => available_gb / 2,           // laptop: 50% (max ~32 GB)
-                65..=256 => available_gb / 3,         // test instance: ~33% (max ~85 GB)
-                _ => 256,                             // cluster: hard cap at 256 GB
+                0..=128 => available_gb / 2,
+                129..=512 => available_gb / 2,
+                _ => 1000,
             }.max(8);  // minimum 8 GB to avoid SPAdes complaining
 
             info!(
