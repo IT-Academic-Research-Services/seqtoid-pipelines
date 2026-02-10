@@ -5487,25 +5487,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
 
     // Temporary: Skip Diamond by providing empty outputs
-    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    // drop(dummy_tx); // Immediately drop sender to create an empty stream
-    // let non_host_diamond_m8_stream = dummy_rx;
-    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-    // let diamond_ref_temp: Option<PathBuf> = None;
-    // let diamond_index_temp: Option<PathBuf> = None;
-    // let diamond_index_dir: Option<PathBuf> = None;
+    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(dummy_tx); // Immediately drop sender to create an empty stream
+    let non_host_diamond_m8_stream = dummy_rx;
+    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let diamond_ref_temp: Option<PathBuf> = None;
+    let diamond_index_temp: Option<PathBuf> = None;
+    let diamond_index_dir: Option<PathBuf> = None;
 
 
     // Diamond non_host alignment
-    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
-        config.clone(),
-        ReceiverStream::new(non_host_dmnd_stream),
-        paired,
-        sample_base.clone()
-    ).await?;
-    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_dmnd_stream),
+    //     paired,
+    //     sample_base.clone()
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
