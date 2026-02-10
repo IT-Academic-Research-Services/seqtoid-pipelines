@@ -79,7 +79,7 @@ use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_ma
                          write_vecu8_to_file};
 use crate::utils::paf::PafRecord;
 use crate::utils::plotting::plot_insert_sizes;
-use crate::utils::sambam::generate_info_from_bam_stream;
+use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
@@ -387,13 +387,17 @@ async fn bowtie2_filter(
     bt2_index_path: PathBuf,
     paired: bool,
     bowtie2_options: HashMap<String, Option<String>>,
-    output_bam_path: Option<PathBuf>,
-    compute_insert_stats: bool,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Option<oneshot::Receiver<SamtoolsStats>>), PipelineError> {
+    output_bam_path: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,                    // unmapped FASTQ stream
+    oneshot::Receiver<u64>,                         // mapped read count
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,     // cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, // cleanup receivers
+    JoinHandle<Result<()>>,                         // BAM write task handle
+    PathBuf,                                        // written BAM path
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
-
-    let paired_compute_insert_stats = paired && compute_insert_stats;
 
     let temp_dir = choose_temp_dir(
         config.input_size,
@@ -405,7 +409,7 @@ async fn bowtie2_filter(
     // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
-        paired: paired,
+        paired,
         option_fields: bowtie2_options,
     };
 
@@ -446,12 +450,11 @@ async fn bowtie2_filter(
             })?
     };
 
-    // Sort, output uncompressed BAM
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted for fastq extraction
-            ("-u".to_string(), None),
+            ("-n".to_string(), None),          // name-sorted
+            ("-u".to_string(), None),          // uncompressed
             ("-O".to_string(), Some("bam".to_string())),
             ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
             ("-".to_string(), None),
@@ -494,7 +497,11 @@ async fn bowtie2_filter(
             })?
     };
 
-    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 } + if paired_compute_insert_stats { 1 } else { 0 };
+    // ────────────────────────────────────────────────────────────────
+    // T-junction: split for unmapped FASTQ, mapped count, and BAM write
+    // ────────────────────────────────────────────────────────────────
+
+    let num_tees = 3; // unmapped → fastq, count, bam file write
     let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
 
     let (bam_streams, bam_done_rx) = t_junction(
@@ -515,53 +522,59 @@ async fn bowtie2_filter(
     let mut bam_streams_iter = bam_streams.into_iter();
     let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let bam_file_stream = if output_bam_path.is_some() {
-        Some(bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?)
-    } else {
-        None
-    };
-    let insert_stats_stream = if paired_compute_insert_stats {
-        Some(bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?)
-    } else {
-        None
-    };
+    let bam_file_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Handle BAM output if requested
-    if let (Some(bam_path), Some(stream)) = (output_bam_path, bam_file_stream) {
-        let bam_write_task = write_byte_stream_to_file(
-            &bam_path,
-            ReceiverStream::new(stream),
-            Some(config.base_buffer_size),
+
+    let config_for_write = config.clone();
+    let output_bam_path_for_write = output_bam_path.clone();
+
+    // ────────────────────────────────────────────────────────────────
+    // Write full BAM to disk
+    // ────────────────────────────────────────────────────────────────
+
+    let bam_write_task: JoinHandle<Result<()>> = tokio::spawn(async move {
+        write_byte_stream_to_file(
+            &output_bam_path_for_write,
+            ReceiverStream::new(bam_file_stream),
+            Some(config_for_write.base_buffer_size),
         )
             .await
-            .map_err(|e| PipelineError::IOError(e.to_string()))?;
-        cleanup_tasks.push(bam_write_task);
-    }
+            .map_err(|e| anyhow!("Failed to write BAM file {}: {}", output_bam_path_for_write.display(), e))?;
 
-    // Count mapped reads
+        Ok(())
+    });
+
+    // ────────────────────────────────────────────────────────────────
+    // Count mapped reads (rough approximation via line count)
+    // ────────────────────────────────────────────────────────────────
+
     let (count_tx, count_rx) = oneshot::channel();
     let count_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(count_stream);
-        let mut line_count = 0;
+        let mut line_count = 0u64;
         while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(line) if !line.is_empty() => line_count += 1,
-                _ => continue,
+            if let ParseOutput::Bytes(b) = item {
+                if !b.is_empty() {
+                    line_count += 1;
+                }
             }
         }
-        let count = line_count as u64 / if paired { 8 } else { 4 };
-        count_tx.send(count).map_err(|_| anyhow!("Failed to send count"))?;
+        let count = line_count / if paired { 8 } else { 4 }; // rough pair estimate
+        let _ = count_tx.send(count);
         Ok(())
     });
     cleanup_tasks.push(count_task);
 
-    // Samtools fastq to extract unmapped reads
-    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
+    // ────────────────────────────────────────────────────────────────
+    // Samtools fastq: extract unmapped reads
+    // ────────────────────────────────────────────────────────────────
+
+    let unmapped_flag = if paired { "-f13" } else { "-f4" };
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
         subcommand_fields: HashMap::from([
-            (unmapped_flag, None),
-            ("-".to_string(), None), // Output to stdout (interleaved for paired)
+            (unmapped_flag.to_string(), None),
+            ("-".to_string(), None),
         ]),
     };
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
@@ -601,229 +614,13 @@ async fn bowtie2_filter(
             })?
     };
 
-    // Compute insert size metrics if paired and compute_insert_stats is true
-    let insert_stats_rx = if paired_compute_insert_stats {
-        let insert_stats_stream = insert_stats_stream.unwrap();
-
-        let (mut stats_streams, stats_done_rx) = t_junction(
-            ReceiverStream::new(insert_stats_stream),
-            2,
-            config.base_buffer_size,
-            config.args.stall_threshold,
-            None,
-            config.base_backpressure_pause,
-            StreamDataType::JustBytes,
-            "insert_stats_split".to_string(),
-            None,
-        )
-            .await
-            .map_err(|_| PipelineError::StreamDataDropped)?;
-        cleanup_receivers.push(stats_done_rx);
-
-        let mut stats_streams_iter = stats_streams.into_iter();
-        let count_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-        let process_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-        let (count_tx, count_rx) = oneshot::channel();
-        let count_task = tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(count_stream);
-            let mut line_count = 0;
-            while let Some(item) = stream.next().await {
-                if let ParseOutput::Bytes(line) = item {
-                    if !line.is_empty() {
-                        line_count += 1;
-                    }
-                }
-            }
-            let _ = count_tx.send(line_count);
-            Ok(())
-        });
-        cleanup_tasks.push(count_task);
-
-        let bam_line_count = count_rx
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("BAM count receiver failed: {}", e)))?;
-
-        if bam_line_count == 0 {
-            warn!("No mapped reads in BAM for insert size stats; skipping samtools stats");
-            let (stats_tx, stats_rx) = oneshot::channel();
-            let _ = stats_tx.send(SamtoolsStats {
-                summary: HashMap::new(),
-                insert_sizes: Vec::new(),
-                total_pairs: 0,
-            });
-            Some(stats_rx)
-        } else {
-            let samtools_coord_sort_config = SamtoolsConfig {
-                subcommand: SamtoolsSubcommand::Sort,
-                subcommand_fields: HashMap::from([
-                    ("-u".to_string(), None),
-                    ("-O".to_string(), Some("bam".to_string())),
-                    ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
-                    ("-".to_string(), None),
-                ]),
-            };
-            let samtools_coord_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_coord_sort_config))
-                .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
-
-            let (mut coord_sort_child, coord_sort_task, coord_sort_err_task) = stream_to_cmd(
-                config.clone(),
-                process_stream,
-                SAMTOOLS_TAG,
-                samtools_coord_sort_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-            )
-                .await?;
-            cleanup_tasks.push(coord_sort_task);
-            cleanup_tasks.push(coord_sort_err_task);
-
-            let coord_sort_out_stream = {
-                let mut guard = coord_sort_child.lock().await;
-                parse_child_output(
-                    &mut guard,
-                    ChildStream::Stdout,
-                    ParseMode::Bytes,
-                    config.base_buffer_size,
-                )
-                    .await
-                    .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?
-            };
-
-            let samtools_stats_config = SamtoolsConfig {
-                subcommand: SamtoolsSubcommand::Stats,
-                subcommand_fields: HashMap::new(),
-            };
-            let samtools_stats_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_stats_config))
-                .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
-
-            let (mut stats_child, stats_stream_task, stats_err_task) = stream_to_cmd(
-                config.clone(),
-                coord_sort_out_stream,
-                SAMTOOLS_TAG,
-                samtools_stats_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-            )
-                .await?;
-            cleanup_tasks.push(stats_stream_task);
-            cleanup_tasks.push(stats_err_task);
-
-            let stats_out_stream = {
-                let mut guard = stats_child.lock().await;
-                parse_child_output(
-                    &mut guard,
-                    ChildStream::Stdout,
-                    ParseMode::Bytes,
-                    config.base_buffer_size,
-                )
-                    .await
-                    .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?
-            };
-
-            let (stats_tx, stats_rx) = oneshot::channel();
-            let stats_task = tokio::spawn(async move {
-                // 1. Collect all lines serially (fast, small data)
-                let mut stats_lines: Vec<String> = Vec::new();
-                let mut stream = ReceiverStream::new(stats_out_stream);
-                while let Some(item) = stream.next().await {
-                    if let ParseOutput::Bytes(b) = item {
-                        if let Ok(s) = String::from_utf8((*b).clone()) {
-                            stats_lines.push(s);
-                        }
-                    }
-                }
-
-                // 2. Parallel parse using thread_pool
-                let thread_pool = &config.thread_pool;
-                let parsed_stats = thread_pool.install(|| {
-                    stats_lines
-                        .par_iter()
-                        .fold(
-                            || SamtoolsStats {
-                                summary: HashMap::new(),
-                                insert_sizes: Vec::new(),
-                                total_pairs: 0,
-                            },
-                            |mut acc, line| {
-                                let line = line.trim();
-                                if line.is_empty() || !line.starts_with('#') {
-                                    return acc;
-                                }
-                                let line = line.trim_start_matches('#').trim();
-                                let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
-
-                                if parts.is_empty() {
-                                    return acc;
-                                }
-
-                                let key = parts[0].trim_end_matches(':');
-
-                                match key {
-                                    "SN" => {
-                                        if parts.len() >= 3 {
-                                            let key_str = parts[1].trim_end_matches(':').to_string();
-                                            let value = parts[2].to_string();
-
-                                            acc.summary.insert(key_str.clone(), value);
-
-                                            if key_str == "reads mapped and paired" {
-                                                if let Ok(count) = parts[2].parse::<u64>() {
-                                                    acc.total_pairs = count;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "IS" => {
-                                        if parts.len() == 5 {
-                                            if let Ok(size) = parts[1].parse::<u32>() {
-                                                let inward = parts[2].parse::<u64>().unwrap_or(0);
-                                                let outward = parts[3].parse::<u64>().unwrap_or(0);
-                                                let other = parts[4].parse::<u64>().unwrap_or(0);
-                                                let count = inward + outward + other;
-                                                if count > 0 {
-                                                    acc.insert_sizes.push((size, count));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                acc
-                            },
-                        )
-                        .reduce(
-                            || SamtoolsStats {
-                                summary: HashMap::new(),
-                                insert_sizes: Vec::new(),
-                                total_pairs: 0,
-                            },
-                            |mut a, b| {
-                                a.summary.extend(b.summary);
-                                a.insert_sizes.extend(b.insert_sizes);
-                                a.total_pairs += b.total_pairs;
-                                a
-                            },
-                        )
-                });
-
-                let _ = stats_tx.send(parsed_stats);
-                Ok(())
-            });
-            cleanup_tasks.push(stats_task);
-
-            Some(stats_rx)
-        }
-    } else {
-        None
-    };
-
     Ok((
         ReceiverStream::new(unmapped_fastq_stream),
         count_rx,
         cleanup_tasks,
         cleanup_receivers,
-        insert_stats_rx,
+        bam_write_task,
+        output_bam_path,
     ))
 }
 
@@ -5340,14 +5137,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
     let ercc_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, _ercc_bt2_insert_stats_rx) = bowtie2_filter(
+    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, ercc_bt2_bam_write_handle, ercc_bt2_bam_path) = bowtie2_filter(
         config.clone(),
         val_out_stream,
         ercc_bt2_index_path,
         paired,
         ercc_bt2_options,
-        None,
-        false
+        out_dir.join("ercc_bt2_aligned_sorted.bam"),
     ).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
@@ -5393,14 +5189,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Host filtering: bt2
     let host_bt2_index_path = bowtie2_index_prep(host_bowtie2_index, &cwd)?;
     let host_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers, host_bt2_insert_stats_rx) = bowtie2_filter(
+    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers, host_bt2_bam_write_handle, host_bt2_bam_path) = bowtie2_filter(
         config.clone(),
         ReceiverStream::new(kallisto_bypass_stream),
         host_bt2_index_path,
         paired,
         host_bt2_options,
-        None,
-        true
+        out_dir.join("host_bt2_aligned_sorted.bam"),
     ).await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
@@ -5426,48 +5221,68 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // If host is no huma, run an additional filter stage using a human reference
-    let post_filter_stream  = if config.args.human_host {
+    let mut optional_human_bam_write_handle: Option<JoinHandle<Result<()>>> = None;
+    let mut optional_human_bam_path: Option<PathBuf> = None;
+
+    let post_filter_stream = if config.args.human_host {
         host_hisat2_out_stream
-    }
-    else {
+    } else {
+
         let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
         let human_hisat2_index: String = config.args.human_hisat2_index.clone();
 
-        // human filtering: bt2
         let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
         let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-        let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers, _human_bt2_insert_stats_rx) = bowtie2_filter(
+
+        let (
+            human_bt2_out_stream,
+            _human_bt2_count_rx,
+            human_bt2_cleanup_tasks,
+            human_bt2_cleanup_receivers,
+            human_bt2_bam_write_handle,
+            human_bt2_bam_path,
+        ) = bowtie2_filter(
             config.clone(),
             host_hisat2_out_stream,
             human_bt2_index_path,
             paired,
             human_bt2_options,
-            None,
-            false
-        ).await?;
+            out_dir.join("human_bt2_aligned_sorted.bam"),
+        )
+            .await?;
+
+        cleanup_tasks.extend(human_bt2_cleanup_tasks);
         cleanup_receivers.extend(human_bt2_cleanup_receivers);
 
-        //host filtering hisat2
+        // Save the BAM write handle and path for later awaiting / insert stats
+        optional_human_bam_write_handle = Some(human_bt2_bam_write_handle);
+        optional_human_bam_path = Some(human_bt2_bam_path);
 
         let human_hisat2_index_path = hisat2_index_prep(human_hisat2_index, &cwd)?;
-        let hisat2_options = HashMap::from([]);
-        let (human_hisat2_out_stream, _human_hisat2_count_rx, mut human_hisat2_cleanup_tasks, mut human_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
+        let hisat2_options = HashMap::new();
+
+        let (
+            human_hisat2_out_stream,
+            _human_hisat2_count_rx,
+            mut human_hisat2_cleanup_tasks,
+            mut human_hisat2_cleanup_receivers,
+            hisat_input_files,
+        ) = hisat2_filter(
             config.clone(),
             human_bt2_out_stream,
             human_hisat2_index_path,
             paired,
             hisat2_options,
             None,
-            4
-
+            4,
         )
             .await?;
+
         cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
         cleanup_receivers.append(&mut human_hisat2_cleanup_receivers);
         temp_paths.extend(hisat_input_files);
 
         human_hisat2_out_stream
-
     };
 
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
@@ -5661,25 +5476,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
 
     // Temporary: Skip Diamond by providing empty outputs
-    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    // drop(dummy_tx); // Immediately drop sender to create an empty stream
-    // let non_host_diamond_m8_stream = dummy_rx;
-    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-    // let diamond_ref_temp: Option<PathBuf> = None;
-    // let diamond_index_temp: Option<PathBuf> = None;
-    // let diamond_index_dir: Option<PathBuf> = None;
+    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(dummy_tx); // Immediately drop sender to create an empty stream
+    let non_host_diamond_m8_stream = dummy_rx;
+    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let diamond_ref_temp: Option<PathBuf> = None;
+    let diamond_index_temp: Option<PathBuf> = None;
+    let diamond_index_dir: Option<PathBuf> = None;
 
 
     // Diamond non_host alignment
-    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
-        config.clone(),
-        ReceiverStream::new(non_host_dmnd_stream),
-        paired,
-        sample_base
-    ).await?;
-    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_dmnd_stream),
+    //     paired,
+    //     sample_base
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
@@ -6535,57 +6350,54 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let ercc_mapped_count = ercc_count_rx.await
         .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
 
+    ercc_bt2_bam_write_handle.await??;
+    host_bt2_bam_write_handle.await??;
+    if let Some(handle) = optional_human_bam_write_handle {
+        handle.await??;
+    }
+
     let host_bt2_counts = host_bt2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
     info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
-    if let Some(insert_stats_rx) = host_bt2_insert_stats_rx {
-        match insert_stats_rx.await {
-            Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
-                info!("Host bt2 insert size stats available – generating Picard files");
-
-                let metrics_path = out_dir.join("picard_insert_metrics.txt");
-                let mut metrics_file = std::fs::File::create(&metrics_path)
-                    .context("Failed to create picard_insert_metrics.txt")?;
 
 
-                writeln!(metrics_file, "## HISTOGRAM\tinsert_size")?;
-                for &(size, count) in &insert_stats.insert_sizes {
-                    writeln!(metrics_file, "{}\t{}", size, count)?;
-                }
-                //  minimal summary line that matches real Picard output format
-                let mean: f64 = insert_stats.insert_sizes.iter()
-                    .map(|&(s, c)| s as f64 * c as f64)
-                    .sum::<f64>() / insert_stats.total_pairs as f64;
-                let variance: f64 = insert_stats.insert_sizes.iter()
-                    .map(|&(s, c)| {
-                        let dev = s as f64 - mean;
-                        dev * dev * c as f64
-                    })
-                    .sum::<f64>() / insert_stats.total_pairs as f64;
-                let stddev = variance.sqrt();
+    // insert size, now host BAM written out
+    if paired {
 
-                writeln!(metrics_file, "## METRICS\tMEAN_INSERT_SIZE\t{:.2}\tMEDIAN_INSERT_SIZE\t{:.0}\tSTANDARD_DEVIATION\t{:.2}",
-                         mean, mean, stddev)?;  // median approximated as mean for simplicity
+        info!("Computing host insert size statistics from {}", host_bt2_bam_path.display());
 
-                let histogram_path = out_dir.join("insert_size_histogram.png");
-                let sample_name = sample_base_buf
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("sample")
-                    .to_string();
+        let stats = compute_insert_size_stats_from_bam(
+            host_bt2_bam_path.clone(),
+            None,
+            &config.thread_pool,
+        )
+            .await
+            .context("Failed to compute insert size stats")?;
 
-                let plot_task = tokio::spawn(async move {
-                    plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &histogram_path)
-                        .map_err(|e| anyhow!("Failed to plot insert sizes: {}", e))?;
-                    Ok(())
-                });
-                cleanup_tasks.push(plot_task);
-            }
-            Ok(_) => warn!("No insert size stats available; skipping Picard metrics"),
-            Err(e) => error!("Host bt2 insert stats receiver failed: {}", e),
+        // Write Picard-style metrics file
+        let metrics_path = out_dir.join("host_insert_metrics.txt");
+        let mut f = std::fs::File::create(&metrics_path)
+            .context("Failed to create insert metrics file")?;
+
+        writeln!(f, "## METRICS")?;
+        writeln!(f, "MEAN_INSERT_SIZE\t{:.2}", stats.mean)?;
+        writeln!(f, "MEDIAN_INSERT_SIZE\t{:.0}", stats.median)?;
+        writeln!(f, "STANDARD_DEVIATION\t{:.2}", stats.stddev)?;
+        writeln!(f, "TOTAL_PROPER_PAIRS\t{}", stats.total_proper_pairs)?;
+        writeln!(f, "\n## HISTOGRAM\tinsert_size\tcount")?;
+        for &(size, count) in &stats.insert_sizes {
+            writeln!(f, "{}\t{}", size, count)?;
         }
+
+        let plot_path = out_dir.join("host_insert_size_histogram.png");
+        if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
+            warn!("Failed to plot insert size histogram: {}", e);
+        }
+
+        info!("Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
+          stats.mean, stats.median, stats.total_proper_pairs);
     }
 
     let host_hisat2_counts = host_hisat2_count_rx
