@@ -31,7 +31,7 @@ use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::r1r2_base;
-use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
+use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir, detect_gpus, GpuDetection, GpuInfo};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 use pipelines::db;
@@ -82,6 +82,25 @@ async fn main() -> Result<()> {
         .expect("Failed to create thread pool"));
 
     let maximal_semaphore = Arc::new(Semaphore::new(2));
+
+    let gpu_info = detect_gpus().unwrap_or(GpuDetection { count: 0, gpus: vec![] });
+
+    if gpu_info.count > 0 {
+        for gpu in &gpu_info.gpus {
+            info!(
+            "GPU {}: {} ({}{} MiB)",
+            gpu.index,
+            gpu.name,
+            gpu.memory_mib.map_or("?".to_string(), |m| m.to_string()),
+            if gpu.memory_mib.is_some() { "" } else { "unknown" }
+        );
+        }
+
+        // Example: decide whether to use MMseqs2-GPU
+        // if gpu_info.gpus.iter().any(|g| g.name.contains("H100") || g.name.contains("L40")) {
+        //     // enable GPU path
+        // }
+    }
 
     let (total_ram, available_ram) = detect_ram()?;
     debug!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);

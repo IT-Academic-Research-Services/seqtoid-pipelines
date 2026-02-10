@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::process::Command;
 
 use log::{self, LevelFilter, debug, info, error, warn};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
@@ -275,4 +276,146 @@ fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub fn detect_gpus() -> Result<GpuDetection> {
+    #[cfg(target_os = "linux")]
+    {
+        // Try nvidia-smi first (most reliable on your cluster)
+        if let Ok(nvidia) = detect_nvidia() {
+            if !nvidia.gpus.is_empty() {
+                info!("Detected {} NVIDIA GPU(s): {:?}", nvidia.count, nvidia.gpus);
+                return Ok(nvidia);
+            }
+        }
+
+        // Fallback: very basic lspci detection (just count + rough names)
+        if let Ok(basic) = detect_lspci_basic() {
+            if basic.count > 0 {
+                info!("Detected {} GPU(s) via lspci (no nvidia-smi available)");
+                return Ok(basic);
+            }
+        }
+
+        debug!("No GPUs detected on Linux");
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(macos) = detect_macos() {
+            if macos.count > 0 {
+                info!("Detected {} GPU(s) on macOS: {:?}", macos.count, macos.gpus);
+                return Ok(macos);
+            }
+        }
+        debug!("No GPUs detected on macOS");
+        Ok(GpuDetection { count: 0, gpus: vec![] })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        warn!("GPU detection not implemented for this platform");
+        Ok(GpuDetection { count: 0, gpus: vec![] })
+    }
+}
+
+
+fn detect_nvidia() -> Result<GpuDetection> {
+    // Query name + memory + driver
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .map_err(|e| anyhow!("nvidia-smi not found or failed: {}", e))?;
+
+    if !output.status.success() {
+        debug!("nvidia-smi command failed");
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut gpus = vec![];
+
+    for (i, line) in stdout.lines().enumerate() {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let index = i;
+        let name = parts[1].to_string();
+        let memory_str = parts[2].trim_end_matches(" MiB");
+        let memory_mib = memory_str.parse::<u64>().ok();
+        let driver = Some(parts[3].to_string());
+
+        gpus.push(GpuInfo {
+            index,
+            name,
+            memory_mib,
+            is_discrete: true,           // NVIDIA cards are always discrete
+            driver,
+        });
+    }
+
+    Ok(GpuDetection {
+        count: gpus.len(),
+        gpus,
+    })
+}
+
+fn detect_macos() -> Result<GpuDetection> {
+    let output = Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+        .map_err(|e| anyhow!("system_profiler failed: {}", e))?;
+
+    if !output.status.success() {
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Very simple parsing — real parsing would use serde_json, but we avoid extra deps here
+    let mut gpus = vec![];
+    let mut index = 0;
+
+    for line in stdout.lines() {
+        if line.contains("\"Chipset Model\":") || line.contains("\"Device Name\":") {
+            let name = line
+                .split(':')
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches(',')
+                .to_string();
+
+            gpus.push(GpuInfo {
+                index,
+                name: if name.is_empty() { "Apple GPU".to_string() } else { name },
+                memory_mib: None,           // macOS doesn't expose easily via CLI
+                is_discrete: false,         // Apple Silicon is integrated
+                driver: None,
+            });
+            index += 1;
+        }
+    }
+
+    // Fallback: assume at least 1 on modern Macs
+    if gpus.is_empty() {
+        gpus.push(GpuInfo {
+            index: 0,
+            name: "Apple integrated GPU".to_string(),
+            memory_mib: None,
+            is_discrete: false,
+            driver: None,
+        });
+    }
+
+    Ok(GpuDetection {
+        count: gpus.len(),
+        gpus,
+    })
 }
