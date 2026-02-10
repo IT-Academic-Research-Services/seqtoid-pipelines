@@ -2647,15 +2647,26 @@ async fn diamond_non_host_align(
     ) .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // ("--bin".to_string(), Some("1".to_string())),
-    // ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
-    // ("--range-culling".to_string(), None),
+
+    let threads = config.thread_allocation(DIAMOND_TAG, None);
+    let index_chunks = if threads >= 192 {
+        24
+    } else if threads >= 128 {
+        16
+    } else if threads >= 64 {
+        12
+    } else if threads >= 32 {
+        8
+    } else {
+        4
+    };
+
+    info!("Diamond threads: {}, index-chunks: {}", threads, index_chunks);
 
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
-        ("--block-size".to_string(), Some("100".to_string())),
-        ("-c".to_string(), Some("12".to_string())),
-        // ("--hit-membuf".to_string(), None),
+        ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
+        ("-c".to_string(), Some(index_chunks.to_string())),
         ("-f".to_string(), Some("6".to_string())),
         ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
         ("--tmpdir".to_string(), Some(diamond_tmpdir.to_string_lossy().into_owned())),
@@ -5476,25 +5487,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
 
     // Temporary: Skip Diamond by providing empty outputs
-    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    drop(dummy_tx); // Immediately drop sender to create an empty stream
-    let non_host_diamond_m8_stream = dummy_rx;
-    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-    let diamond_ref_temp: Option<PathBuf> = None;
-    let diamond_index_temp: Option<PathBuf> = None;
-    let diamond_index_dir: Option<PathBuf> = None;
+    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    // drop(dummy_tx); // Immediately drop sender to create an empty stream
+    // let non_host_diamond_m8_stream = dummy_rx;
+    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    // let diamond_ref_temp: Option<PathBuf> = None;
+    // let diamond_index_temp: Option<PathBuf> = None;
+    // let diamond_index_dir: Option<PathBuf> = None;
 
 
     // Diamond non_host alignment
-    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
-    //     config.clone(),
-    //     ReceiverStream::new(non_host_dmnd_stream),
-    //     paired,
-    //     sample_base
-    // ).await?;
-    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
+        config.clone(),
+        ReceiverStream::new(non_host_dmnd_stream),
+        paired,
+        sample_base.clone()
+    ).await?;
+    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
