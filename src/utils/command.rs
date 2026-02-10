@@ -1750,61 +1750,59 @@ pub mod diamond {
     }
 
     pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
-        let db_path_base = run_config.args.diamond_db.as_deref()
-            .ok_or_else(|| anyhow!("--diamond-db not provided"))?;
-
-        // Auto-append .dmnd if missing
-        let db_path = if db_path_base.ends_with(".dmnd") {
-            db_path_base.to_string()
-        } else {
-            format!("{}.dmnd", db_path_base)
-        };
-
-        debug!("Using DB path for stats: {}", db_path);
-
         let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
 
-        let scratch_path_str = run_config.args.nvme_scratch.as_deref().unwrap_or(".");
-        let scratch_path = PathBuf::from(scratch_path_str);
-        let scratch_space = available_space_for_path(&scratch_path).await?;
+        // Get real DB size if possible
+        let db_path = run_config.args.diamond_db.as_deref()
+            .ok_or_else(|| anyhow!("--diamond-db required"))?;
+        let db_path = if db_path.ends_with(".dmnd") {
+            db_path.to_string()
+        } else {
+            format!("{}.dmnd", db_path)
+        };
 
         let db_stats = get_diamond_db_stats(&db_path).await
-            .unwrap_or_else(|e| {
-                warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
-                (0, 300_000_000_000)  // sequences, letters
-            });
+            .unwrap_or((0, 300_000_000_000)); // fallback NR size
 
-        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
+        let total_letters_billions = db_stats.1 as f64 / 1e9;
 
-        let ram_based_b = available_ram_gb / 20.0;
+        // RAM scaling — blastx needs roughly 10–14 GB per billion letters
+        let ram_factor = if available_ram_gb >= 1000.0 {  // EPYC / r6id
+            10.0
+        } else if available_ram_gb >= 128.0 {  // decent server
+            12.0
+        } else {  // laptop
+            15.0
+        };
 
-        let mut block_size = ram_based_b
-            .min(total_letters_billions)
-            .max(6.0)
-            .floor();
+        let mut block_size = available_ram_gb / ram_factor;
 
-        let db_file_gb = std::fs::metadata(&db_path)
-            .map(|m| m.len() as f64 / 1_073_741_824.0)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get DB file size: {}. Skipping scratch derate.", e);
-                0.0
-            });
+        // Never exceed DB size
+        block_size = block_size.min(total_letters_billions);
 
-        if scratch_space < (db_file_gb * 2.0) as u64 {
-            warn!("Low scratch; reducing block size by 40%");
-            block_size *= 0.6;
+        // Safety floors and caps
+        block_size = block_size.max(6.0);
+        block_size = block_size.min(200.0);  // very large block sizes can cause issues
+
+        // Scratch space check
+        let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
+        let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
+        let db_size_gb = std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1e9 / 1_073_741_824.0)
+            .unwrap_or(50.0);  // fallback ~50 GB for NR
+
+        if scratch_avail < (db_size_gb * 2.0) as u64 {
+            warn!("Low scratch space — reducing block size by 30%");
+            block_size *= 0.7;
         }
 
-        debug!(
-    "Computed --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
-    block_size,
-    available_ram_gb,
-    db_stats.1 as f64 / 1e9,
-    scratch_space as f64 / 1_073_741_824.0
-);
+        info!(
+        "Diamond block size: {:.1} (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
+        block_size, available_ram_gb, total_letters_billions, scratch_avail as f64 / 1e9 / 1_073_741_824.0
+    );
 
-        Ok(block_size.max(6.0))
+        Ok(block_size)
     }
 
     async fn get_diamond_db_stats(db_path: &str) -> AnyhowResult<(u64, u64)> {
