@@ -86,6 +86,7 @@ lazy_static! {
     static ref TOOL_THREAD_CAPS: HashMap<&'static str, usize> = {
         let mut m = HashMap::new();
         m.insert("bowtie2", 64);
+        m.insert("hisat2", 64);
         m.insert("minimap2", 64);
         m.insert("samtools", 32);     // Sort is I/O-bound
         m.insert("spades", 128);      // Compute-heavy
@@ -231,7 +232,7 @@ impl RunConfig {
         match (tag, subcommand) {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
-            (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _)
+            (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _) | (HISAT2_TAG, _)
             | (MAKEBLASTDB_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
@@ -262,6 +263,7 @@ impl RunConfig {
             (PIGZ_TAG, _) => allocation.min(16),
             (FASTP_TAG, _) => allocation.min(32),
             (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16),
+            (HISAT2_TAG, _) => allocation.min(64), //scales a bit worse than bt2
             _ => allocation,
         }
     }
