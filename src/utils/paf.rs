@@ -1,5 +1,13 @@
 // Functions and definitions for the minimap2-associated PAF file format
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::mpsc::Sender;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};  
+
+use crate::utils::streams::ParseOutput;
 
 const LAMBDA: f64 = 1.58;
 const K: f64 = 0.1;
@@ -54,6 +62,81 @@ impl PafRecord {
         })
     }
 
+    pub fn alignment_score(&self) -> i32 {
+        self.tags
+            .get("AS")
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0)
+    }
+
+    pub fn to_paf_line(&self) -> String {
+        let mut line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.qname, self.qlen, self.qstart, self.qend, self.strand,
+            self.tname, self.tlen, self.tstart, self.tend, self.nmatch, self.alen, self.mapq,
+        );
+
+        for (key, value) in &self.tags {
+            line.push_str(&format!("\t{}:Z:{}", key, value));
+        }
+
+        line
+    }
+
+    pub async fn merge_paf_streams(
+        mut streams: Vec<ReceiverStream<ParseOutput>>,
+        tx: Sender<ParseOutput>,
+        _buffer_size: usize,  // unused but kept for signature compatibility
+    ) -> Result<()> {
+        let mut query_hits: HashMap<String, Vec<PafRecord>> = HashMap::new();
+
+        // Collect all PAF records from all partial streams
+        for mut stream in streams {
+            while let Some(item) = stream.next().await {
+                match item {
+                    ParseOutput::Bytes(bytes) => {
+                        let line = String::from_utf8_lossy(&*bytes).trim().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let record = PafRecord::parse_line(&line)?;
+                        query_hits
+                            .entry(record.qname.clone())
+                            .or_default()
+                            .push(record);
+                    }
+                    _ => {
+                        return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
+                    }
+                }
+            }
+        }
+
+        // Sort queries alphabetically for deterministic output
+        let mut queries: Vec<String> = query_hits.keys().cloned().collect();
+        queries.sort();
+
+        // For each query: sort by descending AS score, keep top 6 hits
+        for query in queries {
+            if let Some(mut hits) = query_hits.remove(&query) {
+                hits.sort_by_key(|h| Reverse(h.alignment_score()));
+                hits.truncate(6);  // 1 primary + up to 5 secondaries
+
+                for hit in hits {
+                    let paf_line = hit.to_paf_line();
+                    tx.send(ParseOutput::Bytes(Arc::new(paf_line.into_bytes())))
+                        .await
+                        .map_err(|e| anyhow!("Failed to send merged PAF line: {}", e))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Your existing methods (unchanged)
+    // ────────────────────────────────────────────────────────────────
     fn calc_bitscore(&self) -> f64 {
         let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let alen = self.alen as f64;
@@ -87,15 +170,11 @@ impl PafRecord {
         }
     }
 
-
     fn extract_accession(&self) -> String {
-        // Strategy:
-        // 1. Try to find NT: or NR: prefix (CZ ID style)
-        // 2. If not, take first word after space/tab, strip '>' if present, else keep as-is
         self.tname
             .split(':')
             .find(|part| part.starts_with("NT:") || part.starts_with("NR:"))
-            .and_then(|s| s.split('|').next())  // strip |kraken:taxid|
+            .and_then(|s| s.split('|').next())
             .map(|s| s.trim().to_string())
             .or_else(|| {
                 self.tname
@@ -107,9 +186,7 @@ impl PafRecord {
     }
 
     pub fn to_m8_line(&self, genome_size: f64) -> String {
-
         let accession = self.extract_accession();
-        // NCBI policy: All versions of a GenBank accession (e.g., MT093571.1, MT093571.2) map to the same taxid.
         let base_accession = accession.split('.').next().unwrap_or(&accession).to_string();
 
         if accession.is_empty() {

@@ -200,6 +200,7 @@ async fn align_to_host(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: host_index_path,
+        input_path: None,
         option_fields: minimap2_options.clone(),
     };
 
@@ -503,6 +504,7 @@ async fn process_ercc(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: ercc_index_path,
+        input_path: None,
         option_fields: minimap2_options.clone(),
     };
 
@@ -1055,6 +1057,7 @@ async fn align_to_target(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: target_index_path,
+        input_path: None,
         option_fields: minimap2_options.clone(),
     };
 
@@ -1099,7 +1102,7 @@ async fn align_to_target(
         subcommand_fields: HashMap::from([
             ("-u".to_string(), None), // Uncompressed
             ("-O".to_string(), Some("bam".to_string())), // BAM output
-            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
+            ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
             ("-".to_string(), None)
         ]),
     };

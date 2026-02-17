@@ -9,6 +9,7 @@ use crate::config::defs::GZIP_EXT;
 use log::{self, LevelFilter, debug, info, error, warn};
 use anyhow::{Result, anyhow};
 use tempfile::NamedTempFile;
+use tempfile::TempDir;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::streams::ParseOutput;
@@ -684,9 +685,8 @@ pub async fn choose_temp_dir(
     ram_dir: &PathBuf,
     nvme_scratch: &Option<String>,
     headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
-) -> Result<PathBuf> {
-
-    async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool> {
+) -> Result<TempDir, PipelineError> {
+    async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool, PipelineError> {
         let avail = available_space_for_path(path).await?;
         Ok(required <= avail / factor)
     }
@@ -700,7 +700,8 @@ pub async fn choose_temp_dir(
             available_space_for_path(ram_dir).await?,
             headroom_factor
         );
-        return Ok(ram_dir.clone());
+        return TempDir::new_in(ram_dir)
+            .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in RAM dir {}: {}", ram_dir.display(), e)));
     }
 
     // 2. Try NVMe scratch if provided
@@ -713,7 +714,8 @@ pub async fn choose_temp_dir(
                 estimated_bytes,
                 headroom_factor
             );
-            return Ok(nvme_path.clone());
+            return TempDir::new_in(&nvme_path)
+                .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in NVMe dir {}: {}", nvme_path.display(), e)));
         } else {
             warn!(
                 "NVMe scratch {} insufficient: need {} bytes (/{})",
@@ -728,11 +730,10 @@ pub async fn choose_temp_dir(
 
     // 3. Final fallback: system temp
     debug!(
-        "Falling back to system temp dir {} (RAM/NVMe insufficient or unavailable)",
-        std::env::temp_dir().display()
+        "Falling back to system temp dir (RAM/NVMe insufficient or unavailable)"
     );
-    Ok(std::env::temp_dir())
-
+    TempDir::new()
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))
 }
 
 #[cfg(test)]

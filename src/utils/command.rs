@@ -198,25 +198,33 @@ mod h5dump {
     }
 }
 
-
 pub mod minimap2 {
     use std::collections::HashMap;
-    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio::fs;
-    use tempfile::TempDir;
+    use tokio::task::JoinHandle;
+    use tempfile::{NamedTempFile, TempDir};
     use log::{self, LevelFilter, debug, info, error, warn};
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG, FASTA_EXTS};
     use crate::utils::file::available_space_for_path;
+    use crate::utils::command::{ArgGenerator, version_check, spawn_cmd};
+    use crate::utils::streams::ChildStream;
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
+        pub input_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
         pub option_fields: HashMap<String, Option<String>>,
     }
+
     pub struct Minimap2ArgGenerator;
 
     pub async fn minimap2_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
         let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file).await?;
         Ok(version)
     }
+
     pub async fn minimap2_index_prep(
         config: &RunConfig,
         ram_temp_dir: &PathBuf,
@@ -225,7 +233,7 @@ pub mod minimap2 {
         ref_type: &str,
     ) -> Result<
         (
-            Option<PathBuf>,             // FASTa path
+            Option<PathBuf>,             // FASTA path
             PathBuf,                     // index path (.mmi)
             Option<NamedTempFile>,       // FASTA temp
             Option<NamedTempFile>,       // Index temp
@@ -242,7 +250,7 @@ pub mod minimap2 {
         let mut index_temp_dir: Option<TempDir> = None;
 
         match index_path {
-            // pre-existing .mmi index , maybe w split parts
+            // pre-existing .mmi index, maybe w split parts
             Some(index) => {
                 let orig_index_path = PathBuf::from(&index);
                 if !orig_index_path.exists() {
@@ -265,7 +273,7 @@ pub mod minimap2 {
                     PipelineError::InvalidConfig("Invalid UTF-8 in filename".to_string())
                 })?;
 
-                //find split parts: {basename}.part_001.idx, etc. —
+                // find split parts: {basename}.part_001.mmi, etc.
                 let mut split_files: Vec<PathBuf> = Vec::new();
                 let split_prefix = format!("{}.part_", basename);
                 let mut dir_entries = fs::read_dir(orig_dir).await
@@ -275,7 +283,7 @@ pub mod minimap2 {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with(&split_prefix) && name.ends_with(".idx") {
+                            if name.starts_with(&split_prefix) && name.ends_with(".mmi") {
                                 split_files.push(path);
                             }
                         }
@@ -299,7 +307,7 @@ pub mod minimap2 {
                         .map_err(|e| PipelineError::Other(e.into()))?;
                     total_size += meta.len();
                 }
-                
+
                 let buffer = 10 * 1024 * 1024; // 10 megs buffer
                 let avail = available_space_for_path(ram_temp_dir)
                     .await
@@ -344,13 +352,12 @@ pub mod minimap2 {
                     }
                 } else {
                     info!(
-                    "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
-                    ref_type, total_size, avail
-                );
+                        "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
+                        ref_type, total_size, avail
+                    );
                     final_index_path = orig_index_path;
                 }
             }
-
 
             // or build index from FASTA
             None => {
@@ -426,9 +433,6 @@ pub mod minimap2 {
             }
         }
 
-        // ————————————————————————————————————————————————————————————————
-        // FINAL RETURN
-        // ————————————————————————————————————————————————————————————————
         Ok((
             ref_fasta_path,
             final_index_path,
@@ -459,13 +463,21 @@ pub mod minimap2 {
             args_vec.push(num_cores.to_string());
 
             for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
+                args_vec.push(key.clone());
                 if let Some(v) = value {
-                    args_vec.push(format!("{}", v));
+                    args_vec.push(v.clone());
                 }
             }
+
+            // Index path
             args_vec.push(index_path.to_string_lossy().to_string());
-            args_vec.push("-".to_string()); // Query from stdin
+
+            // Input: file if provided, otherwise stdin
+            if let Some(input_path) = &config.input_path {
+                args_vec.push(input_path.to_string_lossy().to_string());
+            } else {
+                args_vec.push("-".to_string()); // stdin
+            }
 
             Ok(args_vec)
         }
