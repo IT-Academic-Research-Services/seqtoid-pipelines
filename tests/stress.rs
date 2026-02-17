@@ -158,6 +158,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
         maximal_semaphore: Arc::new(Semaphore::new(84)),
         base_buffer_size: 5_000_000, // Reasonable for 1.5TB RAM
         input_size: 100 * 1_048_576,
+        physical_cores: 64,
         max_cores: 64,
         available_ram: available_ram,
         rng: rng,

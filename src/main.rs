@@ -31,7 +31,9 @@ use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
 use crate::cli::args::Technology;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::r1r2_base;
-use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir, detect_gpus, GpuDetection, GpuInfo};
+use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
+                           compute_base_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
+                           GpuDetection, GpuInfo};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 use pipelines::db;
@@ -73,6 +75,7 @@ async fn main() -> Result<()> {
     let ram_temp_dir = get_ram_temp_dir();
     info!("The RAM temp directory is {:?}\n", ram_temp_dir);
 
+    let physical_cores = detect_physical_cores();
     let (max_cores, cpu_load) = detect_cores_and_load(args.threads, args.use_smt).await?;
     let stream_threads = compute_stream_threads(max_cores, cpu_load, args.threads, args.use_smt);
 
@@ -128,6 +131,7 @@ async fn main() -> Result<()> {
         maximal_semaphore,
         base_buffer_size,
         input_size,
+        physical_cores,
         max_cores,
         available_ram,
         rng,

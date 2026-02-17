@@ -1693,6 +1693,7 @@ mod tests {
             maximal_semaphore: Arc::new(Semaphore::new(8)),
             base_buffer_size: 5_000_000,
             input_size: 100 + 1_048_576,
+            physical_cores: 4,
             max_cores: 8,
             available_ram: available_ram,
             rng: rng,

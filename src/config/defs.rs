@@ -56,6 +56,8 @@ pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 
 pub const CONFORMING_PREAMBLE: &str = ">family_nr:-300:family_nt:-300:genus_nr:-200:genus_nt:-200:species_nr:-100:species_nt:-100:";
 
+pub const SMT_MODEST_MULTIPLIER: f32 = 1.3_f32;
+
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();
@@ -204,6 +206,7 @@ pub struct RunConfig {
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
     pub input_size: u64,
+    pub physical_cores: usize,
     pub max_cores: usize,
     pub available_ram: u64,
     pub rng: StdRng,
@@ -252,6 +255,21 @@ impl RunConfig {
             CoreAllocation::Low => (max_cores / 3).max(1),
             CoreAllocation::Minimal => 1,
         };
+
+        let prefer_physical = match tag {
+            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG => false, // allow modest SMT
+            BOWTIE2_TAG | HISAT2_TAG | SPADES_TAG | FASTP_TAG | PIGZ_TAG => true,      // physical only
+            _ => false,  // default allow
+        };
+
+        if prefer_physical && self.args.use_smt { // If a program does poorly with SMT, don't allow it even if use_smt true
+            allocation = allocation.min(self.physical_cores);
+        } else if !prefer_physical && self.args.use_smt {
+            // Modest SMT: allow up to ~1.3× physical cores 
+
+            let modest_max = (self.physical_cores as f32 * SMT_MODEST_MULTIPLIER).ceil() as usize;
+            allocation = allocation.min(modest_max);
+        }
 
         // Apply tool-specific cap
         if let Some(cap) = TOOL_THREAD_CAPS.get(tag) {
