@@ -2706,13 +2706,13 @@ async fn diamond_non_host_align(
 
     let threads = config.thread_allocation(DIAMOND_TAG, None);
     let index_chunks = if threads >= 192 {
-        24
+        32
     } else if threads >= 128 {
+        24
+    } else if threads >= 96 {
         16
     } else if threads >= 64 {
         12
-    } else if threads >= 32 {
-        8
     } else {
         4
     };
