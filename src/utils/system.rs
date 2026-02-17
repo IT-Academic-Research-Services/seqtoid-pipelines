@@ -419,3 +419,85 @@ fn detect_macos() -> Result<GpuDetection> {
         gpus,
     })
 }
+
+fn detect_lspci_basic() -> Result<GpuDetection> {
+    let output = Command::new("lspci")
+        .arg("-mm")           // machine-readable format, easier to parse
+        .arg("-v")            // more verbose (includes device class)
+        .output()
+        .map_err(|e| anyhow!("Failed to run lspci: {}", e))?;
+
+    if !output.status.success() {
+        debug!("lspci command failed or not found");
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut gpus = vec![];
+    let mut index = 0;
+
+    // Keywords that usually indicate a GPU
+    let gpu_indicators = [
+        "VGA compatible controller",
+        "3D controller",
+        "Display controller",
+    ];
+
+    // Common GPU vendors (for rough classification)
+    let gpu_vendors = [
+        "NVIDIA", "AMD", "ATI", "Intel", "Matrox", "Radeon", "GeForce",
+        "Quadro", "Tesla", "RTX", "GTX", "FirePro", "Arc",
+    ];
+
+    for line in stdout.lines() {
+        // Skip lines that are clearly not device descriptions
+        if line.contains("Kernel driver") || line.contains("Subsystem") || line.is_empty() {
+            continue;
+        }
+
+        let lower = line.to_lowercase();
+
+        // Check if this line describes a graphics device
+        if gpu_indicators.iter().any(|&kw| lower.contains(&kw.to_lowercase())) {
+            // Try to extract something that looks like a device name/model
+            let mut name_parts = vec![];
+
+            // Split on ':' and take the part after the slot/class
+            if let Some(after_class) = line.splitn(3, ':').nth(2) {
+                let cleaned = after_class.trim();
+                name_parts.push(cleaned.to_string());
+            }
+
+            // Look for vendor/model in the line
+            for vendor in &gpu_vendors {
+                if lower.contains(&vendor.to_lowercase()) {
+                    name_parts.push(vendor.to_string());
+                    break;
+                }
+            }
+
+            let name = if name_parts.is_empty() {
+                "Unknown GPU".to_string()
+            } else {
+                name_parts.join(" ")
+            };
+
+            gpus.push(GpuInfo {
+                index,
+                name,
+                memory_mib: None,         // lspci doesn't show VRAM
+                is_discrete: !lower.contains("intel") && !lower.contains("integrated"),
+                driver: None,
+            });
+
+            index += 1;
+        }
+    }
+
+    debug!("lspci basic detection found {} potential GPU(s)", gpus.len());
+
+    Ok(GpuDetection {
+        count: gpus.len(),
+        gpus,
+    })
+}
