@@ -494,7 +494,7 @@ fn detect_lspci_basic() -> Result<GpuDetection> {
         }
     }
 
-    debug!("lspci basic detection found {} potential GPU(s)", gpus.len());
+    debug!("lspci basic detection found {} potential GPUs", gpus.len());
 
     Ok(GpuDetection {
         count: gpus.len(),
