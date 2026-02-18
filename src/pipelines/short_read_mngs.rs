@@ -75,7 +75,7 @@ use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_f
                           filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
-                         validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
+                         validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
                          write_vecu8_to_file};
 use crate::utils::paf::PafRecord;
 use crate::utils::plotting::plot_insert_sizes;
@@ -2188,7 +2188,7 @@ async fn minimap2_non_host_align(
 
     let input_fastq_path = temp_dir.path().join("nonhost.fastq");
 
-    let write_handle = write_byte_stream_to_file(
+    let write_handle = write_parse_output_to_file(
         &input_fastq_path,
         input_stream,
         Some(config.base_buffer_size),

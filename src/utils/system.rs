@@ -42,7 +42,6 @@ pub fn detect_physical_cores() -> usize {
     let physical = num_cpus::get_physical();
 
     if physical > 0 {
-        info!("Detected {} physical cores", physical);
         physical
     } else {
         let logical = num_cpus::get();
