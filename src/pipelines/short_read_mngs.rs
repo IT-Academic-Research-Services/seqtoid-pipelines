@@ -2175,6 +2175,9 @@ async fn minimap2_non_host_align(
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
+    let base_buffer_size = config.base_buffer_size;
+    let channel_buffer = base_buffer_size * 4;
+
     // 1. Write to temp FASTQ
     let temp_dir = choose_temp_dir(
         config.input_size * 3,
@@ -2189,7 +2192,7 @@ async fn minimap2_non_host_align(
     let write_handle = write_parse_output_to_file(
         &input_fastq_path,
         input_stream,
-        Some(config.base_buffer_size),
+        Some(base_buffer_size),
     ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -2227,9 +2230,11 @@ async fn minimap2_non_host_align(
 
     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
+    let config_for_scatter = config.clone();
+
     for chunk_mmi in chunk_paths {
         let sem_clone = sem.clone();
-        let config_clone = config.clone();
+        let config_clone = config_for_scatter.clone();
         let fastq_clone = input_fastq_path.clone();
 
         let handle = tokio::spawn(async move {
@@ -2251,10 +2256,10 @@ async fn minimap2_non_host_align(
                 .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
 
             let (mut child, stderr_task) = spawn_cmd(
-                config_clone,
+                config_clone.clone(),
                 MINIMAP2_TAG,
                 args,
-                config.args.verbose,
+                config_clone.args.verbose,
             )
                 .await
                 .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
@@ -2263,7 +2268,7 @@ async fn minimap2_non_host_align(
                 &mut child,
                 ChildStream::Stdout,
                 ParseMode::Lines,
-                config.base_buffer_size,
+                config_clone.base_buffer_size,
             )
                 .await
                 .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
@@ -2286,12 +2291,12 @@ async fn minimap2_non_host_align(
     }
 
     // 4. Gather
-    let (merged_tx, merged_rx) = mpsc::channel(config.base_buffer_size * 4);
+    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
         partial_paf_receivers,
         merged_tx,
-        config.base_buffer_size,
+        channel_buffer,
     ));
 
     cleanup_tasks.push(gather_handle);
