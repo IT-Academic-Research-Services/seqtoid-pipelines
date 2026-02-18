@@ -292,7 +292,7 @@ pub fn detect_gpus() -> Result<GpuDetection> {
         // Fallback: very basic lspci detection (just count + rough names)
         if let Ok(basic) = detect_lspci_basic() {
             if basic.count > 0 {
-                info!("Detected {} GPU(s) via lspci (no nvidia-smi available)");
+                info!("Detected {} GPU(s) via lspci (no nvidia-smi available)", basic.count);
                 return Ok(basic);
             }
         }
