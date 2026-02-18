@@ -37,6 +37,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::try_join;
@@ -2174,17 +2175,14 @@ async fn minimap2_non_host_align(
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
-
-    // ----------------------------------------------------------------
-    // 1. Write non-host FASTQ stream to temp file
-    // ----------------------------------------------------------------
+    // 1. Write to temp FASTQ
     let temp_dir = choose_temp_dir(
         config.input_size * 3,
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
-    ).await?;
-
+    ).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
     let input_fastq_path = temp_dir.path().join("nonhost.fastq");
 
@@ -2197,10 +2195,8 @@ async fn minimap2_non_host_align(
 
     cleanup_tasks.push(write_handle);
 
-    // ----------------------------------------------------------------
-    // 2. Find split NT indexes by .mmi extension
-    // ----------------------------------------------------------------
-    let nt_split_dir = PathBuf::from(&config.args.nt_split_dir);
+    // 2. Discover chunks
+    let nt_split_dir = PathBuf::from("/scratch/refs/nt_split");
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
 
     let mut entries = fs::read_dir(&nt_split_dir)
@@ -2226,55 +2222,70 @@ async fn minimap2_non_host_align(
     chunk_paths.sort();
     info!("Found {} minimap2 NT index chunks", chunk_paths.len());
 
-    // ----------------------------------------------------------------
-    // 3. Scatter: run minimap2 on each chunk in parallel
-    // ----------------------------------------------------------------
-    let mut partial_paf_receivers: Vec<ReceiverStream<ParseOutput>> = Vec::new();
+    // 3. Scatter with concurrency limit
+    let sem = Arc::new(Semaphore::new(6)); // Max 6 concurrent mm2 jobs
+
+    let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
     for chunk_mmi in chunk_paths {
+        let sem_clone = sem.clone();
         let config_clone = config.clone();
         let fastq_clone = input_fastq_path.clone();
 
-        let mut options = HashMap::new();
-        options.insert("-c".to_string(), None);
-        options.insert("-x".to_string(), Some("sr".to_string()));
-        options.insert("--secondary".to_string(), Some("yes".to_string()));
+        let handle = tokio::spawn(async move {
+            let _permit = sem_clone.acquire().await
+                .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
 
-        let mm_config = Minimap2Config {
-            minimap2_index_path: chunk_mmi,
-            input_path: Some(fastq_clone),
-            option_fields: options,
-        };
+            let mut options = HashMap::new();
+            options.insert("-c".to_string(), None);
+            options.insert("-x".to_string(), Some("sr".to_string()));
+            options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-        let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-            .map_err(|e| PipelineError::Other(anyhow!("Failed to generate minimap2 args: {}", e)))?;
+            let mm_config = Minimap2Config {
+                minimap2_index_path: chunk_mmi,
+                input_path: Some(fastq_clone),
+                option_fields: options,
+            };
 
-        let (mut child, stderr_task) = spawn_cmd(
-            config_clone,
-            MINIMAP2_TAG,
-            args,
-            config.args.verbose,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("spawn_cmd failed: {}", e)))?;
+            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+                .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
 
-        let paf_receiver = parse_child_output(
-            &mut child,
-            ChildStream::Stdout,
-            ParseMode::Lines,
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("parse_child_output failed: {}", e)))?;
+            let (mut child, stderr_task) = spawn_cmd(
+                config_clone,
+                MINIMAP2_TAG,
+                args,
+                config.args.verbose,
+            )
+                .await
+                .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
 
-        partial_paf_receivers.push(ReceiverStream::new(paf_receiver));
+            let paf_receiver = parse_child_output(
+                &mut child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config.base_buffer_size,
+            )
+                .await
+                .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
 
+            Ok((ReceiverStream::new(paf_receiver), stderr_task))
+        });
+
+        partial_handles.push(handle);
+    }
+
+    // Await all scatter tasks
+    let mut partial_paf_receivers = Vec::new();
+
+    for handle in partial_handles {
+        let (paf_rx, stderr_task) = handle.await
+            .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+
+        partial_paf_receivers.push(paf_rx);
         cleanup_tasks.push(stderr_task);
     }
 
-    // ----------------------------------------------------------------
-    // 4. Gather: merge partial PAF streams
-    // ----------------------------------------------------------------
+    // 4. Gather
     let (merged_tx, merged_rx) = mpsc::channel(config.base_buffer_size * 4);
 
     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
