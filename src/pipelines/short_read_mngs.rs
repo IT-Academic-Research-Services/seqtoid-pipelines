@@ -6233,7 +6233,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
         ReceiverStream::new(taxid_mapped_rx),
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
