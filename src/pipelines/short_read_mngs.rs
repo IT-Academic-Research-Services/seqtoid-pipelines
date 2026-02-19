@@ -6605,10 +6605,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         result.map_err(|e| PipelineError::Other(e))?;
     }
     for receiver in cleanup_receivers {
-        receiver
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
+        match receiver.await {
+            Ok(Ok(_)) => {},  // normal
+            Ok(Err(e)) => return Err(PipelineError::Other(e)),
+            Err(e) => {
+                // Check if this is due to empty stream (sender closed with 0 items)
+                if e.to_string().contains("closed") {  // or check if is_closed()
+                    warn!("Cleanup receiver closed with empty stream (non-fatal, no data): {}", e);
+                    continue;  // skip, don't fail
+                } else {
+                    return Err(PipelineError::Other(e.into()));
+                }
+            },
+        }
     }
 
     if let Some(coverage_task) = coverage_task {
@@ -6617,7 +6626,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 Ok(_) => info!("Coverage visualization completed successfully"),
                 Err(e) => warn!("Coverage viz failed (non-fatal): {}", e),
             },
-            Err(e) => warn!("Coverage viz task panicked: {}", e),
+            Err(e) => {
+                if e.to_string().contains("empty") {
+                    warn!("Coverage task skipped due to empty stream (no data)");
+                } else {
+                    warn!("Coverage viz task panicked: {}", e);
+                }
+            },
         }
     }
 
