@@ -4058,34 +4058,35 @@ pub async fn build_reference_fasta_from_selected_genera(
     db_type: &str,
     source_fasta_path: &PathBuf,                  // full NT/NR FASTA (e.g. nt.fa)
     source_index_path: &PathBuf,                  // FST index for fast lookup
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, TempDir)> {  // ← Change return to include TempDir
     // Flatten and deduplicate accessions
     let mut accessions: HashSet<String> = HashSet::new();
     for acc_list in selected_genera.values() {
         accessions.extend(acc_list.iter().cloned());
     }
 
+    let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;  // ← Create early
+
     if accessions.is_empty() {
         warn!("selected_genera is empty — writing empty reference FASTA");
-        let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;
         let empty_path = temp_dir.path().join(format!("{}_empty_ref.fasta", db_type));
 
-        // Create and write minimal FASTA (ensure file exists even if empty)
+        // Create and write minimal FASTA
         let file = TokioFile::create(&empty_path).await
             .with_context(|| format!("Failed to create empty ref FASTA: {}", empty_path.display()))?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(b">empty\nN\n").await  // minimal valid FASTA
+        writer.write_all(b">empty\nN\n").await
             .with_context(|| format!("Failed to write to empty ref FASTA: {}", empty_path.display()))?;
         writer.flush().await?;
-        drop(writer);  // explicit drop for correctness
+        drop(writer);
 
-        // Verify existence (correctness: fail early if write failed)
+        // Verify
         if !empty_path.exists() {
             return Err(anyhow!("Empty ref FASTA {} was not created after write", empty_path.display()));
         }
 
         info!("Wrote empty ref FASTA to {} (verified exists)", empty_path.display());
-        return Ok(empty_path);
+        return Ok((empty_path, temp_dir));  // ← Return dir to keep alive
     }
 
     let mut acc_vec: Vec<String> = accessions.into_iter().collect();
@@ -4107,14 +4108,8 @@ pub async fn build_reference_fasta_from_selected_genera(
         .with_context(|| format!("Failed to open source FASTA: {}", source_fasta_path.display()))?;
     let mut reader = BufReader::new(file);
 
-    // Estimate size and pick best temp location
+    // Estimate size (use existing temp_dir)
     let estimated_size = (acc_vec.len() as u64) * 2000; // ~2KB per accession avg
-    let temp_dir = choose_temp_dir(
-        estimated_size,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        4,
-    ).await?;
 
     let output_path = temp_dir.path().join(format!("{}_ref_from_selected_genera.fasta", db_type));
     let mut writer = std::io::BufWriter::new(
@@ -4174,7 +4169,7 @@ pub async fn build_reference_fasta_from_selected_genera(
     }
 
     writer.flush()?;
-    drop(writer); // ensure flushed
+    drop(writer);
 
     if missing > 0 {
         warn!("{} accessions from selected_genera not found in source FASTA", missing);
@@ -4189,7 +4184,7 @@ pub async fn build_reference_fasta_from_selected_genera(
         acc_vec.len() - missing
     );
 
-    Ok(output_path)
+    Ok((output_path, temp_dir))  // ← Keep dir alive
 }
 
 
@@ -5900,7 +5895,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
     //nt accessions
-    let nt_ref_fasta_path = build_reference_fasta_from_selected_genera(
+    let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
         config.clone(),
         &nt_selected_genera,
         NT_TAG,
@@ -5910,7 +5905,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("nt path {}", nt_ref_fasta_path.display());
-
+    temp_dirs.push(nt_ref_fasta_temp_dir);
 
     // //NR
     let (
@@ -5927,7 +5922,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
 
 
-    let nr_ref_fasta_path = build_reference_fasta_from_selected_genera(
+    let (nr_ref_fasta_path, nr_ref_fasta_temp_dir)  = build_reference_fasta_from_selected_genera(
         config.clone(),
         &nr_selected_genera,
         NR_TAG,
@@ -5937,6 +5932,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("nr path {}", nr_ref_fasta_path.display());
+    temp_dirs.push(nr_ref_fasta_temp_dir);
 
     let nt_handle = tokio::spawn({
         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
