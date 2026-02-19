@@ -4069,7 +4069,22 @@ pub async fn build_reference_fasta_from_selected_genera(
         warn!("selected_genera is empty — writing empty reference FASTA");
         let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;
         let empty_path = temp_dir.path().join(format!("{}_empty_ref.fasta", db_type));
-        fs::write(&empty_path, b">empty\nN\n").await?;
+
+        // Create and write minimal FASTA (ensure file exists even if empty)
+        let file = TokioFile::create(&empty_path).await
+            .with_context(|| format!("Failed to create empty ref FASTA: {}", empty_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(b">empty\nN\n").await  // minimal valid FASTA
+            .with_context(|| format!("Failed to write to empty ref FASTA: {}", empty_path.display()))?;
+        writer.flush().await?;
+        drop(writer);  // explicit drop for correctness
+
+        // Verify existence (correctness: fail early if write failed)
+        if !empty_path.exists() {
+            return Err(anyhow!("Empty ref FASTA {} was not created after write", empty_path.display()));
+        }
+
+        info!("Wrote empty ref FASTA to {} (verified exists)", empty_path.display());
         return Ok(empty_path);
     }
 
@@ -4080,8 +4095,6 @@ pub async fn build_reference_fasta_from_selected_genera(
         "Building reference FASTA from {} filtered accessions (selected_genera)",
         acc_vec.len()
     );
-
-
 
     // Load FST index
     let index_data = std::fs::read(source_index_path)
@@ -4103,7 +4116,7 @@ pub async fn build_reference_fasta_from_selected_genera(
         4,
     ).await?;
 
-    let  output_path = temp_dir.path().join(format!("{}_ref_from_selected_genera.fasta", db_type));
+    let output_path = temp_dir.path().join(format!("{}_ref_from_selected_genera.fasta", db_type));
     let mut writer = std::io::BufWriter::new(
         File::create(&output_path)
             .with_context(|| format!("Failed to create ref FASTA: {}", output_path.display()))?,
@@ -4161,7 +4174,7 @@ pub async fn build_reference_fasta_from_selected_genera(
     }
 
     writer.flush()?;
-    drop(writer); // ensure written
+    drop(writer); // ensure flushed
 
     if missing > 0 {
         warn!("{} accessions from selected_genera not found in source FASTA", missing);
