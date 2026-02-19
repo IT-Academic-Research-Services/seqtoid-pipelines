@@ -2232,83 +2232,125 @@ async fn minimap2_non_host_align(
 
     let config_for_scatter = config.clone();
 
-    for chunk_mmi in chunk_paths {
-        let sem_clone = sem.clone();
-        let config_clone = config_for_scatter.clone();
-        let fastq_clone = input_fastq_path.clone();
+    //     for chunk_mmi in chunk_paths {
+    //         let sem_clone = sem.clone();
+    //         let config_clone = config_for_scatter.clone();
+    //         let fastq_clone = input_fastq_path.clone();
+    //
+    //         let handle = tokio::spawn(async move {
+    //             let _permit = sem_clone.acquire().await
+    //                 .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+    //
+    //             let mut options = HashMap::new();
+    //             options.insert("-c".to_string(), None);
+    //             options.insert("-x".to_string(), Some("sr".to_string()));
+    //             options.insert("--secondary".to_string(), Some("yes".to_string()));
+    //
+    //             let mm_config = Minimap2Config {
+    //                 minimap2_index_path: chunk_mmi,
+    //                 input_path: Some(fastq_clone),
+    //                 option_fields: options,
+    //             };
+    //
+    //             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+    //                 .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
+    //
+    //             let (mut child, stderr_task) = spawn_cmd(
+    //                 config_clone.clone(),
+    //                 MINIMAP2_TAG,
+    //                 args,
+    //                 config_clone.args.verbose,
+    //             )
+    //                 .await
+    //                 .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
+    //
+    //             let paf_receiver = parse_child_output(
+    //                 &mut child,
+    //                 ChildStream::Stdout,
+    //                 ParseMode::Lines,
+    //                 config_clone.base_buffer_size,
+    //             )
+    //                 .await
+    //                 .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
+    //
+    //             Ok((ReceiverStream::new(paf_receiver), stderr_task))
+    //         });
+    //
+    //         partial_handles.push(handle);
+    //     }
+    //
+    //     // Await all scatter tasks
+    //     let mut partial_paf_receivers = Vec::new();
+    //
+    //     for handle in partial_handles {
+    //         let (paf_rx, stderr_task) = handle.await
+    //             .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+    //
+    //         partial_paf_receivers.push(paf_rx);
+    //         cleanup_tasks.push(stderr_task);
+    //     }
+    //
+    //     // 4. Gather
+    //     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
+    //
+    //     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
+    //         partial_paf_receivers,
+    //         merged_tx,
+    //         channel_buffer,
+    //     ));
+    //
+    //     cleanup_tasks.push(gather_handle);
+    //
+    //     Ok((
+    //         ReceiverStream::new(merged_rx),
+    //         cleanup_tasks,
+    //         cleanup_receivers,
+    //         Some(temp_dir),
+    //     ))
+    // }
 
-        let handle = tokio::spawn(async move {
-            let _permit = sem_clone.acquire().await
-                .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
 
-            let mut options = HashMap::new();
-            options.insert("-c".to_string(), None);
-            options.insert("-x".to_string(), Some("sr".to_string()));
-            options.insert("--secondary".to_string(), Some("yes".to_string()));
+    // ────────────────────────────────────────────────────────────────
+    //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
+    //   (comment out or delete this whole block when done debugging)
+    // ────────────────────────────────────────────────────────────────
 
-            let mm_config = Minimap2Config {
-                minimap2_index_path: chunk_mmi,
-                input_path: Some(fastq_clone),
-                option_fields: options,
-            };
+    // ────────────────────────────────────────────────────────────────
+    //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
+    //   Comment out or delete this whole block when finished debugging
+    // ────────────────────────────────────────────────────────────────
 
-            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-                .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
+    info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
+    info!("Returning fake single-line ParseOutput stream instead of real PAF");
 
-            let (mut child, stderr_task) = spawn_cmd(
-                config_clone.clone(),
-                MINIMAP2_TAG,
-                args,
-                config_clone.args.verbose,
-            )
-                .await
-                .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
+    use tokio::sync::mpsc;
 
-            let paf_receiver = parse_child_output(
-                &mut child,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                config_clone.base_buffer_size,
-            )
-                .await
-                .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
+    let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
 
-            Ok((ReceiverStream::new(paf_receiver), stderr_task))
-        });
+    // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
+    let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
 
-        partial_handles.push(handle);
-    }
+    fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
+        .await
+        .expect("Failed to send fake ParseOutput in debug bypass");
 
-    // Await all scatter tasks
-    let mut partial_paf_receivers = Vec::new();
+    drop(fake_tx);  // Close the channel → downstream sees EOF
 
-    for handle in partial_handles {
-        let (paf_rx, stderr_task) = handle.await
-            .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+    let fake_paf_stream = ReceiverStream::new(fake_rx);
 
-        partial_paf_receivers.push(paf_rx);
-        cleanup_tasks.push(stderr_task);
-    }
-
-    // 4. Gather
-    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
-
-    let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
-        partial_paf_receivers,
-        merged_tx,
-        channel_buffer,
-    ));
-
-    cleanup_tasks.push(gather_handle);
+    info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
 
     Ok((
-        ReceiverStream::new(merged_rx),
+        fake_paf_stream,
         cleanup_tasks,
         cleanup_receivers,
         Some(temp_dir),
     ))
 }
 
+// ────────────────────────────────────────────────────────────────
+    //   End of temporary OOM-test bypass
+    // ────────────────────────────────────────────────────────────────
 
 /// Converts a PAF stream to an m8 stream, splits it with t_junction for file writing,
 /// and returns the main m8 stream along with cleanup handles.
