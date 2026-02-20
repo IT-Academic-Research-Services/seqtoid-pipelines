@@ -5500,7 +5500,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let non_host_coverage_viz_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     // This is part of post-process starting here for concurrency
@@ -6011,7 +6010,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_m8_streams, nt_m8_rx) = t_junction(
         ReceiverStream::new(nt_refined_m8_stream_out),
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6027,6 +6026,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
     let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
         ReceiverStream::new(nt_refined_hit_summary_stream_out),
@@ -6419,7 +6419,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 ReceiverStream::new(nt_refined_m8_top_stream_out),
                 assembly_outputs.coverage_json,
                 assembly_outputs.contig_stats_json,
-                ReceiverStream::new(non_host_coverage_viz_stream),
+                ReceiverStream::new(nt_m8_viz),
                 nt_info_db_path,
                 out_dir_for_viz,
                 Some(MAX_NUM_BINS_COVERAGE),
