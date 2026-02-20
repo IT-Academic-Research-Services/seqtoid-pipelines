@@ -174,6 +174,8 @@ pub struct ReadStats {
     pub undersized: u64,
     pub validated: u64,
     pub oversized: u64,
+    pub unpaired_r1: u64,
+    pub unpaired_r2: u64,
 }
 
 /// Samtools stats output
