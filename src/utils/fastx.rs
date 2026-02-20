@@ -784,32 +784,67 @@ pub fn write_fasta_stream_to_file(
 }
 
 fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
-    // Fast path: exact match (common when IDs are identical)
+    // Fast path: exact byte match (very common when IDs are identical)
     if id1 == id2 {
         return true;
     }
 
-    // Convert to str (with fallback to empty if invalid UTF-8 — rare)
+    // Convert to str with fallback (safe, no panic)
     let s1 = std::str::from_utf8(id1).unwrap_or("");
     let s2 = std::str::from_utf8(id2).unwrap_or("");
 
-    // Common paired suffixes — ordered by frequency
-    let suffixes = [
-        "/1", "/2", ".1", ".2", " 1:", " 2:", "_1", "_2",
-        " 1:N:0:", " 2:N:0:", "/1:N:0:", "/2:N:0:",
-        " 1#0/1", " 2#0/2", "|1", "|2",
+    // Expanded suffix list — ordered roughly by frequency / importance
+    // Each group is labeled with the platforms / formats it covers
+    let suffixes: [&str; 24] = [
+        // Classic Illumina / most common overall
+        "/1", "/2",
+
+        // Older Illumina, some custom pipelines
+        ".1", ".2",
+
+        // Illumina with space + colon (HiSeq, NovaSeq, NextSeq)
+        " 1:", " 2:",
+
+        // Full Illumina flowcell/lane info suffix (very common on NovaSeq)
+        " 1:N:0:", " 2:N:0:",
+
+        // Variant with slash instead of space (some demux tools)
+        "/1:N:0:", "/2:N:0:",
+
+        // BGISEQ, DNBSEQ, MGISEQ, many Chinese platforms
+        "_1", "_2",
+
+        // Very old Illumina CASAVA format (pre-2011, rare but still seen)
+        " 1#0/1", " 2#0/2",
+
+        // Nanopore, Oxford Nanopore, some custom / long-read paired
+        "|1", "|2",
+
+        // Rare 10x Genomics / Parse / custom variants
+        " 1#", " 2#",
+
+        // 10x Genomics, Parse Biosciences, some single-cell demux
+        "/R1", "/R2",
+
+        // Sometimes appears in headers instead of file names
+        "_R1", "_R2",
+
+        // Rare variant without N (some older or custom)
+        " 1:0", " 2:0",
     ];
 
-    // Find and strip the longest matching suffix from each
     let mut base1 = s1;
     let mut base2 = s2;
 
+    // Strip the longest matching suffix from each ID
+    // We break after the first match to avoid over-trimming
     for &suffix in &suffixes {
         if base1.ends_with(suffix) {
             base1 = &base1[..base1.len() - suffix.len()];
             break;
         }
     }
+
     for &suffix in &suffixes {
         if base2.ends_with(suffix) {
             base2 = &base2[..base2.len() - suffix.len()];
@@ -817,18 +852,12 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
         }
     }
 
-    // Trim any trailing whitespace or colon (leftover from suffix stripping)
-    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
-    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
+    // Clean up any trailing whitespace, colon, or hash that might remain
+    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
+    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
 
-    // Compare the cleaned bases
+    // Final comparison
     base1 == base2
-}
-
-fn extract_id(head: &[u8]) -> &[u8] {
-    let start = head.iter().position(|&b| b != b'@').unwrap_or(0);
-    let end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
-    &head[start..end]
 }
 
 /// Counts the number of records in a FASTQ.
