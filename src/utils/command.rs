@@ -216,6 +216,7 @@ pub mod minimap2 {
         pub minimap2_index_path: PathBuf,
         pub input_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
         pub option_fields: HashMap<String, Option<String>>,
+        pub num_threads: Option<usize>,
     }
 
     pub struct Minimap2ArgGenerator;
@@ -458,9 +459,16 @@ pub mod minimap2 {
             }
 
             let mut args_vec: Vec<String> = Vec::new();
-            let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
+
+            let mut threads = if let Some(override_threads) = config.num_threads {
+                override_threads
+            } else {
+                run_config.thread_allocation(MINIMAP2_TAG, None)
+            };
+            
+            // let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
             args_vec.push("-t".to_string());
-            args_vec.push(num_cores.to_string());
+            args_vec.push(threads.to_string());
 
             for (key, value) in config.option_fields.iter() {
                 args_vec.push(key.clone());

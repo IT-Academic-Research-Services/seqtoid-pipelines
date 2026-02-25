@@ -108,6 +108,9 @@ const MIN_ASSEMBLY_READ_COUNT: usize = 56;
 
 const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
+const MM2_TARGET_THREADS_PER : usize = 8;
+
+
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r",(?=[^\s])").unwrap()
 });
@@ -1385,6 +1388,7 @@ async fn minimap2_filter(
             ("-O".to_string(), Some("4,24".to_string())), // Gap open
             ("-E".to_string(), Some("2,1".to_string())), // Gap extension
         ]),
+        num_threads: None,
     };
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -2223,91 +2227,122 @@ async fn minimap2_non_host_align(
     }
 
     chunk_paths.sort();
-    info!("Found {} minimap2 NT index chunks", chunk_paths.len());
+    let num_chunks = chunk_paths.len();
+    info!("Found {} minimap2 NT index chunks", num_chunks);
 
-    // 3. Scatter with concurrency limit
-    let sem = Arc::new(Semaphore::new(6)); // Max 6 concurrent mm2 jobs
+    // 3. Compute dynamic concurrency
+    // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
+    let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
+
+    // Total available threads: Respects --threads, --use-smt, detected cores
+    let total_threads = config.max_cores;
+
+    // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
+    let max_concurrency = match total_threads {
+        0..=16   => total_threads,
+        17..=64  => 16,
+        65..=128 => 32,
+        _        => 64.max(total_threads / 6),
+    };
+
+    let concurrency = (total_threads / target_threads_per)
+        .max(1)                 // At least 1
+        .min(num_chunks)        // Don't exceed chunks
+        .min(max_concurrency);  // Prevent overload on small machines
+
+    // Recalculate threads_per to fit total_threads exactly (avoids waste)
+    let mut threads_per = total_threads / concurrency;
+    threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
+
+    info!(
+        "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
+        concurrency, threads_per, total_threads, num_chunks
+    );
+
+    // Scatter with dynamic concurrency limit
+    let sem = Arc::new(Semaphore::new(concurrency as usize));
 
     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
     let config_for_scatter = config.clone();
 
-        for chunk_mmi in chunk_paths {
-            let sem_clone = sem.clone();
-            let config_clone = config_for_scatter.clone();
-            let fastq_clone = input_fastq_path.clone();
+    for chunk_mmi in chunk_paths {
+        let sem_clone = sem.clone();
+        let config_clone = config_for_scatter.clone();
+        let fastq_clone = input_fastq_path.clone();
 
-            let handle = tokio::spawn(async move {
-                let _permit = sem_clone.acquire().await
-                    .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+        let handle = tokio::spawn(async move {
+            let _permit = sem_clone.acquire().await
+                .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
 
-                let mut options = HashMap::new();
-                options.insert("-c".to_string(), None);
-                options.insert("-x".to_string(), Some("sr".to_string()));
-                options.insert("--secondary".to_string(), Some("yes".to_string()));
+            let mut options = HashMap::new();
+            options.insert("-c".to_string(), None);
+            options.insert("-x".to_string(), Some("sr".to_string()));
+            options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-                let mm_config = Minimap2Config {
-                    minimap2_index_path: chunk_mmi,
-                    input_path: Some(fastq_clone),
-                    option_fields: options,
-                };
+            let mm_config = Minimap2Config {
+                minimap2_index_path: chunk_mmi,
+                input_path: Some(fastq_clone),
+                option_fields: options,
+                num_threads: Some(threads_per),
+            };
 
-                let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-                    .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
+            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+                .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
 
-                let (mut child, stderr_task) = spawn_cmd(
-                    config_clone.clone(),
-                    MINIMAP2_TAG,
-                    args,
-                    config_clone.args.verbose,
-                )
-                    .await
-                    .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
+            let (mut child, stderr_task) = spawn_cmd(
+                config_clone.clone(),
+                MINIMAP2_TAG,
+                args,
+                config_clone.args.verbose,
+            )
+                .await
+                .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
 
-                let paf_receiver = parse_child_output(
-                    &mut child,
-                    ChildStream::Stdout,
-                    ParseMode::Lines,
-                    config_clone.base_buffer_size,
-                )
-                    .await
-                    .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
+            let paf_receiver = parse_child_output(
+                &mut child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config_clone.base_buffer_size,
+            )
+                .await
+                .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
 
-                Ok((ReceiverStream::new(paf_receiver), stderr_task))
-            });
+            Ok((ReceiverStream::new(paf_receiver), stderr_task))
+        });
 
-            partial_handles.push(handle);
-        }
-
-        // Await all scatter tasks
-        let mut partial_paf_receivers = Vec::new();
-
-        for handle in partial_handles {
-            let (paf_rx, stderr_task) = handle.await
-                .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
-
-            partial_paf_receivers.push(paf_rx);
-            cleanup_tasks.push(stderr_task);
-        }
-
-        // 4. Gather
-        let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
-
-        let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
-            partial_paf_receivers,
-            merged_tx,
-            channel_buffer,
-        ));
-
-        cleanup_tasks.push(gather_handle);
-
-        Ok((
-            ReceiverStream::new(merged_rx),
-            cleanup_tasks,
-            cleanup_receivers,
-            Some(temp_dir),
-        ))
+        partial_handles.push(handle);
     }
+
+    // Await all scatter tasks
+    let mut partial_paf_receivers = Vec::new();
+
+    for handle in partial_handles {
+        let (paf_rx, stderr_task) = handle.await
+            .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+
+        partial_paf_receivers.push(paf_rx);
+        cleanup_tasks.push(stderr_task);
+    }
+
+    // 4. Gather
+    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
+
+    let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
+        partial_paf_receivers,
+        merged_tx,
+        channel_buffer,
+    ));
+
+    cleanup_tasks.push(gather_handle);
+
+    Ok((
+        ReceiverStream::new(merged_rx),
+        cleanup_tasks,
+        cleanup_receivers,
+        Some(temp_dir),
+    ))
+}
 
 
     // ────────────────────────────────────────────────────────────────

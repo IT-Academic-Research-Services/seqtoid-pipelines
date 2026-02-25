@@ -202,6 +202,7 @@ async fn align_to_host(
         minimap2_index_path: host_index_path,
         input_path: None,
         option_fields: minimap2_options.clone(),
+        num_threads: None,
     };
 
 
@@ -506,6 +507,7 @@ async fn process_ercc(
         minimap2_index_path: ercc_index_path,
         input_path: None,
         option_fields: minimap2_options.clone(),
+        num_threads: None,
     };
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
@@ -1059,6 +1061,7 @@ async fn align_to_target(
         minimap2_index_path: target_index_path,
         input_path: None,
         option_fields: minimap2_options.clone(),
+        num_threads: None,
     };
 
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
