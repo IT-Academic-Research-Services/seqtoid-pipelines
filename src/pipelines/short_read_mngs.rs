@@ -2203,7 +2203,7 @@ async fn minimap2_non_host_align(
     cleanup_tasks.push(write_handle);
 
     // 2. Discover chunks
-    let nt_split_dir = PathBuf::from("/home/ubuntu/refs/nt_split");
+    let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
 
     let mut entries = fs::read_dir(&nt_split_dir)
