@@ -2237,30 +2237,41 @@ async fn minimap2_non_host_align(
     // Total available threads: Respects --threads, --use-smt, detected cores
     let total_threads = config.max_cores;
 
-    // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
-    let max_concurrency = match total_threads {
-        0..=16   => total_threads,
-        17..=64  => 8,
-        65..=128 => 16,
-        _        => 32.max(total_threads / 8),
-    };
+    let (total_bytes, _avail_bytes) = detect_ram()?;
+    let total_gib = total_bytes / (1024 * 1024 * 1024);
+
+    let mut max_index_loads = 2;
+    let mut max_concurrent_jobs = 8;
+
+    if total_gib >= 1400 {  // 1.4 TiB+ → dual EPYC
+        max_concurrent_jobs = 16;  // or 20 if testing shows headroom
+        max_index_loads = 4;
+    } else if total_gib >= 1000 {  // 1 TiB → r6id.32xlarge
+        max_concurrent_jobs = 8;
+        max_index_loads = 2;
+    } else {
+        // Laptop/small instance fallback
+        max_concurrent_jobs = 4;
+        max_index_loads = 1;
+    }
 
     let concurrency = (total_threads / target_threads_per)
-        .max(1)                 // At least 1
-        .min(num_chunks)        // Don't exceed chunks
-        .min(max_concurrency);  // Prevent overload on small machines
+        .max(1)
+        .min(num_chunks)
+        .min(max_concurrent_jobs);
+    
 
     // Recalculate threads_per to fit total_threads exactly (avoids waste)
     let mut threads_per = total_threads / concurrency;
     threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
 
     info!(
-        "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
-        concurrency, threads_per, total_threads, num_chunks
-    );
+    "Instance-aware settings: total RAM ~{} GiB → concurrency cap={}, index loads cap={}",
+    total_gib, max_concurrent_jobs, max_index_loads
+);
 
     // Separate semaphore for index loading phase (only 1–2 concurrent loads)
-    let index_load_sem = Arc::new(Semaphore::new(2)); // 1 or 2 is safe
+    let index_load_sem = Arc::new(Semaphore::new(max_index_loads));
 
     // Scatter with dynamic concurrency limit
     let sem = Arc::new(Semaphore::new(concurrency as usize));
