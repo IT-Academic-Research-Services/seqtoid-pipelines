@@ -2203,241 +2203,241 @@ async fn minimap2_non_host_align(
     cleanup_tasks.push(write_handle);
 
     // 2. Discover chunks
-    let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
-    let mut chunk_paths: Vec<PathBuf> = Vec::new();
-
-    let mut entries = fs::read_dir(&nt_split_dir)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
-
-    while let Some(entry) = entries.next_entry().await.transpose() {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
-                chunk_paths.push(path);
-            }
-        }
-    }
-
-    if chunk_paths.is_empty() {
-        return Err(PipelineError::Other(anyhow!(
-            "No .mmi chunk files found in {}",
-            nt_split_dir.display()
-        )));
-    }
-
-    chunk_paths.sort();
-    let num_chunks = chunk_paths.len();
-    info!("Found {} minimap2 NT index chunks", num_chunks);
-
-    // 3. Compute dynamic concurrency
-    // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
-    let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
-
-    // Total available threads: Respects --threads, --use-smt, detected cores
-    let total_threads = config.max_cores;
-
-    // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
-    let max_concurrency = match total_threads {
-        0..=16   => total_threads,
-        17..=64  => 16,
-        65..=128 => 32,
-        _        => 64.max(total_threads / 6),
-    };
-
-    let concurrency = (total_threads / target_threads_per)
-        .max(1)                 // At least 1
-        .min(num_chunks)        // Don't exceed chunks
-        .min(max_concurrency);  // Prevent overload on small machines
-
-    // Recalculate threads_per to fit total_threads exactly (avoids waste)
-    let mut threads_per = total_threads / concurrency;
-    threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
-
-    info!(
-        "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
-        concurrency, threads_per, total_threads, num_chunks
-    );
-
-    // Scatter with dynamic concurrency limit
-    let sem = Arc::new(Semaphore::new(concurrency as usize));
-
-    let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
-
-    let config_for_scatter = config.clone();
-
-
-    const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
-    const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
-    const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
-    const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
-    const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
-
-
-    for chunk_mmi in chunk_paths {
-        let sem_clone = sem.clone();
-        let config_clone = config_for_scatter.clone();
-        let fastq_clone = input_fastq_path.clone();
-        let chunk_name = chunk_mmi.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let handle = tokio::spawn(async move {
-            let start_wait = Instant::now();
-            let mut delay_count = 0;
-            let mut effective_threads = threads_per; // start with computed value
-
-            // Declare these outside so they're available after the loop
-            let mut avail_gib: u64 = 0;
-            let mut total_gib: u64 = 0;
-
-            loop {
-                let (total_bytes, avail_bytes) = match detect_ram() {
-                    Ok((t, a)) => (t, a),
-                    Err(e) => {
-                        warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
-                        effective_threads = FALLBACK_THREADS.min(effective_threads);
-                        break;
-                    }
-                };
-
-                total_gib = total_bytes / (1024 * 1024 * 1024);
-                avail_gib = avail_bytes / (1024 * 1024 * 1024);
-
-                // Dynamic minimum free RAM required
-                let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
-                    .max(MIN_FREE_ABSOLUTE_GIB)
-                    .min(total_gib / 4); // never more than 25% of total
-
-                // Small-machine auto-reduction
-                let is_small_machine = total_gib < 128;
-                if is_small_machine {
-                    if total_gib <= 64 {
-                        effective_threads = effective_threads.min(4);
-                        info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
-                    }
-                    if total_gib <= 32 {
-                        info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
-                        effective_threads = 2;
-                    }
-                }
-
-                if avail_gib >= min_free_gib {
-                    info!(
-                "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
-                chunk_name, avail_gib, total_gib, min_free_gib
-            );
-                    break;
-                }
-
-                let elapsed = start_wait.elapsed().as_secs();
-                if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
-                    warn!(
-                "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
-                chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
-            );
-                    effective_threads = FALLBACK_THREADS.min(effective_threads);
-                    break;
-                }
-
-                let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
-                info!(
-            "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
-            sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
-        );
-                sleep(Duration::from_secs(sleep_s)).await;
-                delay_count += 1;
-            }
-
-            // Now try to acquire semaphore (concurrency still enforced)
-            let _permit = match sem_clone.acquire().await {
-                Ok(p) => p,
-                Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
-            };
-
-            info!(
-        "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
-        chunk_name, effective_threads, avail_gib  // now in scope
-    );
-
-            let mut options = HashMap::new();
-            options.insert("-c".to_string(), None);
-            options.insert("-x".to_string(), Some("sr".to_string()));
-            options.insert("--secondary".to_string(), Some("yes".to_string()));
-
-            let mm_config = Minimap2Config {
-                minimap2_index_path: chunk_mmi,
-                input_path: Some(fastq_clone),
-                option_fields: options,
-                num_threads: Some(effective_threads),  // use the possibly-reduced value
-            };
-
-            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-                .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
-
-            info!(
-        "minimap2 cmd for {}: minimap2 {}",
-        chunk_name,
-        args.join(" ")
-    );
-
-            let (mut child, stderr_task) = spawn_cmd(
-                config_clone.clone(),
-                MINIMAP2_TAG,
-                args,
-                config_clone.args.verbose,
-            )
-                .await
-                .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
-
-            if let Some(pid) = child.id() {
-                info!("minimap2 PID for {}: {}", chunk_name, pid);
-            }
-
-            let paf_receiver = parse_child_output(
-                &mut child,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                config_clone.base_buffer_size,
-            )
-                .await
-                .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
-
-            Ok((ReceiverStream::new(paf_receiver), stderr_task))
-        });
-
-        partial_handles.push(handle);
-    }
-
-    // Await all scatter tasks
-    let mut partial_paf_receivers = Vec::new();
-
-    for handle in partial_handles {
-        let (paf_rx, stderr_task) = handle.await
-            .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
-
-        partial_paf_receivers.push(paf_rx);
-        cleanup_tasks.push(stderr_task);
-    }
-
-    // 4. Gather
-    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
-
-    let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
-        partial_paf_receivers,
-        merged_tx,
-        channel_buffer,
-    ));
-
-    cleanup_tasks.push(gather_handle);
-
-    Ok((
-        ReceiverStream::new(merged_rx),
-        cleanup_tasks,
-        cleanup_receivers,
-        Some(temp_dir),
-    ))
-}
+//     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
+//     let mut chunk_paths: Vec<PathBuf> = Vec::new();
+//
+//     let mut entries = fs::read_dir(&nt_split_dir)
+//         .await
+//         .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
+//
+//     while let Some(entry) = entries.next_entry().await.transpose() {
+//         if let Ok(entry) = entry {
+//             let path = entry.path();
+//             if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
+//                 chunk_paths.push(path);
+//             }
+//         }
+//     }
+//
+//     if chunk_paths.is_empty() {
+//         return Err(PipelineError::Other(anyhow!(
+//             "No .mmi chunk files found in {}",
+//             nt_split_dir.display()
+//         )));
+//     }
+//
+//     chunk_paths.sort();
+//     let num_chunks = chunk_paths.len();
+//     info!("Found {} minimap2 NT index chunks", num_chunks);
+//
+//     // 3. Compute dynamic concurrency
+//     // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
+//     let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
+//
+//     // Total available threads: Respects --threads, --use-smt, detected cores
+//     let total_threads = config.max_cores;
+//
+//     // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
+//     let max_concurrency = match total_threads {
+//         0..=16   => total_threads,
+//         17..=64  => 16,
+//         65..=128 => 32,
+//         _        => 64.max(total_threads / 6),
+//     };
+//
+//     let concurrency = (total_threads / target_threads_per)
+//         .max(1)                 // At least 1
+//         .min(num_chunks)        // Don't exceed chunks
+//         .min(max_concurrency);  // Prevent overload on small machines
+//
+//     // Recalculate threads_per to fit total_threads exactly (avoids waste)
+//     let mut threads_per = total_threads / concurrency;
+//     threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
+//
+//     info!(
+//         "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
+//         concurrency, threads_per, total_threads, num_chunks
+//     );
+//
+//     // Scatter with dynamic concurrency limit
+//     let sem = Arc::new(Semaphore::new(concurrency as usize));
+//
+//     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
+//
+//     let config_for_scatter = config.clone();
+//
+//
+//     const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
+//     const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
+//     const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
+//     const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
+//     const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
+//
+//
+//     for chunk_mmi in chunk_paths {
+//         let sem_clone = sem.clone();
+//         let config_clone = config_for_scatter.clone();
+//         let fastq_clone = input_fastq_path.clone();
+//         let chunk_name = chunk_mmi.file_name()
+//             .map(|s| s.to_string_lossy().to_string())
+//             .unwrap_or_else(|| "unknown".to_string());
+//
+//         let handle = tokio::spawn(async move {
+//             let start_wait = Instant::now();
+//             let mut delay_count = 0;
+//             let mut effective_threads = threads_per; // start with computed value
+//
+//             // Declare these outside so they're available after the loop
+//             let mut avail_gib: u64 = 0;
+//             let mut total_gib: u64 = 0;
+//
+//             loop {
+//                 let (total_bytes, avail_bytes) = match detect_ram() {
+//                     Ok((t, a)) => (t, a),
+//                     Err(e) => {
+//                         warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
+//                         effective_threads = FALLBACK_THREADS.min(effective_threads);
+//                         break;
+//                     }
+//                 };
+//
+//                 total_gib = total_bytes / (1024 * 1024 * 1024);
+//                 avail_gib = avail_bytes / (1024 * 1024 * 1024);
+//
+//                 // Dynamic minimum free RAM required
+//                 let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
+//                     .max(MIN_FREE_ABSOLUTE_GIB)
+//                     .min(total_gib / 4); // never more than 25% of total
+//
+//                 // Small-machine auto-reduction
+//                 let is_small_machine = total_gib < 128;
+//                 if is_small_machine {
+//                     if total_gib <= 64 {
+//                         effective_threads = effective_threads.min(4);
+//                         info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
+//                     }
+//                     if total_gib <= 32 {
+//                         info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
+//                         effective_threads = 2;
+//                     }
+//                 }
+//
+//                 if avail_gib >= min_free_gib {
+//                     info!(
+//                 "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
+//                 chunk_name, avail_gib, total_gib, min_free_gib
+//             );
+//                     break;
+//                 }
+//
+//                 let elapsed = start_wait.elapsed().as_secs();
+//                 if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
+//                     warn!(
+//                 "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
+//                 chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
+//             );
+//                     effective_threads = FALLBACK_THREADS.min(effective_threads);
+//                     break;
+//                 }
+//
+//                 let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
+//                 info!(
+//             "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
+//             sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
+//         );
+//                 sleep(Duration::from_secs(sleep_s)).await;
+//                 delay_count += 1;
+//             }
+//
+//             // Now try to acquire semaphore (concurrency still enforced)
+//             let _permit = match sem_clone.acquire().await {
+//                 Ok(p) => p,
+//                 Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
+//             };
+//
+//             info!(
+//         "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
+//         chunk_name, effective_threads, avail_gib  // now in scope
+//     );
+//
+//             let mut options = HashMap::new();
+//             options.insert("-c".to_string(), None);
+//             options.insert("-x".to_string(), Some("sr".to_string()));
+//             options.insert("--secondary".to_string(), Some("yes".to_string()));
+//
+//             let mm_config = Minimap2Config {
+//                 minimap2_index_path: chunk_mmi,
+//                 input_path: Some(fastq_clone),
+//                 option_fields: options,
+//                 num_threads: Some(effective_threads),  // use the possibly-reduced value
+//             };
+//
+//             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+//                 .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
+//
+//             info!(
+//         "minimap2 cmd for {}: minimap2 {}",
+//         chunk_name,
+//         args.join(" ")
+//     );
+//
+//             let (mut child, stderr_task) = spawn_cmd(
+//                 config_clone.clone(),
+//                 MINIMAP2_TAG,
+//                 args,
+//                 config_clone.args.verbose,
+//             )
+//                 .await
+//                 .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
+//
+//             if let Some(pid) = child.id() {
+//                 info!("minimap2 PID for {}: {}", chunk_name, pid);
+//             }
+//
+//             let paf_receiver = parse_child_output(
+//                 &mut child,
+//                 ChildStream::Stdout,
+//                 ParseMode::Lines,
+//                 config_clone.base_buffer_size,
+//             )
+//                 .await
+//                 .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
+//
+//             Ok((ReceiverStream::new(paf_receiver), stderr_task))
+//         });
+//
+//         partial_handles.push(handle);
+//     }
+//
+//     // Await all scatter tasks
+//     let mut partial_paf_receivers = Vec::new();
+//
+//     for handle in partial_handles {
+//         let (paf_rx, stderr_task) = handle.await
+//             .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+//
+//         partial_paf_receivers.push(paf_rx);
+//         cleanup_tasks.push(stderr_task);
+//     }
+//
+//     // 4. Gather
+//     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
+//
+//     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
+//         partial_paf_receivers,
+//         merged_tx,
+//         channel_buffer,
+//     ));
+//
+//     cleanup_tasks.push(gather_handle);
+//
+//     Ok((
+//         ReceiverStream::new(merged_rx),
+//         cleanup_tasks,
+//         cleanup_receivers,
+//         Some(temp_dir),
+//     ))
+// }
 
 
     // ────────────────────────────────────────────────────────────────
@@ -2450,33 +2450,33 @@ async fn minimap2_non_host_align(
     //   Comment out or delete this whole block when finished debugging
     // ────────────────────────────────────────────────────────────────
 
-//     info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
-//     info!("Returning fake single-line ParseOutput stream instead of real PAF");
-//
-//     use tokio::sync::mpsc;
-//
-//     let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
-//
-//     // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
-//     let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
-//
-//     fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
-//         .await
-//         .expect("Failed to send fake ParseOutput in debug bypass");
-//
-//     drop(fake_tx);  // Close the channel → downstream sees EOF
-//
-//     let fake_paf_stream = ReceiverStream::new(fake_rx);
-//
-//     info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
-//
-//     Ok((
-//         fake_paf_stream,
-//         cleanup_tasks,
-//         cleanup_receivers,
-//         Some(temp_dir),
-//     ))
-// }
+    info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
+    info!("Returning fake single-line ParseOutput stream instead of real PAF");
+
+    use tokio::sync::mpsc;
+
+    let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
+
+    // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
+    let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
+
+    fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
+        .await
+        .expect("Failed to send fake ParseOutput in debug bypass");
+
+    drop(fake_tx);  // Close the channel → downstream sees EOF
+
+    let fake_paf_stream = ReceiverStream::new(fake_rx);
+
+    info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
+
+    Ok((
+        fake_paf_stream,
+        cleanup_tasks,
+        cleanup_receivers,
+        Some(temp_dir),
+    ))
+}
 
 // ────────────────────────────────────────────────────────────────
     //   End of temporary OOM-test bypass
