@@ -2266,14 +2266,99 @@ async fn minimap2_non_host_align(
 
     let config_for_scatter = config.clone();
 
+
+    const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
+    const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
+    const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
+    const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
+    const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
+
+
     for chunk_mmi in chunk_paths {
         let sem_clone = sem.clone();
         let config_clone = config_for_scatter.clone();
         let fastq_clone = input_fastq_path.clone();
+        let chunk_name = chunk_mmi.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let handle = tokio::spawn(async move {
-            let _permit = sem_clone.acquire().await
-                .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+            let start_wait = Instant::now();
+            let mut delay_count = 0;
+            let mut effective_threads = threads_per; // start with computed value
+
+            // Declare these outside so they're available after the loop
+            let mut avail_gib: u64 = 0;
+            let mut total_gib: u64 = 0;
+
+            loop {
+                let (total_bytes, avail_bytes) = match detect_ram() {
+                    Ok((t, a)) => (t, a),
+                    Err(e) => {
+                        warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
+                        effective_threads = FALLBACK_THREADS.min(effective_threads);
+                        break;
+                    }
+                };
+
+                total_gib = total_bytes / (1024 * 1024 * 1024);
+                avail_gib = avail_bytes / (1024 * 1024 * 1024);
+
+                // Dynamic minimum free RAM required
+                let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
+                    .max(MIN_FREE_ABSOLUTE_GIB)
+                    .min(total_gib / 4); // never more than 25% of total
+
+                // Small-machine auto-reduction
+                let is_small_machine = total_gib < 128;
+                if is_small_machine {
+                    if total_gib <= 64 {
+                        effective_threads = effective_threads.min(4);
+                        info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
+                    }
+                    if total_gib <= 32 {
+                        info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
+                        effective_threads = 2;
+                    }
+                }
+
+                if avail_gib >= min_free_gib {
+                    info!(
+                "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
+                chunk_name, avail_gib, total_gib, min_free_gib
+            );
+                    break;
+                }
+
+                let elapsed = start_wait.elapsed().as_secs();
+                if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
+                    warn!(
+                "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
+                chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
+            );
+                    effective_threads = FALLBACK_THREADS.min(effective_threads);
+                    break;
+                }
+
+                let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
+                info!(
+            "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
+            sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
+        );
+                sleep(Duration::from_secs(sleep_s)).await;
+                delay_count += 1;
+            }
+
+            // Now try to acquire semaphore (concurrency still enforced)
+            let _permit = match sem_clone.acquire().await {
+                Ok(p) => p,
+                Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
+            };
+
+            info!(
+        "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
+        chunk_name, effective_threads, avail_gib  // now in scope
+    );
 
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
@@ -2284,11 +2369,17 @@ async fn minimap2_non_host_align(
                 minimap2_index_path: chunk_mmi,
                 input_path: Some(fastq_clone),
                 option_fields: options,
-                num_threads: Some(threads_per),
+                num_threads: Some(effective_threads),  // use the possibly-reduced value
             };
 
             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-                .map_err(|e| anyhow!("Failed to generate minimap2 args: {}", e))?;
+                .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
+
+            info!(
+        "minimap2 cmd for {}: minimap2 {}",
+        chunk_name,
+        args.join(" ")
+    );
 
             let (mut child, stderr_task) = spawn_cmd(
                 config_clone.clone(),
@@ -2297,7 +2388,11 @@ async fn minimap2_non_host_align(
                 config_clone.args.verbose,
             )
                 .await
-                .map_err(|e| anyhow!("spawn_cmd failed: {}", e))?;
+                .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
+
+            if let Some(pid) = child.id() {
+                info!("minimap2 PID for {}: {}", chunk_name, pid);
+            }
 
             let paf_receiver = parse_child_output(
                 &mut child,
@@ -2306,7 +2401,7 @@ async fn minimap2_non_host_align(
                 config_clone.base_buffer_size,
             )
                 .await
-                .map_err(|e| anyhow!("parse_child_output failed: {}", e))?;
+                .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
 
             Ok((ReceiverStream::new(paf_receiver), stderr_task))
         });
