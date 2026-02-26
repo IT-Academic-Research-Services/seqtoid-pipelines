@@ -2240,9 +2240,9 @@ async fn minimap2_non_host_align(
     // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
     let max_concurrency = match total_threads {
         0..=16   => total_threads,
-        17..=64  => 16,
-        65..=128 => 32,
-        _        => 64.max(total_threads / 6),
+        17..=64  => 8,
+        65..=128 => 16,
+        _        => 32.max(total_threads / 8),
     };
 
     let concurrency = (total_threads / target_threads_per)
@@ -2258,6 +2258,9 @@ async fn minimap2_non_host_align(
         "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
         concurrency, threads_per, total_threads, num_chunks
     );
+
+    // Separate semaphore for index loading phase (only 1–2 concurrent loads)
+    let index_load_sem = Arc::new(Semaphore::new(2)); // 1 or 2 is safe
 
     // Scatter with dynamic concurrency limit
     let sem = Arc::new(Semaphore::new(concurrency as usize));
@@ -2276,6 +2279,7 @@ async fn minimap2_non_host_align(
 
     for chunk_mmi in chunk_paths {
         let sem_clone = sem.clone();
+        let index_load_sem_clone = index_load_sem.clone();
         let config_clone = config_for_scatter.clone();
         let fastq_clone = input_fastq_path.clone();
         let chunk_name = chunk_mmi.file_name()
@@ -2380,6 +2384,9 @@ async fn minimap2_non_host_align(
                 args.join(" ")
             );
 
+            let _index_permit = index_load_sem_clone.acquire().await
+                .map_err(|e| anyhow!("Index load semaphore failed for {}: {}", chunk_name, e))?;
+
             let (mut child, stderr_task) = spawn_cmd(
                 config_clone.clone(),
                 MINIMAP2_TAG,
@@ -2388,6 +2395,7 @@ async fn minimap2_non_host_align(
             )
                 .await
                 .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
+
 
             if let Some(pid) = child.id() {
                 info!("minimap2 PID for {}: {}", chunk_name, pid);
