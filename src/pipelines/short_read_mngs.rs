@@ -2203,241 +2203,240 @@ async fn minimap2_non_host_align(
     cleanup_tasks.push(write_handle);
 
     // 2. Discover chunks
-//     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
-//     let mut chunk_paths: Vec<PathBuf> = Vec::new();
-//
-//     let mut entries = fs::read_dir(&nt_split_dir)
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
-//
-//     while let Some(entry) = entries.next_entry().await.transpose() {
-//         if let Ok(entry) = entry {
-//             let path = entry.path();
-//             if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
-//                 chunk_paths.push(path);
-//             }
-//         }
-//     }
-//
-//     if chunk_paths.is_empty() {
-//         return Err(PipelineError::Other(anyhow!(
-//             "No .mmi chunk files found in {}",
-//             nt_split_dir.display()
-//         )));
-//     }
-//
-//     chunk_paths.sort();
-//     let num_chunks = chunk_paths.len();
-//     info!("Found {} minimap2 NT index chunks", num_chunks);
-//
-//     // 3. Compute dynamic concurrency
-//     // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
-//     let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
-//
-//     // Total available threads: Respects --threads, --use-smt, detected cores
-//     let total_threads = config.max_cores;
-//
-//     // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
-//     let max_concurrency = match total_threads {
-//         0..=16   => total_threads,
-//         17..=64  => 16,
-//         65..=128 => 32,
-//         _        => 64.max(total_threads / 6),
-//     };
-//
-//     let concurrency = (total_threads / target_threads_per)
-//         .max(1)                 // At least 1
-//         .min(num_chunks)        // Don't exceed chunks
-//         .min(max_concurrency);  // Prevent overload on small machines
-//
-//     // Recalculate threads_per to fit total_threads exactly (avoids waste)
-//     let mut threads_per = total_threads / concurrency;
-//     threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
-//
-//     info!(
-//         "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
-//         concurrency, threads_per, total_threads, num_chunks
-//     );
-//
-//     // Scatter with dynamic concurrency limit
-//     let sem = Arc::new(Semaphore::new(concurrency as usize));
-//
-//     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
-//
-//     let config_for_scatter = config.clone();
-//
-//
-//     const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
-//     const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
-//     const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
-//     const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
-//     const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
-//
-//
-//     for chunk_mmi in chunk_paths {
-//         let sem_clone = sem.clone();
-//         let config_clone = config_for_scatter.clone();
-//         let fastq_clone = input_fastq_path.clone();
-//         let chunk_name = chunk_mmi.file_name()
-//             .map(|s| s.to_string_lossy().to_string())
-//             .unwrap_or_else(|| "unknown".to_string());
-//
-//         let handle = tokio::spawn(async move {
-//             let start_wait = Instant::now();
-//             let mut delay_count = 0;
-//             let mut effective_threads = threads_per; // start with computed value
-//
-//             // Declare these outside so they're available after the loop
-//             let mut avail_gib: u64 = 0;
-//             let mut total_gib: u64 = 0;
-//
-//             loop {
-//                 let (total_bytes, avail_bytes) = match detect_ram() {
-//                     Ok((t, a)) => (t, a),
-//                     Err(e) => {
-//                         warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
-//                         effective_threads = FALLBACK_THREADS.min(effective_threads);
-//                         break;
-//                     }
-//                 };
-//
-//                 total_gib = total_bytes / (1024 * 1024 * 1024);
-//                 avail_gib = avail_bytes / (1024 * 1024 * 1024);
-//
-//                 // Dynamic minimum free RAM required
-//                 let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
-//                     .max(MIN_FREE_ABSOLUTE_GIB)
-//                     .min(total_gib / 4); // never more than 25% of total
-//
-//                 // Small-machine auto-reduction
-//                 let is_small_machine = total_gib < 128;
-//                 if is_small_machine {
-//                     if total_gib <= 64 {
-//                         effective_threads = effective_threads.min(4);
-//                         info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
-//                     }
-//                     if total_gib <= 32 {
-//                         info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
-//                         effective_threads = 2;
-//                     }
-//                 }
-//
-//                 if avail_gib >= min_free_gib {
-//                     info!(
-//                 "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
-//                 chunk_name, avail_gib, total_gib, min_free_gib
-//             );
-//                     break;
-//                 }
-//
-//                 let elapsed = start_wait.elapsed().as_secs();
-//                 if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
-//                     warn!(
-//                 "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
-//                 chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
-//             );
-//                     effective_threads = FALLBACK_THREADS.min(effective_threads);
-//                     break;
-//                 }
-//
-//                 let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
-//                 info!(
-//             "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
-//             sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
-//         );
-//                 sleep(Duration::from_secs(sleep_s)).await;
-//                 delay_count += 1;
-//             }
-//
-//             // Now try to acquire semaphore (concurrency still enforced)
-//             let _permit = match sem_clone.acquire().await {
-//                 Ok(p) => p,
-//                 Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
-//             };
-//
-//             info!(
-//         "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
-//         chunk_name, effective_threads, avail_gib  // now in scope
-//     );
-//
-//             let mut options = HashMap::new();
-//             options.insert("-c".to_string(), None);
-//             options.insert("-x".to_string(), Some("sr".to_string()));
-//             options.insert("--secondary".to_string(), Some("yes".to_string()));
-//
-//             let mm_config = Minimap2Config {
-//                 minimap2_index_path: chunk_mmi,
-//                 input_path: Some(fastq_clone),
-//                 option_fields: options,
-//                 num_threads: Some(effective_threads),  // use the possibly-reduced value
-//             };
-//
-//             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-//                 .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
-//
-//             info!(
-//         "minimap2 cmd for {}: minimap2 {}",
-//         chunk_name,
-//         args.join(" ")
-//     );
-//
-//             let (mut child, stderr_task) = spawn_cmd(
-//                 config_clone.clone(),
-//                 MINIMAP2_TAG,
-//                 args,
-//                 config_clone.args.verbose,
-//             )
-//                 .await
-//                 .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
-//
-//             if let Some(pid) = child.id() {
-//                 info!("minimap2 PID for {}: {}", chunk_name, pid);
-//             }
-//
-//             let paf_receiver = parse_child_output(
-//                 &mut child,
-//                 ChildStream::Stdout,
-//                 ParseMode::Lines,
-//                 config_clone.base_buffer_size,
-//             )
-//                 .await
-//                 .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
-//
-//             Ok((ReceiverStream::new(paf_receiver), stderr_task))
-//         });
-//
-//         partial_handles.push(handle);
-//     }
-//
-//     // Await all scatter tasks
-//     let mut partial_paf_receivers = Vec::new();
-//
-//     for handle in partial_handles {
-//         let (paf_rx, stderr_task) = handle.await
-//             .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
-//
-//         partial_paf_receivers.push(paf_rx);
-//         cleanup_tasks.push(stderr_task);
-//     }
-//
-//     // 4. Gather
-//     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
-//
-//     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
-//         partial_paf_receivers,
-//         merged_tx,
-//         channel_buffer,
-//     ));
-//
-//     cleanup_tasks.push(gather_handle);
-//
-//     Ok((
-//         ReceiverStream::new(merged_rx),
-//         cleanup_tasks,
-//         cleanup_receivers,
-//         Some(temp_dir),
-//     ))
-// }
+    let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
+    let mut chunk_paths: Vec<PathBuf> = Vec::new();
+
+    let mut entries = fs::read_dir(&nt_split_dir)
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
+
+    while let Some(entry) = entries.next_entry().await.transpose() {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
+                chunk_paths.push(path);
+            }
+        }
+    }
+
+    if chunk_paths.is_empty() {
+        return Err(PipelineError::Other(anyhow!(
+            "No .mmi chunk files found in {}",
+            nt_split_dir.display()
+        )));
+    }
+
+    chunk_paths.sort();
+    let num_chunks = chunk_paths.len();
+    info!("Found {} minimap2 NT index chunks", num_chunks);
+
+    // 3. Compute dynamic concurrency
+    // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
+    let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
+
+    // Total available threads: Respects --threads, --use-smt, detected cores
+    let total_threads = config.max_cores;
+
+    // Compute concurrency: Aim to give each job ~target_threads_per, but don't exceed num_chunks or a max to avoid I/O thrashing
+    let max_concurrency = match total_threads {
+        0..=16   => total_threads,
+        17..=64  => 16,
+        65..=128 => 32,
+        _        => 64.max(total_threads / 6),
+    };
+
+    let concurrency = (total_threads / target_threads_per)
+        .max(1)                 // At least 1
+        .min(num_chunks)        // Don't exceed chunks
+        .min(max_concurrency);  // Prevent overload on small machines
+
+    // Recalculate threads_per to fit total_threads exactly (avoids waste)
+    let mut threads_per = total_threads / concurrency;
+    threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
+
+    info!(
+        "Dynamic scatter: concurrency={}, threads_per={} (total_threads={}, num_chunks={})",
+        concurrency, threads_per, total_threads, num_chunks
+    );
+
+    // Scatter with dynamic concurrency limit
+    let sem = Arc::new(Semaphore::new(concurrency as usize));
+
+    let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
+
+    let config_for_scatter = config.clone();
+
+
+    const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
+    const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
+    const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
+    const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
+    const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
+
+
+    for chunk_mmi in chunk_paths {
+        let sem_clone = sem.clone();
+        let config_clone = config_for_scatter.clone();
+        let fastq_clone = input_fastq_path.clone();
+        let chunk_name = chunk_mmi.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let handle = tokio::spawn(async move {
+            let start_wait = Instant::now();
+            let mut delay_count = 0;
+            let mut effective_threads = threads_per; // start with computed value
+
+            let mut avail_gib: u64 = 0;
+            let mut total_gib: u64 = 0;
+
+            loop {
+                let (total_bytes, avail_bytes) = match detect_ram() {
+                    Ok((t, a)) => (t, a),
+                    Err(e) => {
+                        warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
+                        effective_threads = FALLBACK_THREADS.min(effective_threads);
+                        break;
+                    }
+                };
+
+                total_gib = total_bytes / (1024 * 1024 * 1024);
+                avail_gib = avail_bytes / (1024 * 1024 * 1024);
+
+                // Dynamic minimum free RAM required
+                let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
+                    .max(MIN_FREE_ABSOLUTE_GIB)
+                    .min(total_gib / 4); // never more than 25% of total
+
+                // Small-machine auto-reduction
+                let is_small_machine = total_gib < 128;
+                if is_small_machine {
+                    if total_gib <= 64 {
+                        effective_threads = effective_threads.min(4);
+                        info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
+                    }
+                    if total_gib <= 32 {
+                        info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
+                        effective_threads = 2;
+                    }
+                }
+
+                if avail_gib >= min_free_gib {
+                    info!(
+                        "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
+                        chunk_name, avail_gib, total_gib, min_free_gib
+                    );
+                    break;
+                }
+
+                let elapsed = start_wait.elapsed().as_secs();
+                if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
+                    warn!(
+                        "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
+                        chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
+                    );
+                    effective_threads = FALLBACK_THREADS.min(effective_threads);
+                    break;
+                }
+
+                let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
+                info!(
+                    "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
+                    sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
+                );
+                sleep(Duration::from_secs(sleep_s)).await;
+                delay_count += 1;
+            }
+
+            // try to acquire semaphore (concurrency still enforced)
+            let _permit = match sem_clone.acquire().await {
+                Ok(p) => p,
+                Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
+            };
+
+            info!(
+                "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
+                chunk_name, effective_threads, avail_gib  // now in scope
+            );
+
+            let mut options = HashMap::new();
+            options.insert("-c".to_string(), None);
+            options.insert("-x".to_string(), Some("sr".to_string()));
+            options.insert("--secondary".to_string(), Some("yes".to_string()));
+
+            let mm_config = Minimap2Config {
+                minimap2_index_path: chunk_mmi,
+                input_path: Some(fastq_clone),
+                option_fields: options,
+                num_threads: Some(effective_threads),
+            };
+
+            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+                .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
+
+            info!(
+                "minimap2 cmd for {}: minimap2 {}",
+                chunk_name,
+                args.join(" ")
+            );
+
+            let (mut child, stderr_task) = spawn_cmd(
+                config_clone.clone(),
+                MINIMAP2_TAG,
+                args,
+                config_clone.args.verbose,
+            )
+                .await
+                .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
+
+            if let Some(pid) = child.id() {
+                info!("minimap2 PID for {}: {}", chunk_name, pid);
+            }
+
+            let paf_receiver = parse_child_output(
+                &mut child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config_clone.base_buffer_size,
+            )
+                .await
+                .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
+
+            Ok((ReceiverStream::new(paf_receiver), stderr_task))
+        });
+
+        partial_handles.push(handle);
+    }
+
+    // Await all scatter tasks
+    let mut partial_paf_receivers = Vec::new();
+
+    for handle in partial_handles {
+        let (paf_rx, stderr_task) = handle.await
+            .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+
+        partial_paf_receivers.push(paf_rx);
+        cleanup_tasks.push(stderr_task);
+    }
+
+    // 4. Gather
+    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
+
+    let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
+        partial_paf_receivers,
+        merged_tx,
+        channel_buffer,
+    ));
+
+    cleanup_tasks.push(gather_handle);
+
+    Ok((
+        ReceiverStream::new(merged_rx),
+        cleanup_tasks,
+        cleanup_receivers,
+        Some(temp_dir),
+    ))
+}
 
 
     // ────────────────────────────────────────────────────────────────
@@ -2450,33 +2449,33 @@ async fn minimap2_non_host_align(
     //   Comment out or delete this whole block when finished debugging
     // ────────────────────────────────────────────────────────────────
 
-    info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
-    info!("Returning fake single-line ParseOutput stream instead of real PAF");
-
-    use tokio::sync::mpsc;
-
-    let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
-
-    // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
-    let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
-
-    fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
-        .await
-        .expect("Failed to send fake ParseOutput in debug bypass");
-
-    drop(fake_tx);  // Close the channel → downstream sees EOF
-
-    let fake_paf_stream = ReceiverStream::new(fake_rx);
-
-    info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
-
-    Ok((
-        fake_paf_stream,
-        cleanup_tasks,
-        cleanup_receivers,
-        Some(temp_dir),
-    ))
-}
+//     info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
+//     info!("Returning fake single-line ParseOutput stream instead of real PAF");
+//
+//     use tokio::sync::mpsc;
+//
+//     let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
+//
+//     // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
+//     let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
+//
+//     fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
+//         .await
+//         .expect("Failed to send fake ParseOutput in debug bypass");
+//
+//     drop(fake_tx);  // Close the channel → downstream sees EOF
+//
+//     let fake_paf_stream = ReceiverStream::new(fake_rx);
+//
+//     info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
+//
+//     Ok((
+//         fake_paf_stream,
+//         cleanup_tasks,
+//         cleanup_receivers,
+//         Some(temp_dir),
+//     ))
+// }
 
 // ────────────────────────────────────────────────────────────────
     //   End of temporary OOM-test bypass
@@ -5477,7 +5476,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         hisat2_options,
         None,
         4
-
     )
         .await?;
     cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
@@ -5492,7 +5490,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let post_filter_stream = if config.args.human_host {
         host_hisat2_out_stream
     } else {
-
         let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
         let human_hisat2_index: String = config.args.human_hisat2_index.clone();
 
@@ -5582,7 +5579,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
 
     cleanup_tasks.push(subsample_send_task);
-    
+
     let subsample_count = subsample_count_rx.await?;
     let subsample_reads = subsample_count * if paired { 2 } else { 1 };
     info!("Subsampled reads (pairs counted separately): {}", subsample_reads);
@@ -5641,7 +5638,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
 
 
-
     // Minimap2 non_host alignment
     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_mm2_temp_dir) = minimap2_non_host_align(
         config.clone(),
@@ -5695,7 +5691,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|_| PipelineError::StreamDataDropped)?;
     cleanup_receivers.push(nt_done_rx);
 
-    let mut nt_streams_iter =nt_streams.into_iter();
+    let mut nt_streams_iter = nt_streams.into_iter();
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -5743,7 +5739,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
 
-
     // Diamond non_host alignment
     // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
     //     config.clone(),
@@ -5754,8 +5749,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
     // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
     // temp_dirs.extend(non_host_diamond_temp_dirs);
-
-
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
@@ -5848,7 +5841,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ReceiverStream::new(non_host_annot_stream),
         cluster_stream,
         nt_map, nr_map,
-    )            .await
+    ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
 
     cleanup_tasks.append(&mut annot_tasks);
@@ -5988,7 +5981,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ))?;
 
 
-
     let nr_file = config
         .args
         .nr
@@ -6004,8 +5996,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .ok_or(PipelineError::MissingArgument(
             "NR offset DB file required for fasta extraction".into(),
         ))?;
-
-
 
 
     // Blast contigs
@@ -6051,7 +6041,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
 
 
-    let (nr_ref_fasta_path, nr_ref_fasta_temp_dir)  = build_reference_fasta_from_selected_genera(
+    let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
         config.clone(),
         &nr_selected_genera,
         NR_TAG,
@@ -6120,15 +6110,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
 
-
-
-
-
     let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
         .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
 
     let (nt_read_dict, nt_refined_counts,
-        nt_contig_summary,  nt_refined_m8_stream_out,
+        nt_contig_summary, nt_refined_m8_stream_out,
         nt_refined_hit_summary_stream_out, nt_refined_m8_top_stream_out,
         nt_cleanup_tasks, nt_cleanup_receivers,
         nt_temp_files) = nt_res?;
@@ -6280,7 +6266,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_alignment_per_read
     ));
 
-    
+
     let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
     let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
@@ -6333,7 +6319,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         contigs_cluster_stream,
         nt_refined_map.into_iter().collect(),
         nr_refined_map.into_iter().collect(),
-    )            .await
+    ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
@@ -6565,7 +6551,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-
     let clusters_opt = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
         Some(duplicate_clusters.clone())
     } else {
@@ -6582,7 +6567,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //     clusters_opt,
     //     out_dir.clone(),
     // ).await?;
-
 
 
     // *******************
@@ -6627,10 +6611,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
 
-
     // insert size, now host BAM written out
     if paired {
-
         info!("Computing host insert size statistics from {}", host_bt2_bam_path.display());
 
         let stats = compute_insert_size_stats_from_bam(
@@ -6730,37 +6712,88 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
     // Cleanup
     // *******************
-    let results = try_join_all(cleanup_tasks)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        match receiver.await {
-            Ok(Ok(_)) => {},
-            Ok(Err(e)) => return Err(PipelineError::Other(e)),
-            Err(e) => {
-                warn!("Cleanup receiver failed (possibly empty stream): {}", e);
-                continue;  // non-fatal for empty
-            },
+
+    // Helper to handle downcast + NotFound tolerance in one place
+    fn handle_cleanup_error(e: anyhow::Error, context: &str) -> Result<(), PipelineError> {
+        match e.downcast::<std::io::Error>() {
+            Ok(io_err) => {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    warn!("Cleanup ignored missing file/dir (non-fatal) [{}]: {}", context, io_err);
+                    Ok(())
+                } else {
+                    // Other io errors are fatal
+                    Err(PipelineError::Other(anyhow::Error::new(io_err)))
+                }
+            }
+            Err(remaining) => {
+                // Not an io::Error → treat as fatal
+                Err(PipelineError::Other(remaining))
+            }
         }
     }
 
+    // Wait for all cleanup tasks
+    let cleanup_results = try_join_all(cleanup_tasks)
+        .await
+        .map_err(|join_err| PipelineError::Other(join_err.into()))?;
+
+    // Process each task result
+    for res in cleanup_results {
+        if let Err(e) = res {
+            handle_cleanup_error(e, "task")?;
+        }
+    }
+
+    // Process cleanup receivers (oneshot channels)
+    for rx in cleanup_receivers {
+        match rx.await {
+            Ok(Ok(_)) => {}  // success
+
+            Ok(Err(e)) => {
+                handle_cleanup_error(e, "receiver")?;
+            }
+
+            Err(oneshot_err) => {
+                // Channel broken (panic, drop, empty stream, etc.)
+                // Usually safe to ignore if stream was empty
+                warn!("Cleanup receiver channel failed (possibly empty): {}", oneshot_err);
+                // continue (non-fatal)
+            }
+        }
+    }
+
+    // Coverage viz — keep non-fatal as before
     if let Some(coverage_task) = coverage_task {
         match coverage_task.await {
-            Ok(result) => match result {
-                Ok(_) => info!("Coverage visualization completed successfully"),
-                Err(e) => warn!("Coverage viz failed (non-fatal): {}", e),
-            },
-            Err(e) => warn!("Coverage viz task failed: {}", e),
+            Ok(Ok(_)) => info!("Coverage visualization completed successfully"),
+            Ok(Err(e)) => warn!("Coverage viz failed (non-fatal): {}", e),
+            Err(join_err) => warn!("Coverage viz task join failed (non-fatal): {}", join_err),
         }
     }
 
-    drop(temp_files);
-    drop(temp_dirs);
+    // Final temp resource drops — defensive, never fail the pipeline
+    for tf in temp_files {
+        if let Err(e) = tf.close() {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!("Temp file already gone during close: {}", e);
+            } else {
+                warn!("Temp file close failed (non-fatal): {}", e);
+            }
+        }
+    }
+
+    for td in temp_dirs {
+        if let Err(e) = std::fs::remove_dir_all(td.path()) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!("Temp dir already gone: {}", e);
+            } else {
+                warn!("Temp dir removal failed (non-fatal): {}", e);
+            }
+        }
+    }
+
     drop(temp_paths);
 
-    info!("Finished short read mNGS pipeline.");
+    info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
     Ok(())
 }
