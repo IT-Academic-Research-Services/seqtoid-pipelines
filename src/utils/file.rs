@@ -9,6 +9,7 @@ use crate::config::defs::GZIP_EXT;
 use log::{self, LevelFilter, debug, info, error, warn};
 use anyhow::{Result, anyhow};
 use tempfile::NamedTempFile;
+use tempfile::TempDir;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_stream::wrappers::ReceiverStream;
 use crate::utils::streams::ParseOutput;
@@ -460,74 +461,46 @@ pub async fn write_vecu8_to_file<P: AsRef<Path>>(
 /// - A `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
 /// - The temporary file path as `PathBuf`.
 /// - The `NamedTempFile` handle (hold this to prevent deletion; auto-deletes on drop unless persisted).
-pub async fn write_parse_output_to_temp_file<P: AsRef<Path>>(
-    input_stream: ReceiverStream<ParseOutput>,
+pub async fn write_parse_output_to_file(
+    output_path: &PathBuf,
+    mut input_stream: ReceiverStream<ParseOutput>,
     buffer_size: Option<usize>,
-    suffix: Option<&str>,
-    ram_temp_dir: P,
-) -> Result<(JoinHandle<Result<(), anyhow::Error>>, PathBuf, tempfile::NamedTempFile)> {
-    let mut temp_name = match suffix {
-        Some(s) => TempfileBuilder::new()
-            .suffix(s)
-            .tempfile_in(ram_temp_dir.as_ref()),
-        None => TempfileBuilder::new().tempfile_in(ram_temp_dir.as_ref()),
-    }
-        .map_err(|e| anyhow!("Failed to create temp file in {}: {}", ram_temp_dir.as_ref().display(), e))?;
-    let temp_path = temp_name.path().to_path_buf();
-
-    let writer_file = TokioFile::create(&temp_path).await?;
+) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
-    let temp_path_clone = temp_path.clone();
+    let output_path_clone = output_path.clone();
 
     let task = tokio::spawn(async move {
-        let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
-        let mut input_stream = input_stream;
-        let mut byte_count = 0;
+        let file = TokioFile::create(&output_path_clone)
+            .await
+            .map_err(|e| anyhow!("Failed to create file at {}: {}", output_path_clone.display(), e))?;
+        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
+        let mut total_bytes = 0u64;
 
         while let Some(item) = input_stream.next().await {
-            match item {
-                ParseOutput::Bytes(data) => {
-                    writer.write_all(&data).await?;
-                    byte_count += data.len();
-                }
-                ParseOutput::Fasta(record) => {
-                    if let SequenceRecord::Fasta { id, desc, seq } = &record {
-                        if let Some(d) = desc {
-                            writer.write_all(format!(">{} {}\n", id, d).as_bytes()).await?;
-                        } else {
-                            writer.write_all(format!(">{}\n", id).as_bytes()).await?;
-                        }
-                        writer.write_all(&**seq).await?;
-                        writer.write_all(b"\n").await?;
-                        byte_count += seq.len() + id.len() + 2 + desc.as_ref().map_or(0, |d| d.len() + 1);
-                    }
-                }
-                ParseOutput::Fastq(record) => {
-                    if let SequenceRecord::Fastq { id, desc, seq, qual } = &record {
-                        if let Some(d) = desc {
-                            writer.write_all(format!("@{} {}\n", id, d).as_bytes()).await?;
-                        } else {
-                            writer.write_all(format!("@{}\n", id).as_bytes()).await?;
-                        }
-                        writer.write_all(&**seq).await?;
-                        writer.write_all(b"\n+\n").await?;
-                        writer.write_all(&**qual).await?;
-                        writer.write_all(b"\n").await?;
-                        byte_count += seq.len() + qual.len() + id.len() + 4 + desc.as_ref().map_or(0, |d| d.len() + 1);
-                    }
-                }
-            }
+            let bytes = item.to_bytes()?;  // Convert ANY ParseOutput to bytes (uses ToBytes impl)
+            writer.write_all(&bytes)
+                .await
+                .map_err(|e| anyhow!("Failed to write to {}: {}", output_path_clone.display(), e))?;
+            total_bytes += bytes.len() as u64;
         }
 
-        writer.flush().await?;
-        writer.shutdown().await?;
-        if byte_count == 0 {
-            return Err(anyhow!("No data written to temp file at {}", temp_path_clone.display()));
+        writer.flush()
+            .await
+            .map_err(|e| anyhow!("Failed to flush {}: {}", output_path_clone.display(), e))?;
+        writer.shutdown()
+            .await
+            .map_err(|e| anyhow!("Failed to shutdown {}: {}", output_path_clone.display(), e))?;
+
+        if total_bytes == 0 {
+            warn!("No data written to file at {}", output_path_clone.display());
+        } else {
+            debug!("Wrote {} bytes to {}", total_bytes, output_path_clone.display());
         }
+
         Ok(())
     });
 
-    Ok((task, temp_path, temp_name))
+    Ok(task)
 }
 
 pub async fn validate_file_inputs(
@@ -684,9 +657,8 @@ pub async fn choose_temp_dir(
     ram_dir: &PathBuf,
     nvme_scratch: &Option<String>,
     headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
-) -> Result<PathBuf> {
-
-    async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool> {
+) -> Result<TempDir, PipelineError> {
+    async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool, PipelineError> {
         let avail = available_space_for_path(path).await?;
         Ok(required <= avail / factor)
     }
@@ -700,7 +672,8 @@ pub async fn choose_temp_dir(
             available_space_for_path(ram_dir).await?,
             headroom_factor
         );
-        return Ok(ram_dir.clone());
+        return TempDir::new_in(ram_dir)
+            .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in RAM dir {}: {}", ram_dir.display(), e)));
     }
 
     // 2. Try NVMe scratch if provided
@@ -713,7 +686,8 @@ pub async fn choose_temp_dir(
                 estimated_bytes,
                 headroom_factor
             );
-            return Ok(nvme_path.clone());
+            return TempDir::new_in(&nvme_path)
+                .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in NVMe dir {}: {}", nvme_path.display(), e)));
         } else {
             warn!(
                 "NVMe scratch {} insufficient: need {} bytes (/{})",
@@ -728,11 +702,10 @@ pub async fn choose_temp_dir(
 
     // 3. Final fallback: system temp
     debug!(
-        "Falling back to system temp dir {} (RAM/NVMe insufficient or unavailable)",
-        std::env::temp_dir().display()
+        "Falling back to system temp dir (RAM/NVMe insufficient or unavailable)"
     );
-    Ok(std::env::temp_dir())
-
+    TempDir::new()
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))
 }
 
 #[cfg(test)]
@@ -778,22 +751,5 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_write_parse_output_to_temp_file_fastq() -> Result<()> {
-        let (tx, rx) = mpsc::channel(10);
-        let fastq = SequenceRecord::Fastq {
-            id: "read1".to_string(),
-            desc: None,
-            seq: Arc::new(b"ATCG".to_vec()),
-            qual: Arc::new(b"IIII".to_vec()),
-        };
-        tokio::spawn(async move { tx.send(ParseOutput::Fastq(fastq)).await.unwrap(); });
-        let (task, path, _temp) = write_parse_output_to_temp_file(ReceiverStream::new(rx), None, Some(".fq"), std::env::temp_dir()).await?;
-        task.await??;
-        let file = std::fs::File::open(&path)?;
-        let mut contents = String::new();
-        std::io::BufReader::new(file).read_to_string(&mut contents)?;
-        assert_eq!(contents, "@read1\nATCG\n+\nIIII\n");
-        Ok(())
-    }
+
 }

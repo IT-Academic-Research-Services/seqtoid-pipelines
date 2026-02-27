@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::process::Command;
 
 use log::{self, LevelFilter, debug, info, error, warn};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
@@ -20,6 +21,20 @@ use crate::cli::args::{Arguments, Technology};
 use crate::config::defs::{RunConfig, StreamDataType};
 
 
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    pub index: usize,              // 0-based
+    pub name: String,              // e.g. "NVIDIA H100 80GB HBM3" or "Apple M2"
+    pub memory_mib: Option<u64>,   // total VRAM in MiB (None if unknown)
+    pub is_discrete: bool,         // true for dedicated card, false for integrated
+    pub driver: Option<String>,    // e.g. "550.90.07" or None
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuDetection {
+    pub count: usize,
+    pub gpus: Vec<GpuInfo>,
+}
 
 
 /// Detects physical cores (not logical) — fallback to lscpu if sysinfo doesn't distinguish
@@ -27,7 +42,6 @@ pub fn detect_physical_cores() -> usize {
     let physical = num_cpus::get_physical();
 
     if physical > 0 {
-        info!("Detected {} physical cores", physical);
         physical
     } else {
         let logical = num_cpus::get();
@@ -261,4 +275,228 @@ fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
         }
     }
     None
+}
+
+pub fn detect_gpus() -> Result<GpuDetection> {
+    #[cfg(target_os = "linux")]
+    {
+        // Try nvidia-smi first (most reliable on your cluster)
+        if let Ok(nvidia) = detect_nvidia() {
+            if !nvidia.gpus.is_empty() {
+                info!("Detected {} NVIDIA GPU(s): {:?}", nvidia.count, nvidia.gpus);
+                return Ok(nvidia);
+            }
+        }
+
+        // Fallback: very basic lspci detection (just count + rough names)
+        if let Ok(basic) = detect_lspci_basic() {
+            if basic.count > 0 {
+                info!("Detected {} GPU(s) via lspci (no nvidia-smi available)", basic.count);
+                return Ok(basic);
+            }
+        }
+
+        debug!("No GPUs detected on Linux");
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(macos) = detect_macos() {
+            if macos.count > 0 {
+                info!("Detected {} GPU(s) on macOS: {:?}", macos.count, macos.gpus);
+                return Ok(macos);
+            }
+        }
+        debug!("No GPUs detected on macOS");
+        Ok(GpuDetection { count: 0, gpus: vec![] })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        warn!("GPU detection not implemented for this platform");
+        Ok(GpuDetection { count: 0, gpus: vec![] })
+    }
+}
+
+
+fn detect_nvidia() -> Result<GpuDetection> {
+    // Query name + memory + driver
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .map_err(|e| anyhow!("nvidia-smi not found or failed: {}", e))?;
+
+    if !output.status.success() {
+        debug!("nvidia-smi command failed");
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut gpus = vec![];
+
+    for (i, line) in stdout.lines().enumerate() {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let index = i;
+        let name = parts[1].to_string();
+        let memory_str = parts[2].trim_end_matches(" MiB");
+        let memory_mib = memory_str.parse::<u64>().ok();
+        let driver = Some(parts[3].to_string());
+
+        gpus.push(GpuInfo {
+            index,
+            name,
+            memory_mib,
+            is_discrete: true,           // NVIDIA cards are always discrete
+            driver,
+        });
+    }
+
+    Ok(GpuDetection {
+        count: gpus.len(),
+        gpus,
+    })
+}
+
+fn detect_macos() -> Result<GpuDetection> {
+    let output = Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+        .map_err(|e| anyhow!("system_profiler failed: {}", e))?;
+
+    if !output.status.success() {
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Very simple parsing — real parsing would use serde_json, but we avoid extra deps here
+    let mut gpus = vec![];
+    let mut index = 0;
+
+    for line in stdout.lines() {
+        if line.contains("\"Chipset Model\":") || line.contains("\"Device Name\":") {
+            let name = line
+                .split(':')
+                .nth(1)
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches(',')
+                .to_string();
+
+            gpus.push(GpuInfo {
+                index,
+                name: if name.is_empty() { "Apple GPU".to_string() } else { name },
+                memory_mib: None,           // macOS doesn't expose easily via CLI
+                is_discrete: false,         // Apple Silicon is integrated
+                driver: None,
+            });
+            index += 1;
+        }
+    }
+
+    // Fallback: assume at least 1 on modern Macs
+    if gpus.is_empty() {
+        gpus.push(GpuInfo {
+            index: 0,
+            name: "Apple integrated GPU".to_string(),
+            memory_mib: None,
+            is_discrete: false,
+            driver: None,
+        });
+    }
+
+    Ok(GpuDetection {
+        count: gpus.len(),
+        gpus,
+    })
+}
+
+fn detect_lspci_basic() -> Result<GpuDetection> {
+    let output = Command::new("lspci")
+        .arg("-mm")           // machine-readable format, easier to parse
+        .arg("-v")            // more verbose (includes device class)
+        .output()
+        .map_err(|e| anyhow!("Failed to run lspci: {}", e))?;
+
+    if !output.status.success() {
+        debug!("lspci command failed or not found");
+        return Ok(GpuDetection { count: 0, gpus: vec![] });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut gpus = vec![];
+    let mut index = 0;
+
+    // Keywords that usually indicate a GPU
+    let gpu_indicators = [
+        "VGA compatible controller",
+        "3D controller",
+        "Display controller",
+    ];
+
+    // Common GPU vendors (for rough classification)
+    let gpu_vendors = [
+        "NVIDIA", "AMD", "ATI", "Intel", "Matrox", "Radeon", "GeForce",
+        "Quadro", "Tesla", "RTX", "GTX", "FirePro", "Arc",
+    ];
+
+    for line in stdout.lines() {
+        // Skip lines that are clearly not device descriptions
+        if line.contains("Kernel driver") || line.contains("Subsystem") || line.is_empty() {
+            continue;
+        }
+
+        let lower = line.to_lowercase();
+
+        // Check if this line describes a graphics device
+        if gpu_indicators.iter().any(|&kw| lower.contains(&kw.to_lowercase())) {
+            // Try to extract something that looks like a device name/model
+            let mut name_parts = vec![];
+
+            // Split on ':' and take the part after the slot/class
+            if let Some(after_class) = line.splitn(3, ':').nth(2) {
+                let cleaned = after_class.trim();
+                name_parts.push(cleaned.to_string());
+            }
+
+            // Look for vendor/model in the line
+            for vendor in &gpu_vendors {
+                if lower.contains(&vendor.to_lowercase()) {
+                    name_parts.push(vendor.to_string());
+                    break;
+                }
+            }
+
+            let name = if name_parts.is_empty() {
+                "Unknown GPU".to_string()
+            } else {
+                name_parts.join(" ")
+            };
+
+            gpus.push(GpuInfo {
+                index,
+                name,
+                memory_mib: None,         // lspci doesn't show VRAM
+                is_discrete: !lower.contains("intel") && !lower.contains("integrated"),
+                driver: None,
+            });
+
+            index += 1;
+        }
+    }
+
+    debug!("lspci basic detection found {} potential GPUs", gpus.len());
+
+    Ok(GpuDetection {
+        count: gpus.len(),
+        gpus,
+    })
 }

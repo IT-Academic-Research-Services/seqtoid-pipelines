@@ -37,6 +37,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::try_join;
@@ -75,11 +76,11 @@ use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_f
                           filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
-                         validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_temp_file,
+                         validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
                          write_vecu8_to_file};
 use crate::utils::paf::PafRecord;
 use crate::utils::plotting::plot_insert_sizes;
-use crate::utils::sambam::generate_info_from_bam_stream;
+use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
@@ -106,6 +107,9 @@ const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
 const MIN_ASSEMBLY_READ_COUNT: usize = 56;
 
 const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
+
+const MM2_TARGET_THREADS_PER : usize = 8;
+
 
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r",(?=[^\s])").unwrap()
@@ -387,13 +391,18 @@ async fn bowtie2_filter(
     bt2_index_path: PathBuf,
     paired: bool,
     bowtie2_options: HashMap<String, Option<String>>,
-    output_bam_path: Option<PathBuf>,
-    compute_insert_stats: bool,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Option<oneshot::Receiver<SamtoolsStats>>), PipelineError> {
+    output_bam_path: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,                    // unmapped FASTQ stream
+    oneshot::Receiver<u64>,                         // mapped read count
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,     // cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, // cleanup receivers
+    JoinHandle<Result<()>>,                         // BAM write task handle
+    PathBuf,                                        // written BAM path
+    Vec<TempDir>
+), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
-
-    let paired_compute_insert_stats = paired && compute_insert_stats;
 
     let temp_dir = choose_temp_dir(
         config.input_size,
@@ -405,7 +414,7 @@ async fn bowtie2_filter(
     // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
-        paired: paired,
+        paired,
         option_fields: bowtie2_options,
     };
 
@@ -446,14 +455,13 @@ async fn bowtie2_filter(
             })?
     };
 
-    // Sort, output uncompressed BAM
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // Name-sorted for fastq extraction
-            ("-u".to_string(), None),
+            ("-n".to_string(), None),          // name-sorted
+            ("-u".to_string(), None),          // uncompressed
             ("-O".to_string(), Some("bam".to_string())),
-            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
+            ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
             ("-".to_string(), None),
         ]),
     };
@@ -494,7 +502,11 @@ async fn bowtie2_filter(
             })?
     };
 
-    let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 } + if paired_compute_insert_stats { 1 } else { 0 };
+    // ────────────────────────────────────────────────────────────────
+    // T-junction: split for unmapped FASTQ, mapped count, and BAM write
+    // ────────────────────────────────────────────────────────────────
+
+    let num_tees = 3; // unmapped → fastq, count, bam file write
     let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
 
     let (bam_streams, bam_done_rx) = t_junction(
@@ -515,53 +527,59 @@ async fn bowtie2_filter(
     let mut bam_streams_iter = bam_streams.into_iter();
     let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let bam_file_stream = if output_bam_path.is_some() {
-        Some(bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?)
-    } else {
-        None
-    };
-    let insert_stats_stream = if paired_compute_insert_stats {
-        Some(bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?)
-    } else {
-        None
-    };
+    let bam_file_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    // Handle BAM output if requested
-    if let (Some(bam_path), Some(stream)) = (output_bam_path, bam_file_stream) {
-        let bam_write_task = write_byte_stream_to_file(
-            &bam_path,
-            ReceiverStream::new(stream),
-            Some(config.base_buffer_size),
+
+    let config_for_write = config.clone();
+    let output_bam_path_for_write = output_bam_path.clone();
+
+    // ────────────────────────────────────────────────────────────────
+    // Write full BAM to disk
+    // ────────────────────────────────────────────────────────────────
+
+    let bam_write_task: JoinHandle<Result<()>> = tokio::spawn(async move {
+        write_byte_stream_to_file(
+            &output_bam_path_for_write,
+            ReceiverStream::new(bam_file_stream),
+            Some(config_for_write.base_buffer_size),
         )
             .await
-            .map_err(|e| PipelineError::IOError(e.to_string()))?;
-        cleanup_tasks.push(bam_write_task);
-    }
+            .map_err(|e| anyhow!("Failed to write BAM file {}: {}", output_bam_path_for_write.display(), e))?;
 
-    // Count mapped reads
+        Ok(())
+    });
+
+    // ────────────────────────────────────────────────────────────────
+    // Count mapped reads (rough approximation via line count)
+    // ────────────────────────────────────────────────────────────────
+
     let (count_tx, count_rx) = oneshot::channel();
     let count_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(count_stream);
-        let mut line_count = 0;
+        let mut line_count = 0u64;
         while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(line) if !line.is_empty() => line_count += 1,
-                _ => continue,
+            if let ParseOutput::Bytes(b) = item {
+                if !b.is_empty() {
+                    line_count += 1;
+                }
             }
         }
-        let count = line_count as u64 / if paired { 8 } else { 4 };
-        count_tx.send(count).map_err(|_| anyhow!("Failed to send count"))?;
+        let count = line_count / if paired { 8 } else { 4 }; // rough pair estimate
+        let _ = count_tx.send(count);
         Ok(())
     });
     cleanup_tasks.push(count_task);
 
-    // Samtools fastq to extract unmapped reads
-    let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
+    // ────────────────────────────────────────────────────────────────
+    // Samtools fastq: extract unmapped reads
+    // ────────────────────────────────────────────────────────────────
+
+    let unmapped_flag = if paired { "-f13" } else { "-f4" };
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
         subcommand_fields: HashMap::from([
-            (unmapped_flag, None),
-            ("-".to_string(), None), // Output to stdout (interleaved for paired)
+            (unmapped_flag.to_string(), None),
+            ("-".to_string(), None),
         ]),
     };
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
@@ -601,229 +619,16 @@ async fn bowtie2_filter(
             })?
     };
 
-    // Compute insert size metrics if paired and compute_insert_stats is true
-    let insert_stats_rx = if paired_compute_insert_stats {
-        let insert_stats_stream = insert_stats_stream.unwrap();
-
-        let (mut stats_streams, stats_done_rx) = t_junction(
-            ReceiverStream::new(insert_stats_stream),
-            2,
-            config.base_buffer_size,
-            config.args.stall_threshold,
-            None,
-            config.base_backpressure_pause,
-            StreamDataType::JustBytes,
-            "insert_stats_split".to_string(),
-            None,
-        )
-            .await
-            .map_err(|_| PipelineError::StreamDataDropped)?;
-        cleanup_receivers.push(stats_done_rx);
-
-        let mut stats_streams_iter = stats_streams.into_iter();
-        let count_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-        let process_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-        let (count_tx, count_rx) = oneshot::channel();
-        let count_task = tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(count_stream);
-            let mut line_count = 0;
-            while let Some(item) = stream.next().await {
-                if let ParseOutput::Bytes(line) = item {
-                    if !line.is_empty() {
-                        line_count += 1;
-                    }
-                }
-            }
-            let _ = count_tx.send(line_count);
-            Ok(())
-        });
-        cleanup_tasks.push(count_task);
-
-        let bam_line_count = count_rx
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("BAM count receiver failed: {}", e)))?;
-
-        if bam_line_count == 0 {
-            warn!("No mapped reads in BAM for insert size stats; skipping samtools stats");
-            let (stats_tx, stats_rx) = oneshot::channel();
-            let _ = stats_tx.send(SamtoolsStats {
-                summary: HashMap::new(),
-                insert_sizes: Vec::new(),
-                total_pairs: 0,
-            });
-            Some(stats_rx)
-        } else {
-            let samtools_coord_sort_config = SamtoolsConfig {
-                subcommand: SamtoolsSubcommand::Sort,
-                subcommand_fields: HashMap::from([
-                    ("-u".to_string(), None),
-                    ("-O".to_string(), Some("bam".to_string())),
-                    ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
-                    ("-".to_string(), None),
-                ]),
-            };
-            let samtools_coord_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_coord_sort_config))
-                .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
-
-            let (mut coord_sort_child, coord_sort_task, coord_sort_err_task) = stream_to_cmd(
-                config.clone(),
-                process_stream,
-                SAMTOOLS_TAG,
-                samtools_coord_sort_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-            )
-                .await?;
-            cleanup_tasks.push(coord_sort_task);
-            cleanup_tasks.push(coord_sort_err_task);
-
-            let coord_sort_out_stream = {
-                let mut guard = coord_sort_child.lock().await;
-                parse_child_output(
-                    &mut guard,
-                    ChildStream::Stdout,
-                    ParseMode::Bytes,
-                    config.base_buffer_size,
-                )
-                    .await
-                    .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?
-            };
-
-            let samtools_stats_config = SamtoolsConfig {
-                subcommand: SamtoolsSubcommand::Stats,
-                subcommand_fields: HashMap::new(),
-            };
-            let samtools_stats_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_stats_config))
-                .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?;
-
-            let (mut stats_child, stats_stream_task, stats_err_task) = stream_to_cmd(
-                config.clone(),
-                coord_sort_out_stream,
-                SAMTOOLS_TAG,
-                samtools_stats_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-            )
-                .await?;
-            cleanup_tasks.push(stats_stream_task);
-            cleanup_tasks.push(stats_err_task);
-
-            let stats_out_stream = {
-                let mut guard = stats_child.lock().await;
-                parse_child_output(
-                    &mut guard,
-                    ChildStream::Stdout,
-                    ParseMode::Bytes,
-                    config.base_buffer_size,
-                )
-                    .await
-                    .map_err(|e| PipelineError::ToolExecution { tool: SAMTOOLS_TAG.to_string(), error: e.to_string() })?
-            };
-
-            let (stats_tx, stats_rx) = oneshot::channel();
-            let stats_task = tokio::spawn(async move {
-                // 1. Collect all lines serially (fast, small data)
-                let mut stats_lines: Vec<String> = Vec::new();
-                let mut stream = ReceiverStream::new(stats_out_stream);
-                while let Some(item) = stream.next().await {
-                    if let ParseOutput::Bytes(b) = item {
-                        if let Ok(s) = String::from_utf8((*b).clone()) {
-                            stats_lines.push(s);
-                        }
-                    }
-                }
-
-                // 2. Parallel parse using thread_pool
-                let thread_pool = &config.thread_pool;
-                let parsed_stats = thread_pool.install(|| {
-                    stats_lines
-                        .par_iter()
-                        .fold(
-                            || SamtoolsStats {
-                                summary: HashMap::new(),
-                                insert_sizes: Vec::new(),
-                                total_pairs: 0,
-                            },
-                            |mut acc, line| {
-                                let line = line.trim();
-                                if line.is_empty() || !line.starts_with('#') {
-                                    return acc;
-                                }
-                                let line = line.trim_start_matches('#').trim();
-                                let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
-
-                                if parts.is_empty() {
-                                    return acc;
-                                }
-
-                                let key = parts[0].trim_end_matches(':');
-
-                                match key {
-                                    "SN" => {
-                                        if parts.len() >= 3 {
-                                            let key_str = parts[1].trim_end_matches(':').to_string();
-                                            let value = parts[2].to_string();
-
-                                            acc.summary.insert(key_str.clone(), value);
-
-                                            if key_str == "reads mapped and paired" {
-                                                if let Ok(count) = parts[2].parse::<u64>() {
-                                                    acc.total_pairs = count;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    "IS" => {
-                                        if parts.len() == 5 {
-                                            if let Ok(size) = parts[1].parse::<u32>() {
-                                                let inward = parts[2].parse::<u64>().unwrap_or(0);
-                                                let outward = parts[3].parse::<u64>().unwrap_or(0);
-                                                let other = parts[4].parse::<u64>().unwrap_or(0);
-                                                let count = inward + outward + other;
-                                                if count > 0 {
-                                                    acc.insert_sizes.push((size, count));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                acc
-                            },
-                        )
-                        .reduce(
-                            || SamtoolsStats {
-                                summary: HashMap::new(),
-                                insert_sizes: Vec::new(),
-                                total_pairs: 0,
-                            },
-                            |mut a, b| {
-                                a.summary.extend(b.summary);
-                                a.insert_sizes.extend(b.insert_sizes);
-                                a.total_pairs += b.total_pairs;
-                                a
-                            },
-                        )
-                });
-
-                let _ = stats_tx.send(parsed_stats);
-                Ok(())
-            });
-            cleanup_tasks.push(stats_task);
-
-            Some(stats_rx)
-        }
-    } else {
-        None
-    };
+    let mut temp_dirs = vec![temp_dir];
 
     Ok((
         ReceiverStream::new(unmapped_fastq_stream),
         count_rx,
         cleanup_tasks,
         cleanup_receivers,
-        insert_stats_rx,
+        bam_write_task,
+        output_bam_path,
+        temp_dirs
     ))
 }
 
@@ -858,18 +663,17 @@ async fn hisat2_filter(
     oneshot::Receiver<u64>,
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-    Vec<PathBuf>,
+    Vec<TempDir>
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
-    let mut temp_files = Vec::new();
 
     let required_space = config.input_size * headroom;
     let ram_available = available_space_for_path(&config.ram_temp_dir).await.unwrap_or(0);
     let use_ram = required_space <= ram_available;
 
     let temp_dir = choose_temp_dir(
-        config.input_size,
+        config.input_size * headroom,
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
@@ -882,8 +686,7 @@ async fn hisat2_filter(
         config.base_buffer_size,
     ).await.map_err(|e| PipelineError::Other(e))?;
 
-    let r1_path = temp_dir.join("hisat2_input_r1.fastq");
-    temp_files.push(r1_path.clone());
+    let r1_path = temp_dir.path().join("hisat2_input_r1.fastq");
     let r1_write_task = write_byte_stream_to_file(
         &r1_path,
         ReceiverStream::new(r1_rx),
@@ -892,8 +695,7 @@ async fn hisat2_filter(
     cleanup_tasks.push(r1_write_task);
 
     let r2_path_opt = if paired {
-        let r2_path = temp_dir.join("hisat2_input_r2.fastq");
-        temp_files.push(r2_path.clone());
+        let r2_path = temp_dir.path().join("hisat2_input_r2.fastq");
         let r2_write_task = write_byte_stream_to_file(
             &r2_path,
             ReceiverStream::new(r2_rx_opt.unwrap()),
@@ -908,8 +710,7 @@ async fn hisat2_filter(
     deint_handle.await.map_err(|e| PipelineError::Other(e.into()))??;
 
     // 2. HISAT2 alignment to temp SAM
-    let sam_path = temp_dir.join("hisat2.sam");
-    temp_files.push(sam_path.clone());
+    let sam_path = temp_dir.path().join("hisat2.sam");
 
     let hisat2_config = Hisat2Config {
         hisat2_index_path: hisat2_index_path.clone(),
@@ -952,8 +753,7 @@ async fn hisat2_filter(
     }
 
     // 3. samtools sort -n SAM → BAM
-    let bam_path = temp_dir.join("hisat2_sorted.bam");
-    temp_files.push(bam_path.clone());
+    let bam_path = temp_dir.path().join("hisat2_sorted.bam");
 
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -962,7 +762,7 @@ async fn hisat2_filter(
             ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
             ("-@".to_string(), Some("8".to_string())),
             ("-l".to_string(), Some("1".to_string())),
-            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
+            ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
         ]),
     };
 
@@ -989,12 +789,11 @@ async fn hisat2_filter(
     }
 
     // 4. Pipe: sorted BAM → fixmate -m → fastq -f 13/-f 4 (to files)
-    let fq1_path = temp_dir.join("hisat2_host_filtered1.fastq");
-    temp_files.push(fq1_path.clone());
+    let fq1_path = temp_dir.path().join("hisat2_host_filtered1.fastq");
+
 
     let fq2_path_opt = if paired {
-        let fq2 = temp_dir.join("hisat2_host_filtered2.fastq");
-        temp_files.push(fq2.clone());
+        let fq2 = temp_dir.path().join("hisat2_host_filtered2.fastq");
         Some(fq2)
     } else {
         None
@@ -1134,13 +933,14 @@ async fn hisat2_filter(
         Ok(())
     });
     cleanup_tasks.push(bam_count_task);
+    let mut temp_dirs = vec![temp_dir];
 
     Ok((
         unmapped_stream,
         count_rx,
         cleanup_tasks,
         cleanup_receivers,
-        temp_files,
+        temp_dirs
     ))
 }
 
@@ -1535,14 +1335,15 @@ async fn minimap2_filter(
         oneshot::Receiver<u64>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-        Option<NamedTempFile>,
-        Option<NamedTempFile>,
-        Option<TempDir>,
+        Vec<NamedTempFile>,
+        Vec<TempDir>
     ),
     PipelineError,
 > {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
+    let mut temp_dirs: Vec<TempDir> = Vec::new();
+    let mut named_temp_files: Vec<NamedTempFile> = Vec::new();
 
     let temp_dir = choose_temp_dir(
         config.input_size,
@@ -1550,6 +1351,7 @@ async fn minimap2_filter(
         &config.args.nvme_scratch,
         4,
     ).await?;
+
 
     let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, host_temp_dir,  mut host_ref_tasks) =
         minimap2_index_prep(
@@ -1563,8 +1365,19 @@ async fn minimap2_filter(
     try_join_all(host_ref_tasks).await?; // Have to wait on this to make sure index is in place ahead of running minimap2
     debug!("Host index : {}", host_index_path.display());
 
+    if let Some(temp) = host_ref_temp {
+        named_temp_files.push(temp);
+    }
+    if let Some(temp) = host_index_temp {
+        named_temp_files.push(temp);
+    }
+    if let Some(temp_dir) = host_temp_dir {
+        temp_dirs.push(temp_dir);
+    }
+
     let minimap2_config = Minimap2Config {
         minimap2_index_path: host_index_path,
+        input_path: None,
         option_fields: HashMap::from([
             ("-ax".to_string(), Some("sr".to_string())), // Short-read preset
             ("-k".to_string(), Some("15".to_string())), // Default k-mer
@@ -1575,6 +1388,7 @@ async fn minimap2_filter(
             ("-O".to_string(), Some("4,24".to_string())), // Gap open
             ("-E".to_string(), Some("2,1".to_string())), // Gap extension
         ]),
+        num_threads: None,
     };
     let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -1620,7 +1434,7 @@ async fn minimap2_filter(
             ("-n".to_string(), None),
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
-            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
+            ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
             ("-".to_string(), None),
         ]),
     };
@@ -1783,15 +1597,14 @@ async fn minimap2_filter(
                 error: e.to_string(),
             })?
     };
-
+    temp_dirs.push(temp_dir);
     Ok((
         ReceiverStream::new(unmapped_fastq_stream),
         count_rx,
         cleanup_tasks,
         cleanup_receivers,
-        host_ref_temp,
-        host_index_temp,
-        host_temp_dir
+        named_temp_files,
+        temp_dirs
     ))
 }
 
@@ -2359,82 +2172,333 @@ async fn minimap2_non_host_align(
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-        Option<NamedTempFile>,
-        Option<NamedTempFile>,
-        Option<TempDir>
+        Option<TempDir>,
     ),
     PipelineError,
 > {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
-    let (_non_host_ref_fasta_path, non_host_index_path, non_host_ref_temp, non_host_index_temp, non_host_temp_dir,mut non_host_ref_tasks) =
-        minimap2_index_prep(
-            &config,
-            &config.ram_temp_dir,
-            config.args.target_sequence.clone(),
-            config.args.target_index.clone(),
-            "non-host",
-        )
-            .await?;
-    try_join_all(non_host_ref_tasks).await?;
+    let base_buffer_size = config.base_buffer_size;
+    let channel_buffer = base_buffer_size * 4;
 
-    debug!("Non-host index: {}", non_host_index_path.display());
+    // 1. Write to temp FASTQ
+    let temp_dir = choose_temp_dir(
+        config.input_size * 3,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: non_host_index_path,
-        option_fields: HashMap::from([
-            ("-cx".to_string(), Some("sr".to_string())), // Short-read preset, PAF out
-            ("--secondary".to_string(), Some("yes".to_string())), // allow secondary alignments
-        ]),
-    };
+    let input_fastq_path = temp_dir.path().join("nonhost.fastq");
 
-    let minimap2_args = generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MINIMAP2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let write_handle = write_parse_output_to_file(
+        &input_fastq_path,
+        input_stream,
+        Some(base_buffer_size),
+    ).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
-        config.clone(),
-        input_stream.into_inner(),
-        MINIMAP2_TAG,
-        minimap2_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-    )
+    cleanup_tasks.push(write_handle);
+
+    // 2. Discover chunks
+    let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
+    let mut chunk_paths: Vec<PathBuf> = Vec::new();
+
+    let mut entries = fs::read_dir(&nt_split_dir)
         .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MINIMAP2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    cleanup_tasks.push(minimap2_task);
-    cleanup_tasks.push(minimap2_err_task);
+        .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
 
-    let minimap2_out_stream = {
-        let mut guard = minimap2_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Lines,
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: MINIMAP2_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
+    while let Some(entry) = entries.next_entry().await.transpose() {
+        if let Ok(entry) = entry {
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
+                chunk_paths.push(path);
+            }
+        }
+    }
+
+    if chunk_paths.is_empty() {
+        return Err(PipelineError::Other(anyhow!(
+            "No .mmi chunk files found in {}",
+            nt_split_dir.display()
+        )));
+    }
+
+    chunk_paths.sort();
+    let num_chunks = chunk_paths.len();
+    info!("Found {} minimap2 NT index chunks", num_chunks);
+
+    // 3. Compute dynamic concurrency
+    // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
+    let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
+
+    // Total available threads: Respects --threads, --use-smt, detected cores
+    let total_threads = config.max_cores;
+
+    let (total_bytes, _avail_bytes) = detect_ram()?;
+    let total_gib = total_bytes / (1024 * 1024 * 1024);
+
+    let mut max_index_loads = 2;
+    let mut max_concurrent_jobs = 8;
+
+    if total_gib >= 1400 {  // 1.4 TiB+ → dual EPYC
+        max_concurrent_jobs = 16;  // or 20 if testing shows headroom
+        max_index_loads = 4;
+    } else if total_gib >= 1000 {  // 1 TiB → r6id.32xlarge
+        max_concurrent_jobs = 8;
+        max_index_loads = 2;
+    } else {
+        // Laptop/small instance fallback
+        max_concurrent_jobs = 4;
+        max_index_loads = 1;
+    }
+
+    let concurrency = (total_threads / target_threads_per)
+        .max(1)
+        .min(num_chunks)
+        .min(max_concurrent_jobs);
+    
+
+    // Recalculate threads_per to fit total_threads exactly (avoids waste)
+    let mut threads_per = total_threads / concurrency;
+    threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
+
+    info!(
+    "Instance-aware settings: total RAM ~{} GiB → concurrency cap={}, index loads cap={}",
+    total_gib, max_concurrent_jobs, max_index_loads
+);
+
+    // Separate semaphore for index loading phase (only 1–2 concurrent loads)
+    let index_load_sem = Arc::new(Semaphore::new(max_index_loads));
+
+    // Scatter with dynamic concurrency limit
+    let sem = Arc::new(Semaphore::new(concurrency as usize));
+
+    let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
+
+    let config_for_scatter = config.clone();
+
+
+    const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
+    const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
+    const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
+    const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
+    const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
+
+
+    for chunk_mmi in chunk_paths {
+        let sem_clone = sem.clone();
+        let index_load_sem_clone = index_load_sem.clone();
+        let config_clone = config_for_scatter.clone();
+        let fastq_clone = input_fastq_path.clone();
+        let chunk_name = chunk_mmi.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let handle = tokio::spawn(async move {
+            let start_wait = Instant::now();
+            let mut delay_count = 0;
+            let mut effective_threads = threads_per; // start with computed value
+
+            let mut avail_gib: u64 = 0;
+            let mut total_gib: u64 = 0;
+
+            loop {
+                let (total_bytes, avail_bytes) = match detect_ram() {
+                    Ok((t, a)) => (t, a),
+                    Err(e) => {
+                        warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
+                        effective_threads = FALLBACK_THREADS.min(effective_threads);
+                        break;
+                    }
+                };
+
+                total_gib = total_bytes / (1024 * 1024 * 1024);
+                avail_gib = avail_bytes / (1024 * 1024 * 1024);
+
+                // Dynamic minimum free RAM required
+                let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
+                    .max(MIN_FREE_ABSOLUTE_GIB)
+                    .min(total_gib / 4); // never more than 25% of total
+
+                // Small-machine auto-reduction
+                let is_small_machine = total_gib < 128;
+                if is_small_machine {
+                    if total_gib <= 64 {
+                        effective_threads = effective_threads.min(4);
+                        info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
+                    }
+                    if total_gib <= 32 {
+                        info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
+                        effective_threads = 2;
+                    }
+                }
+
+                if avail_gib >= min_free_gib {
+                    info!(
+                        "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
+                        chunk_name, avail_gib, total_gib, min_free_gib
+                    );
+                    break;
+                }
+
+                let elapsed = start_wait.elapsed().as_secs();
+                if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
+                    warn!(
+                        "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
+                        chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
+                    );
+                    effective_threads = FALLBACK_THREADS.min(effective_threads);
+                    break;
+                }
+
+                let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
+                info!(
+                    "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
+                    sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
+                );
+                sleep(Duration::from_secs(sleep_s)).await;
+                delay_count += 1;
+            }
+
+            // try to acquire semaphore (concurrency still enforced)
+            let _permit = match sem_clone.acquire().await {
+                Ok(p) => p,
+                Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
+            };
+
+            info!(
+                "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
+                chunk_name, effective_threads, avail_gib  // now in scope
+            );
+
+            let mut options = HashMap::new();
+            options.insert("-c".to_string(), None);
+            options.insert("-x".to_string(), Some("sr".to_string()));
+            options.insert("--secondary".to_string(), Some("yes".to_string()));
+
+            let mm_config = Minimap2Config {
+                minimap2_index_path: chunk_mmi,
+                input_path: Some(fastq_clone),
+                option_fields: options,
+                num_threads: Some(effective_threads),
+            };
+
+            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+                .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
+
+            info!(
+                "minimap2 cmd for {}: minimap2 {}",
+                chunk_name,
+                args.join(" ")
+            );
+
+            let _index_permit = index_load_sem_clone.acquire().await
+                .map_err(|e| anyhow!("Index load semaphore failed for {}: {}", chunk_name, e))?;
+
+            let (mut child, stderr_task) = spawn_cmd(
+                config_clone.clone(),
+                MINIMAP2_TAG,
+                args,
+                config_clone.args.verbose,
+            )
+                .await
+                .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
+
+
+            if let Some(pid) = child.id() {
+                info!("minimap2 PID for {}: {}", chunk_name, pid);
+            }
+
+            let paf_receiver = parse_child_output(
+                &mut child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config_clone.base_buffer_size,
+            )
+                .await
+                .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
+
+            Ok((ReceiverStream::new(paf_receiver), stderr_task))
+        });
+
+        partial_handles.push(handle);
+    }
+
+    // Await all scatter tasks
+    let mut partial_paf_receivers = Vec::new();
+
+    for handle in partial_handles {
+        let (paf_rx, stderr_task) = handle.await
+            .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
+
+        partial_paf_receivers.push(paf_rx);
+        cleanup_tasks.push(stderr_task);
+    }
+
+    // 4. Gather
+    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
+
+    let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
+        partial_paf_receivers,
+        merged_tx,
+        channel_buffer,
+    ));
+
+    cleanup_tasks.push(gather_handle);
 
     Ok((
-        ReceiverStream::new(minimap2_out_stream),
+        ReceiverStream::new(merged_rx),
         cleanup_tasks,
         cleanup_receivers,
-        non_host_ref_temp,
-        non_host_index_temp,
-        non_host_temp_dir
+        Some(temp_dir),
     ))
 }
+
+
+    // ────────────────────────────────────────────────────────────────
+    //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
+    //   (comment out or delete this whole block when done debugging)
+    // ────────────────────────────────────────────────────────────────
+
+    // ────────────────────────────────────────────────────────────────
+    //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
+    //   Comment out or delete this whole block when finished debugging
+    // ────────────────────────────────────────────────────────────────
+
+//     info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
+//     info!("Returning fake single-line ParseOutput stream instead of real PAF");
+//
+//     use tokio::sync::mpsc;
+//
+//     let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
+//
+//     // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
+//     let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
+//
+//     fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
+//         .await
+//         .expect("Failed to send fake ParseOutput in debug bypass");
+//
+//     drop(fake_tx);  // Close the channel → downstream sees EOF
+//
+//     let fake_paf_stream = ReceiverStream::new(fake_rx);
+//
+//     info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
+//
+//     Ok((
+//         fake_paf_stream,
+//         cleanup_tasks,
+//         cleanup_receivers,
+//         Some(temp_dir),
+//     ))
+// }
+
+// ────────────────────────────────────────────────────────────────
+    //   End of temporary OOM-test bypass
+    // ────────────────────────────────────────────────────────────────
 
 /// Converts a PAF stream to an m8 stream, splits it with t_junction for file writing,
 /// and returns the main m8 stream along with cleanup handles.
@@ -2804,7 +2868,7 @@ pub async fn call_hits_m8_stream(
     ))
 }
 
-/// Non-host DIAMOND alignment – write to a temp file, then stream it.
+
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -2814,12 +2878,17 @@ async fn diamond_non_host_align(
     mpsc::Receiver<ParseOutput>,
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-    Option<NamedTempFile>,
-    Option<NamedTempFile>,
-    Option<TempDir>,
+    Vec<TempDir>
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
+
+    let temp_dir = choose_temp_dir(
+        DIAMOND_TEMP,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+    ).await?;
 
     let diamond_db = config
         .args
@@ -2831,7 +2900,6 @@ async fn diamond_non_host_align(
     let (db_prefix, prep_tasks) = diamond_index_prep(Some(diamond_db), "non_host").await?;
     cleanup_tasks.extend(prep_tasks);
 
-
     let temp_output = NamedTempFile::new_in(&config.ram_temp_dir)
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file: {}", e)))?;
     let temp_path = temp_output.path().to_path_buf();
@@ -2842,26 +2910,28 @@ async fn diamond_non_host_align(
 
     info!("Using optimal Diamond block size: {:.1}", optimal_block_size);
 
-    let diamond_tmpdir = choose_temp_dir(
-        DIAMOND_TEMP,
-        &config.ram_temp_dir,           // /dev/shm
-        &config.args.nvme_scratch,      // user-provided NVMe path
-        4,                   // use at most 1/4 of available space → safe headroom
-    ) .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    let threads = config.thread_allocation(DIAMOND_TAG, None);
+    let index_chunks = if threads >= 192 {
+        32
+    } else if threads >= 128 {
+        24
+    } else if threads >= 96 {
+        16
+    } else if threads >= 64 {
+        12
+    } else {
+        4
+    };
 
-    // ("--bin".to_string(), Some("1".to_string())),
-    // ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
-    // ("--range-culling".to_string(), None),
+    info!("Diamond threads: {}, index-chunks: {}", threads, index_chunks);
 
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
-        ("--block-size".to_string(), Some("100".to_string())),
-        ("-c".to_string(), Some("12".to_string())),
-        // ("--hit-membuf".to_string(), None),
+        ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
+        ("-c".to_string(), Some(index_chunks.to_string())),
         ("-f".to_string(), Some("6".to_string())),
         ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
-        ("--tmpdir".to_string(), Some(diamond_tmpdir.to_string_lossy().into_owned())),
+        ("--tmpdir".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
         ("--verbose".to_string(), None),
     ]);
 
@@ -2943,8 +3013,9 @@ async fn diamond_non_host_align(
     });
     cleanup_tasks.push(read_task);
 
+    let mut temp_dirs = vec![temp_dir];
 
-    Ok((rx, cleanup_tasks, cleanup_receivers, None, None, None))
+    Ok((rx, cleanup_tasks, cleanup_receivers, temp_dirs))
 }
 
 /// Generates ytaxon counts from a called m8 stream
@@ -3483,7 +3554,6 @@ async fn spades_assembly(
             4,
         ).await?;
 
-        info!("Using temp dir for SPAdes inputs: {}", temp_dir.display());
 
         // 2. Deinterleave and write to file(s) in temp
         let paired = true;
@@ -3497,8 +3567,8 @@ async fn spades_assembly(
         let r1_stream = ReceiverStream::new(r1_rx);
         let r2_stream_opt = r2_rx_opt.map(ReceiverStream::new);
 
-        let r1_path = temp_dir.join("nonhost_R1.fastq");
-        let r2_path = temp_dir.join("nonhost_R2.fastq");
+        let r1_path = temp_dir.path().join("nonhost_R1.fastq");
+        let r2_path = temp_dir.path().join("nonhost_R2.fastq");
 
         let r1_write_task = write_byte_stream_to_file(&r1_path, r1_stream, Some(4 * 1024 * 1024)).await?;
         r1_write_task.await??;
@@ -3788,7 +3858,7 @@ pub async fn process_assembly(
             ("-n".to_string(), None),
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
-            ("-T".to_string(), Some(temp_dir.to_string_lossy().to_string())),
+            ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
             ("-".to_string(), None),
         ]),
     };
@@ -4136,19 +4206,35 @@ pub async fn build_reference_fasta_from_selected_genera(
     db_type: &str,
     source_fasta_path: &PathBuf,                  // full NT/NR FASTA (e.g. nt.fa)
     source_index_path: &PathBuf,                  // FST index for fast lookup
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, TempDir)> {  // ← Change return to include TempDir
     // Flatten and deduplicate accessions
     let mut accessions: HashSet<String> = HashSet::new();
     for acc_list in selected_genera.values() {
         accessions.extend(acc_list.iter().cloned());
     }
 
+    let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;  // ← Create early
+
     if accessions.is_empty() {
         warn!("selected_genera is empty — writing empty reference FASTA");
-        let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;
-        let empty_path = temp_dir.join(format!("{}_empty_ref.fasta", db_type));
-        fs::write(&empty_path, b">empty\nN\n").await?;
-        return Ok(empty_path);
+        let empty_path = temp_dir.path().join(format!("{}_empty_ref.fasta", db_type));
+
+        // Create and write minimal FASTA
+        let file = TokioFile::create(&empty_path).await
+            .with_context(|| format!("Failed to create empty ref FASTA: {}", empty_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(b">empty\nN\n").await
+            .with_context(|| format!("Failed to write to empty ref FASTA: {}", empty_path.display()))?;
+        writer.flush().await?;
+        drop(writer);
+
+        // Verify
+        if !empty_path.exists() {
+            return Err(anyhow!("Empty ref FASTA {} was not created after write", empty_path.display()));
+        }
+
+        info!("Wrote empty ref FASTA to {} (verified exists)", empty_path.display());
+        return Ok((empty_path, temp_dir));  // ← Return dir to keep alive
     }
 
     let mut acc_vec: Vec<String> = accessions.into_iter().collect();
@@ -4158,8 +4244,6 @@ pub async fn build_reference_fasta_from_selected_genera(
         "Building reference FASTA from {} filtered accessions (selected_genera)",
         acc_vec.len()
     );
-
-
 
     // Load FST index
     let index_data = std::fs::read(source_index_path)
@@ -4172,16 +4256,10 @@ pub async fn build_reference_fasta_from_selected_genera(
         .with_context(|| format!("Failed to open source FASTA: {}", source_fasta_path.display()))?;
     let mut reader = BufReader::new(file);
 
-    // Estimate size and pick best temp location
+    // Estimate size (use existing temp_dir)
     let estimated_size = (acc_vec.len() as u64) * 2000; // ~2KB per accession avg
-    let temp_dir = choose_temp_dir(
-        estimated_size,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        4,
-    ).await?;
 
-    let output_path = temp_dir.join(format!("{}_ref_from_selected_genera.fasta", db_type));
+    let output_path = temp_dir.path().join(format!("{}_ref_from_selected_genera.fasta", db_type));
     let mut writer = std::io::BufWriter::new(
         File::create(&output_path)
             .with_context(|| format!("Failed to create ref FASTA: {}", output_path.display()))?,
@@ -4239,7 +4317,7 @@ pub async fn build_reference_fasta_from_selected_genera(
     }
 
     writer.flush()?;
-    drop(writer); // ensure written
+    drop(writer);
 
     if missing > 0 {
         warn!("{} accessions from selected_genera not found in source FASTA", missing);
@@ -4254,7 +4332,7 @@ pub async fn build_reference_fasta_from_selected_genera(
         acc_vec.len() - missing
     );
 
-    Ok(output_path)
+    Ok((output_path, temp_dir))  // ← Keep dir alive
 }
 
 
@@ -5340,17 +5418,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
     let ercc_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, _ercc_bt2_insert_stats_rx) = bowtie2_filter(
+    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, ercc_bt2_bam_write_handle, ercc_bt2_bam_path, ercc_bt2_temp_dirs) = bowtie2_filter(
         config.clone(),
         val_out_stream,
         ercc_bt2_index_path,
         paired,
         ercc_bt2_options,
-        None,
-        false
+        out_dir.join("ercc_bt2_aligned_sorted.bam"),
     ).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
+    temp_dirs.extend(ercc_bt2_temp_dirs);
 
     // QC with fastp
     let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) = fastp_qc(
@@ -5393,23 +5471,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Host filtering: bt2
     let host_bt2_index_path = bowtie2_index_prep(host_bowtie2_index, &cwd)?;
     let host_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers, host_bt2_insert_stats_rx) = bowtie2_filter(
+    let (host_bt2_out_stream, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers, host_bt2_bam_write_handle, host_bt2_bam_path, host_bt2_temp_dirs) = bowtie2_filter(
         config.clone(),
         ReceiverStream::new(kallisto_bypass_stream),
         host_bt2_index_path,
         paired,
         host_bt2_options,
-        None,
-        true
+        out_dir.join("host_bt2_aligned_sorted.bam"),
     ).await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
+    temp_dirs.extend(host_bt2_temp_dirs);
 
 
     //host filtering hisat2
     let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
     let hisat2_options = HashMap::from([]);
-    let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
+    let (host_hisat2_out_stream, host_hisat2_count_rx, mut host_hisat2_cleanup_tasks, mut host_hisat2_cleanup_receivers, hisat_temp_dirs) = hisat2_filter(
         config.clone(),
         host_bt2_out_stream,
         host_hisat2_index_path,
@@ -5417,57 +5495,77 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         hisat2_options,
         None,
         4
-
     )
         .await?;
     cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
     cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
-    temp_paths.extend(hisat_input_files);
+    temp_dirs.extend(hisat_temp_dirs);
 
 
     // If host is no huma, run an additional filter stage using a human reference
-    let post_filter_stream  = if config.args.human_host {
+    let mut optional_human_bam_write_handle: Option<JoinHandle<Result<()>>> = None;
+    let mut optional_human_bam_path: Option<PathBuf> = None;
+
+    let post_filter_stream = if config.args.human_host {
         host_hisat2_out_stream
-    }
-    else {
+    } else {
         let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
         let human_hisat2_index: String = config.args.human_hisat2_index.clone();
 
-        // human filtering: bt2
         let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
         let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-        let (human_bt2_out_stream, human_bt2_count_rx, human_bt2_cleanup_tasks, human_bt2_cleanup_receivers, _human_bt2_insert_stats_rx) = bowtie2_filter(
+
+        let (
+            human_bt2_out_stream,
+            _human_bt2_count_rx,
+            human_bt2_cleanup_tasks,
+            human_bt2_cleanup_receivers,
+            human_bt2_bam_write_handle,
+            human_bt2_bam_path,
+            human_bt2_temp_dirs
+        ) = bowtie2_filter(
             config.clone(),
             host_hisat2_out_stream,
             human_bt2_index_path,
             paired,
             human_bt2_options,
-            None,
-            false
-        ).await?;
-        cleanup_receivers.extend(human_bt2_cleanup_receivers);
+            out_dir.join("human_bt2_aligned_sorted.bam"),
+        )
+            .await?;
 
-        //host filtering hisat2
+        cleanup_tasks.extend(human_bt2_cleanup_tasks);
+        cleanup_receivers.extend(human_bt2_cleanup_receivers);
+        temp_dirs.extend(human_bt2_temp_dirs);
+
+        // Save the BAM write handle and path for later awaiting / insert stats
+        optional_human_bam_write_handle = Some(human_bt2_bam_write_handle);
+        optional_human_bam_path = Some(human_bt2_bam_path);
 
         let human_hisat2_index_path = hisat2_index_prep(human_hisat2_index, &cwd)?;
-        let hisat2_options = HashMap::from([]);
-        let (human_hisat2_out_stream, _human_hisat2_count_rx, mut human_hisat2_cleanup_tasks, mut human_hisat2_cleanup_receivers, hisat_input_files) = hisat2_filter(
+        let hisat2_options = HashMap::new();
+
+        let (
+            human_hisat2_out_stream,
+            _human_hisat2_count_rx,
+            mut human_hisat2_cleanup_tasks,
+            mut human_hisat2_cleanup_receivers,
+            human_hisat_temp_dirs,
+        ) = hisat2_filter(
             config.clone(),
             human_bt2_out_stream,
             human_hisat2_index_path,
             paired,
             hisat2_options,
             None,
-            4
-
+            4,
         )
             .await?;
+
         cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
         cleanup_receivers.append(&mut human_hisat2_cleanup_receivers);
-        temp_paths.extend(hisat_input_files);
+        temp_dirs.extend(human_hisat_temp_dirs);
 
         human_hisat2_out_stream
-
     };
 
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
@@ -5500,7 +5598,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
 
     cleanup_tasks.push(subsample_send_task);
-    
+
     let subsample_count = subsample_count_rx.await?;
     let subsample_reads = subsample_count * if paired { 2 } else { 1 };
     info!("Subsampled reads (pairs counted separately): {}", subsample_reads);
@@ -5548,7 +5646,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let non_host_coverage_viz_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     // This is part of post-process starting here for concurrency
@@ -5560,25 +5657,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
 
 
-
     // Minimap2 non_host alignment
-    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_ref_temp, non_host_index_temp, non_host_index_dir) = minimap2_non_host_align(
+    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_mm2_temp_dir) = minimap2_non_host_align(
         config.clone(),
         ReceiverStream::new(non_host_mm2_stream),
     )
         .await?;
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
-
-    if let Some(temp) = non_host_ref_temp {
-        temp_files.push(temp);
-    }
-    if let Some(index_temp) = non_host_index_temp {
-        temp_files.push(index_temp);
-    }
-    if let Some(index_temp) = non_host_index_dir {
+    if let Some(index_temp) = non_host_mm2_temp_dir {
         temp_dirs.push(index_temp);
     }
+
 
     let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
 
@@ -5620,7 +5710,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|_| PipelineError::StreamDataDropped)?;
     cleanup_receivers.push(nt_done_rx);
 
-    let mut nt_streams_iter =nt_streams.into_iter();
+    let mut nt_streams_iter = nt_streams.into_iter();
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -5661,25 +5751,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
 
     // Temporary: Skip Diamond by providing empty outputs
-    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    // drop(dummy_tx); // Immediately drop sender to create an empty stream
-    // let non_host_diamond_m8_stream = dummy_rx;
-    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-    // let diamond_ref_temp: Option<PathBuf> = None;
-    // let diamond_index_temp: Option<PathBuf> = None;
-    // let diamond_index_dir: Option<PathBuf> = None;
+    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(dummy_tx); // Immediately drop sender to create an empty stream
+    let non_host_diamond_m8_stream = dummy_rx;
+    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
 
     // Diamond non_host alignment
-    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, diamond_ref_temp, diamond_index_temp, diamond_index_dir) = diamond_non_host_align(
-        config.clone(),
-        ReceiverStream::new(non_host_dmnd_stream),
-        paired,
-        sample_base
-    ).await?;
-    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_dmnd_stream),
+    //     paired,
+    //     sample_base.clone()
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // temp_dirs.extend(non_host_diamond_temp_dirs);
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
@@ -5772,7 +5860,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ReceiverStream::new(non_host_annot_stream),
         cluster_stream,
         nt_map, nr_map,
-    )            .await
+    ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
 
     cleanup_tasks.append(&mut annot_tasks);
@@ -5912,7 +6000,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ))?;
 
 
-
     let nr_file = config
         .args
         .nr
@@ -5928,8 +6015,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .ok_or(PipelineError::MissingArgument(
             "NR offset DB file required for fasta extraction".into(),
         ))?;
-
-
 
 
     // Blast contigs
@@ -5948,7 +6033,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
 
     //nt accessions
-    let nt_ref_fasta_path = build_reference_fasta_from_selected_genera(
+    let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
         config.clone(),
         &nt_selected_genera,
         NT_TAG,
@@ -5958,7 +6043,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("nt path {}", nt_ref_fasta_path.display());
-
+    temp_dirs.push(nt_ref_fasta_temp_dir);
 
     // //NR
     let (
@@ -5975,7 +6060,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
 
 
-    let nr_ref_fasta_path = build_reference_fasta_from_selected_genera(
+    let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
         config.clone(),
         &nr_selected_genera,
         NR_TAG,
@@ -5985,6 +6070,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("nr path {}", nr_ref_fasta_path.display());
+    temp_dirs.push(nr_ref_fasta_temp_dir);
 
     let nt_handle = tokio::spawn({
         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
@@ -6043,15 +6129,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
 
-
-
-
-
     let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
         .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
 
     let (nt_read_dict, nt_refined_counts,
-        nt_contig_summary,  nt_refined_m8_stream_out,
+        nt_contig_summary, nt_refined_m8_stream_out,
         nt_refined_hit_summary_stream_out, nt_refined_m8_top_stream_out,
         nt_cleanup_tasks, nt_cleanup_receivers,
         nt_temp_files) = nt_res?;
@@ -6063,7 +6145,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_m8_streams, nt_m8_rx) = t_junction(
         ReceiverStream::new(nt_refined_m8_stream_out),
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6079,6 +6161,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
     let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
         ReceiverStream::new(nt_refined_hit_summary_stream_out),
@@ -6202,7 +6285,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_alignment_per_read
     ));
 
-    
+
     let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
     let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
@@ -6255,7 +6338,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         contigs_cluster_stream,
         nt_refined_map.into_iter().collect(),
         nr_refined_map.into_iter().collect(),
-    )            .await
+    ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
@@ -6285,7 +6368,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
         ReceiverStream::new(taxid_mapped_rx),
-        2,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6471,7 +6554,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 ReceiverStream::new(nt_refined_m8_top_stream_out),
                 assembly_outputs.coverage_json,
                 assembly_outputs.contig_stats_json,
-                ReceiverStream::new(non_host_coverage_viz_stream),
+                ReceiverStream::new(nt_m8_viz),
                 nt_info_db_path,
                 out_dir_for_viz,
                 Some(MAX_NUM_BINS_COVERAGE),
@@ -6487,22 +6570,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-
     let clusters_opt = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
         Some(duplicate_clusters.clone())
     } else {
         None
     };
 
-    let (nonhost_r1, nonhost_r2_opt) = generate_nonhost_fastq_from_files(
-        config.clone(),
-        file1_path.clone(),
-        file2_path.clone(),
-        ReceiverStream::new(taxid_mapped_nonhost),
-        clusters_opt,
-        out_dir.clone(),
-    ).await?;
-
+    // shutting this off as: 1. needletail is more picky than seqkit and finds mismatcxhes too easily
+    // 2. It is unlikely we'll be allowed to keep the non host FASTQ's
+    // let (nonhost_r1, nonhost_r2_opt) = generate_nonhost_fastq_from_files(
+    //     config.clone(),
+    //     file1_path.clone(),
+    //     file2_path.clone(),
+    //     ReceiverStream::new(taxid_mapped_nonhost),
+    //     clusters_opt,
+    //     out_dir.clone(),
+    // ).await?;
 
 
     // *******************
@@ -6535,57 +6618,52 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let ercc_mapped_count = ercc_count_rx.await
         .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
 
+    ercc_bt2_bam_write_handle.await??;
+    host_bt2_bam_write_handle.await??;
+    if let Some(handle) = optional_human_bam_write_handle {
+        handle.await??;
+    }
+
     let host_bt2_counts = host_bt2_count_rx
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
     info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
-    if let Some(insert_stats_rx) = host_bt2_insert_stats_rx {
-        match insert_stats_rx.await {
-            Ok(insert_stats) if !insert_stats.insert_sizes.is_empty() => {
-                info!("Host bt2 insert size stats available – generating Picard files");
 
-                let metrics_path = out_dir.join("picard_insert_metrics.txt");
-                let mut metrics_file = std::fs::File::create(&metrics_path)
-                    .context("Failed to create picard_insert_metrics.txt")?;
+    // insert size, now host BAM written out
+    if paired {
+        info!("Computing host insert size statistics from {}", host_bt2_bam_path.display());
 
+        let stats = compute_insert_size_stats_from_bam(
+            host_bt2_bam_path.clone(),
+            None,
+            &config.thread_pool,
+        )
+            .await
+            .context("Failed to compute insert size stats")?;
 
-                writeln!(metrics_file, "## HISTOGRAM\tinsert_size")?;
-                for &(size, count) in &insert_stats.insert_sizes {
-                    writeln!(metrics_file, "{}\t{}", size, count)?;
-                }
-                //  minimal summary line that matches real Picard output format
-                let mean: f64 = insert_stats.insert_sizes.iter()
-                    .map(|&(s, c)| s as f64 * c as f64)
-                    .sum::<f64>() / insert_stats.total_pairs as f64;
-                let variance: f64 = insert_stats.insert_sizes.iter()
-                    .map(|&(s, c)| {
-                        let dev = s as f64 - mean;
-                        dev * dev * c as f64
-                    })
-                    .sum::<f64>() / insert_stats.total_pairs as f64;
-                let stddev = variance.sqrt();
+        // Write Picard-style metrics file
+        let metrics_path = out_dir.join("host_insert_metrics.txt");
+        let mut f = std::fs::File::create(&metrics_path)
+            .context("Failed to create insert metrics file")?;
 
-                writeln!(metrics_file, "## METRICS\tMEAN_INSERT_SIZE\t{:.2}\tMEDIAN_INSERT_SIZE\t{:.0}\tSTANDARD_DEVIATION\t{:.2}",
-                         mean, mean, stddev)?;  // median approximated as mean for simplicity
-
-                let histogram_path = out_dir.join("insert_size_histogram.png");
-                let sample_name = sample_base_buf
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("sample")
-                    .to_string();
-
-                let plot_task = tokio::spawn(async move {
-                    plot_insert_sizes(&insert_stats.insert_sizes, &sample_name, &histogram_path)
-                        .map_err(|e| anyhow!("Failed to plot insert sizes: {}", e))?;
-                    Ok(())
-                });
-                cleanup_tasks.push(plot_task);
-            }
-            Ok(_) => warn!("No insert size stats available; skipping Picard metrics"),
-            Err(e) => error!("Host bt2 insert stats receiver failed: {}", e),
+        writeln!(f, "## METRICS")?;
+        writeln!(f, "MEAN_INSERT_SIZE\t{:.2}", stats.mean)?;
+        writeln!(f, "MEDIAN_INSERT_SIZE\t{:.0}", stats.median)?;
+        writeln!(f, "STANDARD_DEVIATION\t{:.2}", stats.stddev)?;
+        writeln!(f, "TOTAL_PROPER_PAIRS\t{}", stats.total_proper_pairs)?;
+        writeln!(f, "\n## HISTOGRAM\tinsert_size\tcount")?;
+        for &(size, count) in &stats.insert_sizes {
+            writeln!(f, "{}\t{}", size, count)?;
         }
+
+        let plot_path = out_dir.join("host_insert_size_histogram.png");
+        if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
+            warn!("Failed to plot insert size histogram: {}", e);
+        }
+
+        info!("Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
+          stats.mean, stats.median, stats.total_proper_pairs);
     }
 
     let host_hisat2_counts = host_hisat2_count_rx
@@ -6653,33 +6731,88 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
     // Cleanup
     // *******************
-    let results = try_join_all(cleanup_tasks)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    for result in results {
-        result.map_err(|e| PipelineError::Other(e))?;
-    }
-    for receiver in cleanup_receivers {
-        receiver
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?
-            .map_err(|e| PipelineError::Other(e))?;
-    }
 
-    if let Some(coverage_task) = coverage_task {
-        match coverage_task.await {
-            Ok(result) => match result {
-                Ok(_) => info!("Coverage visualization completed successfully"),
-                Err(e) => warn!("Coverage viz failed (non-fatal): {}", e),
-            },
-            Err(e) => warn!("Coverage viz task panicked: {}", e),
+    // Helper to handle downcast + NotFound tolerance in one place
+    fn handle_cleanup_error(e: anyhow::Error, context: &str) -> Result<(), PipelineError> {
+        match e.downcast::<std::io::Error>() {
+            Ok(io_err) => {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    warn!("Cleanup ignored missing file/dir (non-fatal) [{}]: {}", context, io_err);
+                    Ok(())
+                } else {
+                    // Other io errors are fatal
+                    Err(PipelineError::Other(anyhow::Error::new(io_err)))
+                }
+            }
+            Err(remaining) => {
+                // Not an io::Error → treat as fatal
+                Err(PipelineError::Other(remaining))
+            }
         }
     }
 
-    drop(temp_files);
-    drop(temp_dirs);
+    // Wait for all cleanup tasks
+    let cleanup_results = try_join_all(cleanup_tasks)
+        .await
+        .map_err(|join_err| PipelineError::Other(join_err.into()))?;
+
+    // Process each task result
+    for res in cleanup_results {
+        if let Err(e) = res {
+            handle_cleanup_error(e, "task")?;
+        }
+    }
+
+    // Process cleanup receivers (oneshot channels)
+    for rx in cleanup_receivers {
+        match rx.await {
+            Ok(Ok(_)) => {}  // success
+
+            Ok(Err(e)) => {
+                handle_cleanup_error(e, "receiver")?;
+            }
+
+            Err(oneshot_err) => {
+                // Channel broken (panic, drop, empty stream, etc.)
+                // Usually safe to ignore if stream was empty
+                warn!("Cleanup receiver channel failed (possibly empty): {}", oneshot_err);
+                // continue (non-fatal)
+            }
+        }
+    }
+
+    // Coverage viz — keep non-fatal as before
+    if let Some(coverage_task) = coverage_task {
+        match coverage_task.await {
+            Ok(Ok(_)) => info!("Coverage visualization completed successfully"),
+            Ok(Err(e)) => warn!("Coverage viz failed (non-fatal): {}", e),
+            Err(join_err) => warn!("Coverage viz task join failed (non-fatal): {}", join_err),
+        }
+    }
+
+    // Final temp resource drops — defensive, never fail the pipeline
+    for tf in temp_files {
+        if let Err(e) = tf.close() {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!("Temp file already gone during close: {}", e);
+            } else {
+                warn!("Temp file close failed (non-fatal): {}", e);
+            }
+        }
+    }
+
+    for td in temp_dirs {
+        if let Err(e) = std::fs::remove_dir_all(td.path()) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!("Temp dir already gone: {}", e);
+            } else {
+                warn!("Temp dir removal failed (non-fatal): {}", e);
+            }
+        }
+    }
+
     drop(temp_paths);
 
-    info!("Finished short read mNGS pipeline.");
+    info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
     Ok(())
 }

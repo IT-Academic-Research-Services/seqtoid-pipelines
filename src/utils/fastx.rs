@@ -399,15 +399,15 @@ pub fn read_fastq(
         let mut undersized_reads: u64 = 0;
         let mut oversized_reads: u64 = 0;
         let mut validated_reads: u64 = 0;
+        let mut unpaired_r1: u64 = 0;
+        let mut unpaired_r2: u64 = 0;
 
         match path2 {
             None => {
-                // Single-end: Stream chunks from one file
+                // Single-end: unchanged
                 debug!("read_fastq: Opening single-end FASTQ: {:?}", path1);
                 let mut reader = parse_fastx_file(&path1)
-                    .map_err(|e| {
-                        anyhow!("Failed to open FASTQ {}: {}", path1.display(), e)
-                    })?;
+                    .map_err(|e| anyhow!("Failed to open FASTQ {}: {}", path1.display(), e))?;
                 let mut buffer = Vec::with_capacity(chunk_size);
 
                 while let Some(result) = reader.next() {
@@ -419,32 +419,25 @@ pub fn read_fastq(
                         anyhow!("Parse error at read {}: {}", validated_reads + undersized_reads + oversized_reads + 1, e)
                     })?;
 
-                    // Ensure FASTQ (not FASTA)
                     if record.qual().is_none() {
                         return Err(anyhow!("Expected FASTQ, got FASTA at read {}", validated_reads + undersized_reads + oversized_reads + 1));
                     }
 
-                    // Log read details
                     let seq_len = record.seq().len();
-                    let _id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
 
-                    // Optional length filters
                     if let Some(min) = min_read_len {
                         if seq_len < min {
-                            debug!("read_fastq: Skipping read {}: seq_len={} < min={}", validated_reads + undersized_reads + oversized_reads + 1, seq_len, min);
                             undersized_reads += 1;
                             continue;
                         }
                     }
                     if let Some(max) = max_read_len {
                         if seq_len > max {
-                            debug!("read_fastq: Skipping read {}: seq_len={} > max={}", validated_reads + undersized_reads + oversized_reads + 1, seq_len, max);
                             oversized_reads += 1;
                             continue;
                         }
                     }
 
-                    // Construct FASTQ record
                     let mut record_bytes = Vec::new();
                     record_bytes.push(b'@');
                     record_bytes.extend_from_slice(record.id());
@@ -459,14 +452,12 @@ pub fn read_fastq(
                     buffer.extend_from_slice(&record_bytes);
                     validated_reads += 1;
 
-                    // Send if chunk full
                     if buffer.len() >= chunk_size {
                         if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
                             return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
                         }
                     }
                 }
-                // Send remaining
                 if !buffer.is_empty() {
                     if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
                         return Err(anyhow!("Failed to send final byte chunk"));
@@ -481,142 +472,161 @@ pub fn read_fastq(
                     undersized: undersized_reads,
                     validated: validated_reads,
                     oversized: oversized_reads,
+                    unpaired_r1: 0,
+                    unpaired_r2: 0,
                 })
             }
             Some(path2) => {
                 if let Some(Technology::ONT) = technology {
                     return Err(anyhow!("Paired-end not supported for ONT"));
                 }
-                // Paired-end: Interleave raw record bytes
                 debug!("read_fastq: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
                 let mut reader1 = parse_fastx_file(&path1)
-                    .map_err(|e| {
-                        anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e)
-                    })?;
+                    .map_err(|e| anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e))?;
                 let mut reader2 = parse_fastx_file(&path2)
-                    .map_err(|e| {
-                        anyhow!("Failed to open R2 FASTQ {}: {}", path2.display(), e)
-                    })?;
+                    .map_err(|e| anyhow!("Failed to open R2 FASTQ {}: {}", path2.display(), e))?;
                 let mut buffer = Vec::with_capacity(chunk_size);
 
                 loop {
-                    if validated_reads + undersized_reads + oversized_reads >= max_reads {
+                    if validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 >= max_reads {
                         debug!("read_fastq: Reached max_reads={}", max_reads);
                         break;
                     }
-                    // Read R1
+
+                    // Try to read R1
                     let r1_opt = reader1.next();
                     let r1_record = match r1_opt {
-                        Some(Ok(rec)) => rec,
+                        Some(Ok(rec)) => Some(rec),
                         Some(Err(e)) => {
-                            return Err(anyhow!("R1 parse error at read {}: {}", validated_reads + undersized_reads + oversized_reads + 1, e));
+                            warn!("R1 parse error at read {}: {} — discarding unpaired",
+                                  validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 + 1, e);
+                            unpaired_r1 += 1;
+                            continue;
                         }
-                        None => {
-                            debug!("read_fastq: R1 stream ended at read {}", validated_reads + undersized_reads + oversized_reads + 1);
-                            break;
-                        }
+                        None => None,
                     };
-                    if r1_record.qual().is_none() {
-                        return Err(anyhow!("Expected FASTQ for R1 at read {}", validated_reads + undersized_reads + oversized_reads + 1));
-                    }
 
-                    // Read R2
+                    // Try to read R2
                     let r2_opt = reader2.next();
                     let r2_record = match r2_opt {
-                        Some(Ok(rec)) => rec,
+                        Some(Ok(rec)) => Some(rec),
                         Some(Err(e)) => {
-                            return Err(anyhow!("R2 parse error at read {}: {}", validated_reads + undersized_reads + oversized_reads + 1, e));
+                            warn!("R2 parse error at read {}: {} — discarding unpaired",
+                                  validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 + 1, e);
+                            unpaired_r2 += 1;
+                            continue;
                         }
-                        None => {
-                            return Err(anyhow!("R2 ended before R1 at read {}", validated_reads + undersized_reads + oversized_reads + 1));
-                        }
+                        None => None,
                     };
-                    if r2_record.qual().is_none() {
-                        return Err(anyhow!("Expected FASTQ for R2 at read {}", validated_reads + undersized_reads + oversized_reads + 1));
-                    }
 
-                    // Log read details
-                    let r1_id = std::str::from_utf8(r1_record.id()).unwrap_or("<invalid utf8>");
-                    let r2_id = std::str::from_utf8(r2_record.id()).unwrap_or("<invalid utf8>");
-                    let r1_len = r1_record.seq().len();
-                    let r2_len = r2_record.seq().len();
+                    match (r1_record, r2_record) {
+                        (Some(r1), Some(r2)) => {
+                            // Both valid → process pair
+                            if r1.qual().is_none() || r2.qual().is_none() {
+                                return Err(anyhow!("Expected FASTQ for pair at read {}",
+                                                    validated_reads + undersized_reads + oversized_reads + 1));
+                            }
 
-                    // Relaxed ID check: Strip common suffixes
-                    let r1_head = r1_record.id();
-                    let r2_head = r2_record.id();
-                    if !compare_read_ids_bytes(r1_head, r2_head) {
-                        return Err(anyhow!("ID mismatch at pair {}: {:?} vs {:?}", validated_reads + undersized_reads + oversized_reads + 1, r1_id, r2_id));
-                    }
+                            if !compare_read_ids_bytes(r1.id(), r2.id()) {
+                                warn!("ID mismatch at pair {} — discarding unpaired",
+                                      validated_reads + undersized_reads + oversized_reads + 1);
+                                unpaired_r1 += 1;
+                                unpaired_r2 += 1;
+                                continue;
+                            }
 
-                    // Length filters
-                    if let Some(min) = min_read_len {
-                        if r1_len < min || r2_len < min {
-                            undersized_reads += 1;
-                            continue;
+                            let r1_len = r1.seq().len();
+                            let r2_len = r2.seq().len();
+
+                            if let Some(min) = min_read_len {
+                                if r1_len < min || r2_len < min {
+                                    undersized_reads += 1;
+                                    continue;
+                                }
+                            }
+                            if let Some(max) = max_read_len {
+                                if r1_len > max || r2_len > max {
+                                    oversized_reads += 1;
+                                    continue;
+                                }
+                            }
+
+                            // Build R1 bytes
+                            let mut r1_bytes = Vec::new();
+                            r1_bytes.push(b'@');
+                            r1_bytes.extend_from_slice(r1.id());
+                            r1_bytes.push(b'\n');
+                            r1_bytes.extend_from_slice(&r1.seq());
+                            r1_bytes.push(b'\n');
+                            r1_bytes.push(b'+');
+                            r1_bytes.push(b'\n');
+                            r1_bytes.extend_from_slice(r1.qual().unwrap());
+                            r1_bytes.push(b'\n');
+
+                            // Build R2 bytes
+                            let mut r2_bytes = Vec::new();
+                            r2_bytes.push(b'@');
+                            r2_bytes.extend_from_slice(r2.id());
+                            r2_bytes.push(b'\n');
+                            r2_bytes.extend_from_slice(&r2.seq());
+                            r2_bytes.push(b'\n');
+                            r2_bytes.push(b'+');
+                            r2_bytes.push(b'\n');
+                            r2_bytes.extend_from_slice(r2.qual().unwrap());
+                            r2_bytes.push(b'\n');
+
+                            // Interleave: R1 then R2
+                            buffer.extend_from_slice(&r1_bytes);
+                            buffer.extend_from_slice(&r2_bytes);
+                            validated_reads += 1;
+
+                            if buffer.len() >= chunk_size {
+                                if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                                    return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
+                                }
+                            }
                         }
-                    }
-                    if let Some(max) = max_read_len {
-                        if r1_len > max || r2_len > max {
-                            oversized_reads += 1;
-                            continue;
+                        (Some(_), None) => {
+                            unpaired_r1 += 1;
+                            if unpaired_r1 <= 10 {
+                                warn!("Unpaired R1 read after R2 ended — discarding");
+                            }
                         }
-                    }
-
-                    // Construct R1 FASTQ
-                    let mut r1_bytes = Vec::new();
-                    r1_bytes.push(b'@');
-                    r1_bytes.extend_from_slice(r1_record.id());
-                    r1_bytes.push(b'\n');
-                    r1_bytes.extend_from_slice(&r1_record.seq());
-                    r1_bytes.push(b'\n');
-                    r1_bytes.push(b'+');
-                    r1_bytes.push(b'\n');
-                    r1_bytes.extend_from_slice(r1_record.qual().unwrap());
-                    r1_bytes.push(b'\n');
-
-                    // Construct R2 FASTQ
-                    let mut r2_bytes = Vec::new();
-                    r2_bytes.push(b'@');
-                    r2_bytes.extend_from_slice(r2_record.id());
-                    r2_bytes.push(b'\n');
-                    r2_bytes.extend_from_slice(&r2_record.seq());
-                    r2_bytes.push(b'\n');
-                    r2_bytes.push(b'+');
-                    r2_bytes.push(b'\n');
-                    r2_bytes.extend_from_slice(r2_record.qual().unwrap());
-                    r2_bytes.push(b'\n');
-
-                    // Interleave: R1 then R2
-                    buffer.extend_from_slice(&r1_bytes);
-                    buffer.extend_from_slice(&r2_bytes);
-                    validated_reads += 1;
-
-                    // Send if chunk full
-                    if buffer.len() >= chunk_size {
-                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
-                            return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
+                        (None, Some(_)) => {
+                            unpaired_r2 += 1;
+                            if unpaired_r2 <= 10 {
+                                warn!("Unpaired R2 read after R1 ended — discarding");
+                            }
                         }
+                        (None, None) => break,
                     }
                 }
-                // Send remaining
+
+                // Send remaining buffer
                 if !buffer.is_empty() {
                     if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
-                // Check for extra R2
-                if reader2.next().is_some() {
-                    return Err(anyhow!("R2 has extra reads after R1 ended"));
+
+                if unpaired_r1 > 0 || unpaired_r2 > 0 {
+                    warn!("Discarded {} unpaired R1 reads and {} unpaired R2 reads from raw input", unpaired_r1, unpaired_r2);
                 }
-                debug!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {})",
-                          validated_reads + undersized_reads + oversized_reads, undersized_reads, validated_reads, oversized_reads);
+
+                debug!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {}, unpaired R1: {}, unpaired R2: {})",
+                          validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2,
+                          undersized_reads, validated_reads, oversized_reads, unpaired_r1, unpaired_r2);
+
                 if validated_reads == 0 {
-                    warn!("read_fastq: Warning: No reads processed from R1={:?}, R2={:?}", path1, path2);
+                    warn!("read_fastq: Warning: No valid paired reads processed from R1={:?}, R2={:?}", path1, path2);
                 }
+
                 Ok(ReadStats {
                     undersized: undersized_reads,
                     validated: validated_reads,
                     oversized: oversized_reads,
+                    unpaired_r1,
+                    unpaired_r2,
                 })
             }
         }
@@ -773,20 +783,81 @@ pub fn write_fasta_stream_to_file(
     })
 }
 
-fn compare_read_ids_bytes(head1: &[u8], head2: &[u8]) -> bool {
-    let id1 = extract_id(head1);
-    let id2 = extract_id(head2);
-    let id1_str = std::str::from_utf8(id1).unwrap_or("");
-    let id2_str = std::str::from_utf8(id2).unwrap_or("");
-    let id1_base = id1_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
-    let id2_base = id2_str.trim_end_matches(|c| c == '/' || c == ' ' || c == '1' || c == '2');
-    id1_base == id2_base
-}
+fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
+    // Fast path: exact byte match (very common when IDs are identical)
+    if id1 == id2 {
+        return true;
+    }
 
-fn extract_id(head: &[u8]) -> &[u8] {
-    let start = head.iter().position(|&b| b != b'@').unwrap_or(0);
-    let end = head.iter().position(|&b| b == b' ' || b == b'\t').unwrap_or(head.len());
-    &head[start..end]
+    // Convert to str with fallback (safe, no panic)
+    let s1 = std::str::from_utf8(id1).unwrap_or("");
+    let s2 = std::str::from_utf8(id2).unwrap_or("");
+
+    // Expanded suffix list — ordered roughly by frequency / importance
+    // Each group is labeled with the platforms / formats it covers
+    let suffixes: [&str; 24] = [
+        // Classic Illumina / most common overall
+        "/1", "/2",
+
+        // Older Illumina, some custom pipelines
+        ".1", ".2",
+
+        // Illumina with space + colon (HiSeq, NovaSeq, NextSeq)
+        " 1:", " 2:",
+
+        // Full Illumina flowcell/lane info suffix (very common on NovaSeq)
+        " 1:N:0:", " 2:N:0:",
+
+        // Variant with slash instead of space (some demux tools)
+        "/1:N:0:", "/2:N:0:",
+
+        // BGISEQ, DNBSEQ, MGISEQ, many Chinese platforms
+        "_1", "_2",
+
+        // Very old Illumina CASAVA format (pre-2011, rare but still seen)
+        " 1#0/1", " 2#0/2",
+
+        // Nanopore, Oxford Nanopore, some custom / long-read paired
+        "|1", "|2",
+
+        // Rare 10x Genomics / Parse / custom variants
+        " 1#", " 2#",
+
+        // 10x Genomics, Parse Biosciences, some single-cell demux
+        "/R1", "/R2",
+
+        // Sometimes appears in headers instead of file names
+        "_R1", "_R2",
+
+        // Rare variant without N (some older or custom)
+        " 1:0", " 2:0",
+    ];
+
+    let mut base1 = s1;
+    let mut base2 = s2;
+
+    // Strip the longest matching suffix from each ID
+    // We break after the first match to avoid over-trimming
+    for &suffix in &suffixes {
+        if base1.ends_with(suffix) {
+            base1 = &base1[..base1.len() - suffix.len()];
+            break;
+        }
+    }
+
+    for &suffix in &suffixes {
+        if base2.ends_with(suffix) {
+            base2 = &base2[..base2.len() - suffix.len()];
+            break;
+        }
+    }
+
+    // Clean up any trailing whitespace, colon, or hash that might remain
+    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
+    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
+
+    // Final comparison
+    base1 == base2
 }
 
 /// Counts the number of records in a FASTQ.

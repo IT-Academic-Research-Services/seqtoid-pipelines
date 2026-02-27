@@ -215,4 +215,7 @@ pub struct Arguments {
 
     #[arg(long, default_value = "nt_info.tab")]
     pub nt_info_tab: Option<String>,
+    
+    #[arg(long, default_value = "nt_split")]
+    pub nt_split_dir: String,
 }

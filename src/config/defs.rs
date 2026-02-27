@@ -56,6 +56,8 @@ pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 
 pub const CONFORMING_PREAMBLE: &str = ">family_nr:-300:family_nt:-300:genus_nr:-200:genus_nt:-200:species_nr:-100:species_nt:-100:";
 
+pub const SMT_MODEST_MULTIPLIER: f32 = 1.3_f32;
+
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();
@@ -86,10 +88,11 @@ lazy_static! {
     static ref TOOL_THREAD_CAPS: HashMap<&'static str, usize> = {
         let mut m = HashMap::new();
         m.insert("bowtie2", 64);
+        m.insert("hisat2", 64);
         m.insert("minimap2", 64);
         m.insert("samtools", 32);     // Sort is I/O-bound
         m.insert("spades", 128);      // Compute-heavy
-        m.insert("diamond", 128);     // Compute-heavy
+        m.insert("diamond", 256);  // warp factor 10
         m.insert("fastp", 32);        // I/O-bound
         m.insert("pigz", 16);         // Compression scales poorly >16
         m.insert("kraken2", 64);      // Memory/I/O heavy
@@ -171,6 +174,8 @@ pub struct ReadStats {
     pub undersized: u64,
     pub validated: u64,
     pub oversized: u64,
+    pub unpaired_r1: u64,
+    pub unpaired_r2: u64,
 }
 
 /// Samtools stats output
@@ -203,6 +208,7 @@ pub struct RunConfig {
     pub maximal_semaphore: Arc<Semaphore>,
     pub base_buffer_size: usize,
     pub input_size: u64,
+    pub physical_cores: usize,
     pub max_cores: usize,
     pub available_ram: u64,
     pub rng: StdRng,
@@ -231,7 +237,7 @@ impl RunConfig {
         match (tag, subcommand) {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
-            (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _)
+            (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _) | (HISAT2_TAG, _)
             | (MAKEBLASTDB_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
@@ -252,6 +258,21 @@ impl RunConfig {
             CoreAllocation::Minimal => 1,
         };
 
+        let prefer_physical = match tag {
+            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG => false, // allow modest SMT
+            BOWTIE2_TAG | HISAT2_TAG | SPADES_TAG | FASTP_TAG | PIGZ_TAG => true,      // physical only
+            _ => false,  // default allow
+        };
+
+        if prefer_physical && self.args.use_smt { // If a program does poorly with SMT, don't allow it even if use_smt true
+            allocation = allocation.min(self.physical_cores);
+        } else if !prefer_physical && self.args.use_smt {
+            // Modest SMT: allow up to ~1.3× physical cores 
+
+            let modest_max = (self.physical_cores as f32 * SMT_MODEST_MULTIPLIER).ceil() as usize;
+            allocation = allocation.min(modest_max);
+        }
+
         // Apply tool-specific cap
         if let Some(cap) = TOOL_THREAD_CAPS.get(tag) {
             allocation = allocation.min(*cap);
@@ -262,6 +283,7 @@ impl RunConfig {
             (PIGZ_TAG, _) => allocation.min(16),
             (FASTP_TAG, _) => allocation.min(32),
             (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16),
+            (HISAT2_TAG, _) => allocation.min(64), //scales a bit worse than bt2
             _ => allocation,
         }
     }

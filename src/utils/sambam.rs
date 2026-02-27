@@ -4,18 +4,32 @@ use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 
 use rayon::prelude::*;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 use noodles::bam::r#async::io::Reader as BamAsyncReader;
-use noodles::bam::record::Record;
+use noodles::bam::record::{Record};
 use noodles::bam::record::Record as BamRecord;
 use noodles::sam::Header;
+use noodles::bam;
+use tokio::fs::File;
+
 
 use crate::utils::streams::ParseOutput;
 use crate::config::defs::{ClusterInfo, DuplicateClusters};
+
+#[derive(Debug, Clone)]
+pub struct InsertSizeStats {
+    pub insert_sizes: Vec<(u32, u64)>,      // (size, count) sorted by size
+    pub total_proper_pairs: u64,
+    pub mean: f64,
+    pub median: f64,
+    pub stddev: f64,
+    pub mapped_proper_pairs: u64,           // should == total_proper_pairs here
+}
 
 pub async fn stream_sam_alignment_counter(
     rx: mpsc::Receiver<ParseOutput>,
@@ -168,6 +182,146 @@ pub async fn generate_info_from_bam_stream(
     contig_unique_counts.retain(|contig_name, _| contig_stats.contains_key(contig_name));
 
     Ok((read2contig, contig_stats, contig_unique_counts))
+}
+
+
+/// Insert stats from an exisiting bam file
+///
+///
+/// # Arguments
+///
+///  * `bam_path`
+/// * `max_records_to_check` - limits records
+/// * `_thread_pool - left in for possible future rayon based
+///
+/// # Returns
+///
+/// Rreult <InsertSizeStats>
+pub async fn compute_insert_size_stats_from_bam(
+    bam_path: PathBuf,
+    max_records_to_check: Option<usize>,
+    _thread_pool: &Arc<rayon::ThreadPool>,
+) -> Result<InsertSizeStats> {
+    let file = File::open(&bam_path)
+        .await
+        .map_err(|e| anyhow!("Failed to open BAM file {}: {}", bam_path.display(), e))?;
+
+    let mut bam_reader = bam::r#async::io::Reader::new(file);
+    let header = bam_reader.read_header().await?;
+
+    let histogram = Arc::new(Mutex::new(HashMap::<u32, u64>::new()));
+    let mut total_proper_pairs = 0u64;
+    let mut processed = 0usize;
+
+    const MAX_REASONABLE_INSERT: u32 = 10_000;
+    const MIN_REASONABLE_INSERT: u32 = 10;
+
+    let mut record = Record::default();
+
+    loop {
+        let bytes_read = bam_reader.read_record(&mut record).await?;
+
+        if bytes_read == 0 {
+            // End of file
+            break;
+        }
+
+        processed += 1;
+        if let Some(max) = max_records_to_check {
+            if processed > max {
+                break;
+            }
+        }
+
+        let flags = record.flags();
+
+        // Skip records that cannot contribute valid insert sizes
+        if flags.is_unmapped()
+            || flags.is_secondary()
+            || flags.is_supplementary()
+            || !flags.is_properly_segmented()
+            || record.mate_reference_sequence_id().is_none()
+            || record.template_length() == 0
+        {
+            continue;
+        }
+
+        // Only count first segment (R1) that is forward, with mate reverse
+        // This avoids double-counting and matches common Picard-style logic
+        if !flags.is_first_segment() || !flags.is_reverse_complemented() {
+            continue;
+        }
+
+        let insert_size = record.template_length().abs() as u32;
+
+        if insert_size < MIN_REASONABLE_INSERT || insert_size > MAX_REASONABLE_INSERT {
+            continue;
+        }
+
+        // Increment histogram (thread-safe)
+        {
+            let mut hist = histogram.lock().unwrap();
+            *hist.entry(insert_size).or_insert(0) += 1;
+        }
+
+        total_proper_pairs += 1;
+    }
+
+    // Build sorted vec of (size, count)
+    let mut insert_sizes: Vec<(u32, u64)> = {
+        let hist = histogram.lock().unwrap();
+        hist.iter().map(|(&size, &count)| (size, count)).collect()
+    };
+
+    insert_sizes.sort_by_key(|&(size, _)| size);
+
+    // Compute statistics
+    let total_weight: u64 = insert_sizes.iter().map(|&(_, c)| c).sum();
+
+    let mean = if total_weight > 0 {
+        insert_sizes
+            .iter()
+            .map(|&(s, c)| s as f64 * c as f64)
+            .sum::<f64>()
+            / total_weight as f64
+    } else {
+        0.0
+    };
+
+    // Median (middle value — handles both even and odd counts reasonably)
+    let mut cumulative = 0u64;
+    let mut median = 0.0;
+    for &(size, count) in &insert_sizes {
+        cumulative += count;
+        if cumulative >= (total_weight + 1) / 2 {
+            median = size as f64;
+            break;
+        }
+    }
+
+    let variance = if total_weight > 0 {
+        insert_sizes
+            .iter()
+            .map(|&(s, c)| {
+                let dev = s as f64 - mean;
+                dev * dev * c as f64
+            })
+            .sum::<f64>()
+            / total_weight as f64
+    } else {
+        0.0
+    };
+
+    let stddev = variance.sqrt();
+
+    Ok(InsertSizeStats {
+        insert_sizes,
+        total_proper_pairs,
+        mean,
+        median,
+        stddev,
+        mapped_proper_pairs: total_proper_pairs,
+    })
 }
 
 #[cfg(test)]

@@ -198,25 +198,34 @@ mod h5dump {
     }
 }
 
-
 pub mod minimap2 {
     use std::collections::HashMap;
-    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio::fs;
-    use tempfile::TempDir;
+    use tokio::task::JoinHandle;
+    use tempfile::{NamedTempFile, TempDir};
     use log::{self, LevelFilter, debug, info, error, warn};
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG, FASTA_EXTS};
     use crate::utils::file::available_space_for_path;
+    use crate::utils::command::{ArgGenerator, version_check, spawn_cmd};
+    use crate::utils::streams::ChildStream;
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
+        pub input_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
         pub option_fields: HashMap<String, Option<String>>,
+        pub num_threads: Option<usize>,
     }
+
     pub struct Minimap2ArgGenerator;
 
     pub async fn minimap2_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
         let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file).await?;
         Ok(version)
     }
+
     pub async fn minimap2_index_prep(
         config: &RunConfig,
         ram_temp_dir: &PathBuf,
@@ -225,7 +234,7 @@ pub mod minimap2 {
         ref_type: &str,
     ) -> Result<
         (
-            Option<PathBuf>,             // FASTa path
+            Option<PathBuf>,             // FASTA path
             PathBuf,                     // index path (.mmi)
             Option<NamedTempFile>,       // FASTA temp
             Option<NamedTempFile>,       // Index temp
@@ -242,7 +251,7 @@ pub mod minimap2 {
         let mut index_temp_dir: Option<TempDir> = None;
 
         match index_path {
-            // pre-existing .mmi index , maybe w split parts
+            // pre-existing .mmi index, maybe w split parts
             Some(index) => {
                 let orig_index_path = PathBuf::from(&index);
                 if !orig_index_path.exists() {
@@ -265,7 +274,7 @@ pub mod minimap2 {
                     PipelineError::InvalidConfig("Invalid UTF-8 in filename".to_string())
                 })?;
 
-                //find split parts: {basename}.part_001.idx, etc. —
+                // find split parts: {basename}.part_001.mmi, etc.
                 let mut split_files: Vec<PathBuf> = Vec::new();
                 let split_prefix = format!("{}.part_", basename);
                 let mut dir_entries = fs::read_dir(orig_dir).await
@@ -275,7 +284,7 @@ pub mod minimap2 {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with(&split_prefix) && name.ends_with(".idx") {
+                            if name.starts_with(&split_prefix) && name.ends_with(".mmi") {
                                 split_files.push(path);
                             }
                         }
@@ -299,7 +308,7 @@ pub mod minimap2 {
                         .map_err(|e| PipelineError::Other(e.into()))?;
                     total_size += meta.len();
                 }
-                
+
                 let buffer = 10 * 1024 * 1024; // 10 megs buffer
                 let avail = available_space_for_path(ram_temp_dir)
                     .await
@@ -344,13 +353,12 @@ pub mod minimap2 {
                     }
                 } else {
                     info!(
-                    "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
-                    ref_type, total_size, avail
-                );
+                        "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
+                        ref_type, total_size, avail
+                    );
                     final_index_path = orig_index_path;
                 }
             }
-
 
             // or build index from FASTA
             None => {
@@ -426,9 +434,6 @@ pub mod minimap2 {
             }
         }
 
-        // ————————————————————————————————————————————————————————————————
-        // FINAL RETURN
-        // ————————————————————————————————————————————————————————————————
         Ok((
             ref_fasta_path,
             final_index_path,
@@ -454,18 +459,33 @@ pub mod minimap2 {
             }
 
             let mut args_vec: Vec<String> = Vec::new();
-            let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
+
+            let mut threads = if let Some(override_threads) = config.num_threads {
+                override_threads
+            } else {
+                run_config.thread_allocation(MINIMAP2_TAG, None)
+            };
+            
+            // let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
             args_vec.push("-t".to_string());
-            args_vec.push(num_cores.to_string());
+            args_vec.push(threads.to_string());
 
             for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
+                args_vec.push(key.clone());
                 if let Some(v) = value {
-                    args_vec.push(format!("{}", v));
+                    args_vec.push(v.clone());
                 }
             }
+
+            // Index path
             args_vec.push(index_path.to_string_lossy().to_string());
-            args_vec.push("-".to_string()); // Query from stdin
+
+            // Input: file if provided, otherwise stdin
+            if let Some(input_path) = &config.input_path {
+                args_vec.push(input_path.to_string_lossy().to_string());
+            } else {
+                args_vec.push("-".to_string()); // stdin
+            }
 
             Ok(args_vec)
         }
@@ -1750,61 +1770,59 @@ pub mod diamond {
     }
 
     pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
-        let db_path_base = run_config.args.diamond_db.as_deref()
-            .ok_or_else(|| anyhow!("--diamond-db not provided"))?;
-
-        // Auto-append .dmnd if missing
-        let db_path = if db_path_base.ends_with(".dmnd") {
-            db_path_base.to_string()
-        } else {
-            format!("{}.dmnd", db_path_base)
-        };
-
-        debug!("Using DB path for stats: {}", db_path);
-
         let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
 
-        let scratch_path_str = run_config.args.nvme_scratch.as_deref().unwrap_or(".");
-        let scratch_path = PathBuf::from(scratch_path_str);
-        let scratch_space = available_space_for_path(&scratch_path).await?;
+        // Get real DB size if possible
+        let db_path = run_config.args.diamond_db.as_deref()
+            .ok_or_else(|| anyhow!("--diamond-db required"))?;
+        let db_path = if db_path.ends_with(".dmnd") {
+            db_path.to_string()
+        } else {
+            format!("{}.dmnd", db_path)
+        };
 
         let db_stats = get_diamond_db_stats(&db_path).await
-            .unwrap_or_else(|e| {
-                warn!("Failed to get Diamond DB stats: {}. Assuming conservative full NR size (300B letters).", e);
-                (0, 300_000_000_000)  // sequences, letters
-            });
+            .unwrap_or((0, 300_000_000_000)); // fallback NR size
 
-        let total_letters_billions = db_stats.1 as f64 / 1_000_000_000.0;
+        let total_letters_billions = db_stats.1 as f64 / 1e9;
 
-        let ram_based_b = available_ram_gb / 20.0;
+        // RAM scaling — blastx needs roughly 10–14 GB per billion letters
+        let ram_factor = if available_ram_gb >= 1000.0 {  // EPYC / r6id
+            10.0
+        } else if available_ram_gb >= 128.0 {  // decent server
+            12.0
+        } else {  // laptop
+            15.0
+        };
 
-        let mut block_size = ram_based_b
-            .min(total_letters_billions)
-            .max(6.0)
-            .floor();
+        let mut block_size = available_ram_gb / ram_factor;
 
-        let db_file_gb = std::fs::metadata(&db_path)
-            .map(|m| m.len() as f64 / 1_073_741_824.0)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get DB file size: {}. Skipping scratch derate.", e);
-                0.0
-            });
+        // Never exceed DB size
+        block_size = block_size.min(total_letters_billions);
 
-        if scratch_space < (db_file_gb * 2.0) as u64 {
-            warn!("Low scratch; reducing block size by 40%");
-            block_size *= 0.6;
+        // Safety floors and caps
+        block_size = block_size.max(6.0);
+        block_size = block_size.min(200.0);  // very large block sizes can cause issues
+
+        // Scratch space check
+        let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
+        let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
+        let db_size_gb = std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1e9 / 1_073_741_824.0)
+            .unwrap_or(50.0);  // fallback ~50 GB for NR
+
+        if scratch_avail < (db_size_gb * 2.0) as u64 {
+            warn!("Low scratch space — reducing block size by 30%");
+            block_size *= 0.7;
         }
 
-        debug!(
-    "Computed --block-size {:.1} (RAM: {:.1} GiB, DB letters: {:.1}B, scratch: {:.1} GiB)",
-    block_size,
-    available_ram_gb,
-    db_stats.1 as f64 / 1e9,
-    scratch_space as f64 / 1_073_741_824.0
-);
+        info!(
+        "Diamond block size: {:.1} (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
+        block_size, available_ram_gb, total_letters_billions, scratch_avail as f64 / 1e9 / 1_073_741_824.0
+    );
 
-        Ok(block_size.max(6.0))
+        Ok(block_size)
     }
 
     async fn get_diamond_db_stats(db_path: &str) -> AnyhowResult<(u64, u64)> {
@@ -1889,18 +1907,20 @@ pub mod spades {
                 args_vec.push(config.r1_path.to_string_lossy().to_string());
             }
 
-            // Threads: Adaptive but capped at 64 (SPAdes doesn't scale well beyond ~32-64)
-            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None).min(64);
+            // SPAdes scales decently up to ~80 threads on large machines
+            // Beyond that, memory contention + scheduling overhead usually hurts
+            //no minimum, to allow smaller machines to run
+            let num_cores: usize = RunConfig::thread_allocation(run_config, SPADES_TAG, None).min(80);
             args_vec.push("-t".to_string());
             args_vec.push(num_cores.to_string());
 
-            // Memory: Conservative cap — never give SPAdes more than 256 GB
+            // Memory
             // Scale down aggressively on smaller machines
             let available_gb = (run_config.available_ram as f64 / 1_000_000_000.0) as u64;
             let spades_gb = match available_gb {
-                0..=64 => available_gb / 2,           // laptop: 50% (max ~32 GB)
-                65..=256 => available_gb / 3,         // test instance: ~33% (max ~85 GB)
-                _ => 256,                             // cluster: hard cap at 256 GB
+                0..=128 => available_gb / 2,
+                129..=512 => available_gb / 2,
+                _ => 1000,
             }.max(8);  // minimum 8 GB to avoid SPAdes complaining
 
             info!(
