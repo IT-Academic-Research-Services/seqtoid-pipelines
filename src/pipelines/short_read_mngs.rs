@@ -2433,7 +2433,7 @@ async fn minimap2_non_host_align(
                 .await
                 .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
 
-            info!("Task for chunk {} completed, releasing permit");
+            info!("Task for chunk {} completed, releasing permit", chunk_name);
 
             Ok((ReceiverStream::new(paf_receiver), stderr_task))
         });
