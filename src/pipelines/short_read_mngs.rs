@@ -2191,7 +2191,15 @@ async fn minimap2_non_host_align(
     ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let input_fastq_path = temp_dir.path().join("nonhost.fastq");
+    let input_fastq_path = if let Some(nvme) = &config.args.nvme_scratch {
+        let p = PathBuf::from(nvme).join("nonhost.fastq");
+        info!("Placing nonhost.fastq on NVMe scratch: {}", p.display());
+        p
+    } else {
+        let p = temp_dir.path().join("nonhost.fastq");
+        info!("No NVMe — placing nonhost.fastq in chosen temp dir: {}", p.display());
+        p
+    };
 
     let write_handle = write_parse_output_to_file(
         &input_fastq_path,
@@ -2265,7 +2273,6 @@ async fn minimap2_non_host_align(
     threads_per = (total_threads / concurrency)
         .max(4)
         .min(12);   // ← tighter cap // Bounds: Min 4 (efficiency floor), max 12 (diminishing returns for sr preset)
-
 
 
     info!(
