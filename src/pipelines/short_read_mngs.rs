@@ -2241,13 +2241,13 @@ async fn minimap2_non_host_align(
     let total_gib = total_bytes / (1024 * 1024 * 1024);
 
     let mut max_index_loads = 1;
-    let mut max_concurrent_jobs = 8;
+    let mut max_concurrent_jobs = 2;
 
     if total_gib >= 1400 {          // dual Epyc 1.5 TB
         max_concurrent_jobs = 6;    // 6 × ~60 GB = ~360 GB safe
         max_index_loads     = 2;
     } else if total_gib >= 900 {    // r6id.32xlarge ~1 TB
-        max_concurrent_jobs = 4;    // 4 × 60 GB = ~240 GB — very safe
+        max_concurrent_jobs = 3;    // 4 × 60 GB = ~240 GB — very safe
         max_index_loads     = 1;    // serialize index loading completely
     } else {
         max_concurrent_jobs = 2;
@@ -2269,8 +2269,8 @@ async fn minimap2_non_host_align(
 
 
     info!(
-    "Instance-aware settings: total RAM ~{} GiB → concurrency cap={}, index loads cap={}",
-    total_gib, max_concurrent_jobs, max_index_loads
+    "Instance-aware settings: total RAM ~{} GiB → concurrency={}, index loads cap={}, threads per run={}",
+    total_gib, concurrency, max_index_loads, threads_per
 );
 
     // Separate semaphore for index loading phase (only 1–2 concurrent loads)
