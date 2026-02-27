@@ -2418,6 +2418,8 @@ async fn minimap2_non_host_align(
                 .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
 
 
+            info!("Spawned task for chunk {} (permit acquired, concurrency should now be at most {})", chunk_name, concurrency);
+
             if let Some(pid) = child.id() {
                 info!("minimap2 PID for {}: {}", chunk_name, pid);
             }
@@ -2430,6 +2432,8 @@ async fn minimap2_non_host_align(
             )
                 .await
                 .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
+
+            info!("Task for chunk {} completed, releasing permit");
 
             Ok((ReceiverStream::new(paf_receiver), stderr_task))
         });
