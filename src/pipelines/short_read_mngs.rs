@@ -2240,19 +2240,18 @@ async fn minimap2_non_host_align(
     let (total_bytes, _avail_bytes) = detect_ram()?;
     let total_gib = total_bytes / (1024 * 1024 * 1024);
 
-    let mut max_index_loads = 2;
+    let mut max_index_loads = 1;
     let mut max_concurrent_jobs = 8;
 
-    if total_gib >= 1400 {  // 1.4 TiB+ → dual EPYC
-        max_concurrent_jobs = 16;  // or 20 if testing shows headroom
-        max_index_loads = 4;
-    } else if total_gib >= 1000 {  // 1 TiB → r6id.32xlarge
-        max_concurrent_jobs = 8;
-        max_index_loads = 2;
+    if total_gib >= 1400 {          // dual Epyc 1.5 TB
+        max_concurrent_jobs = 6;    // 6 × ~60 GB = ~360 GB safe
+        max_index_loads     = 2;
+    } else if total_gib >= 900 {    // r6id.32xlarge ~1 TB
+        max_concurrent_jobs = 4;    // 4 × 60 GB = ~240 GB — very safe
+        max_index_loads     = 1;    // serialize index loading completely
     } else {
-        // Laptop/small instance fallback
-        max_concurrent_jobs = 4;
-        max_index_loads = 1;
+        max_concurrent_jobs = 2;
+        max_index_loads     = 1;
     }
 
     let concurrency = (total_threads / target_threads_per)
@@ -2263,7 +2262,11 @@ async fn minimap2_non_host_align(
 
     // Recalculate threads_per to fit total_threads exactly (avoids waste)
     let mut threads_per = total_threads / concurrency;
-    threads_per = threads_per.max(4).min(16); // Bounds: Min 4 (efficiency floor), max 16 (diminishing returns for sr preset)
+    threads_per = (total_threads / concurrency)
+        .max(4)
+        .min(12);   // ← tighter cap // Bounds: Min 4 (efficiency floor), max 12 (diminishing returns for sr preset)
+
+
 
     info!(
     "Instance-aware settings: total RAM ~{} GiB → concurrency cap={}, index loads cap={}",
