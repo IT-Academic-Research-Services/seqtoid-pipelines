@@ -2872,8 +2872,8 @@ pub async fn call_hits_m8_stream(
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
-    paired: bool,
-    sample_base: String,
+    _paired: bool,           // kept for signature compatibility
+    _sample_base: String,    // kept for signature compatibility
 ) -> Result<(
     mpsc::Receiver<ParseOutput>,
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
@@ -2883,55 +2883,45 @@ async fn diamond_non_host_align(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
+    // Temp dir
     let temp_dir = choose_temp_dir(
-        DIAMOND_TEMP,
+        100_000_000_000,
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
     ).await?;
 
-    let diamond_db = config
-        .args
-        .diamond_db
+    let diamond_db = config.args.diamond_db
         .clone()
-        .ok_or(PipelineError::MissingArgument(
-            "diamond_db required for NR alignment".into(),
-        ))?;
+        .ok_or(PipelineError::MissingArgument("diamond_db required for NR alignment".into()))?;
+
     let (db_prefix, prep_tasks) = diamond_index_prep(Some(diamond_db), "non_host").await?;
     cleanup_tasks.extend(prep_tasks);
 
-    let temp_output = NamedTempFile::new_in(&config.ram_temp_dir)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create temp file: {}", e)))?;
-    let temp_path = temp_output.path().to_path_buf();
-
     let optimal_block_size = compute_optimal_block_size(&config)
         .await
-        .unwrap_or(8.0);
-
-    info!("Using optimal Diamond block size: {:.1}", optimal_block_size);
+        .unwrap_or(12.0);
 
     let threads = config.thread_allocation(DIAMOND_TAG, None);
-    let index_chunks = if threads >= 192 {
-        32
-    } else if threads >= 128 {
-        24
-    } else if threads >= 96 {
-        16
-    } else if threads >= 64 {
-        12
-    } else {
-        4
-    };
+    let mut index_chunks = if threads >= 192 { 32 }
+    else if threads >= 128 { 24 }
+    else if threads >= 96 { 16 }
+    else if threads >= 64 { 12 }
+    else { 4 };
 
-    info!("Diamond threads: {}, index-chunks: {}", threads, index_chunks);
+    // Safety cap for Epyc nodes
+    index_chunks = index_chunks.min((config.available_ram / 12_000_000_000) as usize);
+
+    info!("Diamond non-host: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
+          threads, index_chunks, optimal_block_size, temp_dir.path().display());
 
     let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
         ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
         ("-c".to_string(), Some(index_chunks.to_string())),
         ("-f".to_string(), Some("6".to_string())),
-        ("-o".to_string(), Some(temp_path.to_string_lossy().into_owned())),
         ("--tmpdir".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
+        ("--unal".to_string(), Some("0".to_string())),
         ("--verbose".to_string(), None),
     ]);
 
@@ -2942,13 +2932,9 @@ async fn diamond_non_host_align(
     };
 
     let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: DIAMOND_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::ToolExecution { tool: DIAMOND_TAG.to_string(), error: e.to_string() })?;
 
-    debug!("DIAMOND args: {:?}", diamond_args);
-
+    // Stream FASTQ → diamond → stdout m8
     let (diamond_child_arc, diamond_stream_task, diamond_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),
@@ -2956,66 +2942,57 @@ async fn diamond_non_host_align(
         diamond_args,
         StreamDataType::IlluminaFastq,
         config.args.verbose,
-    )
-        .await?;
+    ).await.map_err(|e| PipelineError::ToolExecution { tool: DIAMOND_TAG.to_string(), error: e.to_string() })?;
 
+    cleanup_tasks.push(diamond_stream_task);
     cleanup_tasks.push(diamond_err_task);
 
-    diamond_stream_task.await??;
+    // Stream diamond stdout directly to m8 channel
+    let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
 
-    let diamond_child_clone = diamond_child_arc.clone();
-    let wait_task = tokio::spawn(async move {
-        let mut guard = diamond_child_clone.lock().await;
-        let status = guard.wait().await.map_err(|e| anyhow!("Diamond wait error: {}", e))?;
-        if !status.success() {
-            return Err(anyhow!("DIAMOND exited with code {:?}", status.code()));
-        }
-        Ok(())
-    });
-    wait_task.await??;
+    let parse_task = tokio::spawn({
+        let child = diamond_child_arc.clone();
+        async move {
+            let mut guard = child.lock().await;
+            let stdout = guard.stdout.as_mut().ok_or_else(|| anyhow!("diamond stdout missing"))?;
+            let mut reader = TokioBufReader::new(stdout);
+            let mut line = Vec::with_capacity(1024);
 
-    let (tx, rx) = mpsc::channel(config.base_buffer_size);
-
-    let read_task = tokio::spawn(async move {
-        // Open the file we just created
-        let file = TokioFile::open(&temp_path)
-            .await
-            .map_err(|e| anyhow!("Failed to open DIAMOND output {}: {}", temp_path.display(), e))?;
-
-        let mut reader = TokioBufReader::new(file);
-        let mut line = Vec::<u8>::new();
-
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line).await {
-                Ok(0) => {
-                    info!("DIAMOND temp-file EOF");
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line).await? == 0 {
                     break;
                 }
-                Ok(_) => {
-                    // Clone the line into an Arc so the rest of the pipeline can share it
+                if !line.is_empty() && line[0] != b'#' {
                     let arc_line = Arc::new(line.clone());
-                    if tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
-                        warn!("DIAMOND m8 receiver dropped");
+                    if m8_tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("DIAMOND temp-file read error: {}", e);
-                    return Err(anyhow!("Read error: {}", e));
-                }
             }
+            Ok(())
         }
-
-        drop(temp_output);
-
-        Ok(())
     });
-    cleanup_tasks.push(read_task);
+
+    cleanup_tasks.push(parse_task);
+
+    // Wait for diamond exit
+    let wait_task = tokio::spawn({
+        let child = diamond_child_arc.clone();
+        async move {
+            let mut guard = child.lock().await;
+            let status = guard.wait().await?;
+            if !status.success() {
+                return Err(anyhow!("diamond exited with code {:?}", status.code()));
+            }
+            Ok(())
+        }
+    });
+    cleanup_tasks.push(wait_task);
 
     let mut temp_dirs = vec![temp_dir];
 
-    Ok((rx, cleanup_tasks, cleanup_receivers, temp_dirs))
+    Ok((m8_rx, cleanup_tasks, cleanup_receivers, temp_dirs))
 }
 
 /// Generates ytaxon counts from a called m8 stream
