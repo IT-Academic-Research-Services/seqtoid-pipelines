@@ -5739,15 +5739,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Diamond non_host alignment
-    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
-        config.clone(),
-        ReceiverStream::new(non_host_dmnd_stream),
-        paired,
-        sample_base.clone()
-    ).await?;
-    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
-    temp_dirs.extend(non_host_diamond_temp_dirs);
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_dmnd_stream),
+    //     paired,
+    //     sample_base.clone()
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // temp_dirs.extend(non_host_diamond_temp_dirs);
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
