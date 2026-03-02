@@ -2329,40 +2329,40 @@ async fn minimap2_non_host_align(
     index_load_sem.available_permits()
 );
 
-    // 6. Scatter — acquire permit beforespawning
+    // ────────────────────────────────────────────────────────────────
+    // 6. Scatter — acquire permit BEFORE spawning (this is the fix)
+    // ────────────────────────────────────────────────────────────────
     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
     for chunk_mmi in chunk_paths {
-
+        let exec_sem_clone = exec_sem.clone();
+        let index_load_sem_clone = index_load_sem.clone();
+        let config_clone = config.clone();
+        let fastq_clone = input_fastq_path.clone();
         let chunk_name = chunk_mmi
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
+        // Await the permit HERE, in the main loop ===
+        let _exec_permit = exec_sem_clone
+            .acquire_owned()
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Exec semaphore closed for {}: {}", chunk_name, e)))?;
+
         info!(
-        "Before spawning chunk {}: semaphore available = {}, calculated concurrency was {}",
-        chunk_name,
-        exec_sem.available_permits(),
-        concurrency
+        "Acquired permit for {} (available now: {}) — spawning task",
+        chunk_name, exec_sem_clone.available_permits()
     );
 
-        let exec_sem_clone = exec_sem.clone();
-        let index_load_sem_clone = index_load_sem.clone();
-        let config_clone = config.clone();
-        let fastq_clone = input_fastq_path.clone();
-
-
         let handle = tokio::spawn(async move {
-            let _exec_permit = exec_sem_clone
-                .acquire_owned()
-                .await
-                .map_err(|e| anyhow!("Exec semaphore closed for {}: {}", chunk_name, e))?;
-
+            // Index load permit (still limited)
             let _idx_permit = index_load_sem_clone
                 .acquire()
                 .await
                 .map_err(|e| anyhow!("Index load semaphore failed for {}: {}", chunk_name, e))?;
 
+            // Build args
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
             options.insert("-x".to_string(), Some("sr".to_string()));
@@ -2378,11 +2378,7 @@ async fn minimap2_non_host_align(
             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
                 .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
 
-            info!(
-            "minimap2 cmd for {}: minimap2 {}",
-            chunk_name,
-            args.join(" ")
-        );
+            info!("minimap2 cmd for {}: minimap2 {}", chunk_name, args.join(" "));
 
             let (mut child, stderr_task) = spawn_cmd(
                 config_clone.clone(),
@@ -2406,8 +2402,7 @@ async fn minimap2_non_host_align(
                 .await
                 .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
 
-            // Permit drops here when _exec_permit goes out of scope → slot freed
-            info!("Task for chunk {} completed", chunk_name);
+            info!("Task for chunk {} completed (permit will be released on drop)", chunk_name);
 
             Ok((ReceiverStream::new(paf_receiver), stderr_task))
         });
