@@ -2344,8 +2344,10 @@ async fn minimap2_non_host_align(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
+        let sem_for_acquire = exec_sem_clone.clone();
+
         // Await the permit HERE, in the main loop ===
-        let _exec_permit = exec_sem_clone
+        let _exec_permit = sem_for_acquire
             .acquire_owned()
             .await
             .map_err(|e| PipelineError::Other(anyhow!("Exec semaphore closed for {}: {}", chunk_name, e)))?;
