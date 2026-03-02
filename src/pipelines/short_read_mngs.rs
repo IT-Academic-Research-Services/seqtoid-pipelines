@@ -2325,7 +2325,7 @@ async fn minimap2_non_host_align(
     let index_load_sem = Arc::new(Semaphore::new(2));  // keep index loading limited as its a ram hog
     info!(
     "Index Semaphore created with capacity = {} (available_permits now = {})",
-    2
+    2,
     index_load_sem.available_permits()
 );
 
