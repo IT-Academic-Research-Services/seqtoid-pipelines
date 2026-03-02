@@ -2335,36 +2335,34 @@ async fn minimap2_non_host_align(
     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
     for chunk_mmi in chunk_paths {
-        let exec_sem_clone = exec_sem.clone();
-        let index_load_sem_clone = index_load_sem.clone();
-        let config_clone = config.clone();
-        let fastq_clone = input_fastq_path.clone();
-        let chunk_name = chunk_mmi
-            .file_name()
+        let chunk_name = chunk_mmi.file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let sem_for_acquire = exec_sem_clone.clone();
+        // Clone Arc before acquire — each acquire gets its own Arc reference
+        let exec_sem_clone = exec_sem.clone();
 
-        // Await the permit HERE, in the main loop ===
-        let _exec_permit = sem_for_acquire
-            .acquire_owned()
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("Exec semaphore closed for {}: {}", chunk_name, e)))?;
+        // Now safe to call acquire_owned() — consumes the clone, not the original
+        let permit = exec_sem_clone.acquire_owned().await
+            .map_err(|e| PipelineError::Other(anyhow!("Semaphore failed for {}: {}", chunk_name, e)))?;
 
         info!(
-        "Acquired permit for {} (available now: {}) — spawning task",
-        chunk_name, exec_sem_clone.available_permits()
+        "Acquired exec permit for {} (remaining slots: {})",
+        chunk_name,
+        exec_sem.available_permits()
     );
 
-        let handle = tokio::spawn(async move {
-            // Index load permit (still limited)
-            let _idx_permit = index_load_sem_clone
-                .acquire()
-                .await
-                .map_err(|e| anyhow!("Index load semaphore failed for {}: {}", chunk_name, e))?;
+        let index_load_sem_clone = index_load_sem.clone();
+        let config_clone = config.clone();
+        let fastq_clone = input_fastq_path.clone();
 
-            // Build args
+        let handle = tokio::spawn(async move {
+            // Keep permit alive for the whole job
+            let _permit_held = permit;
+
+            let _idx_permit = index_load_sem_clone.acquire().await
+                .map_err(|e| anyhow!("Index semaphore failed: {}", e))?;
+
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
             options.insert("-x".to_string(), Some("sr".to_string()));
@@ -2378,18 +2376,17 @@ async fn minimap2_non_host_align(
             };
 
             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-                .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
+                .map_err(|e| anyhow!("Args failed for {}: {}", chunk_name, e))?;
 
-            info!("minimap2 cmd for {}: minimap2 {}", chunk_name, args.join(" "));
+            info!("Launching minimap2 for {}: {}", chunk_name, args.join(" "));
 
             let (mut child, stderr_task) = spawn_cmd(
                 config_clone.clone(),
                 MINIMAP2_TAG,
                 args,
                 config_clone.args.verbose,
-            )
-                .await
-                .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
+            ).await
+                .map_err(|e| anyhow!("Spawn failed for {}: {}", chunk_name, e))?;
 
             if let Some(pid) = child.id() {
                 info!("minimap2 PID for {}: {}", chunk_name, pid);
@@ -2400,11 +2397,10 @@ async fn minimap2_non_host_align(
                 ChildStream::Stdout,
                 ParseMode::Lines,
                 config_clone.base_buffer_size,
-            )
-                .await
-                .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
+            ).await
+                .map_err(|e| anyhow!("Parse failed for {}: {}", chunk_name, e))?;
 
-            info!("Task for chunk {} completed (permit will be released on drop)", chunk_name);
+            info!("Chunk {} finished", chunk_name);
 
             Ok((ReceiverStream::new(paf_receiver), stderr_task))
         });
