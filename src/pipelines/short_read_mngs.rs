@@ -2210,9 +2210,10 @@ async fn minimap2_non_host_align(
 
     cleanup_tasks.push(write_handle);
 
-    // 2. Discover chunks
+    // 2. Discover NT split .mmi chunks + find the largest one
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
+    let mut max_size_bytes: u64 = 0;
 
     let mut entries = fs::read_dir(&nt_split_dir)
         .await
@@ -2222,6 +2223,12 @@ async fn minimap2_non_host_align(
         if let Ok(entry) = entry {
             let path = entry.path();
             if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
+                if let Ok(meta) = path.metadata() {
+                    let size = meta.len();
+                    if size > max_size_bytes {
+                        max_size_bytes = size;
+                    }
+                }
                 chunk_paths.push(path);
             }
         }
@@ -2234,155 +2241,106 @@ async fn minimap2_non_host_align(
         )));
     }
 
-    chunk_paths.sort();
+    // Sort largest → smallest so heavy jobs run while RAM headroom is highest
+    chunk_paths.sort_by_key(|p| {
+        std::cmp::Reverse(
+            p.metadata()
+                .map(|m| m.len())
+                .unwrap_or(0)
+        )
+    });
+
     let num_chunks = chunk_paths.len();
-    info!("Found {} minimap2 NT index chunks", num_chunks);
+    info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 3. Compute dynamic concurrency
-    // Target threads per job: 8-12 is sweet spot for Minimap2 short-read alignment (scales well without diminishing returns)
-    let target_threads_per: usize = MM2_TARGET_THREADS_PER; // Adjustable; test 8-16 based on chunk size and I/O
+    // 3. Estimate memory usage based on the largest chunk
+    const SAFETY_MULTIPLIER: f64 = 0.95;
+    const MIN_ESTIMATE_GB: u64 = 20;       // floor for very small indexes
 
-    // Total available threads: Respects --threads, --use-smt, detected cores
-    let total_threads = config.max_cores;
-
-    let (total_bytes, _avail_bytes) = detect_ram()?;
-    let total_gib = total_bytes / (1024 * 1024 * 1024);
-
-    let mut max_index_loads = 1;
-    let mut max_concurrent_jobs = 2;
-
-    if total_gib >= 1400 {          // dual Epyc 1.5 TB
-        max_concurrent_jobs = 6;    // 6 × ~60 GB = ~360 GB safe
-        max_index_loads     = 2;
-    } else if total_gib >= 900 {    // r6id.32xlarge ~1 TB
-        max_concurrent_jobs = 3;    // 4 × 60 GB = ~240 GB — very safe
-        max_index_loads     = 1;    // serialize index loading completely
+    let largest_gb = if max_size_bytes > 0 {
+        ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as u64
     } else {
-        max_concurrent_jobs = 2;
-        max_index_loads     = 1;
-    }
+        70  // fallback (should never happen)
+    };
 
-    let concurrency = (total_threads / target_threads_per)
-        .max(1)
-        .min(num_chunks)
-        .min(max_concurrent_jobs);
-    
-
-    // Recalculate threads_per to fit total_threads exactly (avoids waste)
-    let mut threads_per = total_threads / concurrency;
-    threads_per = (total_threads / concurrency)
-        .max(4)
-        .min(12);   // ← tighter cap // Bounds: Min 4 (efficiency floor), max 12 (diminishing returns for sr preset)
-
+    let est_gb_per_job = ((largest_gb as f64 * SAFETY_MULTIPLIER).ceil() as u64)
+        .max(MIN_ESTIMATE_GB);
 
     info!(
-    "Instance-aware settings: total RAM ~{} GiB → concurrency={}, index loads cap={}, threads per run={}",
-    total_gib, concurrency, max_index_loads, threads_per
-);
+        "Largest NT chunk: {} GiB → estimating {:.0} GiB RAM per minimap2 job (with margin)",
+        largest_gb, est_gb_per_job
+    );
 
-    // Separate semaphore for index loading phase (only 1–2 concurrent loads)
-    let index_load_sem = Arc::new(Semaphore::new(max_index_loads));
+    // 4. Compute safe concurrency & threads-per-job
+    const SAFE_RAM_USAGE_PCT: f64 = 0.82;
+    const MIN_THREADS_PER_JOB: usize = 4;
+    const MAX_THREADS_PER_JOB: usize = 12;  // diminishign returns above this point
+    const MAX_CONCURRENCY_CAP: usize = 20;
 
-    // Scatter with dynamic concurrency limit
-    let sem = Arc::new(Semaphore::new(concurrency as usize));
+    let total_threads = config.max_cores;
+    let (total_bytes, avail_bytes) = detect_ram()
+        .map_err(|e| PipelineError::Other(anyhow!("RAM detection failed: {}", e)))?;
 
+    let total_gib = total_bytes / (1024 * 1024 * 1024);
+    let avail_gib = avail_bytes / (1024 * 1024 * 1024);
+
+    let target_ram_gib = (avail_gib as f64 * SAFE_RAM_USAGE_PCT) as u64;
+    let max_jobs_from_ram = target_ram_gib / est_gb_per_job;
+
+    let max_jobs_from_cpu = (total_threads / 6).max(1);
+
+    let mut concurrency = max_jobs_from_ram
+        .min(max_jobs_from_cpu as u64)
+        .min(MAX_CONCURRENCY_CAP as u64)
+        .max(1) as usize;
+
+    // Auto-reduce on small machines
+    if total_gib < 128 {
+        concurrency = concurrency.min(2);
+    }
+    if total_gib < 64 {
+        concurrency = 1;
+    }
+
+    let threads_per_job = (total_threads / concurrency)
+        .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
+
+    info!(
+        "NT minimap2 stage: {} GiB total / {} GiB avail → {} concurrent jobs × {} threads each (est peak ~{} GiB)",
+        total_gib,
+        avail_gib,
+        concurrency,
+        threads_per_job,
+        concurrency as u64 * est_gb_per_job
+    );
+
+    // 5. Semaphores
+    let exec_sem = Arc::new(Semaphore::new(concurrency));
+    let index_load_sem = Arc::new(Semaphore::new(2));  // keep index loading limited as its a ram hog
+
+    // 6. Scatter — acquire permit beforespawning
     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
-    let config_for_scatter = config.clone();
-
-
-    const MIN_FREE_PCT: f64 = 0.10;              // Try to keep at least 10% of total RAM free
-    const MIN_FREE_ABSOLUTE_GIB: u64 = 24;       // But never require less than ~24 GiB free
-    const MAX_WAIT_PER_CHUNK_SECS: u64 = 900;    // 15 minutes max wait per chunk
-    const FALLBACK_THREADS: usize = 4;           // When desperate, use this many threads
-    const FALLBACK_CONCURRENCY: usize = 1;       // Single job only in fallback
-
-
     for chunk_mmi in chunk_paths {
-        let sem_clone = sem.clone();
+        let exec_sem_clone = exec_sem.clone();
         let index_load_sem_clone = index_load_sem.clone();
-        let config_clone = config_for_scatter.clone();
+        let config_clone = config.clone();
         let fastq_clone = input_fastq_path.clone();
-        let chunk_name = chunk_mmi.file_name()
+        let chunk_name = chunk_mmi
+            .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         let handle = tokio::spawn(async move {
-            let start_wait = Instant::now();
-            let mut delay_count = 0;
-            let mut effective_threads = threads_per; // start with computed value
+            let _exec_permit = exec_sem_clone
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow!("Exec semaphore closed for {}: {}", chunk_name, e))?;
 
-            let mut avail_gib: u64 = 0;
-            let mut total_gib: u64 = 0;
-
-            loop {
-                let (total_bytes, avail_bytes) = match detect_ram() {
-                    Ok((t, a)) => (t, a),
-                    Err(e) => {
-                        warn!("RAM detection failed for {}: {}. Proceeding with fallback.", chunk_name, e);
-                        effective_threads = FALLBACK_THREADS.min(effective_threads);
-                        break;
-                    }
-                };
-
-                total_gib = total_bytes / (1024 * 1024 * 1024);
-                avail_gib = avail_bytes / (1024 * 1024 * 1024);
-
-                // Dynamic minimum free RAM required
-                let min_free_gib = ((total_gib as f64 * MIN_FREE_PCT) as u64)
-                    .max(MIN_FREE_ABSOLUTE_GIB)
-                    .min(total_gib / 4); // never more than 25% of total
-
-                // Small-machine auto-reduction
-                let is_small_machine = total_gib < 128;
-                if is_small_machine {
-                    if total_gib <= 64 {
-                        effective_threads = effective_threads.min(4);
-                        info!("Small machine detected ({} GiB total) → capping threads at {}", total_gib, effective_threads);
-                    }
-                    if total_gib <= 32 {
-                        info!("Very small machine ({} GiB total) → forcing fallback mode", total_gib);
-                        effective_threads = 2;
-                    }
-                }
-
-                if avail_gib >= min_free_gib {
-                    info!(
-                        "RAM check passed for {}: {} GiB free / {} GiB total (min required: {} GiB)",
-                        chunk_name, avail_gib, total_gib, min_free_gib
-                    );
-                    break;
-                }
-
-                let elapsed = start_wait.elapsed().as_secs();
-                if elapsed >= MAX_WAIT_PER_CHUNK_SECS {
-                    warn!(
-                        "RAM timeout for chunk {} after {}s (free={} / total={} GiB, required >= {}). Falling back to {} threads.",
-                        chunk_name, elapsed, avail_gib, total_gib, min_free_gib, FALLBACK_THREADS
-                    );
-                    effective_threads = FALLBACK_THREADS.min(effective_threads);
-                    break;
-                }
-
-                let sleep_s = 10 + delay_count.min(6) * 5; // backoff up to 40s
-                info!(
-                    "Waiting {}s for more RAM on chunk {} (free={} / total={} GiB, required >= {}, attempt {})",
-                    sleep_s, chunk_name, avail_gib, total_gib, min_free_gib, delay_count + 1
-                );
-                sleep(Duration::from_secs(sleep_s)).await;
-                delay_count += 1;
-            }
-
-            // try to acquire semaphore (concurrency still enforced)
-            let _permit = match sem_clone.acquire().await {
-                Ok(p) => p,
-                Err(e) => return Err(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)),
-            };
-
-            info!(
-                "Starting minimap2 for {} | -t {} | free RAM at start: {} GiB",
-                chunk_name, effective_threads, avail_gib  // now in scope
-            );
+            let _idx_permit = index_load_sem_clone
+                .acquire()
+                .await
+                .map_err(|e| anyhow!("Index load semaphore failed for {}: {}", chunk_name, e))?;
 
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
@@ -2393,20 +2351,17 @@ async fn minimap2_non_host_align(
                 minimap2_index_path: chunk_mmi,
                 input_path: Some(fastq_clone),
                 option_fields: options,
-                num_threads: Some(effective_threads),
+                num_threads: Some(threads_per_job),
             };
 
             let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
                 .map_err(|e| anyhow!("Failed to generate minimap2 args for {}: {}", chunk_name, e))?;
 
             info!(
-                "minimap2 cmd for {}: minimap2 {}",
-                chunk_name,
-                args.join(" ")
-            );
-
-            let _index_permit = index_load_sem_clone.acquire().await
-                .map_err(|e| anyhow!("Index load semaphore failed for {}: {}", chunk_name, e))?;
+            "minimap2 cmd for {}: minimap2 {}",
+            chunk_name,
+            args.join(" ")
+        );
 
             let (mut child, stderr_task) = spawn_cmd(
                 config_clone.clone(),
@@ -2416,9 +2371,6 @@ async fn minimap2_non_host_align(
             )
                 .await
                 .map_err(|e| anyhow!("spawn_cmd failed for {}: {}", chunk_name, e))?;
-
-
-            info!("Spawned task for chunk {} (permit acquired, concurrency should now be at most {})", chunk_name, concurrency);
 
             if let Some(pid) = child.id() {
                 info!("minimap2 PID for {}: {}", chunk_name, pid);
@@ -2433,7 +2385,8 @@ async fn minimap2_non_host_align(
                 .await
                 .map_err(|e| anyhow!("parse_child_output failed for {}: {}", chunk_name, e))?;
 
-            info!("Task for chunk {} completed, releasing permit", chunk_name);
+            // Permit drops here when _exec_permit goes out of scope → slot freed
+            info!("Task for chunk {} completed", chunk_name);
 
             Ok((ReceiverStream::new(paf_receiver), stderr_task))
         });
@@ -2441,18 +2394,19 @@ async fn minimap2_non_host_align(
         partial_handles.push(handle);
     }
 
-    // Await all scatter tasks
+    // 7. Collect partial PAF streams
     let mut partial_paf_receivers = Vec::new();
 
     for handle in partial_handles {
-        let (paf_rx, stderr_task) = handle.await
+        let (paf_rx, stderr_task) = handle
+            .await
             .map_err(|e| PipelineError::Other(anyhow!("Scatter task panicked: {}", e)))??;
 
         partial_paf_receivers.push(paf_rx);
         cleanup_tasks.push(stderr_task);
     }
 
-    // 4. Gather
+    // 8. Merge all PAF streams
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
