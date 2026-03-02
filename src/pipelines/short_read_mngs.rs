@@ -2316,20 +2316,41 @@ async fn minimap2_non_host_align(
 
     // 5. Semaphores
     let exec_sem = Arc::new(Semaphore::new(concurrency));
+    info!(
+    "Semaphore created with capacity = {} (available_permits now = {})",
+    concurrency,
+    exec_sem.available_permits()
+);
+
     let index_load_sem = Arc::new(Semaphore::new(2));  // keep index loading limited as its a ram hog
+    info!(
+    "Index Semaphore created with capacity = {} (available_permits now = {})",
+    2
+    index_load_sem.available_permits()
+);
 
     // 6. Scatter — acquire permit beforespawning
     let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
     for chunk_mmi in chunk_paths {
-        let exec_sem_clone = exec_sem.clone();
-        let index_load_sem_clone = index_load_sem.clone();
-        let config_clone = config.clone();
-        let fastq_clone = input_fastq_path.clone();
+
         let chunk_name = chunk_mmi
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
+
+        info!(
+        "Before spawning chunk {}: semaphore available = {}, calculated concurrency was {}",
+        chunk_name,
+        exec_sem.available_permits(),
+        concurrency
+    );
+
+        let exec_sem_clone = exec_sem.clone();
+        let index_load_sem_clone = index_load_sem.clone();
+        let config_clone = config.clone();
+        let fastq_clone = input_fastq_path.clone();
+
 
         let handle = tokio::spawn(async move {
             let _exec_permit = exec_sem_clone
