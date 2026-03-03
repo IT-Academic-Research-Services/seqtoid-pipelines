@@ -2336,71 +2336,79 @@ async fn minimap2_non_host_align(
     // ────────────────────────────────────────────────────────────────
     // 6. Scatter — acquire permit BEFORE spawning (this is the fix)
     // ────────────────────────────────────────────────────────────────
-    let mut partial_handles = Vec::with_capacity(chunk_paths.len());
+    let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
 
     for chunk_mmi in chunk_paths {
         let chunk_name = chunk_mmi.file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
+        
+        let exec_sem_for_this_job = exec_sem.clone();
 
-        let permit = exec_sem.acquire_owned().await
+        // Now safe: acquire_owned consumes only this clone
+        let permit = exec_sem_for_this_job.acquire_owned().await
             .map_err(|e| PipelineError::Other(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)))?;
 
-        info!("Acquired permit for {} (remaining: {})", chunk_name, exec_sem.available_permits());
+        info!(
+        "Acquired exec permit for {} (remaining slots: {})",
+        chunk_name,
+        exec_sem.available_permits()  // original Arc still alive
+    );
 
         let index_load_sem_clone = index_load_sem.clone();
         let config_clone = config.clone();
         let fastq_clone = input_fastq_path.clone();
 
-        let handle = tokio::spawn(async move {
-            // === CRITICAL: hold permit for entire job lifetime ===
-            let _permit = permit;
+        // Type annotation to fix the JoinHandle inference error
+        let handle: JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>> =
+            tokio::spawn(async move {
+                // Hold the permit for the entire lifetime of this minimap2 job
+                let _permit_held = permit;
 
-            let _idx_permit = index_load_sem_clone.acquire().await
-                .map_err(|e| anyhow!("Index load semaphore failed: {}", e))?;
+                let _idx_permit = index_load_sem_clone.acquire().await
+                    .map_err(|e| anyhow!("Index load semaphore failed: {}", e))?;
 
-            // minimap2 launch (your existing code)
-            let mut options = HashMap::new();
-            options.insert("-c".to_string(), None);
-            options.insert("-x".to_string(), Some("sr".to_string()));
-            options.insert("--secondary".to_string(), Some("yes".to_string()));
+                let mut options = HashMap::new();
+                options.insert("-c".to_string(), None);
+                options.insert("-x".to_string(), Some("sr".to_string()));
+                options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-            let mm_config = Minimap2Config {
-                minimap2_index_path: chunk_mmi,
-                input_path: Some(fastq_clone),
-                option_fields: options,
-                num_threads: Some(threads_per_job),
-            };
+                let mm_config = Minimap2Config {
+                    minimap2_index_path: chunk_mmi,
+                    input_path: Some(fastq_clone),
+                    option_fields: options,
+                    num_threads: Some(threads_per_job),
+                };
 
-            let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
-                .map_err(|e| anyhow!("Args failed for {}: {}", chunk_name, e))?;
+                let args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&mm_config))
+                    .map_err(|e| anyhow!("Args failed for {}: {}", chunk_name, e))?;
 
-            info!("Launching minimap2 for {}: {}", chunk_name, args.join(" "));
+                info!("Launching minimap2 for {}: {}", chunk_name, args.join(" "));
 
-            let (mut child, stderr_task) = spawn_cmd(
-                config_clone.clone(),
-                MINIMAP2_TAG,
-                args,
-                config_clone.args.verbose,
-            ).await
-                .map_err(|e| anyhow!("Spawn failed for {}: {}", chunk_name, e))?;
+                let (mut child, stderr_task) = spawn_cmd(
+                    config_clone.clone(),
+                    MINIMAP2_TAG,
+                    args,
+                    config_clone.args.verbose,
+                ).await
+                    .map_err(|e| anyhow!("Spawn failed for {}: {}", chunk_name, e))?;
 
-            if let Some(pid) = child.id() {
-                info!("minimap2 PID for {}: {}", chunk_name, pid);
-            }
+                if let Some(pid) = child.id() {
+                    info!("minimap2 PID for {}: {}", chunk_name, pid);
+                }
 
-            let paf_receiver = parse_child_output(
-                &mut child,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                config_clone.base_buffer_size,
-            ).await
-                .map_err(|e| anyhow!("Parse failed for {}: {}", chunk_name, e))?;
+                let paf_receiver = parse_child_output(
+                    &mut child,
+                    ChildStream::Stdout,
+                    ParseMode::Lines,
+                    config_clone.base_buffer_size,
+                ).await
+                    .map_err(|e| anyhow!("Parse failed for {}: {}", chunk_name, e))?;
 
-            info!("Chunk {} finished", chunk_name);
+                info!("Chunk {} finished", chunk_name);
 
-            Ok((ReceiverStream::new(paf_receiver), stderr_task))
-        });
+                Ok((ReceiverStream::new(paf_receiver), stderr_task))
+            });
 
         partial_handles.push(handle);
     }
