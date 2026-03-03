@@ -2303,8 +2303,8 @@ async fn minimap2_non_host_align(
     }
 
     // Instead of any min() logic for now
-    concurrency = 3;  // ultra-safe for testing
-    info!("EMERGENCY CAP: minimap2 NT concurrency FORCED to 3");
+    concurrency = 6;  // ultra-safe for testing
+    info!("EMERGENCY CAP: minimap2 NT concurrency FORCED to 6");
 
     let threads_per_job = (total_threads / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
@@ -2342,7 +2342,7 @@ async fn minimap2_non_host_align(
         let chunk_name = chunk_mmi.file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        
+
         let exec_sem_for_this_job = exec_sem.clone();
 
         // Now safe: acquire_owned consumes only this clone
@@ -5614,11 +5614,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // This is part of post-process starting here for concurrency
 
-    let spades_task = spades_assembly(
-        config.clone(),
-        ReceiverStream::new(non_host_assembly_stream),
-        &out_dir,
-    ).await?;
+    // let spades_task = spades_assembly(
+    //     config.clone(),
+    //     ReceiverStream::new(non_host_assembly_stream),
+    //     &out_dir,
+    // ).await?;
 
 
     // Minimap2 non_host alignment
@@ -5901,6 +5901,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Assembly stats
     let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
     let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
+
+    let spades_task = spades_assembly(
+        config.clone(),
+        ReceiverStream::new(non_host_assembly_stream),
+        &out_dir,
+    ).await?;
 
     let spades_completion = spades_task.await;
 
