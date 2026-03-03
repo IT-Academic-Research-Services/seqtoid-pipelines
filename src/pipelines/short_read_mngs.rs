@@ -2302,8 +2302,9 @@ async fn minimap2_non_host_align(
         concurrency = 1;
     }
 
-    concurrency = 6;  // hard limit for now
-    info!("FORCE LIMIT: minimap2 NT concurrency capped at 6");
+    // Instead of any min() logic for now
+    concurrency = 3;  // ultra-safe for testing
+    info!("EMERGENCY CAP: minimap2 NT concurrency FORCED to 3");
 
     let threads_per_job = (total_threads / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
@@ -2335,37 +2336,30 @@ async fn minimap2_non_host_align(
     // ────────────────────────────────────────────────────────────────
     // 6. Scatter — acquire permit BEFORE spawning (this is the fix)
     // ────────────────────────────────────────────────────────────────
-    let mut partial_handles: Vec<JoinHandle<Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::new();
+    let mut partial_handles = Vec::with_capacity(chunk_paths.len());
 
     for chunk_mmi in chunk_paths {
         let chunk_name = chunk_mmi.file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Clone Arc before acquire — each acquire gets its own Arc reference
-        let exec_sem_clone = exec_sem.clone();
+        let permit = exec_sem.acquire_owned().await
+            .map_err(|e| PipelineError::Other(anyhow!("Semaphore acquire failed for {}: {}", chunk_name, e)))?;
 
-        // Now safe to call acquire_owned() — consumes the clone, not the original
-        let permit = exec_sem_clone.acquire_owned().await
-            .map_err(|e| PipelineError::Other(anyhow!("Semaphore failed for {}: {}", chunk_name, e)))?;
-
-        info!(
-        "Acquired exec permit for {} (remaining slots: {})",
-        chunk_name,
-        exec_sem.available_permits()
-    );
+        info!("Acquired permit for {} (remaining: {})", chunk_name, exec_sem.available_permits());
 
         let index_load_sem_clone = index_load_sem.clone();
         let config_clone = config.clone();
         let fastq_clone = input_fastq_path.clone();
 
         let handle = tokio::spawn(async move {
-            // Keep permit alive for the whole job
-            let _permit_held = permit;
+            // === CRITICAL: hold permit for entire job lifetime ===
+            let _permit = permit;
 
             let _idx_permit = index_load_sem_clone.acquire().await
-                .map_err(|e| anyhow!("Index semaphore failed: {}", e))?;
+                .map_err(|e| anyhow!("Index load semaphore failed: {}", e))?;
 
+            // minimap2 launch (your existing code)
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
             options.insert("-x".to_string(), Some("sr".to_string()));
