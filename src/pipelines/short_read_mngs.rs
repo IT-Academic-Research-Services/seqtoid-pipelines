@@ -2302,6 +2302,9 @@ async fn minimap2_non_host_align(
         concurrency = 1;
     }
 
+    concurrency = 6;  // hard limit for now
+    info!("FORCE LIMIT: minimap2 NT concurrency capped at 6");
+
     let threads_per_job = (total_threads / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
