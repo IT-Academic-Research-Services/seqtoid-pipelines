@@ -200,7 +200,8 @@ async fn align_to_host(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: host_index_path,
-        input_path: None,
+        r1_path: None,
+        r2_path: None,
         option_fields: minimap2_options.clone(),
         num_threads: None,
     };
@@ -505,7 +506,8 @@ async fn process_ercc(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: ercc_index_path,
-        input_path: None,
+        r1_path: None,             // ← NEW: optional query file (None = stdin)
+        r2_path: None,
         option_fields: minimap2_options.clone(),
         num_threads: None,
     };
@@ -1044,6 +1046,7 @@ async fn align_to_target(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
+        false
     ).await?;
 
 
@@ -1059,7 +1062,8 @@ async fn align_to_target(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: target_index_path,
-        input_path: None,
+        r1_path: None,
+        r2_path: None,
         option_fields: minimap2_options.clone(),
         num_threads: None,
     };

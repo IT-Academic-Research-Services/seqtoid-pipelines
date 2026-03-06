@@ -214,7 +214,8 @@ pub mod minimap2 {
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
-        pub input_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
+        pub r1_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
+        pub r2_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
         pub option_fields: HashMap<String, Option<String>>,
         pub num_threads: Option<usize>,
     }
@@ -481,8 +482,10 @@ pub mod minimap2 {
             args_vec.push(index_path.to_string_lossy().to_string());
 
             // Input: file if provided, otherwise stdin
-            if let Some(input_path) = &config.input_path {
-                args_vec.push(input_path.to_string_lossy().to_string());
+            if let Some(r1_path) = &config.r1_path {
+                args_vec.push(r1_path.to_string_lossy().to_string());
+                if let Some(r2_path) = &config.r2_path { args_vec.push(r2_path.to_string_lossy().to_string());}
+
             } else {
                 args_vec.push("-".to_string()); // stdin
             }
@@ -1006,6 +1009,8 @@ pub mod bowtie2 {
     pub struct Bowtie2Config {
         pub bt2_index_path: PathBuf,
         pub paired: bool,
+        pub r1_path: Option<PathBuf>,
+        pub r2_path: Option<PathBuf>,
         pub option_fields: HashMap<String, Option<String>>,
     }
 
@@ -1139,29 +1144,59 @@ pub mod bowtie2 {
                 .and_then(|e| e.downcast_ref::<Bowtie2Config>())
                 .ok_or_else(|| anyhow!("Bowtie2 requires a Bowtie2Config as extra argument"))?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args: Vec<String> = Vec::new();
 
-            for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
+            for (key, value) in &config.option_fields {
+                args.push(key.clone());
                 if let Some(v) = value {
-                    args_vec.push(format!("{}", v));
+                    args.push(v.clone());
                 }
             }
 
-            args_vec.push("-x".to_string());
-            args_vec.push(config.bt2_index_path.to_string_lossy().to_string());
-            args_vec.push("-p".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
-            args_vec.push(num_cores.to_string());
-            if config.paired{
-                args_vec.push("--interleaved".to_string()); // if paired, will be an interleaved stream
-            }
-            else {
-                args_vec.push("-U".to_string());
-            }
-            args_vec.push("-".to_string());
+            // Index
+            args.push("-x".to_string());
+            args.push(config.bt2_index_path.to_string_lossy().to_string());
 
-            Ok(args_vec)
+            // Threads
+            args.push("-p".to_string());
+            let num_cores = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
+            args.push(num_cores.to_string());
+
+            // Input handling
+            match (config.r1_path.as_ref(), config.r2_path.as_ref()) {
+                (Some(r1), Some(r2)) => {
+                    // Paired files
+                    args.push("-1".to_string());
+                    args.push(r1.to_string_lossy().to_string());
+                    args.push("-2".to_string());
+                    args.push(r2.to_string_lossy().to_string());
+                }
+                (Some(r1), None) => {
+                    // Single-end file
+                    args.push("-U".to_string());
+                    args.push(r1.to_string_lossy().to_string());
+                }
+                (None, _) => {
+                    // Stdin mode
+                    if config.paired {
+                        args.push("--interleaved".to_string());
+                    } else {
+                        args.push("-U".to_string());
+                    }
+                    args.push("-".to_string());  // stdin
+                }
+            }
+
+            // Safety check: paired flag should match input
+            if config.paired && config.r1_path.is_none() && config.r2_path.is_none() {
+                debug!("Bowtie2: using --interleaved for paired stdin input");
+            } else if config.paired && (config.r1_path.is_none() || config.r2_path.is_none()) {
+                return Err(anyhow!("Bowtie2 paired mode requires both R1 and R2 paths (or stdin)"));
+            }
+
+            debug!("Bowtie2 final args: {}", args.join(" "));
+
+            Ok(args)
         }
     }
 }
@@ -1685,6 +1720,8 @@ pub mod diamond {
     pub struct DiamondConfig {
         pub subcommand: DiamondSubcommand,
         pub db: PathBuf,
+        pub r1_path: Option<PathBuf>,
+        pub r2_path: Option<PathBuf>,
         pub subcommand_fields: HashMap<String, Option<String>>,
     }
 
@@ -1749,6 +1786,20 @@ pub mod diamond {
 
             args_vec.push("-d".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
+
+
+            if let Some(r1_path) = &config.r1_path {
+
+                if let Some(r2_path) = &config.r2_path {
+                    args_vec.push("-1".to_string());
+                    args_vec.push(r1_path.to_string_lossy().to_string());
+                    args_vec.push("-2".to_string());
+                    args_vec.push(r2_path.to_string_lossy().to_string());
+                } else {
+                    args_vec.push("-1".to_string());
+                    args_vec.push(r1_path.to_string_lossy().to_string());
+                }
+            } // if no input paths, automatically accpet stdin
 
             let threads = run_config.thread_allocation(DIAMOND_TAG, None);
             args_vec.push("--threads".to_string());

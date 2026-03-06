@@ -412,12 +412,15 @@ async fn bowtie2_filter(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
+        false,
     ).await?;
 
     // BT2
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: bt2_index_path.clone(),
         paired,
+        r1_path: None,
+        r2_path: None,
         option_fields: bowtie2_options,
     };
 
@@ -680,6 +683,7 @@ async fn hisat2_filter(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
+        false
     ).await?;
 
     // 1. Deinterleave input to files for HISAT2 input
@@ -1353,6 +1357,7 @@ async fn minimap2_filter(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
+        false
     ).await?;
 
 
@@ -1380,7 +1385,8 @@ async fn minimap2_filter(
 
     let minimap2_config = Minimap2Config {
         minimap2_index_path: host_index_path,
-        input_path: None,
+        r1_path: None,
+        r2_path: None,
         option_fields: HashMap::from([
             ("-ax".to_string(), Some("sr".to_string())), // Short-read preset
             ("-k".to_string(), Some("15".to_string())), // Default k-mer
@@ -2169,13 +2175,13 @@ async fn subsample_uniform(
 /// - Optional temporary minimap2 index file.
 async fn minimap2_non_host_align(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
 ) -> Result<
     (
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-        Option<TempDir>,
     ),
     PipelineError,
 > {
@@ -2185,33 +2191,7 @@ async fn minimap2_non_host_align(
     let base_buffer_size = config.base_buffer_size;
     let channel_buffer = base_buffer_size * 4;
 
-    // 1. Write non-host FASTQ to disk (unchanged)
-    let temp_dir = choose_temp_dir(
-        config.input_size * 3,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        4,
-    ).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let input_fastq_path = if let Some(nvme) = &config.args.nvme_scratch {
-        let p = PathBuf::from(nvme).join("nonhost.fastq");
-        info!("Placing nonhost.fastq on NVMe scratch: {}", p.display());
-        p
-    } else {
-        let p = temp_dir.path().join("nonhost.fastq");
-        info!("No NVMe — placing nonhost.fastq in temp dir: {}", p.display());
-        p
-    };
-
-    let write_handle = write_parse_output_to_file(
-        &input_fastq_path,
-        input_stream,
-        Some(base_buffer_size),
-    ).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-
-    cleanup_tasks.push(write_handle);
 
     // 2. Discover NT split .mmi chunks + sort largest-first (unchanged)
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
@@ -2325,7 +2305,8 @@ async fn minimap2_non_host_align(
 
                 let mm_config = Minimap2Config {
                     minimap2_index_path: chunk_mmi.clone(),
-                    input_path: Some(input_fastq_path.clone()),
+                    r1_path: Some(r1_path.clone()),
+                    r2_path: r2_path_opt.clone(),
                     option_fields: options,
                     num_threads: Some(threads_per_job),
                 };
@@ -2408,7 +2389,6 @@ async fn minimap2_non_host_align(
         ReceiverStream::new(merged_rx),
         cleanup_tasks,
         cleanup_receivers,
-        Some(temp_dir),
     ))
 }
 
@@ -2826,9 +2806,8 @@ pub async fn call_hits_m8_stream(
 
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    _paired: bool,           // kept for signature compatibility
-    _sample_base: String,    // kept for signature compatibility
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
 ) -> Result<(
     mpsc::Receiver<ParseOutput>,
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
@@ -2844,6 +2823,7 @@ async fn diamond_non_host_align(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
+        true
     ).await?;
 
     let diamond_db = config.args.diamond_db
@@ -2883,67 +2863,61 @@ async fn diamond_non_host_align(
     let diamond_config = DiamondConfig {
         subcommand: DiamondSubcommand::Blastx,
         db: db_prefix,
+        r1_path: Some(r1_path.clone()),
+        r2_path: r2_path_opt.clone(),
         subcommand_fields: diamond_options,
     };
 
     let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
         .map_err(|e| PipelineError::ToolExecution { tool: DIAMOND_TAG.to_string(), error: e.to_string() })?;
 
-    // Stream FASTQ → diamond → stdout m8
-    let (diamond_child_arc, diamond_stream_task, diamond_err_task) = stream_to_cmd(
+
+    let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
         config.clone(),
-        input_stream.into_inner(),
         DIAMOND_TAG,
         diamond_args,
-        StreamDataType::IlluminaFastq,
         config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution { tool: DIAMOND_TAG.to_string(), error: e.to_string() })?;
+    ).await?;
 
-    cleanup_tasks.push(diamond_stream_task);
-    cleanup_tasks.push(diamond_err_task);
+    // Take pipes upfront (before any move)
+    let diamond_stdout = diamond_child.stdout.take().ok_or_else(|| anyhow!("diamond stdout missing"))?;
+    let diamond_stderr = diamond_child.stderr.take().ok_or_else(|| anyhow!("diamond stderr missing"))?;
 
-    // Stream diamond stdout directly to m8 channel
+    // Parse stdout to m8 stream
     let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
 
-    let parse_task = tokio::spawn({
-        let child = diamond_child_arc.clone();
-        async move {
-            let mut guard = child.lock().await;
-            let stdout = guard.stdout.as_mut().ok_or_else(|| anyhow!("diamond stdout missing"))?;
-            let mut reader = TokioBufReader::new(stdout);
-            let mut line = Vec::with_capacity(1024);
+    let parse_task = tokio::spawn(async move {
+        let mut reader = TokioBufReader::new(diamond_stdout);
+        let mut line = Vec::with_capacity(1024);
 
-            loop {
-                line.clear();
-                if reader.read_until(b'\n', &mut line).await? == 0 {
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line).await? == 0 {
+                break;
+            }
+            if !line.is_empty() && line[0] != b'#' {
+                let arc_line = Arc::new(line.clone());
+                if m8_tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
                     break;
                 }
-                if !line.is_empty() && line[0] != b'#' {
-                    let arc_line = Arc::new(line.clone());
-                    if m8_tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
-                        break;
-                    }
-                }
             }
-            Ok(())
         }
+        Ok(())
     });
-
-    cleanup_tasks.push(parse_task);
 
     // Wait for diamond exit
-    let wait_task = tokio::spawn({
-        let child = diamond_child_arc.clone();
-        async move {
-            let mut guard = child.lock().await;
-            let status = guard.wait().await?;
-            if !status.success() {
-                return Err(anyhow!("diamond exited with code {:?}", status.code()));
-            }
-            Ok(())
+    let wait_task = tokio::spawn(async move {
+        let status = diamond_child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("diamond exited with code {:?}", status.code()));
         }
+        Ok(())
     });
+
+    // Cleanup
+    cleanup_tasks.push(parse_task);
     cleanup_tasks.push(wait_task);
+    cleanup_tasks.push(diamond_stderr_task);  // your stderr logging
 
     let mut temp_dirs = vec![temp_dir];
 
@@ -3268,7 +3242,6 @@ pub async fn generate_annotated_fasta(
     mut cluster_stream: ReceiverStream<ParseOutput>,
     nt_map: HashMap<String, String>,
     nr_map: HashMap<String, String>,
-    // out_dir and sample_base no longer needed for paths
 ) -> Result<(
     mpsc::Receiver<ParseOutput>,               // mapped (annotated) contigs
     mpsc::Receiver<ParseOutput>,               // unidentified (all, including expanded duplicates)
@@ -3435,6 +3408,58 @@ pub async fn generate_annotated_fasta(
     ))
 }
 
+async fn generate_annotated_fasta_from_files(
+    config: Arc<RunConfig>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+    cluster_stream: ReceiverStream<ParseOutput>,
+    nt_map: HashMap<String, String>,
+    nr_map: HashMap<String, String>,
+) -> Result<(
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+)> {
+    let mut cleanup_tasks = Vec::new();
+
+    // Parse R1 to raw receiver
+    let r1_file = TokioFile::open(&r1_path).await
+        .map_err(|e| anyhow!("Failed to open R1 {}: {}", r1_path.display(), e))?;
+    let r1_receiver = parse_fastq(r1_file, config.base_buffer_size).await?;
+
+    let interleaved_receiver = if let Some(r2_path) = r2_path_opt {
+        let r2_file = TokioFile::open(&r2_path).await
+            .map_err(|e| anyhow!("Failed to open R2 {}: {}", r2_path.display(), e))?;
+        let r2_receiver = parse_fastq(r2_file, config.base_buffer_size).await?;
+
+        // Interleave raw receivers
+        let (inter_rx, inter_task) = interleave_fastq_streams(
+            r1_receiver,
+            r2_receiver,
+            config.base_buffer_size,
+        ).await?;
+
+        cleanup_tasks.push(inter_task);
+        inter_rx  // raw receiver
+    } else {
+        r1_receiver  // single-end
+    };
+
+    // Wrap the final receiver in ReceiverStream for generate_annotated_fasta
+    let interleaved_stream = ReceiverStream::new(interleaved_receiver);
+
+    // Call existing stream-based function
+    generate_annotated_fasta(
+        config,
+        interleaved_stream,
+        cluster_stream,
+        nt_map,
+        nr_map,
+    ).await
+}
+
 async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow::Error> {
     let contigs     = assembly_dir.join("contigs.fasta");
     let contigs_all = assembly_dir.join("contigs_all.fasta");
@@ -3467,7 +3492,8 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
 
 async fn spades_assembly(
     config: Arc<RunConfig>,
-    dedup_stream: ReceiverStream<ParseOutput>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
     out_dir: &PathBuf,
 ) -> Result<JoinHandle<Result<()>>> {
     let assembly_dir = out_dir.join("assembly");
@@ -3484,39 +3510,9 @@ async fn spades_assembly(
             &config.ram_temp_dir,
             &config.args.nvme_scratch,
             4,
+            true
         ).await?;
 
-
-        // 2. Deinterleave and write to file(s) in temp
-        let paired = true;
-        let buffer_size = 4 * 1024 * 1024;
-        let (r1_rx, r2_rx_opt, deinterleave_handle) = deinterleave_fastq_stream(
-            dedup_stream,
-            paired,
-            buffer_size,
-        ).await?;
-
-        let r1_stream = ReceiverStream::new(r1_rx);
-        let r2_stream_opt = r2_rx_opt.map(ReceiverStream::new);
-
-        let r1_path = temp_dir.path().join("nonhost_R1.fastq");
-        let r2_path = temp_dir.path().join("nonhost_R2.fastq");
-
-        let r1_write_task = write_byte_stream_to_file(&r1_path, r1_stream, Some(4 * 1024 * 1024)).await?;
-        r1_write_task.await??;
-
-        let is_paired = r2_stream_opt.is_some();
-        let r2_write_task_opt = if let Some(r2_stream) = r2_stream_opt {
-            Some(write_byte_stream_to_file(&r2_path, r2_stream, Some(4 * 1024 * 1024)).await?)
-        } else {
-            None
-        };
-
-        if let Some(task) = r2_write_task_opt {
-            task.await??;
-        }
-
-        deinterleave_handle.await??;
 
         // 3. Run SPAdes
         let spades_work_dir = TempDir::new_in(&temp_dir)?;
@@ -3528,7 +3524,7 @@ async fn spades_assembly(
 
         let spades_config = SpadesConfig {
             r1_path: r1_path.clone(),
-            r2_path_opt: if is_paired { Some(r2_path.clone()) } else { None },
+            r2_path_opt: r2_path_opt.clone(),
             outdir_path: spades_work_path.clone(),
             option_fields: options,
         };
@@ -3588,7 +3584,8 @@ pub async fn process_assembly(
     config: Arc<RunConfig>,
     out_dir: &PathBuf,
     work_dir: &PathBuf,
-    bowtie_stream: ReceiverStream<ParseOutput>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
     duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     paired: bool,
     assembly_headroom: u64,
@@ -3673,6 +3670,7 @@ pub async fn process_assembly(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         assembly_headroom,
+        false
     )
         .await?;
 
@@ -3742,6 +3740,8 @@ pub async fn process_assembly(
 
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: index_prefix,
+        r1_path: Some(r1_path.clone()),
+        r2_path: r2_path_opt.clone(),
         paired: paired,
         option_fields: bt2_options,
     };
@@ -3752,37 +3752,26 @@ pub async fn process_assembly(
             error: e.to_string(),
         })?;
 
-    let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
+    let (mut bt2_child, bt2_err_task) = spawn_cmd(
         config.clone(),
-        bowtie_stream.into_inner(),
         BOWTIE2_TAG,
         bt2_args,
-        StreamDataType::JustBytes,
         config.args.verbose,
+    ).await?;
+
+    cleanup_tasks.push(bt2_err_task);
+
+    let bt2_out_stream = parse_child_output(
+        &mut bt2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        config.base_buffer_size,
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: BOWTIE2_TAG.to_string(),
             error: e.to_string(),
         })?;
-
-    cleanup_tasks.push(bt2_stream_task);
-    cleanup_tasks.push(bt2_err_task);
-
-    let bt2_out_stream = {
-        let mut guard = bt2_child.lock().await;
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            config.base_buffer_size,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: BOWTIE2_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
 
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -4145,7 +4134,7 @@ pub async fn build_reference_fasta_from_selected_genera(
         accessions.extend(acc_list.iter().cloned());
     }
 
-    let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4).await?;  // ← Create early
+    let temp_dir = choose_temp_dir(1024, &config.ram_temp_dir, &config.args.nvme_scratch, 4, false).await?;  // ← Create early
 
     if accessions.is_empty() {
         warn!("selected_genera is empty — writing empty reference FASTA");
@@ -4828,6 +4817,7 @@ pub async fn blast_contigs(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         blast_headroom,
+        true
     )
         .await?;
 
@@ -5298,7 +5288,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
-    let mut temp_dirs: Vec<TempDir> = Vec::new();
+    let mut host_filter_temp_dirs: Vec<TempDir> = Vec::new();
+    let mut final_temp_dirs: Vec<TempDir> = Vec::new();
     let mut temp_paths: Vec<PathBuf> = Vec::new();
 
     info!("Starting short read mNGS pipeline.");
@@ -5309,7 +5300,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // External tools check
     check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
-                        BLASTN_TAG, BLASTX_TAG], &out_dir.clone())
+                        BLASTN_TAG, BLASTX_TAG, DIAMOND_TAG], &out_dir.clone())
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -5360,7 +5351,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
-    temp_dirs.extend(ercc_bt2_temp_dirs);
+    final_temp_dirs.extend(ercc_bt2_temp_dirs);
 
     // QC with fastp
     let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) = fastp_qc(
@@ -5413,7 +5404,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     cleanup_receivers.extend(host_bt2_cleanup_receivers);
-    temp_dirs.extend(host_bt2_temp_dirs);
+    host_filter_temp_dirs.extend(host_bt2_temp_dirs);
 
 
     //host filtering hisat2
@@ -5431,7 +5422,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await?;
     cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
     cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
-    temp_dirs.extend(hisat_temp_dirs);
+    host_filter_temp_dirs.extend(hisat_temp_dirs);
 
 
     // If host is no huma, run an additional filter stage using a human reference
@@ -5467,7 +5458,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         cleanup_tasks.extend(human_bt2_cleanup_tasks);
         cleanup_receivers.extend(human_bt2_cleanup_receivers);
-        temp_dirs.extend(human_bt2_temp_dirs);
+        host_filter_temp_dirs.extend(human_bt2_temp_dirs);
 
         // Save the BAM write handle and path for later awaiting / insert stats
         optional_human_bam_write_handle = Some(human_bt2_bam_write_handle);
@@ -5495,7 +5486,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
         cleanup_receivers.append(&mut human_hisat2_cleanup_receivers);
-        temp_dirs.extend(human_hisat_temp_dirs);
+        host_filter_temp_dirs.extend(human_hisat_temp_dirs);
 
         human_hisat2_out_stream
     };
@@ -5556,50 +5547,115 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
 
 
-    // split inpout stream for mm2 and dmnd
-    let (non_host_streams, non_host_done_rx) = t_junction(
+    //write de-interleaved non-host file. easier for the scatter-gather
+    let non_host_deinterleave_task = tokio::spawn(deinterleave_fastq_stream(
         subsampled_stream,
-        6,
-        config.base_buffer_size * 20, // this is a big fanout, and could have high pressure
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "non_host_output".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(non_host_done_rx);
+        paired,
+        config.base_buffer_size * 4,
+    ));
 
-    let mut non_host_streams_iter = non_host_streams.into_iter();
-    let non_host_mm2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let non_host_dmnd_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let non_host_annot_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let non_host_assembly_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let non_host_coverage_bt2_stream = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let (r1_rx, r2_rx_opt, deinterleave_handle) = non_host_deinterleave_task.await??;
 
+    let non_host_temp_dir = choose_temp_dir(
+        config.input_size * 2,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        true,
+    ).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // This is part of post-process starting here for concurrency
+    let non_host_r1_path = non_host_temp_dir.path().join("nonhost_R1.fastq");
+    let non_host_r2_path_opt = r2_rx_opt.as_ref().map(|_| non_host_temp_dir.path().join("nonhost_R2.fastq"));
 
-    // let spades_task = spades_assembly(
-    //     config.clone(),
-    //     ReceiverStream::new(non_host_assembly_stream),
-    //     &out_dir,
-    // ).await?;
+    info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion)");
 
+    let r1_write_task = write_parse_output_to_file(
+        &non_host_r1_path,
+        ReceiverStream::new(r1_rx),
+        Some(config.base_buffer_size * 4),
+    ).await?;
 
-    // Minimap2 non_host alignment
-    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_mm2_temp_dir) = minimap2_non_host_align(
+    r1_write_task.await??;
+
+    let r2_write_task_opt = r2_rx_opt.map(|r2_rx| {
+        let r2_path = non_host_r2_path_opt.as_ref().expect("R2 path should exist when r2_rx is Some");
+        write_parse_output_to_file(
+            r2_path,
+            ReceiverStream::new(r2_rx),
+            Some(config.base_buffer_size * 4),
+        )
+    });
+
+    if let Some(task_future) = r2_write_task_opt {
+        let task_handle = task_future.await?;
+        task_handle.await?;
+    }
+
+    deinterleave_handle.await??;
+
+    // Early cleanup upstream temp dirs (host filter, etc.)
+    for td in &host_filter_temp_dirs {
+        if let Err(e) = std::fs::remove_dir_all(td.path()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Early temp dir cleanup failed (non-fatal): {}", e);
+            } else {
+                debug!("Temp dir already gone: {}", td.path().display());
+            }
+        } else {
+            info!("Early cleanup: removed temp dir {}", td.path().display());
+        }
+    }
+    host_filter_temp_dirs.clear();
+
+    // Clone paths **before** moving them into async copy tasks
+    let non_host_r1_path_clone = non_host_r1_path.clone();
+    let non_host_r2_path_opt_clone = non_host_r2_path_opt.clone();
+
+    // Async copy to out_dir (non-blocking)
+    let out_dir_clone = out_dir.clone();
+    let r1_copy_task = tokio::spawn(async move {
+        let dest_r1 = out_dir_clone.join("nonhost_R1.fastq");
+        if let Err(e) = tokio::fs::copy(&non_host_r1_path_clone, &dest_r1).await {
+            warn!("Failed to copy non-host R1 to out_dir: {}", e);
+        } else {
+            info!("Copied non-host R1 to {}", dest_r1.display());
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(r1_copy_task);
+
+    if let Some(r2_path) = non_host_r2_path_opt_clone {
+        let r2_path_clone = r2_path.clone();
+        let out_dir_clone = out_dir.clone();
+        let r2_copy_task = tokio::spawn(async move {
+            let dest_r2 = out_dir_clone.join("nonhost_R2.fastq");
+            if let Err(e) = tokio::fs::copy(&r2_path_clone, &dest_r2).await {
+                warn!("Failed to copy non-host R2 to out_dir: {}", e);
+            } else {
+                info!("Copied non-host R2 to {}", dest_r2.display());
+            }
+            Ok(())
+        });
+        cleanup_tasks.push(r2_copy_task);
+    }
+
+    // Now spades/mm2/diamond/etc. from files (use original paths — they weren't moved)
+    let spades_task = spades_assembly(
         config.clone(),
-        ReceiverStream::new(non_host_mm2_stream),
-    )
-        .await?;
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        &out_dir,
+    ).await?;
+
+    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+    ).await?;
+
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
-    if let Some(index_temp) = non_host_mm2_temp_dir {
-        temp_dirs.push(index_temp);
-    }
 
 
     let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
@@ -5781,19 +5837,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(write_json_task);
 
 
-    let (
-        annotated_rx,
-        unidentified_rx,
-        unique_unidentified_rx,
-        mut annot_tasks,
-        mut annot_rxs,
-    ) = generate_annotated_fasta(
+    let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) = generate_annotated_fasta_from_files(
         config.clone(),
-        ReceiverStream::new(non_host_annot_stream),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
         cluster_stream,
-        nt_map, nr_map,
+        nt_map,
+        nr_map,
     ).await
-        .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+        .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
 
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
@@ -5870,12 +5922,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
     let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
 
-    let spades_task = spades_assembly(
-        config.clone(),
-        ReceiverStream::new(non_host_assembly_stream),
-        &out_dir,
-    ).await?;
-
     let spades_completion = spades_task.await;
 
     match spades_completion {
@@ -5897,7 +5943,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         &assembly_out_dir,
         &assembly_work_dir,
-        ReceiverStream::new(non_host_coverage_bt2_stream),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
         duplicate_clusters.clone(),
         paired,
         4 // this can become as CLI arg if needed
@@ -5981,7 +6028,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("nt path {}", nt_ref_fasta_path.display());
-    temp_dirs.push(nt_ref_fasta_temp_dir);
+    final_temp_dirs.push(nt_ref_fasta_temp_dir);
 
     // //NR
     let (
@@ -6008,7 +6055,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
     eprintln!("nr path {}", nr_ref_fasta_path.display());
-    temp_dirs.push(nr_ref_fasta_temp_dir);
+    final_temp_dirs.push(nr_ref_fasta_temp_dir);
 
     let nt_handle = tokio::spawn({
         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
@@ -6739,7 +6786,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
 
-    for td in temp_dirs {
+    for td in final_temp_dirs {
         if let Err(e) = std::fs::remove_dir_all(td.path()) {
             if e.kind() == std::io::ErrorKind::NotFound {
                 debug!("Temp dir already gone: {}", e);
