@@ -22,6 +22,7 @@ use crate::utils::streams::ToBytes;
 use crate::utils::fastx::{SequenceRecord, r1r2_base};
 use crate::config::defs::{RunConfig, PipelineError};
 use sysinfo::{Disks, DiskUsage};
+use nix::sys::statvfs;
 
 
 
@@ -631,14 +632,33 @@ pub async fn file_size(path: &PathBuf) -> Result<u64> {
 }
 
 pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+    info!("Querying space for canonical path: {}", target.display());
+
+    // Primary: nix statvfs (reliable for tmpfs/NVMe)
+    match statvfs::statvfs(&target) {
+        Ok(stat) => {
+            let block_size = stat.block_size() as u64;               // safe cast
+            let blocks_avail = stat.blocks_available() as u64;       // safe cast
+            let avail = block_size * blocks_avail;
+            info!("statvfs success: block_size={} blocks_avail={} → {} bytes available", block_size, blocks_avail, avail);
+            return Ok(avail);
+        }
+        Err(e) => warn!("statvfs failed: {}", e),
+    }
+
+    // Fallback: sysinfo
     let disks = Disks::new_with_refreshed_list();
-    let target = path.as_path();
     for disk in disks.list() {
-        if target.starts_with(disk.mount_point()) {
-            return Ok(disk.available_space());
+        let mp = disk.mount_point();
+        if target.starts_with(mp) {
+            let avail = disk.available_space();
+            info!("sysinfo match on {}: {} bytes", mp.display(), avail);
+            return Ok(avail);
         }
     }
-    Err(anyhow!("No disk found for path: {}", path.display()))
+
+    Err(anyhow!("No matching filesystem found for {}", target.display()))
 }
 
 
