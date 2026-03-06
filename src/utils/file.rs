@@ -661,6 +661,7 @@ pub async fn choose_temp_dir(
 ) -> Result<TempDir, PipelineError> {
     async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool, PipelineError> {
         let avail = available_space_for_path(path).await?;
+        info!("choose temp dir avilable bytes {}", avail);
         Ok(required <= avail / factor)
     }
 
@@ -689,6 +690,8 @@ pub async fn choose_temp_dir(
         debug!("No NVMe scratch configured — skipping");
         None
     };
+
+    info!("ran attempt {}    nvme attmept {}", ram_attempt, nvme_path.is_some());
 
     let chosen = if prefer_nvme {
         nvme_attempt.or(ram_attempt)
