@@ -656,54 +656,51 @@ pub async fn choose_temp_dir(
     estimated_bytes: u64,
     ram_dir: &PathBuf,
     nvme_scratch: &Option<String>,
-    headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
+    headroom_factor: u64,
+    prefer_nvme: bool,
 ) -> Result<TempDir, PipelineError> {
     async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool, PipelineError> {
         let avail = available_space_for_path(path).await?;
         Ok(required <= avail / factor)
     }
 
-    // 1. Try RAM dir
-    if check_space(ram_dir, estimated_bytes, headroom_factor).await? {
-        debug!(
-            "Using RAM temp dir {}: {} bytes fits in {} available (/{})",
-            ram_dir.display(),
-            estimated_bytes,
-            available_space_for_path(ram_dir).await?,
-            headroom_factor
-        );
-        return TempDir::new_in(ram_dir)
-            .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in RAM dir {}: {}", ram_dir.display(), e)));
+    async fn try_create_temp(dir_path: &PathBuf, estimated: u64, factor: u64, label: &str) -> Option<Result<TempDir, PipelineError>> {
+        if check_space(dir_path, estimated, factor).await.ok()? {
+            debug!(
+                "Using {} dir {}: {} bytes fits in {} available (/{})",
+                label,
+                dir_path.display(),
+                estimated,
+                available_space_for_path(dir_path).await.ok()?,
+                factor
+            );
+            Some(TempDir::new_in(dir_path)
+                .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in {} dir {}: {}", label, dir_path.display(), e))))
+        } else {
+            None
+        }
     }
 
-    // 2. Try NVMe scratch if provided
-    if let Some(nvme) = nvme_scratch {
-        let nvme_path = PathBuf::from(nvme);
-        if check_space(&nvme_path, estimated_bytes, headroom_factor).await? {
-            debug!(
-                "Using NVMe scratch {}: {} bytes fits (/{})",
-                nvme_path.display(),
-                estimated_bytes,
-                headroom_factor
-            );
-            return TempDir::new_in(&nvme_path)
-                .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in NVMe dir {}: {}", nvme_path.display(), e)));
-        } else {
-            warn!(
-                "NVMe scratch {} insufficient: need {} bytes (/{})",
-                nvme_path.display(),
-                estimated_bytes,
-                headroom_factor
-            );
-        }
+    let ram_attempt = try_create_temp(ram_dir, estimated_bytes, headroom_factor, "RAM").await;
+    let nvme_path = nvme_scratch.as_ref().map(PathBuf::from);
+    let nvme_attempt = if let Some(ref nvme) = nvme_path {
+        try_create_temp(nvme, estimated_bytes, headroom_factor, "NVMe").await
     } else {
         debug!("No NVMe scratch configured — skipping");
+        None
+    };
+
+    let chosen = if prefer_nvme {
+        nvme_attempt.or(ram_attempt)
+    } else {
+        ram_attempt.or(nvme_attempt)
+    };
+
+    if let Some(res) = chosen {
+        return res;
     }
 
-    // 3. Final fallback: system temp
-    debug!(
-        "Falling back to system temp dir (RAM/NVMe insufficient or unavailable)"
-    );
+    debug!("Falling back to system temp dir (RAM/NVMe insufficient or unavailable)");
     TempDir::new()
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))
 }
