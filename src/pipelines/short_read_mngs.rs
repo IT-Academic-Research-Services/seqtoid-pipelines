@@ -46,6 +46,7 @@ use tokio::try_join;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
+use tokio::runtime::Builder as RuntimeBuilder;
 use twox_hash::XxHash64;
 use rayon::prelude::*;
 use crate::cli::Technology;
@@ -2191,8 +2192,6 @@ async fn minimap2_non_host_align(
     let base_buffer_size = config.base_buffer_size;
     let channel_buffer = base_buffer_size * 4;
 
-
-
     // 2. Discover NT split .mmi chunks + sort largest-first (unchanged)
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
@@ -2290,8 +2289,8 @@ async fn minimap2_non_host_align(
     // Prepare work items
     let work_items: Vec<_> = chunk_paths.into_iter().enumerate().collect();
 
-    // Parallel execution — each rayon thread runs one blocking minimap2 job
-    let results: Vec<Result<(Vec<Vec<u8>>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>> =
+    // Parallel execution — each rayon thread runs one minimap2 job
+    let results: Vec<Result<(tokio::sync::mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>> =
         rayon_pool.install(|| {
             work_items.par_iter().map(|(idx, chunk_mmi)| -> Result<_, anyhow::Error> {
                 let chunk_name = chunk_mmi.file_name()
@@ -2316,65 +2315,47 @@ async fn minimap2_non_host_align(
 
                 info!("Rayon launching minimap2 for {}: minimap2 {}", chunk_name, args.join(" "));
 
-                // Blocking spawn (std::process::Command)
-                let mut child = StdCommand::new("minimap2")
-                    .args(&args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .context("Failed to spawn minimap2")?;
+                // Create per-thread Tokio runtime to allow .await inside sync rayon worker
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("Failed to create per-thread tokio runtime")?;
 
-                let stdout = child.stdout.take().ok_or_else(|| anyhow!("No stdout"))?;
-                let stderr = child.stderr.take().ok_or_else(|| anyhow!("No stderr"))?;
+                // Run async spawn_cmd and parse inside the runtime
+                let (mut child, stderr_task) = rt.block_on(spawn_cmd(
+                    config.clone(),
+                    MINIMAP2_TAG,
+                    args,
+                    config.args.verbose,
+                ))?;
 
-                // Read PAF lines blocking
-                let mut paf_lines: Vec<Vec<u8>> = Vec::new();
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    let line = line.context("Failed to read PAF line")?;
-                    paf_lines.push(line.into_bytes());
+                if let Some(pid) = child.id() {
+                    info!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
 
-                // Optional: capture peak RSS from stderr
-                let stderr_reader = BufReader::new(stderr);
-                for line in stderr_reader.lines() {
-                    if let Ok(l) = line {
-                        if l.contains("Peak RSS") {
-                            info!("{}: {}", chunk_name, l);
-                        }
-                    }
-                }
+                let paf_receiver = rt.block_on(parse_child_output(
+                    &mut child,
+                    ChildStream::Stdout,
+                    ParseMode::Lines,
+                    config.base_buffer_size,
+                ))?;
 
-                let status = child.wait()?;
-                if !status.success() {
-                    return Err(anyhow!("minimap2 failed for {}: exit {}", chunk_name, status));
-                }
+                info!("Chunk {} finished", chunk_name);
 
-                // Spawn tokio task for cleanup/logging (minimal)
-                let stderr_task = tokio::spawn(async move { Ok(()) });
-
-                Ok((paf_lines, stderr_task))
+                Ok((paf_receiver, stderr_task))
             }).collect()
         });
 
-    // 6. Convert results to tokio streams
+    // 6. Convert results to ReceiverStream
     let mut partial_paf_receivers = Vec::new();
 
     for res in results {
-        let (paf_lines, stderr_task) = res?;
-
-        let (tx, rx) = mpsc::channel(paf_lines.len() + 10);
-        for line_bytes in paf_lines {
-            tx.send(ParseOutput::Bytes(Arc::new(line_bytes))).await
-                .map_err(|e| anyhow!("Failed to send PAF line: {}", e))?;
-        }
-        drop(tx);
-
-        partial_paf_receivers.push(ReceiverStream::new(rx));
+        let (paf_rx, stderr_task) = res?;
+        partial_paf_receivers.push(ReceiverStream::new(paf_rx));
         cleanup_tasks.push(stderr_task);
     }
 
-    // 7. Merge PAF streams (unchanged)
+    // 7. Merge all PAF streams
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
