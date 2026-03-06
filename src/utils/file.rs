@@ -691,7 +691,7 @@ pub async fn choose_temp_dir(
         None
     };
 
-    info!("ran attempt {}    nvme attmept {}", ram_attempt, nvme_path.is_some());
+    info!("ran attempt {}    nvme attmept {}", ram_attempt.is_some(), nvme_path.is_some());
 
     let chosen = if prefer_nvme {
         nvme_attempt.or(ram_attempt)
