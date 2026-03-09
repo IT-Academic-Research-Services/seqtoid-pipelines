@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
 use tokio_stream::wrappers::BroadcastStream;
+use dashmap::DashMap;
+
 use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
@@ -365,11 +367,10 @@ pub async fn generate_taxon_count_json_from_m8(
     db_type: &str,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
     let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
-
 
     // 0: read_id
     // 1: accession
@@ -465,7 +466,7 @@ pub async fn generate_taxon_count_json_from_m8(
         bucket.nonunique_count += 1;
         bucket.unique_count +=  duplicate_clusters
             .get(&m8.qname)
-            .map(|cluster| cluster.size)
+            .map(|entry| entry.value().size)
             .unwrap_or(1u64);
         bucket.base_count += 1;
         bucket.sum_percent_identity += m8.pident;
@@ -473,7 +474,6 @@ pub async fn generate_taxon_count_json_from_m8(
         bucket.sum_e_value += m8.evalue;
         bucket.source_count_type.insert(db_type.to_string());
     }
-
 
     for (taxid, bucket) in buckets {
         let lineage = match lineage_map.get(&taxid) {
@@ -552,7 +552,7 @@ pub async fn compute_merged_taxon_counts(
 
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
 
     merged_m8_path: PathBuf,
     merged_hitsummary_path: PathBuf,

@@ -1896,8 +1896,7 @@ async fn dedup(
 ) -> Result<(
     ReceiverStream<ParseOutput>,  // uniques stream
     oneshot::Receiver<u64>,      // unique count rx
-    ReceiverStream<ParseOutput>,  // cluster stream (for CSV-like)
-    Arc<HashMap<String, ClusterInfo>>,  // duplicate_clusters
+    Arc<DashMap<String, ClusterInfo>>,  // duplicate_clusters
     Vec<JoinHandle<Result<(), anyhow::Error>>>,  // cleanup tasks
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup rx
 ), PipelineError> {
@@ -2005,20 +2004,29 @@ async fn dedup(
 
     info!("Dedup complete: {} valid pairs, {} unique hashes", total_count, dedup_map.len());
 
-    let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
-    for (&_hash, &(size, ref records)) in &dedup_map {
-        if records.is_empty() { continue; }
-        let rep_id = records[0].id().to_string();
-        let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
-        duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
-    }
+    let duplicate_clusters: Arc<DashMap<String, ClusterInfo>> = {
+        let map = DashMap::with_capacity(dedup_map.len());
+
+        for (&_hash, &(size, ref records)) in &dedup_map {
+            if records.is_empty() {
+                continue;
+            }
+            let rep_id = records[0].id().to_string();
+            let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
+
+            map.insert(rep_id, ClusterInfo { size, members });
+        }
+
+        Arc::new(map)
+    };
 
     // Write cluster sizes TSV
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
     let duplicate_clusters_for_tsv = duplicate_clusters.clone();
     let tsv_task = tokio::spawn(async move {
         let mut file = BufWriter::new(TokioFile::create(&tsv_path).await?);
-        for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
+        for entry in duplicate_clusters_for_tsv.iter() {
+            let (rep_id, cluster) = entry.pair();           // ← this is the clean way
             file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes()).await?;
         }
         file.flush().await?;
@@ -2039,23 +2047,6 @@ async fn dedup(
     });
     cleanup_tasks.push(uniques_task);
 
-    // Cluster stream
-    let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
-    let dedup_map_for_cluster = dedup_map.clone();
-    let cluster_task = tokio::spawn(async move {
-        for (&_hash, &(_, ref records)) in &dedup_map_for_cluster {
-            if records.is_empty() { continue; }
-            let rep_id = records[0].id();
-            let rep_line = format!("{},{}\n", rep_id, rep_id);
-            cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await?;
-            for rec in records.iter().skip(1) {
-                let line = format!("{},{}\n", rec.id(), rep_id);
-                cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await?;
-            }
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(cluster_task);
 
     let unique_count = dedup_map.len() as u64;
     let (count_tx, count_rx) = oneshot::channel();
@@ -2064,8 +2055,7 @@ async fn dedup(
     Ok((
         ReceiverStream::new(uniques_rx),
         count_rx,
-        ReceiverStream::new(cluster_rx),
-        Arc::new(duplicate_clusters),
+        duplicate_clusters,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -2978,7 +2968,7 @@ pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
     mut m8_stream: ReceiverStream<ParseOutput>,
     mut summary_stream: ReceiverStream<ParseOutput>,
-    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
     source_count_type: Option<String>,// e.g. "NR" for the other DB
@@ -3053,7 +3043,7 @@ pub async fn generate_taxon_counts(
     for (read_id, (level, _accession, lineage)) in read_summaries {
         let cluster_size = duplicate_clusters
             .get(&read_id)
-            .map(|cluster| cluster.size)
+            .map(|entry| entry.value().size)
             .unwrap_or(1u64);
 
         // Metrics are guaranteed to exist because the m8 line came from the same read
@@ -3273,171 +3263,188 @@ async fn collect_m8_to_accession_map(
 pub async fn generate_annotated_fasta(
     config: Arc<RunConfig>,
     mut dedup_stream: ReceiverStream<ParseOutput>,
-    mut cluster_stream: ReceiverStream<ParseOutput>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     nt_map: HashMap<String, String>,
     nr_map: HashMap<String, String>,
+    concurrency: usize,                     // ← new param from compute_phase_concurrency
 ) -> Result<(
-    mpsc::Receiver<ParseOutput>,               // mapped (annotated) contigs
-    mpsc::Receiver<ParseOutput>,               // unidentified (all, including expanded duplicates)
-    mpsc::Receiver<ParseOutput>,               // unique unidentified (representatives only)
-    Vec<JoinHandle<Result<()>>>,               // cleanup tasks
-    Vec<oneshot::Receiver<Result<()>>>,        // optional receivers
+    mpsc::Receiver<ParseOutput>,               // annotated mapped contigs
+    mpsc::Receiver<ParseOutput>,               // unidentified (expanded)
+    mpsc::Receiver<ParseOutput>,               // unique unidentified (reps only)
+    Vec<tokio::task::JoinHandle<Result<()>>>,
+    Vec<tokio::sync::oneshot::Receiver<Result<()>>>,
 )> {
-    // Channels for the three output streams
-    let (mapped_tx, mapped_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size / 100); // ~10k records
-    let (unidentified_tx, unidentified_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size / 100);
-    let (unique_unidentified_tx, unique_unidentified_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size / 100);
+    // ────────────────────────────────────────────────
+    // Output channels
+    // ────────────────────────────────────────────────
+    let channel_cap = (config.base_buffer_size / 4).max(10_000);
+    let (mapped_tx,   mapped_rx)   = mpsc::channel::<ParseOutput>(channel_cap);
+    let (unid_tx,     unid_rx)     = mpsc::channel::<ParseOutput>(channel_cap);
+    let (uniq_tx,     uniq_rx)     = mpsc::channel::<ParseOutput>(channel_cap);
 
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    let mut cleanup_receivers = vec![done_rx];
+    let cleanup_receivers = vec![done_rx];
 
-    // Buffer of representative sequences: rep_id → (seq_vec, is_unidentified)
-    let mut rep_buffer: HashMap<String, (Vec<u8>, bool)> = HashMap::with_capacity(1_000_000);
-    let mut csv_line = String::with_capacity(256);
+    // ────────────────────────────────────────────────
+    // Batch collection constants
+    // ────────────────────────────────────────────────
+    let batch_size = if concurrency >= 64 {
+        150_000_usize
+    } else if concurrency >= 16 {
+        80_000_usize
+    } else {
+        30_000_usize
+    };
 
-    let mut processed_reps = 0u64;
-    let mut unidentified_reps = 0u64;
-    let mut expanded_duplicates = 0u64;
-    let start = tokio::time::Instant::now();
+    // ────────────────────────────────────────────────
+    // 1. Batching task: read stream → batches
+    // ────────────────────────────────────────────────
+    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<SequenceRecord>>();
 
-    let process_task = tokio::spawn(async move {
+    let batching_handle = tokio::spawn(async move {
+        let mut batch: Vec<SequenceRecord> = Vec::with_capacity(batch_size);
+        let mut total_records = 0u64;
+
         while let Some(item) = dedup_stream.next().await {
             let record = match item {
-                ParseOutput::Fastq(rec) | ParseOutput::Fasta(rec) => rec,
+                ParseOutput::Fastq(r) | ParseOutput::Fasta(r) => r,
                 _ => continue,
             };
 
-            processed_reps += 1;
-            if processed_reps % 100_000 == 0 {
-                log::debug!("generate_annotated_fasta: processed {} reps", processed_reps);
+            total_records += 1;
+            batch.push(record);
+
+            if batch.len() >= batch_size {
+                let _ = batch_tx.send(std::mem::take(&mut batch));
+                batch = Vec::with_capacity(batch_size);
             }
+        }
 
-            let rep_id = record.id().to_string();
-            let seq = record.seq().to_vec(); // Clone once
-            let nr_acc = nr_map.get(&rep_id).cloned().unwrap_or_default();
-            let nt_acc = nt_map.get(&rep_id).cloned().unwrap_or_default();
-            let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch);
+        }
 
-            // Always buffer the representative
-            rep_buffer.insert(rep_id.clone(), (seq.clone(), is_unidentified));
+        info!("Batching complete: {} records collected", total_records);
+        Ok(())
+    });
 
-            // -----------------------------------------------------------------
-            // Write representative to appropriate stream(s)
-            // -----------------------------------------------------------------
-            if !is_unidentified {
-                // Annotated contig
-                let header = format!(">NR:{}:NT:{}:{}\n", nr_acc, nt_acc, rep_id);
-                let fasta = SequenceRecord::Fasta {
-                    id: format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id),
-                    desc: None,
-                    seq: Arc::new(seq),
-                };
-                mapped_tx
-                    .send(ParseOutput::Fasta(fasta))
-                    .await
-                    .map_err(|_| anyhow!("mapped_tx dropped"))?;
-            } else {
-                // Unidentified representative → both unidentified streams
-                unidentified_reps += 1;
-                let header = format!("{}{}\n", UNMAPPED_HEADER_PREFIX, rep_id);
-                let fasta = SequenceRecord::Fasta {
-                    id: rep_id.clone(),
-                    desc: None,
-                    seq: Arc::new(seq.clone()),
-                };
+    // ────────────────────────────────────────────────
+    // 2. Drain all batches into memory (Vec<Vec<...>>)
+    //    This is safe because batching is bounded by memory pressure
+    // ────────────────────────────────────────────────
+    let mut all_batches: Vec<Vec<SequenceRecord>> = Vec::new();
+    while let Some(batch) = batch_rx.recv().await {
+        all_batches.push(batch);
+    }
 
-                // To full unidentified (all members)
-                unidentified_tx
-                    .send(ParseOutput::Fasta(fasta.clone()))
-                    .await
-                    .map_err(|_| anyhow!("unidentified_tx dropped"))?;
+    info!("Collected {} batches for parallel processing", all_batches.len());
 
-                // To unique unidentified (only reps)
-                unique_unidentified_tx
-                    .send(ParseOutput::Fasta(fasta))
-                    .await
-                    .map_err(|_| anyhow!("unique_unidentified_tx dropped"))?;
-            }
+    // ────────────────────────────────────────────────
+    // 3. Rayon parallel processing — custom pool sized to concurrency
+    // ────────────────────────────────────────────────
+    let rayon_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .thread_name(|i| format!("annot-worker-{}", i))
+        .build()
+        .map_err(|e| anyhow!("Failed to create Rayon pool: {}", e))?;
 
-            // -----------------------------------------------------------------
-            // Expand duplicates for unidentified clusters
-            // -----------------------------------------------------------------
-            loop {
-                let csv_opt = cluster_stream.next().await;
-                let csv_item = match csv_opt {
-                    Some(item) => item,
-                    None => break,
-                };
+    let processed_batches = rayon_pool.install(|| {
+        all_batches.par_iter().map(|batch| {
+            let mut mapped = Vec::with_capacity(batch.len() / 5);
+            let mut unid   = Vec::with_capacity(batch.len());
+            let mut uniq   = Vec::with_capacity(batch.len() / 10);
 
-                if let ParseOutput::Bytes(bytes) = csv_item {
-                    csv_line.clear();
-                    csv_line.push_str(&String::from_utf8_lossy(&bytes));
+            let mut local_unid_reps = 0u64;
+            let mut local_expanded  = 0u64;
 
-                    if !csv_line.ends_with('\n') {
-                        continue; // partial line
-                    }
+            for record in batch {
+                let rep_id = record.id().to_string();
 
-                    let line = std::mem::take(&mut csv_line);
-                    let parts: Vec<&str> = line.trim().split(',').collect();
-                    if parts.len() != 2 {
-                        continue;
-                    }
+                let nr_acc = nr_map.get(&rep_id).cloned().unwrap_or_default();
+                let nt_acc = nt_map.get(&rep_id).cloned().unwrap_or_default();
+                let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
 
-                    let member_id = parts[0];
-                    let csv_rep_id = parts[1];
+                let dup_count = duplicate_clusters
+                    .get(&rep_id)
+                    .map(|r| r.size)
+                    .unwrap_or(1u64);
 
-                    if csv_rep_id == rep_id && is_unidentified {
-                        if let Some((seq, _)) = rep_buffer.get(&rep_id) {
-                            // Preserve /1 /2 suffix if present
-                            let (base, suffix) = if member_id.ends_with("/1") || member_id.ends_with("/2") {
-                                let len = member_id.len();
-                                (&member_id[..len - 2], &member_id[len - 2..])
-                            } else {
-                                (member_id, "")
-                            };
-                            let header = format!("{}{}{}\n", UNMAPPED_HEADER_PREFIX, base, suffix);
-                            let fasta = SequenceRecord::Fasta {
-                                id: format!("{}{}", base, suffix),
-                                desc: None,
-                                seq: Arc::new(seq.clone()),
-                            };
+                let seq_arc = record.seq_arc();
 
-                            unidentified_tx
-                                .send(ParseOutput::Fasta(fasta))
-                                .await
-                                .map_err(|_| anyhow!("unidentified_tx dropped (duplicate)"))?;
+                if !is_unidentified {
+                    let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
+                    mapped.push(ParseOutput::Fasta(SequenceRecord::Fasta {
+                        id,
+                        desc: None,
+                        seq: seq_arc,
+                    }));
+                } else {
+                    local_unid_reps += 1;
 
-                            expanded_duplicates += 1;
+                    let fasta_rep = SequenceRecord::Fasta {
+                        id: rep_id.clone(),
+                        desc: None,
+                        seq: seq_arc.clone(),
+                    };
+
+                    unid.push(ParseOutput::Fasta(fasta_rep.clone()));
+                    uniq.push(ParseOutput::Fasta(fasta_rep.clone()));
+
+                    if dup_count > 1 {
+                        local_expanded += dup_count - 1;
+                        for _ in 1..dup_count {
+                            unid.push(ParseOutput::Fasta(fasta_rep.clone()));
                         }
                     }
                 }
             }
+
+            (mapped, unid, uniq, local_unid_reps, local_expanded)
+        }).collect::<Vec<_>>()
+    });
+
+    // ────────────────────────────────────────────────
+    // 4. Merge task — sequential send to output channels
+    // ────────────────────────────────────────────────
+    let merge_handle = tokio::spawn(async move {
+        let mut total_processed = 0u64;
+        let mut total_unid_reps = 0u64;
+        let mut total_expanded = 0u64;
+
+        for (mapped_b, unid_b, uniq_b, unid_inc, exp_inc) in processed_batches {
+            for item in mapped_b {
+                mapped_tx.send(item).await.map_err(|_| anyhow!("mapped_tx closed"))?;
+            }
+            for item in unid_b {
+                unid_tx.send(item).await.map_err(|_| anyhow!("unid_tx closed"))?;
+            }
+            for item in uniq_b {
+                uniq_tx.send(item).await.map_err(|_| anyhow!("uniq_tx closed"))?;
+            }
+
+            total_processed += batch_size as u64; // approximate
+            total_unid_reps += unid_inc;
+            total_expanded += exp_inc;
         }
 
-        // Close all senders
         drop(mapped_tx);
-        drop(unidentified_tx);
-        drop(unique_unidentified_tx);
+        drop(unid_tx);
+        drop(uniq_tx);
 
-        log::info!(
-            "generate_annotated_fasta: {} reps, {} unidentified ({} expanded duplicates) in {:?}",
-            processed_reps,
-            unidentified_reps,
-            expanded_duplicates,
-            start.elapsed()
+        info!(
+            "generate_annotated_fasta merged: ~{} records | {} unid reps | {} expanded | done",
+            total_processed, total_unid_reps, total_expanded
         );
 
         let _ = done_tx.send(Ok(()));
         Ok(())
     });
 
-    let mut cleanup_tasks = vec![process_task];
-
     Ok((
         mapped_rx,
-        unidentified_rx,
-        unique_unidentified_rx,
-        cleanup_tasks,
+        unid_rx,
+        uniq_rx,
+        vec![batching_handle, merge_handle],
         cleanup_receivers,
     ))
 }
@@ -3446,9 +3453,10 @@ async fn generate_annotated_fasta_from_files(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
-    cluster_stream: ReceiverStream<ParseOutput>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed
     nt_map: HashMap<String, String>,
     nr_map: HashMap<String, String>,
+    concurrency: usize,
 ) -> Result<(
     mpsc::Receiver<ParseOutput>,
     mpsc::Receiver<ParseOutput>,
@@ -3456,41 +3464,35 @@ async fn generate_annotated_fasta_from_files(
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 )> {
-    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_tasks = vec![];
 
-    // Parse R1 to raw receiver
-    let r1_file = TokioFile::open(&r1_path).await
-        .map_err(|e| anyhow!("Failed to open R1 {}: {}", r1_path.display(), e))?;
-    let r1_receiver = parse_fastq(r1_file, config.base_buffer_size).await?;
+    // Open and parse R1
+    let r1_file = TokioFile::open(&r1_path).await?;
+    let r1_stream = parse_fastq(r1_file, config.base_buffer_size).await?;
 
-    let interleaved_receiver = if let Some(r2_path) = r2_path_opt {
-        let r2_file = TokioFile::open(&r2_path).await
-            .map_err(|e| anyhow!("Failed to open R2 {}: {}", r2_path.display(), e))?;
-        let r2_receiver = parse_fastq(r2_file, config.base_buffer_size).await?;
+    let interleaved_stream = if let Some(r2_path) = r2_path_opt {
+        let r2_file = TokioFile::open(&r2_path).await?;
+        let r2_stream = parse_fastq(r2_file, config.base_buffer_size).await?;
 
-        // Interleave raw receivers
         let (inter_rx, inter_task) = interleave_fastq_streams(
-            r1_receiver,
-            r2_receiver,
+            r1_stream,
+            r2_stream,
             config.base_buffer_size,
         ).await?;
 
         cleanup_tasks.push(inter_task);
-        inter_rx  // raw receiver
+        ReceiverStream::new(inter_rx)
     } else {
-        r1_receiver  // single-end
+        ReceiverStream::new(r1_stream)
     };
 
-    // Wrap the final receiver in ReceiverStream for generate_annotated_fasta
-    let interleaved_stream = ReceiverStream::new(interleaved_receiver);
-
-    // Call existing stream-based function
     generate_annotated_fasta(
         config,
         interleaved_stream,
-        cluster_stream,
+        duplicate_clusters,          // ← pass DashMap instead of cluster_stream
         nt_map,
         nr_map,
+        concurrency
     ).await
 }
 
@@ -3620,7 +3622,7 @@ pub async fn process_assembly(
     work_dir: &PathBuf,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
-    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed to DashMap
     paired: bool,
     assembly_headroom: u64,
 ) -> Result<(
@@ -3747,7 +3749,7 @@ pub async fn process_assembly(
 
     let index_dir = out_dir.join("bowtie_index");
     fs::create_dir_all(&index_dir).await?;
-    let index_prefix = index_dir.join("contigs");  //  will create contigs.1.bt2, contigs.2.bt2, ...
+    let index_prefix = index_dir.join("contigs");  // will create contigs.1.bt2, etc.
 
     let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
 
@@ -4616,14 +4618,14 @@ pub async fn generate_contig_summary_json(
     contig2lineage: AHashMap<String, [i32; 3]>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     db_type: &str,
-    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed to DashMap
     min_contig_size: u64,
     mut output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
     let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
     let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
 
-    //lock once
+    // lock once
     {
         let dict = read_dict.lock().unwrap();
 
@@ -4648,7 +4650,7 @@ pub async fn generate_contig_summary_json(
 
             let cluster_size = duplicate_clusters
                 .get(read_id.as_str())
-                .map(|cluster| cluster.size)
+                .map(|entry| entry.value().size)
                 .unwrap_or(1u64);
 
             // Species-level aggregation
@@ -4785,7 +4787,7 @@ pub async fn blast_contigs(
     assembled_contig_fasta: &PathBuf,
     read2contig: Arc<HashMap<String, String>>,
     reference_fasta: &PathBuf,
-    duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed to DashMap
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     blast_headroom: u64,
@@ -5053,7 +5055,7 @@ pub async fn blast_contigs(
     });
     cleanup_tasks.push(hit_forward_handle);
 
-    // Internal taxon count aggregation
+    // Internal taxon count aggregation — the only place where duplicate_clusters is used directly
     let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
     let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
         ReceiverStream::new(refined_m8_for_counts_rx),
@@ -5061,7 +5063,7 @@ pub async fn blast_contigs(
         db_type,
         lineage_map.clone(),
         should_keep_filter.clone(),
-        duplicate_clusters.clone(),
+        duplicate_clusters.clone(),   // ← Arc<DashMap> clone is cheap
         refined_counts_tx,
     ));
 
@@ -5088,7 +5090,7 @@ pub async fn blast_contigs(
         contig2lineage,
         read_dict.clone(),
         db_type,
-        duplicate_clusters.clone(),
+        duplicate_clusters.clone(),   // ← Arc<DashMap> clone is cheap
         4,
         contig_summary_tx,
     ));
@@ -5533,7 +5535,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(parse_task);
 
-    let (dedup_stream, dedup_count_rx, cluster_stream, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
+    let (dedup_stream, dedup_count_rx, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
         pre_dedup_parsed_stream,
         paired,
@@ -5893,14 +5895,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
     cleanup_tasks.push(write_json_task);
 
+    let annot_concurrency = compute_phase_concurrency(
+        &config,
+        "generate_annotated_fasta",
+        0.4,   // ~400 MB/thread — mostly transient
+        4.0,
+        128,
+        8,
+    );
 
     let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) = generate_annotated_fasta_from_files(
         config.clone(),
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
-        cluster_stream,
+        duplicate_clusters.clone(),
         nt_map,
         nr_map,
+        annot_concurrency
     ).await
         .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
 
@@ -6368,6 +6379,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
 
 
+    let nr_annot_concurrency = compute_phase_concurrency(
+        &config,
+        "nr_annot_concurrency",
+        0.4,
+        4.0,
+        128,
+        8,
+    );
+
     let (
         mapped_contigs_rx,
         unidentified_contigs_rx,
@@ -6377,9 +6397,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ) = generate_annotated_fasta(
         config.clone(),
         contigs_stream,
-        contigs_cluster_stream,
+        duplicate_clusters.clone(),
         nt_refined_map.into_iter().collect(),
         nr_refined_map.into_iter().collect(),
+        nr_annot_concurrency,
     ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
     cleanup_tasks.append(&mut annot_tasks);

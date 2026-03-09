@@ -16,6 +16,7 @@ use noodles::bam::record::Record as BamRecord;
 use noodles::sam::Header;
 use noodles::bam;
 use tokio::fs::File;
+use dashmap::DashMap;
 
 
 use crate::utils::streams::ParseOutput;
@@ -67,7 +68,7 @@ fn anyhow_to_io(e: anyhow::Error) -> io::Error {
 
 pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
-    duplicate_clusters: &Arc<HashMap<String, ClusterInfo>>,
+    duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
     min_contig_size: usize,
     thread_pool: &Arc<rayon::ThreadPool>,
 ) -> Result<(
@@ -113,7 +114,7 @@ pub async fn generate_info_from_bam_stream(
             let mut local_contig_unique_counts = HashMap::new();
             let mut local_seen = HashSet::new();
 
-            for record in chunk.iter() {  // ← .iter() gives &BamRecord
+            for record in chunk.iter() {
                 let flags = record.flags();
                 if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
                     continue;
@@ -143,7 +144,7 @@ pub async fn generate_info_from_bam_stream(
 
                 let cluster_size = duplicate_clusters
                     .get(&read_name)
-                    .map(|cluster| cluster.size)
+                    .map(|entry| entry.value().size)
                     .unwrap_or(1u64);
 
                 *local_contig_stats.entry(contig_name.clone()).or_insert(0) += cluster_size;
