@@ -5713,6 +5713,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         64,            // higher cap for CPU-bound phase
         16,            // min for meaningful parallelism
     );
+    info!("call hits nt concurrency {}", nt_concurrency);
 
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
         config.clone(),
@@ -5809,6 +5810,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         64,            // higher cap for CPU-bound phase
         16,            // min for meaningful parallelism
     );
+
+    info!("call hits nr concurrency {}", nr_concurrency);
 
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
