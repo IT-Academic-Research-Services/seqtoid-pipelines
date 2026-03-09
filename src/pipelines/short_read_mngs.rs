@@ -114,6 +114,10 @@ const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
 const MM2_TARGET_THREADS_PER : usize = 8;
 
+const EST_GB_PER_MM2_JOB_STD: f64 = 80.0;   // conservative for 1 TB, gives ~6 jobs
+const EST_GB_PER_MM2_JOB_EXTRA: f64 = 100.0;  // for 1.5 TB, gives ~10–12 jobs
+const MM2_JOB_RAM_THRESHOLD: usize = 1400;
+
 
 static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r",(?=[^\s])").unwrap()
@@ -2240,40 +2244,27 @@ async fn minimap2_non_host_align(
     info!("Largest NT chunk: {} GiB → estimating {:.0} GiB RAM per minimap2 job", largest_gb, est_gb_per_job);
 
     // 4. Compute concurrency & threads-per-job (unchanged)
-    const SAFE_RAM_USAGE_PCT: f64 = 0.82;
     const MIN_THREADS_PER_JOB: usize = 4;
     const MAX_THREADS_PER_JOB: usize = 12;
-    const MAX_CONCURRENCY_CAP: usize = 20;
 
-    let total_threads = config.max_cores;
-    let (total_bytes, avail_bytes) = detect_ram()
-        .map_err(|e| PipelineError::Other(anyhow!("RAM detection failed: {}", e)))?;
 
-    let total_gib = total_bytes / (1024 * 1024 * 1024);
-    let avail_gib = avail_bytes / (1024 * 1024 * 1024);
+    let concurrency = compute_phase_concurrency(
+        &config,
+        "minimap2_nt",
+        est_gb_per_job as f64,
+        6.0,
+        20,
+        4,
+    );
 
-    let target_ram_gib = (avail_gib as f64 * SAFE_RAM_USAGE_PCT) as u64;
-    let max_jobs_from_ram = target_ram_gib / est_gb_per_job;
-
-    let max_jobs_from_cpu = (total_threads / 6).max(1);
-
-    let mut concurrency = max_jobs_from_ram
-        .min(max_jobs_from_cpu as u64)
-        .min(MAX_CONCURRENCY_CAP as u64)
-        .max(1) as usize;
-
-    if total_gib < 128 { concurrency = concurrency.min(2); }
-    if total_gib < 64  { concurrency = 1; }
-
-    concurrency = concurrency.min(6);  // your safe cap
-
-    let threads_per_job = (total_threads / concurrency)
+    let threads_per_job = (config.max_cores / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
-        "NT minimap2 stage (rayon): {} GiB total / {} GiB avail → {} concurrent jobs × {} threads (est peak ~{} GiB)",
-        total_gib, avail_gib, concurrency, threads_per_job, concurrency as u64 * est_gb_per_job
-    );
+    "NT minimap2 stage: using {} concurrent jobs × {} threads (est peak ~{} GiB)",
+    concurrency, threads_per_job, concurrency as u64 * est_gb_per_job as u64
+);
+
 
     // ────────────────────────────────────────────────────────────────
     // 5. Rayon thread pool — enforces exact concurrency
@@ -5718,7 +5709,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         "call_hits_nt",
         1.0,           // ~1 GB per thread max (mostly transient)
-        3.5,           // more aggressive: ~3.5 threads per core
+        3.5,
         64,            // higher cap for CPU-bound phase
         16,            // min for meaningful parallelism
     );
@@ -5814,7 +5805,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         "call_hits_nr",
         1.0,           // ~1 GB per thread max (mostly transient)
-        3.5,           // more aggressive: ~3.5 threads per core
+        3.5,
         64,            // higher cap for CPU-bound phase
         16,            // min for meaningful parallelism
     );
