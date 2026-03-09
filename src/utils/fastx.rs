@@ -90,6 +90,20 @@ impl SequenceRecord {
         }
     }
 
+    pub fn seq_arc(&self) -> Arc<Vec<u8>> {
+        match self {
+            SequenceRecord::Fasta { seq, .. } => seq.clone(),
+            SequenceRecord::Fastq { seq, .. } => seq.clone(),
+        }
+    }
+
+    pub fn seq_owned(&self) -> Vec<u8> {
+        match self {
+            SequenceRecord::Fasta { seq, .. } => (**seq).clone(),
+            SequenceRecord::Fastq { seq, .. } => (**seq).clone(),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn qual(&self) -> &[u8] {
         match self {
