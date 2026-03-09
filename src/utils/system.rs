@@ -500,3 +500,52 @@ fn detect_lspci_basic() -> Result<GpuDetection> {
         gpus,
     })
 }
+
+/// Computes a safe concurrency level for a pipeline phase.
+///
+/// # Parameters
+/// - `config`: RunConfig with max_cores and RAM info
+/// - `phase_name`: For logging (e.g. "minimap2_nt", "call_hits_nr")
+/// - `ram_per_thread_gb`: Estimated GB per thread (mm2 ~65, call_hits ~0.5–1)
+/// - `cpu_divisor`: How many threads per core (mm2: 6, call_hits: 3–4)
+/// - `max_cap`: Hard upper limit (phase-specific)
+/// - `min_threads`: Minimum even if RAM/CPU say lower
+pub fn compute_phase_concurrency(
+    config: &RunConfig,
+    phase_name: &str,
+    ram_per_thread_gb: f64,
+    cpu_divisor: f64,
+    max_cap: usize,
+    min_threads: usize,
+) -> usize {
+    let total_threads = config.max_cores as f64;
+    let (total_bytes, avail_bytes) = detect_ram().unwrap_or((0, 0)); // fallback to 0 if fails
+
+    let total_gib = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let avail_gib = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    let target_ram_gib = avail_gib * 0.80; // 80% safe usage
+    let max_jobs_from_ram = (target_ram_gib / ram_per_thread_gb).floor() as usize;
+
+    let max_jobs_from_cpu = (total_threads / cpu_divisor).max(1.0) as usize;
+
+    let mut concurrency = max_jobs_from_ram
+        .min(max_jobs_from_cpu)
+        .min(max_cap)
+        .max(min_threads);
+
+    // Small machine overrides
+    if total_gib < 128.0 {
+        concurrency = concurrency.min(4);
+    }
+    if total_gib < 64.0 {
+        concurrency = concurrency.min(2);
+    }
+
+    info!(
+        "{} concurrency: {} jobs (RAM limit: {}, CPU limit: {}, cap: {}, min: {})",
+        phase_name, concurrency, max_jobs_from_ram, max_jobs_from_cpu, max_cap, min_threads
+    );
+
+    concurrency
+}
