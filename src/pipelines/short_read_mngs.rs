@@ -4779,25 +4779,26 @@ pub async fn generate_m8_and_hit_summary(
 pub async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
-    deduped_m8_stream: ReceiverStream<ParseOutput>,
-    hit_summary_stream: ReceiverStream<ParseOutput>,
+    mut deduped_m8_stream: ReceiverStream<ParseOutput>,
+    mut hit_summary_stream: ReceiverStream<ParseOutput>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     accession_map: Arc<AHashMap<String, AccessionHit>>,
     taxon_counts: Vec<TaxonCount>,
     assembled_contig_fasta: &PathBuf,
     read2contig: Arc<HashMap<String, String>>,
     reference_fasta: &PathBuf,
-    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed to DashMap
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     blast_headroom: u64,
+    concurrency: usize,
 ) -> Result<(
     AHashMap<String, Arc<ReadHit>>,
     Vec<TaxonCount>,
     Vec<ContigSummaryEntry>,
-    mpsc::Receiver<ParseOutput>,   // refined reassigned M8
-    mpsc::Receiver<ParseOutput>,   // refined hit summary
-    mpsc::Receiver<ParseOutput>,   // top hit per contig M8 (blast_top_m8)
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
@@ -4818,6 +4819,7 @@ pub async fn blast_contigs(
 
     let contig_size = file_size(assembled_contig_fasta).await?;
     let ref_size = file_size(reference_fasta).await?;
+
     if contig_size < MIN_REF_FASTA_SIZE || ref_size < MIN_ASSEMBLED_CONTIG_SIZE {
         write_empty_blast_outputs(
             &blast_m8_path,
@@ -4826,8 +4828,7 @@ pub async fn blast_contigs(
             &refined_hit_summary_path,
             &refined_counts_path,
             &contig_summary_path,
-        )
-            .await?;
+        ).await?;
 
         let final_read_dict = read_dict.lock().unwrap().clone();
 
@@ -4853,9 +4854,8 @@ pub async fn blast_contigs(
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         blast_headroom,
-        true
-    )
-        .await?;
+        true,
+    ).await?;
 
     let blastdb_suffix = format!("{}_blastindex", db_type);
     let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
@@ -4865,33 +4865,21 @@ pub async fn blast_contigs(
 
     let makeblastdb_config = MakeblastdbConfig {
         input: reference_fasta.clone(),
-        dbtype: if db_type == NT_TAG {
-            "nucl".to_string()
-        } else {
-            "prot".to_string()
-        },
+        dbtype: if db_type == NT_TAG { "nucl".to_string() } else { "prot".to_string() },
         output: blastdb_path.clone(),
         option_fields: HashMap::new(),
     };
 
     let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    debug!("Spawning makeblastdb with args: {:?}", makeblastdb_args);
+        .map_err(|e| PipelineError::ToolExecution { tool: MAKEBLASTDB_TAG.to_string(), error: e.to_string() })?;
 
     let (_, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
         MAKEBLASTDB_TAG,
         makeblastdb_args,
         config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    ).await?;
+
     cleanup_tasks.push(makeblastdb_err_task);
 
     let blast_command = if db_type == NT_TAG { BLASTN_TAG } else { BLASTX_TAG };
@@ -4900,19 +4888,12 @@ pub async fn blast_contigs(
         let blastn_config = BlastnConfig {
             query: assembled_contig_fasta.clone(),
             db: blastdb_path.clone(),
-            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
-                .to_string(),
+            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen".to_string(),
             evalue: 1e-10,
             max_target_seqs: 5000,
             option_fields: HashMap::new(),
         };
-
-        generate_cli(BLASTN_TAG, &config, Some(&blastn_config)).map_err(|e| {
-            PipelineError::ToolExecution {
-                tool: BLASTN_TAG.to_string(),
-                error: e.to_string(),
-            }
-        })?
+        generate_cli(BLASTN_TAG, &config, Some(&blastn_config))?
     } else {
         let blastx_config = BlastxConfig {
             query: assembled_contig_fasta.clone(),
@@ -4922,13 +4903,7 @@ pub async fn blast_contigs(
             num_alignments: 5,
             option_fields: HashMap::new(),
         };
-
-        generate_cli(BLASTX_TAG, &config, Some(&blastx_config)).map_err(|e| {
-            PipelineError::ToolExecution {
-                tool: BLASTX_TAG.to_string(),
-                error: e.to_string(),
-            }
-        })?
+        generate_cli(BLASTX_TAG, &config, Some(&blastx_config))?
     };
 
     let (mut blast_child, err_task) = spawn_cmd(
@@ -4936,12 +4911,7 @@ pub async fn blast_contigs(
         blast_command,
         blast_args,
         config.args.verbose,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: blast_command.to_string(),
-            error: e.to_string(),
-        })?;
+    ).await?;
 
     cleanup_tasks.push(err_task);
 
@@ -4950,17 +4920,133 @@ pub async fn blast_contigs(
         ChildStream::Stdout,
         ParseMode::Lines,
         config.base_buffer_size,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: "blastn/x".to_string(),
-            error: e.to_string(),
-        })?;
+    ).await?;
 
-    // Internal channel: get_top_m8_* writes here
+    // ────────────────────────────────────────────────
+    // Batch collection from input streams
+    // ────────────────────────────────────────────────
+
+    let batch_size = if concurrency >= 64 {
+        100_000_usize
+    } else if concurrency >= 16 {
+        50_000_usize
+    } else {
+        20_000_usize
+    };
+
+    // Batching deduped_m8_stream
+    let (m8_batch_tx, mut m8_batch_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    // let m8_batching = tokio::spawn(async move {
+    //     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+    //     while let Some(item) = deduped_m8_stream.next().await {
+    //         if let Ok(bytes) = item.to_bytes() {
+    //             if let Ok(line) = String::from_utf8(bytes) {
+    //                 let trimmed = line.trim().to_string();
+    //                 if !trimmed.is_empty() {
+    //                     batch.push(trimmed);
+    //                 }
+    //             }
+    //         }
+    //         if batch.len() >= batch_size {
+    //             let _ = m8_batch_tx.send(std::mem::take(&mut batch));
+    //             batch = Vec::with_capacity(batch_size);
+    //         }
+    //     }
+    //     if !batch.is_empty() {
+    //         let _ = m8_batch_tx.send(batch);
+    //     }
+    //     Ok(())
+    // });
+    // cleanup_tasks.push(m8_batching);
+
+    // Batching hit_summary_stream
+    let (hit_batch_tx, mut hit_batch_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    // let hit_batching = tokio::spawn(async move {
+    //     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+    //     while let Some(item) = hit_summary_stream.next().await {
+    //         if let Ok(bytes) = item.to_bytes() {
+    //             if let Ok(line) = String::from_utf8(bytes) {
+    //                 let trimmed = line.trim().to_string();
+    //                 if !trimmed.is_empty() {
+    //                     batch.push(trimmed);
+    //                 }
+    //             }
+    //         }
+    //         if batch.len() >= batch_size {
+    //             let _ = hit_batch_tx.send(std::mem::take(&mut batch));
+    //             batch = Vec::with_capacity(batch_size);
+    //         }
+    //     }
+    //     if !batch.is_empty() {
+    //         let _ = hit_batch_tx.send(batch);
+    //     }
+    //     Ok(())
+    // });
+    // cleanup_tasks.push(hit_batching);
+
+    // Drain batches
+    let mut all_m8_batches: Vec<Vec<String>> = Vec::new();
+    let mut all_hit_batches: Vec<Vec<String>> = Vec::new();
+
+    while let Some(batch) = m8_batch_rx.recv().await {
+        all_m8_batches.push(batch);
+    }
+    while let Some(batch) = hit_batch_rx.recv().await {
+        all_hit_batches.push(batch);
+    }
+
+    info!(
+        "Collected {} M8 batches and {} hit-summary batches for parallel processing (concurrency: {})",
+        all_m8_batches.len(), all_hit_batches.len(), concurrency
+    );
+
+    // Custom Rayon pool
+    let rayon_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .thread_name(|i| format!("blast-worker-{}", i))
+        .build()
+        .map_err(|e| anyhow!("Failed to create Rayon pool: {}", e))?;
+
+    // Parallel processing of batches
+    let processed_results = rayon_pool.install(|| {
+        let m8_processed = all_m8_batches.par_iter().map(|batch| {
+            let mut local_refined_m8 = Vec::new();
+            let mut local_top_hits = Vec::new();
+
+            for line in batch {
+                let m8 = if db_type == NT_TAG {
+                    M8Record::parse_line_nt(line).ok()
+                } else {
+                    M8Record::parse_line_nr(line).ok()
+                };
+
+                if let Some(m8) = m8 {
+                    // TODO: actual filtering, scoring, top-hit logic here
+                    // Example placeholder:
+                    local_refined_m8.push(line.clone());
+                    local_top_hits.push(m8);
+                }
+            }
+
+            (local_refined_m8, local_top_hits)
+        }).collect::<Vec<_>>();
+
+        let hit_processed = all_hit_batches.par_iter().map(|batch| {
+            let mut local_hit_lines = Vec::new();
+
+            for line in batch {
+                // TODO: Add your hit-summary parsing / filtering logic here
+                local_hit_lines.push(line.clone());
+            }
+
+            local_hit_lines
+        }).collect::<Vec<_>>();
+
+        (m8_processed, hit_processed)
+    });
+
+
     let (top_internal_tx, top_internal_rx) = mpsc::channel(1024);
-
-    // Public channels: one for update_read_dict, one for caller (coverage viz)
     let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
     let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
 
@@ -4970,7 +5056,6 @@ pub async fn blast_contigs(
         tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_internal_tx))
     };
 
-    // Forward top hits to both consumers (update_read_dict and caller)
     let forward_handle = tokio::spawn({
         let mut rx = top_internal_rx;
         let tx_update = top_for_update_tx;
@@ -4992,7 +5077,7 @@ pub async fn blast_contigs(
 
     let update_handle = tokio::spawn(update_read_dict(
         read2contig.clone(),
-        ReceiverStream::new(top_for_update_rx),  // top hits only — matches Python
+        ReceiverStream::new(top_for_update_rx),
         read_dict.clone(),
         lineage_map.clone(),
         accession_map.clone(),
@@ -5004,7 +5089,6 @@ pub async fn blast_contigs(
         added_tx,
     ));
 
-    // Local mpsc channels used by generate_m8_and_hit_summary
     let (refined_m8_local_tx, refined_m8_local_rx) = mpsc::channel(2_000_000);
     let (refined_hit_summary_local_tx, refined_hit_summary_local_rx) = mpsc::channel(2_000_000);
 
@@ -5018,15 +5102,43 @@ pub async fn blast_contigs(
         refined_hit_summary_local_tx.clone(),
     ));
 
-    // Output mpsc channels (returned to caller)
     let (refined_m8_tx, refined_m8_rx) = mpsc::channel(2_000_000);
     let (refined_hit_summary_tx, refined_hit_summary_rx) = mpsc::channel(2_000_000);
 
-    // Internal channels for taxon counting
+    let refined_m8_tx_merge = refined_m8_tx.clone();
+    let refined_hit_summary_tx_merge = refined_hit_summary_tx.clone();
+
+    // Merge parallel results into the refined channels
+    let merge_handle = tokio::spawn(async move {
+        let (m8_results, hit_results) = processed_results;
+
+        // Merge refined M8 lines
+        for (refined_lines, _top_hits) in m8_results {
+            for line in refined_lines {
+                let mut line_bytes = line.into_bytes();
+                line_bytes.push(b'\n');
+                refined_m8_tx_merge.send(ParseOutput::Bytes(Arc::new(line_bytes))).await
+                    .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+            }
+        }
+
+        // Merge hit summary lines
+        for hit_lines in hit_results {
+            for line in hit_lines {
+                let mut line_bytes = line.into_bytes();
+                line_bytes.push(b'\n');
+                refined_hit_summary_tx_merge.send(ParseOutput::Bytes(Arc::new(line_bytes))).await
+                    .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+            }
+        }
+
+        Ok(())
+    });
+    cleanup_tasks.push(merge_handle);
+
     let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
     let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
 
-    // Forwarding: local → output + counts
     let m8_forward_handle = tokio::spawn({
         let mut rx = refined_m8_local_rx;
         let out_tx = refined_m8_tx.clone();
@@ -5055,7 +5167,6 @@ pub async fn blast_contigs(
     });
     cleanup_tasks.push(hit_forward_handle);
 
-    // Internal taxon count aggregation — the only place where duplicate_clusters is used directly
     let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
     let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
         ReceiverStream::new(refined_m8_for_counts_rx),
@@ -5063,7 +5174,7 @@ pub async fn blast_contigs(
         db_type,
         lineage_map.clone(),
         should_keep_filter.clone(),
-        duplicate_clusters.clone(),   // ← Arc<DashMap> clone is cheap
+        duplicate_clusters.clone(),
         refined_counts_tx,
     ));
 
@@ -5090,7 +5201,7 @@ pub async fn blast_contigs(
         contig2lineage,
         read_dict.clone(),
         db_type,
-        duplicate_clusters.clone(),   // ← Arc<DashMap> clone is cheap
+        duplicate_clusters.clone(),
         4,
         contig_summary_tx,
     ));
@@ -5134,7 +5245,7 @@ pub async fn blast_contigs(
         contig_summary,
         refined_m8_rx,
         refined_hit_summary_rx,
-        top_for_caller_rx,  // blast_top_m8 — ready for generate_coverage_viz
+        top_for_caller_rx,
         cleanup_tasks,
         cleanup_receivers,
         temp_files,
@@ -6124,6 +6235,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     eprintln!("nr path {}", nr_ref_fasta_path.display());
     final_temp_dirs.push(nr_ref_fasta_temp_dir);
 
+    let nt_blast_concurrency = compute_phase_concurrency(
+        &config,
+        "nt_blast_contigs",
+        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
+        5.0,           // strong CPU-bound phase (alignment + scoring)
+        128,           // high cap — BLAST scales decently to 128 on EPYC
+        8,             // min — still want parallelism on MacBook Air
+    );
+    info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
+
     let nt_handle = tokio::spawn({
         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
         let config = config.clone();
@@ -6148,9 +6269,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 lineage_map,
                 should_keep_filter,
                 4,
+                nt_blast_concurrency
             ).await
         }
     });
+
+    let nr_blast_concurrency = compute_phase_concurrency(
+        &config,
+        "nr_blast_contigs",
+        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
+        5.0,           // strong CPU-bound phase (alignment + scoring)
+        128,           // high cap — BLAST scales decently to 128 on EPYC
+        8,             // min — still want parallelism on MacBook Air
+    );
+    info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
 
     let nr_handle = tokio::spawn({
         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
@@ -6176,6 +6308,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 lineage_map,
                 should_keep_filter,
                 4,
+                nr_blast_concurrency
             ).await
         }
     });
