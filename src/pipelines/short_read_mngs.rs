@@ -2168,7 +2168,7 @@ async fn subsample_uniform(
 /// - Vec of cleanup receivers
 /// - Optional temporary FASTA file for non-host reference.
 /// - Optional temporary minimap2 index file.
-async fn minimap2_non_host_align(
+pub async fn minimap2_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
@@ -2181,37 +2181,40 @@ async fn minimap2_non_host_align(
     PipelineError,
 > {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
     let base_buffer_size = config.base_buffer_size;
     let channel_buffer = base_buffer_size * 4;
 
-    // 2. Discover NT split .mmi chunks + sort largest-first (unchanged)
+
+    // 1. Discover NT split .mmi chunks + sort largest-first
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
     let mut max_size_bytes: u64 = 0;
 
-    let mut entries = tokio::fs::read_dir(&nt_split_dir)
+    let mut entries = fs::read_dir(&nt_split_dir)
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
 
-    while let Some(entry) = entries.next_entry().await.transpose() {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
-                if let Ok(meta) = path.metadata() {
-                    let size = meta.len();
-                    if size > max_size_bytes {
-                        max_size_bytes = size;
-                    }
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
+            if let Ok(meta) = path.metadata() {
+                let size: u64 = meta.len();
+                if size > max_size_bytes {
+                    max_size_bytes = size;
                 }
-                chunk_paths.push(path);
             }
+            chunk_paths.push(path);
         }
     }
 
     if chunk_paths.is_empty() {
-        return Err(PipelineError::Other(anyhow!("No .mmi chunk files found in {}", nt_split_dir.display())));
+        return Err(PipelineError::Other(anyhow!(
+            "No .mmi chunk files found in {}",
+            nt_split_dir.display()
+        )));
     }
 
     chunk_paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
@@ -2219,7 +2222,8 @@ async fn minimap2_non_host_align(
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 3. Estimate memory per job (unchanged)
+
+    // 2. Memory & concurrency estimation
     const SAFETY_MULTIPLIER: f64 = 0.95;
     const MIN_ESTIMATE_GB: u64 = 20;
 
@@ -2231,12 +2235,13 @@ async fn minimap2_non_host_align(
 
     let est_gb_per_job = ((largest_gb as f64 * SAFETY_MULTIPLIER).ceil() as u64).max(MIN_ESTIMATE_GB);
 
-    info!("Largest NT chunk: {} GiB → estimating {:.0} GiB RAM per minimap2 job", largest_gb, est_gb_per_job);
+    info!(
+        "Largest NT chunk: {} GiB → estimating {:.0} GiB RAM per minimap2 job",
+        largest_gb, est_gb_per_job
+    );
 
-    // 4. Compute concurrency & threads-per-job (unchanged)
     const MIN_THREADS_PER_JOB: usize = 4;
     const MAX_THREADS_PER_JOB: usize = 12;
-
 
     let concurrency = compute_phase_concurrency(
         &config,
@@ -2251,101 +2256,122 @@ async fn minimap2_non_host_align(
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
-    "NT minimap2 stage: using {} concurrent jobs × {} threads (est peak ~{} GiB)",
-    concurrency, threads_per_job, concurrency as u64 * est_gb_per_job as u64
-);
+        "NT minimap2 stage: {} concurrent jobs × {} threads/job (est peak ~{} GiB)",
+        concurrency,
+        threads_per_job,
+        concurrency as u64 * est_gb_per_job as u64
+    );
 
+    // 3. Semaphore to limit concurrent minimap2 processes
+    let semaphore = Arc::new(Semaphore::new(concurrency as usize));
 
-    // ────────────────────────────────────────────────────────────────
-    // 5. Rayon thread pool — enforces exact concurrency
-    // ────────────────────────────────────────────────────────────────
-    let rayon_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(concurrency)
-        .thread_name(|i| format!("mm2-rayon-{}", i))
-        .build()
-        .map_err(|e| PipelineError::Other(anyhow!("Rayon pool failed: {}", e)))?;
+    // 4. Spawn one task per chunk — all on main Tokio runtime
+    let mut chunk_handles: Vec<JoinHandle<Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> =
+        Vec::with_capacity(chunk_paths.len());
 
-    info!("Rayon pool ready with {} threads for minimap2 chunks", concurrency);
+    for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
+        let chunk_name = chunk_mmi
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("chunk_{}", idx));
 
-    // Prepare work items
-    let work_items: Vec<_> = chunk_paths.into_iter().enumerate().collect();
+        let sem = semaphore.clone();
+        let config = config.clone();
+        let r1 = r1_path.clone();
+        let r2 = r2_path_opt.clone();
 
-    // Parallel execution — each rayon thread runs one minimap2 job
-    let results: Vec<Result<(tokio::sync::mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>> =
-        rayon_pool.install(|| {
-            work_items.par_iter().map(|(idx, chunk_mmi)| -> Result<_, anyhow::Error> {
-                let chunk_name = chunk_mmi.file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| format!("chunk_{}", idx));
+        let handle = tokio::spawn(async move {
+            // Acquire permit — blocks until a slot is free (limits concurrency)
+            let permit = sem
+                .acquire()
+                .await
+                .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
 
-                let mut options = std::collections::HashMap::new();
-                options.insert("-c".to_string(), None);
-                options.insert("-x".to_string(), Some("sr".to_string()));
-                options.insert("--secondary".to_string(), Some("yes".to_string()));
+            // Build minimap2 config & args
+            let mut options = HashMap::new();
+            options.insert("-c".to_string(), None);
+            options.insert("-x".to_string(), Some("sr".to_string()));
+            options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-                let mm_config = Minimap2Config {
-                    minimap2_index_path: chunk_mmi.clone(),
-                    r1_path: Some(r1_path.clone()),
-                    r2_path: r2_path_opt.clone(),
-                    option_fields: options,
-                    num_threads: Some(threads_per_job),
-                };
+            let mm_config = Minimap2Config {
+                minimap2_index_path: chunk_mmi,
+                r1_path: Some(r1),
+                r2_path: r2,
+                option_fields: options,
+                num_threads: Some(threads_per_job),
+            };
 
-                let args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
-                    .context("Failed to generate minimap2 args")?;
+            let args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
+                .context("Failed to generate minimap2 args")?;
 
-                info!("Rayon launching minimap2 for {}: minimap2 {}", chunk_name, args.join(" "));
+            info!("Launching minimap2 for {}: minimap2 {}", chunk_name, args.join(" "));
 
-                // Create per-thread Tokio runtime to allow .await inside sync rayon worker
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("Failed to create per-thread tokio runtime")?;
+            // Spawn subprocess + parse stdout streaming
+            let (mut child, stderr_task) = spawn_cmd(
+                config.clone(),
+                MINIMAP2_TAG,
+                args,
+                config.args.verbose,
+            )
+                .await
+                .context("Failed to spawn minimap2")?;
 
-                // Run async spawn_cmd and parse inside the runtime
-                let (mut child, stderr_task) = rt.block_on(spawn_cmd(
-                    config.clone(),
-                    MINIMAP2_TAG,
-                    args,
-                    config.args.verbose,
-                ))?;
+            if let Some(pid) = child.id() {
+                info!("minimap2 PID for {}: {}", chunk_name, pid);
+            }
 
-                if let Some(pid) = child.id() {
-                    info!("minimap2 PID for {}: {}", chunk_name, pid);
-                }
+            let paf_receiver = parse_child_output(
+                &mut child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                config.base_buffer_size,
+            )
+                .await
+                .context("Failed to parse minimap2 PAF output")?;
 
-                let paf_receiver = rt.block_on(parse_child_output(
-                    &mut child,
-                    ChildStream::Stdout,
-                    ParseMode::Lines,
-                    config.base_buffer_size,
-                ))?;
+            // Drop permit explicitly when job is done (though scope drop is fine too)
+            drop(permit);
 
-                info!("Chunk {} finished", chunk_name);
+            info!("minimap2 for {} completed (stdout parsing receiver ready)", chunk_name);
 
-                Ok((paf_receiver, stderr_task))
-            }).collect()
+            Ok((paf_receiver, stderr_task))
         });
 
-    // 6. Convert results to ReceiverStream
-    let mut partial_paf_receivers = Vec::new();
-
-    for res in results {
-        let (paf_rx, stderr_task) = res?;
-        partial_paf_receivers.push(ReceiverStream::new(paf_rx));
-        cleanup_tasks.push(stderr_task);
+        chunk_handles.push(handle);
     }
 
-    // 7. Merge all PAF streams
+    // 5. Collect results as they complete
+    let mut partial_paf_receivers = Vec::new();
+
+    for handle in chunk_handles {
+        match handle.await {
+            Ok(Ok((paf_rx, stderr_task))) => {
+                partial_paf_receivers.push(ReceiverStream::new(paf_rx));
+                cleanup_tasks.push(stderr_task);
+            }
+            Ok(Err(e)) => {
+                return Err(PipelineError::Other(anyhow!("minimap2 chunk failed: {}", e)));
+            }
+            Err(join_err) => {
+                return Err(PipelineError::Other(anyhow!("minimap2 task panicked: {}", join_err)));
+            }
+        }
+    }
+
+    // 6. Merge all per-chunk PAF streams into one ordered stream
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
-    let gather_handle = tokio::spawn(PafRecord::merge_paf_streams(
-        partial_paf_receivers,
-        merged_tx,
-        channel_buffer,
-    ));
+    let gather_handle = tokio::spawn(async move {
+        if let Err(e) = PafRecord::merge_paf_streams(partial_paf_receivers, merged_tx, channel_buffer).await {
+            warn!("PAF merge failed: {}", e);
+            return Err(e);
+        }
+        Ok(())
+    });
 
     cleanup_tasks.push(gather_handle);
+
+    info!("minimap2 NT alignment launched — {} chunks streaming", num_chunks);
 
     Ok((
         ReceiverStream::new(merged_rx),
@@ -5897,22 +5923,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
 
     // Temporary: Skip Diamond by providing empty outputs
-    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    // drop(dummy_tx); // Immediately drop sender to create an empty stream
-    // let non_host_diamond_m8_stream = dummy_rx;
-    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(dummy_tx); // Immediately drop sender to create an empty stream
+    let non_host_diamond_m8_stream = dummy_rx;
+    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
 
     // Diamond non_host alignment
-    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-    ).await?;
-    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
-    final_temp_dirs.extend(non_host_diamond_temp_dirs);
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
+    //     config.clone(),
+    //     non_host_r1_path.clone(),
+    //     non_host_r2_path_opt.clone(),
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // final_temp_dirs.extend(non_host_diamond_temp_dirs);
 
     let nr_concurrency = compute_phase_concurrency(
         &config,
