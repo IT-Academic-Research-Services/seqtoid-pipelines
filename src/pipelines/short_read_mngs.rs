@@ -3899,11 +3899,21 @@ pub async fn process_assembly(
         .await?;
     cleanup_tasks.push(write_sam_task);
 
+    let bam_concurrency = compute_phase_concurrency(
+        &config,
+        "bam_info",
+        0.5,           // ~500 MB per thread (local maps + record chunk)
+        1.0,
+        128,           // high cap for large clusters
+        4,             // min for small machines like M5 Air
+    );
+    info!("BAM info concurrency {}", bam_concurrency);
+
     let (read2contig, contig_stats, _contig_uniques) = generate_info_from_bam_stream(
         bam_for_stats,
         &duplicate_clusters,
         config.args.min_contig_length,
-        &config.thread_pool
+        bam_concurrency
     )
         .await?;
 
@@ -6692,7 +6702,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let stats = compute_insert_size_stats_from_bam(
             host_bt2_bam_path.clone(),
             None,
-            &config.thread_pool,
         )
             .await
             .context("Failed to compute insert size stats")?;

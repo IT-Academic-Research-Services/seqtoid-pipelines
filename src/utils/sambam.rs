@@ -6,16 +6,15 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
-use rayon::prelude::*;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 use noodles::bam::r#async::io::Reader as BamAsyncReader;
 use noodles::bam::record::{Record};
 use noodles::bam::record::Record as BamRecord;
-use noodles::sam::Header;
 use noodles::bam;
 use tokio::fs::File;
+use tokio::sync::Semaphore;
 use dashmap::DashMap;
 
 
@@ -64,13 +63,11 @@ fn anyhow_to_io(e: anyhow::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-
-
 pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
     duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
     min_contig_size: usize,
-    thread_pool: &Arc<rayon::ThreadPool>,
+    concurrency: usize,
 ) -> Result<(
     HashMap<String, String>,           // read2contig
     HashMap<String, u64>,              // contig_stats (cluster-adjusted)
@@ -87,12 +84,11 @@ pub async fn generate_info_from_bam_stream(
     let header = bam_reader.read_header().await.map_err(|e| anyhow!("BAM header error: {}", e))?;
 
     // Shared structures
-    let read2contig = Arc::new(Mutex::new(HashMap::with_capacity(20_000_000)));
-    let contig_stats = Arc::new(Mutex::new(HashMap::with_capacity(1024)));
-    let contig_unique_counts = Arc::new(Mutex::new(HashMap::with_capacity(1024)));
-    let seen_reads = Arc::new(Mutex::new(HashSet::with_capacity(20_000_000)));
+    let read2contig = Arc::new(DashMap::new());
+    let contig_stats = Arc::new(DashMap::new());
+    let contig_unique_counts = Arc::new(DashMap::new());
+    let seen_reads = Arc::new(DashMap::new());
 
-    // Collect all records
     let mut records: Vec<BamRecord> = Vec::new();
     let mut record = BamRecord::default();
     loop {
@@ -103,12 +99,26 @@ pub async fn generate_info_from_bam_stream(
         }
     }
 
-    // Chunk and process in parallel
-    let chunk_size = (records.len() / 64).max(1); // Adjust divisor based on cores
-    let chunks: Vec<_> = records.chunks(chunk_size).collect();
+    // Chunk and process in parallel with spawn_blocking + semaphore
+    let chunk_size = (records.len() / concurrency).max(1);
+    let chunks: Vec<Vec<BamRecord>> = records.chunks(chunk_size).map(|c| c.to_vec()).collect(); // Owned chunks
 
-    thread_pool.install(|| {
-        chunks.par_iter().for_each(|chunk| {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
+    let mut handles = Vec::with_capacity(chunks.len());
+
+    for chunk in chunks {
+        let sem = semaphore.clone();
+        let duplicate_clusters_clone = duplicate_clusters.clone();
+        let header_clone = header.clone();
+        let read2contig_clone = read2contig.clone();
+        let contig_stats_clone = contig_stats.clone();
+        let contig_unique_counts_clone = contig_unique_counts.clone();
+        let seen_reads_clone = seen_reads.clone();
+
+        let handle = tokio::task::spawn_blocking(move || {
+            let permit = tokio::runtime::Handle::current().block_on(sem.acquire()).map_err(|e| anyhow!("Semaphore error: {}", e))?;
+
             let mut local_read2contig = HashMap::new();
             let mut local_contig_stats = HashMap::new();
             let mut local_contig_unique_counts = HashMap::new();
@@ -135,14 +145,14 @@ pub async fn generate_info_from_bam_stream(
                     _ => continue,
                 };
 
-                let contig_name = match header.reference_sequences().get_index(rid) {
+                let contig_name = match header_clone.reference_sequences().get_index(rid) {
                     Some((name, _)) => name.to_string(),
                     None => continue,
                 };
 
                 local_read2contig.insert(read_name.clone(), contig_name.clone());
 
-                let cluster_size = duplicate_clusters
+                let cluster_size = duplicate_clusters_clone
                     .get(&read_name)
                     .map(|entry| entry.value().size)
                     .unwrap_or(1u64);
@@ -151,29 +161,37 @@ pub async fn generate_info_from_bam_stream(
                 *local_contig_unique_counts.entry(contig_name).or_insert(0) += 1;
             }
 
-            // Merge local into global (lock once per chunk)
-            {
-                let mut global_read2contig = read2contig.lock().unwrap();
-                let mut global_contig_stats = contig_stats.lock().unwrap();
-                let mut global_contig_unique_counts = contig_unique_counts.lock().unwrap();
-                let mut global_seen = seen_reads.lock().unwrap();
-
-                global_read2contig.extend(local_read2contig);
-                for (k, v) in local_contig_stats {
-                    *global_contig_stats.entry(k).or_insert(0) += v;
-                }
-                for (k, v) in local_contig_unique_counts {
-                    *global_contig_unique_counts.entry(k).or_insert(0) += v;
-                }
-                global_seen.extend(local_seen);
+            // Merge local into global (DashMap is concurrent-safe)
+            for (k, v) in local_read2contig {
+                read2contig_clone.insert(k, v);
             }
-        });
-    });
+            for (k, v) in local_contig_stats {
+                *contig_stats_clone.entry(k).or_insert(0) += v;
+            }
+            for (k, v) in local_contig_unique_counts {
+                *contig_unique_counts_clone.entry(k).or_insert(0) += v;
+            }
+            for read in local_seen {
+                seen_reads_clone.insert(read, ());
+            }
 
-    // Extract final results
-    let read2contig = Arc::try_unwrap(read2contig).unwrap().into_inner().unwrap();
-    let mut contig_stats = Arc::try_unwrap(contig_stats).unwrap().into_inner().unwrap();
-    let mut contig_unique_counts = Arc::try_unwrap(contig_unique_counts).unwrap().into_inner().unwrap();
+            drop(permit);
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.map_err(|e| anyhow!("Task join error: {}", e))??;
+    }
+
+    let read2contig: HashMap<String, String> = read2contig.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+
+    let mut contig_stats: HashMap<String, u64> = contig_stats.iter().map(|r| (r.key().clone(), *r.value())).collect();
+
+    let mut contig_unique_counts: HashMap<String, usize> = contig_unique_counts.iter().map(|r| (r.key().clone(), *r.value())).collect();
 
     // Apply min unique read filter
     contig_stats.retain(|contig_name, _| {
@@ -201,7 +219,6 @@ pub async fn generate_info_from_bam_stream(
 pub async fn compute_insert_size_stats_from_bam(
     bam_path: PathBuf,
     max_records_to_check: Option<usize>,
-    _thread_pool: &Arc<rayon::ThreadPool>,
 ) -> Result<InsertSizeStats> {
     let file = File::open(&bam_path)
         .await
