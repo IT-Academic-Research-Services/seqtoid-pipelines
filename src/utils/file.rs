@@ -685,22 +685,50 @@ pub async fn choose_temp_dir(
         Ok(required <= avail / factor)
     }
 
-    async fn try_create_temp(dir_path: &PathBuf, estimated: u64, factor: u64, label: &str) -> Option<Result<TempDir, PipelineError>> {
-        if check_space(dir_path, estimated, factor).await.ok()? {
-            debug!(
-                "Using {} dir {}: {} bytes fits in {} available (/{})",
-                label,
-                dir_path.display(),
-                estimated,
-                available_space_for_path(dir_path).await.ok()?,
-                factor
-            );
-            Some(TempDir::new_in(dir_path)
-                .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in {} dir {}: {}", label, dir_path.display(), e))))
-        } else {
-            None
+    async fn try_create_temp(
+        dir_path: &PathBuf,
+        estimated: u64,
+        factor: u64,
+        label: &str,
+    ) -> Option<Result<TempDir, PipelineError>> {
+        if !check_space(dir_path, estimated, factor).await.ok()? {
+            return None;
         }
+
+        debug!(
+            "Trying {} dir {}: {} bytes fits in {} available (/{})",
+            label,
+            dir_path.display(),
+            estimated,
+            available_space_for_path(dir_path).await.ok()?,
+            factor
+        );
+
+        let temp_dir = match TempDir::new_in(dir_path) {
+            Ok(td) => td,
+            Err(e) => return Some(Err(PipelineError::Other(anyhow!(
+                "Failed to create TempDir in {} dir {}: {}", label, dir_path.display(), e
+            )))),
+        };
+
+        // ────────────────────────────────────────────────────────────────
+        //  force directory visibility before returning
+        // This closes the race window where DIAMOND sees ENOENT
+        // ────────────────────────────────────────────────────────────────
+        if let Err(e) = tokio::fs::create_dir(temp_dir.path().join("probe")).await {
+            warn!("Filesystem probe failed in {}: {}. Continuing anyway.", dir_path.display(), e);
+            // Not fatal — we still return the dir, just log
+        } else {
+            let _ = tokio::fs::remove_dir(temp_dir.path().join("probe")).await;
+        }
+
+        // Optional ultra-paranoid version (usually overkill but zero risk):
+        // tokio::fs::sync_all().await.ok();   // fsync whole filesystem — slow!
+
+        debug!("Created and probed temp dir: {}", temp_dir.path().display());
+        Some(Ok(temp_dir))
     }
+
 
     let ram_attempt = try_create_temp(ram_dir, estimated_bytes, headroom_factor, "RAM").await;
     let nvme_path = nvme_scratch.as_ref().map(PathBuf::from);
@@ -719,14 +747,19 @@ pub async fn choose_temp_dir(
         ram_attempt.or(nvme_attempt)
     };
 
-
     if let Some(res) = chosen {
         return res;
     }
 
-    debug!("Falling back to system temp dir (RAM/NVMe insufficient or unavailable)");
-    TempDir::new()
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))
+    debug!("Falling back to system temp dir");
+    let fallback = TempDir::new()
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))?;
+
+    // Probe fallback too
+    let _ = tokio::fs::create_dir(fallback.path().join("probe")).await;
+    let _ = tokio::fs::remove_dir(fallback.path().join("probe")).await;
+
+    Ok(fallback)
 }
 
 #[cfg(test)]
