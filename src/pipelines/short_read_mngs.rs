@@ -25,7 +25,6 @@ use noodles::sam::alignment::record::cigar::{op::Kind as OpKind, Op};
 use once_cell::sync::Lazy;
 use rand::prelude::*;
 use rand_core::{OsRng, RngCore};
-use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4786,7 +4785,6 @@ pub async fn generate_m8_and_hit_summary(
 }
 
 
-
 pub async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
@@ -4934,129 +4932,8 @@ pub async fn blast_contigs(
     ).await?;
 
     // ────────────────────────────────────────────────
-    // Batch collection from input streams
+    // Top hits and results processing
     // ────────────────────────────────────────────────
-
-    let batch_size = if concurrency >= 64 {
-        100_000_usize
-    } else if concurrency >= 16 {
-        50_000_usize
-    } else {
-        20_000_usize
-    };
-
-    // Batching deduped_m8_stream
-    let (m8_batch_tx, mut m8_batch_rx) = mpsc::unbounded_channel::<Vec<String>>();
-    // let m8_batching = tokio::spawn(async move {
-    //     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
-    //     while let Some(item) = deduped_m8_stream.next().await {
-    //         if let Ok(bytes) = item.to_bytes() {
-    //             if let Ok(line) = String::from_utf8(bytes) {
-    //                 let trimmed = line.trim().to_string();
-    //                 if !trimmed.is_empty() {
-    //                     batch.push(trimmed);
-    //                 }
-    //             }
-    //         }
-    //         if batch.len() >= batch_size {
-    //             let _ = m8_batch_tx.send(std::mem::take(&mut batch));
-    //             batch = Vec::with_capacity(batch_size);
-    //         }
-    //     }
-    //     if !batch.is_empty() {
-    //         let _ = m8_batch_tx.send(batch);
-    //     }
-    //     Ok(())
-    // });
-    // cleanup_tasks.push(m8_batching);
-
-    // Batching hit_summary_stream
-    let (hit_batch_tx, mut hit_batch_rx) = mpsc::unbounded_channel::<Vec<String>>();
-    // let hit_batching = tokio::spawn(async move {
-    //     let mut batch: Vec<String> = Vec::with_capacity(batch_size);
-    //     while let Some(item) = hit_summary_stream.next().await {
-    //         if let Ok(bytes) = item.to_bytes() {
-    //             if let Ok(line) = String::from_utf8(bytes) {
-    //                 let trimmed = line.trim().to_string();
-    //                 if !trimmed.is_empty() {
-    //                     batch.push(trimmed);
-    //                 }
-    //             }
-    //         }
-    //         if batch.len() >= batch_size {
-    //             let _ = hit_batch_tx.send(std::mem::take(&mut batch));
-    //             batch = Vec::with_capacity(batch_size);
-    //         }
-    //     }
-    //     if !batch.is_empty() {
-    //         let _ = hit_batch_tx.send(batch);
-    //     }
-    //     Ok(())
-    // });
-    // cleanup_tasks.push(hit_batching);
-
-    // Drain batches
-    let mut all_m8_batches: Vec<Vec<String>> = Vec::new();
-    let mut all_hit_batches: Vec<Vec<String>> = Vec::new();
-
-    while let Some(batch) = m8_batch_rx.recv().await {
-        all_m8_batches.push(batch);
-    }
-    while let Some(batch) = hit_batch_rx.recv().await {
-        all_hit_batches.push(batch);
-    }
-
-    info!(
-        "Collected {} M8 batches and {} hit-summary batches for parallel processing (concurrency: {})",
-        all_m8_batches.len(), all_hit_batches.len(), concurrency
-    );
-
-    // Custom Rayon pool
-    let rayon_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(concurrency)
-        .thread_name(|i| format!("blast-worker-{}", i))
-        .build()
-        .map_err(|e| anyhow!("Failed to create Rayon pool: {}", e))?;
-
-    // Parallel processing of batches
-    let processed_results = rayon_pool.install(|| {
-        let m8_processed = all_m8_batches.par_iter().map(|batch| {
-            let mut local_refined_m8 = Vec::new();
-            let mut local_top_hits = Vec::new();
-
-            for line in batch {
-                let m8 = if db_type == NT_TAG {
-                    M8Record::parse_line_nt(line).ok()
-                } else {
-                    M8Record::parse_line_nr(line).ok()
-                };
-
-                if let Some(m8) = m8 {
-                    // TODO: actual filtering, scoring, top-hit logic here
-                    // Example placeholder:
-                    local_refined_m8.push(line.clone());
-                    local_top_hits.push(m8);
-                }
-            }
-
-            (local_refined_m8, local_top_hits)
-        }).collect::<Vec<_>>();
-
-        let hit_processed = all_hit_batches.par_iter().map(|batch| {
-            let mut local_hit_lines = Vec::new();
-
-            for line in batch {
-                // TODO: Add your hit-summary parsing / filtering logic here
-                local_hit_lines.push(line.clone());
-            }
-
-            local_hit_lines
-        }).collect::<Vec<_>>();
-
-        (m8_processed, hit_processed)
-    });
-
-
     let (top_internal_tx, top_internal_rx) = mpsc::channel(1024);
     let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
     let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
@@ -5118,34 +4995,6 @@ pub async fn blast_contigs(
 
     let refined_m8_tx_merge = refined_m8_tx.clone();
     let refined_hit_summary_tx_merge = refined_hit_summary_tx.clone();
-
-    // Merge parallel results into the refined channels
-    let merge_handle = tokio::spawn(async move {
-        let (m8_results, hit_results) = processed_results;
-
-        // Merge refined M8 lines
-        for (refined_lines, _top_hits) in m8_results {
-            for line in refined_lines {
-                let mut line_bytes = line.into_bytes();
-                line_bytes.push(b'\n');
-                refined_m8_tx_merge.send(ParseOutput::Bytes(Arc::new(line_bytes))).await
-                    .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
-            }
-        }
-
-        // Merge hit summary lines
-        for hit_lines in hit_results {
-            for line in hit_lines {
-                let mut line_bytes = line.into_bytes();
-                line_bytes.push(b'\n');
-                refined_hit_summary_tx_merge.send(ParseOutput::Bytes(Arc::new(line_bytes))).await
-                    .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
-            }
-        }
-
-        Ok(())
-    });
-    cleanup_tasks.push(merge_handle);
 
     let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
     let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
