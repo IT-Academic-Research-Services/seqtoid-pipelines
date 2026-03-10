@@ -1789,25 +1789,13 @@ pub mod diamond {
 
 
             if let Some(r1_path) = &config.r1_path {
-
-                if let Some(r2_path) = &config.r2_path {
-                    args_vec.push("-1".to_string());
-                    args_vec.push(r1_path.to_string_lossy().to_string());
-                    args_vec.push("-2".to_string());
-                    args_vec.push(r2_path.to_string_lossy().to_string());
-                } else {
-                    args_vec.push("-1".to_string());
-                    args_vec.push(r1_path.to_string_lossy().to_string());
-                }
+                args_vec.push("--query".to_string());
+                args_vec.push(r1_path.to_string_lossy().to_string());
             } // if no input paths, automatically accpet stdin
 
             let threads = run_config.thread_allocation(DIAMOND_TAG, None);
             args_vec.push("--threads".to_string());
             args_vec.push(threads.to_string());
-
-            let index_chunks = if threads >= 96 { 12 } else if threads >= 64 { 8 } else { 4 };
-            args_vec.push("-c".to_string());
-            args_vec.push(index_chunks.to_string());
 
             for (key, value) in &config.subcommand_fields {
                 args_vec.push(key.clone());
