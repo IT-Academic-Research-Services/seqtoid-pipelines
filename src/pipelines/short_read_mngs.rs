@@ -5693,13 +5693,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         cleanup_tasks.push(r2_copy_task);
     }
 
-    // Now spades/mm2/diamond/etc. from files (use original paths — they weren't moved)
-    let spades_task = spades_assembly(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-        &out_dir,
-    ).await?;
 
     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
         config.clone(),
@@ -6005,6 +5998,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Assembly stats
     let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
     let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
+
+    let spades_task = spades_assembly(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        &out_dir,
+    ).await?;
 
     let spades_completion = spades_task.await;
 
