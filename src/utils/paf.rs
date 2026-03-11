@@ -100,10 +100,15 @@ impl PafRecord {
                             continue;
                         }
                         let record = PafRecord::parse_line(&line)?;
-                        query_hits
+                        let hits = query_hits
                             .entry(record.qname.clone())
-                            .or_default()
-                            .push(record);
+                            .or_default();
+                        
+                        hits.push(record);
+                        if hits.len() > 20 {
+                            hits.sort_by_key(|h| Reverse(h.alignment_score()));
+                            hits.truncate(6);
+                        }
                     }
                     _ => {
                         return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
