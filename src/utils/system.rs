@@ -549,3 +549,23 @@ pub fn compute_phase_concurrency(
 
     concurrency
 }
+
+pub fn compute_batch_size(
+    est_total_lines: Option<usize>,  // Optional: If known (e.g., from prior count); else None for defaults
+    avg_line_bytes: usize,           // ~200
+    target_batch_mb: usize,          // 100–500
+    concurrency: usize,
+) -> usize {
+    let target_bytes = target_batch_mb * 1024 * 1024;
+    let base_batch = target_bytes / avg_line_bytes;  // e.g., 100MB / 200B = 500k lines
+
+    if let Some(total_lines) = est_total_lines {
+        // Dynamic: ~10–20 batches per concurrent task for overlap
+        let total_batches = concurrency * 15;
+        let from_total = total_lines / total_batches;
+        base_batch.min(from_total)
+    } else {
+        base_batch  // Fixed if unknown
+    }
+        .clamp(10_000, 500_000)  // Min/max
+}

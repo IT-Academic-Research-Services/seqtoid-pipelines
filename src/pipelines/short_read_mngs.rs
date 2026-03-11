@@ -91,7 +91,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             ChannelReader, ChildStream, ParseMode,
                             ParseOutput, ToBytes};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
-use crate::utils::system::{detect_ram, compute_phase_concurrency};
+use crate::utils::system::{detect_ram, compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
                              get_top_m8_nt, load_taxid_lineages_db, validate_taxid_lineage};
 
@@ -4948,10 +4948,46 @@ pub async fn blast_contigs(
     let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
     let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
 
+
+
+
     let top_handle = if db_type == NT_TAG {
-        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_internal_tx))
+        let top_nt_concurrency = compute_phase_concurrency(
+            &config,
+            "top_m8_nt",
+            0.25,  // ram_per_thread_gb: Conservative; ~250MB/batch (50k lines * ~5KB effective after parsing/maps)
+            1.0,   // cpu_divisor: Light CPU → allow 1 thread/core (high parallelism)
+            128,
+            2,     // at least 2 for basic speedup
+        );
+        info!("NT top m8 concurrency: {}", top_nt_concurrency);
+
+        let avg_line_bytes = 200;  // rough guess
+        let target_batch_mb = if config.available_ram < 64 { 100 } else { 250 };
+        let est_total_lines = None;
+        let top_nt_batch_size = compute_batch_size(est_total_lines, avg_line_bytes, target_batch_mb, top_nt_concurrency);
+        info!("NT batch size: {}", top_nt_batch_size);
+
+        tokio::spawn(get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_internal_tx, top_nt_concurrency, top_nt_batch_size))
     } else {
-        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_internal_tx))
+
+        let top_nr_concurrency = compute_phase_concurrency(
+            &config,
+            "top_m8_nr",
+            0.5,   // (~500MB/batch)
+            1.5,   //  ~0.67 threads/core
+            128,
+            2,
+        );
+        info!("NR top m8 concurrency: {}", top_nr_concurrency);
+
+        let avg_line_bytes = 200;  // rough guess
+        let target_batch_mb = if config.available_ram < 64 { 100 } else { 250 };
+        let est_total_lines = None;
+        let top_nr_batch_size = compute_batch_size(est_total_lines, avg_line_bytes, target_batch_mb, top_nr_concurrency);
+        info!("NR batch size: {}", top_nr_batch_size);
+
+        tokio::spawn(get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_internal_tx, top_nr_concurrency, top_nr_batch_size))
     };
 
     let forward_handle = tokio::spawn({
