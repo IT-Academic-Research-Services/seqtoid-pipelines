@@ -6,6 +6,7 @@ use std::hash::Hasher;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::collections::hash_map::DefaultHasher;
 use std::process::{Command as StdCommand, Stdio};
@@ -4328,6 +4329,7 @@ pub async fn build_reference_fasta_from_selected_genera(
 /// read dicttionary of read id's -> Readhit
 ///  accesions -> Accesiohit
 pub async fn summarize_hits(
+    config: Arc<RunConfig>,
     mut stream: ReceiverStream<ParseOutput>,
     min_reads_per_genus: usize,
 ) -> Result<(
@@ -4336,117 +4338,165 @@ pub async fn summarize_hits(
     HashMap<i32, Vec<String>>,
     usize,
 )> {
-    let read_dict: DashMap<String, Arc<ReadHit>> = DashMap::with_capacity(8_000_000);
-    let accession_dict: DashMap<String, AccessionHit> = DashMap::with_capacity(2_000_000);
+    let read_dict = Arc::new(DashMap::with_capacity(8_000_000));
+    let accession_dict = Arc::new(DashMap::with_capacity(2_000_000));
 
-    let genus_read_counts: DashMap<i32, usize> = DashMap::new();
-    let genus_species: DashMap<i32, HashSet<i32>> = DashMap::new();
-    let genus_accessions: DashMap<i32, HashSet<String>> = DashMap::new();
+    let genus_read_counts: Arc<DashMap<i32, usize>> = Arc::new(DashMap::new());
+    let genus_species: Arc<DashMap<i32, HashSet<i32>>> = Arc::new(DashMap::new());
+    let genus_accessions: Arc<DashMap<i32, HashSet<String>>> = Arc::new(DashMap::new());
 
-    let mut total_reads: usize = 0;
+    let total_reads = Arc::new(AtomicUsize::new(0));
 
-    while let Some(item) = stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => return Err(anyhow!("Expected Bytes in summarize_hits stream")),
-        };
-
-        let line = match std::str::from_utf8(&bytes) {
-            Ok(s) => s.trim_end(),
-            Err(_) => {
-                warn!("Non-UTF8 line in hit summary stream");
-                continue;
-            }
-        };
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split('\t').collect();
-
-        if parts.len() != 6 {
-            warn!(
-        "Malformed hit_summary line (expected exactly 6 fields, got {}): {}",
-        parts.len(),
-        line
+    let concurrency = compute_phase_concurrency(
+        &config,
+        "summarize_hits",
+        0.5,           // ~0.5 GB per thread max
+        3.5,
+        32,            // CPU bound
+        8,             // min for meaningful parallelism
     );
-            continue;
+
+    const BATCH_SIZE: usize = 10_000;
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<Arc<Vec<u8>>>>(concurrency * 2);
+    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+
+    let batcher_handle = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(b) => {
+                    batch.push(b);
+                    if batch.len() >= BATCH_SIZE {
+                        if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ => return Err(anyhow!("Expected Bytes in summarize_hits stream")),
+            }
         }
-
-        let read_id       = parts[0].to_string();
-        let accession_id  = if parts[1].is_empty() || parts[1] == "-" {
-            "-".to_string()
-        } else {
-            parts[1].to_string()
-        };
-        let hit_taxid: i32 = parts[2].parse()
-            .map_err(|_| warn!("Invalid hit_taxid: {}", parts[2])).ok().unwrap_or(0);
-        let genus_taxid: i32 = parts[3].parse()
-            .map_err(|_| warn!("Invalid genus_taxid: {}", parts[3])).ok().unwrap_or(0);
-        let family_taxid: i32 = parts[4].parse()
-            .map_err(|_| warn!("Invalid family_taxid: {}", parts[4])).ok().unwrap_or(0);
-        let level: u8 = parts[5].parse()
-            .map_err(|_| warn!("Invalid level: {}", parts[5])).ok().unwrap_or(0);
-
-        let species_taxid = if level >= 3 && hit_taxid > 0 {
-            hit_taxid                     // level 3+ means species consensus already achieved
-        } else {
-            0                             // only genus/family → species unknown
-        };
-
-        // assign highest resolved level
-        let assigned_taxid = if level >= 3 {
-            species_taxid
-        } else if level == 2 {
-            genus_taxid
-        } else if level == 1 {
-            genus_taxid
-        } else {
-            hit_taxid                     // fallback (should be rare)
-        };
-
-        read_dict.insert(
-            read_id.clone(),
-            Arc::new(ReadHit {
-                level,
-                taxid: assigned_taxid,
-                accession_id: accession_id.clone(),
-                species_taxid,
-                genus_taxid,
-                family_taxid,
-                contig_id: None,
-                contig_accession_id: None,
-                contig_species_taxid: 0,
-                contig_genus_taxid: 0,
-                contig_family_taxid: 0,
-                from_assembly: false,
-                source_count_type: None
-            }),
-        );
-
-        total_reads += 1;
-
-        if accession_id != "-" && genus_taxid > 0 {
-            accession_dict
-                .entry(accession_id.clone())
-                .or_insert_with(|| AccessionHit {
-                    taxid: species_taxid,
-                    genus_taxid,
-                    family_taxid,
-                    count: 0,
-                })
-                .count += 1;
-
-            *genus_read_counts.entry(genus_taxid).or_insert(0) += 1;
-            genus_species.entry(genus_taxid).or_default().insert(species_taxid);
-            genus_accessions.entry(genus_taxid).or_default().insert(accession_id);
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch).await;
         }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = batch_rx.clone();
+        let rd = read_dict.clone();
+        let ad = accession_dict.clone();
+        let grc = genus_read_counts.clone();
+        let gs = genus_species.clone();
+        let ga = genus_accessions.clone();
+        let tr = total_reads.clone();
+
+        worker_handles.push(tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut lock = rx.lock().await;
+                    lock.recv().await
+                };
+
+                let batch = match batch {
+                    Some(b) => b,
+                    None => break,
+                };
+
+                for bytes in batch {
+                    let line = match std::str::from_utf8(&bytes) {
+                        Ok(s) => s.trim_end(),
+                        Err(_) => {
+                            warn!("Non-UTF8 line in hit summary stream");
+                            continue;
+                        }
+                    };
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() != 6 {
+                        warn!("Malformed hit_summary line (expected exactly 6 fields, got {}): {}", parts.len(), line);
+                        continue;
+                    }
+
+                    let read_id       = parts[0].to_string();
+                    let accession_id  = if parts[1].is_empty() || parts[1] == "-" {
+                        "-".to_string()
+                    } else {
+                        parts[1].to_string()
+                    };
+                    let hit_taxid: i32 = parts[2].parse().unwrap_or(0);
+                    let genus_taxid: i32 = parts[3].parse().unwrap_or(0);
+                    let family_taxid: i32 = parts[4].parse().unwrap_or(0);
+                    let level: u8 = parts[5].parse().unwrap_or(0);
+
+                    let species_taxid = if level >= 3 && hit_taxid > 0 {
+                        hit_taxid
+                    } else {
+                        0
+                    };
+
+                    let assigned_taxid = if level >= 3 {
+                        species_taxid
+                    } else if level == 2 || level == 1 {
+                        genus_taxid
+                    } else {
+                        hit_taxid
+                    };
+
+                    rd.insert(
+                        read_id.clone(),
+                        Arc::new(ReadHit {
+                            level,
+                            taxid: assigned_taxid,
+                            accession_id: accession_id.clone(),
+                            species_taxid,
+                            genus_taxid,
+                            family_taxid,
+                            contig_id: None,
+                            contig_accession_id: None,
+                            contig_species_taxid: 0,
+                            contig_genus_taxid: 0,
+                            contig_family_taxid: 0,
+                            from_assembly: false,
+                            source_count_type: None
+                        }),
+                    );
+
+                    tr.fetch_add(1, AtomicOrdering::Relaxed);
+
+                    if accession_id != "-" && genus_taxid > 0 {
+                        ad.entry(accession_id.clone())
+                            .and_modify(|e: &mut AccessionHit| e.count += 1)
+                            .or_insert(AccessionHit {
+                                taxid: species_taxid,
+                                genus_taxid,
+                                family_taxid,
+                                count: 1,
+                            });
+
+                        *grc.entry(genus_taxid).or_insert(0) += 1;
+                        gs.entry(genus_taxid).or_default().insert(species_taxid);
+                        ga.entry(genus_taxid).or_default().insert(accession_id);
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }));
     }
 
+    for h in worker_handles {
+        h.await??;
+    }
+    batcher_handle.await??;
+
+    let total_reads_val = total_reads.load(AtomicOrdering::SeqCst);
     info!(
         "summarize_hits: processed {} reads, {} unique accessions",
-        total_reads,
+        total_reads_val,
         accession_dict.len()
     );
 
@@ -4472,14 +4522,14 @@ pub async fn summarize_hits(
         }
     }
 
-    let read_dict_final: AHashMap<String, Arc<ReadHit>> = read_dict.into_iter().collect();
-    let accession_dict_final: AHashMap<String, AccessionHit> = accession_dict.into_iter().collect();
+    let read_dict_final: AHashMap<String, Arc<ReadHit>> = Arc::try_unwrap(read_dict).unwrap().into_iter().collect();
+    let accession_dict_final: AHashMap<String, AccessionHit> = Arc::try_unwrap(accession_dict).unwrap().into_iter().collect();
 
     Ok((
         read_dict_final,
         accession_dict_final,
         selected_genera,
-        total_reads,
+        total_reads_val,
     ))
 }
 
@@ -5805,7 +5855,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nt_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nt_summary_hit_stream), 0));
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nt_summary_hit_stream), 0));
 
     let nt_counts = generate_taxon_counts(
         config.clone(),
@@ -5904,7 +5954,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_blast_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nr_hit_summary_handle = tokio::spawn(summarize_hits(ReceiverStream::new(nr_summary_hit_stream), 0));
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nr_summary_hit_stream), 0));
 
     let nr_counts = generate_taxon_counts(
         config.clone(),
