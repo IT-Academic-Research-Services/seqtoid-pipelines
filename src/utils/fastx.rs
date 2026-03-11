@@ -1634,7 +1634,7 @@ pub async fn generate_taxid_locator(
         "generate_taxid_locator",
         0.5, // ~0.5 GB per thread max
         4.0, // 4 threads per core
-        64,  // cap
+        128,  // cap
         8,   // min for meaningful parallelism
     );
 
