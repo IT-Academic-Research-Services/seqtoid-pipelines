@@ -191,44 +191,94 @@ pub async fn build_accession2taxid_db(
     db_path: &PathBuf,
 ) -> Result<()> {
     let mut accession_bases: HashSet<String> = HashSet::new();
-    if let Some(p) = nt_file {
-        scan_fasta_bases(p, &mut accession_bases, "NT");
+
+    let mut scan_tasks = Vec::new();
+
+    if let Some(p) = nt_file.cloned() {
+        scan_tasks.push(tokio::task::spawn_blocking(move || {
+            let mut bases = HashSet::new();
+            scan_fasta_bases(&p, &mut bases, "NT");
+            bases
+        }));
     }
-    if let Some(p) = nr_file {
-        scan_fasta_bases(p, &mut accession_bases, "NR");
+    if let Some(p) = nr_file.cloned() {
+        scan_tasks.push(tokio::task::spawn_blocking(move || {
+            let mut bases = HashSet::new();
+            scan_fasta_bases(&p, &mut bases, "NR");
+            bases
+        }));
     }
+
+    for task in scan_tasks {
+        let bases = task.await?;
+        accession_bases.extend(bases);
+    }
+
+    let accession_bases = Arc::new(accession_bases);
+    let (tx, mut rx) = mpsc::channel(100);
+    let semaphore = Arc::new(Semaphore::new(std::cmp::max(1, num_cpus::get() / 2)));
+    let mut join_handles = Vec::new();
+
+    for mapping_file in mapping_files.to_vec() {
+        let tx = tx.clone();
+        let accession_bases = Arc::clone(&accession_bases);
+        let sem = Arc::clone(&semaphore);
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await?;
+            let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+            info!("Reading mapping file: {}", filename);
+
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let file = StdFile::open(&mapping_file)?;
+                let gz = GzDecoder::new(StdBufReader::new(file));
+                let mut rdr = ReaderBuilder::new()
+                    .delimiter(b'\t')
+                    .has_headers(false)
+                    .from_reader(gz);
+
+                let mut batch = Vec::with_capacity(1000);
+                for result in rdr.records() {
+                    let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
+
+                    let full_acc = record[0].to_string();
+                    let acc_base = full_acc.split('.').next().unwrap_or(&full_acc);
+
+                    if !accession_bases.contains(acc_base) {
+                        continue;
+                    }
+
+                    let taxid_idx = if record.len() == 2 { 1 } else { 2 };
+                    let taxid: Taxid = record.get(taxid_idx)
+                        .ok_or_else(|| anyhow!("Missing taxid column in {}", filename))?
+                        .parse()
+                        .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
+
+                    batch.push(AccTaxEntry { acc: full_acc, taxid });
+                    if batch.len() >= 1000 {
+                        tx.blocking_send(std::mem::replace(&mut batch, Vec::with_capacity(1000)))
+                            .map_err(|_| anyhow!("Channel closed"))?;
+                    }
+                }
+                if !batch.is_empty() {
+                    tx.blocking_send(batch).map_err(|_| anyhow!("Channel closed"))?;
+                }
+                Ok(())
+            }).await?
+        });
+        join_handles.push(handle);
+    }
+
+    // Drop the original sender so the receiver can finish
+    drop(tx);
 
     let mut entries = Vec::new();
+    while let Some(batch) = rx.recv().await {
+        entries.extend(batch);
+    }
 
-    for mapping_file in mapping_files {
-        let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
-        info!("Reading mapping file: {}", filename);
-
-        let file = StdFile::open(mapping_file)?;
-        let gz = GzDecoder::new(StdBufReader::new(file));
-        let mut rdr = ReaderBuilder::new()
-            .delimiter(b'\t')
-            .has_headers(false)
-            .from_reader(gz);
-
-        for result in rdr.records() {
-            let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
-
-            let full_acc = record[0].to_string();
-            let acc_base = full_acc.split('.').next().unwrap_or(&full_acc).to_string();
-
-            if !accession_bases.contains(&acc_base) {
-                continue;
-            }
-
-            let taxid_idx = if record.len() == 2 { 1 } else { 2 };
-            let taxid: Taxid = record.get(taxid_idx)
-                .ok_or_else(|| anyhow!("Missing taxid column in {}", filename))?
-                .parse()
-                .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
-
-            entries.push(AccTaxEntry { acc: full_acc, taxid });
-        }
+    for handle in join_handles {
+        handle.await??;
     }
 
 
