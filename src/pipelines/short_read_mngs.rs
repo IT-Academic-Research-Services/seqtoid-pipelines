@@ -4367,9 +4367,8 @@ pub async fn summarize_hits(
                 ParseOutput::Bytes(b) => {
                     batch.push(b);
                     if batch.len() >= BATCH_SIZE {
-                        if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                            break;
-                        }
+                        batch_tx.send(std::mem::take(&mut batch)).await
+                            .map_err(|_| anyhow!("batch_tx dropped unexpectedly in summarize_hits"))?;
                     }
                 }
                 _ => return Err(anyhow!("Expected Bytes in summarize_hits stream")),
@@ -6527,6 +6526,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         load_nr_task,
         taxid_main_task,
     ) = generate_taxid_fasta(
+        config.clone(),
         ReceiverStream::new(mapped_contigs_rx),
         ReceiverStream::new(unidentified_contigs_rx),
         ReceiverStream::new(nt_hit_summary_taxid),
@@ -6606,6 +6606,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         initial_load_nr_task,
         initial_taxid_main_task,
     ) = generate_taxid_fasta(
+        config.clone(),
         ReceiverStream::new(initial_annotated_taxon_stream),
         ReceiverStream::new(initial_unidentified_taxon_stream),
         ReceiverStream::new(nt_initial_stream),
