@@ -6161,58 +6161,86 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Blast contigs
-    //NT
-    let (
-        nt_read_dict_noarc,
-        nt_accession_dict_noarc,
-        nt_selected_genera,
-        nt_total_reads,
-    ) = nt_hit_summary_handle
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
+    // NT and NR prep in parallel
+    let nt_prep_handle = tokio::spawn({
+        let config = config.clone();
+        let nt_file = nt_file.clone();
+        let nt_offset_db_file = nt_offset_db_file.clone();
+        async move {
+            let (
+                nt_read_dict_map,
+                nt_accession_dict_noarc,
+                nt_selected_genera,
+                _nt_total_reads,
+            ) = nt_hit_summary_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
 
-    let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_noarc));
-    let nt_accession_dict = Arc::new(nt_accession_dict_noarc);
+            let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
+                config.clone(),
+                &nt_selected_genera,
+                NT_TAG,
+                &PathBuf::from(nt_file),
+                &PathBuf::from(nt_offset_db_file),
+            )
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
+                nt_read_dict_map,
+                Arc::new(nt_accession_dict_noarc),
+                nt_ref_fasta_path,
+                nt_ref_fasta_temp_dir,
+            ))
+        }
+    });
 
-    //nt accessions
-    let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
-        config.clone(),
-        &nt_selected_genera,
-        NT_TAG,
-        &PathBuf::from(nt_file),
-        &PathBuf::from(nt_offset_db_file),
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    eprintln!("nt path {}", nt_ref_fasta_path.display());
+    let nr_prep_handle = tokio::spawn({
+        let config = config.clone();
+        let nr_file = nr_file.clone();
+        let nr_offset_db_file = nr_offset_db_file.clone();
+        async move {
+            let (
+                nr_read_dict_map,
+                nr_accession_dict_noarc,
+                nr_selected_genera,
+                _nr_total_reads,
+            ) = nr_hit_summary_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
+                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
+
+            let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
+                config.clone(),
+                &nr_selected_genera,
+                NR_TAG,
+                &PathBuf::from(nr_file),
+                &PathBuf::from(nr_offset_db_file),
+            )
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
+                nr_read_dict_map,
+                Arc::new(nr_accession_dict_noarc),
+                nr_ref_fasta_path,
+                nr_ref_fasta_temp_dir,
+            ))
+        }
+    });
+
+    let (nt_prep_res, nr_prep_res) = tokio::try_join!(nt_prep_handle, nr_prep_handle)
+        .map_err(|e| PipelineError::Other(anyhow!("Reference prep task panicked: {e}")))?;
+
+    let (nt_read_dict_map, nt_accession_dict, nt_ref_fasta_path, nt_ref_fasta_temp_dir) = nt_prep_res?;
+    let (nr_read_dict_map, nr_accession_dict, nr_ref_fasta_path, nr_ref_fasta_temp_dir) = nr_prep_res?;
+
+    let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_map));
+    let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_map));
+
+    info!("NT ref path: {}", nt_ref_fasta_path.display());
+    info!("NR ref path: {}", nr_ref_fasta_path.display());
+
     final_temp_dirs.push(nt_ref_fasta_temp_dir);
-
-    // //NR
-    let (
-        nr_read_dict_noarc,
-        nr_accession_dict_noarc,
-        nr_selected_genera,
-        nr_total_reads,
-    ) = nr_hit_summary_handle
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
-
-    let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_noarc));
-    let nr_accession_dict = Arc::new(nr_accession_dict_noarc);
-
-
-    let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
-        config.clone(),
-        &nr_selected_genera,
-        NR_TAG,
-        &PathBuf::from(nr_file),
-        &PathBuf::from(nr_offset_db_file),
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    eprintln!("nr path {}", nr_ref_fasta_path.display());
     final_temp_dirs.push(nr_ref_fasta_temp_dir);
 
     let nt_blast_concurrency = compute_phase_concurrency(

@@ -16,7 +16,6 @@ use csv::ReaderBuilder;
 use sled::{Db, Tree, IVec};
 use fst::{MapBuilder};
 use needletail::{parse_fastx_file, FastxReader};
-use rayon::prelude::*;
 use bincode::{encode_into_std_write, decode_from_std_read};
 use serde::{Serialize, Deserialize};
 use ahash::AHashMap;
