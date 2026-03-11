@@ -6585,6 +6585,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let assembly_dir = out_dir.join("assembly");
 
     let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
+        config.clone(),
         taxid_mapped_locator, // directly pass the receiver
         assembly_dir,
     )
@@ -6685,6 +6686,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
+        config.clone(),
         initial_taxid_mapped_locator,
         out_dir.clone(),
     )

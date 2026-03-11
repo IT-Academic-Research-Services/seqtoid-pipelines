@@ -1616,6 +1616,7 @@ pub async fn generate_taxid_fasta(
 
 
 pub async fn generate_taxid_locator(
+    config: Arc<RunConfig>,
     fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
     assembly_dir: PathBuf,
 ) -> Result<
@@ -1626,45 +1627,110 @@ pub async fn generate_taxid_locator(
     ),
     PipelineError,
 > {
-
     let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
-    let mut records: Vec<(String, String)> = Vec::with_capacity(1_000_000);
 
-    while let Some(item) = fasta_stream.next().await {
-        let bytes = item
-            .to_bytes()
-            .map_err(|e| PipelineError::Other(anyhow!("ParseOutput to_bytes failed: {}", e)))?;
+    let concurrency = compute_phase_concurrency(
+        &config,
+        "generate_taxid_locator",
+        0.5, // ~0.5 GB per thread max
+        4.0, // 4 threads per core
+        64,  // cap
+        8,   // min for meaningful parallelism
+    );
 
-        if bytes.is_empty() {
-            continue;
-        }
+    const BATCH_SIZE: usize = 1000;
 
-        let record_str = String::from_utf8(bytes.to_vec())
-            .map_err(|e| PipelineError::Other(anyhow!("Invalid UTF-8 in FASTA record: {}", e)))?;
+    // Use a worker pool to parse records from the stream in parallel
+    let (record_tx, mut record_rx) = mpsc::channel::<(String, String)>(100_000);
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
+    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
-        let mut lines = record_str.lines();
-        let header_line = match lines.next() {
-            Some(l) => l,
-            None => continue,
-        };
-        let seq_line = match lines.next() {
-            Some(l) => l,
-            None => {
-                warn!("FASTA record missing sequence line");
-                continue;
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = batch_rx.clone();
+        let r_tx = record_tx.clone();
+
+        worker_handles.push(tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut lock = rx.lock().await;
+                    lock.recv().await
+                };
+
+                let batch = match batch {
+                    Some(b) => b,
+                    None => break,
+                };
+
+                for item in batch {
+                    let bytes = item.to_bytes()?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+
+                    let record_str = String::from_utf8(bytes.to_vec())
+                        .map_err(|e| anyhow!("Invalid UTF-8 in FASTA record: {}", e))?;
+
+                    let mut lines = record_str.lines();
+                    let header_line = match lines.next() {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    let seq_line = match lines.next() {
+                        Some(l) => l,
+                        None => {
+                            warn!("FASTA record missing sequence line");
+                            continue;
+                        }
+                    };
+
+                    if !header_line.starts_with('>') {
+                        warn!("Invalid FASTA header (missing '>'): {}", header_line);
+                        continue;
+                    }
+
+                    let header = header_line[1..].trim().to_string(); // strip '>'
+                    let seq = seq_line.trim().to_string();
+
+                    r_tx.send((header, seq)).await.map_err(|_| anyhow!("record_tx dropped"))?;
+                }
             }
-        };
-
-        if !header_line.starts_with('>') {
-            warn!("Invalid FASTA header (missing '>'): {}", header_line);
-            continue;
-        }
-
-        let header = header_line[1..].trim().to_string(); // strip '>'
-        let seq = seq_line.trim().to_string();
-
-        records.push((header, seq));
+            Ok::<(), anyhow::Error>(())
+        }));
     }
+
+    // Spawn a task to collect parsed records into a Vec
+    let collector_handle = tokio::spawn(async move {
+        let mut collected = Vec::with_capacity(1_000_000);
+        while let Some(record) = record_rx.recv().await {
+            collected.push(record);
+        }
+        collected
+    });
+
+    // Stream inputs into the worker pool in batches
+    let mut current_batch = Vec::with_capacity(BATCH_SIZE);
+    while let Some(item) = fasta_stream.next().await {
+        current_batch.push(item);
+        if current_batch.len() >= BATCH_SIZE {
+            batch_tx.send(std::mem::take(&mut current_batch))
+                .await
+                .map_err(|_| PipelineError::Other(anyhow!("batch_tx dropped unexpectedly")))?;
+        }
+    }
+    if !current_batch.is_empty() {
+        batch_tx.send(current_batch).await.map_err(|_| PipelineError::Other(anyhow!("batch_tx dropped")))?;
+    }
+    drop(batch_tx);
+    drop(record_tx); // Important: drop this so the collector knows it's finished
+
+    // Wait for parsing workers to finish
+    for handle in worker_handles {
+        handle.await.map_err(|e| PipelineError::Other(anyhow!("Parsing worker failed: {}", e)))??;
+    }
+
+    // Retrieve collected records
+    let records = collector_handle.await.map_err(|e| PipelineError::Other(anyhow!("Collector task failed: {}", e)))?;
 
     info!("Collected {} mapped contigs for taxid locator generation", records.len());
 

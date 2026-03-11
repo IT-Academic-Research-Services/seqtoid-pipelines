@@ -727,15 +727,15 @@ pub fn generate_locator_work(
             first_byte = pos;
         }
         current_taxid = taxid;
-        
-        let header_line = format!(">{header}\n");
-        let seq_line = format!("{seq}\n");
 
-        writer.write_all(header_line.as_bytes())?;
-        pos += header_line.len() as u64;
+        writer.write_all(b">")?;
+        writer.write_all(header.as_bytes())?;
+        writer.write_all(b"\n")?;
+        pos += 1 + header.len() as u64 + 1;
 
-        writer.write_all(seq_line.as_bytes())?;
-        pos += seq_line.len() as u64;
+        writer.write_all(seq.as_bytes())?;
+        writer.write_all(b"\n")?;
+        pos += seq.len() as u64 + 1;
     }
 
     // loop and a half
