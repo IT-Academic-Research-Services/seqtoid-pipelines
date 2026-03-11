@@ -34,7 +34,7 @@ use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
 use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
-use crate::utils::system::compute_phase_concurrency;
+use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -1638,7 +1638,21 @@ pub async fn generate_taxid_locator(
         8,   // min for meaningful parallelism
     );
 
-    const BATCH_SIZE: usize = 1000;
+    // FASTA header ~100–200 bytes + sequence ~500–2000 bytes → ~800 bytes avg
+    const AVG_RECORD_BYTES: usize = 800;
+
+    // Target ~200–400 MB per batch
+    const TARGET_BATCH_MB: usize = 300;
+
+
+    let batch_size = compute_batch_size(
+        None,                    // est_total_lines
+        AVG_RECORD_BYTES,
+        TARGET_BATCH_MB,
+        concurrency,                       // dummy concurrency — or pass real value if you know it
+    );
+
+    info!("Using dynamic batch size of {} records for taxid locator", batch_size);
 
     // Use a worker pool to parse records from the stream in parallel
     let (record_tx, mut record_rx) = mpsc::channel::<(String, String)>(100_000);
@@ -1709,10 +1723,10 @@ pub async fn generate_taxid_locator(
     });
 
     // Stream inputs into the worker pool in batches
-    let mut current_batch = Vec::with_capacity(BATCH_SIZE);
+    let mut current_batch = Vec::with_capacity(batch_size);
     while let Some(item) = fasta_stream.next().await {
         current_batch.push(item);
-        if current_batch.len() >= BATCH_SIZE {
+        if current_batch.len() >= batch_size {
             batch_tx.send(std::mem::take(&mut current_batch))
                 .await
                 .map_err(|_| PipelineError::Other(anyhow!("batch_tx dropped unexpectedly")))?;
