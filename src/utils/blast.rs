@@ -4,7 +4,7 @@ use std::env::args;
 use std::sync::Arc;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use log::{self, LevelFilter, debug, info, error, warn};
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
@@ -17,14 +17,17 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
 use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use dashmap::DashMap;
+
 
 use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
 use crate::utils::file::write_byte_stream_to_file;
-
+use crate::utils::system::{compute_batch_size, compute_phase_concurrency};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
@@ -361,181 +364,222 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
     }
 }
 
-pub async fn generate_taxon_count_json_from_m8(
-    mut refined_m8_stream: ReceiverStream<ParseOutput>,
-    mut refined_hit_summary_stream: ReceiverStream<ParseOutput>,
-    db_type: &str,
-    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+async fn spawn_batch_processor(
+    batch_m8:           Vec<String>,
+    batch_hit:          Vec<String>,
+    db_type:            String,
+    lineage_map:        Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    mut output_tx: Sender<ParseOutput>,
+    output_tx:          mpsc::Sender<ParseOutput>,
+    semaphore:          Arc<Semaphore>,
+    batch_idx:          u64,
+) -> Result<JoinHandle<Result<()>>> {
+    let permit = semaphore.acquire_owned().await?;
+
+    let task = tokio::spawn(async move {
+        let _permit = permit;
+
+        let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::new();
+
+        for (m8_line, hit_line) in batch_m8.into_iter().zip(batch_hit) {
+            let hit_fields: Vec<&str> = hit_line.split('\t').collect();
+            if hit_fields.len() < 10 { continue; }
+
+            let read_id = hit_fields[0].to_string();
+            let level   = hit_fields.get(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+            let taxid   = hit_fields.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+
+            if taxid <= 0 || level == 0 { continue; }
+
+            if let Ok(m8) = M8Record::parse_line_nt(&m8_line)
+                .or_else(|_| M8Record::parse_line_nr(&m8_line))
+            {
+                let bucket = buckets.entry(taxid).or_default();
+
+                bucket.nonunique_count += 1;
+                bucket.unique_count += duplicate_clusters
+                    .get(&read_id)
+                    .map(|entry| entry.value().size)
+                    .unwrap_or(1);
+
+                bucket.base_count += 1;
+                bucket.sum_percent_identity += m8.pident;
+                bucket.sum_alignment_length += m8.alen as f64;
+                bucket.sum_e_value += m8.evalue;
+                bucket.source_count_type.insert(db_type.clone());
+            }
+        }
+
+        // Emit results for this batch
+        for (taxid, bucket) in buckets {
+            if let Some(lineage) = lineage_map.get(&taxid) {
+                if !should_keep_filter(lineage) { continue; }
+
+                let dcr = if bucket.nonunique_count > 0 {
+                    bucket.unique_count as f64 / bucket.nonunique_count as f64
+                } else {
+                    0.0
+                };
+
+                let percent_identity = if bucket.base_count > 0 {
+                    bucket.sum_percent_identity / bucket.base_count as f64
+                } else { 0.0 };
+
+                let alignment_length = if bucket.base_count > 0 {
+                    bucket.sum_alignment_length / bucket.base_count as f64
+                } else { 0.0 };
+
+                let e_value = if bucket.base_count > 0 {
+                    bucket.sum_e_value / bucket.base_count as f64
+                } else { 0.0 };
+
+                let count = TaxonCount {
+                    tax_id: taxid,
+                    tax_level: 1,
+                    genus_taxid: lineage[1],
+                    family_taxid: lineage[2],
+                    count: bucket.unique_count,
+                    nonunique_count: bucket.nonunique_count,
+                    unique_count: bucket.unique_count,
+                    dcr,
+                    percent_identity,
+                    alignment_length,
+                    e_value,
+                    count_type: db_type.clone(),
+                    base_count: bucket.base_count,
+                    source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+                };
+
+                let json = serde_json::to_string(&count)? + "\n";
+                output_tx.send(ParseOutput::Bytes(Arc::new(json.into_bytes()))).await?;
+            }
+        }
+
+        Ok(())
+    });
+
+    Ok(task)
+}
+
+pub async fn generate_taxon_count_json_from_m8(
+    mut m8_stream_rx:           ReceiverStream<ParseOutput>,
+    mut hit_summary_stream_rx:  ReceiverStream<ParseOutput>,
+    db_type:                    &str,
+    lineage_map:                Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter:         Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_clusters:         Arc<DashMap<String, ClusterInfo>>,
+    output_tx:                  mpsc::Sender<ParseOutput>,
+    concurrency:                usize,
+    batch_size_lines:           usize,
 ) -> Result<()> {
-    let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::with_capacity(500_000);
-
-    // 0: read_id
-    // 1: accession
-    // 2: hit_taxid (often isolate-level)
-    // 3: genus_taxid
-    // 4: family_taxid
-    // 5: consensus_level (1=genus, 2=family, 3=species)
-    let mut read_to_taxid: AHashMap<String, Taxid> = AHashMap::with_capacity(10_000_000);
-    while let Some(item) = refined_hit_summary_stream.next().await {
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 6 {
-            warn!(
-                "Malformed refined hit_summary line (expected 6 fields, got {}): {}",
-                fields.len(),
-                line
-            );
-            continue;
-        }
-
-        let read_id = fields[0].to_string();
-
-        let taxid: Taxid = match fields[2].parse() {
-            Ok(t) if t > 0 => t,
-            Ok(t) => {
-                debug!("Read {} has non-positive taxid {} → skipping", read_id, t);
-                continue;
-            }
-            Err(e) => {
-                warn!("Invalid taxid '{}' in refined hit_summary (parse error: {}): {}", fields[2], e, line);
-                continue;
-            }
-        };
-
-        read_to_taxid.insert(read_id, taxid);
+    if concurrency == 0 {
+        return Err(anyhow::anyhow!("concurrency must be > 0"));
     }
 
-    info!("Loaded {} read → taxid mappings from refined hit summary", read_to_taxid.len());
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
 
-    while let Some(item) = refined_m8_stream.next().await {
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
+    let db_type = db_type.to_string();
+    let mut batch_m8  = Vec::with_capacity(batch_size_lines);
+    let mut batch_hit = Vec::with_capacity(batch_size_lines);
+    let mut batch_idx = 0u64;
 
-        // Parse m8 line — defensive with warnings
-        let m8 = if db_type == NT_TAG {
-            match M8Record::parse_line_nt(&line) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to parse NT m8 line: {} — {}", e, line);
-                    continue;
+    loop {
+        tokio::select! {
+            m8_opt  = m8_stream_rx.next()  => {
+                match m8_opt {
+                    Some(item) => {
+                        if let Ok(bytes) = item.to_bytes() {
+                            if let Ok(line) = String::from_utf8(bytes.to_vec()) {
+                                let trimmed = line.trim_end().to_string();
+                                if !trimmed.is_empty() {
+                                    batch_m8.push(trimmed);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // m8 stream ended → process remaining batch if any, then break
+                        if !batch_m8.is_empty() {
+                            let task = spawn_batch_processor(
+                                std::mem::take(&mut batch_m8),
+                                std::mem::take(&mut batch_hit),
+                                db_type.clone(),
+                                lineage_map.clone(),
+                                should_keep_filter.clone(),
+                                duplicate_clusters.clone(),
+                                output_tx.clone(),
+                                semaphore.clone(),
+                                batch_idx,
+                            ).await?;
+                            tasks.push(task);
+                            batch_idx += 1;
+                        }
+                        break;
+                    }
                 }
             }
-        } else {
-            match M8Record::parse_line_nr(&line) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Failed to parse NR m8 line: {} — {}", e, line);
-                    continue;
+
+            hit_opt = hit_summary_stream_rx.next() => {
+                match hit_opt {
+                    Some(item) => {
+                        if let Ok(bytes) = item.to_bytes() {
+                            if let Ok(line) = String::from_utf8(bytes.to_vec()) {
+                                let trimmed = line.trim_end().to_string();
+                                if !trimmed.is_empty() {
+                                    batch_hit.push(trimmed);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // similar handling as above
+                        if !batch_hit.is_empty() {
+                            let task = spawn_batch_processor(
+                                std::mem::take(&mut batch_m8),
+                                std::mem::take(&mut batch_hit),
+                                db_type.clone(),
+                                lineage_map.clone(),
+                                should_keep_filter.clone(),
+                                duplicate_clusters.clone(),
+                                output_tx.clone(),
+                                semaphore.clone(),
+                                batch_idx,
+                            ).await?;
+                            tasks.push(task);
+                            batch_idx += 1;
+                        }
+                        break;
+                    }
                 }
             }
-        };
-
-        let Some(&taxid) = read_to_taxid.get(&m8.qname) else {
-            // This is expected for unmapped reads — not an error
-            continue;
-        };
-
-        if taxid <= 0 {
-            debug!("Read {} has invalid refined taxid {} — skipping m8 hit", m8.qname, taxid);
-            continue;
         }
 
-        let lineage = match lineage_map.get(&taxid) {
-            Some(l) => l,
-            None => {
-                warn!("Missing lineage for taxid {} (read: {}) — skipping hit", taxid, m8.qname);
-                continue;
-            }
-        };
-
-        if !(should_keep_filter)(lineage) {
-            debug!("Read {} (taxid {}) filtered out by should_keep_filter", m8.qname, taxid);
-            continue;
+        // When both batches are full → dispatch
+        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines {
+            let task = spawn_batch_processor(
+                std::mem::take(&mut batch_m8),
+                std::mem::take(&mut batch_hit),
+                db_type.clone(),
+                lineage_map.clone(),
+                should_keep_filter.clone(),
+                duplicate_clusters.clone(),
+                output_tx.clone(),
+                semaphore.clone(),
+                batch_idx,
+            ).await?;
+            tasks.push(task);
+            batch_idx += 1;
         }
-
-        let bucket = buckets.entry(taxid).or_default();
-        bucket.nonunique_count += 1;
-        bucket.unique_count +=  duplicate_clusters
-            .get(&m8.qname)
-            .map(|entry| entry.value().size)
-            .unwrap_or(1u64);
-        bucket.base_count += 1;
-        bucket.sum_percent_identity += m8.pident;
-        bucket.sum_alignment_length += m8.alen as f64;
-        bucket.sum_e_value += m8.evalue;
-        bucket.source_count_type.insert(db_type.to_string());
     }
 
-    for (taxid, bucket) in buckets {
-        let lineage = match lineage_map.get(&taxid) {
-            Some(l) => l,
-            None => {
-                warn!("No lineage for final taxid {} — skipping output", taxid);
-                continue;
-            }
-        };
-
-        if !(should_keep_filter)(lineage) {
-            continue;
-        }
-
-        let dcr = if bucket.nonunique_count > 0 {
-            bucket.unique_count as f64 / bucket.nonunique_count as f64
-        } else {
-            0.0
-        };
-
-        let percent_identity = if bucket.base_count > 0 {
-            bucket.sum_percent_identity / bucket.base_count as f64
-        } else {
-            0.0
-        };
-
-        let alignment_length = if bucket.base_count > 0 {
-            bucket.sum_alignment_length / bucket.base_count as f64
-        } else {
-            0.0
-        };
-
-        let e_value = if bucket.base_count > 0 {
-            bucket.sum_e_value / bucket.base_count as f64
-        } else {
-            0.0
-        };
-
-        let count = TaxonCount {
-            tax_id: taxid,
-            tax_level: 1, // species-level aggregation
-            genus_taxid: lineage[1],
-            family_taxid: lineage[2],
-            count: bucket.unique_count,
-            nonunique_count: bucket.nonunique_count,
-            unique_count: bucket.unique_count,
-            dcr,
-            percent_identity,
-            alignment_length,
-            e_value,
-            count_type: db_type.to_string(),
-            base_count: bucket.base_count,
-            source_count_type: Some(bucket.source_count_type.iter().cloned().collect()),
-        };
-
-        let json_line = serde_json::to_string(&count)? + "\n";
-        output_tx
-            .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
-            .await
-            .map_err(|_| anyhow!("taxon count output channel dropped"))?;
+    // Wait for remaining tasks
+    for task in tasks {
+        task.await.context("Worker task failed")??;
     }
 
+    info!("Finished taxon count JSON generation for {db_type} ({batch_idx} batches)");
     Ok(())
 }
 
@@ -687,6 +731,22 @@ pub async fn compute_merged_taxon_counts(
         ).await
     });
 
+    let taxon_count_concurrency = compute_phase_concurrency(
+        &config,
+        "taxon_counting",
+        0.4,      // very light
+        4.0,
+        64,
+        4,
+    );
+
+    let taxon_count_batch_size = compute_batch_size(
+        None,               // we don't know total lines yet
+        220,                // rough avg bytes per m8 + hit line
+        150,
+        taxon_count_concurrency,
+    );
+
     generate_taxon_count_json_from_m8(
         ReceiverStream::new(m8_rx),
         ReceiverStream::new(hit_rx),
@@ -695,6 +755,8 @@ pub async fn compute_merged_taxon_counts(
         should_keep_filter.clone(),
         duplicate_clusters.clone(),
         json_tx,
+        taxon_count_concurrency,
+        taxon_count_batch_size
     )
         .await?;
 

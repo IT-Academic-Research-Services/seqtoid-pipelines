@@ -5073,6 +5073,22 @@ pub async fn blast_contigs(
     });
     cleanup_tasks.push(hit_forward_handle);
 
+    let taxon_count_concurrency = compute_phase_concurrency(
+        &config,
+        "taxon_counting",
+        0.4,      // very light
+        4.0,
+        64,
+        4,
+    );
+
+    let taxon_count_batch_size = compute_batch_size(
+        None,               // we don't know total lines yet
+        220,                // rough avg bytes per m8 + hit line
+        150,
+        taxon_count_concurrency,
+    );
+
     let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
     let counts_handle = tokio::spawn(generate_taxon_count_json_from_m8(
         ReceiverStream::new(refined_m8_for_counts_rx),
@@ -5082,6 +5098,8 @@ pub async fn blast_contigs(
         should_keep_filter.clone(),
         duplicate_clusters.clone(),
         refined_counts_tx,
+        taxon_count_concurrency,
+        taxon_count_batch_size
     ));
 
     update_handle.await??;
