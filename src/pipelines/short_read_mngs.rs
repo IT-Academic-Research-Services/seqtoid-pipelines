@@ -2265,7 +2265,7 @@ pub async fn minimap2_non_host_align(
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
 
     // 4. Spawn one task per chunk — all on main Tokio runtime
-    let mut chunk_handles: Vec<JoinHandle<Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> =
+    let mut chunk_handles: Vec<JoinHandle<Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> =
         Vec::with_capacity(chunk_paths.len());
 
     for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
@@ -2282,7 +2282,7 @@ pub async fn minimap2_non_host_align(
         let handle = tokio::spawn(async move {
             // Acquire permit — blocks until a slot is free (limits concurrency)
             let permit = sem
-                .acquire()
+                .acquire_owned()
                 .await
                 .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
 
@@ -2328,12 +2328,18 @@ pub async fn minimap2_non_host_align(
                 .await
                 .context("Failed to parse minimap2 PAF output")?;
 
-            // Drop permit explicitly when job is done (though scope drop is fine too)
-            drop(permit);
+            let chunk_name_clone = chunk_name.clone();
+            let wait_task = tokio::spawn(async move {
+                let status = child.wait().await.context("Failed to wait for minimap2 child")?;
+                if !status.success() {
+                    warn!("minimap2 for {} exited with status: {}", chunk_name_clone, status);
+                }
+                drop(permit); // Permit released only after process ends
+                info!("minimap2 process for {} finished, permit released", chunk_name_clone);
+                Ok::<(), anyhow::Error>(())
+            });
 
-            info!("minimap2 for {} completed (stdout parsing receiver ready)", chunk_name);
-
-            Ok((paf_receiver, stderr_task))
+            Ok((paf_receiver, stderr_task, wait_task))
         });
 
         chunk_handles.push(handle);
@@ -2344,9 +2350,10 @@ pub async fn minimap2_non_host_align(
 
     for handle in chunk_handles {
         match handle.await {
-            Ok(Ok((paf_rx, stderr_task))) => {
+            Ok(Ok((paf_rx, stderr_task, wait_task))) => {
                 partial_paf_receivers.push(ReceiverStream::new(paf_rx));
                 cleanup_tasks.push(stderr_task);
+                cleanup_tasks.push(wait_task);
             }
             Ok(Err(e)) => {
                 return Err(PipelineError::Other(anyhow!("minimap2 chunk failed: {}", e)));
