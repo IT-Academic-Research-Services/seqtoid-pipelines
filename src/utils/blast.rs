@@ -602,89 +602,115 @@ pub async fn compute_merged_taxon_counts(
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-
-    mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults>,
+    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>>,
 ) -> Result<()> {
     // Write merged m8 and hit summary to disk
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
     let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
 
-    // NT pass
-    let mut nt_m8_stream = ReceiverStream::new(nt_m8_stream);
-    let mut nt_hit_stream = ReceiverStream::new(nt_hit_summary_stream);
+    // Channels for synchronized writing
+    let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Arc<Vec<u8>>>(1024);
+    let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Arc<Vec<u8>>>(1024);
 
-    while let (Some(m8_item), Some(hit_item)) = (nt_m8_stream.next().await, nt_hit_stream.next().await) {
-        let m8_bytes = m8_item.to_bytes()?;
-        let hit_bytes = hit_item.to_bytes()?;
-        let hit_line = String::from_utf8_lossy(&hit_bytes);
-        let hit_trimmed = hit_line.trim_end();
-        if hit_trimmed.is_empty() {
-            continue;
-        }
-
-        let hit_fields: Vec<&str> = hit_trimmed.split('\t').collect();
-        if hit_fields.len() < 10 {
-            warn!("Malformed NT hit line: {}", hit_trimmed);
-            continue;
-        }
-
-        let read_id = hit_fields[0];
-
-        let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-        let nt_read = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
-
-        let nr_align = nr_alignment_per_read.get(read_id);
-        let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
-        let has_nr_read = nr_align.map_or(false, |a| a.read.is_some());
-
-        if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
-            merged_m8_file.write_all(&m8_bytes).await?;
+    let m8_write_task = tokio::spawn(async move {
+        while let Some(bytes) = m8_write_rx.recv().await {
+            merged_m8_file.write_all(&bytes).await?;
             merged_m8_file.write_all(b"\n").await?;
-
-            let mut hit_with_source = hit_fields.iter().copied().collect::<Vec<&str>>();
-            hit_with_source.push(NT_TAG);
-            merged_hit_file
-                .write_all(hit_with_source.join("\t").as_bytes())
-                .await?;
-            merged_hit_file.write_all(b"\n").await?;
-
-            nr_alignment_per_read.remove(read_id);
         }
-    }
+        merged_m8_file.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    });
 
-    // Remaining NR pass
-    let mut nr_m8_stream = ReceiverStream::new(nr_m8_stream);
-    let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
-
-    while let (Some(m8_item), Some(hit_item)) = (nr_m8_stream.next().await, nr_hit_stream.next().await) {
-        let hit_bytes = hit_item.to_bytes()?;
-        let hit_line = String::from_utf8_lossy(&hit_bytes);
-        let hit_trimmed = hit_line.trim_end();
-        if hit_trimmed.is_empty() {
-            continue;
-        }
-
-        let hit_fields: Vec<&str> = hit_trimmed.split('\t').collect();
-        let read_id = hit_fields[0];
-
-        if nr_alignment_per_read.contains_key(read_id) {
-            let m8_bytes = m8_item.to_bytes()?;
-            merged_m8_file.write_all(&m8_bytes).await?;
-            merged_m8_file.write_all(b"\n").await?;
-
-            let mut hit_with_source = hit_fields.iter().copied().collect::<Vec<&str>>();
-            hit_with_source.push(NR_TAG);
-            merged_hit_file
-                .write_all(hit_with_source.join("\t").as_bytes())
-                .await?;
+    let hit_write_task = tokio::spawn(async move {
+        while let Some(bytes) = hit_write_rx.recv().await {
+            merged_hit_file.write_all(&bytes).await?;
             merged_hit_file.write_all(b"\n").await?;
         }
-    }
+        merged_hit_file.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    });
 
-    merged_m8_file.flush().await?;
-    merged_hit_file.flush().await?;
-    drop(merged_m8_file);
-    drop(merged_hit_file);
+    // NT pass task
+    let nt_m8_write_tx = m8_write_tx.clone();
+    let nt_hit_write_tx = hit_write_tx.clone();
+    let nr_align_nt = nr_alignment_per_read.clone();
+    let nt_task = tokio::spawn(async move {
+        let mut nt_m8_stream = ReceiverStream::new(nt_m8_stream);
+        let mut nt_hit_stream = ReceiverStream::new(nt_hit_summary_stream);
+
+        while let (Some(m8_item), Some(hit_item)) = (nt_m8_stream.next().await, nt_hit_stream.next().await) {
+            let m8_bytes = if let ParseOutput::Bytes(bytes) = m8_item { bytes } else { continue; };
+            let hit_bytes = hit_item.to_bytes()?;
+            let hit_line = String::from_utf8_lossy(&hit_bytes);
+            let hit_trimmed = hit_line.trim_end();
+            if hit_trimmed.is_empty() {
+                continue;
+            }
+
+            let hit_fields: Vec<&str> = hit_trimmed.split('\t').collect();
+            if hit_fields.len() < 10 {
+                warn!("Malformed NT hit line: {}", hit_trimmed);
+                continue;
+            }
+
+            let read_id = hit_fields[0];
+
+            let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
+            let nt_read = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+
+            let nr_align = nr_align_nt.get(read_id);
+            let has_nr_contig = nr_align.as_deref().map_or(false, |a| a.contig.is_some());
+            let has_nr_read = nr_align.as_deref().map_or(false, |a| a.read.is_some());
+
+            if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
+                nt_m8_write_tx.send(m8_bytes).await?;
+
+                let mut hit_with_source = hit_fields.iter().copied().collect::<Vec<&str>>();
+                hit_with_source.push(NT_TAG);
+                nt_hit_write_tx.send(Arc::new(hit_with_source.join("\t").as_bytes().to_vec())).await?;
+
+                nr_align_nt.remove(read_id);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // NR pass task
+    let nr_m8_write_tx = m8_write_tx;
+    let nr_hit_write_tx = hit_write_tx;
+    let nr_align_nr = nr_alignment_per_read;
+    let nr_task = tokio::spawn(async move {
+        let mut nr_m8_stream = ReceiverStream::new(nr_m8_stream);
+        let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
+
+        while let (Some(m8_item), Some(hit_item)) = (nr_m8_stream.next().await, nr_hit_stream.next().await) {
+            let hit_bytes = hit_item.to_bytes()?;
+            let hit_line = String::from_utf8_lossy(&hit_bytes);
+            let hit_trimmed = hit_line.trim_end();
+            if hit_trimmed.is_empty() {
+                continue;
+            }
+
+            let hit_fields: Vec<&str> = hit_trimmed.split('\t').collect();
+            let read_id = hit_fields[0];
+
+            if nr_align_nr.contains_key(read_id) {
+                let m8_bytes = if let ParseOutput::Bytes(bytes) = m8_item { bytes } else { continue; };
+                nr_m8_write_tx.send(m8_bytes).await?;
+
+                let mut hit_with_source = hit_fields.iter().copied().collect::<Vec<&str>>();
+                hit_with_source.push(NR_TAG);
+                nr_hit_write_tx.send(Arc::new(hit_with_source.join("\t").as_bytes().to_vec())).await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    nt_task.await??;
+    nr_task.await??;
+
+    m8_write_task.await??;
+    hit_write_task.await??;
     info!("Merged alignment files written to disk");
 
     // Stream merged files back for taxon counting

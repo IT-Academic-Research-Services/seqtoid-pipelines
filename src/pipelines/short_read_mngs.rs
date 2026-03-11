@@ -6351,7 +6351,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     //prelod
-    let mut nr_alignment_per_read: HashMap<String, SpeciesAlignmentResults> = HashMap::with_capacity(80_000_000);
+    let mut nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>> = Arc::new(DashMap::with_capacity(80_000_000));
 
     let mut preload_stream = ReceiverStream::new(nr_hit_summary_preload);
     while let Some(item) = preload_stream.next().await {
