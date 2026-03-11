@@ -776,7 +776,7 @@ pub async fn compute_merged_taxon_counts(
     let merged_taxon_counts_path_clone = merged_taxon_counts_path.clone();
     let config_clone = config.clone();
 
-    let (json_tx, json_rx) = mpsc::channel(1024);
+    let (json_tx, json_rx) = mpsc::channel(4096);
     let write_task = tokio::spawn(async move {
         write_byte_stream_to_file(
             &merged_taxon_counts_path_clone,
