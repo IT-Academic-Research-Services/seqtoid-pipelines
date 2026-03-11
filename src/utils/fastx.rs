@@ -32,8 +32,9 @@ use fst::{MapBuilder};
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
+use crate::utils::system::compute_phase_concurrency;
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -1370,6 +1371,7 @@ pub fn build_fasta_index(
 
 
 pub async fn generate_taxid_fasta(
+    config: Arc<RunConfig>,
     mapped_contigs_stream: ReceiverStream<ParseOutput>,
     unidentified_contigs_stream: ReceiverStream<ParseOutput>,
     nt_hit_summary_stream: ReceiverStream<ParseOutput>,
@@ -1387,8 +1389,8 @@ pub async fn generate_taxid_fasta(
     let (combined_tx, combined_rx) = mpsc::channel(2048);
 
     // Channels for completed hit maps
-    let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<AHashMap<String, (Taxid, u8)>>(1);
-    let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<AHashMap<String, (Taxid, u8)>>(1);
+    let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
+    let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
 
     // Load NT hit summary → build map
     let load_nt_task = tokio::spawn({
@@ -1408,7 +1410,7 @@ pub async fn generate_taxid_fasta(
                     hits.insert(read_id, (taxid, level));
                 }
             }
-            nt_hits_tx.send(hits).await.map_err(|_| anyhow!("NT hits tx dropped"))?;
+            nt_hits_tx.send(Arc::new(hits)).await.map_err(|_| anyhow!("NT hits tx dropped"))?;
             Ok(())
         }
     });
@@ -1431,7 +1433,7 @@ pub async fn generate_taxid_fasta(
                     hits.insert(read_id, (taxid, level));
                 }
             }
-            nr_hits_tx.send(hits).await.map_err(|_| anyhow!("NR hits tx dropped"))?;
+            nr_hits_tx.send(Arc::new(hits)).await.map_err(|_| anyhow!("NR hits tx dropped"))?;
             Ok(())
         }
     });
@@ -1442,57 +1444,158 @@ pub async fn generate_taxid_fasta(
         let nt_hits = nt_hits_rx.recv().await.ok_or(anyhow!("NT hits map not received"))?;
         let nr_hits = nr_hits_rx.recv().await.ok_or(anyhow!("NR hits map not received"))?;
 
-        // Process annotated (mapped) contigs
-        let mut mapped_stream = mapped_contigs_stream;
-        while let Some(item) = mapped_stream.next().await {
-            if let ParseOutput::Fasta(rec) = item {
-                let annotated_id = rec.id();
-                let parts: Vec<&str> = annotated_id.split(':').collect();
-                let contig_id = parts.last().unwrap_or(&"").to_string();
+        let concurrency = compute_phase_concurrency(
+            &config,
+            "generate_taxid_fasta",
+            0.5,           // ~0.5 GB per thread max
+            4.0,           // 4 threads per core
+            64,            // cap
+            8,             // min for meaningful parallelism
+        );
 
-                let nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
-                let nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+        const BATCH_SIZE: usize = 1000;
 
-                let new_header = format!(
-                    ">family_nr:{}:family_nt:{}:genus_nr:{}:genus_nt:{}:species_nr:{}:species_nt:{}:{}\n",
-                    nr_lineage[2], nt_lineage[2],
-                    nr_lineage[1], nt_lineage[1],
-                    nr_lineage[0], nt_lineage[0],
-                    annotated_id
-                );
+        // Process annotated (mapped) contigs in parallel
+        {
+            let (batch_tx, batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
+            let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+            
+            let mut worker_handles = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                let rx = batch_rx.clone();
+                let m_tx = mapped_tx.clone();
+                let c_tx = combined_tx.clone();
+                let nt_hits = nt_hits.clone();
+                let nr_hits = nr_hits.clone();
+                let lineage_map = lineage_map.clone();
 
-                let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
-                let seq_arc = match rec {
-                    SequenceRecord::Fasta { seq, .. } => seq,
-                    _ => unreachable!(),
-                };
-                let new_rec = SequenceRecord::Fasta {
-                    id: new_id,
-                    desc: new_desc,
-                    seq: seq_arc,
-                };
+                worker_handles.push(tokio::spawn(async move {
+                    loop {
+                        let batch = {
+                            let mut lock = rx.lock().await;
+                            lock.recv().await
+                        };
 
-                mapped_tx.send(ParseOutput::Fasta(new_rec.clone())).await?;
-                combined_tx.send(ParseOutput::Fasta(new_rec)).await?;
+                        let batch = match batch {
+                            Some(b) => b,
+                            None => break,
+                        };
+
+                        for rec in batch {
+                            let annotated_id = rec.id();
+                            let parts: Vec<&str> = annotated_id.split(':').collect();
+                            let contig_id = parts.last().unwrap_or(&"").to_string();
+
+                            let nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
+                            let nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+
+                            let new_header = format!(
+                                ">family_nr:{}:family_nt:{}:genus_nr:{}:genus_nt:{}:species_nr:{}:species_nt:{}:{}\n",
+                                nr_lineage[2], nt_lineage[2],
+                                nr_lineage[1], nt_lineage[1],
+                                nr_lineage[0], nt_lineage[0],
+                                annotated_id
+                            );
+
+                            let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
+                            let seq_arc = rec.seq_arc();
+                            let new_rec = SequenceRecord::Fasta {
+                                id: new_id,
+                                desc: new_desc,
+                                seq: seq_arc,
+                            };
+
+                            m_tx.send(ParseOutput::Fasta(new_rec.clone())).await.map_err(|_| anyhow!("mapped_tx dropped"))?;
+                            c_tx.send(ParseOutput::Fasta(new_rec)).await.map_err(|_| anyhow!("combined_tx dropped"))?;
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }));
+            }
+
+            let mut mapped_stream = mapped_contigs_stream;
+            let mut current_batch = Vec::with_capacity(BATCH_SIZE);
+            while let Some(item) = mapped_stream.next().await {
+                match item {
+                    ParseOutput::Fasta(rec) => {
+                        current_batch.push(rec);
+                        if current_batch.len() >= BATCH_SIZE {
+                            batch_tx.send(std::mem::take(&mut current_batch))
+                                .await
+                                .map_err(|_| anyhow!("batch_tx dropped unexpectedly during mapped_stream processing"))?;
+                        }
+                    }
+                    _ => return Err(anyhow!("Unexpected item type in mapped_contigs_stream: expected Fasta")),
+                }
+            }
+            if !current_batch.is_empty() {
+                batch_tx.send(current_batch).await.map_err(|_| anyhow!("batch_tx dropped"))?;
+            }
+            drop(batch_tx);
+
+            for handle in worker_handles {
+                handle.await??;
             }
         }
 
         // Process unidentified contigs → conform headers
-        let mut unid_stream = unidentified_contigs_stream;
-        while let Some(item) = unid_stream.next().await {
-            if let ParseOutput::Fasta(rec) = item {
-                let conformed_header = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
-                let (new_id, new_desc) = parse_header(conformed_header.as_bytes(), '>');
-                let seq_arc = match rec {
-                    SequenceRecord::Fasta { seq, .. } => seq,
-                    _ => unreachable!(),
-                };
-                let new_rec = SequenceRecord::Fasta {
-                    id: new_id,
-                    desc: new_desc,
-                    seq: seq_arc,
-                };
-                combined_tx.send(ParseOutput::Fasta(new_rec)).await?;
+        // Also parallelize this since it can be many contigs
+        {
+            let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
+            let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
+            let mut unid_worker_handles = Vec::with_capacity(concurrency);
+
+            for _ in 0..concurrency {
+                let rx = unid_batch_rx.clone();
+                let c_tx = combined_tx.clone();
+                unid_worker_handles.push(tokio::spawn(async move {
+                    loop {
+                        let batch = {
+                            let mut lock = rx.lock().await;
+                            lock.recv().await
+                        };
+                        let batch = match batch {
+                            Some(b) => b,
+                            None => break,
+                        };
+                        for rec in batch {
+                            let conformed_header = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
+                            let (new_id, new_desc) = parse_header(conformed_header.as_bytes(), '>');
+                            let seq_arc = rec.seq_arc();
+                            let new_rec = SequenceRecord::Fasta {
+                                id: new_id,
+                                desc: new_desc,
+                                seq: seq_arc,
+                            };
+                            c_tx.send(ParseOutput::Fasta(new_rec)).await.map_err(|_| anyhow!("combined_tx dropped"))?;
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }));
+            }
+
+            let mut unid_stream = unidentified_contigs_stream;
+            let mut current_unid_batch = Vec::with_capacity(BATCH_SIZE);
+            while let Some(item) = unid_stream.next().await {
+                match item {
+                    ParseOutput::Fasta(rec) => {
+                        current_unid_batch.push(rec);
+                        if current_unid_batch.len() >= BATCH_SIZE {
+                            unid_batch_tx.send(std::mem::take(&mut current_unid_batch))
+                                .await
+                                .map_err(|_| anyhow!("unid_batch_tx dropped unexpectedly during unidentified_contigs_stream processing"))?;
+                        }
+                    }
+                    _ => return Err(anyhow!("Unexpected item type in unidentified_contigs_stream: expected Fasta")),
+                }
+            }
+            if !current_unid_batch.is_empty() {
+                unid_batch_tx.send(current_unid_batch).await.map_err(|_| anyhow!("unid_batch_tx dropped"))?;
+            }
+            drop(unid_batch_tx);
+
+            for handle in unid_worker_handles {
+                handle.await??;
             }
         }
 
