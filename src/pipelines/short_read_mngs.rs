@@ -5691,14 +5691,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
-        true,
+        false,
     ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
     let non_host_r1_path = non_host_temp_dir.path().join("nonhost_R1.fastq");
     let non_host_r2_path_opt = r2_rx_opt.as_ref().map(|_| non_host_temp_dir.path().join("nonhost_R2.fastq"));
 
-    info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion)");
+    info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion). Writing to: {:?}", non_host_temp_dir);
 
     let r1_write_task = write_parse_output_to_file(
         &non_host_r1_path,
@@ -5723,6 +5723,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
 
     deinterleave_handle.await??;
+
+    info!("Checkpoint complete. Files: r1:{:?}   r2:{:?}", non_host_r1_path, non_host_r2_path_opt);
 
     // Early cleanup upstream temp dirs (host filter, etc.)
     for td in &host_filter_temp_dirs {
