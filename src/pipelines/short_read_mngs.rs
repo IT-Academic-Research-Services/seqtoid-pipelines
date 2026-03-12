@@ -2217,7 +2217,8 @@ pub async fn minimap2_non_host_align(
         )));
     }
 
-    chunk_paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
+    chunk_paths.sort_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(0));
+
 
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
@@ -2241,19 +2242,18 @@ pub async fn minimap2_non_host_align(
     );
 
     const MIN_THREADS_PER_JOB: usize = 4;
-    const MAX_THREADS_PER_JOB: usize = 12;
+    const MAX_THREADS_PER_JOB: usize = 16;
 
     let concurrency = compute_phase_concurrency(
         &config,
         "minimap2_nt",
         est_gb_per_job as f64,
         6.0,
-        20,
+        24,
         4,
     );
 
-    let threads_per_job = (config.max_cores / concurrency)
-        .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
+    let threads_per_job = (config.max_cores / concurrency).clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
         "NT minimap2 stage: {} concurrent jobs × {} threads/job (est peak ~{} GiB)",
@@ -2279,6 +2279,8 @@ pub async fn minimap2_non_host_align(
         let config = config.clone();
         let r1 = r1_path.clone();
         let r2 = r2_path_opt.clone();
+
+        sleep(Duration::from_secs(rand::rng().random_range(0..3))).await;
 
         let handle = tokio::spawn(async move {
             // Acquire permit — blocks until a slot is free (limits concurrency)
@@ -2344,6 +2346,7 @@ pub async fn minimap2_non_host_align(
         });
 
         chunk_handles.push(handle);
+
     }
 
     // 5. Collect results as they complete
