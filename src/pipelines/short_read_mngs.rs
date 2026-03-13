@@ -47,6 +47,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
 use tokio::runtime::Builder as RuntimeBuilder;
+use tokio::task::spawn_blocking;
 use twox_hash::XxHash64;
 use rayon::prelude::*;
 use crate::cli::Technology;
@@ -2013,6 +2014,8 @@ async fn subsample_weighted(
 }
 
 
+
+
 async fn subsample_uniform(
     config: Arc<RunConfig>,
     uniques_rx: mpsc::Receiver<ParseOutput>,
@@ -2023,22 +2026,34 @@ async fn subsample_uniform(
     let (count_tx, count_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(uniques_rx);
-        let mut records: Vec<ParseOutput> = Vec::new();
+        // 1. Drain the stream synchronously inside spawn_blocking
+        let drain_result = tokio::task::spawn_blocking(move || {
+            let mut stream = ReceiverStream::new(uniques_rx);
+            let mut records = Vec::new();
+            let mut total = 0u64;
 
-        while let Some(item) = stream.next().await {
-            if let ParseOutput::Fastq(_) = &item {
-                records.push(item);
+            while let Some(item) = futures::executor::block_on(stream.next()) {
+                if let ParseOutput::Fastq(_) = &item {
+                    records.push(item);
+                    total += 1;
+                }
             }
-        }
 
-        let total = records.len() as u64;
+            Ok((records, total)) as Result<(Vec<ParseOutput>, u64), anyhow::Error>
+        }).await??;  // Here ?? works because spawn_blocking result is Result<_, JoinError>
+
+        let (records, total) = drain_result;  // Unpack the Ok tuple
+
         let subsample_size = max_subsample.min(total / if paired { 2 } else { 1 }) * if paired { 2 } else { 1 };
 
         let mut rng = config.rng.clone();
         let mut indices: Vec<usize> = (0..records.len()).collect();
         indices.shuffle(&mut rng);
-        let sampled: Vec<ParseOutput> = indices.into_iter().take(subsample_size as usize).map(|i| records[i].clone()).collect();
+        let sampled: Vec<ParseOutput> = indices
+            .into_iter()
+            .take(subsample_size as usize)
+            .map(|i| records[i].clone())
+            .collect();
 
         for item in sampled {
             tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
