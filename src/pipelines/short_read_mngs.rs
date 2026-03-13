@@ -2014,47 +2014,38 @@ async fn subsample_weighted(
 
 async fn subsample_uniform(
     config: Arc<RunConfig>,
-    uniques_rx: mpsc::Receiver<ParseOutput>,
-    max_subsample: u64,  // Target sampled reads (2M for 1M pairs if paired)
-) -> Result<(mpsc::Receiver<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<()>>)> {
-    let (tx, rx) = mpsc::channel(config.base_buffer_size);
-    let (count_tx, count_rx) = oneshot::channel();
-
-    let task = tokio::spawn({
-        let mut rng = config.rng.clone();  // Clone here for mut in task (cheap, thread-safe)
-        async move {
-            let mut stream = ReceiverStream::new(uniques_rx);
-            let mut reservoir: Vec<ParseOutput> = Vec::with_capacity(max_subsample as usize);
-            let mut record_count = 0u64;
-
-            while let Some(item) = stream.next().await {
-                if let ParseOutput::Fastq(_) = &item {  // Assume Fastq
-                    record_count += 1;
-                    if reservoir.len() < max_subsample as usize {
-                        reservoir.push(item);
-                    } else {
-                        let j = rng.gen_range(0..record_count);
-                        if j < max_subsample {
-                            reservoir[j as usize] = item;
-                        }
-                    }
-                } else {
-                    return Err(anyhow!("Unexpected non-Fastq in subsample input"));
-                }
-            }
-
-            // Stream out sampled items (random order OK, or shuffle if needed)
-            for item in reservoir {
-                tx.send(item).await.map_err(|_| anyhow!("Subsample send failed"))?;
-            }
-
-            info!("Subsample distributor processed {} uniques", record_count);
-            count_tx.send(record_count).map_err(|_| anyhow!("Count send failed"))?;  // Or sampled count
-            Ok(())
+    uniques_stream: mpsc::Receiver<ParseOutput>,
+    max_subsample: u64,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let mut records = Vec::new();
+    let mut stream = ReceiverStream::new(uniques_stream);
+    while let Some(item) = stream.next().await {
+        if let ParseOutput::Fastq(rec) = item {
+            records.push(rec);
         }
+    }
+
+    let subsample_size = max_subsample.min(records.len() as u64) as usize;
+
+    // Uniform random sampling: shuffle indices and take first N
+    let mut rng = config.rng.clone();
+    let mut indices: Vec<usize> = (0..records.len()).collect();
+    indices.shuffle(&mut rng);  // Shuffle all indices randomly
+    let sampled_indices: Vec<usize> = indices.into_iter().take(subsample_size).collect();
+
+    let count = sampled_indices.len() as u64;
+    let (count_tx, count_rx) = oneshot::channel();
+    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+
+    let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        for idx in sampled_indices {
+            tx.send(ParseOutput::Fastq(records[idx].clone())).await?;
+        }
+        Ok(())
     });
 
-    Ok((rx, count_rx, task))
+    Ok((ReceiverStream::new(rx), count_rx, send_task))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -5573,7 +5564,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
    cleanup_tasks.push(subsample_send_task);
 
     let subsample_monitored = monitor_stream(
-        ReceiverStream::new(subsampled_stream),
+        subsampled_stream,
         "subsample",
         Duration::from_secs(5),
     );
