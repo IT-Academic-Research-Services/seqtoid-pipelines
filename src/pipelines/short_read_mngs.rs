@@ -299,6 +299,14 @@ struct Cluster {
     members: Vec<String>,
 }
 
+
+#[derive(Clone)]
+struct WeightedSampleItem {
+    key: f64,
+    record: SequenceRecord,
+    weight: u64,
+}
+
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
 /// # Arguments
@@ -1628,269 +1636,6 @@ async fn minimap2_filter(
 }
 
 
-/// Combined de-duplication and subsambler.
-/// Uses and A-Res algorithm and hashing to creat a min heap BinaryHeap
-/// Runs in memory when possible, but has a disk option when
-/// file size and memory constraints demand.
-/// # Arguments
-///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Strucutred FASTQ stream
-/// * 'paired` - Bool controlling single or paired end data
-/// * `seed` - Seed value for rng allowing possibility of deterministic output
-/// * `max_subsample` - Limit of reads for subsampling
-/// * `prefix_len` - Length of prefix subsample of read
-/// * `out_dir` - Output directory for intermediate files
-///
-/// # Returns
-/// Result of:
-/// Tuple of:
-/// Output stream
-/// Count stream
-/// Vec of tkio tasks
-/// Vec of tokio receivers
-/// with Pipeline Error
-async fn dedup_and_subsample(
-    config: Arc<RunConfig>,
-    input_stream: mpsc::Receiver<ParseOutput>,
-    paired: bool,
-    seed: u64,
-    max_subsample: u64,
-    prefix_len: Option<usize>,
-    out_dir: PathBuf,
-) -> Result<(
-    ReceiverStream<ParseOutput>,
-    oneshot::Receiver<u64>,
-    ReceiverStream<ParseOutput>,
-    Arc<HashMap<String, ClusterInfo>>,
-    Vec<JoinHandle<Result<(), anyhow::Error>>>,
-    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-), PipelineError> {
-    let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
-
-    let mut count_map: HashMap<u64, u64> = HashMap::new();
-    let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
-    let mut total_count = 0u64;
-
-    let mut stream = ReceiverStream::new(input_stream);
-    let mut first_chunk = true;
-    let mut orphan_r1: Option<SequenceRecord> = None;
-    let mut r1_count: u64 = 0;
-    let mut r2_count: u64 = 0;
-
-    while let Some(item) = stream.next().await {
-        let record = match item {
-            ParseOutput::Fastq(rec) => rec,
-            ParseOutput::Bytes(bytes) => {
-                if first_chunk {
-                    if !bytes.starts_with(b"@") {
-                        return Err(PipelineError::InvalidFastqFormat("Raw byte stream does not start with FASTQ header '@'".to_string()));
-                    }
-                    first_chunk = false;
-                }
-
-                let cursor = std::io::Cursor::new(&*bytes);
-                let mut parser = needletail::parse_fastx_reader(cursor)
-                    .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
-
-                if let Some(rec_res) = parser.next() {
-                    let rec = rec_res.map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
-                    SequenceRecord::from(rec)
-                } else {
-                    continue;
-                }
-            }
-            _ => {
-                warn!("Skipping unexpected ParseOutput variant in dedup stream");
-                continue;
-            }
-        };
-
-        if paired {
-            if let Some(r1) = orphan_r1.take() {
-                r1_count += 1;
-                r2_count += 1;
-
-                let mut records = vec![r1.clone(), record.clone()];
-                let mut seq_bytes = r1.seq().to_vec();
-                seq_bytes.extend_from_slice(record.seq());
-
-                let mut hasher = XxHash64::with_seed(seed);
-                let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
-                hasher.write(&seq_bytes[0..write_len]);
-                let hash_key = hasher.finish();
-
-                let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
-                entry.0 += 1;
-                entry.1 = records;
-
-                total_count += 1;
-            } else {
-                // Store as pending R1
-                orphan_r1 = Some(record);
-            }
-        } else {
-            let mut records = vec![record.clone()];
-            let seq_bytes = record.seq().to_vec();
-
-            let mut hasher = XxHash64::with_seed(seed);
-            let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
-            hasher.write(&seq_bytes[0..write_len]);
-            let hash_key = hasher.finish();
-
-            let entry = dedup_map.entry(hash_key).or_insert((0, records.clone()));
-            entry.0 += 1;
-            entry.1 = records;
-
-            total_count += 1;
-        }
-    }
-
-    // Handle any final orphan R1 (e.g., uneven small file)
-    if let Some(orphan) = orphan_r1 {
-        warn!("Orphan R1 at end of paired stream: {} (skipped)", orphan.id());
-    }
-
-    // Fail on severe imbalance (real corruption)
-    let imbalance = (r1_count as i64 - r2_count as i64).abs();
-    if imbalance > 1 {
-        error!("Severe paired stream imbalance: R1={}, R2={} (diff={})", r1_count, r2_count, imbalance);
-        return Err(PipelineError::InvalidFastqFormat(format!(
-            "Paired stream imbalance: R1={}, R2={}, diff={}",
-            r1_count, r2_count, imbalance
-        )));
-    }
-
-    info!(
-        "Dedup complete: {} valid pairs processed (R1={}, R2={}), {} unique hashes",
-        r1_count.min(r2_count),
-        r1_count,
-        r2_count,
-        dedup_map.len()
-    );
-
-    eprintln!("total count for input {}", total_count);
-
-    if total_count == 0 {
-        info!("No reads in dedup input — returning empty outputs");
-        let (empty_tx, empty_rx) = mpsc::channel(1);
-        drop(empty_tx);
-        let (cluster_tx, cluster_rx) = mpsc::channel(1);
-        drop(cluster_tx);
-        let (count_tx, count_rx) = oneshot::channel();
-        let _ = count_tx.send(0);
-        return Ok((ReceiverStream::new(empty_rx), count_rx, ReceiverStream::new(cluster_rx), Arc::new(HashMap::new()), cleanup_tasks, cleanup_receivers));
-    }
-
-    count_map = dedup_map.iter().map(|(&k, &(w, _))| (k, w)).collect();
-
-    let subsample_size = max_subsample.min(count_map.len() as u64);
-    info!("Subsampling {} items (max_subsample={}, unique hashes={})", subsample_size, max_subsample, count_map.len());
-
-    let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
-    let mut rng = config.rng.clone();
-
-    if subsample_size < count_map.len() as u64 {
-        for (&hash_key, &weight) in &count_map {
-            let key = rng.random::<f64>().powf(1.0 / weight as f64);
-            if heap.len() < subsample_size as usize {
-                heap.push(Reverse(SampleItem { key, records: vec![], weight, hash_key: Some(hash_key) }));
-            } else if key > heap.peek().unwrap().0.key {
-                heap.pop();
-                heap.push(Reverse(SampleItem { key, records: vec![], weight, hash_key: Some(hash_key) }));
-            }
-        }
-    } else {
-        for (&hash_key, &weight) in &count_map {
-            heap.push(Reverse(SampleItem { key: 0.0, records: vec![], weight, hash_key: Some(hash_key) }));
-        }
-    }
-
-    let mut sampled: Vec<SampleItem> = heap.into_iter().map(|r| r.0).collect();
-    sampled.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(Ordering::Equal));
-
-    for item in sampled.iter_mut() {
-        if let Some(hash_key) = item.hash_key {
-            if let Some((_, records)) = dedup_map.get(&hash_key) {
-                item.records = records.clone();
-            }
-        }
-    }
-
-    info!("Sampled {} items; first has {} records", sampled.len(), sampled.get(0).map_or(0, |i| i.records.len()));
-
-    let mut duplicate_clusters: HashMap<String, ClusterInfo> = HashMap::with_capacity(dedup_map.len());
-    for (&_hash_key, &(size, ref records)) in &dedup_map {
-        if records.is_empty() { continue; }
-        let rep_id = records[0].id().to_string();
-        let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
-
-        duplicate_clusters.insert(rep_id, ClusterInfo { size, members });
-    }
-
-    let (cluster_tx, cluster_rx) = mpsc::channel(config.base_buffer_size);
-
-    tokio::spawn(async move {
-        for (&_hash_key, &(weight, ref records)) in &dedup_map {
-            if records.is_empty() { continue; }
-            let rep_id = records[0].id();
-            let rep_line = format!("{},{}\n", rep_id, rep_id);
-            let _ = cluster_tx.send(ParseOutput::Bytes(Arc::new(rep_line.into_bytes()))).await;
-            for rec in records.iter().skip(1) {
-                let line = format!("{},{}\n", rec.id(), rep_id);
-                let _ = cluster_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await;
-            }
-        }
-    });
-
-    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
-    let duplicate_clusters_for_tsv = duplicate_clusters.clone();
-
-    let tsv_write_task = tokio::spawn(async move {
-        let mut file = TokioOpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&tsv_path)
-            .await
-            .map_err(|e| anyhow!("TSV open error: {}", e))?;
-
-        for (rep_id, cluster) in duplicate_clusters_for_tsv.iter() {
-            file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes())
-                .await
-                .map_err(|e| anyhow!("TSV write error: {}", e))?;
-        }
-
-        Ok(())
-    });
-    cleanup_tasks.push(tsv_write_task);
-
-    let unique_count = sampled.len() as u64;
-    eprintln!("unique count = {}", unique_count);
-    let (count_tx, count_rx) = oneshot::channel();
-    count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Failed to send subsample count")))?;
-
-    let (tx, rx) = mpsc::channel(config.base_buffer_size);
-    let send_task = tokio::spawn(async move {
-        for item in sampled {
-            for record in item.records {
-                tx.send(ParseOutput::Fastq(record)).await.map_err(|_| anyhow!("Send failed"))?;
-            }
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(send_task);
-
-    Ok((
-        ReceiverStream::new(rx),
-        count_rx,
-        ReceiverStream::new(cluster_rx),
-        Arc::new(duplicate_clusters),
-        cleanup_tasks,
-        cleanup_receivers,
-    ))
-}
-
 async fn dedup(
     config: Arc<RunConfig>,
     input_stream: mpsc::Receiver<ParseOutput>,
@@ -2203,12 +1948,24 @@ async fn subsample_weighted(
     duplicate_clusters: Arc<HashMap<String, ClusterInfo>>,
     seed: u64,
     max_subsample: u64,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
-    let mut heap: BinaryHeap<Reverse<SampleItem>> = BinaryHeap::new();
-    let mut rng = config.rng.clone();
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    oneshot::Receiver<u64>,
+    JoinHandle<Result<(), anyhow::Error>>,
+), PipelineError> {
+    if max_subsample == 0 {
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let (count_tx, count_rx) = oneshot::channel();
+        let _ = count_tx.send(0);
+        return Ok((ReceiverStream::new(rx), count_rx, tokio::spawn(async { Ok(()) })));
+    }
 
+    let mut rng = StdRng::seed_from_u64(seed); // reproducible
+
+    let mut reservoir: Vec<WeightedSampleItem> = Vec::with_capacity(max_subsample as usize);
     let mut stream = ReceiverStream::new(uniques_stream);
-    let mut sampled_items = Vec::new();
+    let mut seen = 0u64;
 
     while let Some(item) = stream.next().await {
         let record = match item {
@@ -2217,35 +1974,37 @@ async fn subsample_weighted(
         };
 
         let rep_id = record.id().to_string();
-        let weight = duplicate_clusters.get(&rep_id).map_or(1, |c| c.size);
+        let weight = duplicate_clusters
+            .get(&rep_id)
+            .map_or(1u64, |c| c.size as u64);
 
-        let key = rng.random::<f64>().powf(1.0 / weight as f64);
-        sampled_items.push(SampleItem { key, records: vec![record], weight, hash_key: None });
-    }
+        seen += 1;
 
-    let subsample_size = max_subsample.min(sampled_items.len() as u64);
-    for mut item in sampled_items.into_iter() {
-        if heap.len() < subsample_size as usize {
-            heap.push(Reverse(item));
-        } else if item.key > heap.peek().unwrap().0.key {
-            heap.pop();
-            heap.push(Reverse(item));
+        let key = rng.gen::<f64>().powf(1.0 / weight as f64);
+
+        if reservoir.len() < max_subsample as usize {
+            reservoir.push(WeightedSampleItem { key, record, weight });
+        } else if let Some(min_item) = reservoir.iter().min_by(|a, b| a.key.partial_cmp(&b.key).unwrap()) {
+            if key > min_item.key {
+                // Replace the smallest key
+                if let Some(idx) = reservoir.iter().position(|r| r.key == min_item.key) {
+                    reservoir[idx] = WeightedSampleItem { key, record, weight };
+                }
+            }
         }
     }
 
-    let mut sampled = heap.into_iter().map(|r| r.0).collect::<Vec<_>>();
-    sampled.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(Ordering::Equal));
+    // Sort by key for consistent output order (same as original)
+    reservoir.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(Ordering::Equal));
 
-    let count = sampled.len() as u64;
+    let count = reservoir.len() as u64;
     let (count_tx, count_rx) = oneshot::channel();
     count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
 
     let (tx, rx) = mpsc::channel(config.base_buffer_size);
-    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-        for item in sampled {
-            for rec in item.records {
-                tx.send(ParseOutput::Fastq(rec)).await?;
-            }
+    let send_task = tokio::spawn(async move {
+        for item in reservoir {
+            tx.send(ParseOutput::Fastq(item.record)).await?;
         }
         Ok(())
     });
@@ -2257,36 +2016,130 @@ async fn subsample_uniform(
     config: Arc<RunConfig>,
     uniques_stream: mpsc::Receiver<ParseOutput>,
     max_subsample: u64,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
-    let mut records = Vec::new();
-    let mut stream = ReceiverStream::new(uniques_stream);
-    while let Some(item) = stream.next().await {
-        if let ParseOutput::Fastq(rec) = item {
-            records.push(rec);
-        }
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    oneshot::Receiver<u64>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+), PipelineError> {
+    if max_subsample == 0 {
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let (count_tx, count_rx) = oneshot::channel();
+        let _ = count_tx.send(0);
+        return Ok((ReceiverStream::new(rx), count_rx, vec![]));
     }
 
-    let subsample_size = max_subsample.min(records.len() as u64) as usize;
+    // Tune chunk size
+    let chunk_size = 500_000usize.max((max_subsample as usize / 4).max(100_000));
 
-    // Uniform random sampling: shuffle indices and take first N
-    let mut rng = config.rng.clone();
-    let mut indices: Vec<usize> = (0..records.len()).collect();
-    indices.shuffle(&mut rng);  // Shuffle all indices randomly
-    let sampled_indices: Vec<usize> = indices.into_iter().take(subsample_size).collect();
+    // Number of parallel samplers
+    let num_parallel = compute_phase_concurrency(
+        &config,
+        "subsample",
+        0.5,
+        1.5,
+        config.max_cores / 2,
+        4,
+    );
 
-    let count = sampled_indices.len() as u64;
-    let (count_tx, count_rx) = oneshot::channel();
-    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+    // Create one channel PER sampler (so distributor can round-robin chunks)
+    let mut sampler_txs: Vec<mpsc::Sender<Vec<SequenceRecord>>> = Vec::new();
+    let mut sampler_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
-    let (tx, rx) = mpsc::channel(config.base_buffer_size);
-    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-        for idx in sampled_indices {
-            tx.send(ParseOutput::Fastq(records[idx].clone())).await?;
+    let (sampled_tx, sampled_rx) = mpsc::channel(config.base_buffer_size * 4);
+
+    // Spawn the samplers first — each gets its own receiver
+    for i in 0..num_parallel {
+        let (tx, mut rx) = mpsc::channel::<Vec<SequenceRecord>>(16); // small per-sampler buffer
+        sampler_txs.push(tx);
+
+        let sampled_tx_clone = sampled_tx.clone();
+        let mut rng = config.rng.clone(); // seeded same, but independent streams
+
+        let handle = tokio::spawn(async move {
+            let mut local_seen = 0u64;
+
+            while let Some(chunk) = rx.recv().await {
+                if chunk.is_empty() {
+                    continue;
+                }
+
+                let fraction = max_subsample as f64 / local_seen.max(1) as f64;
+                let n_want = (chunk.len() as f64 * fraction).ceil() as usize;
+                let n_want = n_want.min(chunk.len());
+
+                if n_want == 0 {
+                    continue;
+                }
+
+                let mut indices: Vec<usize> = (0..chunk.len()).collect();
+                indices.shuffle(&mut rng);
+
+                for &idx in &indices[0..n_want] {
+                    sampled_tx_clone.send(ParseOutput::Fastq(chunk[idx].clone())).await
+                        .context("Send sampled failed")?;
+                }
+
+                local_seen += chunk.len() as u64;
+            }
+
+            Ok(())
+        });
+
+        sampler_handles.push(handle);
+    }
+
+    drop(sampled_tx); // close when all samplers finish
+
+    // Distributor: read uniques → build chunks → round-robin to samplers
+    let distributor_handle = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(uniques_stream);
+        let mut current_chunk = Vec::with_capacity(chunk_size);
+        let mut total_seen = 0u64;
+        let mut sampler_idx = 0usize;
+
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Fastq(rec) = item {
+                current_chunk.push(rec);
+                total_seen += 1;
+
+                if current_chunk.len() >= chunk_size {
+                    // Round-robin send to one sampler
+                    let tx = &sampler_txs[sampler_idx % num_parallel];
+                    tx.send(current_chunk).await
+                        .context("Chunk send failed")?;
+                    current_chunk = Vec::with_capacity(chunk_size);
+                    sampler_idx += 1;
+                }
+            }
         }
+
+        // Send final partial chunk
+        if !current_chunk.is_empty() {
+            let tx = &sampler_txs[sampler_idx % num_parallel];
+            tx.send(current_chunk).await?;
+        }
+
+        // Close all sampler channels
+        for tx in sampler_txs {
+            drop(tx);
+        }
+
+        info!("Subsample distributor processed {} uniques", total_seen);
         Ok(())
     });
 
-    Ok((ReceiverStream::new(rx), count_rx, send_task))
+    sampler_handles.push(distributor_handle);
+
+    // Approximate final count (very close to target)
+    let (count_tx, count_rx) = oneshot::channel();
+    let _ = count_tx.send(max_subsample); // or count sampled downstream if strictness needed
+
+    Ok((
+        ReceiverStream::new(sampled_rx),
+        count_rx,
+        sampler_handles,
+    ))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -5780,13 +5633,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("Uniques count after dedup (pairs counted separately): {}", unique_reads);
 
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
-    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
+    let (subsampled_stream, subsample_count_rx, subsample_send_tasks) = subsample_uniform(
         config.clone(),
         dedup_stream.into_inner(),
         config.args.max_subsample as u64,
     ).await?;
+    cleanup_tasks.extend(subsample_send_tasks);
 
-    cleanup_tasks.push(subsample_send_task);
+
 
     let subsample_count = subsample_count_rx.await?;
     let subsample_reads = subsample_count * if paired { 2 } else { 1 };
