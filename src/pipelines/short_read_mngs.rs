@@ -5667,29 +5667,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion). Writing to: {:?}", non_host_temp_dir);
 
-    let r1_write_task = write_parse_output_to_file(
+    let r1_write_task_fut = write_parse_output_to_file(
         &non_host_r1_path,
         ReceiverStream::new(r1_rx),
         Some(config.base_buffer_size * 4),
-    ).await?;
+    );
 
-    r1_write_task.await??;
-
-    let r2_write_task_opt = r2_rx_opt.map(|r2_rx| {
+    let r2_write_task_fut_opt = r2_rx_opt.map(|r2_rx| {
         let r2_path = non_host_r2_path_opt
             .as_ref()
             .expect("R2 path should exist when r2_rx_opt is Some");
 
         write_parse_output_to_file(
             r2_path,
-            ReceiverStream::new(r2_rx),  // safe: r2_rx is now owned Receiver
+            ReceiverStream::new(r2_rx),
             Some(config.base_buffer_size * 4),
         )
     });
 
-    if let Some(task_future) = r2_write_task_opt {
-        let task = task_future.await?;  // await the future that returns the JoinHandle
-        task.await??;                   // await the actual write task
+    let r1_write_task = r1_write_task_fut.await?;
+    let r2_write_task_opt = if let Some(fut) = r2_write_task_fut_opt {
+        Some(fut.await?)
+    } else {
+        None
+    };
+
+    r1_write_task.await??;
+    if let Some(task) = r2_write_task_opt {
+        task.await??;
     }
 
     deinterleave_handle.await??;
