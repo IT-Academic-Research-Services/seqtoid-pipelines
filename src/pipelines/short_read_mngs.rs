@@ -90,7 +90,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
                             stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
                             ChannelReader, ChildStream, ParseMode,
-                            ParseOutput, ToBytes};
+                            ParseOutput, ToBytes, monitor_stream};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::system::{detect_ram, compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
@@ -5618,15 +5618,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(parse_task);
 
+
+    let pre_dedup_monitored = monitor_stream(
+        ReceiverStream::new(pre_dedup_parsed_stream),
+        "Pre_Dedup_Parse",
+        Duration::from_secs(5),
+    );
+
     let (dedup_stream, dedup_count_rx, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
-        pre_dedup_parsed_stream,
+        pre_dedup_monitored.into_inner(),
         paired,
         Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
     ).await?;
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
+
+    let dedup_monitored = monitor_stream(
+        ReceiverStream::new(dedup_stream.into_inner()),
+        "Dedup",
+        Duration::from_secs(5),
+    );
 
     let uniques_count = dedup_count_rx.await?;
     let unique_reads = uniques_count * if paired { 2 } else { 1 };
@@ -5635,12 +5648,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
     let (subsampled_stream, subsample_count_rx, subsample_send_tasks) = subsample_uniform(
         config.clone(),
-        dedup_stream.into_inner(),
+        dedup_monitored.into_inner(),
         config.args.max_subsample as u64,
     ).await?;
     cleanup_tasks.extend(subsample_send_tasks);
 
-
+    let subsample_monitored = monitor_stream(
+        ReceiverStream::new(subsampled_stream.into_inner()),
+        "subsample",
+        Duration::from_secs(5),
+    );
 
     let subsample_count = subsample_count_rx.await?;
     let subsample_reads = subsample_count * if paired { 2 } else { 1 };
@@ -5669,7 +5686,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     //write de-interleaved non-host file. easier for the scatter-gather
     let non_host_deinterleave_task = tokio::spawn(deinterleave_fastq_stream(
-        subsampled_stream,
+        subsample_monitored,
         paired,
         config.base_buffer_size * 4,
     ));
@@ -5685,31 +5702,47 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
+    // Compute paths after temp_dir but before moving rx (only borrows with as_ref())
     let non_host_r1_path = non_host_temp_dir.path().join("nonhost_R1.fastq");
     let non_host_r2_path_opt = r2_rx_opt.as_ref().map(|_| non_host_temp_dir.path().join("nonhost_R2.fastq"));
+
+    // Now create monitored streams (this moves r1_rx and r2_rx_opt)
+    let r1_monitored = monitor_stream(
+        ReceiverStream::new(r1_rx),
+        "Deinterleave_R1",
+        Duration::from_secs(5),
+    );
+    let r2_monitored_opt = r2_rx_opt.map(|rx| {
+        monitor_stream(
+            ReceiverStream::new(rx),
+            "Deinterleave_R2",
+            Duration::from_secs(5),
+        )
+    });
 
     info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion). Writing to: {:?}", non_host_temp_dir);
 
     let r1_write_task = write_parse_output_to_file(
         &non_host_r1_path,
-        ReceiverStream::new(r1_rx),
+        r1_monitored,
         Some(config.base_buffer_size * 4),
     ).await?;
 
     r1_write_task.await??;
 
-    let r2_write_task_opt = r2_rx_opt.map(|r2_rx| {
-        let r2_path = non_host_r2_path_opt.as_ref().expect("R2 path should exist when r2_rx is Some");
-        write_parse_output_to_file(
+    let r2_write_task_opt = if let Some(monitored) = r2_monitored_opt {
+        let r2_path = non_host_r2_path_opt.as_ref().expect("R2 path should exist when r2_monitored is Some");
+        Some(write_parse_output_to_file(
             r2_path,
-            ReceiverStream::new(r2_rx),
+            monitored,
             Some(config.base_buffer_size * 4),
-        )
-    });
+        ).await?)
+    } else {
+        None
+    };
 
-    if let Some(task_future) = r2_write_task_opt {
-        let task_handle = task_future.await?;
-        task_handle.await?;
+    if let Some(task) = r2_write_task_opt {
+        task.await??;
     }
 
     deinterleave_handle.await??;

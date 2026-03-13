@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 
 use tokio::fs::File;
@@ -14,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufRead
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
+use tokio::time::{interval, Interval};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::Semaphore;
@@ -28,6 +30,8 @@ use uuid::Uuid;
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs::{self, set_permissions};
 use std::fs::Permissions;
+use futures::stream::BoxStream;
+use futures::pin_mut;
 
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
@@ -1648,6 +1652,78 @@ pub async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyh
 }
 
 
+
+pub fn monitor_stream(
+    input: ReceiverStream<ParseOutput>,  // Take ReceiverStream as input
+    stage_name: &str,
+    log_interval: Duration,
+) -> ReceiverStream<ParseOutput> {  // Return ReceiverStream
+    let count = Arc::new(AtomicUsize::new(0));
+    let stage = stage_name.to_string();
+    let count_clone = count.clone();
+
+    // Notify when the stream ends or is dropped.
+    let stop_notify = Arc::new(Notify::new());
+    let stop_notify_clone = stop_notify.clone();
+    let stage_clone = stage.clone();
+
+    // Spawn a separate task for logging to avoid blocking the stream.
+    tokio::spawn(async move {
+        let mut heartbeat: Interval = interval(log_interval);
+        let mut last_count: usize = 0;
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    let current = count_clone.load(Ordering::Relaxed);
+                    let delta = current - last_count;
+                    let velocity = (delta as f64) / log_interval.as_secs_f64();
+                    if delta == 0 {
+                        warn!("{}: Stalled (0 records in last {:?})", stage_clone, log_interval);
+                    } else {
+                        info!("{}: Output velocity: {:.0} records/s ({} total)", stage_clone, velocity, current);
+                    }
+                    last_count = current;
+                }
+                _ = stop_notify_clone.notified() => {
+                    debug!("{}: Logging task stopped", stage_clone);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Create a new channel to forward the monitored data
+    let mut input_receiver = input.into_inner();  // Consume to get Receiver
+    let buf_size = input_receiver.capacity();  // Get buffer size
+    let (forward_tx, forward_rx) = mpsc::channel::<ParseOutput>(buf_size);  // Match buffer size
+    let stop_notify_forward = stop_notify.clone();
+
+    // Spawn a forwarding task: Consume input, monitor/count, send to new tx
+    tokio::spawn(async move {
+        struct DropGuard {
+            notify: Arc<Notify>,
+        }
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.notify.notify_one();
+            }
+        }
+        let _guard = DropGuard { notify: stop_notify };
+
+        while let Some(item) = input_receiver.recv().await {
+            count.fetch_add(1, Ordering::Relaxed);
+            if forward_tx.send(item).await.is_err() {
+                warn!("{}: Forward send failed (downstream dropped)", stage);
+                break;
+            }
+        }
+        info!("{}: Stream complete ({} total records)", stage, count.load(Ordering::Relaxed));
+        drop(forward_tx);  // Explicitly drop to close downstream
+        stop_notify_forward.notify_one();  // Ensure logging stops
+    });
+
+    ReceiverStream::new(forward_rx)  // Return as ReceiverStream
+}
 #[cfg(test)]
 mod tests {
     use super::*;
