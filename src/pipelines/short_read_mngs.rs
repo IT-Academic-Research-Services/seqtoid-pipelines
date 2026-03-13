@@ -5734,41 +5734,58 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
     host_filter_temp_dirs.clear();
 
+
+
+// Clone paths **before** moving them into async copy tasks
+    let non_host_r1_path_clone = non_host_r1_path.clone();
+    let non_host_r2_path_opt_clone = non_host_r2_path_opt.clone();
+
+    // Async copy to out_dir (non-blocking)
+    let out_dir_clone = out_dir.clone();
+    let r1_copy_task = tokio::spawn(async move {
+        let dest_r1 = out_dir_clone.join("nonhost_R1.fastq");
+        if let Err(e) = tokio::fs::copy(&non_host_r1_path_clone, &dest_r1).await {
+            warn!("Failed to copy non-host R1 to out_dir: {}", e);
+        } else {
+            info!("Copied non-host R1 to {}", dest_r1.display());
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(r1_copy_task);
+
+    if let Some(r2_path) = non_host_r2_path_opt_clone {
+        let r2_path_clone = r2_path.clone();
+        let out_dir_clone = out_dir.clone();
+        let r2_copy_task = tokio::spawn(async move {
+            let dest_r2 = out_dir_clone.join("nonhost_R2.fastq");
+            if let Err(e) = tokio::fs::copy(&r2_path_clone, &dest_r2).await {
+                warn!("Failed to copy non-host R2 to out_dir: {}", e);
+            } else {
+                info!("Copied non-host R2 to {}", dest_r2.display());
+            }
+            Ok(())
+        });
+        cleanup_tasks.push(r2_copy_task);
+    }
+
+
+    //below this to end is test
+
+        // Wait for all cleanup tasks
+        let cleanup_results = try_join_all(cleanup_tasks)
+            .await
+            .map_err(|join_err| PipelineError::Other(join_err.into()))?;
+
+        // Process each task result
+        for res in cleanup_results {
+            if let Err(e) = res {
+                eprintln!("Failed because you suck: {}", e);
+            }
+        }
+
     info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
     Ok(())
 }
-
-// // Clone paths **before** moving them into async copy tasks
-//     let non_host_r1_path_clone = non_host_r1_path.clone();
-//     let non_host_r2_path_opt_clone = non_host_r2_path_opt.clone();
-//
-//     // Async copy to out_dir (non-blocking)
-//     let out_dir_clone = out_dir.clone();
-//     let r1_copy_task = tokio::spawn(async move {
-//         let dest_r1 = out_dir_clone.join("nonhost_R1.fastq");
-//         if let Err(e) = tokio::fs::copy(&non_host_r1_path_clone, &dest_r1).await {
-//             warn!("Failed to copy non-host R1 to out_dir: {}", e);
-//         } else {
-//             info!("Copied non-host R1 to {}", dest_r1.display());
-//         }
-//         Ok(())
-//     });
-//     cleanup_tasks.push(r1_copy_task);
-//
-//     if let Some(r2_path) = non_host_r2_path_opt_clone {
-//         let r2_path_clone = r2_path.clone();
-//         let out_dir_clone = out_dir.clone();
-//         let r2_copy_task = tokio::spawn(async move {
-//             let dest_r2 = out_dir_clone.join("nonhost_R2.fastq");
-//             if let Err(e) = tokio::fs::copy(&r2_path_clone, &dest_r2).await {
-//                 warn!("Failed to copy non-host R2 to out_dir: {}", e);
-//             } else {
-//                 info!("Copied non-host R2 to {}", dest_r2.display());
-//             }
-//             Ok(())
-//         });
-//         cleanup_tasks.push(r2_copy_task);
-//     }
 //
 //
 //     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
