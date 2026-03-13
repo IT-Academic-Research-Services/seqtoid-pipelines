@@ -2012,40 +2012,91 @@ async fn subsample_weighted(
     Ok((ReceiverStream::new(rx), count_rx, send_task))
 }
 
+
 async fn subsample_uniform(
     config: Arc<RunConfig>,
-    uniques_stream: mpsc::Receiver<ParseOutput>,
-    max_subsample: u64,
-) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
-    let mut records = Vec::new();
-    let mut stream = ReceiverStream::new(uniques_stream);
-    while let Some(item) = stream.next().await {
-        if let ParseOutput::Fastq(rec) = item {
-            records.push(rec);
-        }
-    }
-
-    let subsample_size = max_subsample.min(records.len() as u64) as usize;
-
-    // Uniform random sampling: shuffle indices and take first N
-    let mut rng = config.rng.clone();
-    let mut indices: Vec<usize> = (0..records.len()).collect();
-    indices.shuffle(&mut rng);  // Shuffle all indices randomly
-    let sampled_indices: Vec<usize> = indices.into_iter().take(subsample_size).collect();
-
-    let count = sampled_indices.len() as u64;
-    let (count_tx, count_rx) = oneshot::channel();
-    count_tx.send(count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
-
+    uniques_rx: mpsc::Receiver<ParseOutput>,
+    max_subsample: u64,  // Target sampled pairs (adjust to reads if single)
+    paired: bool,
+) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<()>>)> {
     let (tx, rx) = mpsc::channel(config.base_buffer_size);
-    let send_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-        for idx in sampled_indices {
-            tx.send(ParseOutput::Fastq(records[idx].clone())).await?;
+    let (count_tx, count_rx) = oneshot::channel();
+
+    let task = tokio::spawn({
+        let config = config.clone();
+        async move {
+            let mut rng = config.rng.clone();
+            let mut stream = ReceiverStream::new(uniques_rx);
+            let mut reservoir: Vec<(Arc<SequenceRecord>, Option<Arc<SequenceRecord>>)> = Vec::with_capacity(max_subsample as usize);
+            let mut pair_count = 0u64;
+
+            while let Some(r1_item) = stream.next().await {
+                if let ParseOutput::Fastq(r1) = r1_item {
+                    let r1_arc = Arc::new(r1);
+                    pair_count += 1;
+                    if reservoir.len() < max_subsample as usize {
+                        if paired {
+                            if let Some(r2_item) = stream.next().await {
+                                if let ParseOutput::Fastq(r2) = r2_item {
+                                    if r1_arc.id() != r2.id() {
+                                        return Err(anyhow!("Mismatched pair IDs: {} != {}", r1_arc.id(), r2.id()));
+                                    }
+                                    reservoir.push((r1_arc, Some(Arc::new(r2))));
+                                } else {
+                                    return Err(anyhow!("Non-Fastq R2 in paired"));
+                                }
+                            } else {
+                                return Err(anyhow!("Missing R2 in paired stream"));
+                            }
+                        } else {
+                            reservoir.push((r1_arc, None));
+                        }
+                    } else {
+                        let j = rng.gen_range(0..pair_count);
+                        if j < max_subsample {
+                            if paired {
+                                if let Some(r2_item) = stream.next().await {
+                                    if let ParseOutput::Fastq(r2) = r2_item {
+                                        if r1_arc.id() != r2.id() {
+                                            return Err(anyhow!("Mismatched pair IDs: {} != {}", r1_arc.id(), r2.id()));
+                                        }
+                                        reservoir[j as usize] = (r1_arc, Some(Arc::new(r2)));
+                                    } else {
+                                        return Err(anyhow!("Non-Fastq R2 in paired"));
+                                    }
+                                } else {
+                                    return Err(anyhow!("Missing R2 in paired stream"));
+                                }
+                            } else {
+                                reservoir[j as usize] = (r1_arc, None);
+                            }
+                        } else if paired {
+                            // Skip R2 if not sampling this pair
+                            if stream.next().await.is_none() {
+                                return Err(anyhow!("Missing R2 when skipping pair"));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(anyhow!("Non-Fastq in subsample input"));
+                }
+            }
+
+            // Send interleaved (zero-copy via Arc)
+            for (r1, r2_opt) in reservoir {
+                tx.send(ParseOutput::Fastq((*r1).clone())).await.map_err(|_| anyhow!("R1 send failed"))?;  // Clone from Arc (shallow)
+                if let Some(r2) = r2_opt {
+                    tx.send(ParseOutput::Fastq((*r2).clone())).await.map_err(|_| anyhow!("R2 send failed"))?;
+                }
+            }
+
+            info!("Subsample distributor processed {} uniques", pair_count * if paired { 2 } else { 1 });
+            count_tx.send(pair_count * if paired { 2 } else { 1 }).map_err(|_| anyhow!("Count send failed"))?;
+            Ok(())
         }
-        Ok(())
     });
 
-    Ok((ReceiverStream::new(rx), count_rx, send_task))
+    Ok((ReceiverStream::new(rx), count_rx, task))
 }
 
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
@@ -5560,6 +5611,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         dedup_monitored.into_inner(),
         config.args.max_subsample as u64,
+        paired,
     ).await?;
    cleanup_tasks.push(subsample_send_task);
 
