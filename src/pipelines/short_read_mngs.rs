@@ -2016,92 +2016,37 @@ async fn subsample_weighted(
 async fn subsample_uniform(
     config: Arc<RunConfig>,
     uniques_rx: mpsc::Receiver<ParseOutput>,
-    max_subsample: u64,  // Target sampled pairs (1M fragments = 1M pairs)
+    max_subsample: u64,
     paired: bool,
 ) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<()>>)> {
     let (tx, rx) = mpsc::channel(config.base_buffer_size);
     let (count_tx, count_rx) = oneshot::channel();
 
-    let task = tokio::spawn({
-        let config = config.clone();
-        async move {
-            let mut rng = config.rng.clone();
-            let mut stream = ReceiverStream::new(uniques_rx);
-            let mut reservoir: Vec<ParseOutput> = Vec::with_capacity(max_subsample as usize * if paired { 2 } else { 1 });
-            let mut pair_count = 0u64;
+    let task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(uniques_rx);
+        let mut records: Vec<ParseOutput> = Vec::new();
 
-            debug!("Subsample: Starting with max={} paired={}", max_subsample, paired);
-
-            while let Some(item) = stream.next().await {
-                debug!("Subsample: Received item");
-                if let ParseOutput::Fastq(r1) = item {
-                    pair_count += 1;
-                    if reservoir.len() < (max_subsample as usize * if paired { 2 } else { 1 }) {
-                        reservoir.push(ParseOutput::Fastq(r1.clone()));  // Clone temp (shallow if SequenceRecord optimized)
-                        if paired {
-                            if let Some(r2_item) = stream.next().await {
-                                if let ParseOutput::Fastq(r2) = r2_item {
-                                    if r1.id() != r2.id() {
-                                        let _ = count_tx.send(0);
-                                        return Err(anyhow!("Mismatched pair IDs: {} != {}", r1.id(), r2.id()));
-                                    }
-                                    reservoir.push(ParseOutput::Fastq(r2.clone()));
-                                } else {
-                                    let _ = count_tx.send(0);
-                                    return Err(anyhow!("Non-Fastq R2 in paired"));
-                                }
-                            } else {
-                                let _ = count_tx.send(0);
-                                return Err(anyhow!("Missing R2 in paired stream"));
-                            }
-                        }
-                    } else {
-                        let j = rng.random_range(0..pair_count);
-                        if j < max_subsample {
-                            let base_idx = (j as usize) * if paired { 2 } else { 1 };
-                            reservoir[base_idx] = ParseOutput::Fastq(r1.clone());
-                            if paired {
-                                if let Some(r2_item) = stream.next().await {
-                                    if let ParseOutput::Fastq(r2) = r2_item {
-                                        if r1.id() != r2.id() {
-                                            let _ = count_tx.send(0);
-                                            return Err(anyhow!("Mismatched pair IDs: {} != {}", r1.id(), r2.id()));
-                                        }
-                                        reservoir[base_idx + 1] = ParseOutput::Fastq(r2.clone());
-                                    } else {
-                                        let _ = count_tx.send(0);
-                                        return Err(anyhow!("Non-Fastq R2 in paired"));
-                                    }
-                                } else {
-                                    let _ = count_tx.send(0);
-                                    return Err(anyhow!("Missing R2 in paired stream"));
-                                }
-                            }
-                        } else if paired {
-                            // Skip R2
-                            if stream.next().await.is_none() {
-                                let _ = count_tx.send(0);
-                                return Err(anyhow!("Missing R2 when skipping pair"));
-                            }
-                        }
-                    }
-                } else {
-                    let _ = count_tx.send(0);
-                    return Err(anyhow!("Non-Fastq in subsample input"));
-                }
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Fastq(_) = &item {
+                records.push(item);
             }
-
-            debug!("Subsample: Stream drained, pair_count={}", pair_count);
-
-            // Send interleaved
-            for item in reservoir {
-                tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
-            }
-
-            info!("Subsample distributor processed {} uniques", pair_count * if paired { 2 } else { 1 });
-            count_tx.send(pair_count * if paired { 2 } else { 1 }).map_err(|_| anyhow!("Count send failed"))?;
-            Ok(())
         }
+
+        let total = records.len() as u64;
+        let subsample_size = max_subsample.min(total / if paired { 2 } else { 1 }) * if paired { 2 } else { 1 };
+
+        let mut rng = config.rng.clone();
+        let mut indices: Vec<usize> = (0..records.len()).collect();
+        indices.shuffle(&mut rng);
+        let sampled: Vec<ParseOutput> = indices.into_iter().take(subsample_size as usize).map(|i| records[i].clone()).collect();
+
+        for item in sampled {
+            tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
+        }
+
+        info!("Subsample distributor processed {} uniques", total);
+        count_tx.send(total).map_err(|_| anyhow!("Count send failed"))?;
+        Ok(())
     });
 
     Ok((ReceiverStream::new(rx), count_rx, task))
@@ -5575,11 +5520,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         human_hisat2_out_stream
     };
 
-    let post_filter_monitored = monitor_stream(post_filter_stream, "Post_Hisat2", Duration::from_secs(5));
+    // let post_filter_monitored = monitor_stream(post_filter_stream, "Post_Hisat2", Duration::from_secs(5));
 
 
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
-        post_filter_monitored.into_inner(),
+        post_filter_stream.into_inner(),
         config.base_buffer_size,
         config.args.stall_threshold,
     ).await?;
@@ -5588,15 +5533,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(parse_task);
 
 
-    let pre_dedup_monitored = monitor_stream(
-        ReceiverStream::new(pre_dedup_parsed_stream),
-        "Pre_Dedup_Parse",
-        Duration::from_secs(5),
-    );
+    // let pre_dedup_monitored = monitor_stream(
+    //     ReceiverStream::new(pre_dedup_parsed_stream),
+    //     "Pre_Dedup_Parse",
+    //     Duration::from_secs(5),
+    // );
 
     let (dedup_stream, dedup_count_rx, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
-        pre_dedup_monitored.into_inner(),
+        pre_dedup_parsed_stream,
         paired,
         Some(70), // Prefix length for deduplication. Hardcoded for now
         out_dir.clone(),
@@ -5604,11 +5549,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
 
-    let dedup_monitored = monitor_stream(
-        ReceiverStream::new(dedup_stream.into_inner()),
-        "Dedup",
-        Duration::from_secs(5),
-    );
+    // let dedup_monitored = monitor_stream(
+    //     ReceiverStream::new(dedup_stream.into_inner()),
+    //     "Dedup",
+    //     Duration::from_secs(5),
+    // );
 
     let uniques_count = dedup_count_rx.await?;
     let unique_reads = uniques_count * if paired { 2 } else { 1 };
@@ -5617,17 +5562,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
     let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
         config.clone(),
-        dedup_monitored.into_inner(),
+        dedup_stream.into_inner(),
         config.args.max_subsample as u64,
         paired,
     ).await?;
    cleanup_tasks.push(subsample_send_task);
 
-    let subsample_monitored = monitor_stream(
-        subsampled_stream,
-        "subsample",
-        Duration::from_secs(5),
-    );
+    // let subsample_monitored = monitor_stream(
+    //     subsampled_stream,
+    //     "subsample",
+    //     Duration::from_secs(5),
+    // );
 
     let subsample_count = subsample_count_rx.await?;
     let subsample_reads = subsample_count * if paired { 2 } else { 1 };
@@ -5656,7 +5601,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     //write de-interleaved non-host file. easier for the scatter-gather
     let non_host_deinterleave_task = tokio::spawn(deinterleave_fastq_stream(
-        subsample_monitored,
+        subsampled_stream,
         paired,
         config.base_buffer_size * 4,
     ));
@@ -5677,42 +5622,44 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let non_host_r2_path_opt = r2_rx_opt.as_ref().map(|_| non_host_temp_dir.path().join("nonhost_R2.fastq"));
 
     // Now create monitored streams (this moves r1_rx and r2_rx_opt)
-    let r1_monitored = monitor_stream(
-        ReceiverStream::new(r1_rx),
-        "Deinterleave_R1",
-        Duration::from_secs(5),
-    );
-    let r2_monitored_opt = r2_rx_opt.map(|rx| {
-        monitor_stream(
-            ReceiverStream::new(rx),
-            "Deinterleave_R2",
-            Duration::from_secs(5),
-        )
-    });
+    // let r1_monitored = monitor_stream(
+    //     ReceiverStream::new(r1_rx),
+    //     "Deinterleave_R1",
+    //     Duration::from_secs(5),
+    // );
+    // let r2_monitored_opt = r2_rx_opt.map(|rx| {
+    //     monitor_stream(
+    //         ReceiverStream::new(rx),
+    //         "Deinterleave_R2",
+    //         Duration::from_secs(5),
+    //     )
+    // });
 
     info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion). Writing to: {:?}", non_host_temp_dir);
 
     let r1_write_task = write_parse_output_to_file(
         &non_host_r1_path,
-        r1_monitored,
+        ReceiverStream::new(r1_rx),
         Some(config.base_buffer_size * 4),
     ).await?;
 
     r1_write_task.await??;
 
-    let r2_write_task_opt = if let Some(monitored) = r2_monitored_opt {
-        let r2_path = non_host_r2_path_opt.as_ref().expect("R2 path should exist when r2_monitored is Some");
-        Some(write_parse_output_to_file(
-            r2_path,
-            monitored,
-            Some(config.base_buffer_size * 4),
-        ).await?)
-    } else {
-        None
-    };
+    let r2_write_task_opt = r2_rx_opt.map(|r2_rx| {
+        let r2_path = non_host_r2_path_opt
+            .as_ref()
+            .expect("R2 path should exist when r2_rx_opt is Some");
 
-    if let Some(task) = r2_write_task_opt {
-        task.await??;
+        write_parse_output_to_file(
+            r2_path,
+            ReceiverStream::new(r2_rx),  // safe: r2_rx is now owned Receiver
+            Some(config.base_buffer_size * 4),
+        )
+    });
+
+    if let Some(task_future) = r2_write_task_opt {
+        let task = task_future.await?;  // await the future that returns the JoinHandle
+        task.await??;                   // await the actual write task
     }
 
     deinterleave_handle.await??;
