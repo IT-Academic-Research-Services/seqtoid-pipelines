@@ -2016,7 +2016,7 @@ async fn subsample_weighted(
 async fn subsample_uniform(
     config: Arc<RunConfig>,
     uniques_rx: mpsc::Receiver<ParseOutput>,
-    max_subsample: u64,  // Target sampled pairs (adjust to reads if single)
+    max_subsample: u64,  // Target sampled pairs (1M fragments = 1M pairs)
     paired: bool,
 ) -> Result<(ReceiverStream<ParseOutput>, oneshot::Receiver<u64>, JoinHandle<Result<()>>)> {
     let (tx, rx) = mpsc::channel(config.base_buffer_size);
@@ -2027,67 +2027,75 @@ async fn subsample_uniform(
         async move {
             let mut rng = config.rng.clone();
             let mut stream = ReceiverStream::new(uniques_rx);
-            let mut reservoir: Vec<(Arc<SequenceRecord>, Option<Arc<SequenceRecord>>)> = Vec::with_capacity(max_subsample as usize);
+            let mut reservoir: Vec<ParseOutput> = Vec::with_capacity(max_subsample as usize * if paired { 2 } else { 1 });
             let mut pair_count = 0u64;
 
-            while let Some(r1_item) = stream.next().await {
-                if let ParseOutput::Fastq(r1) = r1_item {
-                    let r1_arc = Arc::new(r1);
+            debug!("Subsample: Starting with max={} paired={}", max_subsample, paired);
+
+            while let Some(item) = stream.next().await {
+                debug!("Subsample: Received item");
+                if let ParseOutput::Fastq(r1) = item {
                     pair_count += 1;
-                    if reservoir.len() < max_subsample as usize {
+                    if reservoir.len() < (max_subsample as usize * if paired { 2 } else { 1 }) {
+                        reservoir.push(ParseOutput::Fastq(r1.clone()));  // Clone temp (shallow if SequenceRecord optimized)
                         if paired {
                             if let Some(r2_item) = stream.next().await {
                                 if let ParseOutput::Fastq(r2) = r2_item {
-                                    if r1_arc.id() != r2.id() {
-                                        return Err(anyhow!("Mismatched pair IDs: {} != {}", r1_arc.id(), r2.id()));
+                                    if r1.id() != r2.id() {
+                                        let _ = count_tx.send(0);
+                                        return Err(anyhow!("Mismatched pair IDs: {} != {}", r1.id(), r2.id()));
                                     }
-                                    reservoir.push((r1_arc, Some(Arc::new(r2))));
+                                    reservoir.push(ParseOutput::Fastq(r2.clone()));
                                 } else {
+                                    let _ = count_tx.send(0);
                                     return Err(anyhow!("Non-Fastq R2 in paired"));
                                 }
                             } else {
+                                let _ = count_tx.send(0);
                                 return Err(anyhow!("Missing R2 in paired stream"));
                             }
-                        } else {
-                            reservoir.push((r1_arc, None));
                         }
                     } else {
                         let j = rng.gen_range(0..pair_count);
                         if j < max_subsample {
+                            let base_idx = (j as usize) * if paired { 2 } else { 1 };
+                            reservoir[base_idx] = ParseOutput::Fastq(r1.clone());
                             if paired {
                                 if let Some(r2_item) = stream.next().await {
                                     if let ParseOutput::Fastq(r2) = r2_item {
-                                        if r1_arc.id() != r2.id() {
-                                            return Err(anyhow!("Mismatched pair IDs: {} != {}", r1_arc.id(), r2.id()));
+                                        if r1.id() != r2.id() {
+                                            let _ = count_tx.send(0);
+                                            return Err(anyhow!("Mismatched pair IDs: {} != {}", r1.id(), r2.id()));
                                         }
-                                        reservoir[j as usize] = (r1_arc, Some(Arc::new(r2)));
+                                        reservoir[base_idx + 1] = ParseOutput::Fastq(r2.clone());
                                     } else {
+                                        let _ = count_tx.send(0);
                                         return Err(anyhow!("Non-Fastq R2 in paired"));
                                     }
                                 } else {
+                                    let _ = count_tx.send(0);
                                     return Err(anyhow!("Missing R2 in paired stream"));
                                 }
-                            } else {
-                                reservoir[j as usize] = (r1_arc, None);
                             }
                         } else if paired {
-                            // Skip R2 if not sampling this pair
+                            // Skip R2
                             if stream.next().await.is_none() {
+                                let _ = count_tx.send(0);
                                 return Err(anyhow!("Missing R2 when skipping pair"));
                             }
                         }
                     }
                 } else {
+                    let _ = count_tx.send(0);
                     return Err(anyhow!("Non-Fastq in subsample input"));
                 }
             }
 
-            // Send interleaved (zero-copy via Arc)
-            for (r1, r2_opt) in reservoir {
-                tx.send(ParseOutput::Fastq((*r1).clone())).await.map_err(|_| anyhow!("R1 send failed"))?;  // Clone from Arc (shallow)
-                if let Some(r2) = r2_opt {
-                    tx.send(ParseOutput::Fastq((*r2).clone())).await.map_err(|_| anyhow!("R2 send failed"))?;
-                }
+            debug!("Subsample: Stream drained, pair_count={}", pair_count);
+
+            // Send interleaved
+            for item in reservoir {
+                tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
             }
 
             info!("Subsample distributor processed {} uniques", pair_count * if paired { 2 } else { 1 });
