@@ -5754,1273 +5754,1273 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //below this to end is test
 
         // Wait for all cleanup tasks
-        let cleanup_results = try_join_all(cleanup_tasks)
-            .await
-            .map_err(|join_err| PipelineError::Other(join_err.into()))?;
-
-        // Process each task result
-        for res in cleanup_results {
-            if let Err(e) = res {
-                eprintln!("Early end failure condition: {}", e);
-            }
-        }
-
-    info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
-    Ok(())
-}
-//
-//
-//     let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
-//         config.clone(),
-//         non_host_r1_path.clone(),
-//         non_host_r2_path_opt.clone(),
-//     ).await?;
-//
-//     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
-//     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
-//
-//
-//     let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
-//
-//     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
-//         config.clone(),
-//         non_host_mm2_out_stream,
-//         m8_file_path,
-//     )
-//         .await?;
-//     cleanup_tasks.append(&mut m8_cleanup_tasks);
-//     cleanup_receivers.append(&mut m8_cleanup_receivers);
-//
-//     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
-//
-//     let nt_concurrency = compute_phase_concurrency(
-//         &config,
-//         "call_hits_nt",
-//         1.0,           // ~1 GB per thread max (mostly transient)
-//         3.5,
-//         64,            // higher cap for CPU-bound phase
-//         16,            // min for meaningful parallelism
-//     );
-//     info!("call hits nt concurrency {}", nt_concurrency);
-//
-//     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
-//         config.clone(),
-//         m8_stream,
-//         sample_base_buf.clone(),
-//         lineage_map.clone(),
-//         acc2taxid_map.clone(),
-//         should_keep_filter.clone(),
-//         36,
-//         nt_concurrency,
-//     ).await?;
-//     cleanup_tasks.append(&mut call_cleanup_tasks);
-//     cleanup_receivers.append(&mut call_cleanup_receivers);
-//
-//     let (nt_streams, nt_done_rx) = t_junction(
-//         call_stream,
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nt_call".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nt_done_rx);
-//
-//     let mut nt_streams_iter = nt_streams.into_iter();
-//     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
-//         call_summary_stream,
-//         4,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nt_call_summary".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nt_summary_done_rx);
-//     let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
-//     let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//     let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nt_summary_hit_stream), 0));
-//
-//     let nt_counts = generate_taxon_counts(
-//         config.clone(),
-//         ReceiverStream::new(nt_call_stream),
-//         ReceiverStream::new(nt_summary_taxon_stream),
-//         duplicate_clusters.clone(),
-//         should_keep_filter.clone(),
-//         "NT".to_string(),
-//         None,
-//     ).await?;
-//     info!("NT taxon counts: {} entries", nt_counts.len());
-//
-//     let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
-//
-//     // Temporary: Skip Diamond by providing empty outputs
-//     let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-//     drop(dummy_tx); // Immediately drop sender to create an empty stream
-//     let non_host_diamond_m8_stream = dummy_rx;
-//     let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-//     let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-//
-//
-//     // Diamond non_host alignment
-//     // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
-//     //     config.clone(),
-//     //     non_host_r1_path.clone(),
-//     //     non_host_r2_path_opt.clone(),
-//     // ).await?;
-//     // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-//     // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
-//     // final_temp_dirs.extend(non_host_diamond_temp_dirs);
-//
-//     let nr_concurrency = compute_phase_concurrency(
-//         &config,
-//         "call_hits_nr",
-//         1.0,           // ~1 GB per thread max (mostly transient)
-//         3.5,
-//         64,            // higher cap for CPU-bound phase
-//         16,            // min for meaningful parallelism
-//     );
-//
-//     info!("call hits nr concurrency {}", nr_concurrency);
-//
-//
-//     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
-//         config.clone(),
-//         ReceiverStream::new(non_host_diamond_m8_stream),
-//         sample_base_buf.clone(),
-//         lineage_map.clone(),
-//         acc2taxid_map.clone(),
-//         should_keep_filter.clone(),
-//         0,
-//         nr_concurrency,
-//     ).await?;
-//     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
-//     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
-//
-//     let (nr_streams, nr_done_rx) = t_junction(
-//         nr_call_stream,
-//         4,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nr_call".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nr_done_rx);
-//
-//     let mut nr_streams_iter = nr_streams.into_iter();
-//     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_initial_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let (nr_summary_streams, nr_summary_done_rx) = t_junction(
-//         nr_call_summary_stream,
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nr_call_summary".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nr_summary_done_rx);
-//     let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
-//     let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_blast_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//     let nr_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nr_summary_hit_stream), 0));
-//
-//     let nr_counts = generate_taxon_counts(
-//         config.clone(),
-//         ReceiverStream::new(nr_call_stream),
-//         ReceiverStream::new(nr_summary_taxon_stream),
-//         duplicate_clusters.clone(),
-//         should_keep_filter.clone(),
-//         "NR".to_string(),
-//         None,
-//     ).await?;
-//     info!("NR taxon counts: {} entries", nr_counts.len());
-//
-//     let nr_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_stream)).await?;
-//
-//     let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
-//     let (_combined_path, write_json_task) = combine_taxon_counts(
-//         &nt_counts,
-//         &nr_counts,
-//         combined_path,
-//     )
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
-//     cleanup_tasks.push(write_json_task);
-//
-//     let annot_concurrency = compute_phase_concurrency(
-//         &config,
-//         "generate_annotated_fasta",
-//         0.4,   // ~400 MB/thread — mostly transient
-//         4.0,
-//         128,
-//         8,
-//     );
-//
-//     let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) = generate_annotated_fasta_from_files(
-//         config.clone(),
-//         non_host_r1_path.clone(),
-//         non_host_r2_path_opt.clone(),
-//         duplicate_clusters.clone(),
-//         nt_map,
-//         nr_map,
-//         annot_concurrency
-//     ).await
-//         .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
-//
-//     cleanup_tasks.append(&mut annot_tasks);
-//     cleanup_receivers.append(&mut annot_rxs);
-//
-//     let assembly_dir = out_dir.join("assembly");
-//
-//     let annotated_path = assembly_dir.join("annotated_merged.fa");
-//     let unidentified_path = assembly_dir.join("unidentified.fa");
-//     let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
-//
-//
-//     let (initial_annotated_streams, initial_annotated_done_rx) = t_junction(
-//         ReceiverStream::new(annotated_rx),
-//         2,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nr_call_summary".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(initial_annotated_done_rx);
-//     let mut initial_annotated_streams_iter = initial_annotated_streams.into_iter();
-//     let initial_annotated_file_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let initial_annotated_taxon_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let (initial_unidentified_streams, initial_unidentified_done_rx) = t_junction(
-//         ReceiverStream::new(unidentified_rx),
-//         2,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nr_call_summary".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(initial_unidentified_done_rx);
-//     let mut initial_unidentified_streams_iter = initial_unidentified_streams.into_iter();
-//     let initial_unidentified_file_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let initial_unidentified_taxon_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     cleanup_tasks.push(write_fasta_stream_to_file(
-//         ReceiverStream::new(initial_annotated_file_stream),
-//         annotated_path.clone(),
-//         config.base_buffer_size,
-//     ));
-//
-//     cleanup_tasks.push(write_fasta_stream_to_file(
-//         ReceiverStream::new(initial_unidentified_file_stream),
-//         unidentified_path.clone(),
-//         config.base_buffer_size,
-//     ));
-//
-//     cleanup_tasks.push(write_fasta_stream_to_file(
-//         ReceiverStream::new(unique_unidentified_rx),
-//         unique_unidentified_path.clone(),
-//         config.base_buffer_size,
-//     ));
-//
-//
-//     // *******************
-//     // Post-processing
-//     // *******************
-//
-//     // Assembly stats
-//     let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
-//     let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
-//
-//     let spades_task = spades_assembly(
-//         config.clone(),
-//         non_host_r1_path.clone(),
-//         non_host_r2_path_opt.clone(),
-//         &out_dir,
-//     ).await?;
-//
-//     let spades_completion = spades_task.await;
-//
-//     match spades_completion {
-//         Ok(Ok(())) => {
-//             info!("SPAdes assembly task completed successfully");
-//         }
-//         Ok(Err(e)) => {
-//             warn!("SPAdes assembly failed: {}", e);
-//         }
-//         Err(join_err) => {
-//             error!("SPAdes task panicked or was cancelled: {}", join_err);
-//         }
-//     }
-//
-//     let (assembly_outputs, assembly_bam_out_stream,
-//         mut post_assembly_cleanup_tasks,
-//         mut post_assembly_cleanup_receivers,
-//         mut post_assembly_temp_files) = process_assembly(
-//         config.clone(),
-//         &assembly_out_dir,
-//         &assembly_work_dir,
-//         non_host_r1_path.clone(),
-//         non_host_r2_path_opt.clone(),
-//         duplicate_clusters.clone(),
-//         paired,
-//         4 // this can become as CLI arg if needed
-//     ).await?;
-//
-//     cleanup_tasks.extend(post_assembly_cleanup_tasks);
-//     cleanup_receivers.extend(post_assembly_cleanup_receivers);
-//     temp_files.extend(post_assembly_temp_files);
-//
-//     let _ = fs::remove_dir_all(assembly_work_dir).await;
-//
-//     let generate_assembly_coverage_result = generate_assembly_coverage(
-//         config.clone(),
-//         assembly_bam_out_stream,
-//         &assembly_outputs.contigs_fasta,
-//         &assembly_outputs.coverage_json,
-//         &assembly_outputs.coverage_summary_csv,
-//     )
-//         .await
-//         .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
-//     eprintln!("coverage result {:?}", generate_assembly_coverage_result);
-//
-//
-//     let nt_file = config
-//         .args
-//         .nt
-//         .clone()
-//         .ok_or(PipelineError::MissingArgument(
-//             "NT file required for fasta extraction".into(),
-//         ))?;
-//
-//     let nt_offset_db_file = config
-//         .args
-//         .nt_offset_db
-//         .clone()
-//         .ok_or(PipelineError::MissingArgument(
-//             "NT offset DB file required for fasta extraction".into(),
-//         ))?;
-//
-//
-//     let nr_file = config
-//         .args
-//         .nr
-//         .clone()
-//         .ok_or(PipelineError::MissingArgument(
-//             "NR file required for fasta extraction".into(),
-//         ))?;
-//
-//     let nr_offset_db_file = config
-//         .args
-//         .nr_offset_db
-//         .clone()
-//         .ok_or(PipelineError::MissingArgument(
-//             "NR offset DB file required for fasta extraction".into(),
-//         ))?;
-//
-//
-//     // Blast contigs
-//     // NT and NR prep in parallel
-//     let nt_prep_handle = tokio::spawn({
-//         let config = config.clone();
-//         let nt_file = nt_file.clone();
-//         let nt_offset_db_file = nt_offset_db_file.clone();
-//         async move {
-//             let (
-//                 nt_read_dict_map,
-//                 nt_accession_dict_noarc,
-//                 nt_selected_genera,
-//                 _nt_total_reads,
-//             ) = nt_hit_summary_handle
-//                 .await
-//                 .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
-//                 .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
-//
-//             let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
-//                 config.clone(),
-//                 &nt_selected_genera,
-//                 NT_TAG,
-//                 &PathBuf::from(nt_file),
-//                 &PathBuf::from(nt_offset_db_file),
-//             )
-//                 .await
-//                 .map_err(|e| PipelineError::Other(e.into()))?;
-//             Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
-//                 nt_read_dict_map,
-//                 Arc::new(nt_accession_dict_noarc),
-//                 nt_ref_fasta_path,
-//                 nt_ref_fasta_temp_dir,
-//             ))
-//         }
-//     });
-//
-//     let nr_prep_handle = tokio::spawn({
-//         let config = config.clone();
-//         let nr_file = nr_file.clone();
-//         let nr_offset_db_file = nr_offset_db_file.clone();
-//         async move {
-//             let (
-//                 nr_read_dict_map,
-//                 nr_accession_dict_noarc,
-//                 nr_selected_genera,
-//                 _nr_total_reads,
-//             ) = nr_hit_summary_handle
-//                 .await
-//                 .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
-//                 .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
-//
-//             let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
-//                 config.clone(),
-//                 &nr_selected_genera,
-//                 NR_TAG,
-//                 &PathBuf::from(nr_file),
-//                 &PathBuf::from(nr_offset_db_file),
-//             )
-//                 .await
-//                 .map_err(|e| PipelineError::Other(e.into()))?;
-//             Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
-//                 nr_read_dict_map,
-//                 Arc::new(nr_accession_dict_noarc),
-//                 nr_ref_fasta_path,
-//                 nr_ref_fasta_temp_dir,
-//             ))
-//         }
-//     });
-//
-//     let (nt_prep_res, nr_prep_res) = tokio::try_join!(nt_prep_handle, nr_prep_handle)
-//         .map_err(|e| PipelineError::Other(anyhow!("Reference prep task panicked: {e}")))?;
-//
-//     let (nt_read_dict_map, nt_accession_dict, nt_ref_fasta_path, nt_ref_fasta_temp_dir) = nt_prep_res?;
-//     let (nr_read_dict_map, nr_accession_dict, nr_ref_fasta_path, nr_ref_fasta_temp_dir) = nr_prep_res?;
-//
-//     let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_map));
-//     let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_map));
-//
-//     info!("NT ref path: {}", nt_ref_fasta_path.display());
-//     info!("NR ref path: {}", nr_ref_fasta_path.display());
-//
-//     final_temp_dirs.push(nt_ref_fasta_temp_dir);
-//     final_temp_dirs.push(nr_ref_fasta_temp_dir);
-//
-//     let nt_blast_concurrency = compute_phase_concurrency(
-//         &config,
-//         "nt_blast_contigs",
-//         2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
-//         5.0,           // strong CPU-bound phase (alignment + scoring)
-//         128,           // high cap — BLAST scales decently to 128 on EPYC
-//         8,             // min — still want parallelism on MacBook Air
-//     );
-//     info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
-//
-//     let nt_handle = tokio::spawn({
-//         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
-//         let config = config.clone();
-//         let lineage_map = lineage_map.clone();
-//         let should_keep_filter = should_keep_filter.clone();
-//         let duplicate_clusters = duplicate_clusters.clone();
-//         let read2contig = assembly_outputs.read2contig.clone();
-//
-//         async move {
-//             blast_contigs(
-//                 config,
-//                 NT_TAG,
-//                 ReceiverStream::new(nt_blast_stream),
-//                 ReceiverStream::new(nt_blast_hit_stream),
-//                 nt_read_dict.clone(),
-//                 nt_accession_dict,
-//                 nt_counts,
-//                 &contigs_fasta_path.clone(),
-//                 read2contig,
-//                 &nt_ref_fasta_path,
-//                 duplicate_clusters,
-//                 lineage_map,
-//                 should_keep_filter,
-//                 4,
-//                 nt_blast_concurrency
-//             ).await
-//         }
-//     });
-//
-//     let nr_blast_concurrency = compute_phase_concurrency(
-//         &config,
-//         "nr_blast_contigs",
-//         2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
-//         5.0,           // strong CPU-bound phase (alignment + scoring)
-//         128,           // high cap — BLAST scales decently to 128 on EPYC
-//         8,             // min — still want parallelism on MacBook Air
-//     );
-//     info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
-//
-//     let nr_handle = tokio::spawn({
-//         let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
-//         let config = config.clone();
-//         let lineage_map = lineage_map.clone();
-//         let should_keep_filter = should_keep_filter.clone();
-//         let duplicate_clusters = duplicate_clusters.clone();
-//         let read2contig = assembly_outputs.read2contig.clone();
-//
-//         async move {
-//             blast_contigs(
-//                 config,
-//                 NR_TAG,
-//                 ReceiverStream::new(nr_blast_stream),
-//                 ReceiverStream::new(nr_blast_hit_stream),
-//                 nr_read_dict.clone(),
-//                 nr_accession_dict,
-//                 nr_counts,
-//                 &contigs_fasta_path.clone(),
-//                 read2contig,
-//                 &nr_ref_fasta_path,
-//                 duplicate_clusters,
-//                 lineage_map,
-//                 should_keep_filter,
-//                 4,
-//                 nr_blast_concurrency
-//             ).await
-//         }
-//     });
-//
-//
-//     let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
-//         .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
-//
-//     let (nt_read_dict, nt_refined_counts,
-//         nt_contig_summary, nt_refined_m8_stream_out,
-//         nt_refined_hit_summary_stream_out, nt_refined_m8_top_stream_out,
-//         nt_cleanup_tasks, nt_cleanup_receivers,
-//         nt_temp_files) = nt_res?;
-//
-//     cleanup_tasks.extend(nt_cleanup_tasks);
-//     cleanup_receivers.extend(nt_cleanup_receivers);
-//     temp_files.extend(nt_temp_files);
-//
-//
-//     let (nt_m8_streams, nt_m8_rx) = t_junction(
-//         ReceiverStream::new(nt_refined_m8_stream_out),
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nt_m8".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nt_m8_rx);
-//
-//     let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
-//     let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//     let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
-//         ReceiverStream::new(nt_refined_hit_summary_stream_out),
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "validate_input".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nt_hitsummary_rx);
-//
-//     let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
-//     let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let (nr_read_dict, nr_refined_counts,
-//         nr_contig_summary, nr_refined_m8_stream_out,
-//         nr_refined_hit_summary_stream_out, nr_refined_m8_top_stream_out,
-//         nr_cleanup_tasks, nr_cleanup_receivers,
-//         nr_temp_files) = nr_res?;
-//     cleanup_tasks.extend(nr_cleanup_tasks);
-//     cleanup_receivers.extend(nr_cleanup_receivers);
-//     temp_files.extend(nr_temp_files);
-//
-//
-//     let (nr_m8_streams, nr_m8_rx) = t_junction(
-//         ReceiverStream::new(nr_refined_m8_stream_out),
-//         2,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "nr_m8".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nr_m8_rx);
-//
-//     let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
-//     let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
-//         ReceiverStream::new(nr_refined_hit_summary_stream_out),
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "validate_input".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(nr_hitsummary_rx);
-//
-//     let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
-//     let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//     //prelod
-//     let mut nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>> = Arc::new(DashMap::with_capacity(80_000_000));
-//
-//     let mut preload_stream = ReceiverStream::new(nr_hit_summary_preload);
-//     while let Some(item) = preload_stream.next().await {
-//         let bytes = item.to_bytes()?;
-//         let line = String::from_utf8_lossy(&bytes);
-//         let trimmed = line.trim_end();
-//         if trimmed.is_empty() {
-//             continue;
-//         }
-//
-//         let fields: Vec<&str> = trimmed.split('\t').collect();
-//         if fields.len() < 10 {
-//             warn!("Malformed NR hit summary line during preload: {}", trimmed);
-//             continue;
-//         }
-//
-//         let read_id = fields[0].to_string();
-//         let contig_taxid = fields[9].parse::<Taxid>().ok();
-//         let read_taxid = fields[3].parse::<Taxid>().ok();
-//
-//         nr_alignment_per_read.insert(
-//             read_id,
-//             SpeciesAlignmentResults {
-//                 contig: contig_taxid,
-//                 read: read_taxid,
-//             },
-//         );
-//     }
-//     info!("Preloaded {} NR alignments into memory for merge", nr_alignment_per_read.len());
-//
-//
-//     let compute_merged_taxon_handle = tokio::spawn(compute_merged_taxon_counts(
-//         config.clone(),
-//         nt_m8_merge,
-//         nt_hit_summary_merge,
-//         nt_contig_summary,
-//         nr_m8_merge,
-//         nr_hit_summary_merge,
-//         nr_contig_summary,
-//         lineage_map.clone(),
-//         should_keep_filter.clone(),
-//         duplicate_clusters.clone(),
-//         out_dir.join("refined.m8"),
-//         out_dir.join("refined.hitsummary.tab"),
-//         out_dir.join("refined_taxon_counts_with_dcr.json"),
-//         out_dir.join("assembly_combined_contig_summary.json"),
-//         nr_alignment_per_read
-//     ));
-//
-//
-//     let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
-//     let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
-//         &nt_refined_counts,
-//         &nr_refined_counts,
-//         refined_combined_path,
-//     )
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
-//     cleanup_tasks.push(refined_write_json_task);
-//
-//
-//     // Build refined accession maps
-//     let nt_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_map)).await
-//         .map_err(|e| PipelineError::Other(anyhow!("NT refined accession map failed: {}", e)))?;
-//
-//     let nr_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_map)).await
-//         .map_err(|e| PipelineError::Other(anyhow!("NR refined accession map failed: {}", e)))?;
-//
-//
-//     // Contig FASTA stream (from assembly)
-//     // ───────────────────────────────────────────────────────────────
-//     let contigs_fasta = assembly_outputs.contigs_fasta.clone();
-//     let contigs_file = tokio::fs::File::open(&contigs_fasta).await
-//         .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
-//
-//     let contigs_rx = parse_fasta(contigs_file, 32768).await
-//         .map_err(|e| PipelineError::Other(anyhow!("parse_fasta failed: {}", e)))?;
-//
-//     let mut contigs_stream = ReceiverStream::new(contigs_rx);
-//
-//     // Empty cluster stream (contigs have no duplicates)
-//     let (_cluster_tx, cluster_rx) = mpsc::channel::<ParseOutput>(1);
-//     drop(_cluster_tx);
-//     let contigs_cluster_stream = ReceiverStream::new(cluster_rx);
-//
-//     let assembly_dir = out_dir.join("assembly");
-//     tokio::fs::create_dir_all(&assembly_dir).await
-//         .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
-//
-//
-//     let nr_annot_concurrency = compute_phase_concurrency(
-//         &config,
-//         "nr_annot_concurrency",
-//         0.4,
-//         4.0,
-//         128,
-//         8,
-//     );
-//
-//     let (
-//         mapped_contigs_rx,
-//         unidentified_contigs_rx,
-//         unique_unidentified_rx,
-//         mut annot_tasks,
-//         mut annot_rxs,
-//     ) = generate_annotated_fasta(
-//         config.clone(),
-//         contigs_stream,
-//         duplicate_clusters.clone(),
-//         nt_refined_map.into_iter().collect(),
-//         nr_refined_map.into_iter().collect(),
-//         nr_annot_concurrency,
-//     ).await
-//         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
-//     cleanup_tasks.append(&mut annot_tasks);
-//     cleanup_receivers.append(&mut annot_rxs);
-//
-//
-//     let (
-//         taxid_mapped_rx,
-//         taxid_combined_rx,
-//         load_nt_task,
-//         load_nr_task,
-//         taxid_main_task,
-//     ) = generate_taxid_fasta(
-//         config.clone(),
-//         ReceiverStream::new(mapped_contigs_rx),
-//         ReceiverStream::new(unidentified_contigs_rx),
-//         ReceiverStream::new(nt_hit_summary_taxid),
-//         ReceiverStream::new(nr_hit_summary_taxid),
-//         lineage_map.clone(),
-//     )
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
-//
-//
-//     cleanup_tasks.push(load_nt_task);
-//     cleanup_tasks.push(load_nr_task);
-//     cleanup_tasks.push(taxid_main_task);
-//
-//
-//     let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
-//         ReceiverStream::new(taxid_mapped_rx),
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "taxid_mapped".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(taxid_mapped_rx);
-//
-//     let mut taxid_mapped_streams_iter = taxid_mapped_streams.into_iter();
-//     let taxid_mapped_file = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let taxid_mapped_locator = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let taxid_mapped_nonhost = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
-//     let combined_path = assembly_dir.join("refined_taxid_annot_fasta");
-//
-//
-//     let write_mapped_handle = write_fasta_stream_to_file(
-//         ReceiverStream::new(taxid_mapped_file),
-//         mapped_path.clone(),
-//         config.base_buffer_size,
-//     );
-//     cleanup_tasks.push(write_mapped_handle);
-//
-//     let write_combined_handle = write_fasta_stream_to_file(
-//         ReceiverStream::new(taxid_combined_rx),
-//         combined_path.clone(),
-//         config.base_buffer_size,
-//     );
-//     cleanup_tasks.push(write_combined_handle);
-//
-//
-//     let assembly_dir = out_dir.join("assembly");
-//
-//     let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
-//         config.clone(),
-//         taxid_mapped_locator, // directly pass the receiver
-//         assembly_dir,
-//     )
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
-//
-//     cleanup_tasks.append(&mut locator_tasks);
-//     info!("Taxid locator files generated: {:?}", locator_outputs);
-//
-//
-//     // *******************
-//     // Experimental
-//     // *******************
-//
-//     let (
-//         initial_taxid_mapped_rx,
-//         initial_taxid_combined_rx,
-//         initial_load_nt_task,
-//         initial_load_nr_task,
-//         initial_taxid_main_task,
-//     ) = generate_taxid_fasta(
-//         config.clone(),
-//         ReceiverStream::new(initial_annotated_taxon_stream),
-//         ReceiverStream::new(initial_unidentified_taxon_stream),
-//         ReceiverStream::new(nt_initial_stream),
-//         ReceiverStream::new(nr_initial_stream),
-//         lineage_map.clone(),
-//     )
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_fasta failed: {}", e)))?;
-//
-//     cleanup_tasks.push(initial_load_nt_task);
-//     cleanup_tasks.push(initial_load_nr_task);
-//     cleanup_tasks.push(initial_taxid_main_task);
-//
-//     let initial_mapped_path = out_dir.join("taxid_annot_mapped_only.fasta");
-//     let initial_combined_path = out_dir.join("taxid_annot.fasta");
-//
-//     let (initial_taxid_mapped_streams, initial_taxid_mapped_rx) = t_junction(
-//         ReceiverStream::new(initial_taxid_mapped_rx),
-//         3,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "initial_taxid_mapped".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(initial_taxid_mapped_rx);
-//
-//     let mut initial_taxid_mapped_streams_iter = initial_taxid_mapped_streams.into_iter();
-//     let initial_taxid_mapped_file = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
-//     let initial_taxid_mapped_locator = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//     let initial_taxid_mapped_count = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let (initial_taxid_combined_streams, initial_taxid_combined_rx) = t_junction(
-//         ReceiverStream::new(initial_taxid_combined_rx),
-//         2,
-//         config.base_buffer_size,
-//         config.args.stall_threshold,
-//         None,
-//         config.base_backpressure_pause,
-//         StreamDataType::IlluminaFastq,
-//         "initial_taxid_combined".to_string(),
-//         None,
-//     )
-//         .await
-//         .map_err(|_| PipelineError::StreamDataDropped)?;
-//     cleanup_receivers.push(initial_taxid_combined_rx);
-//
-//     let mut initial_taxid_combined_streams_iter = initial_taxid_combined_streams.into_iter();
-//     let initial_taxid_combined_file = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
-//     let initial_taxid_combined_count = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-//
-//
-//     let initial_write_mapped_handle = write_fasta_stream_to_file(
-//         ReceiverStream::new(initial_taxid_mapped_file), // Clone rx if needed for logging
-//         initial_mapped_path.clone(),
-//         config.base_buffer_size,
-//     );
-//     cleanup_tasks.push(initial_write_mapped_handle);
-//
-//     let initial_write_combined_handle = write_fasta_stream_to_file(
-//         ReceiverStream::new(initial_taxid_combined_file),
-//         initial_combined_path.clone(),
-//         config.base_buffer_size,
-//     );
-//     cleanup_tasks.push(initial_write_combined_handle);
-//
-//
-//     let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false).await?;
-//     let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false).await?;
-//     info!("Experimental: {} mapped, {} combined records", initial_mapped_count, initial_combined_count);
-//
-//
-//     let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
-//         config.clone(),
-//         initial_taxid_mapped_locator,
-//         out_dir.clone(),
-//     )
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e)))?;
-//
-//     cleanup_tasks.append(&mut initial_locator_tasks);
-//     info!("Experimental taxid locator files generated: {:?}", initial_locator_outputs);
-//
-//     let nt_info_db_path = config.args.nt_info_tab
-//         .clone()
-//         .map(PathBuf::from)
-//         .unwrap_or_else(|| PathBuf::from("nt_info.tab"));
-//
-//
-//     let skip_coverage_viz = {
-//         let mut skip = false;
-//
-//         if !assembly_outputs.coverage_json.exists() {
-//             warn!("Skipping coverage viz: contig_coverage_json missing (likely due to SPAdes assembly failure)");
-//             skip = true;
-//         } else if assembly_outputs.coverage_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
-//             warn!("Skipping coverage viz: contig_coverage_json is empty");
-//             skip = true;
-//         }
-//
-//         if !assembly_outputs.contig_stats_json.exists() {
-//             warn!("Skipping coverage viz: contig_stats_json missing");
-//             skip = true;
-//         } else if assembly_outputs.contig_stats_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
-//             warn!("Skipping coverage viz: contig_stats_json is empty");
-//             skip = true;
-//         }
-//
-//         skip
-//     };
-//
-//     let out_dir_for_viz = out_dir.clone();
-//     let coverage_task = if !skip_coverage_viz {
-//         info!("All coverage viz inputs present — spawning visualization task");
-//         Some(tokio::spawn(async move {
-//             generate_coverage_viz(
-//                 ReceiverStream::new(nt_hit_summary_coverage),
-//                 ReceiverStream::new(nt_refined_m8_top_stream_out),
-//                 assembly_outputs.coverage_json,
-//                 assembly_outputs.contig_stats_json,
-//                 ReceiverStream::new(nt_m8_viz),
-//                 nt_info_db_path,
-//                 out_dir_for_viz,
-//                 Some(MAX_NUM_BINS_COVERAGE),
-//                 Some(NUM_ACCESSIONS_PER_TAXON),
-//                 Some(MIN_CONTIG_SIZE),
-//                 false,
-//             )
-//                 .await
-//         }))
-//     } else {
-//         warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
-//         None
-//     };
-//
-//
-//     let clusters_opt = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
-//         Some(duplicate_clusters.clone())
-//     } else {
-//         None
-//     };
-//
-//     // shutting this off as: 1. needletail is more picky than seqkit and finds mismatcxhes too easily
-//     // 2. It is unlikely we'll be allowed to keep the non host FASTQ's
-//     // let (nonhost_r1, nonhost_r2_opt) = generate_nonhost_fastq_from_files(
-//     //     config.clone(),
-//     //     file1_path.clone(),
-//     //     file2_path.clone(),
-//     //     ReceiverStream::new(taxid_mapped_nonhost),
-//     //     clusters_opt,
-//     //     out_dir.clone(),
-//     // ).await?;
-//
-//
-//     // *******************
-//     // Results retrieval
-//     // *******************
-//
-//     let raw_count = join_with_error_handling(raw_count_task).await?;
-//     info!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
-//
-//     let stats = join_with_error_handling(val_count_task).await?;
-//     info!("Processed {} validated, {} undersized, {} oversized reads",
-//              stats.validated, stats.undersized, stats.oversized);
-//
-//     let _qc_fastp_read_count = match qc_count_result_rx.await {
-//         Ok(Ok(count)) => {
-//             info!("Received fastp read count: {}", count);
-//             count
-//         }
-//         Ok(Err(e)) => {
-//             error!("Error getting fastp read count: {}", e);
-//             0
-//         }
-//         Err(e) => {
-//             error!("Count receiver dropped: {}", e);
-//             0
-//         }
-//     };
-//
-//
-//     let ercc_mapped_count = ercc_count_rx.await
-//         .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
-//
-//     ercc_bt2_bam_write_handle.await??;
-//     host_bt2_bam_write_handle.await??;
-//     if let Some(handle) = optional_human_bam_write_handle {
-//         handle.await??;
-//     }
-//
-//     let host_bt2_counts = host_bt2_count_rx
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
-//     info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
-//
-//
-//     // insert size, now host BAM written out
-//     if paired {
-//         info!("Computing host insert size statistics from {}", host_bt2_bam_path.display());
-//
-//         let stats = compute_insert_size_stats_from_bam(
-//             host_bt2_bam_path.clone(),
-//             None,
-//         )
+//         let cleanup_results = try_join_all(cleanup_tasks)
 //             .await
-//             .context("Failed to compute insert size stats")?;
+//             .map_err(|join_err| PipelineError::Other(join_err.into()))?;
 //
-//         // Write Picard-style metrics file
-//         let metrics_path = out_dir.join("host_insert_metrics.txt");
-//         let mut f = std::fs::File::create(&metrics_path)
-//             .context("Failed to create insert metrics file")?;
-//
-//         writeln!(f, "## METRICS")?;
-//         writeln!(f, "MEAN_INSERT_SIZE\t{:.2}", stats.mean)?;
-//         writeln!(f, "MEDIAN_INSERT_SIZE\t{:.0}", stats.median)?;
-//         writeln!(f, "STANDARD_DEVIATION\t{:.2}", stats.stddev)?;
-//         writeln!(f, "TOTAL_PROPER_PAIRS\t{}", stats.total_proper_pairs)?;
-//         writeln!(f, "\n## HISTOGRAM\tinsert_size\tcount")?;
-//         for &(size, count) in &stats.insert_sizes {
-//             writeln!(f, "{}\t{}", size, count)?;
-//         }
-//
-//         let plot_path = out_dir.join("host_insert_size_histogram.png");
-//         if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
-//             warn!("Failed to plot insert size histogram: {}", e);
-//         }
-//
-//         info!("Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
-//           stats.mean, stats.median, stats.total_proper_pairs);
-//     }
-//
-//     let host_hisat2_counts = host_hisat2_count_rx
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
-//     info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
-//
-//
-//     // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
-//     // Cannot asusme ERCC's spiked in.
-//     let kallisto_exit = join_with_error_handling(kallisto_exit_task).await;
-//     match kallisto_exit {
-//         Ok(_) => info!("Kallisto completed successfully"),
-//         Err(e) => {
-//             warn!("Kallisto failed (non-fatal, possibly no ERCC spiked in): {}", e);
-//         }
-//     }
-//
-//     let kallisto_results_task = kallisto_results(out_dir.join("kallisto"), kallisto_ercc_tx)
-//         .await
-//         .map_err(|e| PipelineError::Other(e.into()))?;
-//     join_with_error_handling(kallisto_results_task).await
-//         .map_err(|e| PipelineError::Other(e.into()))?;
-//
-//     // Collect Kallisto results
-//     let kallisto_ercc_counts = kallisto_ercc_rx
-//         .await
-//         .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
-//
-//     let kallisto_dir = out_dir.join("kallisto");
-//     tokio::fs::create_dir_all(&kallisto_dir).await?;
-//
-//     let abundance_path = kallisto_dir.join("abundance.tsv");
-//     let abundance_file = TokioFile::create(&abundance_path).await?;
-//     let mut abundance_writer = BufWriter::new(abundance_file);
-//
-//     abundance_writer
-//         .write_all(b"target_id\tlength\teff_length\test_counts\ttpm\n")
-//         .await?;
-//
-//     for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
-//         let line = format!("{}\t0\t0\t{:.6}\t0.000000\n", target_id, est_counts);
-//         abundance_writer.write_all(line.as_bytes()).await?;
-//     }
-//     abundance_writer.flush().await?;
-//     info!("Wrote Kallisto abundance.tsv with {} ERCC transcripts", kallisto_ercc_counts.ercc_counts.len());
-//
-//     let ercc_path = out_dir.join("kallisto_ERCC_counts_tsv");
-//     let ercc_file = TokioFile::create(&ercc_path).await?;
-//     let mut ercc_writer = BufWriter::new(ercc_file);
-//
-//     ercc_writer
-//         .write_all(b"target_id\test_counts\n")
-//         .await?;
-//
-//     for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
-//         let line = format!("{}\t{:.6}\n", target_id, est_counts);
-//         ercc_writer.write_all(line.as_bytes()).await?;
-//     }
-//     ercc_writer.flush().await?;
-//     info!("Wrote kallisto_ERCC_counts_tsv");
-//
-//     let compute_merged_taxon_result = compute_merged_taxon_handle.await??;
-//
-//     // *******************
-//     // Cleanup
-//     // *******************
-//
-//     // Helper to handle downcast + NotFound tolerance in one place
-//     fn handle_cleanup_error(e: anyhow::Error, context: &str) -> Result<(), PipelineError> {
-//         match e.downcast::<std::io::Error>() {
-//             Ok(io_err) => {
-//                 if io_err.kind() == std::io::ErrorKind::NotFound {
-//                     warn!("Cleanup ignored missing file/dir (non-fatal) [{}]: {}", context, io_err);
-//                     Ok(())
-//                 } else {
-//                     // Other io errors are fatal
-//                     Err(PipelineError::Other(anyhow::Error::new(io_err)))
-//                 }
-//             }
-//             Err(remaining) => {
-//                 // Not an io::Error → treat as fatal
-//                 Err(PipelineError::Other(remaining))
+//         // Process each task result
+//         for res in cleanup_results {
+//             if let Err(e) = res {
+//                 eprintln!("Early end failure condition: {}", e);
 //             }
 //         }
-//     }
-//
-//     // Wait for all cleanup tasks
-//     let cleanup_results = try_join_all(cleanup_tasks)
-//         .await
-//         .map_err(|join_err| PipelineError::Other(join_err.into()))?;
-//
-//     // Process each task result
-//     for res in cleanup_results {
-//         if let Err(e) = res {
-//             handle_cleanup_error(e, "task")?;
-//         }
-//     }
-//
-//     // Process cleanup receivers (oneshot channels)
-//     for rx in cleanup_receivers {
-//         match rx.await {
-//             Ok(Ok(_)) => {}  // success
-//
-//             Ok(Err(e)) => {
-//                 handle_cleanup_error(e, "receiver")?;
-//             }
-//
-//             Err(oneshot_err) => {
-//                 // Channel broken (panic, drop, empty stream, etc.)
-//                 // Usually safe to ignore if stream was empty
-//                 warn!("Cleanup receiver channel failed (possibly empty): {}", oneshot_err);
-//                 // continue (non-fatal)
-//             }
-//         }
-//     }
-//
-//     // Coverage viz — keep non-fatal as before
-//     if let Some(coverage_task) = coverage_task {
-//         match coverage_task.await {
-//             Ok(Ok(_)) => info!("Coverage visualization completed successfully"),
-//             Ok(Err(e)) => warn!("Coverage viz failed (non-fatal): {}", e),
-//             Err(join_err) => warn!("Coverage viz task join failed (non-fatal): {}", join_err),
-//         }
-//     }
-//
-//     // Final temp resource drops — defensive, never fail the pipeline
-//     for tf in temp_files {
-//         if let Err(e) = tf.close() {
-//             if e.kind() == std::io::ErrorKind::NotFound {
-//                 debug!("Temp file already gone during close: {}", e);
-//             } else {
-//                 warn!("Temp file close failed (non-fatal): {}", e);
-//             }
-//         }
-//     }
-//
-//     for td in final_temp_dirs {
-//         if let Err(e) = std::fs::remove_dir_all(td.path()) {
-//             if e.kind() == std::io::ErrorKind::NotFound {
-//                 debug!("Temp dir already gone: {}", e);
-//             } else {
-//                 warn!("Temp dir removal failed (non-fatal): {}", e);
-//             }
-//         }
-//     }
-//
-//     drop(temp_paths);
 //
 //     info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
 //     Ok(())
 // }
+//
+
+    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+    ).await?;
+
+    cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
+    cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
+
+
+    let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
+
+    let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
+        config.clone(),
+        non_host_mm2_out_stream,
+        m8_file_path,
+    )
+        .await?;
+    cleanup_tasks.append(&mut m8_cleanup_tasks);
+    cleanup_receivers.append(&mut m8_cleanup_receivers);
+
+    let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
+
+    let nt_concurrency = compute_phase_concurrency(
+        &config,
+        "call_hits_nt",
+        1.0,           // ~1 GB per thread max (mostly transient)
+        3.5,
+        64,            // higher cap for CPU-bound phase
+        16,            // min for meaningful parallelism
+    );
+    info!("call hits nt concurrency {}", nt_concurrency);
+
+    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
+        config.clone(),
+        m8_stream,
+        sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
+        should_keep_filter.clone(),
+        36,
+        nt_concurrency,
+    ).await?;
+    cleanup_tasks.append(&mut call_cleanup_tasks);
+    cleanup_receivers.append(&mut call_cleanup_receivers);
+
+    let (nt_streams, nt_done_rx) = t_junction(
+        call_stream,
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nt_call".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_done_rx);
+
+    let mut nt_streams_iter = nt_streams.into_iter();
+    let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (nt_summary_streams, nt_summary_done_rx) = t_junction(
+        call_summary_stream,
+        4,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nt_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_summary_done_rx);
+    let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
+    let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nt_summary_hit_stream), 0));
+
+    let nt_counts = generate_taxon_counts(
+        config.clone(),
+        ReceiverStream::new(nt_call_stream),
+        ReceiverStream::new(nt_summary_taxon_stream),
+        duplicate_clusters.clone(),
+        should_keep_filter.clone(),
+        "NT".to_string(),
+        None,
+    ).await?;
+    info!("NT taxon counts: {} entries", nt_counts.len());
+
+    let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
+
+    // Temporary: Skip Diamond by providing empty outputs
+    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(dummy_tx); // Immediately drop sender to create an empty stream
+    let non_host_diamond_m8_stream = dummy_rx;
+    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+
+
+    // Diamond non_host alignment
+    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
+    //     config.clone(),
+    //     non_host_r1_path.clone(),
+    //     non_host_r2_path_opt.clone(),
+    // ).await?;
+    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    // final_temp_dirs.extend(non_host_diamond_temp_dirs);
+
+    let nr_concurrency = compute_phase_concurrency(
+        &config,
+        "call_hits_nr",
+        1.0,           // ~1 GB per thread max (mostly transient)
+        3.5,
+        64,            // higher cap for CPU-bound phase
+        16,            // min for meaningful parallelism
+    );
+
+    info!("call hits nr concurrency {}", nr_concurrency);
+
+
+    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
+        config.clone(),
+        ReceiverStream::new(non_host_diamond_m8_stream),
+        sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
+        should_keep_filter.clone(),
+        0,
+        nr_concurrency,
+    ).await?;
+    cleanup_tasks.append(&mut nr_call_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
+
+    let (nr_streams, nr_done_rx) = t_junction(
+        nr_call_stream,
+        4,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nr_call".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_done_rx);
+
+    let mut nr_streams_iter = nr_streams.into_iter();
+    let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_initial_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (nr_summary_streams, nr_summary_done_rx) = t_junction(
+        nr_call_summary_stream,
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_summary_done_rx);
+    let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
+    let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nr_summary_hit_stream), 0));
+
+    let nr_counts = generate_taxon_counts(
+        config.clone(),
+        ReceiverStream::new(nr_call_stream),
+        ReceiverStream::new(nr_summary_taxon_stream),
+        duplicate_clusters.clone(),
+        should_keep_filter.clone(),
+        "NR".to_string(),
+        None,
+    ).await?;
+    info!("NR taxon counts: {} entries", nr_counts.len());
+
+    let nr_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_stream)).await?;
+
+    let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
+    let (_combined_path, write_json_task) = combine_taxon_counts(
+        &nt_counts,
+        &nr_counts,
+        combined_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+    cleanup_tasks.push(write_json_task);
+
+    let annot_concurrency = compute_phase_concurrency(
+        &config,
+        "generate_annotated_fasta",
+        0.4,   // ~400 MB/thread — mostly transient
+        4.0,
+        128,
+        8,
+    );
+
+    let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) = generate_annotated_fasta_from_files(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        duplicate_clusters.clone(),
+        nt_map,
+        nr_map,
+        annot_concurrency
+    ).await
+        .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
+
+    cleanup_tasks.append(&mut annot_tasks);
+    cleanup_receivers.append(&mut annot_rxs);
+
+    let assembly_dir = out_dir.join("assembly");
+
+    let annotated_path = assembly_dir.join("annotated_merged.fa");
+    let unidentified_path = assembly_dir.join("unidentified.fa");
+    let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
+
+
+    let (initial_annotated_streams, initial_annotated_done_rx) = t_junction(
+        ReceiverStream::new(annotated_rx),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_annotated_done_rx);
+    let mut initial_annotated_streams_iter = initial_annotated_streams.into_iter();
+    let initial_annotated_file_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_annotated_taxon_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (initial_unidentified_streams, initial_unidentified_done_rx) = t_junction(
+        ReceiverStream::new(unidentified_rx),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nr_call_summary".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_unidentified_done_rx);
+    let mut initial_unidentified_streams_iter = initial_unidentified_streams.into_iter();
+    let initial_unidentified_file_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_unidentified_taxon_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        ReceiverStream::new(initial_annotated_file_stream),
+        annotated_path.clone(),
+        config.base_buffer_size,
+    ));
+
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        ReceiverStream::new(initial_unidentified_file_stream),
+        unidentified_path.clone(),
+        config.base_buffer_size,
+    ));
+
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        ReceiverStream::new(unique_unidentified_rx),
+        unique_unidentified_path.clone(),
+        config.base_buffer_size,
+    ));
+
+
+    // *******************
+    // Post-processing
+    // *******************
+
+    // Assembly stats
+    let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
+    let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
+
+    let spades_task = spades_assembly(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        &out_dir,
+    ).await?;
+
+    let spades_completion = spades_task.await;
+
+    match spades_completion {
+        Ok(Ok(())) => {
+            info!("SPAdes assembly task completed successfully");
+        }
+        Ok(Err(e)) => {
+            warn!("SPAdes assembly failed: {}", e);
+        }
+        Err(join_err) => {
+            error!("SPAdes task panicked or was cancelled: {}", join_err);
+        }
+    }
+
+    let (assembly_outputs, assembly_bam_out_stream,
+        mut post_assembly_cleanup_tasks,
+        mut post_assembly_cleanup_receivers,
+        mut post_assembly_temp_files) = process_assembly(
+        config.clone(),
+        &assembly_out_dir,
+        &assembly_work_dir,
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        duplicate_clusters.clone(),
+        paired,
+        4 // this can become as CLI arg if needed
+    ).await?;
+
+    cleanup_tasks.extend(post_assembly_cleanup_tasks);
+    cleanup_receivers.extend(post_assembly_cleanup_receivers);
+    temp_files.extend(post_assembly_temp_files);
+
+    let _ = fs::remove_dir_all(assembly_work_dir).await;
+
+    let generate_assembly_coverage_result = generate_assembly_coverage(
+        config.clone(),
+        assembly_bam_out_stream,
+        &assembly_outputs.contigs_fasta,
+        &assembly_outputs.coverage_json,
+        &assembly_outputs.coverage_summary_csv,
+    )
+        .await
+        .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
+    eprintln!("coverage result {:?}", generate_assembly_coverage_result);
+
+
+    let nt_file = config
+        .args
+        .nt
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT file required for fasta extraction".into(),
+        ))?;
+
+    let nt_offset_db_file = config
+        .args
+        .nt_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT offset DB file required for fasta extraction".into(),
+        ))?;
+
+
+    let nr_file = config
+        .args
+        .nr
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR file required for fasta extraction".into(),
+        ))?;
+
+    let nr_offset_db_file = config
+        .args
+        .nr_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR offset DB file required for fasta extraction".into(),
+        ))?;
+
+
+    // Blast contigs
+    // NT and NR prep in parallel
+    let nt_prep_handle = tokio::spawn({
+        let config = config.clone();
+        let nt_file = nt_file.clone();
+        let nt_offset_db_file = nt_offset_db_file.clone();
+        async move {
+            let (
+                nt_read_dict_map,
+                nt_accession_dict_noarc,
+                nt_selected_genera,
+                _nt_total_reads,
+            ) = nt_hit_summary_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
+
+            let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
+                config.clone(),
+                &nt_selected_genera,
+                NT_TAG,
+                &PathBuf::from(nt_file),
+                &PathBuf::from(nt_offset_db_file),
+            )
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
+                nt_read_dict_map,
+                Arc::new(nt_accession_dict_noarc),
+                nt_ref_fasta_path,
+                nt_ref_fasta_temp_dir,
+            ))
+        }
+    });
+
+    let nr_prep_handle = tokio::spawn({
+        let config = config.clone();
+        let nr_file = nr_file.clone();
+        let nr_offset_db_file = nr_offset_db_file.clone();
+        async move {
+            let (
+                nr_read_dict_map,
+                nr_accession_dict_noarc,
+                nr_selected_genera,
+                _nr_total_reads,
+            ) = nr_hit_summary_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
+                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
+
+            let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
+                config.clone(),
+                &nr_selected_genera,
+                NR_TAG,
+                &PathBuf::from(nr_file),
+                &PathBuf::from(nr_offset_db_file),
+            )
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
+                nr_read_dict_map,
+                Arc::new(nr_accession_dict_noarc),
+                nr_ref_fasta_path,
+                nr_ref_fasta_temp_dir,
+            ))
+        }
+    });
+
+    let (nt_prep_res, nr_prep_res) = tokio::try_join!(nt_prep_handle, nr_prep_handle)
+        .map_err(|e| PipelineError::Other(anyhow!("Reference prep task panicked: {e}")))?;
+
+    let (nt_read_dict_map, nt_accession_dict, nt_ref_fasta_path, nt_ref_fasta_temp_dir) = nt_prep_res?;
+    let (nr_read_dict_map, nr_accession_dict, nr_ref_fasta_path, nr_ref_fasta_temp_dir) = nr_prep_res?;
+
+    let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_map));
+    let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_map));
+
+    info!("NT ref path: {}", nt_ref_fasta_path.display());
+    info!("NR ref path: {}", nr_ref_fasta_path.display());
+
+    final_temp_dirs.push(nt_ref_fasta_temp_dir);
+    final_temp_dirs.push(nr_ref_fasta_temp_dir);
+
+    let nt_blast_concurrency = compute_phase_concurrency(
+        &config,
+        "nt_blast_contigs",
+        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
+        5.0,           // strong CPU-bound phase (alignment + scoring)
+        128,           // high cap — BLAST scales decently to 128 on EPYC
+        8,             // min — still want parallelism on MacBook Air
+    );
+    info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
+
+    let nt_handle = tokio::spawn({
+        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        let read2contig = assembly_outputs.read2contig.clone();
+
+        async move {
+            blast_contigs(
+                config,
+                NT_TAG,
+                ReceiverStream::new(nt_blast_stream),
+                ReceiverStream::new(nt_blast_hit_stream),
+                nt_read_dict.clone(),
+                nt_accession_dict,
+                nt_counts,
+                &contigs_fasta_path.clone(),
+                read2contig,
+                &nt_ref_fasta_path,
+                duplicate_clusters,
+                lineage_map,
+                should_keep_filter,
+                4,
+                nt_blast_concurrency
+            ).await
+        }
+    });
+
+    let nr_blast_concurrency = compute_phase_concurrency(
+        &config,
+        "nr_blast_contigs",
+        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
+        5.0,           // strong CPU-bound phase (alignment + scoring)
+        128,           // high cap — BLAST scales decently to 128 on EPYC
+        8,             // min — still want parallelism on MacBook Air
+    );
+    info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
+
+    let nr_handle = tokio::spawn({
+        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        let read2contig = assembly_outputs.read2contig.clone();
+
+        async move {
+            blast_contigs(
+                config,
+                NR_TAG,
+                ReceiverStream::new(nr_blast_stream),
+                ReceiverStream::new(nr_blast_hit_stream),
+                nr_read_dict.clone(),
+                nr_accession_dict,
+                nr_counts,
+                &contigs_fasta_path.clone(),
+                read2contig,
+                &nr_ref_fasta_path,
+                duplicate_clusters,
+                lineage_map,
+                should_keep_filter,
+                4,
+                nr_blast_concurrency
+            ).await
+        }
+    });
+
+
+    let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
+        .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
+
+    let (nt_read_dict, nt_refined_counts,
+        nt_contig_summary, nt_refined_m8_stream_out,
+        nt_refined_hit_summary_stream_out, nt_refined_m8_top_stream_out,
+        nt_cleanup_tasks, nt_cleanup_receivers,
+        nt_temp_files) = nt_res?;
+
+    cleanup_tasks.extend(nt_cleanup_tasks);
+    cleanup_receivers.extend(nt_cleanup_receivers);
+    temp_files.extend(nt_temp_files);
+
+
+    let (nt_m8_streams, nt_m8_rx) = t_junction(
+        ReceiverStream::new(nt_refined_m8_stream_out),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nt_m8".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_m8_rx);
+
+    let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
+    let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
+        ReceiverStream::new(nt_refined_hit_summary_stream_out),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "validate_input".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nt_hitsummary_rx);
+
+    let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
+    let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (nr_read_dict, nr_refined_counts,
+        nr_contig_summary, nr_refined_m8_stream_out,
+        nr_refined_hit_summary_stream_out, nr_refined_m8_top_stream_out,
+        nr_cleanup_tasks, nr_cleanup_receivers,
+        nr_temp_files) = nr_res?;
+    cleanup_tasks.extend(nr_cleanup_tasks);
+    cleanup_receivers.extend(nr_cleanup_receivers);
+    temp_files.extend(nr_temp_files);
+
+
+    let (nr_m8_streams, nr_m8_rx) = t_junction(
+        ReceiverStream::new(nr_refined_m8_stream_out),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "nr_m8".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_m8_rx);
+
+    let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
+    let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
+        ReceiverStream::new(nr_refined_hit_summary_stream_out),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "validate_input".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(nr_hitsummary_rx);
+
+    let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
+    let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    //prelod
+    let mut nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>> = Arc::new(DashMap::with_capacity(80_000_000));
+
+    let mut preload_stream = ReceiverStream::new(nr_hit_summary_preload);
+    while let Some(item) = preload_stream.next().await {
+        let bytes = item.to_bytes()?;
+        let line = String::from_utf8_lossy(&bytes);
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = trimmed.split('\t').collect();
+        if fields.len() < 10 {
+            warn!("Malformed NR hit summary line during preload: {}", trimmed);
+            continue;
+        }
+
+        let read_id = fields[0].to_string();
+        let contig_taxid = fields[9].parse::<Taxid>().ok();
+        let read_taxid = fields[3].parse::<Taxid>().ok();
+
+        nr_alignment_per_read.insert(
+            read_id,
+            SpeciesAlignmentResults {
+                contig: contig_taxid,
+                read: read_taxid,
+            },
+        );
+    }
+    info!("Preloaded {} NR alignments into memory for merge", nr_alignment_per_read.len());
+
+
+    let compute_merged_taxon_handle = tokio::spawn(compute_merged_taxon_counts(
+        config.clone(),
+        nt_m8_merge,
+        nt_hit_summary_merge,
+        nt_contig_summary,
+        nr_m8_merge,
+        nr_hit_summary_merge,
+        nr_contig_summary,
+        lineage_map.clone(),
+        should_keep_filter.clone(),
+        duplicate_clusters.clone(),
+        out_dir.join("refined.m8"),
+        out_dir.join("refined.hitsummary.tab"),
+        out_dir.join("refined_taxon_counts_with_dcr.json"),
+        out_dir.join("assembly_combined_contig_summary.json"),
+        nr_alignment_per_read
+    ));
+
+
+    let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
+    let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
+        &nt_refined_counts,
+        &nr_refined_counts,
+        refined_combined_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+    cleanup_tasks.push(refined_write_json_task);
+
+
+    // Build refined accession maps
+    let nt_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_map)).await
+        .map_err(|e| PipelineError::Other(anyhow!("NT refined accession map failed: {}", e)))?;
+
+    let nr_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_map)).await
+        .map_err(|e| PipelineError::Other(anyhow!("NR refined accession map failed: {}", e)))?;
+
+
+    // Contig FASTA stream (from assembly)
+    // ───────────────────────────────────────────────────────────────
+    let contigs_fasta = assembly_outputs.contigs_fasta.clone();
+    let contigs_file = tokio::fs::File::open(&contigs_fasta).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
+
+    let contigs_rx = parse_fasta(contigs_file, 32768).await
+        .map_err(|e| PipelineError::Other(anyhow!("parse_fasta failed: {}", e)))?;
+
+    let mut contigs_stream = ReceiverStream::new(contigs_rx);
+
+    // Empty cluster stream (contigs have no duplicates)
+    let (_cluster_tx, cluster_rx) = mpsc::channel::<ParseOutput>(1);
+    drop(_cluster_tx);
+    let contigs_cluster_stream = ReceiverStream::new(cluster_rx);
+
+    let assembly_dir = out_dir.join("assembly");
+    tokio::fs::create_dir_all(&assembly_dir).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
+
+
+    let nr_annot_concurrency = compute_phase_concurrency(
+        &config,
+        "nr_annot_concurrency",
+        0.4,
+        4.0,
+        128,
+        8,
+    );
+
+    let (
+        mapped_contigs_rx,
+        unidentified_contigs_rx,
+        unique_unidentified_rx,
+        mut annot_tasks,
+        mut annot_rxs,
+    ) = generate_annotated_fasta(
+        config.clone(),
+        contigs_stream,
+        duplicate_clusters.clone(),
+        nt_refined_map.into_iter().collect(),
+        nr_refined_map.into_iter().collect(),
+        nr_annot_concurrency,
+    ).await
+        .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+    cleanup_tasks.append(&mut annot_tasks);
+    cleanup_receivers.append(&mut annot_rxs);
+
+
+    let (
+        taxid_mapped_rx,
+        taxid_combined_rx,
+        load_nt_task,
+        load_nr_task,
+        taxid_main_task,
+    ) = generate_taxid_fasta(
+        config.clone(),
+        ReceiverStream::new(mapped_contigs_rx),
+        ReceiverStream::new(unidentified_contigs_rx),
+        ReceiverStream::new(nt_hit_summary_taxid),
+        ReceiverStream::new(nr_hit_summary_taxid),
+        lineage_map.clone(),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
+
+
+    cleanup_tasks.push(load_nt_task);
+    cleanup_tasks.push(load_nr_task);
+    cleanup_tasks.push(taxid_main_task);
+
+
+    let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
+        ReceiverStream::new(taxid_mapped_rx),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "taxid_mapped".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(taxid_mapped_rx);
+
+    let mut taxid_mapped_streams_iter = taxid_mapped_streams.into_iter();
+    let taxid_mapped_file = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let taxid_mapped_locator = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let taxid_mapped_nonhost = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
+    let combined_path = assembly_dir.join("refined_taxid_annot_fasta");
+
+
+    let write_mapped_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(taxid_mapped_file),
+        mapped_path.clone(),
+        config.base_buffer_size,
+    );
+    cleanup_tasks.push(write_mapped_handle);
+
+    let write_combined_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(taxid_combined_rx),
+        combined_path.clone(),
+        config.base_buffer_size,
+    );
+    cleanup_tasks.push(write_combined_handle);
+
+
+    let assembly_dir = out_dir.join("assembly");
+
+    let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
+        config.clone(),
+        taxid_mapped_locator, // directly pass the receiver
+        assembly_dir,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
+
+    cleanup_tasks.append(&mut locator_tasks);
+    info!("Taxid locator files generated: {:?}", locator_outputs);
+
+
+    // *******************
+    // Experimental
+    // *******************
+
+    let (
+        initial_taxid_mapped_rx,
+        initial_taxid_combined_rx,
+        initial_load_nt_task,
+        initial_load_nr_task,
+        initial_taxid_main_task,
+    ) = generate_taxid_fasta(
+        config.clone(),
+        ReceiverStream::new(initial_annotated_taxon_stream),
+        ReceiverStream::new(initial_unidentified_taxon_stream),
+        ReceiverStream::new(nt_initial_stream),
+        ReceiverStream::new(nr_initial_stream),
+        lineage_map.clone(),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_fasta failed: {}", e)))?;
+
+    cleanup_tasks.push(initial_load_nt_task);
+    cleanup_tasks.push(initial_load_nr_task);
+    cleanup_tasks.push(initial_taxid_main_task);
+
+    let initial_mapped_path = out_dir.join("taxid_annot_mapped_only.fasta");
+    let initial_combined_path = out_dir.join("taxid_annot.fasta");
+
+    let (initial_taxid_mapped_streams, initial_taxid_mapped_rx) = t_junction(
+        ReceiverStream::new(initial_taxid_mapped_rx),
+        3,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "initial_taxid_mapped".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_taxid_mapped_rx);
+
+    let mut initial_taxid_mapped_streams_iter = initial_taxid_mapped_streams.into_iter();
+    let initial_taxid_mapped_file = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
+    let initial_taxid_mapped_locator = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_taxid_mapped_count = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (initial_taxid_combined_streams, initial_taxid_combined_rx) = t_junction(
+        ReceiverStream::new(initial_taxid_combined_rx),
+        2,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+        None,
+        config.base_backpressure_pause,
+        StreamDataType::IlluminaFastq,
+        "initial_taxid_combined".to_string(),
+        None,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(initial_taxid_combined_rx);
+
+    let mut initial_taxid_combined_streams_iter = initial_taxid_combined_streams.into_iter();
+    let initial_taxid_combined_file = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
+    let initial_taxid_combined_count = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let initial_write_mapped_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(initial_taxid_mapped_file), // Clone rx if needed for logging
+        initial_mapped_path.clone(),
+        config.base_buffer_size,
+    );
+    cleanup_tasks.push(initial_write_mapped_handle);
+
+    let initial_write_combined_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(initial_taxid_combined_file),
+        initial_combined_path.clone(),
+        config.base_buffer_size,
+    );
+    cleanup_tasks.push(initial_write_combined_handle);
+
+
+    let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false).await?;
+    let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false).await?;
+    info!("Experimental: {} mapped, {} combined records", initial_mapped_count, initial_combined_count);
+
+
+    let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
+        config.clone(),
+        initial_taxid_mapped_locator,
+        out_dir.clone(),
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e)))?;
+
+    cleanup_tasks.append(&mut initial_locator_tasks);
+    info!("Experimental taxid locator files generated: {:?}", initial_locator_outputs);
+
+    let nt_info_db_path = config.args.nt_info_tab
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nt_info.tab"));
+
+
+    let skip_coverage_viz = {
+        let mut skip = false;
+
+        if !assembly_outputs.coverage_json.exists() {
+            warn!("Skipping coverage viz: contig_coverage_json missing (likely due to SPAdes assembly failure)");
+            skip = true;
+        } else if assembly_outputs.coverage_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+            warn!("Skipping coverage viz: contig_coverage_json is empty");
+            skip = true;
+        }
+
+        if !assembly_outputs.contig_stats_json.exists() {
+            warn!("Skipping coverage viz: contig_stats_json missing");
+            skip = true;
+        } else if assembly_outputs.contig_stats_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+            warn!("Skipping coverage viz: contig_stats_json is empty");
+            skip = true;
+        }
+
+        skip
+    };
+
+    let out_dir_for_viz = out_dir.clone();
+    let coverage_task = if !skip_coverage_viz {
+        info!("All coverage viz inputs present — spawning visualization task");
+        Some(tokio::spawn(async move {
+            generate_coverage_viz(
+                ReceiverStream::new(nt_hit_summary_coverage),
+                ReceiverStream::new(nt_refined_m8_top_stream_out),
+                assembly_outputs.coverage_json,
+                assembly_outputs.contig_stats_json,
+                ReceiverStream::new(nt_m8_viz),
+                nt_info_db_path,
+                out_dir_for_viz,
+                Some(MAX_NUM_BINS_COVERAGE),
+                Some(NUM_ACCESSIONS_PER_TAXON),
+                Some(MIN_CONTIG_SIZE),
+                false,
+            )
+                .await
+        }))
+    } else {
+        warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
+        None
+    };
+
+
+    let clusters_opt = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
+        Some(duplicate_clusters.clone())
+    } else {
+        None
+    };
+
+    // shutting this off as: 1. needletail is more picky than seqkit and finds mismatcxhes too easily
+    // 2. It is unlikely we'll be allowed to keep the non host FASTQ's
+    // let (nonhost_r1, nonhost_r2_opt) = generate_nonhost_fastq_from_files(
+    //     config.clone(),
+    //     file1_path.clone(),
+    //     file2_path.clone(),
+    //     ReceiverStream::new(taxid_mapped_nonhost),
+    //     clusters_opt,
+    //     out_dir.clone(),
+    // ).await?;
+
+
+    // *******************
+    // Results retrieval
+    // *******************
+
+    let raw_count = join_with_error_handling(raw_count_task).await?;
+    info!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
+
+    let stats = join_with_error_handling(val_count_task).await?;
+    info!("Processed {} validated, {} undersized, {} oversized reads",
+             stats.validated, stats.undersized, stats.oversized);
+
+    let _qc_fastp_read_count = match qc_count_result_rx.await {
+        Ok(Ok(count)) => {
+            info!("Received fastp read count: {}", count);
+            count
+        }
+        Ok(Err(e)) => {
+            error!("Error getting fastp read count: {}", e);
+            0
+        }
+        Err(e) => {
+            error!("Count receiver dropped: {}", e);
+            0
+        }
+    };
+
+
+    let ercc_mapped_count = ercc_count_rx.await
+        .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
+
+    ercc_bt2_bam_write_handle.await??;
+    host_bt2_bam_write_handle.await??;
+    if let Some(handle) = optional_human_bam_write_handle {
+        handle.await??;
+    }
+
+    let host_bt2_counts = host_bt2_count_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
+    info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
+
+
+    // insert size, now host BAM written out
+    if paired {
+        info!("Computing host insert size statistics from {}", host_bt2_bam_path.display());
+
+        let stats = compute_insert_size_stats_from_bam(
+            host_bt2_bam_path.clone(),
+            None,
+        )
+            .await
+            .context("Failed to compute insert size stats")?;
+
+        // Write Picard-style metrics file
+        let metrics_path = out_dir.join("host_insert_metrics.txt");
+        let mut f = std::fs::File::create(&metrics_path)
+            .context("Failed to create insert metrics file")?;
+
+        writeln!(f, "## METRICS")?;
+        writeln!(f, "MEAN_INSERT_SIZE\t{:.2}", stats.mean)?;
+        writeln!(f, "MEDIAN_INSERT_SIZE\t{:.0}", stats.median)?;
+        writeln!(f, "STANDARD_DEVIATION\t{:.2}", stats.stddev)?;
+        writeln!(f, "TOTAL_PROPER_PAIRS\t{}", stats.total_proper_pairs)?;
+        writeln!(f, "\n## HISTOGRAM\tinsert_size\tcount")?;
+        for &(size, count) in &stats.insert_sizes {
+            writeln!(f, "{}\t{}", size, count)?;
+        }
+
+        let plot_path = out_dir.join("host_insert_size_histogram.png");
+        if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
+            warn!("Failed to plot insert size histogram: {}", e);
+        }
+
+        info!("Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
+          stats.mean, stats.median, stats.total_proper_pairs);
+    }
+
+    let host_hisat2_counts = host_hisat2_count_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
+    info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
+
+
+    // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
+    // Cannot asusme ERCC's spiked in.
+    let kallisto_exit = join_with_error_handling(kallisto_exit_task).await;
+    match kallisto_exit {
+        Ok(_) => info!("Kallisto completed successfully"),
+        Err(e) => {
+            warn!("Kallisto failed (non-fatal, possibly no ERCC spiked in): {}", e);
+        }
+    }
+
+    let kallisto_results_task = kallisto_results(out_dir.join("kallisto"), kallisto_ercc_tx)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    join_with_error_handling(kallisto_results_task).await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // Collect Kallisto results
+    let kallisto_ercc_counts = kallisto_ercc_rx
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
+
+    let kallisto_dir = out_dir.join("kallisto");
+    tokio::fs::create_dir_all(&kallisto_dir).await?;
+
+    let abundance_path = kallisto_dir.join("abundance.tsv");
+    let abundance_file = TokioFile::create(&abundance_path).await?;
+    let mut abundance_writer = BufWriter::new(abundance_file);
+
+    abundance_writer
+        .write_all(b"target_id\tlength\teff_length\test_counts\ttpm\n")
+        .await?;
+
+    for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
+        let line = format!("{}\t0\t0\t{:.6}\t0.000000\n", target_id, est_counts);
+        abundance_writer.write_all(line.as_bytes()).await?;
+    }
+    abundance_writer.flush().await?;
+    info!("Wrote Kallisto abundance.tsv with {} ERCC transcripts", kallisto_ercc_counts.ercc_counts.len());
+
+    let ercc_path = out_dir.join("kallisto_ERCC_counts_tsv");
+    let ercc_file = TokioFile::create(&ercc_path).await?;
+    let mut ercc_writer = BufWriter::new(ercc_file);
+
+    ercc_writer
+        .write_all(b"target_id\test_counts\n")
+        .await?;
+
+    for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
+        let line = format!("{}\t{:.6}\n", target_id, est_counts);
+        ercc_writer.write_all(line.as_bytes()).await?;
+    }
+    ercc_writer.flush().await?;
+    info!("Wrote kallisto_ERCC_counts_tsv");
+
+    let compute_merged_taxon_result = compute_merged_taxon_handle.await??;
+
+    // *******************
+    // Cleanup
+    // *******************
+
+    // Helper to handle downcast + NotFound tolerance in one place
+    fn handle_cleanup_error(e: anyhow::Error, context: &str) -> Result<(), PipelineError> {
+        match e.downcast::<std::io::Error>() {
+            Ok(io_err) => {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    warn!("Cleanup ignored missing file/dir (non-fatal) [{}]: {}", context, io_err);
+                    Ok(())
+                } else {
+                    // Other io errors are fatal
+                    Err(PipelineError::Other(anyhow::Error::new(io_err)))
+                }
+            }
+            Err(remaining) => {
+                // Not an io::Error → treat as fatal
+                Err(PipelineError::Other(remaining))
+            }
+        }
+    }
+
+    // Wait for all cleanup tasks
+    let cleanup_results = try_join_all(cleanup_tasks)
+        .await
+        .map_err(|join_err| PipelineError::Other(join_err.into()))?;
+
+    // Process each task result
+    for res in cleanup_results {
+        if let Err(e) = res {
+            handle_cleanup_error(e, "task")?;
+        }
+    }
+
+    // Process cleanup receivers (oneshot channels)
+    for rx in cleanup_receivers {
+        match rx.await {
+            Ok(Ok(_)) => {}  // success
+
+            Ok(Err(e)) => {
+                handle_cleanup_error(e, "receiver")?;
+            }
+
+            Err(oneshot_err) => {
+                // Channel broken (panic, drop, empty stream, etc.)
+                // Usually safe to ignore if stream was empty
+                warn!("Cleanup receiver channel failed (possibly empty): {}", oneshot_err);
+                // continue (non-fatal)
+            }
+        }
+    }
+
+    // Coverage viz — keep non-fatal as before
+    if let Some(coverage_task) = coverage_task {
+        match coverage_task.await {
+            Ok(Ok(_)) => info!("Coverage visualization completed successfully"),
+            Ok(Err(e)) => warn!("Coverage viz failed (non-fatal): {}", e),
+            Err(join_err) => warn!("Coverage viz task join failed (non-fatal): {}", join_err),
+        }
+    }
+
+    // Final temp resource drops — defensive, never fail the pipeline
+    for tf in temp_files {
+        if let Err(e) = tf.close() {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!("Temp file already gone during close: {}", e);
+            } else {
+                warn!("Temp file close failed (non-fatal): {}", e);
+            }
+        }
+    }
+
+    for td in final_temp_dirs {
+        if let Err(e) = std::fs::remove_dir_all(td.path()) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                debug!("Temp dir already gone: {}", e);
+            } else {
+                warn!("Temp dir removal failed (non-fatal): {}", e);
+            }
+        }
+    }
+
+    drop(temp_paths);
+
+    info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
+    Ok(())
+}
