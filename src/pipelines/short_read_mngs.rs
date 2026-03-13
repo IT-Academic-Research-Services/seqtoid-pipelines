@@ -5610,8 +5610,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         human_hisat2_out_stream
     };
 
+    let post_filter_monitored = monitor_stream(post_filter_stream, "Post_Hisat2", Duration::from_secs(5));
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
-        post_filter_stream.into_inner(),
+        post_filter_monitored.into_inner(),
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    ).await?;
+
+    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
+        pre_dedup_parsed_stream,
         config.base_buffer_size,
         config.args.stall_threshold,
     ).await?;
