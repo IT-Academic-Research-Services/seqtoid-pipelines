@@ -6,7 +6,7 @@ use std::hash::Hasher;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::collections::hash_map::DefaultHasher;
 use std::process::{Command as StdCommand, Stdio};
@@ -292,7 +292,12 @@ pub struct AccessionHit {
 }
 
 
-
+#[derive(Debug, Clone)]
+struct Cluster {
+    rep_id: String,
+    size: u64,
+    members: Vec<String>,
+}
 
 /// Called read_fastq in single or paired FASTQ's and streams interleaved output
 ///
@@ -1886,7 +1891,6 @@ async fn dedup_and_subsample(
     ))
 }
 
-
 async fn dedup(
     config: Arc<RunConfig>,
     input_stream: mpsc::Receiver<ParseOutput>,
@@ -1903,154 +1907,162 @@ async fn dedup(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let mut dedup_map: HashMap<u64, (u64, Vec<SequenceRecord>)> = HashMap::new();
-    let mut total_count = 0u64;
+    // CPU-bound hashing, moderate memory
+    let num_workers = compute_phase_concurrency(
+        &config,
+        "dedup",
+        1.0,  // ~1GB per worker
+        1.0,  // 1 thread per core
+        config.max_cores,
+        4,    // min 4 workers
+    );
+    let num_shards = (num_workers * 16).max(1024);  // Good contention balance
 
-    // ───────────────────────────────────────────────────────────────
-    // Debug: counters + hash key log
-    // ───────────────────────────────────────────────────────────────
-    let mut fastq_count: u64 = 0;           // Total Fastq records seen
-    let mut pair_count: u64 = 0;            // Successful pairs formed
-    let mut hash_keys: Vec<u64> = Vec::with_capacity(1_000_000);  // Pre-alloc
+    let shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>> = (0..num_shards)
+        .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
+        .collect();
 
+    let total_count = Arc::new(AtomicU64::new(0));
+    let unique_count_atomic = Arc::new(AtomicU64::new(0));
+
+    // Channel for writing clusters.csv incrementally
+    let (csv_tx, csv_rx) = mpsc::channel::<(String, String)>(config.base_buffer_size * num_workers);
+    let csv_path = out_dir.join("clusters.csv");
+    let csv_task = tokio::spawn(async move {
+        let mut file = BufWriter::new(
+            TokioFile::create(&csv_path).await
+                .context("Failed to create clusters.csv")?,
+        );
+        file.write_all(b"representative read id,read id\n").await
+            .context("CSV header write failed")?;
+        let mut rx = csv_rx;
+        while let Some((rep, member)) = rx.recv().await {
+            file.write_all(format!("{},{}\n", rep, member).as_bytes()).await
+                .context("CSV write failed")?;
+        }
+        file.flush().await.context("CSV flush failed")?;
+        Ok(())
+    });
+    cleanup_tasks.push(csv_task);
+
+    let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size * num_workers);
+
+    let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(num_workers);
+
+    let worker_txs: Vec<mpsc::Sender<ParseOutput>> = (0..num_workers)
+        .map(|_| {
+            let (tx, rx) = mpsc::channel(config.base_buffer_size);
+            let csv_tx_clone = csv_tx.clone();
+            let handle = tokio::spawn(dedup_worker(
+                rx,
+                shards.clone(),
+                uniques_tx.clone(),
+                csv_tx_clone,
+                paired,
+                prefix_len,
+                total_count.clone(),
+                unique_count_atomic.clone(),
+            ));
+            worker_handles.push(handle);
+            tx
+        })
+        .collect();
+
+    // Distributor: round-robin to workers
     let mut stream = ReceiverStream::new(input_stream);
-    let mut orphan_r1: Option<SequenceRecord> = None;
-    let mut r1_count: u64 = 0;
-    let mut r2_count: u64 = 0;
+    let mut i = 0usize;
+    if paired {
+        while let Some(r1_item) = stream.next().await {
+            let r1 = match r1_item {
+                ParseOutput::Fastq(rec) => rec,
+                _ => continue,
+            };
 
-    while let Some(item) = stream.next().await {
-        let record = match item {
-            ParseOutput::Fastq(rec) => rec,
-            _ => continue,
-        };
+            if let Some(r2_item) = stream.next().await {
+                let r2 = match r2_item {
+                    ParseOutput::Fastq(rec) => rec,
+                    _ => continue,
+                };
 
-        fastq_count += 1;  // 1. Count every Fastq record
-
-        if paired {
-            if let Some(r1) = orphan_r1.take() {
-
-                if r1.id() != record.id() {
+                if r1.id() != r2.id() {
                     return Err(PipelineError::InvalidFastqFormat(format!(
                         "Mismatched pair IDs: R1={}, R2={}",
-                        r1.id(), record.id()
+                        r1.id(), r2.id()
                     )));
                 }
 
-                pair_count += 1;  // 2. Count successful pairing
-
-                let r1_prefix = &r1.seq()[..prefix_len.map_or(r1.seq().len(), |l| l.min(r1.seq().len()))]; //prefix length limitation
-                let r2_prefix = &record.seq()[..prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()))];
-
-                let mut hasher = DefaultHasher::new();
-                hasher.write(r1_prefix);
-                hasher.write(&[0u8]);
-                hasher.write(r2_prefix);
-                let hash_key = hasher.finish();
-
-                hash_keys.push(hash_key);  // 3. Collect every hash key
-
-                let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
-                entry.0 += 1;
-                entry.1.push(r1.clone());
-                entry.1.push(record.clone());
-
-                total_count += 1;
+                let worker_tx = &worker_txs[i % num_workers];
+                worker_tx.send(ParseOutput::Fastq(r1)).await
+                    .map_err(|e| PipelineError::Other(anyhow!("Send R1 failed: {}", e)))?;
+                worker_tx.send(ParseOutput::Fastq(r2)).await
+                    .map_err(|e| PipelineError::Other(anyhow!("Send R2 failed: {}", e)))?;
+                i += 1;
             } else {
-                orphan_r1 = Some(record);
+                return Err(PipelineError::InvalidFastqFormat("Missing R2 in paired stream".to_string()));
             }
-        } else {
-            let seq_bytes = record.seq().to_vec();
-
-            let mut hasher = DefaultHasher::new();
-            let write_len = prefix_len.map_or(seq_bytes.len(), |l| l.min(seq_bytes.len()));
-            hasher.write(&seq_bytes[0..write_len]);
-            let hash_key = hasher.finish();
-
-            hash_keys.push(hash_key);  // 3. Collect every hash key
-
-            let entry = dedup_map.entry(hash_key).or_insert((0, vec![]));
-            entry.0 += 1;
-            entry.1.push(record.clone());
-
-            total_count += 1;
+        }
+    } else {
+        while let Some(item) = stream.next().await {
+            let worker_tx = &worker_txs[i % num_workers];
+            worker_tx.send(item).await
+                .map_err(|e| PipelineError::Other(anyhow!("Send failed: {}", e)))?;
+            i += 1;
         }
     }
 
-    // Log counts to console immediately (before any failure)
-    eprintln!("DEBUG: Total Fastq records seen: {}", fastq_count);
-    eprintln!("DEBUG: Successful pairs formed: {}", pair_count);
-    eprintln!("DEBUG: Total hash keys collected: {}", hash_keys.len());
+    drop(worker_txs);
 
-    // Write hash keys to file (async, no blocking)
-    let hash_path = out_dir.join("dedup_hash_keys.txt");
-    let hash_keys_clone = hash_keys.clone();  // Clone for move
-    let hash_write_task = tokio::spawn(async move {
-        let mut file = BufWriter::new(TokioFile::create(&hash_path).await?);
-        for key in hash_keys_clone {
-            file.write_all(format!("{}\n", key).as_bytes()).await?;
-        }
-        file.flush().await?;
-        Ok(())
-    });
-    cleanup_tasks.push(hash_write_task);
-
-    // Align orphan/imbalance: Error on >1 diff (no skip, like czid-dedup TryFrom)
-    if orphan_r1.is_some() || (r1_count as i64 - r2_count as i64).abs() > 1 {
-        return Err(PipelineError::InvalidFastqFormat(format!(
-            "Paired imbalance: R1={}, R2={}, orphan={}",
-            r1_count, r2_count, orphan_r1.is_some() as u8
-        )));
+    for handle in worker_handles {
+        handle.await
+            .map_err(|e| PipelineError::Other(anyhow!("Worker join failed: {}", e)))?
+            .context("Worker error")?;
     }
 
-    info!("Dedup complete: {} valid pairs, {} unique hashes", total_count, dedup_map.len());
+    // Drop csv_tx to close csv_rx
+    drop(csv_tx);
 
-    let duplicate_clusters: Arc<DashMap<String, ClusterInfo>> = {
-        let map = DashMap::with_capacity(dedup_map.len());
-
-        for (&_hash, &(size, ref records)) in &dedup_map {
-            if records.is_empty() {
-                continue;
-            }
-            let rep_id = records[0].id().to_string();
-            let members: Vec<String> = records.iter().map(|r| r.id().to_string()).collect();
-
-            map.insert(rep_id, ClusterInfo { size, members });
+    // Build duplicate_clusters from shards (rep_id -> ClusterInfo)
+    let duplicate_clusters = Arc::new(DashMap::with_capacity(num_shards));
+    for shard in &shards {
+        let guard = shard.lock()
+            .map_err(|e| PipelineError::Other(anyhow!("Shard lock poisoned: {}", e)))?;
+        for (_, (rep_id, size, members)) in guard.iter() {
+            duplicate_clusters.insert(
+                rep_id.clone(),
+                ClusterInfo {
+                    size: *size,
+                    members: members.clone(),
+                },
+            );
         }
+    }
 
-        Arc::new(map)
-    };
-
-    // Write cluster sizes TSV
+    // Write duplicate_cluster_sizes.tsv
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
-    let duplicate_clusters_for_tsv = duplicate_clusters.clone();
+    let duplicate_clusters_clone = duplicate_clusters.clone();
     let tsv_task = tokio::spawn(async move {
-        let mut file = BufWriter::new(TokioFile::create(&tsv_path).await?);
-        for entry in duplicate_clusters_for_tsv.iter() {
-            let (rep_id, cluster) = entry.pair();           // ← this is the clean way
-            file.write_all(format!("{}\t{}\n", rep_id, cluster.size).as_bytes()).await?;
+        let mut file = BufWriter::new(
+            TokioFile::create(&tsv_path).await
+                .context("Failed to create TSV file")?,
+        );
+        file.write_all(b"representative read id\tcluster size\n").await
+            .context("TSV header write failed")?;
+        for entry in duplicate_clusters_clone.iter() {
+            let (rep_id, info) = entry.pair();
+            file.write_all(format!("{}\t{}\n", rep_id, info.size).as_bytes()).await
+                .context("TSV write failed")?;
         }
-        file.flush().await?;
+        file.flush().await.context("TSV flush failed")?;
         Ok(())
     });
     cleanup_tasks.push(tsv_task);
 
-    // Uniques stream: First rep per cluster
-    let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size);
-    let value = dedup_map.clone();
-    let uniques_task = tokio::spawn(async move {
-        for (&_hash, &(_, ref records)) in &value {
-            if !records.is_empty() {
-                uniques_tx.send(ParseOutput::Fastq(records[0].clone())).await?;
-            }
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(uniques_task);
-
-
-    let unique_count = dedup_map.len() as u64;
+    let unique_count = unique_count_atomic.load(AtomicOrdering::Relaxed);
     let (count_tx, count_rx) = oneshot::channel();
-    count_tx.send(unique_count).map_err(|_| PipelineError::Other(anyhow!("Count send failed")))?;
+    count_tx.send(unique_count)
+        .map_err(|_| PipelineError::Other(anyhow!("Unique count send failed")))?;
+
+    info!("Dedup complete: {} total records, {} unique clusters", total_count.load(AtomicOrdering::Relaxed), unique_count);
 
     Ok((
         ReceiverStream::new(uniques_rx),
@@ -2059,6 +2071,130 @@ async fn dedup(
         cleanup_tasks,
         cleanup_receivers,
     ))
+}
+
+async fn dedup_worker(
+    mut rx: mpsc::Receiver<ParseOutput>,
+    shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>>,
+    uniques_tx: mpsc::Sender<ParseOutput>,
+    csv_tx: mpsc::Sender<(String, String)>,
+    paired: bool,
+    prefix_len: Option<usize>,
+    total_count: Arc<AtomicU64>,
+    unique_count: Arc<AtomicU64>,
+) -> Result<(), anyhow::Error> {
+    let mut orphan_r1: Option<SequenceRecord> = None;
+
+    while let Some(item) = rx.recv().await {
+        let record = match item {
+            ParseOutput::Fastq(rec) => rec,
+            _ => continue,
+        };
+
+        if paired {
+            if orphan_r1.is_none() {
+                orphan_r1 = Some(record);
+                continue;
+            }
+
+            let r1 = orphan_r1.take().unwrap();
+            let r2 = record;
+
+            if r1.id() != r2.id() {
+                return Err(anyhow!("Mismatched pair IDs in worker: {} != {}", r1.id(), r2.id()));
+            }
+
+            let id = r1.id().to_string();
+
+            let r1_prefix = &r1.seq()[0..prefix_len.map_or(r1.seq().len(), |l| l.min(r1.seq().len()))];
+            let r2_prefix = &r2.seq()[0..prefix_len.map_or(r2.seq().len(), |l| l.min(r2.seq().len()))];
+
+            let mut hasher = XxHash64::default();
+            hasher.write(r1_prefix);
+            hasher.write_u8(0);
+            hasher.write(r2_prefix);
+            let hash_key = hasher.finish();
+
+            let shard_idx = (hash_key as usize) % shards.len();
+
+            // ─── Critical: only hold lock for the minimal time ───
+            let (rep_id, is_new) = {
+                let mut shard = shards[shard_idx].lock()
+                    .map_err(|e| anyhow!("Shard lock poisoned: {}", e))?;
+
+                let entry = shard.entry(hash_key).or_insert_with(|| {
+                    unique_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    (id.clone(), 0, vec![])
+                });
+
+                entry.1 += 1;
+                entry.2.push(id.clone());
+
+                let rep_id = entry.0.clone();
+                let is_new = entry.1 == 1;
+
+                (rep_id, is_new)
+            };  // ← guard dropped here
+
+            total_count.fetch_add(1, AtomicOrdering::Relaxed);
+
+            // Now safe to await
+            csv_tx.send((rep_id, id)).await
+                .context("CSV send failed")?;
+
+            if is_new {
+                uniques_tx.send(ParseOutput::Fastq(r1)).await
+                    .context("Send R1 unique failed")?;
+                uniques_tx.send(ParseOutput::Fastq(r2)).await
+                    .context("Send R2 unique failed")?;
+            }
+        } else {
+            let prefix = &record.seq()[0..prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()))];
+
+            let mut hasher = XxHash64::default();
+            hasher.write(prefix);
+            let hash_key = hasher.finish();
+
+            let shard_idx = (hash_key as usize) % shards.len();
+
+            // Same pattern: minimal lock scope
+            let (rep_id, is_new) = {
+                let mut shard = shards[shard_idx].lock()
+                    .map_err(|e| anyhow!("Shard lock poisoned: {}", e))?;
+
+                let id = record.id().to_string();
+
+                let entry = shard.entry(hash_key).or_insert_with(|| {
+                    unique_count.fetch_add(1, AtomicOrdering::Relaxed);
+                    (id.clone(), 0, vec![])
+                });
+
+                entry.1 += 1;
+                entry.2.push(id.clone());
+
+                let rep_id = entry.0.clone();
+                let is_new = entry.1 == 1;
+
+                (rep_id, is_new)
+            };
+
+            total_count.fetch_add(1, AtomicOrdering::Relaxed);
+
+            csv_tx.send((rep_id, record.id().to_string())).await
+                .context("CSV send failed")?;
+
+            if is_new {
+                uniques_tx.send(ParseOutput::Fastq(record)).await
+                    .context("Send unique failed")?;
+            }
+        }
+    }
+
+    if orphan_r1.is_some() {
+        return Err(anyhow!("Orphan R1 in worker at end"));
+    }
+
+    Ok(())
 }
 
 async fn subsample_weighted(
