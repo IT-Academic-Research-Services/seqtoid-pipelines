@@ -2026,41 +2026,56 @@ async fn subsample_uniform(
     let (count_tx, count_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
-        // 1. Drain the stream synchronously inside spawn_blocking
-        let drain_result = tokio::task::spawn_blocking(move || {
-            let mut stream = ReceiverStream::new(uniques_rx);
-            let mut records = Vec::new();
-            let mut total = 0u64;
+        let mut stream = ReceiverStream::new(uniques_rx);
+        let mut records = Vec::new();
+        let mut total = 0u64;
 
-            while let Some(item) = futures::executor::block_on(stream.next()) {
-                if let ParseOutput::Fastq(_) = &item {
-                    records.push(item);
-                    total += 1;
-                }
+        while let Some(item) = stream.next().await {
+            if let ParseOutput::Fastq(_) = &item {
+                records.push(item);
+                total += 1;
             }
-
-            Ok((records, total)) as Result<(Vec<ParseOutput>, u64), anyhow::Error>
-        }).await??;  // Here ?? works because spawn_blocking result is Result<_, JoinError>
-
-        let (records, total) = drain_result;  // Unpack the Ok tuple
-
-        let subsample_size = max_subsample.min(total / if paired { 2 } else { 1 }) * if paired { 2 } else { 1 };
-
-        let mut rng = config.rng.clone();
-        let mut indices: Vec<usize> = (0..records.len()).collect();
-        indices.shuffle(&mut rng);
-        let sampled: Vec<ParseOutput> = indices
-            .into_iter()
-            .take(subsample_size as usize)
-            .map(|i| records[i].clone())
-            .collect();
-
-        for item in sampled {
-            tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
         }
 
-        info!("Subsample distributor processed {} uniques", total);
-        count_tx.send(total).map_err(|_| anyhow!("Count send failed"))?;
+        let num_units = if paired { total / 2 } else { total };
+        let subsample_units = (max_subsample).min(num_units);
+        let subsample_size = subsample_units * if paired { 2 } else { 1 };
+
+        // Send count as soon as we know it to avoid deadlock with consumer
+        if count_tx.send(total).is_err() {
+            warn!("Subsample count send failed (receiver might have dropped)");
+        }
+
+        let mut rng = config.rng.clone();
+        let mut indices: Vec<usize> = if paired {
+            (0..(records.len() / 2)).collect()
+        } else {
+            (0..records.len()).collect()
+        };
+        indices.shuffle(&mut rng);
+
+        let sampled_indices: HashSet<usize> = indices.into_iter().take(subsample_units as usize).collect();
+
+        if paired {
+            let mut iter = records.into_iter();
+            let mut i = 0;
+            while let Some(r1) = iter.next() {
+                let r2 = iter.next().ok_or_else(|| anyhow!("Incomplete pair at end of records"))?;
+                if sampled_indices.contains(&i) {
+                    tx.send(r1).await.map_err(|_| anyhow!("Send R1 failed"))?;
+                    tx.send(r2).await.map_err(|_| anyhow!("Send R2 failed"))?;
+                }
+                i += 1;
+            }
+        } else {
+            for (i, item) in records.into_iter().enumerate() {
+                if sampled_indices.contains(&i) {
+                    tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
+                }
+            }
+        }
+
+        info!("Subsample distributor processed {} uniques, sampled {}", total, subsample_size);
         Ok(())
     });
 
