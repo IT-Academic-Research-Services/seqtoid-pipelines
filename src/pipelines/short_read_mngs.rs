@@ -2154,42 +2154,70 @@ pub async fn minimap2_non_host_align(
 
 
     // 2. Memory & concurrency estimation
-    const SAFETY_MULTIPLIER: f64 = 0.95;
-    const MIN_ESTIMATE_GB: u64 = 20;
+    // Measured on r6id.32xlarge-like hardware with mm2-fast AVX-512, -t 11
+    const MEASURED_SINGLE_JOB_GB: f64 = 85.0;     // conservative ceiling from test
+    const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;    // real time for median chunk
 
+    const TARGET_RAM_FRACTION: f64 = 0.60;        // aim to use ≤60% of physical RAM
+    const HARD_MAX_CONCURRENCY: usize = 6;        // never exceed this on 1.5 TB nodes
+    const MIN_CONCURRENCY: usize = 2;
+    const MIN_THREADS_PER_JOB: usize = 8;
+    const MAX_THREADS_PER_JOB: usize = 24;        // sweet spot for EPYC scaling
+
+    // ────────────────────────────────────────────────────────────────
+    // Dynamic per-job RAM estimate (still respects chunk size variation)
     let largest_gb = if max_size_bytes > 0 {
-        ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as u64
+        ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as f64
     } else {
-        70
+        70.0
     };
 
-    let est_gb_per_job = ((largest_gb as f64 * SAFETY_MULTIPLIER).ceil() as u64).max(MIN_ESTIMATE_GB);
+    // Scale estimate conservatively — never go below measured floor
+    let est_gb_per_job = ((largest_gb * 0.95).ceil() as f64)
+        .max(MEASURED_SINGLE_JOB_GB * 0.9)           // floor at ~90% of measured
+        .min(MEASURED_SINGLE_JOB_GB * 1.15);         // cap at 115% of measured
 
     info!(
-        "Largest NT chunk: {} GiB → estimating {:.0} GiB RAM per minimap2 job",
-        largest_gb, est_gb_per_job
+    "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
+    largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
+);
+
+    // ────────────────────────────────────────────────────────────────
+    // Compute safe concurrency based on available RAM
+    let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
+    let ram_based_concurrency = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
+
+    // Apply hard limits — safety first on big-memory nodes
+    let mut concurrency = ram_based_concurrency
+        .clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
+
+    // Last sanity check: don't exceed 85% of physical RAM even if compute_phase_concurrency says otherwise
+    let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
+    if estimated_peak_gb > available_ram_gb * 0.85 {
+        warn!(
+        "Estimated peak RAM {:.0} GiB exceeds 85% of available ({:.0} GiB) — capping concurrency to {}",
+        estimated_peak_gb, available_ram_gb, concurrency.saturating_sub(1).max(MIN_CONCURRENCY)
     );
+        concurrency = concurrency.saturating_sub(1).max(MIN_CONCURRENCY);
+    }
 
-    const MIN_THREADS_PER_JOB: usize = 4;
-    const MAX_THREADS_PER_JOB: usize = 16;
-
-    let concurrency = compute_phase_concurrency(
-        &config,
-        "minimap2_nt",
-        est_gb_per_job as f64,
-        6.0,
-        24,
-        4,
-    );
-
-    let threads_per_job = (config.max_cores / concurrency).clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
+    // ────────────────────────────────────────────────────────────────
+    // Threads per job — avoid over-threading on EPYC (memory bandwidth sensitive)
+    let threads_per_job = (config.max_cores / concurrency)
+        .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
-        "NT minimap2 stage: {} concurrent jobs × {} threads/job (est peak ~{} GiB)",
-        concurrency,
-        threads_per_job,
-        concurrency as u64 * est_gb_per_job as u64
-    );
+    concat!(
+        "NT minimap2 stage: {} concurrent jobs × {} threads/job\n",
+        "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
+        "  single-job baseline: ~{:.0} s real time (measured)"
+    ),
+    concurrency,
+    threads_per_job,
+    estimated_peak_gb,
+    (estimated_peak_gb / available_ram_gb * 100.0).round(),
+    MEASURED_SINGLE_JOB_SEC
+);
 
     // 3. Semaphore to limit concurrent minimap2 processes
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
