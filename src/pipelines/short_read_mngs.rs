@@ -5671,7 +5671,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
-        false,
+        true,
     ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
