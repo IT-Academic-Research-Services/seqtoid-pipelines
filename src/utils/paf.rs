@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::Sender;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};  
+use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
 
 use crate::utils::streams::ParseOutput;
 
@@ -84,22 +84,28 @@ impl PafRecord {
     }
 
     pub async fn merge_paf_streams(
-        mut streams: Vec<ReceiverStream<ParseOutput>>,
+        streams: Vec<ReceiverStream<ParseOutput>>,
         tx: Sender<ParseOutput>,
-        _buffer_size: usize,  // unused but kept for signature compatibility
+        _buffer_size: usize,
     ) -> Result<()> {
         let mut query_hits: HashMap<String, Vec<PafRecord>> = HashMap::new();
+        let mut stream_map = StreamMap::new();
 
-        // Collect all PAF records from all partial streams
-        for mut stream in streams {
-            while let Some(item) = stream.next().await {
-                match item {
-                    ParseOutput::Bytes(bytes) => {
-                        let line = String::from_utf8_lossy(&*bytes).trim().to_string();
-                        if line.is_empty() {
+        for (idx, stream) in streams.into_iter().enumerate() {
+            stream_map.insert(idx, stream);
+        }
+
+        // Collect all PAF records from all partial streams concurrently
+        while let Some((_idx, item)) = stream_map.next().await {
+            match item {
+                ParseOutput::Bytes(bytes) => {
+                    let line = String::from_utf8_lossy(&*bytes).trim().to_string();
+                    for line in line.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
                             continue;
                         }
-                        let record = PafRecord::parse_line(&line)?;
+                        let record = PafRecord::parse_line(trimmed)?;
                         let hits = query_hits
                             .entry(record.qname.clone())
                             .or_default();
@@ -110,9 +116,9 @@ impl PafRecord {
                             hits.truncate(6);
                         }
                     }
-                    _ => {
-                        return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
-                    }
+                }
+                _ => {
+                    return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
                 }
             }
         }
