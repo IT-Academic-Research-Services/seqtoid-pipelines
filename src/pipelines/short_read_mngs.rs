@@ -2330,7 +2330,7 @@ pub async fn minimap2_non_host_align(
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(async move {
-        if let Err(e) = PafRecord::merge_paf_streams(partial_paf_receivers, merged_tx, channel_buffer).await {
+        if let Err(e) = PafRecord::merge_paf_streams(partial_paf_receivers, merged_tx, concurrency).await {
             warn!("PAF merge failed: {}", e);
             return Err(e);
         }

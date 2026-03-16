@@ -1,12 +1,13 @@
 // Functions and definitions for the minimap2-associated PAF file format
 use anyhow::{anyhow, Result};
-use log::{info, debug};
+use log::{info, debug, warn};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
+use dashmap::DashMap;
 
 use crate::utils::streams::ParseOutput;
 
@@ -87,59 +88,133 @@ impl PafRecord {
     pub async fn merge_paf_streams(
         streams: Vec<ReceiverStream<ParseOutput>>,
         tx: Sender<ParseOutput>,
-        _buffer_size: usize,
+        concurrency: usize,
     ) -> Result<()> {
-        info!("Starting merge_paf_streams with {} streams", streams.len());
-        let mut query_hits: HashMap<String, Vec<PafRecord>> = HashMap::new();
+        info!("Starting parallelized merge_paf_streams with {} streams", streams.len());
+        let query_hits: Arc<DashMap<String, Vec<PafRecord>>> = Arc::new(DashMap::new());
         let mut stream_map = StreamMap::new();
 
         for (idx, stream) in streams.into_iter().enumerate() {
             stream_map.insert(idx, stream);
         }
 
-        let mut record_count = 0;
+        let record_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let start_time = tokio::time::Instant::now();
 
-        // Collect all PAF records from all partial streams concurrently
-        while let Some((_idx, item)) = stream_map.next().await {
-            match item {
-                ParseOutput::Bytes(bytes) => {
-                    let line = String::from_utf8_lossy(&*bytes).trim().to_string();
-                    for line in line.lines() {
-                        let trimmed = line.trim();
+        let (batch_tx, batch_rx) = mpsc::channel::<Vec<Arc<Vec<u8>>>>(concurrency * 2);
+        let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+
+        let mut worker_handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let rx = batch_rx.clone();
+            let hits = query_hits.clone();
+            let count = record_count.clone();
+
+            worker_handles.push(tokio::spawn(async move {
+                loop {
+                    let batch = {
+                        let mut lock = rx.lock().await;
+                        lock.recv().await
+                    };
+
+                    let batch = match batch {
+                        Some(b) => b,
+                        None => break,
+                    };
+
+                    for line_bytes in batch {
+                        let content = String::from_utf8_lossy(&line_bytes);
+                        let trimmed = content.trim();
                         if trimmed.is_empty() {
                             continue;
                         }
-                        let record = PafRecord::parse_line(trimmed)?;
-                        let unique_queries = query_hits.len();
-                        let hits = query_hits
-                            .entry(record.qname.clone())
-                            .or_default();
-                        
-                        hits.push(record);
-                        record_count += 1;
-                        if record_count % 100_000 == 0 {
-                            info!("merge_paf_streams: processed {} records, {} unique queries, elapsed {:?}", 
-                                record_count, unique_queries, start_time.elapsed());
-                        }
+                        match PafRecord::parse_line(trimmed) {
+                            Ok(record) => {
+                                let mut entry = hits.entry(record.qname.clone()).or_default();
+                                entry.push(record);
+                                
+                                let current_count = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if current_count % 100_000 == 0 && current_count > 0 {
+                                    info!("merge_paf_streams: processed {} records, {} unique queries", 
+                                        current_count, hits.len());
+                                }
 
-                        if hits.len() > 20 {
-                            hits.sort_by_key(|h| Reverse(h.alignment_score()));
-                            hits.truncate(6);
+                                if entry.len() > 20 {
+                                    entry.sort_by_key(|h| Reverse(h.alignment_score()));
+                                    entry.truncate(6);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse PAF line: {}", e);
+                            }
                         }
                     }
                 }
-                _ => {
-                    return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+        
+        let batcher_handle = tokio::spawn(async move {
+            let mut leftover = Vec::new();
+            let mut batch = Vec::with_capacity(1000);
+
+            while let Some((_idx, item)) = stream_map.next().await {
+                match item {
+                    ParseOutput::Bytes(arc_bytes) => {
+                        let mut bytes = arc_bytes.as_ref().to_vec();
+                        if !leftover.is_empty() {
+                            let mut new_bytes = Vec::with_capacity(leftover.len() + bytes.len());
+                            new_bytes.extend_from_slice(&leftover);
+                            new_bytes.extend_from_slice(&bytes);
+                            bytes = new_bytes;
+                            leftover.clear();
+                        }
+
+                        let mut start = 0;
+                        for i in 0..bytes.len() {
+                            if bytes[i] == b'\n' {
+                                let line = Arc::new(bytes[start..=i].to_vec());
+                                batch.push(line);
+                                if batch.len() >= 1000 {
+                                    batch_tx.send(std::mem::take(&mut batch)).await
+                                        .map_err(|_| anyhow!("batch_tx dropped in merge_paf_streams"))?;
+                                }
+                                start = i + 1;
+                            }
+                        }
+
+                        if start < bytes.len() {
+                            leftover = bytes[start..].to_vec();
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
+                    }
                 }
             }
+
+            if !leftover.is_empty() {
+                batch.push(Arc::new(leftover));
+            }
+
+            if !batch.is_empty() {
+                let _ = batch_tx.send(batch).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // Wait for batcher and workers
+        batcher_handle.await??;
+        for handle in worker_handles {
+            handle.await??;
         }
 
+        let total_records = record_count.load(std::sync::atomic::Ordering::Relaxed);
         info!("merge_paf_streams: finished collecting {} records ({} unique queries) in {:?}", 
-            record_count, query_hits.len(), start_time.elapsed());
+            total_records, query_hits.len(), start_time.elapsed());
 
         // Sort queries alphabetically for deterministic output
-        let mut queries: Vec<String> = query_hits.keys().cloned().collect();
+        let mut queries: Vec<String> = query_hits.iter().map(|kv| kv.key().clone()).collect();
         queries.sort();
 
         info!("merge_paf_streams: emitting merged records...");
@@ -148,7 +223,7 @@ impl PafRecord {
 
         // For each query: sort by descending AS score, keep top 6 hits
         for query in queries {
-            if let Some(mut hits) = query_hits.remove(&query) {
+            if let Some((_, mut hits)) = query_hits.remove(&query) {
                 hits.sort_by_key(|h| Reverse(h.alignment_score()));
                 hits.truncate(6);  // 1 primary + up to 5 secondaries
 
