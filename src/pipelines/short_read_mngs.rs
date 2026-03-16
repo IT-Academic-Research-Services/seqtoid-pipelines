@@ -2317,6 +2317,7 @@ pub async fn minimap2_non_host_align(
 
             let chunk_name_clone = chunk_name.clone();
             let wait_task = tokio::spawn(async move {
+                info!("inside minimap2 wait for {}", chunk_name_clone);
                 let status = child.wait().await.context("Failed to wait for minimap2 child")?;
                 if !status.success() {
                     warn!("minimap2 for {} exited with status: {}", chunk_name_clone, status);
@@ -2352,6 +2353,7 @@ pub async fn minimap2_non_host_align(
         }
     }
 
+    info!("after 5");
     // 6. Merge all per-chunk PAF streams into one ordered stream
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
