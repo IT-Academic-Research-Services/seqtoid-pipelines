@@ -2115,7 +2115,6 @@ pub async fn minimap2_non_host_align(
     let base_buffer_size = config.base_buffer_size;
     let channel_buffer = base_buffer_size * 4;
 
-
     // 1. Discover NT split .mmi chunks + sort largest-first
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
@@ -2148,50 +2147,40 @@ pub async fn minimap2_non_host_align(
 
     chunk_paths.sort_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(0));
 
-
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-
     // 2. Memory & concurrency estimation
-    // Measured on r6id.32xlarge-like hardware with mm2-fast AVX-512, -t 11
-    const MEASURED_SINGLE_JOB_GB: f64 = 85.0;     // conservative ceiling from test
-    const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;    // real time for median chunk
+    const MEASURED_SINGLE_JOB_GB: f64 = 85.0;
+    const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
-    const TARGET_RAM_FRACTION: f64 = 0.60;        // aim to use ≤60% of physical RAM
-    const HARD_MAX_CONCURRENCY: usize = 6;        // never exceed this on 1.5 TB nodes
+    const TARGET_RAM_FRACTION: f64 = 0.60;
+    const HARD_MAX_CONCURRENCY: usize = 6;
     const MIN_CONCURRENCY: usize = 2;
     const MIN_THREADS_PER_JOB: usize = 8;
-    const MAX_THREADS_PER_JOB: usize = 24;        // sweet spot for EPYC scaling
+    const MAX_THREADS_PER_JOB: usize = 24;
 
-    // ────────────────────────────────────────────────────────────────
-    // Dynamic per-job RAM estimate (still respects chunk size variation)
     let largest_gb = if max_size_bytes > 0 {
         ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as f64
     } else {
         70.0
     };
 
-    // Scale estimate conservatively — never go below measured floor
     let est_gb_per_job = ((largest_gb * 0.95).ceil() as f64)
-        .max(MEASURED_SINGLE_JOB_GB * 0.9)           // floor at ~90% of measured
-        .min(MEASURED_SINGLE_JOB_GB * 1.15);         // cap at 115% of measured
+        .max(MEASURED_SINGLE_JOB_GB * 0.9)
+        .min(MEASURED_SINGLE_JOB_GB * 1.15);
 
     info!(
         "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
         largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
     );
 
-    // ────────────────────────────────────────────────────────────────
-    // Compute safe concurrency based on available RAM
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
     let ram_based_concurrency = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
 
-    // Apply hard limits — safety first on big-memory nodes
     let mut concurrency = ram_based_concurrency
         .clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
 
-    // Last sanity check: don't exceed 85% of physical RAM even if compute_phase_concurrency says otherwise
     let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
     if estimated_peak_gb > available_ram_gb * 0.85 {
         warn!(
@@ -2201,8 +2190,6 @@ pub async fn minimap2_non_host_align(
         concurrency = concurrency.saturating_sub(1).max(MIN_CONCURRENCY);
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Threads per job — avoid over-threading on EPYC (memory bandwidth sensitive)
     let threads_per_job = (config.max_cores / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
@@ -2222,32 +2209,50 @@ pub async fn minimap2_non_host_align(
     // 3. Semaphore to limit concurrent minimap2 processes
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
 
-    // 4. Spawn one task per chunk — all on main Tokio runtime
-    let mut chunk_handles: Vec<JoinHandle<Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> =
-        Vec::with_capacity(chunk_paths.len());
+    // 4. Create a temp dir for all chunk PAF outputs (NVMe preferred)
+    let paf_temp_dir = choose_temp_dir(
+        max_size_bytes * num_chunks as u64 / 10,  // conservative estimate, e.g. 10% overhead
+       &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+       true,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    let paf_temp_dir_path = paf_temp_dir.path().to_path_buf();
+
+
+    cleanup_tasks.push(tokio::spawn(async move {
+        if let Err(e) = paf_temp_dir.close() {
+            warn!("Failed to clean PAF temp dir: {}", e);
+        }
+        Ok(())
+    }));
+
+    // 5. Spawn one task per chunk
+    let mut chunk_handles: Vec<JoinHandle<Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::with_capacity(num_chunks);
 
     for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
-        let chunk_name = chunk_mmi
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("chunk_{}", idx));
+        let chunk_name = chunk_mmi.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| format!("chunk_{}", idx));
 
         let sem = semaphore.clone();
         let config = config.clone();
         let r1 = r1_path.clone();
         let r2 = r2_path_opt.clone();
+        let temp_dir_path = paf_temp_dir_path.clone();
 
         let handle = tokio::spawn(async move {
-            debug!("minimap2 for {} waiting for permit", chunk_name);
-
             let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
             debug!("minimap2 for {} acquired permit", chunk_name);
 
-            // Build minimap2 config & args
+            // Create per-chunk temp PAF file
+            let paf_path = temp_dir_path.join(format!("{}.paf", chunk_name));
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
             options.insert("-x".to_string(), Some("sr".to_string()));
             options.insert("--secondary".to_string(), Some("yes".to_string()));
+            options.insert("-o".to_string(), Some(paf_path.to_string_lossy().to_string()));
 
             let mm_config = Minimap2Config {
                 minimap2_index_path: chunk_mmi,
@@ -2257,12 +2262,11 @@ pub async fn minimap2_non_host_align(
                 num_threads: Some(threads_per_job),
             };
 
-            let args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
+            let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
                 .context("Failed to generate minimap2 args")?;
+            
+            info!("Launching minimap2 for {} to file {}: minimap2 {}", chunk_name, paf_path.display(), args.join(" "));
 
-            info!("Launching minimap2 for {}: minimap2 {}", chunk_name, args.join(" "));
-
-            // Spawn subprocess + parse stdout streaming
             let (mut child, stderr_task) = spawn_cmd(
                 config.clone(),
                 MINIMAP2_TAG,
@@ -2276,48 +2280,35 @@ pub async fn minimap2_non_host_align(
                 info!("minimap2 PID for {}: {}", chunk_name, pid);
             }
 
-            let paf_receiver = parse_child_output(
-                &mut child,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                config.base_buffer_size,
-            )
-                .await
-                .context("Failed to parse minimap2 PAF output")?;
-
-            let chunk_name_clone = chunk_name.clone();
+            drop(permit);
+            info!("Permit released for {} after spawn", chunk_name);
 
             let wait_task = tokio::spawn(async move {
-                info!("inside minimap2 wait for {}", chunk_name_clone);
                 let status = child.wait().await.context("Failed to wait for minimap2 child")?;
                 if !status.success() {
-                    warn!("minimap2 for {} exited with status: {}", chunk_name_clone, status);
+                    warn!("minimap2 for {} exited with status: {}", chunk_name, status);
                 }
-                drop(permit);
-                info!("minimap2 process for {} finished", chunk_name_clone);
+                info!("minimap2 process for {} finished", chunk_name);
                 Ok::<(), anyhow::Error>(())
             });
 
-            Ok((paf_receiver, stderr_task, wait_task))
+            Ok((paf_path, wait_task))
         });
 
         chunk_handles.push(handle);
-
     }
 
-    // 5. Collect results as they complete
+    // 6. Collect temp PAF paths and wait tasks
+    let mut paf_paths = Vec::with_capacity(num_chunks);
+    let mut wait_tasks = Vec::new();
+
     let results = try_join_all(chunk_handles).await?;
-
-    info!("minimap2 finished for {} jobs", results.len());
-
-    let mut partial_paf_receivers = Vec::new();
 
     for res in results {
         match res {
-            Ok((paf_rx, stderr_task, wait_task)) => {
-                partial_paf_receivers.push(ReceiverStream::new(paf_rx));
-                cleanup_tasks.push(stderr_task);
-                cleanup_tasks.push(wait_task);
+            Ok((paf_path, wait_task)) => {
+                paf_paths.push(paf_path);
+                wait_tasks.push(wait_task);
             }
             Err(e) => {
                 return Err(PipelineError::Other(anyhow!("minimap2 chunk failed: {}", e)));
@@ -2325,13 +2316,15 @@ pub async fn minimap2_non_host_align(
         }
     }
 
-    info!("after 5");
-    // 6. Merge all per-chunk PAF streams into one ordered stream
+    info!("All minimap2 chunks finished, {} temp PAF files ready", paf_paths.len());
+
+    // 7. Merge from temp files
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(async move {
-        if let Err(e) = PafRecord::merge_paf_streams(partial_paf_receivers, merged_tx, concurrency).await {
-            warn!("PAF merge failed: {}", e);
+        let concurrency = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        if let Err(e) = PafRecord::merge_paf_files(&paf_paths, merged_tx, concurrency).await {
+            warn!("PAF merge from files failed: {}", e);
             return Err(e);
         }
         Ok(())
@@ -2339,7 +2332,12 @@ pub async fn minimap2_non_host_align(
 
     cleanup_tasks.push(gather_handle);
 
-    info!("minimap2 NT alignment launched — {} chunks streaming", num_chunks);
+    // Add wait tasks to cleanup
+    for wt in wait_tasks {
+        cleanup_tasks.push(wt);
+    }
+
+    info!("minimap2 NT alignment launched — {} chunks → temp files → streaming merge", num_chunks);
 
     Ok((
         ReceiverStream::new(merged_rx),

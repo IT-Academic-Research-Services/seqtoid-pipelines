@@ -3,8 +3,10 @@ use anyhow::{anyhow, Result};
 use log::{info, debug, warn};
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
 use dashmap::DashMap;
@@ -85,19 +87,14 @@ impl PafRecord {
         line
     }
 
-    pub async fn merge_paf_streams(
-        streams: Vec<ReceiverStream<ParseOutput>>,
+    pub async fn merge_paf_files(
+        paf_paths: &[PathBuf],
         tx: Sender<ParseOutput>,
         concurrency: usize,
     ) -> Result<()> {
-        info!("Starting parallelized merge_paf_streams with {} streams", streams.len());
+        info!("Starting parallelized merge_paf_files with {} files", paf_paths.len());
         let query_hits: Arc<DashMap<String, Vec<PafRecord>>> = Arc::new(DashMap::new());
-        let mut stream_map = StreamMap::new();
-
-        for (idx, stream) in streams.into_iter().enumerate() {
-            stream_map.insert(idx, stream);
-        }
-
+        
         let record_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let start_time = tokio::time::Instant::now();
 
@@ -135,7 +132,7 @@ impl PafRecord {
                                 
                                 let current_count = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if current_count % 100_000 == 0 && current_count > 0 {
-                                    info!("merge_paf_streams: processed {} records, {} unique queries", 
+                                    info!("merge_paf_files: processed {} records, {} unique queries", 
                                         current_count, hits.len());
                                 }
 
@@ -153,79 +150,54 @@ impl PafRecord {
                 Ok::<(), anyhow::Error>(())
             }));
         }
-        
-        let batcher_handle = tokio::spawn(async move {
-            let mut leftover = Vec::new();
+
+        // Producer task: read files and send lines to workers
+        let paf_paths = paf_paths.to_vec();
+        let producer_handle = tokio::spawn(async move {
             let mut batch = Vec::with_capacity(1000);
-
-            while let Some((_idx, item)) = stream_map.next().await {
-                match item {
-                    ParseOutput::Bytes(arc_bytes) => {
-                        let mut bytes = arc_bytes.as_ref().to_vec();
-                        if !leftover.is_empty() {
-                            let mut new_bytes = Vec::with_capacity(leftover.len() + bytes.len());
-                            new_bytes.extend_from_slice(&leftover);
-                            new_bytes.extend_from_slice(&bytes);
-                            bytes = new_bytes;
-                            leftover.clear();
-                        }
-
-                        let mut start = 0;
-                        for i in 0..bytes.len() {
-                            if bytes[i] == b'\n' {
-                                let line = Arc::new(bytes[start..=i].to_vec());
-                                batch.push(line);
-                                if batch.len() >= 1000 {
-                                    batch_tx.send(std::mem::take(&mut batch)).await
-                                        .map_err(|_| anyhow!("batch_tx dropped in merge_paf_streams"))?;
-                                }
-                                start = i + 1;
-                            }
-                        }
-
-                        if start < bytes.len() {
-                            leftover = bytes[start..].to_vec();
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
+            for path in paf_paths {
+                let file = tokio::fs::File::open(&path).await
+                    .map_err(|e: std::io::Error| anyhow!("Failed to open PAF file {}: {}", path.display(), e))?;
+                let mut reader = tokio::io::BufReader::new(file);
+                let mut line = String::new();
+                
+                while reader.read_line(&mut line).await? > 0 {
+                    batch.push(Arc::new(line.as_bytes().to_vec()));
+                    line.clear();
+                    
+                    if batch.len() >= 1000 {
+                        batch_tx.send(std::mem::take(&mut batch)).await
+                            .map_err(|_| anyhow!("batch_tx dropped in merge_paf_files"))?;
                     }
                 }
             }
-
-            if !leftover.is_empty() {
-                batch.push(Arc::new(leftover));
-            }
-
             if !batch.is_empty() {
                 let _ = batch_tx.send(batch).await;
             }
             Ok::<(), anyhow::Error>(())
         });
 
-        // Wait for batcher and workers
-        batcher_handle.await??;
+        producer_handle.await??;
         for handle in worker_handles {
             handle.await??;
         }
 
         let total_records = record_count.load(std::sync::atomic::Ordering::Relaxed);
-        info!("merge_paf_streams: finished collecting {} records ({} unique queries) in {:?}", 
+        info!("merge_paf_files: finished collecting {} records ({} unique queries) in {:?}", 
             total_records, query_hits.len(), start_time.elapsed());
 
         // Sort queries alphabetically for deterministic output
         let mut queries: Vec<String> = query_hits.iter().map(|kv| kv.key().clone()).collect();
         queries.sort();
 
-        info!("merge_paf_streams: emitting merged records...");
+        info!("merge_paf_files: emitting merged records...");
         let emit_start = tokio::time::Instant::now();
         let mut emitted_count = 0;
 
-        // For each query: sort by descending AS score, keep top 6 hits
         for query in queries {
             if let Some((_, mut hits)) = query_hits.remove(&query) {
                 hits.sort_by_key(|h| Reverse(h.alignment_score()));
-                hits.truncate(6);  // 1 primary + up to 5 secondaries
+                hits.truncate(6);
 
                 for hit in hits {
                     let paf_line = hit.to_paf_line();
@@ -237,11 +209,9 @@ impl PafRecord {
             }
         }
 
-        info!("merge_paf_streams: finished emitting {} records in {:?}", emitted_count, emit_start.elapsed());
-
+        info!("merge_paf_files: finished emitting {} records in {:?}", emitted_count, emit_start.elapsed());
         Ok(())
     }
-
 
     fn calc_bitscore(&self) -> f64 {
         let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
