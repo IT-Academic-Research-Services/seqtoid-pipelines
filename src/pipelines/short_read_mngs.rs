@@ -2178,9 +2178,9 @@ pub async fn minimap2_non_host_align(
         .min(MEASURED_SINGLE_JOB_GB * 1.15);         // cap at 115% of measured
 
     info!(
-    "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
-    largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
-);
+        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
+        largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
+    );
 
     // ────────────────────────────────────────────────────────────────
     // Compute safe concurrency based on available RAM
@@ -2195,9 +2195,9 @@ pub async fn minimap2_non_host_align(
     let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
     if estimated_peak_gb > available_ram_gb * 0.85 {
         warn!(
-        "Estimated peak RAM {:.0} GiB exceeds 85% of available ({:.0} GiB) — capping concurrency to {}",
-        estimated_peak_gb, available_ram_gb, concurrency.saturating_sub(1).max(MIN_CONCURRENCY)
-    );
+            "Estimated peak RAM {:.0} GiB exceeds 85% of available ({:.0} GiB) — capping concurrency to {}",
+            estimated_peak_gb, available_ram_gb, concurrency.saturating_sub(1).max(MIN_CONCURRENCY)
+        );
         concurrency = concurrency.saturating_sub(1).max(MIN_CONCURRENCY);
     }
 
@@ -2207,17 +2207,17 @@ pub async fn minimap2_non_host_align(
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
-    concat!(
-        "NT minimap2 stage: {} concurrent jobs × {} threads/job\n",
-        "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-        "  single-job baseline: ~{:.0} s real time (measured)"
-    ),
-    concurrency,
-    threads_per_job,
-    estimated_peak_gb,
-    (estimated_peak_gb / available_ram_gb * 100.0).round(),
-    MEASURED_SINGLE_JOB_SEC
-);
+        concat!(
+            "NT minimap2 stage: {} concurrent jobs × {} threads/job\n",
+            "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
+            "  single-job baseline: ~{:.0} s real time (measured)"
+        ),
+        concurrency,
+        threads_per_job,
+        estimated_peak_gb,
+        (estimated_peak_gb / available_ram_gb * 100.0).round(),
+        MEASURED_SINGLE_JOB_SEC
+    );
 
     // 3. Semaphore to limit concurrent minimap2 processes
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
@@ -2237,13 +2237,11 @@ pub async fn minimap2_non_host_align(
         let r1 = r1_path.clone();
         let r2 = r2_path_opt.clone();
 
-        let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
-        debug!("minimap2 for {} acquired permit", chunk_name);
-
-        // sleep(Duration::from_secs(rand::rng().random_range(0..3))).await;
-
         let handle = tokio::spawn(async move {
             debug!("minimap2 for {} waiting for permit", chunk_name);
+
+            let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+            debug!("minimap2 for {} acquired permit", chunk_name);
 
             // Build minimap2 config & args
             let mut options = HashMap::new();
@@ -2286,10 +2284,8 @@ pub async fn minimap2_non_host_align(
             )
                 .await
                 .context("Failed to parse minimap2 PAF output")?;
-            
 
             let chunk_name_clone = chunk_name.clone();
-
             drop(permit);
             info!("Permit released for {} after spawn/setup", chunk_name_clone);
 
@@ -2299,8 +2295,7 @@ pub async fn minimap2_non_host_align(
                 if !status.success() {
                     warn!("minimap2 for {} exited with status: {}", chunk_name_clone, status);
                 }
-
-                info!("minimap2 process for {} finished, permit released", chunk_name_clone);
+                info!("minimap2 process for {} finished", chunk_name_clone);
                 Ok::<(), anyhow::Error>(())
             });
 
@@ -2354,7 +2349,7 @@ pub async fn minimap2_non_host_align(
 }
 
 
-    // ────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────
     //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
     //   (comment out or delete this whole block when done debugging)
     // ────────────────────────────────────────────────────────────────
