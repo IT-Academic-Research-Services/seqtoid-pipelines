@@ -2240,11 +2240,13 @@ pub async fn minimap2_non_host_align(
         sleep(Duration::from_secs(rand::rng().random_range(0..3))).await;
 
         let handle = tokio::spawn(async move {
+            debug!("minimap2 for {} waiting for permit", chunk_name);
             // Acquire permit — blocks until a slot is free (limits concurrency)
             let permit = sem
                 .acquire_owned()
                 .await
                 .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+            debug!("minimap2 for {} acquired permit", chunk_name);
 
             // Build minimap2 config & args
             let mut options = HashMap::new();

@@ -1,5 +1,6 @@
 // Functions and definitions for the minimap2-associated PAF file format
 use anyhow::{anyhow, Result};
+use log::{info, debug};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,12 +89,16 @@ impl PafRecord {
         tx: Sender<ParseOutput>,
         _buffer_size: usize,
     ) -> Result<()> {
+        info!("Starting merge_paf_streams with {} streams", streams.len());
         let mut query_hits: HashMap<String, Vec<PafRecord>> = HashMap::new();
         let mut stream_map = StreamMap::new();
 
         for (idx, stream) in streams.into_iter().enumerate() {
             stream_map.insert(idx, stream);
         }
+
+        let mut record_count = 0;
+        let start_time = tokio::time::Instant::now();
 
         // Collect all PAF records from all partial streams concurrently
         while let Some((_idx, item)) = stream_map.next().await {
@@ -106,11 +111,18 @@ impl PafRecord {
                             continue;
                         }
                         let record = PafRecord::parse_line(trimmed)?;
+                        let unique_queries = query_hits.len();
                         let hits = query_hits
                             .entry(record.qname.clone())
                             .or_default();
                         
                         hits.push(record);
+                        record_count += 1;
+                        if record_count % 100_000 == 0 {
+                            info!("merge_paf_streams: processed {} records, {} unique queries, elapsed {:?}", 
+                                record_count, unique_queries, start_time.elapsed());
+                        }
+
                         if hits.len() > 20 {
                             hits.sort_by_key(|h| Reverse(h.alignment_score()));
                             hits.truncate(6);
@@ -123,9 +135,16 @@ impl PafRecord {
             }
         }
 
+        info!("merge_paf_streams: finished collecting {} records ({} unique queries) in {:?}", 
+            record_count, query_hits.len(), start_time.elapsed());
+
         // Sort queries alphabetically for deterministic output
         let mut queries: Vec<String> = query_hits.keys().cloned().collect();
         queries.sort();
+
+        info!("merge_paf_streams: emitting merged records...");
+        let emit_start = tokio::time::Instant::now();
+        let mut emitted_count = 0;
 
         // For each query: sort by descending AS score, keep top 6 hits
         for query in queries {
@@ -138,9 +157,12 @@ impl PafRecord {
                     tx.send(ParseOutput::Bytes(Arc::new(paf_line.into_bytes())))
                         .await
                         .map_err(|e| anyhow!("Failed to send merged PAF line: {}", e))?;
+                    emitted_count += 1;
                 }
             }
         }
+
+        info!("merge_paf_streams: finished emitting {} records in {:?}", emitted_count, emit_start.elapsed());
 
         Ok(())
     }
