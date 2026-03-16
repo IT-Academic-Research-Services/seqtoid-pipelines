@@ -2237,7 +2237,7 @@ pub async fn minimap2_non_host_align(
         let r1 = r1_path.clone();
         let r2 = r2_path_opt.clone();
 
-        sleep(Duration::from_secs(rand::rng().random_range(0..3))).await;
+        // sleep(Duration::from_secs(rand::rng().random_range(0..3))).await;
 
         let handle = tokio::spawn(async move {
             debug!("minimap2 for {} waiting for permit", chunk_name);
@@ -2289,6 +2289,31 @@ pub async fn minimap2_non_host_align(
             )
                 .await
                 .context("Failed to parse minimap2 PAF output")?;
+
+            // Add logging wrapper around paf_receiver
+            let (logged_tx, logged_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+            let chunk_name_log = chunk_name.clone();
+            tokio::spawn(async move {
+                let mut count = 0;
+                let mut paf_receiver = paf_receiver;  // Shadow or reassign to mutable within spawn
+                while let Some(item) = paf_receiver.recv().await {
+                    if let ParseOutput::Bytes(bytes) = &item {
+                        let line = String::from_utf8_lossy(&*bytes).trim().to_string();
+                        info!("PAF line from {} (item {}): {}", chunk_name_log, count, line);
+                        count += 1;
+                    } else {
+                        warn!("Unexpected non-Bytes from {}: {:?}", chunk_name_log, item);
+                    }
+                    if logged_tx.send(item).await.is_err() {
+                        warn!("Logged channel dropped for {}", chunk_name_log);
+                        break;
+                    }
+                }
+                info!("PAF receiver complete for {}: {} items logged", chunk_name_log, count);
+            });
+
+            // Use logged_rx instead of paf_receiver
+            let paf_receiver = logged_rx;  // Reassign for downstream
 
             let chunk_name_clone = chunk_name.clone();
             let wait_task = tokio::spawn(async move {
