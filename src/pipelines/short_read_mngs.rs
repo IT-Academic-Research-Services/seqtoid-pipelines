@@ -2244,12 +2244,6 @@ pub async fn minimap2_non_host_align(
 
         let handle = tokio::spawn(async move {
             debug!("minimap2 for {} waiting for permit", chunk_name);
-            // Acquire permit — blocks until a slot is free (limits concurrency)
-            // let permit = sem
-            //     .acquire_owned()
-            //     .await
-            //     .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
-            // debug!("minimap2 for {} acquired permit", chunk_name);
 
             // Build minimap2 config & args
             let mut options = HashMap::new();
@@ -2292,37 +2286,11 @@ pub async fn minimap2_non_host_align(
             )
                 .await
                 .context("Failed to parse minimap2 PAF output")?;
-
-            // Add logging wrapper around paf_receiver
-            let (logged_tx, logged_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
-            let chunk_name_log = chunk_name.clone();
-            tokio::spawn(async move {
-                let mut count = 0;
-                let mut paf_receiver = paf_receiver;  // Shadow or reassign to mutable within spawn
-                while let Some(item) = paf_receiver.recv().await {
-                    if let ParseOutput::Bytes(bytes) = &item {
-                        let line = String::from_utf8_lossy(&*bytes).trim().to_string();
-                        info!("PAF line from {} (item {}): {}", chunk_name_log, count, line);
-                        count += 1;
-                    } else {
-                        warn!("Unexpected non-Bytes from {}: {:?}", chunk_name_log, item);
-                    }
-                    if logged_tx.send(item).await.is_err() {
-                        warn!("Logged channel dropped for {}", chunk_name_log);
-                        break;
-                    }
-                }
-                info!("PAF receiver complete for {}: {} items logged", chunk_name_log, count);
-            });
-
-            // Use logged_rx instead of paf_receiver
-            let paf_receiver = logged_rx;  // Reassign for downstream
-
-
+            
 
             let chunk_name_clone = chunk_name.clone();
 
-            drop(permit);  // Release HERE, after spawn and parse setup — allows next job to start
+            drop(permit);
             info!("Permit released for {} after spawn/setup", chunk_name_clone);
 
             let wait_task = tokio::spawn(async move {

@@ -106,14 +106,11 @@ impl PafRecord {
                 ParseOutput::Bytes(bytes) => {
                     let line = String::from_utf8_lossy(&*bytes).trim().to_string();
                     for line in line.lines() {
-                        info!("Processing line: {}", line);
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
                         }
-                        info!("Processing trimmed: {}", trimmed);
                         let record = PafRecord::parse_line(trimmed)?;
-                        info!("Processing record: {:?}", record);
                         let unique_queries = query_hits.len();
                         let hits = query_hits
                             .entry(record.qname.clone())
