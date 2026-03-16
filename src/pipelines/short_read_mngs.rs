@@ -2150,7 +2150,7 @@ pub async fn minimap2_non_host_align(
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 2. Memory & concurrency estimation
+    // 2. Memory & concurrency estimation (unchanged)
     const MEASURED_SINGLE_JOB_GB: f64 = 85.0;
     const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
@@ -2209,38 +2209,51 @@ pub async fn minimap2_non_host_align(
     // 3. Semaphore to limit concurrent minimap2 processes
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
 
-    // 4. Create a temp dir for all chunk PAF outputs (NVMe preferred)
+    // 4. Create temp dir for all chunk PAF outputs (NVMe preferred)
     let paf_temp_dir = choose_temp_dir(
-        max_size_bytes * num_chunks as u64 / 10,  // conservative estimate, e.g. 10% overhead
-       &config.ram_temp_dir,
+        max_size_bytes * num_chunks as u64 / 10,  // conservative estimate
+        &config.ram_temp_dir,
         &config.args.nvme_scratch,
         4,
-       true,
+        true,
     )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
+    // Extract path for cloning into chunk tasks
     let paf_temp_dir_path = paf_temp_dir.path().to_path_buf();
 
-
-    cleanup_tasks.push(tokio::spawn(async move {
-        if let Err(e) = paf_temp_dir.close() {
-            warn!("Failed to clean PAF temp dir: {}", e);
+    // Spawn independent cleanup task that waits for all chunk tasks to finish
+    let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
+    let cleanup_handle = tokio::spawn(async move {
+        // Wait for signal that all mm2 jobs are done
+        if cleanup_rx.await.is_ok() {
+            if let Err(e) = paf_temp_dir.close() {
+                warn!("Failed to clean PAF temp dir: {}", e);
+            } else {
+                info!("PAF temp dir cleaned successfully");
+            }
+        } else {
+            warn!("Cleanup signal dropped — temp dir may persist");
         }
-        Ok(())
-    }));
+        Ok::<(), anyhow::Error>(())
+    });
 
     // 5. Spawn one task per chunk
-    let mut chunk_handles: Vec<JoinHandle<Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> = Vec::with_capacity(num_chunks);
+    let mut chunk_handles: Vec<JoinHandle<Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> =
+        Vec::with_capacity(num_chunks);
 
     for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
-        let chunk_name = chunk_mmi.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| format!("chunk_{}", idx));
+        let chunk_name = chunk_mmi
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("chunk_{}", idx));
 
         let sem = semaphore.clone();
         let config = config.clone();
         let r1 = r1_path.clone();
         let r2 = r2_path_opt.clone();
-        let temp_dir_path = paf_temp_dir_path.clone();
+        let temp_dir_path = paf_temp_dir_path.clone();  // cheap clone
 
         let handle = tokio::spawn(async move {
             let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
@@ -2248,11 +2261,11 @@ pub async fn minimap2_non_host_align(
 
             // Create per-chunk temp PAF file
             let paf_path = temp_dir_path.join(format!("{}.paf", chunk_name));
+
             let mut options = HashMap::new();
             options.insert("-c".to_string(), None);
             options.insert("-x".to_string(), Some("sr".to_string()));
             options.insert("--secondary".to_string(), Some("yes".to_string()));
-            options.insert("-o".to_string(), Some(paf_path.to_string_lossy().to_string()));
 
             let mm_config = Minimap2Config {
                 minimap2_index_path: chunk_mmi,
@@ -2264,7 +2277,11 @@ pub async fn minimap2_non_host_align(
 
             let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
                 .context("Failed to generate minimap2 args")?;
-            
+
+            // Redirect output to temp file
+            args.push("-o".to_string());
+            args.push(paf_path.to_string_lossy().to_string());
+
             info!("Launching minimap2 for {} to file {}: minimap2 {}", chunk_name, paf_path.display(), args.join(" "));
 
             let (mut child, stderr_task) = spawn_cmd(
@@ -2299,10 +2316,12 @@ pub async fn minimap2_non_host_align(
     }
 
     // 6. Collect temp PAF paths and wait tasks
+    let results = try_join_all(chunk_handles).await?;
+
+    info!("All minimap2 chunks finished, {} temp PAF files ready", results.len());
+
     let mut paf_paths = Vec::with_capacity(num_chunks);
     let mut wait_tasks = Vec::new();
-
-    let results = try_join_all(chunk_handles).await?;
 
     for res in results {
         match res {
@@ -2316,14 +2335,14 @@ pub async fn minimap2_non_host_align(
         }
     }
 
-    info!("All minimap2 chunks finished, {} temp PAF files ready", paf_paths.len());
+    // Signal cleanup task that all jobs are done (files complete)
+    let _ = cleanup_tx.send(());
 
     // 7. Merge from temp files
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(async move {
-        let concurrency = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-        if let Err(e) = PafRecord::merge_paf_files(&paf_paths, merged_tx, concurrency).await {
+        if let Err(e) = PafRecord::merge_paf_files(&paf_paths, merged_tx, channel_buffer).await {
             warn!("PAF merge from files failed: {}", e);
             return Err(e);
         }
@@ -2332,12 +2351,12 @@ pub async fn minimap2_non_host_align(
 
     cleanup_tasks.push(gather_handle);
 
-    // Add wait tasks to cleanup
+    // Add wait tasks to cleanup (optional, but good practice)
     for wt in wait_tasks {
         cleanup_tasks.push(wt);
     }
 
-    info!("minimap2 NT alignment launched — {} chunks → temp files → streaming merge", num_chunks);
+    info!("minimap2 NT alignment launched — {} chunks → temp files → merge", num_chunks);
 
     Ok((
         ReceiverStream::new(merged_rx),
