@@ -2286,8 +2286,6 @@ pub async fn minimap2_non_host_align(
                 .context("Failed to parse minimap2 PAF output")?;
 
             let chunk_name_clone = chunk_name.clone();
-            drop(permit);
-            info!("Permit released for {} after spawn/setup", chunk_name_clone);
 
             let wait_task = tokio::spawn(async move {
                 info!("inside minimap2 wait for {}", chunk_name_clone);
@@ -2295,6 +2293,7 @@ pub async fn minimap2_non_host_align(
                 if !status.success() {
                     warn!("minimap2 for {} exited with status: {}", chunk_name_clone, status);
                 }
+                drop(permit);
                 info!("minimap2 process for {} finished", chunk_name_clone);
                 Ok::<(), anyhow::Error>(())
             });
