@@ -113,7 +113,7 @@ impl PafRecord {
                         }
                         info!("Processing trimmed: {}", trimmed);
                         let record = PafRecord::parse_line(trimmed)?;
-                        info!("Processing record: {}", record);
+                        info!("Processing record: {:?}", record);
                         let unique_queries = query_hits.len();
                         let hits = query_hits
                             .entry(record.qname.clone())
