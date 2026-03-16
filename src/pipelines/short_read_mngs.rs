@@ -6064,7 +6064,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None,
         config.base_backpressure_pause,
         StreamDataType::IlluminaFastq,
-        "nr_call_summary".to_string(),
+        "nr_annotated_summary".to_string(),
         None,
     )
         .await
@@ -6083,7 +6083,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None,
         config.base_backpressure_pause,
         StreamDataType::IlluminaFastq,
-        "nr_call_summary".to_string(),
+        "nr_unidentified_summary".to_string(),
         None,
     )
         .await
