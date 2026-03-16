@@ -2237,16 +2237,19 @@ pub async fn minimap2_non_host_align(
         let r1 = r1_path.clone();
         let r2 = r2_path_opt.clone();
 
+        let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+        debug!("minimap2 for {} acquired permit", chunk_name);
+
         // sleep(Duration::from_secs(rand::rng().random_range(0..3))).await;
 
         let handle = tokio::spawn(async move {
             debug!("minimap2 for {} waiting for permit", chunk_name);
             // Acquire permit — blocks until a slot is free (limits concurrency)
-            let permit = sem
-                .acquire_owned()
-                .await
-                .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
-            debug!("minimap2 for {} acquired permit", chunk_name);
+            // let permit = sem
+            //     .acquire_owned()
+            //     .await
+            //     .map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+            // debug!("minimap2 for {} acquired permit", chunk_name);
 
             // Build minimap2 config & args
             let mut options = HashMap::new();
@@ -2315,14 +2318,20 @@ pub async fn minimap2_non_host_align(
             // Use logged_rx instead of paf_receiver
             let paf_receiver = logged_rx;  // Reassign for downstream
 
+
+
             let chunk_name_clone = chunk_name.clone();
+
+            drop(permit);  // Release HERE, after spawn and parse setup — allows next job to start
+            info!("Permit released for {} after spawn/setup", chunk_name_clone);
+
             let wait_task = tokio::spawn(async move {
                 info!("inside minimap2 wait for {}", chunk_name_clone);
                 let status = child.wait().await.context("Failed to wait for minimap2 child")?;
                 if !status.success() {
                     warn!("minimap2 for {} exited with status: {}", chunk_name_clone, status);
                 }
-                drop(permit); // Permit released only after process ends
+
                 info!("minimap2 process for {} finished, permit released", chunk_name_clone);
                 Ok::<(), anyhow::Error>(())
             });
