@@ -2284,7 +2284,7 @@ pub async fn minimap2_non_host_align(
             let paf_receiver = parse_child_output(
                 &mut child,
                 ChildStream::Stdout,
-                ParseMode::Bytes,
+                ParseMode::Lines,
                 config.base_buffer_size,
             )
                 .await
