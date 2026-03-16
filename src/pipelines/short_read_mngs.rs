@@ -2308,6 +2308,8 @@ pub async fn minimap2_non_host_align(
     // 5. Collect results as they complete
     let results = try_join_all(chunk_handles).await?;
 
+    info!("minimap2 finished for {} jobs", results.len());
+
     let mut partial_paf_receivers = Vec::new();
 
     for res in results {
@@ -2322,7 +2324,7 @@ pub async fn minimap2_non_host_align(
             }
         }
     }
-    
+
     info!("after 5");
     // 6. Merge all per-chunk PAF streams into one ordered stream
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
