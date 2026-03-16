@@ -2306,24 +2306,23 @@ pub async fn minimap2_non_host_align(
     }
 
     // 5. Collect results as they complete
+    let results = try_join_all(chunk_handles).await?;
+
     let mut partial_paf_receivers = Vec::new();
 
-    for handle in chunk_handles {
-        match handle.await {
-            Ok(Ok((paf_rx, stderr_task, wait_task))) => {
+    for res in results {
+        match res {
+            Ok((paf_rx, stderr_task, wait_task)) => {
                 partial_paf_receivers.push(ReceiverStream::new(paf_rx));
                 cleanup_tasks.push(stderr_task);
                 cleanup_tasks.push(wait_task);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 return Err(PipelineError::Other(anyhow!("minimap2 chunk failed: {}", e)));
-            }
-            Err(join_err) => {
-                return Err(PipelineError::Other(anyhow!("minimap2 task panicked: {}", join_err)));
             }
         }
     }
-
+    
     info!("after 5");
     // 6. Merge all per-chunk PAF streams into one ordered stream
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);

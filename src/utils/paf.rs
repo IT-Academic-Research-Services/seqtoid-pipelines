@@ -167,9 +167,7 @@ impl PafRecord {
         Ok(())
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Your existing methods (unchanged)
-    // ────────────────────────────────────────────────────────────────
+
     fn calc_bitscore(&self) -> f64 {
         let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let alen = self.alen as f64;
