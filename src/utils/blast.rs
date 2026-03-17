@@ -364,103 +364,6 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
     }
 }
 
-async fn spawn_batch_processor(
-    batch_m8:           Vec<String>,
-    batch_hit:          Vec<String>,
-    db_type:            String,
-    lineage_map:        Arc<AHashMap<Taxid, Lineage>>,
-    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    output_tx:          mpsc::Sender<ParseOutput>,
-    semaphore:          Arc<Semaphore>,
-    batch_idx:          u64,
-) -> Result<JoinHandle<Result<()>>> {
-    let permit = semaphore.acquire_owned().await?;
-
-    let task = tokio::spawn(async move {
-        let _permit = permit;
-
-        let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::new();
-
-        for (m8_line, hit_line) in batch_m8.into_iter().zip(batch_hit) {
-            let hit_fields: Vec<&str> = hit_line.split('\t').collect();
-            if hit_fields.len() < 10 { continue; }
-
-            let read_id = hit_fields[0].to_string();
-            let level   = hit_fields.get(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
-            let taxid   = hit_fields.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-
-            if taxid <= 0 || level == 0 { continue; }
-
-            if let Ok(m8) = M8Record::parse_line_nt(&m8_line)
-                .or_else(|_| M8Record::parse_line_nr(&m8_line))
-            {
-                let bucket = buckets.entry(taxid).or_default();
-
-                bucket.nonunique_count += 1;
-                bucket.unique_count += duplicate_clusters
-                    .get(&read_id)
-                    .map(|entry| entry.value().size)
-                    .unwrap_or(1);
-
-                bucket.base_count += 1;
-                bucket.sum_percent_identity += m8.pident;
-                bucket.sum_alignment_length += m8.alen as f64;
-                bucket.sum_e_value += m8.evalue;
-                bucket.source_count_type.insert(db_type.clone());
-            }
-        }
-
-        // Emit results for this batch
-        for (taxid, bucket) in buckets {
-            if let Some(lineage) = lineage_map.get(&taxid) {
-                if !should_keep_filter(lineage) { continue; }
-
-                let dcr = if bucket.nonunique_count > 0 {
-                    bucket.unique_count as f64 / bucket.nonunique_count as f64
-                } else {
-                    0.0
-                };
-
-                let percent_identity = if bucket.base_count > 0 {
-                    bucket.sum_percent_identity / bucket.base_count as f64
-                } else { 0.0 };
-
-                let alignment_length = if bucket.base_count > 0 {
-                    bucket.sum_alignment_length / bucket.base_count as f64
-                } else { 0.0 };
-
-                let e_value = if bucket.base_count > 0 {
-                    bucket.sum_e_value / bucket.base_count as f64
-                } else { 0.0 };
-
-                let count = TaxonCount {
-                    tax_id: taxid,
-                    tax_level: 1,
-                    genus_taxid: lineage[1],
-                    family_taxid: lineage[2],
-                    count: bucket.unique_count,
-                    nonunique_count: bucket.nonunique_count,
-                    unique_count: bucket.unique_count,
-                    dcr,
-                    percent_identity,
-                    alignment_length,
-                    e_value,
-                    count_type: db_type.clone(),
-                    base_count: bucket.base_count,
-                    source_count_type: Some(bucket.source_count_type.into_iter().collect()),
-                };
-
-                let json = serde_json::to_string(&count)? + "\n";
-                output_tx.send(ParseOutput::Bytes(Arc::new(json.into_bytes()))).await?;
-            }
-        }
-
-        Ok(())
-    });
-
-    Ok(task)
-}
 
 pub async fn generate_taxon_count_json_from_m8(
     mut m8_stream_rx:           ReceiverStream<ParseOutput>,
@@ -477,109 +380,168 @@ pub async fn generate_taxon_count_json_from_m8(
         return Err(anyhow::anyhow!("concurrency must be > 0"));
     }
 
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-
     let db_type = db_type.to_string();
-    let mut batch_m8  = Vec::with_capacity(batch_size_lines);
-    let mut batch_hit = Vec::with_capacity(batch_size_lines);
-    let mut batch_idx = 0u64;
 
-    loop {
-        tokio::select! {
-            m8_opt  = m8_stream_rx.next()  => {
-                match m8_opt {
-                    Some(item) => {
-                        if let Ok(bytes) = item.to_bytes() {
-                            if let Ok(line) = String::from_utf8(bytes.to_vec()) {
-                                let trimmed = line.trim_end().to_string();
-                                if !trimmed.is_empty() {
-                                    batch_m8.push(trimmed);
-                                }
+    // Bounded mpsc channel — hard concurrency cap + backpressure
+    let (job_tx, job_rx) = mpsc::channel::<(Vec<String>, Vec<String>)>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    // Producer: build batches and send to bounded channel (exact same loop as before)
+    let producer_handle = tokio::spawn({
+        let mut m8_stream = m8_stream_rx;
+        let mut hit_stream = hit_summary_stream_rx;
+        async move {
+            let mut batch_m8 = Vec::with_capacity(batch_size_lines);
+            let mut batch_hit = Vec::with_capacity(batch_size_lines);
+
+            loop {
+                let m8_item = m8_stream.next().await;
+                let hit_item = hit_stream.next().await;
+
+                match (m8_item, hit_item) {
+                    (Some(m8), Some(hit)) => {
+                        if let Ok(bytes) = m8.to_bytes() {
+                            let line = String::from_utf8_lossy(&bytes);
+                            let trimmed = line.trim_end().to_string();
+                            if !trimmed.is_empty() {
+                                batch_m8.push(trimmed);
+                            }
+                        }
+                        if let Ok(bytes) = hit.to_bytes() {
+                            let line = String::from_utf8_lossy(&bytes);
+                            let trimmed = line.trim_end().to_string();
+                            if !trimmed.is_empty() {
+                                batch_hit.push(trimmed);
+                            }
+                        }
+
+                        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines {
+                            if job_tx.send((std::mem::take(&mut batch_m8), std::mem::take(&mut batch_hit))).await.is_err() {
+                                break;
                             }
                         }
                     }
-                    None => {
-                        // m8 stream ended → process remaining batch if any, then break
-                        if !batch_m8.is_empty() {
-                            let task = spawn_batch_processor(
-                                std::mem::take(&mut batch_m8),
-                                std::mem::take(&mut batch_hit),
-                                db_type.clone(),
-                                lineage_map.clone(),
-                                should_keep_filter.clone(),
-                                duplicate_clusters.clone(),
-                                output_tx.clone(),
-                                semaphore.clone(),
-                                batch_idx,
-                            ).await?;
-                            tasks.push(task);
-                            batch_idx += 1;
+                    _ => {
+                        // final partial batch
+                        if !batch_m8.is_empty() || !batch_hit.is_empty() {
+                            let _ = job_tx.send((batch_m8, batch_hit)).await;
                         }
                         break;
                     }
                 }
             }
+            drop(job_tx);
+            Ok::<(), anyhow::Error>(())
+        }
+    });
 
-            hit_opt = hit_summary_stream_rx.next() => {
-                match hit_opt {
-                    Some(item) => {
-                        if let Ok(bytes) = item.to_bytes() {
-                            if let Ok(line) = String::from_utf8(bytes.to_vec()) {
-                                let trimmed = line.trim_end().to_string();
-                                if !trimmed.is_empty() {
-                                    batch_hit.push(trimmed);
-                                }
-                            }
+    // Fixed worker pool — exactly `concurrency` workers (hard cap)
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = shared_rx.clone();
+        let output_tx = output_tx.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        let db_type = db_type.clone();
+
+        let worker = tokio::spawn(async move {
+            loop {
+                let job = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                if let Some((batch_m8, batch_hit)) = job {
+                    let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::new();
+
+                    for (m8_line, hit_line) in batch_m8.into_iter().zip(batch_hit) {
+                        let hit_fields: Vec<&str> = hit_line.split('\t').collect();
+                        if hit_fields.len() < 10 { continue; }
+
+                        let read_id = hit_fields[0].to_string();
+                        let level   = hit_fields.get(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+                        let taxid   = hit_fields.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+
+                        if taxid <= 0 || level == 0 { continue; }
+
+                        if let Ok(m8) = M8Record::parse_line_nt(&m8_line)
+                            .or_else(|_| M8Record::parse_line_nr(&m8_line))
+                        {
+                            let bucket = buckets.entry(taxid).or_default();
+
+                            bucket.nonunique_count += 1;
+                            bucket.unique_count += duplicate_clusters
+                                .get(&read_id)
+                                .map(|entry| entry.value().size)
+                                .unwrap_or(1);
+
+                            bucket.base_count += 1;
+                            bucket.sum_percent_identity += m8.pident;
+                            bucket.sum_alignment_length += m8.alen as f64;
+                            bucket.sum_e_value += m8.evalue;
+                            bucket.source_count_type.insert(db_type.clone());
                         }
                     }
-                    None => {
-                        // similar handling as above
-                        if !batch_hit.is_empty() {
-                            let task = spawn_batch_processor(
-                                std::mem::take(&mut batch_m8),
-                                std::mem::take(&mut batch_hit),
-                                db_type.clone(),
-                                lineage_map.clone(),
-                                should_keep_filter.clone(),
-                                duplicate_clusters.clone(),
-                                output_tx.clone(),
-                                semaphore.clone(),
-                                batch_idx,
-                            ).await?;
-                            tasks.push(task);
-                            batch_idx += 1;
+
+                    // Emit results
+                    for (taxid, bucket) in buckets {
+                        if let Some(lineage) = lineage_map.get(&taxid) {
+                            if !should_keep_filter(lineage) { continue; }
+
+                            let dcr = if bucket.nonunique_count > 0 {
+                                bucket.unique_count as f64 / bucket.nonunique_count as f64
+                            } else { 0.0 };
+
+                            let percent_identity = if bucket.base_count > 0 {
+                                bucket.sum_percent_identity / bucket.base_count as f64
+                            } else { 0.0 };
+
+                            let alignment_length = if bucket.base_count > 0 {
+                                bucket.sum_alignment_length / bucket.base_count as f64
+                            } else { 0.0 };
+
+                            let e_value = if bucket.base_count > 0 {
+                                bucket.sum_e_value / bucket.base_count as f64
+                            } else { 0.0 };
+
+                            let count = TaxonCount {
+                                tax_id: taxid,
+                                tax_level: 1,
+                                genus_taxid: lineage[1],
+                                family_taxid: lineage[2],
+                                count: bucket.unique_count,
+                                nonunique_count: bucket.nonunique_count,
+                                unique_count: bucket.unique_count,
+                                dcr,
+                                percent_identity,
+                                alignment_length,
+                                e_value,
+                                count_type: db_type.clone(),
+                                base_count: bucket.base_count,
+                                source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+                            };
+
+                            let json = serde_json::to_string(&count)? + "\n";
+                            let _ = output_tx.send(ParseOutput::Bytes(Arc::new(json.into_bytes()))).await;
                         }
-                        break;
                     }
+                } else {
+                    break;
                 }
             }
-        }
-
-        // When both batches are full → dispatch
-        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines {
-            let task = spawn_batch_processor(
-                std::mem::take(&mut batch_m8),
-                std::mem::take(&mut batch_hit),
-                db_type.clone(),
-                lineage_map.clone(),
-                should_keep_filter.clone(),
-                duplicate_clusters.clone(),
-                output_tx.clone(),
-                semaphore.clone(),
-                batch_idx,
-            ).await?;
-            tasks.push(task);
-            batch_idx += 1;
-        }
+            Ok::<(), anyhow::Error>(())
+        });
+        workers.push(worker);
     }
 
-    // Wait for remaining tasks
-    for task in tasks {
-        task.await.context("Worker task failed")??;
+    // Wait for producer + all workers
+    producer_handle.await??;
+    for w in workers {
+        w.await??;
     }
 
-    info!("Finished taxon count JSON generation for {db_type} ({batch_idx} batches)");
+    info!("Finished taxon count JSON generation for {} (bounded channel, {} workers)", db_type, concurrency);
     Ok(())
 }
 
