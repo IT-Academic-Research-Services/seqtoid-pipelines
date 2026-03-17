@@ -4820,6 +4820,7 @@ pub async fn generate_contig_summary_json(
 
 
 pub async fn generate_m8_and_hit_summary(
+    config: Arc<RunConfig>,
     mut updated_reads_stream: ReceiverStream<ParseOutput>,
     mut added_reads_stream: ReceiverStream<ParseOutput>,
     mut blast_hits_stream: ReceiverStream<ParseOutput>,
@@ -4828,24 +4829,38 @@ pub async fn generate_m8_and_hit_summary(
     refined_m8_tx: Sender<ParseOutput>,
     refined_hit_summary_tx: Sender<ParseOutput>,
 ) -> Result<()> {
-
-
-    // copy everything from original deduped M8
+    // ─────────────────────────────────────────────────────────────
+    // M8 forwarding (unchanged – fast & order-preserving)
+    // ─────────────────────────────────────────────────────────────
     while let Some(item) = original_deduped_m8_stream.next().await {
         refined_m8_tx.send(item).await
             .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
     }
-
-    // append new blast hits
     while let Some(item) = blast_hits_stream.next().await {
         refined_m8_tx.send(item).await
             .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
     }
-    drop(refined_m8_tx); // signals EOF
+    drop(refined_m8_tx);
 
+    // ─────────────────────────────────────────────────────────────
+    // Dynamic concurrency from your helper
+    // ─────────────────────────────────────────────────────────────
+    let merge_concurrency = compute_phase_concurrency(
+        &config,
+        "hit_summary_merge",
+        0.25,   // ~250 MB per batch
+        2.0,    // very light CPU
+        128,
+        4,
+    );
+    info!("hit_summary_merge concurrency: {} workers", merge_concurrency);
 
-    // stream through the original hit summary and replace rows that were updated
-    let mut updated_reads = AHashMap::new();
+    // Bounded channel — capacity = computed concurrency
+    let (job_tx, job_rx) = mpsc::channel::<ParseOutput>(merge_concurrency);
+    let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    // Build the lookup maps (small & fast)
+    let mut updated_reads: AHashMap<String, Arc<Vec<u8>>> = AHashMap::new();
     while let Some(item) = updated_reads_stream.next().await {
         if let ParseOutput::Bytes(bytes) = item {
             let line = String::from_utf8_lossy(&*bytes);
@@ -4854,7 +4869,7 @@ pub async fn generate_m8_and_hit_summary(
         }
     }
 
-    let mut added_reads = AHashMap::new();
+    let mut added_reads: AHashMap<String, Arc<Vec<u8>>> = AHashMap::new();
     while let Some(item) = added_reads_stream.next().await {
         if let ParseOutput::Bytes(bytes) = item {
             let line = String::from_utf8_lossy(&*bytes);
@@ -4863,34 +4878,56 @@ pub async fn generate_m8_and_hit_summary(
         }
     }
 
-    //walk the original hit summary once
-    while let Some(item) = original_hit_summary_stream.next().await {
-        if let ParseOutput::Bytes(bytes) = item {
-            let line = String::from_utf8_lossy(&*bytes);
-            let read_id = line.split('\t').next().unwrap_or("").to_string();
+    // Fixed worker pool (exactly merge_concurrency workers)
+    let mut workers = Vec::with_capacity(merge_concurrency);
+    for _ in 0..merge_concurrency {
+        let mut rx = job_rx.clone();
+        let refined_hit_summary_tx = refined_hit_summary_tx.clone();
+        let updated_reads = updated_reads.clone();
+        let added_reads = added_reads.clone();
 
-            // pefer updated version, then added, otherwise keep original
-            let to_send = updated_reads.get(&read_id)
-                .or_else(|| added_reads.get(&read_id))
-                .map_or(bytes.clone(), |v| v.clone());
+        let w = tokio::spawn(async move {
+            while let Some(item) = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            } {
+                if let ParseOutput::Bytes(bytes) = item {
+                    let line = String::from_utf8_lossy(&*bytes);
+                    let read_id = line.split('\t').next().unwrap_or("").to_string();
 
-            refined_hit_summary_tx.send(ParseOutput::Bytes(to_send)).await
-                .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
-        }
+                    let to_send = updated_reads.get(&read_id)
+                        .or_else(|| added_reads.get(&read_id))
+                        .map_or(bytes.clone(), |v| v.clone());
+
+                    let _ = refined_hit_summary_tx.send(ParseOutput::Bytes(to_send)).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        workers.push(w);
     }
 
-    // append  added reads not in the original hit summary
+    // Feed original hit summary into the bounded channel (backpressure)
+    while let Some(item) = original_hit_summary_stream.next().await {
+        let _ = job_tx.send(item).await;
+    }
+    drop(job_tx);
+
+    // Wait for all workers
+    for w in workers {
+        w.await??;
+    }
+
+    // Append any added reads not in original summary
     for (read_id, bytes) in added_reads {
         if !updated_reads.contains_key(&read_id) {
-            refined_hit_summary_tx.send(ParseOutput::Bytes(bytes)).await
-                .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+            let _ = refined_hit_summary_tx.send(ParseOutput::Bytes(bytes)).await;
         }
     }
 
     drop(refined_hit_summary_tx);
     Ok(())
 }
-
 
 pub async fn blast_contigs(
     config: Arc<RunConfig>,
@@ -5125,6 +5162,7 @@ pub async fn blast_contigs(
     let (refined_hit_summary_local_tx, refined_hit_summary_local_rx) = mpsc::channel(2_000_000);
 
     let generate_m8_handle = tokio::spawn(generate_m8_and_hit_summary(
+        config.clone(),
         ReceiverStream::new(updated_rx),
         ReceiverStream::new(added_rx),
         ReceiverStream::new(read2blastm8_rx),
