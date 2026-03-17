@@ -2209,7 +2209,6 @@ pub async fn minimap2_non_host_align(
     );
 
 
-
     // 3. Semaphore to limit concurrent minimap2 processes
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
 
@@ -2227,10 +2226,117 @@ pub async fn minimap2_non_host_align(
     // Extract path for cloning into chunk tasks
     let paf_temp_dir_path = paf_temp_dir.path().to_path_buf();
 
+
+    let (job_tx, job_rx) = mpsc::channel::<(PathBuf, String)>(concurrency); // capacity = max running jobs
+
+    // Producer: enqueue all jobs (will block when queue full → backpressure)
+    let producer_handle = tokio::spawn({
+        let chunk_paths = chunk_paths.clone();
+        let temp_dir_path = paf_temp_dir_path.clone();
+        async move {
+            for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
+                let chunk_name = chunk_mmi
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("chunk_{}", idx));
+
+                // Clone name only if needed for error logging
+                let chunk_name_for_log = chunk_name.clone();
+
+                if let Err(e) = job_tx
+                    .send((chunk_mmi, chunk_name))
+                    .await
+                {
+                    error!("Failed to enqueue job for {}: {}", chunk_name_for_log, e);
+                    break;
+                }
+            }
+            drop(job_tx);
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+
+
+
+    let config_clone = config.clone();
+    let r1_clone = r1_path.clone();
+    let r2_clone = r2_path_opt.clone();
+    let temp_dir_path_clone = paf_temp_dir_path.clone();
+
+
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+    let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = shared_rx.clone();
+        let config = config_clone.clone();
+        let r1 = r1_clone.clone();
+        let r2 = r2_clone.clone();
+        let temp_dir_path = temp_dir_path_clone.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let job = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                if let Some((chunk_mmi, chunk_name)) = job {
+                    let paf_path = temp_dir_path.join(format!("{}.paf", chunk_name));
+
+                    // ── your exact worker body from here ──
+                    let mut options = HashMap::new();
+                    options.insert("-c".to_string(), None);
+                    options.insert("-x".to_string(), Some("sr".to_string()));
+                    options.insert("--secondary".to_string(), Some("yes".to_string()));
+
+                    let mm_config = Minimap2Config {
+                        minimap2_index_path: chunk_mmi,
+                        r1_path: Some(r1.clone()),
+                        r2_path: r2.clone(),
+                        option_fields: options,
+                        num_threads: Some(threads_per_job),
+                    };
+
+                    let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
+                        .context("Failed to generate minimap2 args")?;
+
+                    args.push("-o".to_string());
+                    args.push(paf_path.to_string_lossy().to_string());
+
+                    info!("Launching minimap2 for {} to file {}: minimap2 {}", chunk_name, paf_path.display(), args.join(" "));
+
+                    let (mut child, stderr_task) = spawn_cmd(
+                        config.clone(),
+                        MINIMAP2_TAG,
+                        args,
+                        config.args.verbose,
+                    )
+                        .await
+                        .context("Failed to spawn minimap2")?;
+
+                    if let Some(pid) = child.id() {
+                        info!("minimap2 PID for {}: {}", chunk_name, pid);
+                    }
+
+                    let status = child.wait().await.context("Failed to wait for minimap2 child")?;
+                    if !status.success() {
+                        warn!("minimap2 for {} exited with status: {}", chunk_name, status);
+                    }
+                    info!("minimap2 process for {} finished", chunk_name);
+                } else {
+                    break; // channel closed
+                }
+            }
+            Ok(())
+        });
+
+        worker_handles.push(handle);
+    }
+
+
     // Spawn independent cleanup task that waits for all chunk tasks to finish
     let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
     let cleanup_handle = tokio::spawn(async move {
-        // Wait for signal that all mm2 jobs are done
         if cleanup_rx.await.is_ok() {
             if let Err(e) = paf_temp_dir.close() {
                 warn!("Failed to clean PAF temp dir: {}", e);
@@ -2243,107 +2349,33 @@ pub async fn minimap2_non_host_align(
         Ok::<(), anyhow::Error>(())
     });
 
-    // 5. Spawn one task per chunk
-    let mut chunk_handles: Vec<JoinHandle<Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), anyhow::Error>>> =
-        Vec::with_capacity(num_chunks);
 
-    for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
+    // 5. Wait for producer and all workers
+    producer_handle.await??;
+    try_join_all(worker_handles).await?
+        .into_iter()
+        .try_for_each(|r| r)?;
+
+    // Collect all generated PAF paths (same naming as before)
+    let mut paf_paths = Vec::with_capacity(num_chunks);
+    for chunk_mmi in &chunk_paths {
         let chunk_name = chunk_mmi
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("chunk_{}", idx));
-
-        let sem = semaphore.clone();
-        let config = config.clone();
-        let r1 = r1_path.clone();
-        let r2 = r2_path_opt.clone();
-        let temp_dir_path = paf_temp_dir_path.clone();  // cheap clone
-
-        let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
-        debug!("minimap2 for {} acquired permit", chunk_name);
-
-        let handle = tokio::spawn(async move {
-
-            // Create per-chunk temp PAF file
-            let paf_path = temp_dir_path.join(format!("{}.paf", chunk_name));
-
-            let mut options = HashMap::new();
-            options.insert("-c".to_string(), None);
-            options.insert("-x".to_string(), Some("sr".to_string()));
-            options.insert("--secondary".to_string(), Some("yes".to_string()));
-
-            let mm_config = Minimap2Config {
-                minimap2_index_path: chunk_mmi,
-                r1_path: Some(r1),
-                r2_path: r2,
-                option_fields: options,
-                num_threads: Some(threads_per_job),
-            };
-
-            let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
-                .context("Failed to generate minimap2 args")?;
-
-            // Redirect output to temp file
-            args.push("-o".to_string());
-            args.push(paf_path.to_string_lossy().to_string());
-
-            info!("Launching minimap2 for {} to file {}: minimap2 {}", chunk_name, paf_path.display(), args.join(" "));
-
-            let (mut child, stderr_task) = spawn_cmd(
-                config.clone(),
-                MINIMAP2_TAG,
-                args,
-                config.args.verbose,
-            )
-                .await
-                .context("Failed to spawn minimap2")?;
-
-            if let Some(pid) = child.id() {
-                info!("minimap2 PID for {}: {}", chunk_name, pid);
-            }
-
-            drop(permit);
-            info!("Permit released for {} after spawn", chunk_name);
-
-            let wait_task = tokio::spawn(async move {
-                let status = child.wait().await.context("Failed to wait for minimap2 child")?;
-                if !status.success() {
-                    warn!("minimap2 for {} exited with status: {}", chunk_name, status);
-                }
-                info!("minimap2 process for {} finished", chunk_name);
-                Ok::<(), anyhow::Error>(())
-            });
-
-            Ok((paf_path, wait_task))
-        });
-
-        chunk_handles.push(handle);
-    }
-
-    // 6. Collect temp PAF paths and wait tasks
-    let results = try_join_all(chunk_handles).await?;
-
-    info!("All minimap2 chunks finished, {} temp PAF files ready", results.len());
-
-    let mut paf_paths = Vec::with_capacity(num_chunks);
-    let mut wait_tasks = Vec::new();
-
-    for res in results {
-        match res {
-            Ok((paf_path, wait_task)) => {
-                paf_paths.push(paf_path);
-                wait_tasks.push(wait_task);
-            }
-            Err(e) => {
-                return Err(PipelineError::Other(anyhow!("minimap2 chunk failed: {}", e)));
-            }
+            .unwrap_or_else(|| "unknown".to_string());
+        let paf_path = paf_temp_dir_path.join(format!("{}.paf", chunk_name));
+        if paf_path.exists() {
+            paf_paths.push(paf_path);
+        } else {
+            warn!("PAF file missing for chunk {}", chunk_name);
         }
     }
 
-    // Signal cleanup task that all jobs are done (files complete)
+    // Signal cleanup that all jobs are done
     let _ = cleanup_tx.send(());
 
-    // 7. Merge from temp files
+
+    // 6. Merge from temp files — unchanged
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(async move {
@@ -2355,11 +2387,6 @@ pub async fn minimap2_non_host_align(
     });
 
     cleanup_tasks.push(gather_handle);
-
-    // Add wait tasks to cleanup (optional, but good practice)
-    for wt in wait_tasks {
-        cleanup_tasks.push(wt);
-    }
 
     info!("minimap2 NT alignment launched — {} chunks → temp files → merge", num_chunks);
 
