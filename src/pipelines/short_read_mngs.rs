@@ -4576,6 +4576,7 @@ async fn write_empty_blast_outputs(
 /// # Returns
 /// Result
 pub async fn update_read_dict(
+    config: Arc<RunConfig>,
     read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
@@ -4588,6 +4589,60 @@ pub async fn update_read_dict(
     updated_tx: Sender<ParseOutput>,
     added_tx: Sender<ParseOutput>,
 ) -> Result<()> {
+
+    let update_concurrency = compute_phase_concurrency(
+        &config,                    // you already have this in scope
+        "update_read_dict",
+        0.05,   // ~50 MB per batch of reads (very light)
+        8.0,    // extremely light CPU work → allow ~1 thread per core
+        128,    // max cap (you can raise later)
+        4,      // minimum for small machines
+    );
+    info!("update_read_dict concurrency: {} jobs", update_concurrency);
+    // Bounded channel + fixed worker pool
+
+    let (job_tx, job_rx) = mpsc::channel::<(String, Arc<ReadHit>)>(update_concurrency);
+
+    // Share the receiver safely
+    let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    // Fixed worker pool (exactly READ_UPDATE_CONCURRENCY workers)
+    let mut workers = Vec::with_capacity(update_concurrency);
+    for _ in 0..update_concurrency{
+        let mut rx = job_rx.clone();
+        let read_dict = read_dict.clone();
+        let updated_tx = updated_tx.clone();
+        let added_tx = added_tx.clone();
+
+        let w = tokio::spawn(async move {
+            while let Some((read_id, shared_hit)) = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            } {
+                let final_line = shared_hit.to_full_tab_line(&read_id);
+                let bytes = Arc::new(final_line.into_bytes());
+
+                let was_present = {
+                    let mut dict = read_dict.lock().unwrap();
+                    let present = dict.contains_key(&read_id);
+                    dict.insert(read_id, shared_hit);
+                    present
+                };
+
+                if was_present {
+                    let _ = updated_tx.send(ParseOutput::Bytes(bytes)).await;
+                } else {
+                    let _ = added_tx.send(ParseOutput::Bytes(bytes)).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        workers.push(w);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Original main loop (only fan-out changed)
+    // ─────────────────────────────────────────────────────────────
     while let Some(item) = top_m8_stream.next().await {
         let bytes = match item {
             ParseOutput::Bytes(b) => b,
@@ -4632,16 +4687,11 @@ pub async fn update_read_dict(
         });
         let mut json_line = serde_json::to_string(&json)?;
         json_line.push('\n');
-        contig2lineage_tx
-            .send(ParseOutput::Bytes(Arc::new(json_line.into_bytes())))
-            .await?;
+        let _ = contig2lineage_tx.send(ParseOutput::Bytes(Arc::new(json_line.into_bytes()))).await?;
 
-        // Send refined M8 line
         let mut m8_line = m8.to_tab_string();
         m8_line.push('\n');
-        read2blastm8_tx
-            .send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes())))
-            .await?;
+        let _ = read2blastm8_tx.send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes()))).await?;
 
         // Get all reads in this contig
         let reads_in_contig: Vec<String> = read2contig
@@ -4666,31 +4716,19 @@ pub async fn update_read_dict(
             source_count_type: Some(db_type.to_uppercase()),
         });
 
-
+        // Fan-out to bounded channel (backpressure if workers are busy)
         for read_id in reads_in_contig {
-            let final_line = shared_hit.to_full_tab_line(&read_id);
-
-            let was_present = {
-                let mut dict = read_dict.lock().unwrap();
-                let was_present = dict.contains_key(&read_id);
-                dict.insert(read_id.clone(), shared_hit.clone());
-                was_present
-            };
-
-            let bytes = Arc::new(final_line.into_bytes());
-            if was_present {
-                let _ = updated_tx.send(ParseOutput::Bytes(bytes)).await;
-            } else {
-                let _ = added_tx.send(ParseOutput::Bytes(bytes)).await;
-            }
+            let _ = job_tx.send((read_id, shared_hit.clone())).await;
         }
+    }
 
+    drop(job_tx);               // close channel so workers exit cleanly
+    for w in workers {
+        w.await??;
     }
 
     Ok(())
 }
-
-
 
 pub async fn generate_contig_summary_json(
     read2contig: Arc<HashMap<String, String>>,
@@ -5069,6 +5107,7 @@ pub async fn blast_contigs(
     let (added_tx, added_rx) = mpsc::channel(1024);
 
     let update_handle = tokio::spawn(update_read_dict(
+        config.clone(),
         read2contig.clone(),
         ReceiverStream::new(top_for_update_rx),
         read_dict.clone(),
