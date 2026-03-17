@@ -405,51 +405,6 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
     Ok(set)
 }
 
-async fn dispatch_batch(
-    batch_lines: Vec<String>,
-    semaphore: Arc<Semaphore>,
-    output_tx: mpsc::Sender<ParseOutput>,
-    start_item: usize,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let permit = semaphore.acquire_owned().await
-        .context("Semaphore acquire failed")?;
-    let task = tokio::spawn(async move {
-        let mut hits_by_read: AHashMap<String, Vec<M8Record>> = AHashMap::new();
-        for line in batch_lines {
-            match M8Record::parse_line_nt(&line) {
-                Ok(m8) => {
-                    hits_by_read.entry(m8.qname.clone()).or_default().push(m8);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse NT m8 line: {} — {}", e, line);
-                }
-            }
-        }
-
-        for (_read_id, mut hits) in hits_by_read {
-            if hits.is_empty() {
-                continue;
-            }
-            // Sort: Descending alen, ascending mismatch+gapopen, ascending evalue, descending bitscore
-            hits.sort_by(|a, b| {
-                b.alen.cmp(&a.alen)
-                    .then_with(|| a.mismatch.cmp(&b.mismatch))
-                    .then_with(|| a.gapopen.cmp(&b.gapopen))
-                    .then_with(|| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal))
-                    .then_with(|| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal))
-            });
-            let best = hits.into_iter().next().expect("Non-empty vec after check");
-            let line = best.to_tab_string() + "\n";
-            output_tx
-                .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
-                .await
-                .with_context(|| format!("Output send failed at batch starting item {}", start_item))?;
-        }
-        drop(permit);
-        Ok(())
-    });
-    Ok(task)
-}
 
 /// Retrieves the top hit from an m8 stream
 /// Ranking
@@ -466,14 +421,69 @@ pub async fn get_top_m8_nt(
     concurrency: usize,
     batch_size: usize,   // Lines per batch; aim for 10-50MB/batch
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(concurrency);
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut item_count = 0usize;  // For error context
+    if concurrency == 0 {
+        return Err(anyhow!("concurrency must be > 0"));
+    }
 
-    // Process stream: Batch lines, dispatch to workers
+    // Bounded mpsc channel — hard concurrency cap + backpressure
+    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for i in 0..concurrency {
+        let rx = shared_rx.clone();
+        let out_tx = output_tx.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                let batch_lines = match batch {
+                    Some(b) => b,
+                    None => break,
+                };
+
+                let mut hits_by_read: AHashMap<String, Vec<M8Record>> = AHashMap::new();
+                for line in batch_lines {
+                    match M8Record::parse_line_nt(&line) {
+                        Ok(m8) => {
+                            hits_by_read.entry(m8.qname.clone()).or_default().push(m8);
+                        }
+                        Err(e) => {
+                            log::warn!("Worker {} failed to parse NT m8 line: {} — {}", i, e, line);
+                        }
+                    }
+                }
+
+                for (_read_id, mut hits) in hits_by_read {
+                    if hits.is_empty() {
+                        continue;
+                    }
+                    // Sort: Descending alen, ascending mismatch+gapopen, ascending evalue, descending bitscore
+                    hits.sort_by(|a, b| {
+                        b.alen.cmp(&a.alen)
+                            .then_with(|| a.mismatch.cmp(&b.mismatch))
+                            .then_with(|| a.gapopen.cmp(&b.gapopen))
+                            .then_with(|| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal))
+                    });
+                    let best = hits.into_iter().next().expect("Non-empty vec after check");
+                    let line = best.to_tab_string() + "\n";
+                    if out_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
+                        return Err(anyhow!("Output send failed in worker {}", i));
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        worker_handles.push(handle);
+    }
+
+    // Producer: build batches and send to bounded channel
+    let mut batch = Vec::with_capacity(batch_size);
     while let Some(item) = input.next().await {
-        item_count += 1;
         if let ParseOutput::Bytes(bytes) = item {
             let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
             if line.is_empty() {
@@ -482,36 +492,20 @@ pub async fn get_top_m8_nt(
             batch.push(line);
 
             if batch.len() >= batch_size {
-                let task = dispatch_batch(
-                    std::mem::take(&mut batch),
-                    semaphore.clone(),
-                    output_tx.clone(),
-                    item_count,
-                )
-                    .await
-                    .context("Failed to dispatch batch")?;
-                tasks.push(task);
+                if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                    break;
+                }
             }
         }
     }
 
-    // Final batch
     if !batch.is_empty() {
-        let task = dispatch_batch(
-            batch,
-            semaphore.clone(),
-            output_tx.clone(),
-            item_count,
-        )
-            .await
-            .context("Failed to dispatch final batch")?;
-        tasks.push(task);
+        let _ = job_tx.send(batch).await;
     }
+    drop(job_tx);
 
-    // Await all workers
-    for task in tasks {
-        task.await
-            .map_err(|e| anyhow!("Task join failed: {}", e))??;
+    for handle in worker_handles {
+        handle.await.map_err(|e| anyhow!("Worker join failed: {}", e))??;
     }
 
     Ok(())
@@ -527,73 +521,6 @@ struct MergedHsp {
     representative: M8Record,
 }
 
-async fn dispatch_batch_nr(
-    batch_lines: Vec<String>,
-    semaphore: Arc<Semaphore>,
-    output_tx: mpsc::Sender<ParseOutput>,
-    start_item: usize,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let permit = semaphore.acquire_owned().await
-        .context("Semaphore acquire failed")?;
-    let task = tokio::spawn(async move {
-        // Merge HSPs per (contig, subject)
-        let mut merged: AHashMap<(String, String), MergedHsp> = AHashMap::new();
-        for line in batch_lines {
-            match M8Record::parse_line_nr(&line) {
-                Ok(m8) => {
-                    let key = (m8.qname.clone(), m8.tname.clone());
-                    let entry = merged.entry(key).or_default();
-                    entry.total_alen += m8.alen;
-                    entry.sum_pident += m8.pident * m8.alen as f64;
-                    entry.evalue = entry.evalue.min(m8.evalue);
-                    entry.bitscore = entry.bitscore.max(m8.bitscore);
-                    entry.hsp_count += 1;
-                    // Update representative if better bitscore
-                    if m8.bitscore > entry.representative.bitscore {
-                        entry.representative = m8;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse NR m8 line: {} — {}", e, line);
-                }
-            }
-        }
-
-        // Per contig, pick best subject
-        let mut best_per_contig: AHashMap<String, MergedHsp> = AHashMap::new();
-        for ((contig, _subject), merged_hsp) in merged {
-            let current = best_per_contig.entry(contig).or_default();
-            if merged_hsp.bitscore > current.bitscore ||
-                (merged_hsp.bitscore == current.bitscore && merged_hsp.evalue < current.evalue) {
-                *current = merged_hsp;
-            }
-        }
-
-        // Output reconstructed lines
-        for (_contig, best) in best_per_contig {
-            let rep = &best.representative;
-            let avg_pident = if best.total_alen > 0 {
-                best.sum_pident / best.total_alen as f64
-            } else {
-                rep.pident
-            };
-            // Reconstruct line (12-column NR format: no qlen/slen)
-            let line = format!(
-                "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
-                rep.qname, rep.tname, avg_pident, best.total_alen,
-                rep.mismatch, rep.gapopen, rep.qstart, rep.qend,
-                rep.tstart, rep.tend, best.evalue, best.bitscore
-            );
-            output_tx
-                .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
-                .await
-                .with_context(|| format!("Output send failed at batch starting item {}", start_item))?;
-        }
-        drop(permit);
-        Ok(())
-    });
-    Ok(task)
-}
 
 pub async fn get_top_m8_nr(
     mut input: ReceiverStream<ParseOutput>,
@@ -601,14 +528,91 @@ pub async fn get_top_m8_nr(
     concurrency: usize,
     batch_size: usize,   // Lines per batch; aim for 10-50MB/batch
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(concurrency);
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut item_count = 0usize;  // For error context
+    if concurrency == 0 {
+        return Err(anyhow!("concurrency must be > 0"));
+    }
 
-    // Process stream: Batch lines, dispatch to workers
+    // Bounded mpsc channel — hard concurrency cap + backpressure
+    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for i in 0..concurrency {
+        let rx = shared_rx.clone();
+        let out_tx = output_tx.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                let batch_lines = match batch {
+                    Some(b) => b,
+                    None => break,
+                };
+
+                // Merge HSPs per (contig, subject)
+                let mut merged: AHashMap<(String, String), MergedHsp> = AHashMap::new();
+                for line in batch_lines {
+                    match M8Record::parse_line_nr(&line) {
+                        Ok(m8) => {
+                            let key = (m8.qname.clone(), m8.tname.clone());
+                            let entry = merged.entry(key).or_default();
+                            entry.total_alen += m8.alen;
+                            entry.sum_pident += m8.pident * m8.alen as f64;
+                            entry.evalue = entry.evalue.min(m8.evalue);
+                            entry.bitscore = entry.bitscore.max(m8.bitscore);
+                            entry.hsp_count += 1;
+                            // Update representative if better bitscore
+                            if m8.bitscore > entry.representative.bitscore {
+                                entry.representative = m8;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Worker {} failed to parse NR m8 line: {} — {}", i, e, line);
+                        }
+                    }
+                }
+
+                // Per contig, pick best subject
+                let mut best_per_contig: AHashMap<String, MergedHsp> = AHashMap::new();
+                for ((contig, _subject), merged_hsp) in merged {
+                    let current = best_per_contig.entry(contig).or_default();
+                    if merged_hsp.bitscore > current.bitscore ||
+                        (merged_hsp.bitscore == current.bitscore && merged_hsp.evalue < current.evalue) {
+                        *current = merged_hsp;
+                    }
+                }
+
+                // Output reconstructed lines
+                for (_contig, best) in best_per_contig {
+                    let rep = &best.representative;
+                    let avg_pident = if best.total_alen > 0 {
+                        best.sum_pident / best.total_alen as f64
+                    } else {
+                        rep.pident
+                    };
+                    // Reconstruct line (12-column NR format: no qlen/slen)
+                    let line = format!(
+                        "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
+                        rep.qname, rep.tname, avg_pident, best.total_alen,
+                        rep.mismatch, rep.gapopen, rep.qstart, rep.qend,
+                        rep.tstart, rep.tend, best.evalue, best.bitscore
+                    );
+                    if out_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
+                        return Err(anyhow!("Output send failed in worker {}", i));
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        worker_handles.push(handle);
+    }
+
+    // Producer: build batches and send to bounded channel
+    let mut batch = Vec::with_capacity(batch_size);
     while let Some(item) = input.next().await {
-        item_count += 1;
         if let ParseOutput::Bytes(bytes) = item {
             let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
             if line.is_empty() {
@@ -617,36 +621,20 @@ pub async fn get_top_m8_nr(
             batch.push(line);
 
             if batch.len() >= batch_size {
-                let task = dispatch_batch_nr(
-                    std::mem::take(&mut batch),
-                    semaphore.clone(),
-                    output_tx.clone(),
-                    item_count,
-                )
-                    .await
-                    .context("Failed to dispatch batch")?;
-                tasks.push(task);
+                if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                    break;
+                }
             }
         }
     }
 
-    // Final batch
     if !batch.is_empty() {
-        let task = dispatch_batch_nr(
-            batch,
-            semaphore.clone(),
-            output_tx.clone(),
-            item_count,
-        )
-            .await
-            .context("Failed to dispatch final batch")?;
-        tasks.push(task);
+        let _ = job_tx.send(batch).await;
     }
+    drop(job_tx);
 
-    // Await all workers
-    for task in tasks {
-        task.await
-            .map_err(|e| anyhow!("Task join failed: {}", e))??;
+    for handle in worker_handles {
+        handle.await.map_err(|e| anyhow!("Worker join failed: {}", e))??;
     }
 
     Ok(())
