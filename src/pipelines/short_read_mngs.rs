@@ -2629,12 +2629,119 @@ pub async fn call_hits_m8_stream(
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<String>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
     // Batching task: m8 lines → batches of Vec<String> for easier parsing
     const BATCH_SIZE: usize = 50_000;
 
-    let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<String>>(concurrency * 2);
+    let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(concurrency);
+    for i in 0..concurrency {
+        let rx = shared_rx.clone();
+        let dedup_tx = dedup_tx.clone();
+        let summary_tx = summary_tx.clone();
+        let lineage_map = lineage_map.clone();
+        let acc2taxid_map = acc2taxid_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                let batch_lines = match batch {
+                    Some(b) => b,
+                    None => break,
+                };
+
+                let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::with_capacity(batch_lines.len() / 10);
+
+                for line in batch_lines {
+                    let rec = match M8Record::parse_line_nr(&line) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!("Worker {} failed to parse m8 line: {} — {}", i, e, line);
+                            continue;
+                        }
+                    };
+
+                    if rec.alen < min_aln_len {
+                        continue;
+                    }
+
+                    read_groups.entry(rec.qname.clone()).or_default().push(rec);
+                }
+
+                for (read_id, hits) in read_groups {
+                    let mut valid_hits = Vec::new();
+                    for hit in &hits {
+                        if let Some(taxid_u64) = acc2taxid_map.get(hit.tname.as_bytes()) {
+                            let taxid = taxid_u64 as i32;
+                            if taxid == 0 {
+                                continue;
+                            }
+                            let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1; 3]);
+                            if !should_keep_filter(&lineage) {
+                                continue;
+                            }
+                            valid_hits.push(hit.clone());
+                        }
+                    }
+
+                    if valid_hits.is_empty() {
+                        continue;
+                    }
+
+                    valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(Ordering::Equal));
+                    let best = valid_hits[0].clone();
+
+                    let dedup_line = format!(
+                        "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\n",
+                        best.qname, best.tname, best.pident, best.alen, best.mismatch,
+                        best.gapopen, best.qstart, best.qend, best.tstart, best.tend,
+                        best.evalue, best.bitscore
+                    );
+                    if dedup_tx.send(ParseOutput::Bytes(Arc::new(dedup_line.into_bytes()))).await.is_err() {
+                        break;
+                    }
+
+                    let (tax_level, _consensus_taxid, consensus_hits) = consensus_level(
+                        &hits,
+                        &*lineage_map,
+                        &*acc2taxid_map,
+                        &should_keep_filter,
+                    ).unwrap_or_else(|e| {
+                        warn!("Consensus failed for {}: {}", read_id, e);
+                        (0, 0, Vec::new())
+                    });
+
+                    let first_lineage = consensus_hits
+                        .first()
+                        .and_then(|h| acc2taxid_map.get(h.tname.as_bytes()))
+                        .map(|taxid_u64| taxid_u64 as i32)
+                        .and_then(|taxid| lineage_map.get(&taxid))
+                        .cloned()
+                        .unwrap_or([-1; 3]);
+
+                    let species = first_lineage[0] as i64;
+                    let genus = first_lineage[1] as i64;
+                    let family = first_lineage[2] as i64;
+
+                    let summary_line = format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\n",
+                        read_id, best.tname, species, genus, family, tax_level
+                    );
+                    if summary_tx.send(ParseOutput::Bytes(Arc::new(summary_line.into_bytes()))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        cleanup_tasks.push(handle);
+    }
 
     let batching_handle = tokio::spawn(async move {
         let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
@@ -2663,7 +2770,6 @@ pub async fn call_hits_m8_stream(
 
             if batch.len() >= BATCH_SIZE {
                 if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                    info!("Batching stopped: downstream closed");
                     break;
                 }
                 batch = Vec::with_capacity(BATCH_SIZE);
@@ -2678,118 +2784,6 @@ pub async fn call_hits_m8_stream(
         Ok(())
     });
     cleanup_tasks.push(batching_handle);
-
-    let dispatcher_handle = tokio::spawn({
-        let dedup_tx = dedup_tx.clone();
-        let summary_tx = summary_tx.clone();
-        let lineage_map = lineage_map.clone();
-        let acc2taxid_map = acc2taxid_map.clone();
-        let should_keep_filter = should_keep_filter.clone();
-
-        async move {
-            while let Some(batch) = batch_rx.recv().await {
-                let permit = match semaphore.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-
-                let dedup_tx_b = dedup_tx.clone();
-                let summary_tx_b = summary_tx.clone();
-                let lineage_map_b = lineage_map.clone();
-                let acc2taxid_map_b = acc2taxid_map.clone();
-                let should_keep_b = should_keep_filter.clone();
-
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::with_capacity(batch.len() / 10);
-
-                    for line in batch {
-                        let rec = match M8Record::parse_line_nr(&line) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                warn!("Failed to parse m8 line: {} — {}", e, line);
-                                continue;
-                            }
-                        };
-
-                        if rec.alen < min_aln_len {
-                            continue;
-                        }
-
-                        read_groups.entry(rec.qname.clone()).or_default().push(rec);
-                    }
-
-                    for (read_id, mut hits) in read_groups {
-                        let mut valid_hits = Vec::new();
-                        for hit in &hits {
-                            if let Some(taxid_u64) = acc2taxid_map_b.get(hit.tname.as_bytes()) {
-                                let taxid = taxid_u64 as i32;
-                                if taxid == 0 {
-                                    continue;
-                                }
-                                let lineage = lineage_map_b.get(&taxid).cloned().unwrap_or([-1; 3]);
-                                if !should_keep_b(&lineage) {
-                                    continue;
-                                }
-                                valid_hits.push(hit.clone());
-                            } else {
-                                // debug!("Missing taxid for accession: {}", hit.tname);
-                            }
-                        }
-
-                        if valid_hits.is_empty() {
-                            continue;
-                        }
-
-                        valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(Ordering::Equal));
-                        let best = valid_hits[0].clone();
-
-                        let dedup_line = format!(
-                            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\n",
-                            best.qname, best.tname, best.pident, best.alen, best.mismatch,
-                            best.gapopen, best.qstart, best.qend, best.tstart, best.tend,
-                            best.evalue, best.bitscore
-                        );
-                        let _ = dedup_tx_b.blocking_send(ParseOutput::Bytes(Arc::new(dedup_line.into_bytes())));
-
-                        let (tax_level, _consensus_taxid, consensus_hits) = consensus_level(
-                            &hits,
-                            &*lineage_map_b,
-                            &*acc2taxid_map_b,
-                            &should_keep_b,
-                        ).unwrap_or_else(|e| {
-                            warn!("Consensus failed for {}: {}", read_id, e);
-                            (0, 0, Vec::new())
-                        });
-
-                        let first_lineage = consensus_hits
-                            .first()
-                            .and_then(|h| acc2taxid_map_b.get(h.tname.as_bytes()))
-                            .map(|taxid_u64| taxid_u64 as i32)
-                            .and_then(|taxid| lineage_map_b.get(&taxid))
-                            .cloned()
-                            .unwrap_or([-1; 3]);
-
-                        let species = first_lineage[0] as i64;
-                        let genus = first_lineage[1] as i64;
-                        let family = first_lineage[2] as i64;
-
-                        let summary_line = format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\n",
-                            read_id, best.tname, species, genus, family, tax_level
-                        );
-                        let _ = summary_tx_b.blocking_send(ParseOutput::Bytes(Arc::new(summary_line.into_bytes())));
-                    }
-
-                    Ok::<(), anyhow::Error>(())
-                });
-                // permit drops here
-            }
-
-            info!("call_hits_m8 dispatcher finished");
-            Ok(())
-        }
-    });
-    cleanup_tasks.push(dispatcher_handle);
 
     // File writes via t_junction (unchanged, good pattern)
     let m8_dedup_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("dedup.m8"), "_"));
