@@ -1541,13 +1541,26 @@ pub async fn generate_taxid_fasta(
         // Process unidentified contigs → conform headers
         // Also parallelize this since it can be many contigs
         {
-            let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
-            let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
-            let mut unid_worker_handles = Vec::with_capacity(concurrency);
+            let unidentified_concurrency = compute_phase_concurrency(
+                &config,
+                "unidentified_taxid_conform",
+                0.08,   // ~80 MB per batch (this phase is almost pure header work)
+                1.0,    // allow ~1 thread per core (very cheap work)
+                128,
+                8,
+            );
+            info!("unidentified_taxid_conform concurrency: {} workers", unidentified_concurrency);
 
-            for _ in 0..concurrency {
+            let unid_batch_size = 8000;  // much larger because work is trivial (no name collision with the outer const BATCH_SIZE)
+
+            let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(unidentified_concurrency * 3);
+            let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
+            let mut unid_worker_handles = Vec::with_capacity(unidentified_concurrency);
+
+            for _ in 0..unidentified_concurrency {
                 let rx = unid_batch_rx.clone();
                 let c_tx = combined_tx.clone();
+
                 unid_worker_handles.push(tokio::spawn(async move {
                     loop {
                         let batch = {
@@ -1558,6 +1571,7 @@ pub async fn generate_taxid_fasta(
                             Some(b) => b,
                             None => break,
                         };
+
                         for rec in batch {
                             let conformed_header = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
                             let (new_id, new_desc) = parse_header(conformed_header.as_bytes(), '>');
@@ -1567,7 +1581,7 @@ pub async fn generate_taxid_fasta(
                                 desc: new_desc,
                                 seq: seq_arc,
                             };
-                            c_tx.send(ParseOutput::Fasta(new_rec)).await.map_err(|_| anyhow!("combined_tx dropped"))?;
+                            let _ = c_tx.send(ParseOutput::Fasta(new_rec)).await;
                         }
                     }
                     Ok::<(), anyhow::Error>(())
@@ -1575,22 +1589,20 @@ pub async fn generate_taxid_fasta(
             }
 
             let mut unid_stream = unidentified_contigs_stream;
-            let mut current_unid_batch = Vec::with_capacity(BATCH_SIZE);
+            let mut current_unid_batch = Vec::with_capacity(unid_batch_size);
             while let Some(item) = unid_stream.next().await {
                 match item {
                     ParseOutput::Fasta(rec) => {
                         current_unid_batch.push(rec);
-                        if current_unid_batch.len() >= BATCH_SIZE {
-                            unid_batch_tx.send(std::mem::take(&mut current_unid_batch))
-                                .await
-                                .map_err(|_| anyhow!("unid_batch_tx dropped unexpectedly during unidentified_contigs_stream processing"))?;
+                        if current_unid_batch.len() >= unid_batch_size {
+                            let _ = unid_batch_tx.send(std::mem::take(&mut current_unid_batch)).await;
                         }
                     }
                     _ => return Err(anyhow!("Unexpected item type in unidentified_contigs_stream: expected Fasta")),
                 }
             }
             if !current_unid_batch.is_empty() {
-                unid_batch_tx.send(current_unid_batch).await.map_err(|_| anyhow!("unid_batch_tx dropped"))?;
+                let _ = unid_batch_tx.send(current_unid_batch).await;
             }
             drop(unid_batch_tx);
 
