@@ -2150,15 +2150,15 @@ pub async fn minimap2_non_host_align(
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 2. Memory & concurrency estimation (unchanged)
-    const MEASURED_SINGLE_JOB_GB: f64 = 85.0;
+    // 2. Memory & concurrency estimation —
+    const MEASURED_SINGLE_JOB_GB: f64 = 40.0;           //real runs show ~15–35 GiB/job
     const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
-    const TARGET_RAM_FRACTION: f64 = 0.60;
-    const HARD_MAX_CONCURRENCY: usize = 6;
+    const TARGET_RAM_FRACTION: f64 = 0.50;              // aim for ≤50% usage
+    const HARD_MAX_CONCURRENCY: usize = 24;             // (allows ~600–800 GiB peak)
     const MIN_CONCURRENCY: usize = 2;
     const MIN_THREADS_PER_JOB: usize = 8;
-    const MAX_THREADS_PER_JOB: usize = 24;
+    const MAX_THREADS_PER_JOB: usize = 32;
 
     let largest_gb = if max_size_bytes > 0 {
         ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as f64
@@ -2168,12 +2168,13 @@ pub async fn minimap2_non_host_align(
 
     let est_gb_per_job = ((largest_gb * 0.95).ceil() as f64)
         .max(MEASURED_SINGLE_JOB_GB * 0.9)
-        .min(MEASURED_SINGLE_JOB_GB * 1.15);
+        .min(MEASURED_SINGLE_JOB_GB * 1.15)
+        .max(20.0);  // floor — prevent tiny-chunk underestimation
 
     info!(
-        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
-        largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
-    );
+    "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
+    largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
+);
 
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
     let ram_based_concurrency = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
@@ -2181,32 +2182,35 @@ pub async fn minimap2_non_host_align(
     let mut concurrency = ram_based_concurrency
         .clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
 
+    // Safety: never push past ~75% of available RAM
     let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
-    if estimated_peak_gb > available_ram_gb * 0.85 {
+    if estimated_peak_gb > available_ram_gb * 0.75 {
+        let new_conc = concurrency.saturating_sub(2).max(MIN_CONCURRENCY);
         warn!(
-            "Estimated peak RAM {:.0} GiB exceeds 85% of available ({:.0} GiB) — capping concurrency to {}",
-            estimated_peak_gb, available_ram_gb, concurrency.saturating_sub(1).max(MIN_CONCURRENCY)
-        );
-        concurrency = concurrency.saturating_sub(1).max(MIN_CONCURRENCY);
+        "Estimated peak {:.0} GiB exceeds 75% of available ({:.0} GiB) → reducing concurrency from {} to {}",
+        estimated_peak_gb, available_ram_gb, concurrency, new_conc
+    );
+        concurrency = new_conc;
     }
 
     let threads_per_job = (config.max_cores / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
-    concurrency = 8; // test test
-
     info!(
-        concat!(
-            "NT minimap2 stage: {} concurrent jobs × {} threads/job\n",
-            "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-            "  single-job baseline: ~{:.0} s real time (measured)"
-        ),
-        concurrency,
-        threads_per_job,
-        estimated_peak_gb,
-        (estimated_peak_gb / available_ram_gb * 100.0).round(),
-        MEASURED_SINGLE_JOB_SEC
-    );
+    concat!(
+        "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
+        "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
+        "  single-job baseline: ~{:.0} s real time (measured)\n",
+        "  largest chunk: {:.1} GiB → est/job: {:.0} GiB"
+    ),
+    concurrency,
+    threads_per_job,
+    estimated_peak_gb,
+    (estimated_peak_gb / available_ram_gb * 100.0).round(),
+    MEASURED_SINGLE_JOB_SEC,
+    largest_gb,
+    est_gb_per_job
+);
 
 
     // 4. Create temp dir for all chunk PAF outputs (NVMe preferred)
