@@ -2193,6 +2193,8 @@ pub async fn minimap2_non_host_align(
     let threads_per_job = (config.max_cores / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
+    concurrency = 2; // test test
+
     info!(
         concat!(
             "NT minimap2 stage: {} concurrent jobs × {} threads/job\n",
@@ -2205,6 +2207,8 @@ pub async fn minimap2_non_host_align(
         (estimated_peak_gb / available_ram_gb * 100.0).round(),
         MEASURED_SINGLE_JOB_SEC
     );
+
+
 
     // 3. Semaphore to limit concurrent minimap2 processes
     let semaphore = Arc::new(Semaphore::new(concurrency as usize));
