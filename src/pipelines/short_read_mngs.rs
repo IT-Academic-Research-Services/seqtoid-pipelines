@@ -3312,148 +3312,146 @@ pub async fn generate_annotated_fasta(
         30_000_usize
     };
 
-    // Semaphore limits concurrent batch processors
-    let semaphore = Arc::new(Semaphore::new(concurrency));
 
-    // Batching task: read from dedup_stream → send bounded batches
-    let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 4);
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency);
+    let shared_batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
-    let batching_handle: JoinHandle<Result<()>> = tokio::spawn(async move {
-        let mut batch: Vec<SequenceRecord> = Vec::with_capacity(batch_size);
-        let mut total_records = 0u64;
+    let batching_handle: JoinHandle<Result<()>> = tokio::spawn({
+        let mut dedup_stream = dedup_stream;
+        let batch_tx = batch_tx.clone();
+        async move {
+            let mut batch: Vec<SequenceRecord> = Vec::with_capacity(batch_size);
+            let mut total_records = 0u64;
 
-        while let Some(item) = dedup_stream.next().await {
-            let record = match item {
-                ParseOutput::Fastq(r) | ParseOutput::Fasta(r) => r,
-                _ => continue,
-            };
+            while let Some(item) = dedup_stream.next().await {
+                let record = match item {
+                    ParseOutput::Fastq(r) | ParseOutput::Fasta(r) => r,
+                    _ => continue,
+                };
 
-            total_records += 1;
-            batch.push(record);
+                total_records += 1;
+                batch.push(record);
 
-            if batch.len() >= batch_size {
-                if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                    info!("Batching stopped early: downstream closed");
-                    break;
+                if batch.len() >= batch_size {
+                    if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                        info!("Batching stopped early: downstream closed");
+                        break;
+                    }
+                    batch = Vec::with_capacity(batch_size);
                 }
-                batch = Vec::with_capacity(batch_size);
             }
-        }
 
-        if !batch.is_empty() {
-            let _ = batch_tx.send(batch).await;
-        }
+            if !batch.is_empty() {
+                let _ = batch_tx.send(batch).await;
+            }
 
-        info!("Batching complete: {} records collected", total_records);
-        Ok(())
+            info!("Batching complete: {} records collected", total_records);
+            Ok(())
+        }
     });
 
-    // ────────────────────────────────────────────────────────────────
-    // Spawn ONE task that owns batch_rx and dispatches batches dynamically
-    // ────────────────────────────────────────────────────────────────
-    let dispatcher_handle: JoinHandle<Result<()>> = tokio::spawn({
+    // Worker tasks: pull batches and process
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = shared_batch_rx.clone();
         let mapped_tx = mapped_tx.clone();
         let unid_tx = unid_tx.clone();
         let uniq_tx = uniq_tx.clone();
         let dup_clusters = duplicate_clusters.clone();
         let nt_map = nt_map.clone();
         let nr_map = nr_map.clone();
-        let semaphore = semaphore.clone();
 
-        async move {
-            while let Some(batch) = batch_rx.recv().await {
-                // Acquire permit — limits concurrent processing to 'concurrency'
-                let permit = match semaphore.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => break, // semaphore closed → shutdown
+        let handle: JoinHandle<Result<()>> = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
                 };
 
-                // Clone senders for this batch
-                let mapped_tx_b = mapped_tx.clone();
-                let unid_tx_b = unid_tx.clone();
-                let uniq_tx_b = uniq_tx.clone();
-                let dup_clusters_b = dup_clusters.clone();
-                let nt_map_b = nt_map.clone();
-                let nr_map_b = nr_map.clone();
+                if let Some(batch) = batch {
+                    let mapped_tx = mapped_tx.clone();
+                    let unid_tx = unid_tx.clone();
+                    let uniq_tx = uniq_tx.clone();
+                    let dup_clusters = dup_clusters.clone();
+                    let nt_map = nt_map.clone();
+                    let nr_map = nr_map.clone();
 
-                // Spawn blocking task for CPU work
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut mapped = Vec::with_capacity(batch.len() / 5);
-                    let mut unid   = Vec::with_capacity(batch.len());
-                    let mut uniq   = Vec::with_capacity(batch.len() / 10);
+                    tokio::task::spawn_blocking(move || {
+                        let mut mapped = Vec::with_capacity(batch.len() / 5);
+                        let mut unid   = Vec::with_capacity(batch.len());
+                        let mut uniq   = Vec::with_capacity(batch.len() / 10);
 
-                    for record in batch {
-                        let rep_id: String = record.id().to_string();
+                        for record in batch {
+                            let rep_id: String = record.id().to_string();
 
-                        let nr_acc = nr_map_b.get(&rep_id).cloned().unwrap_or_default();
-                        let nt_acc = nt_map_b.get(&rep_id).cloned().unwrap_or_default();
-                        let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
+                            let nr_acc = nr_map.get(&rep_id).cloned().unwrap_or_default();
+                            let nt_acc = nt_map.get(&rep_id).cloned().unwrap_or_default();
+                            let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
 
-                        let dup_count = dup_clusters_b
-                            .get(&rep_id)
-                            .map(|r| r.size)
-                            .unwrap_or(1u64);
+                            let dup_count = dup_clusters
+                                .get(&rep_id)
+                                .map(|r| r.size)
+                                .unwrap_or(1u64);
 
-                        let seq_arc = record.seq_arc();
+                            let seq_arc = record.seq_arc();
 
-                        if !is_unidentified {
-                            let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
-                            mapped.push(ParseOutput::Fasta(SequenceRecord::Fasta {
-                                id,
-                                desc: None,
-                                seq: seq_arc,
-                            }));
-                        } else {
-                            let fasta_rep = SequenceRecord::Fasta {
-                                id: rep_id.clone(),
-                                desc: None,
-                                seq: seq_arc.clone(),
-                            };
+                            if !is_unidentified {
+                                let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
+                                mapped.push(ParseOutput::Fasta(SequenceRecord::Fasta {
+                                    id,
+                                    desc: None,
+                                    seq: seq_arc,
+                                }));
+                            } else {
+                                let fasta_rep = SequenceRecord::Fasta {
+                                    id: rep_id.clone(),
+                                    desc: None,
+                                    seq: seq_arc.clone(),
+                                };
 
-                            unid.push(ParseOutput::Fasta(fasta_rep.clone()));
-                            uniq.push(ParseOutput::Fasta(fasta_rep.clone()));
+                                unid.push(ParseOutput::Fasta(fasta_rep.clone()));
+                                uniq.push(ParseOutput::Fasta(fasta_rep.clone()));
 
-                            if dup_count > 1 {
-                                for _ in 1..dup_count {
-                                    unid.push(ParseOutput::Fasta(fasta_rep.clone()));
+                                if dup_count > 1 {
+                                    for _ in 1..dup_count {
+                                        unid.push(ParseOutput::Fasta(fasta_rep.clone()));
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Blocking send (safe inside spawn_blocking)
-                    for item in mapped {
-                        let _ = mapped_tx_b.blocking_send(item);
-                    }
-                    for item in unid {
-                        let _ = unid_tx_b.blocking_send(item);
-                    }
-                    for item in uniq {
-                        let _ = uniq_tx_b.blocking_send(item);
-                    }
-
-                    Ok::<(), anyhow::Error>(())
-                });
-                // permit drops here → next batch can start
+                        for item in mapped {
+                            let _ = mapped_tx.blocking_send(item);
+                        }
+                        for item in unid {
+                            let _ = unid_tx.blocking_send(item);
+                        }
+                        for item in uniq {
+                            let _ = uniq_tx.blocking_send(item);
+                        }
+                    }).await?;
+                } else {
+                    break;
+                }
             }
-
-            info!("Dispatcher finished — all batches processed");
             Ok(())
-        }
-    });
+        });
+        worker_handles.push(handle);
+    }
 
-    // ────────────────────────────────────────────────────────────────
-    // Shutdown watcher: wait for batching + dispatcher, then close channels
-    // ────────────────────────────────────────────────────────────────
+    // Shutdown watcher
     let shutdown_handle = tokio::spawn(async move {
-        // Wait for batching
         if let Err(e) = batching_handle.await {
             error!("Batching failed: {}", e);
         }
 
-        // Wait for dispatcher (which waits for all spawned blocking tasks via drop order)
-        if let Err(e) = dispatcher_handle.await {
-            error!("Dispatcher failed: {}", e);
+        // Drop the transmitter so workers can finish
+        drop(batch_tx);
+
+        for handle in worker_handles {
+            if let Err(e) = handle.await {
+                error!("Worker task failed: {}", e);
+            }
         }
 
         drop(mapped_tx);
