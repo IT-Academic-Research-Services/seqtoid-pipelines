@@ -20,7 +20,7 @@ use bincode::{encode_into_std_write, decode_from_std_read};
 use serde::{Serialize, Deserialize};
 use ahash::AHashMap;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Semaphore, Mutex};
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID, TaxonSeqLocation};
 use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
 use crate::utils::streams::ParseOutput;
@@ -215,60 +215,90 @@ pub async fn build_accession2taxid_db(
 
     let accession_bases = Arc::new(accession_bases);
     let (tx, mut rx) = mpsc::channel(100);
-    let semaphore = Arc::new(Semaphore::new(std::cmp::max(1, num_cpus::get() / 2)));
-    let mut join_handles = Vec::new();
+    let concurrency = std::cmp::max(1, num_cpus::get() / 2);
+    let (job_tx, job_rx) = mpsc::channel::<PathBuf>(concurrency);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let mut worker_handles = Vec::new();
 
-    for mapping_file in mapping_files.to_vec() {
+    for i in 0..concurrency {
+        let job_rx = Arc::clone(&job_rx);
         let tx = tx.clone();
         let accession_bases = Arc::clone(&accession_bases);
-        let sem = Arc::clone(&semaphore);
 
         let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await?;
-            let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
-            info!("Reading mapping file: {}", filename);
+            loop {
+                let mapping_file = {
+                    let mut rx = job_rx.lock().await;
+                    rx.recv().await
+                };
 
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let file = StdFile::open(&mapping_file)?;
-                let gz = GzDecoder::new(StdBufReader::new(file));
-                let mut rdr = ReaderBuilder::new()
-                    .delimiter(b'\t')
-                    .has_headers(false)
-                    .from_reader(gz);
+                let mapping_file = match mapping_file {
+                    Some(f) => f,
+                    None => break,
+                };
 
-                let mut batch = Vec::with_capacity(1000);
-                for result in rdr.records() {
-                    let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
+                let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+                info!("Worker {} reading mapping file: {}", i, filename);
 
-                    let full_acc = record[0].to_string();
-                    let acc_base = full_acc.split('.').next().unwrap_or(&full_acc);
+                let tx = tx.clone();
+                let accession_bases = Arc::clone(&accession_bases);
+                let res = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let file = StdFile::open(&mapping_file)?;
+                    let gz = GzDecoder::new(StdBufReader::new(file));
+                    let mut rdr = ReaderBuilder::new()
+                        .delimiter(b'\t')
+                        .has_headers(false)
+                        .from_reader(gz);
 
-                    if !accession_bases.contains(acc_base) {
-                        continue;
+                    let mut batch = Vec::with_capacity(1000);
+                    for result in rdr.records() {
+                        let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
+
+                        let full_acc = record[0].to_string();
+                        let acc_base = full_acc.split('.').next().unwrap_or(&full_acc);
+
+                        if !accession_bases.contains(acc_base) {
+                            continue;
+                        }
+
+                        let taxid_idx = if record.len() == 2 { 1 } else { 2 };
+                        let taxid: Taxid = record.get(taxid_idx)
+                            .ok_or_else(|| anyhow!("Missing taxid column in {}", filename))?
+                            .parse()
+                            .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
+
+                        batch.push(AccTaxEntry { acc: full_acc, taxid });
+                        if batch.len() >= 1000 {
+                            tx.blocking_send(std::mem::replace(&mut batch, Vec::with_capacity(1000)))
+                                .map_err(|_| anyhow!("Channel closed"))?;
+                        }
                     }
-
-                    let taxid_idx = if record.len() == 2 { 1 } else { 2 };
-                    let taxid: Taxid = record.get(taxid_idx)
-                        .ok_or_else(|| anyhow!("Missing taxid column in {}", filename))?
-                        .parse()
-                        .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
-
-                    batch.push(AccTaxEntry { acc: full_acc, taxid });
-                    if batch.len() >= 1000 {
-                        tx.blocking_send(std::mem::replace(&mut batch, Vec::with_capacity(1000)))
-                            .map_err(|_| anyhow!("Channel closed"))?;
+                    if !batch.is_empty() {
+                        tx.blocking_send(batch).map_err(|_| anyhow!("Channel closed"))?;
                     }
+                    Ok(())
+                }).await?;
+
+                if let Err(e) = res {
+                    return Err(e);
                 }
-                if !batch.is_empty() {
-                    tx.blocking_send(batch).map_err(|_| anyhow!("Channel closed"))?;
-                }
-                Ok(())
-            }).await?
+            }
+            Ok::<(), anyhow::Error>(())
         });
-        join_handles.push(handle);
+        worker_handles.push(handle);
     }
 
-    // Drop the original sender so the receiver can finish
+    // Producer for jobs
+    let mapping_files_vec = mapping_files.to_vec();
+    tokio::spawn(async move {
+        for mapping_file in mapping_files_vec {
+            if job_tx.send(mapping_file).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Drop the original sender so the receiver can finish when workers are done
     drop(tx);
 
     let mut entries = Vec::new();
@@ -276,7 +306,7 @@ pub async fn build_accession2taxid_db(
         entries.extend(batch);
     }
 
-    for handle in join_handles {
+    for handle in worker_handles {
         handle.await??;
     }
 
