@@ -2259,9 +2259,10 @@ pub async fn minimap2_non_host_align(
         let r2 = r2_path_opt.clone();
         let temp_dir_path = paf_temp_dir_path.clone();  // cheap clone
 
+        let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
+        debug!("minimap2 for {} acquired permit", chunk_name);
+
         let handle = tokio::spawn(async move {
-            let permit = sem.acquire_owned().await.map_err(|e| anyhow!("Semaphore acquire failed: {}", e))?;
-            debug!("minimap2 for {} acquired permit", chunk_name);
 
             // Create per-chunk temp PAF file
             let paf_path = temp_dir_path.join(format!("{}.paf", chunk_name));
