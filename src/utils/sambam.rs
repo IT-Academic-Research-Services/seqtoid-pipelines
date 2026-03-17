@@ -89,26 +89,12 @@ pub async fn generate_info_from_bam_stream(
     let contig_unique_counts = Arc::new(DashMap::new());
     let seen_reads = Arc::new(DashMap::new());
 
-    let mut records: Vec<BamRecord> = Vec::new();
-    let mut record = BamRecord::default();
-    loop {
-        match bam_reader.read_record(&mut record).await {
-            Ok(0) => break,
-            Ok(_) => records.push(record.clone()),
-            Err(e) => return Err(anyhow!("BAM record read error: {}", e)),
-        }
-    }
+    let (job_tx, job_rx) = mpsc::channel::<Vec<BamRecord>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
 
-    // Chunk and process in parallel with spawn_blocking + semaphore
-    let chunk_size = (records.len() / concurrency).max(1);
-    let chunks: Vec<Vec<BamRecord>> = records.chunks(chunk_size).map(|c| c.to_vec()).collect(); // Owned chunks
-
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-
-    let mut handles = Vec::with_capacity(chunks.len());
-
-    for chunk in chunks {
-        let sem = semaphore.clone();
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for i in 0..concurrency {
+        let rx = shared_rx.clone();
         let duplicate_clusters_clone = duplicate_clusters.clone();
         let header_clone = header.clone();
         let read2contig_clone = read2contig.clone();
@@ -116,75 +102,105 @@ pub async fn generate_info_from_bam_stream(
         let contig_unique_counts_clone = contig_unique_counts.clone();
         let seen_reads_clone = seen_reads.clone();
 
-        let handle = tokio::task::spawn_blocking(move || {
-            let permit = tokio::runtime::Handle::current().block_on(sem.acquire()).map_err(|e| anyhow!("Semaphore error: {}", e))?;
-
-            let mut local_read2contig = HashMap::new();
-            let mut local_contig_stats = HashMap::new();
-            let mut local_contig_unique_counts = HashMap::new();
-            let mut local_seen = HashSet::new();
-
-            for record in chunk.iter() {
-                let flags = record.flags();
-                if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
-                    continue;
-                }
-
-                let read_name = record
-                    .name()
-                    .and_then(|b| std::str::from_utf8(b.as_ref()).ok())
-                    .unwrap_or("*")
-                    .to_string();
-
-                if !local_seen.insert(read_name.clone()) {
-                    continue;
-                }
-
-                let rid = match record.reference_sequence_id() {
-                    Some(Ok(rid)) => rid,
-                    _ => continue,
+        let handle = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
                 };
 
-                let contig_name = match header_clone.reference_sequences().get_index(rid) {
-                    Some((name, _)) => name.to_string(),
-                    None => continue,
+                let chunk = match batch {
+                    Some(c) => c,
+                    None => break,
                 };
 
-                local_read2contig.insert(read_name.clone(), contig_name.clone());
+                // Process locally for this batch
+                let mut local_read2contig = HashMap::new();
+                let mut local_contig_stats = HashMap::new();
+                let mut local_contig_unique_counts = HashMap::new();
+                let mut local_seen = HashSet::new();
 
-                let cluster_size = duplicate_clusters_clone
-                    .get(&read_name)
-                    .map(|entry| entry.value().size)
-                    .unwrap_or(1u64);
+                for record in chunk.iter() {
+                    let flags = record.flags();
+                    if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
+                        continue;
+                    }
 
-                *local_contig_stats.entry(contig_name.clone()).or_insert(0) += cluster_size;
-                *local_contig_unique_counts.entry(contig_name).or_insert(0) += 1;
-            }
+                    let read_name = record
+                        .name()
+                        .and_then(|b| std::str::from_utf8(b.as_ref()).ok())
+                        .unwrap_or("*")
+                        .to_string();
 
-            // Merge local into global (DashMap is concurrent-safe)
-            for (k, v) in local_read2contig {
-                read2contig_clone.insert(k, v);
-            }
-            for (k, v) in local_contig_stats {
-                *contig_stats_clone.entry(k).or_insert(0) += v;
-            }
-            for (k, v) in local_contig_unique_counts {
-                *contig_unique_counts_clone.entry(k).or_insert(0) += v;
-            }
-            for read in local_seen {
-                seen_reads_clone.insert(read, ());
-            }
+                    if !local_seen.insert(read_name.clone()) {
+                        continue;
+                    }
 
-            drop(permit);
+                    let rid = match record.reference_sequence_id() {
+                        Some(Ok(rid)) => rid,
+                        _ => continue,
+                    };
 
+                    let contig_name = match header_clone.reference_sequences().get_index(rid) {
+                        Some((name, _)) => name.to_string(),
+                        None => continue,
+                    };
+
+                    local_read2contig.insert(read_name.clone(), contig_name.clone());
+
+                    let cluster_size = duplicate_clusters_clone
+                        .get(&read_name)
+                        .map(|entry| entry.value().size)
+                        .unwrap_or(1u64);
+
+                    *local_contig_stats.entry(contig_name.clone()).or_insert(0) += cluster_size;
+                    *local_contig_unique_counts.entry(contig_name).or_insert(0) += 1;
+                }
+
+                // Merge local into global (DashMap is concurrent-safe)
+                for (k, v) in local_read2contig {
+                    read2contig_clone.insert(k, v);
+                }
+                for (k, v) in local_contig_stats {
+                    *contig_stats_clone.entry(k).or_insert(0) += v;
+                }
+                for (k, v) in local_contig_unique_counts {
+                    *contig_unique_counts_clone.entry(k).or_insert(0) += v;
+                }
+                for read in local_seen {
+                    seen_reads_clone.insert(read, ());
+                }
+            }
             Ok::<(), anyhow::Error>(())
         });
-
-        handles.push(handle);
+        worker_handles.push(handle);
     }
 
-    for handle in handles {
-        handle.await.map_err(|e| anyhow!("Task join error: {}", e))??;
+    // Producer loop: read and batch BAM records
+    let mut batch = Vec::with_capacity(10_000);
+    let mut record = BamRecord::default();
+    loop {
+        match bam_reader.read_record(&mut record).await {
+            Ok(0) => break,
+            Ok(_) => {
+                batch.push(record.clone());
+                if batch.len() >= 10_000 {
+                    if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => return Err(anyhow!("BAM record read error: {}", e)),
+        }
+    }
+
+    if !batch.is_empty() {
+        let _ = job_tx.send(batch).await;
+    }
+    drop(job_tx);
+
+    for handle in worker_handles {
+        handle.await.map_err(|e| anyhow!("Worker join error: {}", e))??;
     }
 
     let read2contig: HashMap<String, String> = read2contig.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
