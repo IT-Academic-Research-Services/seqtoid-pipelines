@@ -2193,7 +2193,7 @@ pub async fn minimap2_non_host_align(
     let threads_per_job = (config.max_cores / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
-    concurrency = 2; // test test
+    concurrency = 8; // test test
 
     info!(
         concat!(
@@ -2208,9 +2208,6 @@ pub async fn minimap2_non_host_align(
         MEASURED_SINGLE_JOB_SEC
     );
 
-
-    // 3. Semaphore to limit concurrent minimap2 processes
-    let semaphore = Arc::new(Semaphore::new(concurrency as usize));
 
     // 4. Create temp dir for all chunk PAF outputs (NVMe preferred)
     let paf_temp_dir = choose_temp_dir(
