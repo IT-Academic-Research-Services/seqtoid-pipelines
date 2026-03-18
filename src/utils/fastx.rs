@@ -1,3 +1,4 @@
+use crate::utils::taxonomy::get_taxid;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -37,7 +38,7 @@ use fst::{MapBuilder};
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 
@@ -1672,200 +1673,167 @@ pub async fn generate_taxid_locator(
     ),
     PipelineError,
 > {
-    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
-
     let concurrency = compute_phase_concurrency(
         &config,
         "generate_taxid_locator",
-        0.5, // ~0.5 GB per thread max
-        4.0, // 4 threads per core
-        128,  // cap
-        8,   // min for meaningful parallelism
+        0.5,
+        4.0,
+        128,
+        16,
     );
+    info!("generate_taxid_locator starting — {} output workers", concurrency);
 
-    // FASTA header ~100–200 bytes + sequence ~500–2000 bytes → ~800 bytes avg
-    const AVG_RECORD_BYTES: usize = 800;
+    let levels = vec!["species", "genus", "family"];
+    let hit_types = vec!["NT", "NR"];
 
-    // Target ~200–400 MB per batch
-    const TARGET_BATCH_MB: usize = 300;
+    let mut output_paths = Vec::new();
+    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+    let mut record_channels = Vec::new(); // (taxid_field, sender)
 
+    // Create one channel + one task per output type (8 total)
+    for level in levels.iter() {
+        for hit_type in hit_types.iter() {
+            let level_owned = level.to_string();
+            let hit_type_owned = hit_type.to_string();
+            let taxid_field = format!("{}_{}", level_owned, hit_type_owned.to_lowercase());
 
-    let batch_size = compute_batch_size(
-        None,                    // est_total_lines
-        AVG_RECORD_BYTES,
-        TARGET_BATCH_MB,
-        concurrency,                       // dummy concurrency — or pass real value if you know it
-    );
-
-    info!("Using dynamic batch size of {} records for taxid locator", batch_size);
-
-    // Use a worker pool to parse records from the stream in parallel
-    let (record_tx, mut record_rx) = mpsc::channel::<(String, String)>(100_000);
-    let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
-    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
-
-    let mut worker_handles = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let rx = batch_rx.clone();
-        let r_tx = record_tx.clone();
-
-        worker_handles.push(tokio::spawn(async move {
-            loop {
-                let batch = {
-                    let mut lock = rx.lock().await;
-                    lock.recv().await
-                };
-
-                let batch = match batch {
-                    Some(b) => b,
-                    None => break,
-                };
-
-                for item in batch {
-                    let bytes = item.to_bytes()?;
-                    if bytes.is_empty() {
-                        continue;
-                    }
-
-                    let record_str = String::from_utf8(bytes.to_vec())
-                        .map_err(|e| anyhow!("Invalid UTF-8 in FASTA record: {}", e))?;
-
-                    let mut lines = record_str.lines();
-                    let header_line = match lines.next() {
-                        Some(l) => l,
-                        None => continue,
-                    };
-                    let seq_line = match lines.next() {
-                        Some(l) => l,
-                        None => {
-                            warn!("FASTA record missing sequence line");
-                            continue;
-                        }
-                    };
-
-                    if !header_line.starts_with('>') {
-                        warn!("Invalid FASTA header (missing '>'): {}", header_line);
-                        continue;
-                    }
-
-                    let header = header_line[1..].trim().to_string(); // strip '>'
-                    let seq = seq_line.trim().to_string();
-
-                    r_tx.send((header, seq)).await.map_err(|_| anyhow!("record_tx dropped"))?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }));
-    }
-
-    // Spawn a task to collect parsed records into a Vec
-    let collector_handle = tokio::spawn(async move {
-        let mut collected = Vec::with_capacity(1_000_000);
-        while let Some(record) = record_rx.recv().await {
-            collected.push(record);
-        }
-        collected
-    });
-
-    // Stream inputs into the worker pool in batches
-    let mut current_batch = Vec::with_capacity(batch_size);
-    while let Some(item) = fasta_stream.next().await {
-        current_batch.push(item);
-        if current_batch.len() >= batch_size {
-            batch_tx.send(std::mem::take(&mut current_batch))
-                .await
-                .map_err(|_| PipelineError::Other(anyhow!("batch_tx dropped unexpectedly")))?;
-        }
-    }
-    if !current_batch.is_empty() {
-        batch_tx.send(current_batch).await.map_err(|_| PipelineError::Other(anyhow!("batch_tx dropped")))?;
-    }
-    drop(batch_tx);
-    drop(record_tx); // Important: drop this so the collector knows it's finished
-
-    // Wait for parsing workers to finish
-    for handle in worker_handles {
-        handle.await.map_err(|e| PipelineError::Other(anyhow!("Parsing worker failed: {}", e)))??;
-    }
-
-    // Retrieve collected records
-    let records = collector_handle.await.map_err(|e| PipelineError::Other(anyhow!("Collector task failed: {}", e)))?;
-
-    info!("Collected {} mapped contigs for taxid locator generation", records.len());
-
-    if records.is_empty() {
-        // Write empty outputs
-        let empty_paths = vec![
-            assembly_dir.join("refined_taxid_annot_sorted_nt.fasta"),
-            assembly_dir.join("refined_taxid_annot_sorted_nr.fasta"),
-        ];
-        return Ok((empty_paths, vec![], vec![]));
-    }
-
-    let records_arc = Arc::new(records);
-
-    let levels = ["species", "genus", "family"];
-    let hit_types = ["NT", "NR"];
-
-    let mut output_paths: Vec<PathBuf> = Vec::new();
-    let mut locator_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-
-    for &level in &levels {
-        for &hit_type in &hit_types {
-            let taxid_field = format!("{}_{}", level, hit_type.to_lowercase());
-
-            let fa_name = if level == "species" {
-                format!("refined_taxid_annot_sorted_{}.fasta", hit_type.to_lowercase())
+            let fa_name = if level_owned == "species" {
+                format!("refined_taxid_annot_sorted_{}.fasta", hit_type_owned.to_lowercase())
             } else {
-                format!("refined_taxid_annot_sorted_{}_{}.fasta", level, hit_type.to_lowercase())
+                format!(
+                    "refined_taxid_annot_sorted_{}_{}.fasta",
+                    level_owned,
+                    hit_type_owned.to_lowercase()
+                )
             };
-            let output_fa = assembly_dir.join(&fa_name);
-            let output_json = assembly_dir.join(format!(
+            let fa_path = assembly_dir.join(&fa_name);
+            let json_path = assembly_dir.join(format!(
                 "refined_taxid_locations_{}_{}.json",
-                level,
-                hit_type.to_lowercase()
+                level_owned,
+                hit_type_owned.to_lowercase()
             ));
 
-            let records_clone = records_arc.clone();
-            let taxid_field_clone = taxid_field.clone();
-            let hit_type_clone = hit_type.to_string();
-            let output_fa_clone = output_fa.clone();
-            let output_json_clone = output_json.clone();
+            output_paths.push(fa_path.clone());
+            output_paths.push(json_path.clone());
 
-            let handle = tokio::task::spawn_blocking(move || {
-                generate_locator_work(
-                    records_clone,
-                    taxid_field_clone,
-                    hit_type_clone,
-                    output_fa_clone,
-                    output_json_clone,
-                )
+            let (tx, rx) = mpsc::channel::<(String, String)>(32768);
+
+            // Clone what the worker needs before moving into closure
+            let taxid_field_for_worker = taxid_field.clone();
+            let hit_type_for_worker = hit_type_owned.clone();
+            let fa_path_for_worker = fa_path.clone();
+            let json_path_for_worker = json_path.clone();
+
+            let task = tokio::spawn(async move {
+                let mut records_by_taxid: AHashMap<i32, Vec<(String, String)>> = AHashMap::new();
+
+                let mut rx = rx;
+                while let Some((header, seq)) = rx.recv().await {
+                    let taxid = get_taxid(&header, &taxid_field_for_worker).unwrap_or(-1);
+                    records_by_taxid.entry(taxid).or_default().push((header, seq));
+                }
+
+                if records_by_taxid.is_empty() {
+                    std::fs::write(&fa_path_for_worker, b"")?;
+                    std::fs::write(&json_path_for_worker, b"[]")?;
+                    debug!("Empty output written: {}", fa_path_for_worker.display());
+                    return Ok(());
+                }
+
+                let mut sorted_taxids: Vec<i32> = records_by_taxid.keys().copied().collect();
+                sorted_taxids.sort();
+
+                let file = std::fs::File::create(&fa_path_for_worker)
+                    .map_err(|e| anyhow!("create {}: {}", fa_path_for_worker.display(), e))?;
+                let mut writer = std::io::BufWriter::with_capacity(32 * 1024 * 1024, file);
+
+                let mut pos: u64 = 0;
+                let mut locations = Vec::with_capacity(records_by_taxid.len());
+
+                for taxid in sorted_taxids {
+                    let recs = records_by_taxid.get(&taxid).unwrap();
+                    let start = pos;
+
+                    for (header, seq) in recs {
+                        writer.write_all(b">")?;
+                        writer.write_all(header.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                        pos += 1 + header.len() as u64 + 1;
+
+                        writer.write_all(seq.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                        pos += seq.len() as u64 + 1;
+                    }
+
+                    locations.push(TaxonSeqLocation {
+                        taxid,
+                        first_byte: start,
+                        last_byte: pos.saturating_sub(1),
+                        hit_type: hit_type_for_worker.clone(),
+                    });
+                }
+
+                writer.flush()
+                    .map_err(|e| anyhow!("flush {}: {}", fa_path_for_worker.display(), e))?;
+
+                let json_bytes = serde_json::to_vec(&locations)?;
+                std::fs::write(&json_path_for_worker, json_bytes)?;
+
+                info!(
+                    "Wrote {} ({} taxids, {} records)",
+                    fa_path_for_worker.display(),
+                    locations.len(),
+                    records_by_taxid.values().map(|v| v.len()).sum::<usize>()
+                );
+                Ok(())
             });
 
-            locator_tasks.push(handle);
-
-            output_paths.push(output_fa);
-            output_paths.push(output_json);
+            tasks.push(task);
+            record_channels.push((taxid_field, tx));
         }
     }
 
+    // Stream parsing + selective broadcast
+    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
+    while let Some(item) = fasta_stream.next().await {
+        if let ParseOutput::Fasta(rec) = item {
+            let header = rec.id().to_string();
+            let seq = String::from_utf8(rec.seq().to_vec())
+                .map_err(|e| anyhow!("Invalid UTF-8 in sequence: {}", e))?;
+
+            // Send only to channels where this header has a valid taxid for that field
+            for (field, tx) in &record_channels {
+                if get_taxid(&header, field).unwrap_or(-1) != -1 {
+                    let _ = tx.send((header.clone(), seq.clone())).await;
+                }
+            }
+        }
+    }
+
+    // Close all channels
+    for (_, tx) in record_channels {
+        drop(tx);
+    }
+
+    // Wait for all workers
+    for task in tasks {
+        task.await??;
+    }
+
+    // Combine JSON locators
     let json_paths: Vec<PathBuf> = output_paths
         .iter()
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter(|p| p.extension().map_or(false, |e| e == "json"))
         .cloned()
         .collect();
 
     let combined_path = assembly_dir.join("refined_taxid_locations_combined.json");
-    let combined_path_for_worker = combined_path.clone(); // ← explicit clone
+    combine_taxon_loc_json(json_paths, combined_path.clone())?;
 
-    let combine_handle = tokio::task::spawn_blocking(move || {
-        combine_taxon_loc_json(json_paths, combined_path_for_worker)
-    });
-
-    locator_tasks.push(combine_handle);
     output_paths.push(combined_path);
 
-    Ok((output_paths, locator_tasks, vec![]))
+    info!("generate_taxid_locator complete");
+    Ok((output_paths, vec![], vec![]))
 }
 
 pub async fn filter_fastq_to_bytes_stream(

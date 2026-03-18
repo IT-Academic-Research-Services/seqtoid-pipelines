@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self as StdFS};
 use std::fs::File as StdFile;
 use std::io::{BufReader as StdBufReader};
+
 use std::sync::Arc;
-use std::io::Write;
+use std::io::{BufWriter as StdBufWriter, Write};
 
 use anyhow::{anyhow, Context, Result};
 use log::{info, warn, debug};
@@ -759,23 +760,34 @@ pub fn generate_locator_work(
     output_json: PathBuf,
 ) -> Result<()> {
     if records.is_empty() {
-        StdFS::write(&output_fa, b"")?;
-        StdFS::write(&output_json, b"[]")?;
+        std::fs::write(&output_fa, b"")?;
+        std::fs::write(&output_json, b"[]")?;
+        debug!("Empty FASTA/JSON written for taxid_field: {}", taxid_field);
         return Ok(());
     }
 
-
+    // -----------------------------------------------------------------------
+    // 1. Build sort indices using the same taxid extraction logic as Python
+    // -----------------------------------------------------------------------
     let mut indices: Vec<usize> = (0..records.len()).collect();
+
     indices.sort_unstable_by_key(|&i| {
         get_taxid(&records[i].0, &taxid_field).unwrap_or(-1)
     });
 
+    // -----------------------------------------------------------------------
+    // 2. Prepare FASTA writer (large buffer, same as before)
+    // -----------------------------------------------------------------------
+    let std_file = StdFile::create(&output_fa)
+        .map_err(|e| anyhow!("Failed to create FASTA file {}: {}", output_fa.display(), e))?;
 
-    let std_file = std::fs::File::create(&output_fa)?;
-    let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, std_file); // 8 MiB
+    let mut writer = StdBufWriter::with_capacity(8 * 1024 * 1024, std_file);
 
-    let mut locations = Vec::with_capacity(100_000);
-    let mut current_taxid: i32 = -1;
+    // -----------------------------------------------------------------------
+    // 3. Write sorted FASTA + collect byte ranges
+    // -----------------------------------------------------------------------
+    let mut locations: Vec<TaxonSeqLocation> = Vec::with_capacity(100_000.min(records.len() / 10));
+    let mut current_taxid: Taxid = -1;
     let mut first_byte: u64 = 0;
     let mut pos: u64 = 0;
 
@@ -783,63 +795,113 @@ pub fn generate_locator_work(
         let (header, seq) = &records[idx];
         let taxid = get_taxid(header, &taxid_field).unwrap_or(-1);
 
-        // New taxid block → close previous
+        // Close previous block if taxid changed
         if taxid != current_taxid && current_taxid != -1 {
             locations.push(TaxonSeqLocation {
                 taxid: current_taxid,
                 first_byte,
-                last_byte: pos - 1,
+                last_byte: pos.saturating_sub(1),
                 hit_type: hit_type.clone(),
             });
             first_byte = pos;
         }
         current_taxid = taxid;
 
+        // Write header
         writer.write_all(b">")?;
         writer.write_all(header.as_bytes())?;
         writer.write_all(b"\n")?;
         pos += 1 + header.len() as u64 + 1;
 
+        // Write sequence
         writer.write_all(seq.as_bytes())?;
         writer.write_all(b"\n")?;
         pos += seq.len() as u64 + 1;
     }
 
-    // loop and a half
+    // Final block
     if current_taxid != -1 {
         locations.push(TaxonSeqLocation {
             taxid: current_taxid,
             first_byte,
-            last_byte: pos - 1,
+            last_byte: pos.saturating_sub(1),
             hit_type: hit_type.clone(),
         });
     }
 
-    writer.flush()?;
+    writer.flush()
+        .map_err(|e| anyhow!("Failed to flush FASTA writer for {}: {}", output_fa.display(), e))?;
 
-    // 3. Write JSON locator
-    let json_bytes = serde_json::to_vec(&locations)?;
-    StdFS::write(&output_json, json_bytes)?;
+    // -----------------------------------------------------------------------
+    // 4. Write JSON locator (same format as Python)
+    // -----------------------------------------------------------------------
+    let json_bytes = serde_json::to_vec(&locations)
+        .map_err(|e| anyhow!("Failed to serialize JSON for {}: {}", output_json.display(), e))?;
+
+    std::fs::write(&output_json, json_bytes)
+        .map_err(|e| anyhow!("Failed to write JSON {}: {}", output_json.display(), e))?;
+
+    debug!(
+        "generate_locator_work complete: {} contigs → {} FASTA bytes, {} locations",
+        records.len(),
+        pos,
+        locations.len()
+    );
 
     Ok(())
 }
 
+/// Matches the original Python splitting logic as closely as possible
+/// Returns -1 on failure (same fallback as your current version)
+pub fn get_taxid(header: &str, field: &str) -> Result<i32> {
+    // Remove leading '>' if present
+    let cleaned = header.trim_start_matches('>');
 
-fn get_taxid(header: &str, field: &str) -> Result<i32> {
-    let parts: Vec<&str> = header.split(':').collect();
-    let pos = parts
-        .iter()
-        .position(|&p| p == field)
-        .ok_or_else(|| anyhow!("Field '{field}' not found in header: {header}"))?;
+    // Build delimiter exactly like Python: ":field:"
+    let delimiter = format!(":{}:", field);
 
-    let taxid_str = parts
-        .get(pos + 1)
-        .ok_or_else(|| anyhow!("No value after field '{field}' in header: {header}"))?;
+    // Split exactly on that delimiter (like Python split(f":{taxid_field}:"))
+    let parts: Vec<&str> = cleaned.split(&delimiter).collect();
 
-    taxid_str
+    if parts.len() <= 1 {
+        // Field not found
+        return Ok(-1);
+    }
+
+    // Take the part immediately after the delimiter
+    let after = parts[1];
+
+    // Take until next ':' (like Python parts[1].split(":")[0])
+    let taxid_str = match after.split(':').next() {
+        Some(s) => s.trim(),
+        None => return Ok(-1),
+    };
+
+    // Parse (same as Python — fail silently to -1)
+    let taxid = taxid_str
         .parse::<i32>()
-        .map_err(|e| anyhow!("Failed to parse taxid '{taxid_str}' for field '{field}': {e}"))
+        .unwrap_or_else(|e| {
+            debug!("Failed to parse taxid '{}': {}", taxid_str, e);
+            -1
+        });
+
+    Ok(taxid)
 }
+
+
+fn get_taxid_field_num(sample_headers: &[String], taxid_field: &str) -> i32 {
+    for header in sample_headers.iter().take(100) {  // look at first 100 headers
+        let cleaned = header.trim_start_matches('>');
+        let parts: Vec<&str> = cleaned.split(':').collect();
+        if let Some(idx) = parts.iter().position(|&p| p == taxid_field) {
+            info!("Found taxid field '{}' at position {}", taxid_field, idx + 1);
+            return (idx + 1) as i32;
+        }
+    }
+    warn!("Taxid field '{}' not found in first 100 headers", taxid_field);
+    -1
+}
+
 
 pub fn combine_taxon_loc_json(input_jsons: Vec<PathBuf>, output_json: PathBuf) -> Result<()> {
     let mut combined: Vec<TaxonSeqLocation> = Vec::new();
@@ -852,3 +914,4 @@ pub fn combine_taxon_loc_json(input_jsons: Vec<PathBuf>, output_json: PathBuf) -
     StdFS::write(output_json, json_data)?;
     Ok(())
 }
+
