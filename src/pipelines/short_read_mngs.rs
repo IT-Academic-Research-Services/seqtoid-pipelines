@@ -6761,7 +6761,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let assembly_dir = out_dir.join("assembly");
-
+    info!("Starting generate_taxid_locator on combined FASTA stream");
     let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
         config.clone(),
         taxid_mapped_locator, // directly pass the receiver
@@ -6769,7 +6769,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await
         .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
-
+    info!("generate_taxid_locator finished");
     cleanup_tasks.append(&mut locator_tasks);
     info!("Taxid locator files generated: {:?}", locator_outputs);
 
@@ -6862,7 +6862,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false).await?;
     info!("Experimental: {} mapped, {} combined records", initial_mapped_count, initial_combined_count);
 
-
+    info!("Starting generate_taxid_locator on second");
     let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
         config.clone(),
         initial_taxid_mapped_locator,
@@ -6870,7 +6870,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e)))?;
-
+    info!("second generate_taxid_locator odone ");
     cleanup_tasks.append(&mut initial_locator_tasks);
     info!("Experimental taxid locator files generated: {:?}", initial_locator_outputs);
 
