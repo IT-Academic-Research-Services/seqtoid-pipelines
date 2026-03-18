@@ -2358,12 +2358,12 @@ pub async fn minimap2_non_host_align(
     }
 
 
-
+    let genome_size = config.args.nt_db_size as f64;
     // 6. Merge from temp files — unchanged
     let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
 
     let gather_handle = tokio::spawn(async move {
-        if let Err(e) = PafRecord::merge_paf_files(&paf_paths, merged_tx, channel_buffer).await {
+        if let Err(e) = PafRecord::merge_paf_files(&paf_paths, merged_tx, channel_buffer, genome_size).await {
             warn!("PAF merge from files failed: {}", e);
             return Err(e);
         }

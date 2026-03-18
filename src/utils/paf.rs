@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::io::AsyncBufReadExt;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
 use dashmap::DashMap;
@@ -90,126 +91,86 @@ impl PafRecord {
     pub async fn merge_paf_files(
         paf_paths: &[PathBuf],
         tx: Sender<ParseOutput>,
-        concurrency: usize,
+        concurrency: usize,          // unused now, but keep for signature compat
+        genome_size: f64,            // from config.args.nt_db_size
     ) -> Result<()> {
-        info!("Starting parallelized merge_paf_files with {} files", paf_paths.len());
-        let query_hits: Arc<DashMap<String, Vec<PafRecord>>> = Arc::new(DashMap::new());
-        
-        let record_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let start_time = tokio::time::Instant::now();
+        info!("Starting streaming PAF → m8 conversion from {} files (no in-memory grouping)", paf_paths.len());
 
-        let (batch_tx, batch_rx) = mpsc::channel::<Vec<Arc<Vec<u8>>>>(concurrency * 2);
-        let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+        let start = std::time::Instant::now();
+        let mut total_lines = 0u64;
+        let mut valid_alignments = 0u64;
+        let mut parse_errors = 0u64;
 
-        let mut worker_handles = Vec::with_capacity(concurrency);
-        for _ in 0..concurrency {
-            let rx = batch_rx.clone();
-            let hits = query_hits.clone();
-            let count = record_count.clone();
+        // Simple parallel file reading + processing
+        // We fan out one task per file (or batch if too many files)
+        let mut handles = Vec::new();
 
-            worker_handles.push(tokio::spawn(async move {
-                loop {
-                    let batch = {
-                        let mut lock = rx.lock().await;
-                        lock.recv().await
-                    };
+        for path in paf_paths {
+            let path = path.clone();
+            let tx_clone = tx.clone();
 
-                    let batch = match batch {
-                        Some(b) => b,
-                        None => break,
-                    };
+            handles.push(tokio::spawn(async move {
+                let file = File::open(&path).await
+                    .map_err(|e| anyhow!("Failed to open PAF {}: {}", path.display(), e))?;
 
-                    for line_bytes in batch {
-                        let content = String::from_utf8_lossy(&line_bytes);
-                        let trimmed = content.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        match PafRecord::parse_line(trimmed) {
-                            Ok(record) => {
-                                let mut entry = hits.entry(record.qname.clone()).or_default();
-                                entry.push(record);
-                                
-                                let current_count = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if current_count % 100_000 == 0 && current_count > 0 {
-                                    info!("merge_paf_files: processed {} records, {} unique queries", 
-                                        current_count, hits.len());
+                let mut reader = BufReader::new(file);
+                let mut line = String::new();
+                let mut local_lines = 0u64;
+                let mut local_valid = 0u64;
+                let mut local_errors = 0u64;
+
+                while reader.read_line(&mut line).await? > 0 {
+                    local_lines += 1;
+                    let trimmed = line.trim();
+
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        line.clear();
+                        continue;
+                    }
+
+                    match PafRecord::parse_line(trimmed) {
+                        Ok(record) => {
+                            let m8_line = record.to_m8_line(genome_size);
+                            if !m8_line.is_empty() {
+                                let bytes = (m8_line + "\n").into_bytes();
+                                if tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
+                                    // Downstream closed — stop early
+                                    return Ok(());
                                 }
-
-                                if entry.len() > 20 {
-                                    entry.sort_by_key(|h| Reverse(h.alignment_score()));
-                                    entry.truncate(6);
-                                }
+                                local_valid += 1;
                             }
-                            Err(e) => {
-                                warn!("Failed to parse PAF line: {}", e);
+                        }
+                        Err(e) => {
+                            local_errors += 1;
+                            if local_errors <= 10 {
+                                warn!("PAF parse error in {}: {} — line: {}", path.display(), e, trimmed);
                             }
                         }
                     }
+
+                    line.clear();
                 }
+
+                info!("Processed {}: {} lines, {} valid alignments, {} parse errors",
+                  path.display(), local_lines, local_valid, local_errors);
+
                 Ok::<(), anyhow::Error>(())
             }));
         }
 
-        // Producer task: read files and send lines to workers
-        let paf_paths = paf_paths.to_vec();
-        let producer_handle = tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(1000);
-            for path in paf_paths {
-                let file = tokio::fs::File::open(&path).await
-                    .map_err(|e: std::io::Error| anyhow!("Failed to open PAF file {}: {}", path.display(), e))?;
-                let mut reader = tokio::io::BufReader::new(file);
-                let mut line = String::new();
-                
-                while reader.read_line(&mut line).await? > 0 {
-                    batch.push(Arc::new(line.as_bytes().to_vec()));
-                    line.clear();
-                    
-                    if batch.len() >= 1000 {
-                        batch_tx.send(std::mem::take(&mut batch)).await
-                            .map_err(|_| anyhow!("batch_tx dropped in merge_paf_files"))?;
-                    }
-                }
-            }
-            if !batch.is_empty() {
-                let _ = batch_tx.send(batch).await;
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-
-        producer_handle.await??;
-        for handle in worker_handles {
-            handle.await??;
+        // Wait for all file processors
+        for h in handles {
+            h.await??;
         }
 
-        let total_records = record_count.load(std::sync::atomic::Ordering::Relaxed);
-        info!("merge_paf_files: finished collecting {} records ({} unique queries) in {:?}", 
-            total_records, query_hits.len(), start_time.elapsed());
+        let duration = start.elapsed();
+        info!("PAF → m8 streaming complete: {} total lines, {} valid m8 records emitted in {:.2?}",
+          total_lines, valid_alignments, duration);
 
-        // Sort queries alphabetically for deterministic output
-        let mut queries: Vec<String> = query_hits.iter().map(|kv| kv.key().clone()).collect();
-        queries.sort();
-
-        info!("merge_paf_files: emitting merged records...");
-        let emit_start = tokio::time::Instant::now();
-        let mut emitted_count = 0;
-
-        for query in queries {
-            if let Some((_, mut hits)) = query_hits.remove(&query) {
-                hits.sort_by_key(|h| Reverse(h.alignment_score()));
-                hits.truncate(6);
-
-                for hit in hits {
-                    let paf_line = hit.to_paf_line();
-                    tx.send(ParseOutput::Bytes(Arc::new(paf_line.into_bytes())))
-                        .await
-                        .map_err(|e| anyhow!("Failed to send merged PAF line: {}", e))?;
-                    emitted_count += 1;
-                }
-            }
+        if valid_alignments == 0 {
+            warn!("ZERO valid alignments emitted from PAF merge — check minimap2 output and parameters");
         }
 
-        info!("merge_paf_files: finished emitting {} records in {:?}", emitted_count, emit_start.elapsed());
         Ok(())
     }
 
