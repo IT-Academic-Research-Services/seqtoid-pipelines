@@ -2106,6 +2106,7 @@ pub async fn minimap2_non_host_align(
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        TempDir
     ),
     PipelineError,
 > {
@@ -2335,22 +2336,6 @@ pub async fn minimap2_non_host_align(
     }
 
 
-    // Spawn independent cleanup task that waits for all chunk tasks to finish
-    let (cleanup_tx, cleanup_rx) = oneshot::channel::<()>();
-    let cleanup_handle = tokio::spawn(async move {
-        if cleanup_rx.await.is_ok() {
-            if let Err(e) = paf_temp_dir.close() {
-                warn!("Failed to clean PAF temp dir: {}", e);
-            } else {
-                info!("PAF temp dir cleaned successfully");
-            }
-        } else {
-            warn!("Cleanup signal dropped — temp dir may persist");
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-
-
     // 5. Wait for producer and all workers
     producer_handle.await??;
     try_join_all(worker_handles).await?
@@ -2372,8 +2357,6 @@ pub async fn minimap2_non_host_align(
         }
     }
 
-    // Signal cleanup that all jobs are done
-    let _ = cleanup_tx.send(());
 
 
     // 6. Merge from temp files — unchanged
@@ -2395,6 +2378,8 @@ pub async fn minimap2_non_host_align(
         ReceiverStream::new(merged_rx),
         cleanup_tasks,
         cleanup_receivers,
+        paf_temp_dir,
+
     ))
 }
 
@@ -5918,7 +5903,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 // }
 //
 
-    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
+    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_mm2_paf_dir) = minimap2_non_host_align(
         config.clone(),
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
@@ -5926,6 +5911,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
+    final_temp_dirs.push(non_host_mm2_paf_dir);
 
 
     let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
