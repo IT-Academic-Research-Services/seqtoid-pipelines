@@ -30,6 +30,7 @@ use futures::future::try_join_all;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::sync::mpsc::Receiver;
+use tokio::io::AsyncSeekExt;
 use memchr::memmem;
 use fst::{MapBuilder};
 
@@ -773,6 +774,8 @@ pub fn read_fasta(
 /// * 'dest_path' - location to write to
 /// * 'mbuffer_capacity'
 /// # Returns      Vec<JoinHandle<Result<()>>>,
+/// Writes any FASTA stream to file with aggressive batching + large buffer.
+/// Used in 9 places — keeps the exact same API so nothing else changes.
 pub fn write_fasta_stream_to_file(
     stream: ReceiverStream<ParseOutput>,
     dest_path: PathBuf,
@@ -785,26 +788,38 @@ pub fn write_fasta_stream_to_file(
             .await
             .map_err(|e| anyhow!("Cannot create FASTA file {}: {}", dest_path_clone.display(), e))?;
 
-        let mut writer = tokio::io::BufWriter::with_capacity(buffer_capacity, file);
+        // Much larger effective buffer (16–32 MiB)
+        let effective_buffer = buffer_capacity.max(32 * 1024 * 1024);
+        let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
 
         let mut stream = stream;
+        let mut batch: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024); // 8 MiB batch
+
         while let Some(item) = stream.next().await {
             let bytes = item
                 .to_bytes()
                 .map_err(|e| anyhow!("Failed to convert FASTA record to bytes: {}", e))?;
 
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+            batch.extend_from_slice(&bytes);
+
+            // Flush batch when it hits 8 MiB — drastically reduces syscalls
+            if batch.len() >= 8 * 1024 * 1024 {
+                writer.write_all(&batch).await
+                    .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+                batch.clear();
+            }
         }
 
-        writer
-            .flush()
-            .await
+        if !batch.is_empty() {
+            writer.write_all(&batch).await
+                .map_err(|e| anyhow!("Final write error to {}: {}", dest_path_clone.display(), e))?;
+        }
+
+        writer.flush().await
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
-        info!("FASTA written to {}", dest_path_clone.display());
+        let final_size = writer.stream_position().await.unwrap_or(0);
+        info!("FASTA written to {} ({} bytes)", dest_path_clone.display(), final_size);
         Ok(())
     })
 }
