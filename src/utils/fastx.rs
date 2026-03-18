@@ -59,12 +59,6 @@ lazy_static! {
     };
 }
 
-static CONFORMED_COUNT: AtomicU64 = AtomicU64::new(0);
-
-lazy_static! {
-    static ref CONFORM_START: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
-    static ref CONFORM_COUNT: AtomicU64 = AtomicU64::new(0);
-}
 
 lazy_static! {
     pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
@@ -1576,12 +1570,6 @@ pub async fn generate_taxid_fasta(
             );
             let unid_batch_size = 32_000;
 
-            // Reset timing & counter RIGHT BEFORE we start processing this phase
-            {
-                let mut start_guard = CONFORM_START.lock().unwrap();
-                *start_guard = Instant::now();
-            }
-            CONFORM_COUNT.store(0, Ordering::Relaxed);
 
             let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(unidentified_concurrency * 3);
             let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
@@ -1615,18 +1603,6 @@ pub async fn generate_taxid_fasta(
                                 seq: rec.seq_arc(),
                             };
 
-                            // ────────────────────────────────────────────────
-                            // Progress logging
-                            let count = CONFORM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                            if count % 10_000 == 0 {
-                                let elapsed = CONFORM_START.lock().unwrap().elapsed().as_secs_f64();
-                                let rate = if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 };
-                                info!(
-                            "unidentified_taxid_conform: processed {} contigs @ {:.1} items/sec",
-                            count, rate
-                        );
-                            }
-                            // ────────────────────────────────────────────────
 
                             let _ = c_tx.send(ParseOutput::Fasta(new_rec)).await;
                         }
@@ -1665,15 +1641,7 @@ pub async fn generate_taxid_fasta(
             for worker in unid_workers {
                 worker.await??;
             }
-
-            // Final summary when the whole phase is done
-            let total = CONFORM_COUNT.load(Ordering::Relaxed);
-            let elapsed = CONFORM_START.lock().unwrap().elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
-            info!(
-        "unidentified_taxid_conform FINISHED: total {} contigs @ {:.1} items/sec",
-        total, rate
-    );
+            
         }
 
         drop(mapped_tx);
