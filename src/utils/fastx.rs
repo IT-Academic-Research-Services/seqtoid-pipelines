@@ -9,6 +9,10 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow, Context};
 use log::{self, debug, info, error, warn};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use std::sync::Mutex;
+
 use std::collections::HashMap;
 use ahash::AHashMap;
 use lazy_static::lazy_static;
@@ -52,6 +56,13 @@ lazy_static! {
         m.insert("read1", "read2");
         m
     };
+}
+
+static CONFORMED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+lazy_static! {
+    static ref CONFORM_START: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    static ref CONFORM_COUNT: AtomicU64 = AtomicU64::new(0);
 }
 
 lazy_static! {
@@ -1550,7 +1561,13 @@ pub async fn generate_taxid_fasta(
             );
             let unid_batch_size = 32_000;
 
-            // Explicit type on the channel (this was already fixed in previous message)
+            // Reset timing & counter RIGHT BEFORE we start processing this phase
+            {
+                let mut start_guard = CONFORM_START.lock().unwrap();
+                *start_guard = Instant::now();
+            }
+            CONFORM_COUNT.store(0, Ordering::Relaxed);
+
             let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(unidentified_concurrency * 3);
             let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
 
@@ -1572,15 +1589,30 @@ pub async fn generate_taxid_fasta(
                         };
 
                         for item in batch.iter() {
-                            let rec: &SequenceRecord = item;   // ← this line fixes the inference
+                            let rec: &SequenceRecord = item;
 
                             let conformed = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
                             let (new_id, new_desc) = parse_header(conformed.as_bytes(), '>');
+
                             let new_rec = SequenceRecord::Fasta {
                                 id: new_id,
                                 desc: new_desc,
                                 seq: rec.seq_arc(),
                             };
+
+                            // ────────────────────────────────────────────────
+                            // Progress logging
+                            let count = CONFORM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                            if count % 10_000 == 0 {
+                                let elapsed = CONFORM_START.lock().unwrap().elapsed().as_secs_f64();
+                                let rate = if elapsed > 0.0 { count as f64 / elapsed } else { 0.0 };
+                                info!(
+                            "unidentified_taxid_conform: processed {} contigs @ {:.1} items/sec",
+                            count, rate
+                        );
+                            }
+                            // ────────────────────────────────────────────────
+
                             let _ = c_tx.send(ParseOutput::Fasta(new_rec)).await;
                         }
                     }
@@ -1589,7 +1621,7 @@ pub async fn generate_taxid_fasta(
                 }));
             }
 
-            // Producer part (unchanged)
+            // Producer: batch incoming unidentified FASTA records
             let mut unid_stream = unidentified_contigs_stream;
             let mut current_batch: Vec<SequenceRecord> = Vec::with_capacity(unid_batch_size);
 
@@ -1614,9 +1646,19 @@ pub async fn generate_taxid_fasta(
 
             drop(unid_batch_tx);
 
+            // Wait for all workers
             for worker in unid_workers {
                 worker.await??;
             }
+
+            // Final summary when the whole phase is done
+            let total = CONFORM_COUNT.load(Ordering::Relaxed);
+            let elapsed = CONFORM_START.lock().unwrap().elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { total as f64 / elapsed } else { 0.0 };
+            info!(
+        "unidentified_taxid_conform FINISHED: total {} contigs @ {:.1} items/sec",
+        total, rate
+    );
         }
 
         drop(mapped_tx);
