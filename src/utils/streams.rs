@@ -33,12 +33,18 @@ use std::fs::Permissions;
 use futures::stream::BoxStream;
 use futures::pin_mut;
 
+use rayon::prelude::*;
+
+
+
+
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType};
 use crate::config::defs::{CoreAllocation, RunConfig};
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 
+const BATCH_SIZE_BYTES: usize = 16 * 1024 * 1024; // ~128k alignments
 
 
 pub trait ToBytes {
@@ -1724,6 +1730,66 @@ pub fn monitor_stream(
 
     ReceiverStream::new(forward_rx)  // Return as ReceiverStream
 }
+
+
+
+pub fn batch_rayon_process<F>(
+    mut input: ReceiverStream<ParseOutput>,
+    processor: F,
+    stage_name: &'static str,
+) -> ReceiverStream<ParseOutput>
+where
+    F: Fn(Vec<u8>) -> Vec<Vec<u8>> + Send + Sync + 'static,
+//   F must be a closure that processes batches safely in Rayon workers
+//   (Send + Sync + 'static = required for tokio::spawn_blocking + Arc)
+{
+    let (tx, rx) = mpsc::channel(1024);
+    let processor = Arc::new(processor);
+
+    tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(BATCH_SIZE_BYTES);
+        let mut processed = 0u64;
+
+        while let Some(item) = input.next().await {
+            if let ParseOutput::Bytes(b) = item {
+                buf.extend_from_slice(&b);
+                if buf.len() >= BATCH_SIZE_BYTES {
+                    let batch = std::mem::take(&mut buf);
+                    let p = processor.clone();
+                    let lines = tokio::task::spawn_blocking(move || p(batch))
+                        .await
+                        .expect("batch_rayon_process panicked — this should never happen in our contract");
+
+                    let batch_len = lines.len() as u64;
+
+                    for line in lines {
+                        let _ = tx.send(ParseOutput::Bytes(line.into())).await;
+                    }
+
+                    processed += batch_len;
+                    if processed % 1_000_000 == 0 {
+                        debug!("{}: {} alignments processed (batched, no data dropped)", stage_name, processed);
+                    }
+                }
+            }
+        }
+
+        // final flush
+        if !buf.is_empty() {
+            let lines = tokio::task::spawn_blocking(move || processor(buf)).await.expect("final batch panicked");
+            let batch_len = lines.len() as u64;
+            for line in lines {
+                let _ = tx.send(ParseOutput::Bytes(line.into())).await;
+            }
+            processed += batch_len;
+        }
+
+        debug!("{}: finished — total {} alignments, stream closed cleanly", stage_name, processed);
+    });
+
+    ReceiverStream::new(rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
