@@ -91,18 +91,13 @@ impl PafRecord {
     pub async fn merge_paf_files(
         paf_paths: &[PathBuf],
         tx: Sender<ParseOutput>,
-        concurrency: usize,          // unused now, but keep for signature compat
-        genome_size: f64,            // from config.args.nt_db_size
     ) -> Result<()> {
-        info!("Starting streaming PAF → m8 conversion from {} files (no in-memory grouping)", paf_paths.len());
+        info!("Merging {} raw PAF files → streaming PAF output (no conversion)", paf_paths.len());
 
         let start = std::time::Instant::now();
         let mut total_lines = 0u64;
-        let mut valid_alignments = 0u64;
-        let mut parse_errors = 0u64;
+        let mut skipped = 0u64;
 
-        // Simple parallel file reading + processing
-        // We fan out one task per file (or batch if too many files)
         let mut handles = Vec::new();
 
         for path in paf_paths {
@@ -116,61 +111,37 @@ impl PafRecord {
                 let mut reader = BufReader::new(file);
                 let mut line = String::new();
                 let mut local_lines = 0u64;
-                let mut local_valid = 0u64;
-                let mut local_errors = 0u64;
+                let mut local_skipped = 0u64;
 
                 while reader.read_line(&mut line).await? > 0 {
                     local_lines += 1;
                     let trimmed = line.trim();
 
                     if trimmed.is_empty() || trimmed.starts_with('#') {
+                        local_skipped += 1;
                         line.clear();
                         continue;
                     }
 
-                    match PafRecord::parse_line(trimmed) {
-                        Ok(record) => {
-                            let m8_line = record.to_m8_line(genome_size);
-                            if !m8_line.is_empty() {
-                                let bytes = (m8_line + "\n").into_bytes();
-                                if tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
-                                    // Downstream closed — stop early
-                                    return Ok(());
-                                }
-                                local_valid += 1;
-                            }
-                        }
-                        Err(e) => {
-                            local_errors += 1;
-                            if local_errors <= 10 {
-                                warn!("PAF parse error in {}: {} — line: {}", path.display(), e, trimmed);
-                            }
-                        }
+                    // Forward raw PAF line unchanged
+                    let bytes = (trimmed.to_string() + "\n").into_bytes();
+                    if tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
+                        return Ok(());
                     }
 
                     line.clear();
                 }
 
-                info!("Processed {}: {} lines, {} valid alignments, {} parse errors",
-                  path.display(), local_lines, local_valid, local_errors);
-
+                info!("Merged {}: {} lines ({} skipped)", path.display(), local_lines, local_skipped);
                 Ok::<(), anyhow::Error>(())
             }));
         }
 
-        // Wait for all file processors
         for h in handles {
             h.await??;
         }
 
-        let duration = start.elapsed();
-        info!("PAF → m8 streaming complete: {} total lines, {} valid m8 records emitted in {:.2?}",
-          total_lines, valid_alignments, duration);
-
-        if valid_alignments == 0 {
-            warn!("ZERO valid alignments emitted from PAF merge — check minimap2 output and parameters");
-        }
-
+        info!("Raw PAF merge complete: {} total lines in {:.2?}", total_lines, start.elapsed());
         Ok(())
     }
 
