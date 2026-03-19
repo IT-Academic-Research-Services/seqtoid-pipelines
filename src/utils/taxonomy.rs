@@ -256,9 +256,9 @@ pub async fn build_accession2taxid_db(
                         let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
 
                         let full_acc = record[0].to_string();
-                        let acc_base = full_acc.split('.').next().unwrap_or(&full_acc);
+                        let acc_base = full_acc.split('.').next().unwrap_or(&full_acc).to_string();
 
-                        if !accession_bases.contains(acc_base) {
+                        if !accession_bases.contains(&acc_base) {
                             continue;
                         }
 
@@ -268,7 +268,7 @@ pub async fn build_accession2taxid_db(
                             .parse()
                             .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
 
-                        batch.push(AccTaxEntry { acc: full_acc, taxid });
+                        batch.push(AccTaxEntry { acc: acc_base, taxid });  // ← key = base only
                         if batch.len() >= 1000 {
                             tx.blocking_send(std::mem::replace(&mut batch, Vec::with_capacity(1000)))
                                 .map_err(|_| anyhow!("Channel closed"))?;
@@ -299,7 +299,6 @@ pub async fn build_accession2taxid_db(
         }
     });
 
-    // Drop the original sender so the receiver can finish when workers are done
     drop(tx);
 
     let mut entries = Vec::new();
@@ -311,26 +310,33 @@ pub async fn build_accession2taxid_db(
         handle.await??;
     }
 
-
-    entries.sort_unstable_by(|a, b| a.acc.cmp(&b.acc));
-
-    let mut builder = MapBuilder::memory();
+    // No need to sort — we use HashMap dedup below
+    let mut acc_to_taxid: HashMap<String, Taxid> = HashMap::new();
     let mut total_mapped = 0;
-    let mut last_acc: Option<String> = None;
 
     for entry in entries {
-        // Skip duplicate keys (same accession)
-        if last_acc.as_deref() == Some(&entry.acc) {
-            continue;
+        // Dedup: keep first seen (or warn on conflict)
+        if let Some(existing) = acc_to_taxid.insert(entry.acc.clone(), entry.taxid) {
+            if existing != entry.taxid {
+                warn!("Taxid conflict for base {}: {} vs {}", entry.acc, existing, entry.taxid);
+            }
+        } else {
+            total_mapped += 1;
         }
 
-        last_acc = Some(entry.acc.clone());
-
-        builder.insert(entry.acc.as_bytes(), entry.taxid as u64)?;
-        total_mapped += 1;
-
         if total_mapped % 1_000_000 == 0 {
-            info!("\t{}M accessions mapped", total_mapped / 1_000_000);
+            info!("\t{}M base accessions mapped", total_mapped / 1_000_000);
+        }
+    }
+
+    // Build FST with base accessions as keys
+    let mut builder = MapBuilder::memory();
+    let mut sorted_keys: Vec<String> = acc_to_taxid.keys().cloned().collect();
+    sorted_keys.sort_unstable();  // deterministic order
+
+    for acc_base in sorted_keys {
+        if let Some(&taxid) = acc_to_taxid.get(&acc_base) {
+            builder.insert(acc_base.as_bytes(), taxid as u64)?;
         }
     }
 
