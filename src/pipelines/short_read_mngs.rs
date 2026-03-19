@@ -2565,6 +2565,33 @@ pub async fn load_lineage_and_acc2tax_maps(
 
     let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
 
+    // ────────────────────────────────────────────────────────────────
+    // TEMP SANITY CHECK: Verify a few known accession → taxid mappings
+    // ────────────────────────────────────────────────────────────────
+    let test_accessions = vec![
+        "NC_000913",   // E. coli K-12, taxid 511145
+        "NM_000546",   // Human TP53, taxid 9606
+        "NP_414543",   // E. coli protein, taxid 511145
+        "XM_017839123", // Human gene, taxid 9606
+    ];
+
+    info!("Sanity checking {} known accessions → taxid mappings", test_accessions.len());
+    for acc in test_accessions {
+        let key = acc.as_bytes();
+        if let Some(taxid_u64) = acc2taxid_map.get(key) {
+            let taxid = taxid_u64 as i32;
+            info!("  {} → taxid {}", acc, taxid);
+            // Optional: check lineage exists
+            if lineage_map.get(&taxid).is_some() {
+                debug!("     (lineage found for taxid {})", taxid);
+            } else {
+                warn!("     WARNING: No lineage found for taxid {}", taxid);
+            }
+        } else {
+            warn!("WARNING: Accession {} not found in acc2taxid map", acc);
+        }
+    }
+
     info!(
         "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
         lineage_map.len(),
@@ -2611,14 +2638,13 @@ pub async fn call_hits_m8_stream(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
-    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 2);
+    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 2);
 
-    let (batch_tx, batch_rx) = mpsc::channel::<Vec<String>>(concurrency);
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<String>>(concurrency * 2);
     let shared_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
-    // Batching task: m8 lines → batches of Vec<String> for easier parsing
-    const BATCH_SIZE: usize = 50_000;
+    const BATCH_SIZE: usize = 100_000;
 
     let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(concurrency);
     for i in 0..concurrency {
@@ -2630,24 +2656,32 @@ pub async fn call_hits_m8_stream(
         let should_keep_filter = should_keep_filter.clone();
 
         let handle = tokio::spawn(async move {
+            let mut processed_lines = 0u64;
+
             loop {
                 let batch = {
                     let mut guard = rx.lock().await;
                     guard.recv().await
                 };
 
-                let batch_lines = match batch {
+                let mut batch_lines = match batch {
                     Some(b) => b,
                     None => break,
                 };
 
-                let mut read_groups: HashMap<String, Vec<M8Record>> = HashMap::with_capacity(batch_lines.len() / 10);
+                let batch_len = batch_lines.len();
+                let mut read_groups: AHashMap<String, Vec<M8Record>> =
+                    AHashMap::with_capacity((batch_len / 10).max(16));
 
                 for line in batch_lines {
+                    processed_lines += 1;
+
                     let rec = match M8Record::parse_line_nr(&line) {
                         Ok(r) => r,
                         Err(e) => {
-                            warn!("Worker {} failed to parse m8 line: {} — {}", i, e, line);
+                            if processed_lines < 200 {
+                                warn!("Worker {} parse error (line {}): {} — skipping", i, processed_lines, e);
+                            }
                             continue;
                         }
                     };
@@ -2660,18 +2694,23 @@ pub async fn call_hits_m8_stream(
                 }
 
                 for (read_id, hits) in read_groups {
-                    let mut valid_hits = Vec::new();
+                    // Filter to valid hits (references to avoid clone explosion)
+                    let mut valid_hits: Vec<&M8Record> = Vec::with_capacity(hits.len().min(64));
+
                     for hit in &hits {
                         if let Some(taxid_u64) = acc2taxid_map.get(hit.tname.as_bytes()) {
                             let taxid = taxid_u64 as i32;
+
                             if taxid == 0 {
                                 continue;
                             }
-                            let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1; 3]);
+
+                            let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
                             if !should_keep_filter(&lineage) {
                                 continue;
                             }
-                            valid_hits.push(hit.clone());
+
+                            valid_hits.push(hit);
                         }
                     }
 
@@ -2679,55 +2718,78 @@ pub async fn call_hits_m8_stream(
                         continue;
                     }
 
-                    valid_hits.sort_by(|a, b| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(Ordering::Equal));
-                    let best = valid_hits[0].clone();
+                    // Find best hit (linear scan — faster than sort, matches Python)
+                    let mut best: Option<&M8Record> = None;
+                    let mut max_bitscore = f64::NEG_INFINITY;
 
+                    for &h in &valid_hits {
+                        if h.bitscore > max_bitscore {
+                            max_bitscore = h.bitscore;
+                            best = Some(h);
+                        }
+                    }
+
+                    let best = match best {
+                        Some(b) => b,
+                        None => continue,
+                    };
+
+                    // Deduped m8: single best hit per read
                     let dedup_line = format!(
-                        "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\n",
+                        "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
                         best.qname, best.tname, best.pident, best.alen, best.mismatch,
                         best.gapopen, best.qstart, best.qend, best.tstart, best.tend,
                         best.evalue, best.bitscore
                     );
+
                     if dedup_tx.send(ParseOutput::Bytes(Arc::new(dedup_line.into_bytes()))).await.is_err() {
-                        break;
+                        return Ok(());
                     }
 
-                    let (tax_level, _consensus_taxid, consensus_hits) = consensus_level(
-                        &hits,
+                    // Consensus on filtered valid hits only (exact match to Python)
+                    let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
+
+                    let (tax_level, _cons_taxid, consensus_hits) = consensus_level(
+                        &valid_owned,
                         &*lineage_map,
                         &*acc2taxid_map,
                         &should_keep_filter,
                     ).unwrap_or_else(|e| {
-                        warn!("Consensus failed for {}: {}", read_id, e);
+                        warn!("Consensus failed for read {}: {}", read_id, e);
                         (0, 0, Vec::new())
                     });
 
+                    // Summary line: best accession + consensus ranks
                     let first_lineage = consensus_hits
                         .first()
                         .and_then(|h| acc2taxid_map.get(h.tname.as_bytes()))
                         .map(|taxid_u64| taxid_u64 as i32)
-                        .and_then(|taxid| lineage_map.get(&taxid))
-                        .cloned()
-                        .unwrap_or([-1; 3]);
-
-                    let species = first_lineage[0] as i64;
-                    let genus = first_lineage[1] as i64;
-                    let family = first_lineage[2] as i64;
+                        .and_then(|taxid| lineage_map.get(&taxid).cloned())
+                        .unwrap_or([-1i32; 3]);
 
                     let summary_line = format!(
                         "{}\t{}\t{}\t{}\t{}\t{}\n",
-                        read_id, best.tname, species, genus, family, tax_level
+                        read_id, best.tname, first_lineage[0], first_lineage[1], first_lineage[2], tax_level
                     );
+
                     if summary_tx.send(ParseOutput::Bytes(Arc::new(summary_line.into_bytes()))).await.is_err() {
-                        break;
+                        return Ok(());
                     }
                 }
+
+                // Progress logging
+                if processed_lines % 1_000_000 < batch_len as u64 {
+                    info!("call_hits worker {} processed ~{} total m8 lines", i, processed_lines);
+                }
             }
+
             Ok::<(), anyhow::Error>(())
         });
+
         cleanup_tasks.push(handle);
     }
 
+    // Batching task
     let batching_handle = tokio::spawn(async move {
         let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
         let mut line_count = 0u64;
@@ -2735,15 +2797,13 @@ pub async fn call_hits_m8_stream(
         while let Some(item) = m8_input.next().await {
             line_count += 1;
             let line = match item {
-                ParseOutput::Bytes(b) => {
-                    match String::from_utf8(b.to_vec()) {
-                        Ok(s) => s.trim_end().to_string(),
-                        Err(e) => {
-                            debug!("m8 line not UTF-8: {}", e);
-                            continue;
-                        }
+                ParseOutput::Bytes(b) => match String::from_utf8(b.to_vec()) {
+                    Ok(s) => s.trim_end().to_string(),
+                    Err(e) => {
+                        debug!("m8 line not UTF-8: {}", e);
+                        continue;
                     }
-                }
+                },
                 _ => continue,
             };
 
@@ -2765,12 +2825,12 @@ pub async fn call_hits_m8_stream(
             let _ = batch_tx.send(batch).await;
         }
 
-        info!("Batching complete: {} lines", line_count);
+        info!("Batching complete: {} m8 lines processed", line_count);
         Ok(())
     });
     cleanup_tasks.push(batching_handle);
 
-    // File writes via t_junction (unchanged, good pattern)
+    // File writes via t_junction (unchanged)
     let m8_dedup_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("dedup.m8"), "_"));
     let summary_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some("summary.txt"), "_"));
 

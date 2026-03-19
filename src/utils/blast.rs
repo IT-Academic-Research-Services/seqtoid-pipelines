@@ -286,10 +286,10 @@ fn negative_taxid(level: u8) -> i64 {
 ///
 /// (level, consensus_taxid, selected_hits) where level=1 species, 2 genus, 3 family, 0 none;
 /// consensus_taxid is the taxid at that level.
-pub fn consensus_level<D: AsRef<[u8]>>(
+pub fn consensus_level(
     hits: &[M8Record],
     lineage_map: &AHashMap<Taxid, Lineage>,
-    acc2taxid_map: &Map<D>,
+    acc2taxid_map: &Map<Vec<u8>>,
     should_keep: &Arc<impl Fn(&[i32]) -> bool + Send + Sync>,
 ) -> Result<(u8, i64, Vec<M8Record>)>   {
     let lineages: Vec<Lineage> = hits
