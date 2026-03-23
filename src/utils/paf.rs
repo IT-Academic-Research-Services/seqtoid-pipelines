@@ -225,3 +225,21 @@ impl PafRecord {
         )
     }
 }
+
+pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
+    let mut output = Vec::with_capacity(64_000);
+
+    for line_bytes in batch.split(|&b| b == b'\n') {
+        if line_bytes.is_empty() || line_bytes.starts_with(b"#") {
+            continue;
+        }
+        if let Ok(line) = std::str::from_utf8(line_bytes) {
+            if let Ok(record) = PafRecord::parse_line(line) {
+                let m8_line = record.to_m8_line(genome_size);
+                output.push((m8_line + "\n").into_bytes());
+            }
+        }
+    }
+
+    output
+}

@@ -83,7 +83,7 @@ use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_ma
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
                          write_vecu8_to_file};
-use crate::utils::paf::PafRecord;
+use crate::utils::paf::{PafRecord, parse_paf_batch_to_m8};
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
 use crate::utils::stats::parse_samtools_stats;
@@ -91,7 +91,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
                             stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
                             ChannelReader, ChildStream, ParseMode,
-                            ParseOutput, ToBytes, monitor_stream};
+                            ParseOutput, ToBytes, monitor_stream, batch_rayon_process};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::system::{detect_ram, compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
@@ -2447,47 +2447,28 @@ pub async fn paf_to_m8(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 )> {
+
+    let phase_start = Instant::now();
+    info!("paf_to_m8 phase started");
+
+    let genome_size = config.args.nt_db_size as f64;
+
+    let batched_stream = batch_rayon_process(
+        config.clone(),
+        input_stream,
+        move |batch: Vec<u8>| parse_paf_batch_to_m8(batch, genome_size),
+        "paf_to_m8",
+        16 * 1024 * 1024,   //  (16 MiB = good starting point)
+    );
+
     let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
     let config_clone = config.clone();
 
     let conversion_handle = tokio::spawn(async move {
-        while let Some(item) = input_stream.next().await {
-            let line_bytes = match item {
-                ParseOutput::Bytes(b) => b,
-                _ => {
-                    debug!("Skipping non-bytes item in PAF stream");
-                    continue;
-                }
-            };
-
-            let line = match String::from_utf8((*line_bytes).clone()) {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("Invalid UTF-8 in PAF line: {}", e);
-                    continue;
-                }
-            };
-
-            if line.trim().is_empty() || line.starts_with('#') {
-                continue;
-            }
-            // eprintln!("paf: {}", line);
-            let record = match PafRecord::parse_line(&line) {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!("Failed to parse PAF line: {} — {}", e, line);
-                    continue;
-                }
-            };
-
-            let genome_size = config_clone.args.nt_db_size as f64;
-            let m8_line = record.to_m8_line(genome_size);
-            // eprintln!("m8: {}", m8_line);
-            // eprintln!("");
-            let m8_bytes = (m8_line + "\n").into_bytes();
-
-            if m8_tx.send(ParseOutput::Bytes(Arc::new(m8_bytes))).await.is_err() {
+        let mut stream = batched_stream;
+        while let Some(item) = stream.next().await {
+            if m8_tx.send(item).await.is_err() {
                 return Err(anyhow!("m8 channel send failed"));
             }
         }
@@ -2495,6 +2476,8 @@ pub async fn paf_to_m8(
     });
 
     let m8_stream = ReceiverStream::new(m8_rx);
+
+    info!("paf_to_m8 phase finished in {:?}", phase_start.elapsed());
 
     let (mut streams, done_rx) = t_junction(
         m8_stream,
