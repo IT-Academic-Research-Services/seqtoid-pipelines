@@ -1759,19 +1759,23 @@ where
                     let p = processor.clone();
                     let config_clone = config.clone();
 
+                    debug!("{}: starting batch of {} bytes", stage_name, batch.len());
+
                     let lines = tokio::task::spawn_blocking(move || {
                         config_clone.thread_pool.install(|| p(batch))
                     })
                         .await
                         .expect("batch_rayon_process panicked");
 
+                    debug!("{}: batch complete — produced {} lines", stage_name, lines.len());
+
                     let batch_len = lines.len() as u64;
                     for line in lines {
                         let _ = tx.send(ParseOutput::Bytes(Arc::new(line))).await;
                     }
                     processed += batch_len;
-                    if processed % 10_000 == 0 {
-                        info!("{}: processed {} items (batched, {} bytes)", stage_name, processed, batch_target_bytes);
+                    if processed % 1_000 == 0 || processed % 100_000 == 0 {
+                        info!("{}: {} items (batch {} bytes)", stage_name, processed, batch_target_bytes);
                     }
                 }
             }
