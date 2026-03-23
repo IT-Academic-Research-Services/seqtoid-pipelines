@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::env::args;
 use std::sync::Arc;
 use std::path::PathBuf;
+use rayon::prelude::*;
 
 use anyhow::{anyhow, Context, Result};
 use log::{self, LevelFilter, debug, info, error, warn};
@@ -366,7 +367,6 @@ pub fn parse_m8_batch_to_calls<F>(
 where
     F: Fn(&[i32]) -> bool + Send + Sync,
 {
-    let batch_start = Instant::now();
     let mut read_groups: AHashMap<String, Vec<M8Record>> = AHashMap::with_capacity(1024);
 
     if let Ok(batch_str) = std::str::from_utf8(&batch) {
@@ -463,6 +463,22 @@ where
     }
 
     results
+}
+
+pub fn parse_summary_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
+    batch
+        .par_split(|&b| b == b'\n')
+        .filter(|line: &&[u8]| !line.is_empty() && line[0] != b'#')
+        .flat_map(|line: &[u8]| vec![line.to_vec()])
+        .collect()
+}
+
+pub fn parse_m8_metrics_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
+    batch
+        .par_split(|&b| b == b'\n')
+        .filter(|line: &&[u8]| !line.is_empty() && line[0] != b'#')
+        .flat_map(|line: &[u8]| vec![line.to_vec()])
+        .collect()
 }
 
 fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {

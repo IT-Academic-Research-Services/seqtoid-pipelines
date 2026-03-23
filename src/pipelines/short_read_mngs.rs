@@ -59,7 +59,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
                           SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters};
-use crate::utils::blast::{parse_m8_batch_to_calls, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
+use crate::utils::blast::{parse_m8_batch_to_calls, parse_summary_batch, parse_m8_metrics_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
@@ -2862,8 +2862,8 @@ async fn diamond_non_host_align(
 /// vector of taxon counts
 pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
-    mut m8_stream: ReceiverStream<ParseOutput>,
-    mut summary_stream: ReceiverStream<ParseOutput>,
+    m8_stream: ReceiverStream<ParseOutput>,
+    summary_stream: ReceiverStream<ParseOutput>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,               // e.g. "NT"
@@ -2874,7 +2874,15 @@ pub async fn generate_taxon_counts(
     // read_id   accession   species   genus   family   level
     let mut read_summaries: HashMap<String, (u8, String, Vec<i32>)> = HashMap::new();
 
-    while let Some(item) = summary_stream.next().await {
+    let mut summary_batched = batch_rayon_process(
+        config.clone(),
+        summary_stream,
+        parse_summary_batch,
+        "generate_taxon_counts_summary",
+        16 * 1024 * 1024,
+    );
+
+    while let Some(item) = summary_batched.next().await {
         let line = match item {
             ParseOutput::Bytes(b) => {
                 let s = String::from_utf8(b.to_vec())
@@ -2919,7 +2927,15 @@ pub async fn generate_taxon_counts(
     // We only need percent-identity, alignment-length and e-value.
     let mut read_metrics: HashMap<String, (f64, u64, f64)> = HashMap::new();
 
-    while let Some(item) = m8_stream.next().await {
+    let mut m8_batched = batch_rayon_process(
+        config.clone(),
+        m8_stream,
+        parse_m8_metrics_batch,
+        "generate_taxon_counts_m8",
+        16 * 1024 * 1024,
+    );
+
+    while let Some(item) = m8_batched.next().await {
         let line = match item {
             ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
                 .map_err(|e| anyhow!("m8 line not UTF-8: {}", e))?,
@@ -5822,73 +5838,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
-
-
-    // ────────────────────────────────────────────────────────────────
-    // TEMPORARY: Drain both streams so nothing backs up or gets dropped
-    // ────────────────────────────────────────────────────────────────
-    // info!("TEMP DRAIN MODE: consuming call_stream (dedup m8) and call_summary_stream");
-    //
-    // let mut dedup_count = 0u64;
-    // let mut summary_count = 0u64;
-    // let mut last_log = std::time::Instant::now();
-    //
-    // let drain_handle = tokio::spawn(async move {
-    //     let mut call_stream = call_stream;
-    //     let mut call_summary_stream = call_summary_stream;
-    //
-    //     loop {
-    //         tokio::select! {
-    //         Some(item) = call_stream.next() => {
-    //             dedup_count += 1;
-    //             // We don't care about the content — just drain
-    //             // Optional: if you want to peek, match on item here
-    //             if last_log.elapsed().as_secs() >= 10 {
-    //                 info!("Drained {} dedup m8 lines so far", dedup_count);
-    //                 last_log = std::time::Instant::now();
-    //             }
-    //         }
-    //         Some(item) = call_summary_stream.next() => {
-    //             summary_count += 1;
-    //             if last_log.elapsed().as_secs() >= 10 {
-    //                 info!("Drained {} summary lines so far", summary_count);
-    //                 last_log = std::time::Instant::now();
-    //             }
-    //         }
-    //         else => break,  // both streams exhausted
-    //     }
-    //     }
-    //
-    //     info!("TEMP DRAIN COMPLETE: {} dedup m8 lines, {} summary lines consumed", dedup_count, summary_count);
-    //     Ok::<(), anyhow::Error>(())
-    // });
-    //
-    // // cleanup_tasks.push(drain_handle);
-    //
-    // // ────────────────────────────────────────────────────────────────
-    // //  wait for drain before full cleanup
-    // // ────────────────────────────────────────────────────────────────
-    // info!("Waiting for temporary drain to finish before cleanup...");
-    // if let Err(e) = drain_handle.await {
-    //     error!("Drain task failed: {:?}", e);
-    // } else {
-    //     info!("Drain task completed successfully");
-    // }
-    //
-    //         let cleanup_results = try_join_all(cleanup_tasks)
-    //             .await
-    //             .map_err(|join_err| PipelineError::Other(join_err.into()))?;
-    //
-    //         // Process each task result
-    //         for res in cleanup_results {
-    //             if let Err(e) = res {
-    //                 eprintln!("Early end failure condition: {}", e);
-    //             }
-    //         }
-    //
-    //     info!("Finished short read mNGS pipeline (cleanup completed, some non-fatal warnings may have occurred).");
-    //     Ok(())
-    // }
 
 
     let (nt_streams, nt_done_rx) = t_junction(
