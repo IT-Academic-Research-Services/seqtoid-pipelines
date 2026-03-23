@@ -1770,8 +1770,8 @@ where
                         let _ = tx.send(ParseOutput::Bytes(Arc::new(line))).await;
                     }
                     processed += batch_len;
-                    if processed % 1_000_000 == 0 {
-                        debug!("{}: processed {} items (batched, {} bytes)", stage_name, processed, batch_target_bytes);
+                    if processed % 10_000 == 0 {
+                        info!("{}: processed {} items (batched, {} bytes)", stage_name, processed, batch_target_bytes);
                     }
                 }
             }

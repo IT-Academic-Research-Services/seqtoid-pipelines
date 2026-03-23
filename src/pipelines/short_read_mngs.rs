@@ -2448,8 +2448,6 @@ pub async fn paf_to_m8(
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 )> {
 
-    let phase_start = Instant::now();
-    info!("paf_to_m8 phase started");
 
     let genome_size = config.args.nt_db_size as f64;
 
@@ -2476,8 +2474,6 @@ pub async fn paf_to_m8(
     });
 
     let m8_stream = ReceiverStream::new(m8_rx);
-
-    info!("paf_to_m8 phase finished in {:?}", phase_start.elapsed());
 
     let (mut streams, done_rx) = t_junction(
         m8_stream,
