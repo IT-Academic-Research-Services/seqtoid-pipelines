@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
 use dashmap::DashMap;
+use rayon::prelude::*;
 
 use crate::utils::streams::ParseOutput;
 
@@ -227,19 +228,17 @@ impl PafRecord {
 }
 
 pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
-    let mut output = Vec::with_capacity(64_000);
-
-    for line_bytes in batch.split(|&b| b == b'\n') {
-        if line_bytes.is_empty() || line_bytes.starts_with(b"#") {
-            continue;
-        }
-        if let Ok(line) = std::str::from_utf8(line_bytes) {
-            if let Ok(record) = PafRecord::parse_line(line) {
-                let m8_line = record.to_m8_line(genome_size);
-                output.push((m8_line + "\n").into_bytes());
+    batch
+        .par_split(|&b| b == b'\n')
+        .filter(|line: &&[u8]| !line.is_empty() && !line.starts_with(b"#"))
+        .flat_map(|line_bytes: &[u8]| {
+            if let Ok(line) = std::str::from_utf8(line_bytes) {
+                if let Ok(record) = PafRecord::parse_line(line) {
+                    let m8_line = record.to_m8_line(genome_size);
+                    return vec![(m8_line + "\n").into_bytes()];
+                }
             }
-        }
-    }
-
-    output
+            vec![]
+        })
+        .collect()
 }
