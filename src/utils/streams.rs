@@ -44,7 +44,6 @@ use crate::config::defs::{PipelineError, StreamDataType};
 use crate::config::defs::{CoreAllocation, RunConfig};
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 
-const BATCH_SIZE_BYTES: usize = 16 * 1024 * 1024; // ~128k alignments
 
 
 pub trait ToBytes {
@@ -1740,6 +1739,7 @@ pub fn batch_rayon_process<F>(
     mut input: ReceiverStream<ParseOutput>,
     processor: F,
     stage_name: &'static str,
+    batch_target_bytes: usize,
 ) -> ReceiverStream<ParseOutput>
 where
     F: Fn(Vec<u8>) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -1748,29 +1748,30 @@ where
     let processor = Arc::new(processor);
 
     tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(BATCH_SIZE_BYTES);
+        let mut buf = Vec::with_capacity(batch_target_bytes / 4);
         let mut processed = 0u64;
 
         while let Some(item) = input.next().await {
             if let ParseOutput::Bytes(b) = item {
                 buf.extend_from_slice(&b);
-                if buf.len() >= BATCH_SIZE_BYTES {
+                if buf.len() >= batch_target_bytes {
                     let batch = std::mem::take(&mut buf);
                     let p = processor.clone();
-                    let cfg = config.clone();
+                    let config_clone = config.clone();
 
                     let lines = tokio::task::spawn_blocking(move || {
-                        cfg.thread_pool.install(|| p(batch))
-                    }).await
+                        config_clone.thread_pool.install(|| p(batch))
+                    })
+                        .await
                         .expect("batch_rayon_process panicked");
 
                     let batch_len = lines.len() as u64;
                     for line in lines {
-                        let _ = tx.send(ParseOutput::Bytes(line.into())).await;
+                        let _ = tx.send(ParseOutput::Bytes(Arc::new(line))).await;
                     }
                     processed += batch_len;
                     if processed % 1_000_000 == 0 {
-                        debug!("{}: processed {} alignments (batched)", stage_name, processed);
+                        debug!("{}: processed {} items (batched, {} bytes)", stage_name, processed, batch_target_bytes);
                     }
                 }
             }
@@ -1778,19 +1779,22 @@ where
 
         // final flush
         if !buf.is_empty() {
-            let p = processor;
-            let cfg = config;
-            let lines = tokio::task::spawn_blocking(move || cfg.thread_pool.install(|| p(buf)))
-                .await.expect("final batch panicked");
+            let config_clone = config.clone();
+
+            let lines = tokio::task::spawn_blocking(move || {
+                config_clone.thread_pool.install(|| processor(buf))
+            })
+                .await
+                .expect("final batch panicked");
 
             let batch_len = lines.len() as u64;
             for line in lines {
-                let _ = tx.send(ParseOutput::Bytes(line.into())).await;
+                let _ = tx.send(ParseOutput::Bytes(Arc::new(line))).await;
             }
             processed += batch_len;
         }
 
-        debug!("{}: finished — total {} alignments, stream closed cleanly", stage_name, processed);
+        debug!("{}: finished — total {} items", stage_name, processed);
     });
 
     ReceiverStream::new(rx)
