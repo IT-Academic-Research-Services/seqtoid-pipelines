@@ -2599,7 +2599,7 @@ pub async fn load_lineage_and_acc2tax_maps(
 ///  -hit-summary TSV stream
 /// - Vec of cleanup tasks
 /// - Vec of cleanup receivers
-pub async fn call_hits_m8_stream(
+pub async fn call_hits_m8(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>,
     sample_base_buf: PathBuf,
@@ -2636,7 +2636,7 @@ pub async fn call_hits_m8_stream(
                 min_aln_len,
             )
         },
-        "call_hits_m8_stream",
+        "call_hits_m8",
         16 * 1024 * 1024,
     );
 
@@ -5810,7 +5810,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
     info!("call hits nt concurrency {}", nt_concurrency);
 
-    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8_stream(
+    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
         config.clone(),
         m8_stream,
         sample_base_buf.clone(),
@@ -5976,7 +5976,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("call hits nr concurrency {}", nr_concurrency);
 
 
-    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8_stream(
+    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8(
         config.clone(),
         ReceiverStream::new(non_host_diamond_m8_stream),
         sample_base_buf.clone(),
