@@ -481,6 +481,36 @@ pub fn parse_m8_metrics_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+pub fn parse_m8_acc_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
+    batch
+        .par_split(|&b| b == b'\n')
+        .filter(|line: &&[u8]| !line.is_empty() && line[0] != b'#')
+        .flat_map(|line_bytes: &[u8]| {
+            if let Ok(line) = std::str::from_utf8(line_bytes) {
+                let trimmed = line.trim_end(); // faster than trim() for typical TSV
+                if trimmed.is_empty() {
+                    return vec![];
+                }
+
+                let mut fields = trimmed.split('\t');
+                let read_id = fields.next().unwrap_or("");
+                let accession = fields.next().unwrap_or("");
+
+                if !read_id.is_empty() && !accession.is_empty() {
+                    // Build the exact string we need, no intermediate String alloc
+                    let mut out = Vec::with_capacity(read_id.len() + accession.len() + 2);
+                    out.extend_from_slice(read_id.as_bytes());
+                    out.push(b'\t');
+                    out.extend_from_slice(accession.as_bytes());
+                    out.push(b'\n');
+                    return vec![out];
+                }
+            }
+            vec![]
+        })
+        .collect()
+}
+
 fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
     let parts: Vec<&str> = line.split('\t').collect();
     if parts.len() >= 3 {

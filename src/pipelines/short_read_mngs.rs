@@ -59,7 +59,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
                           SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters};
-use crate::utils::blast::{parse_m8_batch_to_calls, parse_summary_batch, parse_m8_metrics_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
+use crate::utils::blast::{parse_m8_batch_to_calls, parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
@@ -2879,7 +2879,7 @@ pub async fn generate_taxon_counts(
         summary_stream,
         parse_summary_batch,
         "generate_taxon_counts_summary",
-        16 * 1024 * 1024,
+        8 * 1024 * 1024,
     );
 
     while let Some(item) = summary_batched.next().await {
@@ -3126,13 +3126,22 @@ pub async fn combine_taxon_counts(
 /// Result of hashmap of id:accession
 ///
 async fn collect_m8_to_accession_map(
+    config: Arc<RunConfig>,
     mut m8_stream: ReceiverStream<ParseOutput>,
 ) -> Result<HashMap<String, String>> {
     let mut map: HashMap<String, String> = HashMap::new();
     let mut item_count = 0;
     let start_time = Instant::now();
 
-    while let Some(item) = m8_stream.next().await {
+    let mut batched_stream = batch_rayon_process(
+        config.clone(),
+        m8_stream,
+        parse_m8_acc_batch,
+        "collect_m8_to_accession_map",
+        8 * 1024 * 1024,
+    );
+
+    while let Some(item) = batched_stream.next().await {
         item_count += 1;
         if let ParseOutput::Bytes(bytes) = item {
             let line = String::from_utf8_lossy(&*bytes).to_string();
@@ -5893,7 +5902,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     info!("NT taxon counts: {} entries", nt_counts.len());
 
-    let nt_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_stream)).await?;
+    let nt_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nt_m8_stream)).await?;
 
     // Temporary: Skip Diamond by providing empty outputs
     let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
@@ -5992,7 +6001,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     info!("NR taxon counts: {} entries", nr_counts.len());
 
-    let nr_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_stream)).await?;
+    let nr_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nr_m8_stream)).await?;
 
     let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
     let (_combined_path, write_json_task) = combine_taxon_counts(
@@ -6517,10 +6526,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Build refined accession maps
-    let nt_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nt_m8_map)).await
+    let nt_refined_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nt_m8_map)).await
         .map_err(|e| PipelineError::Other(anyhow!("NT refined accession map failed: {}", e)))?;
 
-    let nr_refined_map = collect_m8_to_accession_map(ReceiverStream::new(nr_m8_map)).await
+    let nr_refined_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nr_m8_map)).await
         .map_err(|e| PipelineError::Other(anyhow!("NR refined accession map failed: {}", e)))?;
 
 
