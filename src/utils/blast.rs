@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::env::args;
 use std::sync::Arc;
 use std::path::PathBuf;
+use std::hash::{BuildHasher, Hash, Hasher};
 use rayon::prelude::*;
 
 use anyhow::{anyhow, Context, Result};
@@ -10,7 +11,7 @@ use log::{self, LevelFilter, debug, info, error, warn};
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
 use fst::Map;
-use ahash::AHashMap;
+use ahash::{AHashMap, RandomState as AHashState};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::fs::File as TokioFile;
@@ -68,6 +69,26 @@ pub struct M8Record {
     pub bitscore: f64,       // Bitscore
     pub qlen: u64,   // Query length: From column in NT; 0 or contig len in NR (unused in NR logic)
     pub slen: u64,   // Subject length: From column in NT; 0 in NR (unused entirely)
+}
+
+//for read-grouped bastching
+#[derive(Debug)]
+pub struct ReducedRead {
+    pub seq: u64,
+    pub dedup: Vec<u8>,
+    pub summary: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct PendingRead {
+    pub read_id: String,
+    pub hits: Vec<M8Record>,
+}
+
+#[derive(Debug)]
+pub enum WorkerMsg {
+    Line { seq: u64, line: Vec<u8> },
+    Flush,
 }
 
 impl M8Record {
@@ -357,113 +378,125 @@ pub fn consensus_level(
     Ok((max_level, consensus_taxid, hits.to_vec()))
 }
 
-pub fn parse_m8_batch_to_calls<F>(
-    batch: Vec<u8>,
+
+
+pub fn read_id_from_m8_line(line: &str) -> Option<&str> {
+    let read_id = line.split('\t').next()?;
+    if read_id.is_empty() { None } else { Some(read_id) }
+}
+
+pub fn shard_for_read_id(read_id: &str, workers: usize) -> usize {
+    let workers = workers.max(1);
+    let state = AHashState::with_seeds(0, 1, 2, 3);
+    let mut hasher = state.build_hasher();
+    read_id.hash(&mut hasher);
+    (hasher.finish() as usize) % workers
+}
+
+pub fn summarize_m8_hits<F>(
+    seq: u64,
+    read_id: String,
+    hits: &[M8Record],
     lineage_map: &AHashMap<Taxid, Lineage>,
     acc2taxid_map: &Map<Vec<u8>>,
     should_keep_filter: &F,
     min_aln_len: u64,
-) -> Vec<Vec<u8>>
+) -> Option<ReducedRead>
 where
     F: Fn(&[i32]) -> bool + Send + Sync,
 {
-    let mut read_groups: AHashMap<String, Vec<M8Record>> = AHashMap::with_capacity(1024);
+    // Preserve existing semantics: ignore short hits, invalid accessions, invalid lineages,
+    // and only keep hits that pass should_keep_filter.
+    let mut valid_hits: Vec<&M8Record> = Vec::with_capacity(hits.len().min(64));
 
-    if let Ok(batch_str) = std::str::from_utf8(&batch) {
-        for line in batch_str.lines() {
-            if line.trim().is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            if let Ok(rec) = M8Record::parse_line_nr(line) {
-                if rec.alen >= min_aln_len {
-                    read_groups.entry(rec.qname.clone()).or_default().push(rec);
-                }
-            }
-        }
-    }
-
-    let mut results = Vec::with_capacity(read_groups.len() * 2);
-
-    for (read_id, hits) in read_groups {
-        let mut valid_hits: Vec<&M8Record> = Vec::with_capacity(hits.len().min(64));
-
-        for hit in &hits {
-            if let Some(taxid_u64) = acc2taxid_map.get(hit.tname.as_bytes()) {
-                let taxid = taxid_u64 as i32;
-                if taxid <= 0 {
-                    continue;
-                }
-
-                let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
-                if !should_keep_filter(&lineage) {
-                    continue;
-                }
-                valid_hits.push(hit);
-            }
-        }
-
-        if valid_hits.is_empty() {
+    for hit in hits {
+        if hit.alen < min_aln_len {
             continue;
         }
 
-        let mut best: Option<&M8Record> = None;
-        let mut max_bitscore = f64::NEG_INFINITY;
-
-        for &h in &valid_hits {
-            if h.bitscore > max_bitscore {
-                max_bitscore = h.bitscore;
-                best = Some(h);
+        if let Some(taxid_u64) = acc2taxid_map.get(hit.tname.as_bytes()) {
+            let taxid = taxid_u64 as i32;
+            if taxid <= 0 {
+                continue;
             }
+
+            let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
+            if !should_keep_filter(&lineage) {
+                continue;
+            }
+
+            valid_hits.push(hit);
         }
-
-        let best = match best {
-            Some(b) => b,
-            None => continue,
-        };
-
-        let dedup_line = format!(
-            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-            best.qname,
-            best.tname,
-            best.pident,
-            best.alen,
-            best.mismatch,
-            best.gapopen,
-            best.qstart,
-            best.qend,
-            best.tstart,
-            best.tend,
-            best.evalue,
-            best.bitscore
-        );
-
-        let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
-
-        // Wrap should_keep_filter to match consensus_level's requirement
-        let wrapped_filter = Arc::new(|l: &[i32]| should_keep_filter(l));
-        let (tax_level, _cons_taxid, consensus_hits) =
-            consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter)
-                .unwrap_or((0, 0, Vec::new()));
-
-        let first_lineage = consensus_hits
-            .first()
-            .and_then(|h| acc2taxid_map.get(h.tname.as_bytes()))
-            .map(|taxid_u64| taxid_u64 as i32)
-            .and_then(|taxid| lineage_map.get(&taxid).cloned())
-            .unwrap_or([-1i32; 3]);
-
-        let summary_line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\n",
-            read_id, best.tname, first_lineage[0], first_lineage[1], first_lineage[2], tax_level
-        );
-
-        results.push(dedup_line.into_bytes());
-        results.push(summary_line.into_bytes());
     }
 
-    results
+    if valid_hits.is_empty() {
+        return None;
+    }
+
+    // Best hit = max bitscore, first seen wins on ties.
+    let mut best: Option<&M8Record> = None;
+    let mut max_bitscore = f64::NEG_INFINITY;
+
+    for &h in &valid_hits {
+        if h.bitscore > max_bitscore {
+            max_bitscore = h.bitscore;
+            best = Some(h);
+        }
+    }
+
+    let best = best?;
+
+    let dedup_line = format!(
+        "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
+        best.qname,
+        best.tname,
+        best.pident,
+        best.alen,
+        best.mismatch,
+        best.gapopen,
+        best.qstart,
+        best.qend,
+        best.tstart,
+        best.tend,
+        best.evalue,
+        best.bitscore
+    )
+        .into_bytes();
+
+    // Keep the same consensus logic as the current code.
+    let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
+    let wrapped_filter = Arc::new(|l: &[i32]| should_keep_filter(l));
+
+    let (tax_level, _cons_taxid, consensus_hits) =
+        consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter)
+            .unwrap_or((0, 0, Vec::new()));
+
+    let first_lineage = consensus_hits
+        .first()
+        .and_then(|h| acc2taxid_map.get(h.tname.as_bytes()))
+        .map(|taxid_u64| taxid_u64 as i32)
+        .and_then(|taxid| lineage_map.get(&taxid).cloned())
+        .unwrap_or([-1i32; 3]);
+
+    let summary_line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\n",
+        read_id,
+        best.tname,
+        first_lineage[0],
+        first_lineage[1],
+        first_lineage[2],
+        tax_level
+    )
+        .into_bytes();
+
+    Some(ReducedRead {
+        seq,
+        dedup: dedup_line,
+        summary: summary_line,
+    })
 }
+
+
 
 pub fn parse_summary_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
     batch
