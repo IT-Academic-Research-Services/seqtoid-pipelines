@@ -5879,13 +5879,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     //write de-interleaved non-host file. easier for the scatter-gather
-    let non_host_deinterleave_task = tokio::spawn(deinterleave_fastq_stream(
+    let (r1_rx, r2_rx_opt, deinterleave_handle) = deinterleave_fastq_stream(
         subsampled_stream,
         paired,
         config.base_buffer_size * 4,
-    ));
-
-    let (r1_rx, r2_rx_opt, deinterleave_handle) = non_host_deinterleave_task.await??;
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e))?;
 
     let non_host_temp_dir = choose_temp_dir(
         config.input_size * 2,
