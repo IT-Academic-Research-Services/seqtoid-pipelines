@@ -7277,140 +7277,168 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Results retrieval
     // *******************
 
-    let raw_count = join_with_error_handling(raw_count_task).await?;
-    info!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
+    // Clone paths needed in multiple concurrent async blocks.
+    let out_dir_host = out_dir.clone();
+    let out_dir_kallisto = out_dir.clone();
 
-    let stats = join_with_error_handling(val_count_task).await?;
-    info!("Processed {} validated, {} undersized, {} oversized reads",
-             stats.validated, stats.undersized, stats.oversized);
+    let validation_and_qc_fut = async move {
+        let raw_count = join_with_error_handling(raw_count_task).await?;
+        info!("Processed {} raw reads (additive from R1 and R2 if paired)", raw_count);
 
-    let _qc_fastp_read_count = match qc_count_result_rx.await {
-        Ok(Ok(count)) => {
-            info!("Received fastp read count: {}", count);
-            count
-        }
-        Ok(Err(e)) => {
-            error!("Error getting fastp read count: {}", e);
-            0
-        }
-        Err(e) => {
-            error!("Count receiver dropped: {}", e);
-            0
-        }
+        let stats = join_with_error_handling(val_count_task).await?;
+        info!(
+        "Processed {} validated, {} undersized, {} oversized reads",
+        stats.validated, stats.undersized, stats.oversized
+    );
+
+        let _qc_fastp_read_count = match qc_count_result_rx.await {
+            Ok(Ok(count)) => {
+                info!("Received fastp read count: {}", count);
+                count
+            }
+            Ok(Err(e)) => {
+                error!("Error getting fastp read count: {}", e);
+                0
+            }
+            Err(e) => {
+                error!("Count receiver dropped: {}", e);
+                0
+            }
+        };
+
+        let ercc_mapped_count = ercc_count_rx
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
+
+        Ok::<_, PipelineError>((raw_count, stats, ercc_mapped_count))
     };
 
+    let host_bam_and_counts_fut = async move {
+        ercc_bt2_bam_write_handle.await??;
+        host_bt2_bam_write_handle.await??;
 
-    let ercc_mapped_count = ercc_count_rx.await
-        .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
+        if let Some(handle) = optional_human_bam_write_handle {
+            handle.await??;
+        }
 
-    ercc_bt2_bam_write_handle.await??;
-    host_bt2_bam_write_handle.await??;
-    if let Some(handle) = optional_human_bam_write_handle {
-        handle.await??;
-    }
-
-    let host_bt2_counts = host_bt2_count_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
-    info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
-
-
-    // insert size, now host BAM written out
-    if paired {
-        info!("Computing host insert size statistics from {}", host_bt2_bam_path.display());
-
-        let stats = compute_insert_size_stats_from_bam(
-            host_bt2_bam_path.clone(),
-            None,
-        )
+        let host_bt2_counts = host_bt2_count_rx
             .await
-            .context("Failed to compute insert size stats")?;
+            .map_err(|e| PipelineError::Other(anyhow!("Host bt2 counts receiver failed: {}", e)))?;
+        info!("Host bt2: mapped counts: {:?}", host_bt2_counts);
 
-        // Write Picard-style metrics file
-        let metrics_path = out_dir.join("host_insert_metrics.txt");
-        let mut f = std::fs::File::create(&metrics_path)
-            .context("Failed to create insert metrics file")?;
+        let host_hisat2_counts = host_hisat2_count_rx
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
+        info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
 
-        writeln!(f, "## METRICS")?;
-        writeln!(f, "MEAN_INSERT_SIZE\t{:.2}", stats.mean)?;
-        writeln!(f, "MEDIAN_INSERT_SIZE\t{:.0}", stats.median)?;
-        writeln!(f, "STANDARD_DEVIATION\t{:.2}", stats.stddev)?;
-        writeln!(f, "TOTAL_PROPER_PAIRS\t{}", stats.total_proper_pairs)?;
-        writeln!(f, "\n## HISTOGRAM\tinsert_size\tcount")?;
-        for &(size, count) in &stats.insert_sizes {
-            writeln!(f, "{}\t{}", size, count)?;
+        if paired {
+            info!(
+            "Computing host insert size statistics from {}",
+            host_bt2_bam_path.display()
+        );
+
+            let stats = compute_insert_size_stats_from_bam(
+                host_bt2_bam_path.clone(),
+                None,
+            )
+                .await
+                .context("Failed to compute insert size stats")?;
+
+            let metrics_path = out_dir_host.join("host_insert_metrics.txt");
+            let mut f = std::fs::File::create(&metrics_path)
+                .context("Failed to create insert metrics file")?;
+
+            writeln!(f, "## METRICS")?;
+            writeln!(f, "MEAN_INSERT_SIZE\t{:.2}", stats.mean)?;
+            writeln!(f, "MEDIAN_INSERT_SIZE\t{:.0}", stats.median)?;
+            writeln!(f, "STANDARD_DEVIATION\t{:.2}", stats.stddev)?;
+            writeln!(f, "TOTAL_PROPER_PAIRS\t{}", stats.total_proper_pairs)?;
+            writeln!(f, "\n## HISTOGRAM\tinsert_size\tcount")?;
+            for &(size, count) in &stats.insert_sizes {
+                writeln!(f, "{}\t{}", size, count)?;
+            }
+
+            let plot_path = out_dir_host.join("host_insert_size_histogram.png");
+            if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
+                warn!("Failed to plot insert size histogram: {}", e);
+            }
+
+            info!(
+            "Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
+            stats.mean, stats.median, stats.total_proper_pairs
+        );
         }
 
-        let plot_path = out_dir.join("host_insert_size_histogram.png");
-        if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
-            warn!("Failed to plot insert size histogram: {}", e);
+        Ok::<_, PipelineError>((host_bt2_counts, host_hisat2_counts))
+    };
+
+    let kallisto_and_taxon_fut = async move {
+        let kallisto_exit = join_with_error_handling(kallisto_exit_task).await;
+        match kallisto_exit {
+            Ok(_) => info!("Kallisto completed successfully"),
+            Err(e) => {
+                warn!("Kallisto failed (non-fatal, possibly no ERCC spiked in): {}", e);
+            }
         }
 
-        info!("Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
-          stats.mean, stats.median, stats.total_proper_pairs);
-    }
+        let kallisto_results_task = kallisto_results(out_dir_kallisto.join("kallisto"), kallisto_ercc_tx)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let host_hisat2_counts = host_hisat2_count_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Host hisat2 counts receiver failed: {}", e)))?;
-    info!("Host hisat2: mapped counts: {:?}", host_hisat2_counts);
+        join_with_error_handling(kallisto_results_task)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?;
 
+        let kallisto_ercc_counts = kallisto_ercc_rx
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
 
-    // Await Kallisto exit and process results. Allow graceful exit even if kallisto finds nothing.
-    // Cannot asusme ERCC's spiked in.
-    let kallisto_exit = join_with_error_handling(kallisto_exit_task).await;
-    match kallisto_exit {
-        Ok(_) => info!("Kallisto completed successfully"),
-        Err(e) => {
-            warn!("Kallisto failed (non-fatal, possibly no ERCC spiked in): {}", e);
+        let kallisto_dir = out_dir_kallisto.join("kallisto");
+        tokio::fs::create_dir_all(&kallisto_dir).await?;
+
+        let abundance_path = kallisto_dir.join("abundance.tsv");
+        let abundance_file = TokioFile::create(&abundance_path).await?;
+        let mut abundance_writer = BufWriter::new(abundance_file);
+
+        abundance_writer
+            .write_all(b"target_id\tlength\teff_length\test_counts\ttpm\n")
+            .await?;
+
+        for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
+            let line = format!("{}\t0\t0\t{:.6}\t0.000000\n", target_id, est_counts);
+            abundance_writer.write_all(line.as_bytes()).await?;
         }
-    }
+        abundance_writer.flush().await?;
+        info!(
+        "Wrote Kallisto abundance.tsv with {} ERCC transcripts",
+        kallisto_ercc_counts.ercc_counts.len()
+    );
 
-    let kallisto_results_task = kallisto_results(out_dir.join("kallisto"), kallisto_ercc_tx)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    join_with_error_handling(kallisto_results_task).await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+        let ercc_path = out_dir_kallisto.join("kallisto_ERCC_counts_tsv");
+        let ercc_file = TokioFile::create(&ercc_path).await?;
+        let mut ercc_writer = BufWriter::new(ercc_file);
 
-    // Collect Kallisto results
-    let kallisto_ercc_counts = kallisto_ercc_rx
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("ERCC counts receiver failed: {}", e)))?;
+        ercc_writer
+            .write_all(b"target_id\test_counts\n")
+            .await?;
 
-    let kallisto_dir = out_dir.join("kallisto");
-    tokio::fs::create_dir_all(&kallisto_dir).await?;
+        for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
+            let line = format!("{}\t{:.6}\n", target_id, est_counts);
+            ercc_writer.write_all(line.as_bytes()).await?;
+        }
+        ercc_writer.flush().await?;
+        info!("Wrote kallisto_ERCC_counts_tsv");
 
-    let abundance_path = kallisto_dir.join("abundance.tsv");
-    let abundance_file = TokioFile::create(&abundance_path).await?;
-    let mut abundance_writer = BufWriter::new(abundance_file);
+        let compute_merged_taxon_result = compute_merged_taxon_handle.await??;
+        Ok::<_, PipelineError>((kallisto_ercc_counts, compute_merged_taxon_result))
+    };
 
-    abundance_writer
-        .write_all(b"target_id\tlength\teff_length\test_counts\ttpm\n")
-        .await?;
-
-    for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
-        let line = format!("{}\t0\t0\t{:.6}\t0.000000\n", target_id, est_counts);
-        abundance_writer.write_all(line.as_bytes()).await?;
-    }
-    abundance_writer.flush().await?;
-    info!("Wrote Kallisto abundance.tsv with {} ERCC transcripts", kallisto_ercc_counts.ercc_counts.len());
-
-    let ercc_path = out_dir.join("kallisto_ERCC_counts_tsv");
-    let ercc_file = TokioFile::create(&ercc_path).await?;
-    let mut ercc_writer = BufWriter::new(ercc_file);
-
-    ercc_writer
-        .write_all(b"target_id\test_counts\n")
-        .await?;
-
-    for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
-        let line = format!("{}\t{:.6}\n", target_id, est_counts);
-        ercc_writer.write_all(line.as_bytes()).await?;
-    }
-    ercc_writer.flush().await?;
-    info!("Wrote kallisto_ERCC_counts_tsv");
-
-    let compute_merged_taxon_result = compute_merged_taxon_handle.await??;
+    let (_validation_and_qc, _host_bam_and_counts, _kallisto_and_taxon) =
+        tokio::try_join!(
+        validation_and_qc_fut,
+        host_bam_and_counts_fut,
+        kallisto_and_taxon_fut
+    )?;
 
     // *******************
     // Cleanup
