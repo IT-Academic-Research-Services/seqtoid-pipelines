@@ -6082,18 +6082,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nt_summary_hit_stream), 0));
 
-    let nt_counts = generate_taxon_counts(
-        config.clone(),
-        ReceiverStream::new(nt_call_stream),
-        ReceiverStream::new(nt_summary_taxon_stream),
-        duplicate_clusters.clone(),
-        should_keep_filter.clone(),
-        "NT".to_string(),
-        None,
-    ).await?;
-    info!("NT taxon counts: {} entries", nt_counts.len());
+    let nt_counts_task = tokio::spawn({
+        let config = config.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        async move {
+            generate_taxon_counts(
+                config,
+                ReceiverStream::new(nt_call_stream),
+                ReceiverStream::new(nt_summary_taxon_stream),
+                duplicate_clusters,
+                should_keep_filter,
+                "NT".to_string(),
+                None,
+            ).await
+        }
+    });
 
-    let nt_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nt_m8_stream)).await?;
+    let nt_map_task = tokio::spawn({
+        let config = config.clone();
+        async move {
+            collect_m8_to_accession_map(config, ReceiverStream::new(nt_m8_stream)).await
+        }
+    });
 
     // Temporary: Skip Diamond by providing empty outputs
     let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
@@ -6182,28 +6193,32 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nr_summary_hit_stream), 0));
 
-    let nr_counts = generate_taxon_counts(
-        config.clone(),
-        ReceiverStream::new(nr_call_stream),
-        ReceiverStream::new(nr_summary_taxon_stream),
-        duplicate_clusters.clone(),
-        should_keep_filter.clone(),
-        "NR".to_string(),
-        None,
-    ).await?;
-    info!("NR taxon counts: {} entries", nr_counts.len());
+    let nr_counts_task = tokio::spawn({
+        let config = config.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        async move {
+            generate_taxon_counts(
+                config,
+                ReceiverStream::new(nr_call_stream),
+                ReceiverStream::new(nr_summary_taxon_stream),
+                duplicate_clusters,
+                should_keep_filter,
+                "NR".to_string(),
+                None,
+            ).await
+        }
+    });
 
-    let nr_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nr_m8_stream)).await?;
+    let nr_map_task = tokio::spawn({
+        let config = config.clone();
+        async move {
+            collect_m8_to_accession_map(config, ReceiverStream::new(nr_m8_stream)).await
+        }
+    });
 
-    let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
-    let (_combined_path, write_json_task) = combine_taxon_counts(
-        &nt_counts,
-        &nr_counts,
-        combined_path,
-    )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
-    cleanup_tasks.push(write_json_task);
+
+
 
     let annot_concurrency = compute_phase_concurrency(
         &config,
@@ -6233,6 +6248,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     } else {
         ReceiverStream::new(r1_stream)
     };
+
+    let (nt_map, nr_map) = tokio::try_join!(
+        async { nt_map_task.await.map_err(|e| PipelineError::Other(anyhow!(e.to_string()))) },
+        async { nr_map_task.await.map_err(|e| PipelineError::Other(anyhow!(e.to_string()))) },
+    )?;
+    let nt_map = nt_map?;
+    let nr_map = nr_map?;
 
     let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) = generate_annotated_fasta_stream(
         config.clone(),
@@ -6488,6 +6510,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     final_temp_dirs.push(nt_ref_fasta_temp_dir);
     final_temp_dirs.push(nr_ref_fasta_temp_dir);
+
+
+    let (nt_counts, nr_counts) = tokio::try_join!(
+        async { nt_counts_task.await.map_err(|e| PipelineError::Other(anyhow!(e.to_string()))) },
+        async { nr_counts_task.await.map_err(|e| PipelineError::Other(anyhow!(e.to_string()))) },
+    )?;
+    let nt_counts = nt_counts?;
+    let nr_counts = nr_counts?;
+
+
+    let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
+    let (_combined_path, write_json_task) = combine_taxon_counts(
+        &nt_counts,
+        &nr_counts,
+        combined_path,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+    cleanup_tasks.push(write_json_task);
+    
 
     let nt_blast_concurrency = compute_phase_concurrency(
         &config,
