@@ -5247,6 +5247,28 @@ pub async fn blast_contigs(
         added_tx,
     ));
 
+    cleanup_tasks.push(update_handle);
+
+    let contig2lineage_task = tokio::spawn(async move {
+        let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
+        let mut lineage_stream = ReceiverStream::new(contig2lineage_rx);
+
+        while let Some(item) = lineage_stream.next().await {
+            let bytes = item.to_bytes()?;
+            let line = String::from_utf8_lossy(&bytes);
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() >= 4 {
+                let contig = fields[0].to_string();
+                let species = fields[1].parse().unwrap_or(0);
+                let genus = fields[2].parse().unwrap_or(0);
+                let family = fields[3].parse().unwrap_or(0);
+                contig2lineage.insert(contig, [species, genus, family]);
+            }
+        }
+
+        Ok::<_, anyhow::Error>(contig2lineage)
+    });
+
     let (refined_m8_local_tx, refined_m8_local_rx) = mpsc::channel(2_000_000);
     let (refined_hit_summary_local_tx, refined_hit_summary_local_rx) = mpsc::channel(2_000_000);
 
@@ -5327,22 +5349,10 @@ pub async fn blast_contigs(
         taxon_count_batch_size
     ));
 
-    update_handle.await??;
 
-    let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
-    let mut lineage_stream = ReceiverStream::new(contig2lineage_rx);
-    while let Some(item) = lineage_stream.next().await {
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() >= 4 {
-            let contig = fields[0].to_string();
-            let species = fields[1].parse().unwrap_or(0);
-            let genus = fields[2].parse().unwrap_or(0);
-            let family = fields[3].parse().unwrap_or(0);
-            contig2lineage.insert(contig, [species, genus, family]);
-        }
-    }
+    let contig2lineage = contig2lineage_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("contig2lineage task panicked: {e}")))??;
 
     let (contig_summary_tx, contig_summary_rx) = mpsc::channel(1024);
     let contig_summary_handle = tokio::spawn(generate_contig_summary_json(
