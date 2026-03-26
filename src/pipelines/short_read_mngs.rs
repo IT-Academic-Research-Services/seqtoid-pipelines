@@ -2608,6 +2608,7 @@ pub async fn call_hits_m8(
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     min_aln_len: u64,
     concurrency: usize,
+    mut tag: String,
 ) -> Result<(
     ReceiverStream<ParseOutput>,
     ReceiverStream<ParseOutput>,
@@ -2833,13 +2834,19 @@ pub async fn call_hits_m8(
     };
     cleanup_tasks.push(merge_handle);
 
+    let dedup_tag = format!("{}.dedup.m8", tag);
+    let summary_tag = format!("{}.summary.txt", tag);
+
     // File writes via t_junction stay unchanged.
     let m8_dedup_file_path = config
         .out_dir
-        .join(rename_file_path(&sample_base_buf, None, Some("dedup.m8"), "_"));
+        .join(rename_file_path(&sample_base_buf, None, Some(&dedup_tag), "_"));
+    info!("what the hell are we calling m8_dedup_file_path {:?} to {:?}", sample_base_buf, m8_dedup_file_path.display());
+
     let summary_file_path = config
         .out_dir
-        .join(rename_file_path(&sample_base_buf, None, Some("summary.txt"), "_"));
+        .join(rename_file_path(&sample_base_buf, None, Some(&summary_tag), "_"));
+    info!("what the hell are we calling summary_file_path{:?} to {:?}", sample_base_buf, summary_file_path.display());
 
     let dedup_stream = ReceiverStream::new(dedup_rx);
     let (mut dedup_branches, dedup_done) = t_junction(
@@ -5603,6 +5610,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd).await?;
     let paired = file2_path.is_some();
 
+    info!("file1 path: {:?}  sample base buf: {:?}", file1_path.display(), sample_base_buf.display());
+
     let seed = config.args.seed.unwrap_or_else(|| {
         let mut bytes = [0u8; 8];
         OsRng.fill_bytes(&mut bytes);
@@ -6025,6 +6034,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         should_keep_filter.clone(),
         36,
         nt_concurrency,
+        "nt".to_string(),
     ).await?;
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
@@ -6124,6 +6134,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         should_keep_filter.clone(),
         0,
         nr_concurrency,
+        "nr".to_string(),
     ).await?;
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
