@@ -6520,15 +6520,31 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_counts = nr_counts?;
 
 
-    let combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("taxon_counts_with_dcr.json"), "_"));
-    let (_combined_path, write_json_task) = combine_taxon_counts(
-        &nt_counts,
-        &nr_counts,
-        combined_path,
-    )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
-    cleanup_tasks.push(write_json_task);
+    let combined_path = out_dir.join(rename_file_path(
+        &sample_base_buf,
+        None,
+        Some("taxon_counts_with_dcr.json"),
+        "_",
+    ));
+
+    let nt_counts_for_combine = nt_counts.clone();
+    let nr_counts_for_combine = nr_counts.clone();
+
+    let combine_handle = tokio::spawn(async move {
+        let (_combined_path, write_json_task) = combine_taxon_counts(
+            &nt_counts_for_combine,
+            &nr_counts_for_combine,
+            combined_path,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+
+        write_json_task
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts write task failed: {}", e)))?
+    });
+
+    cleanup_tasks.push(combine_handle);
     
 
     let nt_blast_concurrency = compute_phase_concurrency(
