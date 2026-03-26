@@ -5990,19 +5990,31 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         )
     });
 
-    let r1_write_task = r1_write_task_fut.await?;
-    let r2_write_task_opt = if let Some(fut) = r2_write_task_fut_opt {
-        Some(fut.await?)
-    } else {
-        None
-    };
-
-    r1_write_task.await??;
-    if let Some(task) = r2_write_task_opt {
-        task.await??;
+    // start both writer tasks concurrently
+    let (r1_write_task, r2_write_task_opt) = tokio::try_join!(
+    r1_write_task_fut,
+    async {
+        match r2_write_task_fut_opt {
+            Some(fut) => fut.await.map(Some),
+            None => Ok(None),
+        }
     }
+)?;
 
-    deinterleave_handle.await??;
+    // then wait for both background writes and deinterleave together
+    tokio::try_join!(
+    async { r1_write_task.await?; Ok::<(), anyhow::Error>(()) },
+    async {
+        if let Some(task) = r2_write_task_opt {
+            task.await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    },
+    async {
+        deinterleave_handle.await?;
+        Ok::<(), anyhow::Error>(())
+    },
+)?;
 
     info!("Checkpoint complete. Files: r1:{:?}   r2:{:?}", non_host_r1_path, non_host_r2_path_opt);
 
@@ -6282,8 +6294,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             collect_m8_to_accession_map(config, ReceiverStream::new(nr_m8_stream)).await
         }
     });
-
-
 
 
     let annot_concurrency = compute_phase_concurrency(
