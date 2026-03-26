@@ -2812,26 +2812,111 @@ pub async fn call_hits_m8(
         let summary_tx = summary_tx.clone();
 
         tokio::spawn(async move {
+            let start_total = Instant::now();
             let mut merged: Vec<ReducedRead> = Vec::new();
 
+            // ─────────────────────────────
+            // Phase 1: receive all batches
+            // ─────────────────────────────
+            let start_recv = Instant::now();
+            let mut batch_count = 0;
+
             while let Some(batch) = results_rx.recv().await {
+                batch_count += 1;
                 merged.extend(batch);
+
+                if batch_count % 50 == 0 {
+                    debug!(
+                    "call_hits_m8 merge: received {} batches ({} items so far)",
+                    batch_count,
+                    merged.len()
+                );
+                }
             }
+
+            debug!(
+            "call_hits_m8 merge: DONE receiving {} batches, {} items in {:?}",
+            batch_count,
+            merged.len(),
+            start_recv.elapsed()
+        );
+
+            // ─────────────────────────────
+            // Phase 2: sort
+            // ─────────────────────────────
+            let start_sort = Instant::now();
 
             merged.sort_unstable_by_key(|r| r.seq);
 
+            debug!(
+            "call_hits_m8 merge: sort complete ({} items) in {:?}",
+            merged.len(),
+            start_sort.elapsed()
+        );
+
+            // ─────────────────────────────
+            // Phase 3: send downstream
+            // ─────────────────────────────
+            let start_send = Instant::now();
+            let mut sent = 0usize;
+
             for item in merged {
-                if dedup_tx.send(ParseOutput::Bytes(Arc::new(item.dedup))).await.is_err() {
+                // measure backpressure per send
+                let send_start = Instant::now();
+
+                if dedup_tx
+                    .send(ParseOutput::Bytes(Arc::new(item.dedup)))
+                    .await
+                    .is_err()
+                {
                     return Err(anyhow!("call_hits_m8: dedup receiver dropped"));
                 }
-                if summary_tx.send(ParseOutput::Bytes(Arc::new(item.summary))).await.is_err() {
+
+                if summary_tx
+                    .send(ParseOutput::Bytes(Arc::new(item.summary)))
+                    .await
+                    .is_err()
+                {
                     return Err(anyhow!("call_hits_m8: summary receiver dropped"));
                 }
+
+                let send_elapsed = send_start.elapsed();
+                sent += 1;
+
+                // log slow sends (backpressure signal)
+                if send_elapsed.as_millis() > 5 {
+                    debug!(
+                    "call_hits_m8 merge: slow send detected ({} ms) at item {}",
+                    send_elapsed.as_millis(),
+                    sent
+                );
+                }
+
+                // periodic progress
+                if sent % 50_000 == 0 {
+                    debug!(
+                    "call_hits_m8 merge: sent {} items so far ({:?})",
+                    sent,
+                    start_send.elapsed()
+                );
+                }
             }
+
+            debug!(
+            "call_hits_m8 merge: DONE sending {} items in {:?}",
+            sent,
+            start_send.elapsed()
+        );
+
+            debug!(
+            "call_hits_m8 merge: TOTAL time {:?}",
+            start_total.elapsed()
+        );
 
             Ok::<(), anyhow::Error>(())
         })
     };
+
     cleanup_tasks.push(merge_handle);
 
     let dedup_tag = format!("{}.dedup.m8", tag);
