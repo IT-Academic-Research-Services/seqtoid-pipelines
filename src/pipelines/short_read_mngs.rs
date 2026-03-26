@@ -6545,7 +6545,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
     cleanup_tasks.push(combine_handle);
-    
+
 
     let nt_blast_concurrency = compute_phase_concurrency(
         &config,
@@ -6625,111 +6625,208 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
+    let nt_post_handle = tokio::spawn({
+        let config = config.clone();
+        async move {
+            let nt_res = nt_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs task panicked: {e}")))??;
 
-    let (nt_res, nr_res) = tokio::try_join!(nt_handle, nr_handle)
-        .map_err(|e| PipelineError::Other(anyhow!("blast_contigs task panicked: {e}")))?;
+            let (
+                nt_read_dict,
+                nt_refined_counts,
+                nt_contig_summary,
+                nt_refined_m8_stream_out,
+                nt_refined_hit_summary_stream_out,
+                nt_refined_m8_top_stream_out,
+                nt_cleanup_tasks,
+                nt_cleanup_receivers,
+                nt_temp_files,
+            ) = nt_res;
 
-    let (nt_read_dict, nt_refined_counts,
-        nt_contig_summary, nt_refined_m8_stream_out,
-        nt_refined_hit_summary_stream_out, nt_refined_m8_top_stream_out,
-        nt_cleanup_tasks, nt_cleanup_receivers,
-        nt_temp_files) = nt_res?;
+            let mut cleanup_tasks = nt_cleanup_tasks;
+            let mut cleanup_receivers = nt_cleanup_receivers;
+            let mut temp_files = nt_temp_files;
 
+            let (nt_m8_streams, nt_m8_rx) = t_junction(
+                ReceiverStream::new(nt_refined_m8_stream_out),
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "nt_m8".to_string(),
+                None,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
+            cleanup_receivers.push(nt_m8_rx);
+
+            let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
+            let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
+                ReceiverStream::new(nt_refined_hit_summary_stream_out),
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "validate_input".to_string(),
+                None,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
+            cleanup_receivers.push(nt_hitsummary_rx);
+
+            let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
+            let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            Ok::<_, PipelineError>((
+                nt_read_dict,
+                nt_refined_counts,
+                nt_contig_summary,
+                nt_m8_merge,
+                nt_m8_map,
+                nt_m8_viz,
+                nt_hit_summary_merge,
+                nt_hit_summary_taxid,
+                nt_hit_summary_coverage,
+                nt_refined_m8_top_stream_out,
+                cleanup_tasks,
+                cleanup_receivers,
+                temp_files,
+            ))
+        }
+    });
+
+    let nr_post_handle = tokio::spawn({
+        let config = config.clone();
+        async move {
+            let nr_res = nr_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs task panicked: {e}")))??;
+
+            let (
+                nr_read_dict,
+                nr_refined_counts,
+                nr_contig_summary,
+                nr_refined_m8_stream_out,
+                nr_refined_hit_summary_stream_out,
+                _nr_refined_m8_top_stream_out,
+                nr_cleanup_tasks,
+                nr_cleanup_receivers,
+                nr_temp_files,
+            ) = nr_res;
+
+            let mut cleanup_tasks = nr_cleanup_tasks;
+            let mut cleanup_receivers = nr_cleanup_receivers;
+            let mut temp_files = nr_temp_files;
+
+            let (nr_m8_streams, nr_m8_rx) = t_junction(
+                ReceiverStream::new(nr_refined_m8_stream_out),
+                2,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "nr_m8".to_string(),
+                None,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
+            cleanup_receivers.push(nr_m8_rx);
+
+            let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
+            let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
+                ReceiverStream::new(nr_refined_hit_summary_stream_out),
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "validate_input".to_string(),
+                None,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
+            cleanup_receivers.push(nr_hitsummary_rx);
+
+            let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
+            let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            Ok::<_, PipelineError>((
+                nr_read_dict,
+                nr_refined_counts,
+                nr_contig_summary,
+                nr_m8_merge,
+                nr_m8_map,
+                nr_hit_summary_merge,
+                nr_hit_summary_preload,
+                nr_hit_summary_taxid,
+                cleanup_tasks,
+                cleanup_receivers,
+                temp_files,
+            ))
+        }
+    });
+
+    let (nt_post_res, nr_post_res) = tokio::join!(nt_post_handle, nr_post_handle);
+
+    let nt_post_res = nt_post_res
+        .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs postprocess task panicked: {e}")))??;
+    let nr_post_res = nr_post_res
+        .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs postprocess task panicked: {e}")))??;
+
+    let (
+        nt_read_dict,
+        nt_refined_counts,
+        nt_contig_summary,
+        nt_m8_merge,
+        nt_m8_map,
+        nt_m8_viz,
+        nt_hit_summary_merge,
+        nt_hit_summary_taxid,
+        nt_hit_summary_coverage,
+        nt_refined_m8_top_stream_out,
+        nt_cleanup_tasks,
+        nt_cleanup_receivers,
+        nt_temp_files,
+    ) = nt_post_res;
     cleanup_tasks.extend(nt_cleanup_tasks);
     cleanup_receivers.extend(nt_cleanup_receivers);
     temp_files.extend(nt_temp_files);
 
-
-    let (nt_m8_streams, nt_m8_rx) = t_junction(
-        ReceiverStream::new(nt_refined_m8_stream_out),
-        3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nt_m8".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(nt_m8_rx);
-
-    let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
-    let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
-        ReceiverStream::new(nt_refined_hit_summary_stream_out),
-        3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "validate_input".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(nt_hitsummary_rx);
-
-    let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
-    let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-
-    let (nr_read_dict, nr_refined_counts,
-        nr_contig_summary, nr_refined_m8_stream_out,
-        nr_refined_hit_summary_stream_out, nr_refined_m8_top_stream_out,
-        nr_cleanup_tasks, nr_cleanup_receivers,
-        nr_temp_files) = nr_res?;
+    let (
+        nr_read_dict,
+        nr_refined_counts,
+        nr_contig_summary,
+        nr_m8_merge,
+        nr_m8_map,
+        nr_hit_summary_merge,
+        nr_hit_summary_preload,
+        nr_hit_summary_taxid,
+        nr_cleanup_tasks,
+        nr_cleanup_receivers,
+        nr_temp_files,
+    ) = nr_post_res;
     cleanup_tasks.extend(nr_cleanup_tasks);
     cleanup_receivers.extend(nr_cleanup_receivers);
     temp_files.extend(nr_temp_files);
 
-
-    let (nr_m8_streams, nr_m8_rx) = t_junction(
-        ReceiverStream::new(nr_refined_m8_stream_out),
-        2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nr_m8".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(nr_m8_rx);
-
-    let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
-    let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-
-    let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
-        ReceiverStream::new(nr_refined_hit_summary_stream_out),
-        3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "validate_input".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(nr_hitsummary_rx);
-
-    let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
-    let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     //prelod
     let mut nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>> = Arc::new(DashMap::with_capacity(80_000_000));
@@ -6795,11 +6892,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Build refined accession maps
-    let nt_refined_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nt_m8_map)).await
-        .map_err(|e| PipelineError::Other(anyhow!("NT refined accession map failed: {}", e)))?;
+    let (nt_refined_map, nr_refined_map) = tokio::try_join!(
+    collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nt_m8_map)),
+    collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nr_m8_map)),
+)
+        .map_err(|e| PipelineError::Other(anyhow!("refined accession map failed: {}", e)))?;
 
-    let nr_refined_map = collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nr_m8_map)).await
-        .map_err(|e| PipelineError::Other(anyhow!("NR refined accession map failed: {}", e)))?;
 
 
     // Contig FASTA stream (from assembly)
