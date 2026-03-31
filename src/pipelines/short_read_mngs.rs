@@ -2660,25 +2660,15 @@ pub async fn call_hits_m8(
                             continue;
                         }
 
-                        // ─── NT / NR parsing switch ───
-                        let rec = match tag.as_str() {
-                            "nt" => match M8Record::parse_line_nt(line_str) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    debug!("Failed to parse NT m8 line: {} — {}", line_str, e);
-                                    continue;
-                                }
-                            },
-                            "nr" => match M8Record::parse_line_nr(line_str) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    debug!("Failed to parse NR m8 line: {} — {}", line_str, e);
-                                    continue;
-                                }
-                            },
-                            other => {
-                                error!("Unknown tag '{}' in call_hits_m8 worker", other);
-                                return Err(anyhow!("Unknown m8 tag: {}", other));
+                        // Both NT (minimap2 → paf2blast6) and NR (diamond) produce standard 12-column m8 files.
+                        // The original Python BlastnOutput6Reader / BlastnOutput6NTRerankedReader always used
+                        // the 12-column parser for both paths. qlen/slen were never present in the real data.
+                        // Using parse_line_nr for both is therefore correct and matches the original results exactly.
+                        let rec = match M8Record::parse_line_nr(line_str) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                debug!("Failed to parse m8 line (12-column): {} — {}", line_str, e);
+                                continue;
                             }
                         };
 
