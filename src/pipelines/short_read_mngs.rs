@@ -3152,12 +3152,15 @@ pub async fn generate_taxon_counts(
     summary_stream: ReceiverStream<ParseOutput>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    count_type: String,               // e.g. "NT"
-    source_count_type: Option<String>,// e.g. "NR" for the other DB
+    count_type: String,                // e.g. "NT"
+    source_count_type: Option<String>, // e.g. "NR" for the other DB
 ) -> Result<Vec<TaxonCount>, PipelineError> {
+    let start_total = Instant::now();
+    debug!("generate_taxon_counts[{}]: start", count_type);
 
     // Expected format (tab-separated):
     // read_id   accession   species   genus   family   level
+    let start_summary = Instant::now();
     let mut read_summaries: HashMap<String, (u8, String, Vec<i32>)> = HashMap::new();
 
     let mut summary_batched = batch_rayon_process(
@@ -3206,11 +3209,17 @@ pub async fn generate_taxon_counts(
         let cleaned = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
         read_summaries.insert(read_id, (level, accession, cleaned));
     }
-    info!("Loaded {} read summaries", read_summaries.len());
 
+    debug!(
+        "generate_taxon_counts[{}]: loaded summaries = {} in {:?}",
+        count_type,
+        read_summaries.len(),
+        start_summary.elapsed()
+    );
 
     // consume the **deduped m8** stream (one line per read)
     // We only need percent-identity, alignment-length and e-value.
+    let start_m8 = Instant::now();
     let mut read_metrics: HashMap<String, (f64, u64, f64)> = HashMap::new();
 
     let mut m8_batched = batch_rayon_process(
@@ -3232,9 +3241,15 @@ pub async fn generate_taxon_counts(
             .map_err(|e| anyhow!("failed to parse m8 line: {}", e))?;
         read_metrics.insert(rec.qname, (rec.pident, rec.alen, rec.evalue));
     }
-    info!("Loaded {} read metrics", read_metrics.len());
 
+    debug!(
+        "generate_taxon_counts[{}]: loaded m8 metrics = {} in {:?}",
+        count_type,
+        read_metrics.len(),
+        start_m8.elapsed()
+    );
 
+    let start_agg = Instant::now();
     let mut aggregation: HashMap<Vec<i32>, AggBucket> = HashMap::new();
     let mut base_count_per_read: HashMap<String, u64> = HashMap::new();
 
@@ -3245,7 +3260,7 @@ pub async fn generate_taxon_counts(
             .unwrap_or(1u64);
 
         // Metrics are guaranteed to exist because the m8 line came from the same read
-        if let Some((pident, alen, mut raw_evalue)) = read_metrics.get(&read_id).cloned() {
+        if let Some((pident, alen, raw_evalue)) = read_metrics.get(&read_id).cloned() {
             if !should_keep_filter(&lineage) {
                 continue;
             }
@@ -3259,7 +3274,6 @@ pub async fn generate_taxon_counts(
             };
             let evalue_log10 = evalue.log10();
 
-
             if level == 1 {
                 base_count_per_read.insert(read_id.clone(), alen * cluster_size);
             }
@@ -3270,8 +3284,8 @@ pub async fn generate_taxon_counts(
                 let bucket = aggregation.entry(agg_key.clone()).or_default();
 
                 bucket.nonunique_count += cluster_size;
-                bucket.unique_count    += 1;
-                bucket.base_count      += *base_count_per_read.get(&read_id).unwrap_or(&0);
+                bucket.unique_count += 1;
+                bucket.base_count += *base_count_per_read.get(&read_id).unwrap_or(&0);
                 bucket.sum_percent_identity += pident;
                 bucket.sum_alignment_length += alen as f64;
                 bucket.sum_e_value += evalue_log10;
@@ -3289,21 +3303,30 @@ pub async fn generate_taxon_counts(
     let mut taxon_counts = Vec::new();
 
     for (mut agg_key, bucket) in aggregation {
-        if bucket.unique_count == 0 { continue; }
+        if bucket.unique_count == 0 {
+            continue;
+        }
 
         // Number of ranks we still have in the key (3 = species, 2 = genus, 1 = family)
         let remaining = agg_key.len() as u8;
-        let tax_level = 4 - remaining;               // 1 = species, 2 = genus, 3 = family
-        let tax_id    = agg_key[0];
+        let tax_level = 4 - remaining; // 1 = species, 2 = genus, 3 = family
+        let tax_id = agg_key[0];
 
         // Helper to pull a rank with a negative fallback
         macro_rules! rank_or_neg {
             ($idx:expr, $neg:expr) => {
-                if tax_level <= $idx { agg_key.get($idx as usize - tax_level as usize).copied().unwrap_or($neg) }
-                else { $neg }
+                if tax_level <= $idx {
+                    agg_key
+                        .get($idx as usize - tax_level as usize)
+                        .copied()
+                        .unwrap_or($neg)
+                } else {
+                    $neg
+                }
             };
         }
-        let genus_taxid  = rank_or_neg!(2, -200);
+
+        let genus_taxid = rank_or_neg!(2, -200);
         let family_taxid = rank_or_neg!(3, -300);
 
         let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
@@ -3315,7 +3338,7 @@ pub async fn generate_taxon_counts(
         let dcr = bucket.nonunique_count as f64 / bucket.unique_count as f64;
         let percent_identity = bucket.sum_percent_identity / bucket.unique_count as f64;
         let alignment_length = bucket.sum_alignment_length / bucket.unique_count as f64;
-        let e_value          = bucket.sum_e_value / bucket.unique_count as f64;
+        let e_value = bucket.sum_e_value / bucket.unique_count as f64;
 
         let source_vec = if bucket.source_count_type.is_empty() {
             None
@@ -3332,7 +3355,7 @@ pub async fn generate_taxon_counts(
             family_taxid,
             count,
             nonunique_count: bucket.nonunique_count,
-            unique_count:    bucket.unique_count,
+            unique_count: bucket.unique_count,
             dcr,
             percent_identity,
             alignment_length,
@@ -3342,6 +3365,19 @@ pub async fn generate_taxon_counts(
             source_count_type: source_vec,
         });
     }
+
+    debug!(
+        "generate_taxon_counts[{}]: aggregation complete = {} taxa in {:?}",
+        count_type,
+        taxon_counts.len(),
+        start_agg.elapsed()
+    );
+
+    debug!(
+        "generate_taxon_counts[{}]: TOTAL {:?}",
+        count_type,
+        start_total.elapsed()
+    );
 
     Ok(taxon_counts)
 }
