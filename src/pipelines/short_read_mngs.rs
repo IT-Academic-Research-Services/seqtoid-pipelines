@@ -2857,8 +2857,7 @@ pub async fn call_hits_m8(
             debug!("call_hits_m8 merge: starting downstream sends");
 
             for item in merged {
-                let send_start = Instant::now();
-
+                let dedup_start = Instant::now();
                 if dedup_tx
                     .send(ParseOutput::Bytes(Arc::new(item.dedup)))
                     .await
@@ -2866,7 +2865,16 @@ pub async fn call_hits_m8(
                 {
                     return Err(anyhow!("call_hits_m8: dedup receiver dropped"));
                 }
+                let dedup_elapsed = dedup_start.elapsed();
+                if dedup_elapsed.as_millis() > 5 {
+                    debug!(
+            "call_hits_m8 merge: slow dedup send at item {} ({} ms)",
+            sent + 1,
+            dedup_elapsed.as_millis()
+        );
+                }
 
+                let summary_start = Instant::now();
                 if summary_tx
                     .send(ParseOutput::Bytes(Arc::new(item.summary)))
                     .await
@@ -2874,26 +2882,23 @@ pub async fn call_hits_m8(
                 {
                     return Err(anyhow!("call_hits_m8: summary receiver dropped"));
                 }
+                let summary_elapsed = summary_start.elapsed();
+                if summary_elapsed.as_millis() > 5 {
+                    debug!(
+            "call_hits_m8 merge: slow summary send at item {} ({} ms)",
+            sent + 1,
+            summary_elapsed.as_millis()
+        );
+                }
 
                 sent += 1;
 
-                let send_elapsed = send_start.elapsed();
-                if send_elapsed.as_millis() > 5 {
-                    slow_send_count += 1;
-                    debug!(
-                    "call_hits_m8 merge: slow send detected at item {} ({} ms, slow count {})",
-                    sent,
-                    send_elapsed.as_millis(),
-                    slow_send_count
-                );
-                }
-
                 if sent % 50_000 == 0 {
                     debug!(
-                    "call_hits_m8 merge: sent {} items so far ({:?})",
-                    sent,
-                    start_send.elapsed()
-                );
+            "call_hits_m8 merge: sent {} items so far ({:?})",
+            sent,
+            start_send.elapsed()
+        );
                 }
             }
 
