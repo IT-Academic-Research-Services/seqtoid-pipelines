@@ -933,6 +933,7 @@ pub async fn compute_merged_taxon_counts(
             &merged_taxon_counts_path_clone,
             ReceiverStream::new(json_rx),
             Some(config_clone.base_buffer_size),
+            "compute_merged_taxon_counts"
         ).await
     });
 

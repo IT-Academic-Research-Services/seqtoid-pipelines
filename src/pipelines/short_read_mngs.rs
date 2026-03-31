@@ -380,6 +380,7 @@ async fn validate_input(
         &validated_interleaved_file_path,
         ReceiverStream::new(val_file_stream),
         Some(config.base_buffer_size),
+        "validate_input",
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -567,6 +568,7 @@ async fn bowtie2_filter(
             &output_bam_path_for_write,
             ReceiverStream::new(bam_file_stream),
             Some(config_for_write.base_buffer_size),
+            "bowtie2_filter_bam"
         )
             .await
             .map_err(|e| anyhow!("Failed to write BAM file {}: {}", output_bam_path_for_write.display(), e))?;
@@ -717,6 +719,7 @@ async fn hisat2_filter(
         &r1_path,
         ReceiverStream::new(r1_rx),
         Some(config.base_buffer_size),
+        "hisat2_filter_r1"
     ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(r1_write_task);
 
@@ -726,6 +729,7 @@ async fn hisat2_filter(
             &r2_path,
             ReceiverStream::new(r2_rx_opt.unwrap()),
             Some(config.base_buffer_size),
+            "hisat2_filter_r2"
         ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
         cleanup_tasks.push(r2_write_task);
         Some(r2_path)
@@ -1530,6 +1534,7 @@ async fn minimap2_filter(
             &bam_path,
             ReceiverStream::new(stream),
             Some(config.base_buffer_size),
+            "mm2_filter_bam"
         )
             .await
             .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -2495,6 +2500,7 @@ pub async fn paf_to_m8(
         &m8_path,
         ReceiverStream::new(file_stream),
         Some(config.base_buffer_size),
+        "paf_to_m8_m8",
     )
         .await?;
 
@@ -2806,15 +2812,53 @@ pub async fn call_hits_m8(
         let summary_tx = summary_tx.clone();
 
         tokio::spawn(async move {
+            let start_total = Instant::now();
             let mut merged: Vec<ReducedRead> = Vec::new();
 
+            debug!("call_hits_m8 merge: waiting for worker batches");
+
+            let start_recv = Instant::now();
+            let mut batch_count = 0usize;
+
             while let Some(batch) = results_rx.recv().await {
+                batch_count += 1;
+                let batch_len = batch.len();
                 merged.extend(batch);
+
+                if batch_count == 1 || batch_count % 10 == 0 {
+                    debug!(
+                    "call_hits_m8 merge: received batch {} ({} items total, last batch {} items)",
+                    batch_count,
+                    merged.len(),
+                    batch_len
+                );
+                }
             }
 
+            debug!(
+            "call_hits_m8 merge: DONE receiving {} batches, {} items in {:?}",
+            batch_count,
+            merged.len(),
+            start_recv.elapsed()
+        );
+
+            let start_sort = Instant::now();
             merged.sort_unstable_by_key(|r| r.seq);
+            debug!(
+            "call_hits_m8 merge: sort complete ({} items) in {:?}",
+            merged.len(),
+            start_sort.elapsed()
+        );
+
+            let start_send = Instant::now();
+            let mut sent = 0usize;
+            let mut slow_send_count = 0usize;
+
+            debug!("call_hits_m8 merge: starting downstream sends");
 
             for item in merged {
+                let send_start = Instant::now();
+
                 if dedup_tx
                     .send(ParseOutput::Bytes(Arc::new(item.dedup)))
                     .await
@@ -2830,7 +2874,40 @@ pub async fn call_hits_m8(
                 {
                     return Err(anyhow!("call_hits_m8: summary receiver dropped"));
                 }
+
+                sent += 1;
+
+                let send_elapsed = send_start.elapsed();
+                if send_elapsed.as_millis() > 5 {
+                    slow_send_count += 1;
+                    debug!(
+                    "call_hits_m8 merge: slow send detected at item {} ({} ms, slow count {})",
+                    sent,
+                    send_elapsed.as_millis(),
+                    slow_send_count
+                );
+                }
+
+                if sent % 50_000 == 0 {
+                    debug!(
+                    "call_hits_m8 merge: sent {} items so far ({:?})",
+                    sent,
+                    start_send.elapsed()
+                );
+                }
             }
+
+            debug!(
+            "call_hits_m8 merge: DONE sending {} items in {:?} ({} slow sends)",
+            sent,
+            start_send.elapsed(),
+            slow_send_count
+        );
+
+            debug!(
+            "call_hits_m8 merge: TOTAL time {:?}",
+            start_total.elapsed()
+        );
 
             Ok::<(), anyhow::Error>(())
         })
@@ -2845,20 +2922,21 @@ pub async fn call_hits_m8(
         .out_dir
         .join(rename_file_path(&sample_base_buf, None, Some(&dedup_tag), "_"));
     info!(
-        "what the hell are we calling m8_dedup_file_path {:?} to {:?}",
-        sample_base_buf,
-        m8_dedup_file_path.display()
-    );
+    "what the hell are we calling m8_dedup_file_path {:?} to {:?}",
+    sample_base_buf,
+    m8_dedup_file_path.display()
+);
 
     let summary_file_path = config
         .out_dir
         .join(rename_file_path(&sample_base_buf, None, Some(&summary_tag), "_"));
     info!(
-        "what the hell are we calling summary_file_path{:?} to {:?}",
-        sample_base_buf,
-        summary_file_path.display()
-    );
+    "what the hell are we calling summary_file_path{:?} to {:?}",
+    sample_base_buf,
+    summary_file_path.display()
+);
 
+    debug!("call_hits_m8_dedup: setting up junction and file writer");
     let dedup_stream = ReceiverStream::new(dedup_rx);
     let (mut dedup_branches, dedup_done) = t_junction(
         dedup_stream,
@@ -2877,15 +2955,18 @@ pub async fn call_hits_m8(
     let dedup_main = dedup_branches.remove(0);
     let dedup_file_stream = dedup_branches.remove(0);
 
+    debug!("call_hits_m8_dedup: main branch handed off; file branch starting");
     let call_file_write_task = write_byte_stream_to_file(
         &m8_dedup_file_path,
         ReceiverStream::new(dedup_file_stream),
         Some(config.base_buffer_size),
+        "call_hits_m8_dedup"
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(call_file_write_task);
 
+    debug!("call_hits_m8_summary: setting up junction and file writer");
     let summary_stream = ReceiverStream::new(summary_rx);
     let (mut summary_branches, summary_done) = t_junction(
         summary_stream,
@@ -2904,10 +2985,12 @@ pub async fn call_hits_m8(
     let summary_main = summary_branches.remove(0);
     let summary_file_stream = summary_branches.remove(0);
 
+    debug!("call_hits_m8_summary: main branch handed off; file branch starting");
     let summary_file_write_task = write_byte_stream_to_file(
         &summary_file_path,
         ReceiverStream::new(summary_file_stream),
         Some(config.base_buffer_size),
+        "call_hits_m8_summary"
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -4006,6 +4089,7 @@ pub async fn process_assembly(
         &sam_path,
         ReceiverStream::new(bam_for_file),
         Some(config.base_buffer_size),
+        "process_assembly"
     )
         .await?;
     cleanup_tasks.push(write_sam_task);
@@ -5603,7 +5687,7 @@ pub async fn generate_nonhost_fastq_from_files(
     )?;
     let r1_input_stream = ReceiverStream::new(r1_rx);
     let r1_filtered = filter_fastq_to_bytes_stream(r1_input_stream, r1_headers).await;
-    let write_r1 = write_byte_stream_to_file(&out_r1, r1_filtered, Some(config.base_buffer_size)).await?;
+    let write_r1 = write_byte_stream_to_file(&out_r1, r1_filtered, Some(config.base_buffer_size), "nonhost_r1").await?;
 
     // Stream and filter R2 if present
     let write_r2 = if let (Some(r2_path), Some(r2_headers)) = (original_r2_path, r2_headers) {
@@ -5618,7 +5702,7 @@ pub async fn generate_nonhost_fastq_from_files(
         )?;
         let r2_input_stream = ReceiverStream::new(r2_rx);
         let r2_filtered = filter_fastq_to_bytes_stream(r2_input_stream, r2_headers).await;
-        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_filtered, Some(config.base_buffer_size)).await?)
+        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_filtered, Some(config.base_buffer_size), "nonhost_r2").await?)
     } else {
         None
     };

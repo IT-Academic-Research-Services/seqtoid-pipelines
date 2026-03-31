@@ -622,51 +622,84 @@ pub async fn write_byte_stream_to_file(
     output_path: &PathBuf,
     mut input_stream: ReceiverStream<ParseOutput>,
     buffer_size: Option<usize>,
+    tag: &str,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
     let output_path_clone = output_path.clone();
+    let tag = tag.to_string();
 
     let task = tokio::spawn(async move {
+        debug!("[{}] writer: START {}", tag, output_path_clone.display());
+
         let file = TokioFile::create(&output_path_clone)
             .await
             .map_err(|e| anyhow!("Failed to create output file at {}: {}",
                                output_path_clone.display(), e))?;
+
         let mut writer = BufWriter::with_capacity(buffer_capacity, file);
         let mut stream = input_stream;
+
         let mut total_bytes = 0u64;
+        let mut item_count = 0usize;
+        let mut first = true;
 
         while let Some(item) = stream.next().await {
             match item {
                 ParseOutput::Bytes(bytes) => {
+                    if first {
+                        debug!("[{}] writer: FIRST CHUNK ({} bytes)", tag, bytes.len());
+                        first = false;
+                    }
+
                     writer.write_all(&bytes)
                         .await
                         .map_err(|e| anyhow!("Failed to write to {}: {}",
                                            output_path_clone.display(), e))?;
+
                     total_bytes += bytes.len() as u64;
+                    item_count += 1;
+
+                    if item_count % 50_000 == 0 {
+                        debug!(
+                            "[{}] writer: progress {} items, {} bytes",
+                            tag,
+                            item_count,
+                            total_bytes
+                        );
+                    }
                 }
                 _ => {
-                    // Log unexpected non-Bytes items but continue
-                    warn!("write_byte_stream_to_file: Skipping non-Bytes item for {}",
-                              output_path_clone.display());
+                    warn!(
+                        "[{}] writer: Skipping non-Bytes item for {}",
+                        tag,
+                        output_path_clone.display()
+                    );
                 }
             }
         }
+
+        debug!("[{}] writer: STREAM CLOSED after {} items", tag, item_count);
 
         writer.flush()
             .await
             .map_err(|e| anyhow!("Failed to flush {}: {}",
                                output_path_clone.display(), e))?;
+
         writer.shutdown()
             .await
             .map_err(|e| anyhow!("Failed to shutdown {}: {}",
                                output_path_clone.display(), e))?;
 
         if total_bytes == 0 {
-            warn!("No bytes written to file at {}", output_path_clone.display());
+            warn!("[{}] writer: No bytes written to {}", tag, output_path_clone.display());
         }
 
-        debug!("write_byte_stream_to_file: Wrote {} bytes to {}",
-                  total_bytes, output_path_clone.display());
+        debug!(
+            "[{}] writer: DONE {} bytes ({} items)",
+            tag,
+            total_bytes,
+            item_count
+        );
 
         Ok(())
     });
