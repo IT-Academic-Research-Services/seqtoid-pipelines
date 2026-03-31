@@ -6274,6 +6274,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
+    info!("nt_call t_junction completed - 3 branches created. Starting consumers...");
+
+    let nt_call_stream = monitor_stream(
+        ReceiverStream::new(nt_call_stream),
+        "nt_call_stream_to_taxon_counts",
+        Duration::from_secs(10),   // log every 10s
+    );
+
+    let nt_m8_stream = monitor_stream(
+        ReceiverStream::new(nt_m8_stream),
+        "nt_m8_stream_to_accession_map",
+        Duration::from_secs(10),
+    );
+
+    let nt_blast_stream = monitor_stream(
+        ReceiverStream::new(nt_blast_stream),
+        "nt_blast_stream_to_blast_contigs",
+        Duration::from_secs(15),
+    );
+
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
         call_summary_stream,
         4,
@@ -6294,7 +6314,42 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nt_summary_hit_stream), 0));
+
+    let nt_summary_taxon_stream = monitor_stream(
+        ReceiverStream::new(nt_summary_taxon_stream),
+        "nt_summary_taxon_stream_to_generate_taxon_counts",
+        Duration::from_secs(10),
+    );
+
+    let nt_summary_hit_stream = monitor_stream(
+        ReceiverStream::new(nt_summary_hit_stream),
+        "nt_summary_hit_stream_to_summarize_hits",
+        Duration::from_secs(10),
+    );
+
+    let nt_initial_stream = monitor_stream(
+        ReceiverStream::new(nt_initial_stream),
+        "nt_initial_stream_to_initial_taxid_fasta",
+        Duration::from_secs(15),
+    );
+
+    let nt_blast_hit_stream = monitor_stream(
+        ReceiverStream::new(nt_blast_hit_stream),
+        "nt_blast_hit_stream_to_blast_contigs",
+        Duration::from_secs(15),
+    );
+
+    info!("nt_summary t_junction completed - 4 branches created");
+
+    // Before launching any heavy downstream tasks
+    info!("Launching downstream consumers for NT results:");
+    info!("  → nt_call_stream (to generate_taxon_counts + nt_map_task)");
+    info!("  → nt_m8_stream (to collect_m8_to_accession_map)");
+    info!("  → nt_blast_stream (to blast_contigs later)");
+    info!("  → nt_summary_hit_stream (to summarize_hits)");
+    info!("  → nt_summary_taxon_stream (to generate_taxon_counts)");
+
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), nt_summary_hit_stream, 0));
 
     let nt_counts_task = tokio::spawn({
         let config = config.clone();
@@ -6303,8 +6358,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         async move {
             generate_taxon_counts(
                 config,
-                ReceiverStream::new(nt_call_stream),
-                ReceiverStream::new(nt_summary_taxon_stream),
+                nt_call_stream,
+                nt_summary_taxon_stream,
                 duplicate_clusters,
                 should_keep_filter,
                 "NT".to_string(),
@@ -6316,7 +6371,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_map_task = tokio::spawn({
         let config = config.clone();
         async move {
-            collect_m8_to_accession_map(config, ReceiverStream::new(nt_m8_stream)).await
+            collect_m8_to_accession_map(config, nt_m8_stream).await
         }
     });
 
@@ -6781,8 +6836,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             blast_contigs(
                 config,
                 NT_TAG,
-                ReceiverStream::new(nt_blast_stream),
-                ReceiverStream::new(nt_blast_hit_stream),
+                nt_blast_stream,
+                nt_blast_hit_stream,
                 nt_read_dict.clone(),
                 nt_accession_dict,
                 nt_counts,
@@ -7252,7 +7307,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(initial_annotated_taxon_stream),
         ReceiverStream::new(initial_unidentified_taxon_stream),
-        ReceiverStream::new(nt_initial_stream),
+        nt_initial_stream,
         ReceiverStream::new(nr_initial_stream),
         lineage_map.clone(),
     )
