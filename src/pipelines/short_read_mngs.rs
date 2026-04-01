@@ -2978,57 +2978,50 @@ async fn diamond_non_host_align(
 /// vector of taxon counts
 pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
-    m8_stream: ReceiverStream<ParseOutput>,
-    summary_stream: ReceiverStream<ParseOutput>,
+    m8_stream: ReceiverStream<ParseOutput>,      // deduped m8 (12-column)
+    summary_stream: ReceiverStream<ParseOutput>, // hitsummary.tab
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    count_type: String,                // e.g. "NT"
-    source_count_type: Option<String>, // e.g. "NR" for the other DB
+    count_type: String,                          // "NT", "NR", or "merged_NT_NR"
+    source_count_type: Option<String>,           // optional source tag
 ) -> Result<Vec<TaxonCount>, PipelineError> {
+
     let start_total = Instant::now();
-    debug!("generate_taxon_counts[{}]: start", count_type);
+    debug!("generate_taxon_counts[{}]: starting single-pass streaming aggregation", count_type);
 
-    // Expected format (tab-separated):
-    // read_id   accession   species   genus   family   level
-    let start_summary = Instant::now();
-    let mut read_summaries: HashMap<String, (u8, String, Vec<i32>)> = HashMap::new();
+    // Direct aggregation by cleaned lineage key (exactly like original Python)
+    let mut aggregation: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
 
-    let mut summary_batched = batch_rayon_process(
-        config.clone(),
-        summary_stream,
-        parse_summary_batch,
-        "generate_taxon_counts_summary",
-        8 * 1024 * 1024,
-    );
+    let mut summary_iter = summary_stream;
+    let mut m8_iter = m8_stream;
 
-    while let Some(item) = summary_batched.next().await {
-        let line = match item {
-            ParseOutput::Bytes(b) => {
-                let s = String::from_utf8(b.to_vec())
-                    .map_err(|e| PipelineError::Other(anyhow!("UTF-8 error: {}", e)))?;
-                let s = s.trim_end();
-                if s.is_empty() || s.starts_with('#') {
-                    continue;
-                }
-                s.to_string()
-            }
-            _ => continue,
+    let mut paired_count = 0usize;
+
+    while let (Some(summary_item), Some(m8_item)) = (summary_iter.next().await, m8_iter.next().await) {
+        paired_count += 1;
+
+        // --- Parse summary line ---
+        let summary_line = match summary_item.to_bytes() {
+            Ok(b) => String::from_utf8_lossy(&b).trim_end().to_string(),
+            Err(_) => continue,
         };
-
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() != 6 {
-            warn!("Skipping malformed summary line (expected 6 cols): {}", line);
+        if summary_line.is_empty() || summary_line.starts_with('#') {
             continue;
         }
 
-        let read_id = cols[0].to_string();
-        let accession = cols[1].to_string();
+        let cols: Vec<&str> = summary_line.split('\t').collect();
+        if cols.len() != 6 {
+            warn!("Malformed summary line (expected 6 cols): {}", summary_line);
+            continue;
+        }
+
+        let read_id = cols[0];
+        let level: u8 = cols[5].parse().unwrap_or(0);
         let species: i32 = cols[2].parse().unwrap_or(0);
         let genus: i32 = cols[3].parse().unwrap_or(0);
         let family: i32 = cols[4].parse().unwrap_or(0);
-        let level: u8 = cols[5].parse().unwrap_or(0);
 
-        let consensus_taxid: i32 = match level {
+        let consensus_taxid = match level {
             1 => species,
             2 => genus,
             3 => family,
@@ -3036,128 +3029,84 @@ pub async fn generate_taxon_counts(
         };
 
         let raw_lineage = vec![species, genus, family];
-        let cleaned = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
-        read_summaries.insert(read_id, (level, accession, cleaned));
-    }
+        let cleaned_lineage = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
 
-    debug!(
-        "generate_taxon_counts[{}]: loaded summaries = {} in {:?}",
-        count_type,
-        read_summaries.len(),
-        start_summary.elapsed()
-    );
+        if !should_keep_filter(&cleaned_lineage) {
+            continue;
+        }
 
-    // consume the **deduped m8** stream (one line per read)
-    // We only need percent-identity, alignment-length and e-value.
-    let start_m8 = Instant::now();
-    let mut read_metrics: HashMap<String, (f64, u64, f64)> = HashMap::new();
-
-    let mut m8_batched = batch_rayon_process(
-        config.clone(),
-        m8_stream,
-        parse_m8_metrics_batch,
-        "generate_taxon_counts_m8",
-        16 * 1024 * 1024,
-    );
-
-    while let Some(item) = m8_batched.next().await {
-        let line = match item {
-            ParseOutput::Bytes(b) => String::from_utf8(b.to_vec())
-                .map_err(|e| anyhow!("m8 line not UTF-8: {}", e))?,
-            _ => continue,
+        // --- Parse corresponding m8 line (12-column) ---
+        let m8_line = match m8_item.to_bytes() {
+            Ok(b) => String::from_utf8_lossy(&b).trim_end().to_string(),
+            Err(_) => continue,
         };
 
-        let rec = M8Record::parse_line_nr(&line)
-            .map_err(|e| anyhow!("failed to parse m8 line: {}", e))?;
-        read_metrics.insert(rec.qname, (rec.pident, rec.alen, rec.evalue));
-    }
-
-    debug!(
-        "generate_taxon_counts[{}]: loaded m8 metrics = {} in {:?}",
-        count_type,
-        read_metrics.len(),
-        start_m8.elapsed()
-    );
-
-    let start_agg = Instant::now();
-    let mut aggregation: HashMap<Vec<i32>, AggBucket> = HashMap::new();
-    let mut base_count_per_read: HashMap<String, u64> = HashMap::new();
-
-    for (read_id, (level, _accession, lineage)) in read_summaries {
-        let cluster_size = duplicate_clusters
-            .get(&read_id)
-            .map(|entry| entry.value().size)
-            .unwrap_or(1u64);
-
-        // Metrics are guaranteed to exist because the m8 line came from the same read
-        if let Some((pident, alen, raw_evalue)) = read_metrics.get(&read_id).cloned() {
-            if !should_keep_filter(&lineage) {
+        let rec = match M8Record::parse_line_nr(&m8_line) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Failed to parse m8 line for read {}: {}", read_id, e);
                 continue;
             }
+        };
 
-            let evalue = if raw_evalue <= 0.0 || !raw_evalue.is_finite() {
-                MIN_NORMAL_POSITIVE_DOUBLE
-            } else if raw_evalue <= MIN_NORMAL_POSITIVE_DOUBLE {
-                MIN_NORMAL_POSITIVE_DOUBLE
-            } else {
-                raw_evalue
-            };
-            let evalue_log10 = evalue.log10();
+        let cluster_size = duplicate_clusters
+            .get(read_id)
+            .map(|e| e.value().size)
+            .unwrap_or(1u64);
 
-            if level == 1 {
-                base_count_per_read.insert(read_id.clone(), alen * cluster_size);
+        let evalue_log10 = if rec.evalue <= 0.0 || !rec.evalue.is_finite() {
+            MIN_NORMAL_POSITIVE_DOUBLE.log10()
+        } else {
+            rec.evalue.log10()
+        };
+
+        // --- Aggregate (walk lineage upward) ---
+        let mut agg_key = cleaned_lineage.clone();
+        while !agg_key.is_empty() {
+            let bucket = aggregation.entry(agg_key.clone()).or_default();
+
+            bucket.nonunique_count += cluster_size;
+            bucket.unique_count += 1;
+            bucket.base_count += rec.alen * cluster_size;           // base_count = alignment length * cluster size
+            bucket.sum_percent_identity += rec.pident;
+            bucket.sum_alignment_length += rec.alen as f64;
+            bucket.sum_e_value += evalue_log10;
+
+            if let Some(src) = &source_count_type {
+                bucket.source_count_type.insert(src.clone());
             }
 
-            // walk the lineagerootward
-            let mut agg_key = lineage.clone();
-            while !agg_key.is_empty() {
-                let bucket = aggregation.entry(agg_key.clone()).or_default();
-
-                bucket.nonunique_count += cluster_size;
-                bucket.unique_count += 1;
-                bucket.base_count += *base_count_per_read.get(&read_id).unwrap_or(&0);
-                bucket.sum_percent_identity += pident;
-                bucket.sum_alignment_length += alen as f64;
-                bucket.sum_e_value += evalue_log10;
-
-                if let Some(src) = &source_count_type {
-                    bucket.source_count_type.insert(src.clone());
-                }
-
-                // chop the leafward rank
-                agg_key.remove(0);
-            }
+            agg_key.remove(0);   // remove leafward rank
         }
     }
 
-    let mut taxon_counts = Vec::new();
+    debug!(
+        "generate_taxon_counts[{}]: processed {} paired records in {:?}",
+        count_type, paired_count, start_total.elapsed()
+    );
 
-    for (mut agg_key, bucket) in aggregation {
+    // --- Build final TaxonCount list ---
+    let mut taxon_counts = Vec::with_capacity(aggregation.len());
+
+    for (agg_key, bucket) in aggregation {
         if bucket.unique_count == 0 {
             continue;
         }
 
-        // Number of ranks we still have in the key (3 = species, 2 = genus, 1 = family)
         let remaining = agg_key.len() as u8;
-        let tax_level = 4 - remaining; // 1 = species, 2 = genus, 3 = family
+        let tax_level = 4 - remaining;                     // 1=species, 2=genus, 3=family
         let tax_id = agg_key[0];
 
-        // Helper to pull a rank with a negative fallback
-        macro_rules! rank_or_neg {
-            ($idx:expr, $neg:expr) => {
-                if tax_level <= $idx {
-                    agg_key
-                        .get($idx as usize - tax_level as usize)
-                        .copied()
-                        .unwrap_or($neg)
-                } else {
-                    $neg
-                }
-            };
-        }
-
-        let genus_taxid = rank_or_neg!(2, -200);
-        let family_taxid = rank_or_neg!(3, -300);
+        let genus_taxid = if tax_level <= 2 {
+            *agg_key.get(agg_key.len().saturating_sub(2)).unwrap_or(&-200)
+        } else {
+            -200
+        };
+        let family_taxid = if tax_level <= 3 {
+            *agg_key.get(agg_key.len().saturating_sub(3)).unwrap_or(&-300)
+        } else {
+            -300
+        };
 
         let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
             bucket.nonunique_count
@@ -3173,7 +3122,7 @@ pub async fn generate_taxon_counts(
         let source_vec = if bucket.source_count_type.is_empty() {
             None
         } else {
-            let mut v: Vec<String> = bucket.source_count_type.into_iter().collect();
+            let mut v: Vec<_> = bucket.source_count_type.into_iter().collect();
             v.sort_unstable();
             Some(v)
         };
@@ -3197,15 +3146,10 @@ pub async fn generate_taxon_counts(
     }
 
     debug!(
-        "generate_taxon_counts[{}]: aggregation complete = {} taxa in {:?}",
+        "generate_taxon_counts[{}]: final aggregation produced {} taxa in {:?} (total time {:?})",
         count_type,
         taxon_counts.len(),
-        start_agg.elapsed()
-    );
-
-    debug!(
-        "generate_taxon_counts[{}]: TOTAL {:?}",
-        count_type,
+        start_total.elapsed(),
         start_total.elapsed()
     );
 
