@@ -3265,6 +3265,97 @@ async fn collect_m8_to_accession_map(
 }
 
 
+/// Conurrently generates small accession map contianing only the assembled contigs
+///
+/// # Arguments
+///
+/// * `summary_stream` -stream from hit summary
+///
+/// # Returns
+/// Result of ahashmap of id:accession
+///
+/// Concurrent collector: hit-summary stream → tiny contig_id → best_accession map
+/// Final map merge is offloaded to spawn_blocking (exactly as you requested).
+pub async fn collect_hit_summary_to_accession_map_concurrent(
+    config: Arc<RunConfig>,
+    mut summary_stream: ReceiverStream<ParseOutput>,
+) -> Result<AHashMap<String, String>> {
+    let concurrency = compute_phase_concurrency(&config, "accession_map_final_merge", 0.2, 4.0, 32, 4);
+    let batch_size = compute_batch_size(None, 1024, 512, concurrency);
+
+    let (job_tx, job_rx) = mpsc::channel::<Vec<Vec<u8>>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = shared_rx.clone();
+        let handle = tokio::spawn(async move {
+            let mut partial = AHashMap::with_capacity(batch_size);
+            while let Some(batch) = {
+                let mut g = rx.lock().await;
+                g.recv().await
+            } {
+                let lines: Vec<(String, String)> = batch
+                    .par_iter()
+                    .filter_map(|bytes| {
+                        let line = String::from_utf8_lossy(bytes).trim_end().to_string();
+                        if line.is_empty() { return None; }
+                        let fields: Vec<&str> = line.split('\t').collect();
+                        if fields.len() < 2 { return None; }
+                        Some((fields[0].to_string(), fields[1].to_string()))
+                    })
+                    .collect();
+                for (k, v) in lines {
+                    partial.insert(k, v);
+                }
+            }
+            Ok::<AHashMap<String, String>, anyhow::Error>(partial)
+        });
+        worker_handles.push(handle);
+    }
+
+    // Producer
+    let producer = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(batch_size);
+        while let Some(item) = summary_stream.next().await {
+            if let ParseOutput::Bytes(b) = item {
+                batch.push(b.to_vec());
+                if batch.len() >= batch_size {
+                    if job_tx.send(std::mem::take(&mut batch)).await.is_err() { break; }
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let _ = job_tx.send(batch).await;
+        }
+        drop(job_tx);
+        Ok::<(), anyhow::Error>(())
+    });
+
+    // Await all workers FIRST (in async context)
+    let mut partial_maps = Vec::with_capacity(worker_handles.len());
+    for handle in worker_handles {
+        let partial = handle.await
+            .map_err(|e| anyhow!("Worker task panicked: {}", e))??;
+        partial_maps.push(partial);
+    }
+
+    // FINAL MERGE OFFLOADED TO spawn_blocking
+    let map = tokio::task::spawn_blocking(move || {
+        let mut final_map = AHashMap::with_capacity(2_500_000);
+        for partial in partial_maps {
+            final_map.extend(partial);
+        }
+        final_map
+    }).await
+        .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
+
+    producer.await??;
+
+    info!("collect_hit_summary_to_accession_map_concurrent → {} entries (tiny contig map, final merge in spawn_blocking)", map.len());
+    Ok(map)
+}
+
 /// Generates an annotated FASTA using deduped stream from  dedup_and_subsample
 /// and the full duplicate cluster size stream
 ///
