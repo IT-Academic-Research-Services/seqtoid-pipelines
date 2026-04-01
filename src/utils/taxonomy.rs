@@ -684,7 +684,12 @@ pub async fn get_top_m8_nr(
 // *******************
 
 /// Validates and cleans a taxonomic lineage
-/// /// # Arguments
+/// Matches the CZI lineage.validate_taxid_lineage  for 3-rank case
+/// (species, genus, family).
+///
+/// - Levels below the consensus hit_level get artificial negative taxids.
+/// - Levels at/above consensus keep real taxid if present, else get negative fallback
+/// # Arguments
 /// * `lineage`  lineage from taxdump (species, genus, family, ... root). May contain 0s or gaps.
 /// * `hit_taxid`   - The taxid at the level where consensus was reached
 /// * `hit_level`   - 1: species, 2: genus, 3: family
@@ -693,39 +698,44 @@ pub async fn get_top_m8_nr(
 /// # Returns
 /// Validayte lineage vector with negtive taxids by converntion for no hit at that level
 pub fn validate_taxid_lineage(
-    lineage: &[i32], //
-    hit_taxid: Taxid,
-    hit_level: u8
+    lineage: &[i32],        // full lineage from DB for the hit_taxid
+    hit_taxid: Taxid,       // the taxid at which consensus was reached
+    hit_level: u8,          // 1=species, 2=genus, 3=family, 0=no consensus
 ) -> Vec<i32> {
-    const INVALID_BASE: i32 = -2_000_000_000; //  base for artificial negative taxids
+    let mut cleaned = lineage.to_vec();   // always length 3 in our usage
 
-    let mut cleaned = lineage.to_vec();
-
-    // Invalidate all levels below the consensus level
-    // If hit_level == 0 → no consensus → invalidate everything
-    let invalidate_up_to = if hit_level == 0 {
-        cleaned.len()
-    } else {
-        hit_level.saturating_sub(1) as usize
-    };
-
-    for level in 0..invalidate_up_to {
-        cleaned[level] = INVALID_BASE - (level as i32 + 1) * 100;
+    if hit_level == 0 {
+        // No consensus at any level → invalidate everything
+        cleaned[0] = SPECIES_NON_SPECIFIC;   // -100
+        cleaned[1] = GENUS_NON_SPECIFIC;     // -200
+        cleaned[2] = FAMILY_NON_SPECIFIC;    // -300
+        return cleaned;
     }
 
-    //  From the consensus level upward, fill missing/invalid entries
-    // with artificial negative taxids based on parent
-    if hit_level > 0 && hit_level <= cleaned.len() as u8 {
-        let start_level = (hit_level as usize).saturating_sub(1); // inclusive
-        let mut parent = hit_taxid;
+    // Invalidate levels below the consensus level
+    // hit_level=1 → invalidate nothing (species is the consensus)
+    // hit_level=2 → invalidate species (index 0)
+    // hit_level=3 → invalidate species + genus (indices 0,1)
+    for level in 0..(hit_level as usize).saturating_sub(1) {
+        cleaned[level] = match level {
+            0 => SPECIES_NON_SPECIFIC,
+            1 => GENUS_NON_SPECIFIC,
+            2 => FAMILY_NON_SPECIFIC,
+            _ => -100 * (level as i32 + 1),
+        };
+    }
 
-        for level in start_level..cleaned.len() {
-            if cleaned[level] <= 0 {
-                // missing or invalid. so artificial negative ID
-                cleaned[level] = INVALID_BASE - (level as i32 + 1) * 100 - parent;
-            }
-            parent = cleaned[level];
+    // For the consensus level and above, keep real values or fill gaps with negatives
+    // (in practice for 3-rank we rarely have gaps above consensus)
+    let start = (hit_level as usize).saturating_sub(1);
+    let mut parent = hit_taxid;
+
+    for level in start..cleaned.len() {
+        if cleaned[level] <= 0 {
+            // missing or invalid → artificial negative based on parent
+            cleaned[level] = -100 * (level as i32 + 1) - parent;
         }
+        parent = cleaned[level];
     }
 
     cleaned
