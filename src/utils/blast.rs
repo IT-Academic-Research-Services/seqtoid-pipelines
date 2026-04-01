@@ -72,11 +72,12 @@ pub struct M8Record {
 }
 
 //for read-grouped bastching
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReducedRead {
     pub seq: u64,
     pub dedup: Vec<u8>,
     pub summary: Vec<u8>,
+    pub accession: String,
 }
 
 #[derive(Debug)]
@@ -493,6 +494,7 @@ where
         seq,
         dedup: dedup_line,
         summary: summary_line,
+        accession: best.tname.clone(),   
     })
 }
 

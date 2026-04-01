@@ -3435,6 +3435,94 @@ pub fn parse_fasta_batch_to_annotated(
     results
 }
 
+
+/// Streaing parser if fasta to annotated
+///
+/// # Arguments
+/// * `config` - RunConfig struct
+/// * `duplicate_clusters` - Dashmap of duploicates
+/// * `nt_map` - small map of only contig_id → best NT accession
+/// * `n2_map` - small map of only contig_id → best NR accession
+///
+/// # Returns
+/// Result of hashmap of id:accession
+///
+pub fn parse_fasta_batch_to_annotated_streaming(
+    batch: Vec<u8>,
+    duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
+    nt_map: &AHashMap<String, String>,   // tiny contig_id → best NT accession
+    nr_map: &AHashMap<String, String>,   // tiny contig_id → best NR accession
+) -> Vec<Vec<u8>> {
+    let mut results = Vec::with_capacity(batch.len() / 512);
+    let mut reader = match needletail::parse_fastx_reader(std::io::Cursor::new(batch)) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("parse_fasta_batch_to_annotated_streaming: failed to create reader: {}", e);
+            return results;
+        }
+    };
+
+    while let Some(record) = reader.next() {
+        let rec = match record {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("parse_fasta_batch_to_annotated_streaming: bad record: {}", e);
+                continue;
+            }
+        };
+
+        let record: SequenceRecord = rec.into();
+        let rep_id = record.id().to_string();
+
+        let nr_acc = nr_map.get(&rep_id).cloned().unwrap_or_default();
+        let nt_acc = nt_map.get(&rep_id).cloned().unwrap_or_default();
+        let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
+
+        let dup_count = duplicate_clusters
+            .get(&rep_id)
+            .map(|r| r.size)
+            .unwrap_or(1u64);
+
+        let seq_arc = record.seq_arc();
+
+        if !is_unidentified {
+            let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
+            let mapped_rec = SequenceRecord::Fasta {
+                id,
+                desc: None,
+                seq: seq_arc,
+            };
+            if let Ok(bytes) = mapped_rec.to_bytes() {
+                let mut tagged = vec![0u8];
+                tagged.extend_from_slice(&bytes);
+                results.push(tagged);
+            }
+        } else {
+            let fasta_rep = SequenceRecord::Fasta {
+                id: rep_id.clone(),
+                desc: None,
+                seq: seq_arc.clone(),
+            };
+            if let Ok(bytes) = fasta_rep.to_bytes() {
+                let mut tagged_unid = vec![1u8];
+                tagged_unid.extend_from_slice(&bytes);
+                results.push(tagged_unid.clone());
+
+                if dup_count > 1 {
+                    for _ in 1..dup_count {
+                        results.push(tagged_unid.clone());
+                    }
+                }
+
+                let mut tagged_uniq = vec![2u8];
+                tagged_uniq.extend_from_slice(&bytes);
+                results.push(tagged_uniq);
+            }
+        }
+    }
+    results
+}
+
 pub async fn generate_annotated_fasta_stream(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
