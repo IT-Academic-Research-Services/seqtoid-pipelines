@@ -3525,10 +3525,10 @@ pub fn parse_fasta_batch_to_annotated_streaming(
 
 pub async fn generate_annotated_fasta_stream(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,           // contig FASTA
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    nt_map: HashMap<String, String>,
-    nr_map: HashMap<String, String>,
+    nt_map: AHashMap<String, String>,                    // tiny contig → NT accession
+    nr_map: AHashMap<String, String>,                    // tiny contig → NR accession
     _concurrency: usize,
 ) -> Result<(
     mpsc::Receiver<ParseOutput>,               // annotated mapped contigs
@@ -3538,13 +3538,14 @@ pub async fn generate_annotated_fasta_stream(
     Vec<oneshot::Receiver<Result<()>>>,
 )> {
     let channel_cap = (config.base_buffer_size / 4).max(10_000);
-    let (mapped_tx, mapped_rx) = mpsc::channel::<ParseOutput>(channel_cap);
-    let (unid_tx, unid_rx) = mpsc::channel::<ParseOutput>(channel_cap);
-    let (uniq_tx, uniq_rx) = mpsc::channel::<ParseOutput>(channel_cap);
+    let (mapped_tx, mapped_rx) = mpsc::channel(channel_cap);
+    let (unid_tx, unid_rx) = mpsc::channel(channel_cap);
+    let (uniq_tx, uniq_rx) = mpsc::channel(channel_cap);
 
     let (done_tx, done_rx) = oneshot::channel();
     let cleanup_receivers = vec![done_rx];
 
+    // Wrap the tiny maps for the rayon closure
     let nt_map_arc = Arc::new(nt_map);
     let nr_map_arc = Arc::new(nr_map);
 
@@ -3552,14 +3553,14 @@ pub async fn generate_annotated_fasta_stream(
         config.clone(),
         input_stream,
         move |batch: Vec<u8>| {
-            parse_fasta_batch_to_annotated(
-                batch,
-                &duplicate_clusters,
-                &nt_map_arc,
-                &nr_map_arc,
+            parse_fasta_batch_to_annotated_streaming(   // ← new streaming parser
+                                                        batch,
+                                                        &duplicate_clusters,
+                                                        &nt_map_arc,
+                                                        &nr_map_arc,
             )
         },
-        "generate_annotated_fasta",
+        "generate_annotated_fasta_streaming",
         16 * 1024 * 1024,
     );
 
@@ -3571,10 +3572,9 @@ pub async fn generate_annotated_fasta_stream(
                 let tag = b[0];
                 let data = &b[1..];
 
-                // Downstream (generate_taxid_fasta) expects SequenceRecord (Fasta/Fastq)
                 let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(data))
                     .map_err(|e| anyhow!("Failed to parse demuxed record: {}", e))?;
-                
+
                 if let Some(record) = reader.next() {
                     let rec = record.map_err(|e| anyhow!("Needletail error: {}", e))?;
                     let seq_rec: SequenceRecord = rec.into();
@@ -3603,96 +3603,6 @@ pub async fn generate_annotated_fasta_stream(
     ))
 }
 
-pub async fn generate_annotated_fasta(
-    config: Arc<RunConfig>,
-    mut dedup_stream: ReceiverStream<ParseOutput>,
-    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    nt_map: HashMap<String, String>,
-    nr_map: HashMap<String, String>,
-    concurrency: usize,
-) -> Result<(
-    mpsc::Receiver<ParseOutput>,               // annotated mapped contigs
-    mpsc::Receiver<ParseOutput>,               // unidentified (expanded)
-    mpsc::Receiver<ParseOutput>,               // unique unidentified (reps only)
-    Vec<JoinHandle<Result<()>>>,
-    Vec<oneshot::Receiver<Result<()>>>,
-)> {
-    let (tx, rx) = mpsc::channel(config.base_buffer_size);
-    let convert_handle = tokio::spawn(async move {
-        while let Some(item) = dedup_stream.next().await {
-            match item {
-                ParseOutput::Bytes(b) => {
-                    if tx.send(ParseOutput::Bytes(b)).await.is_err() { break; }
-                }
-                _ => {
-                    if let Ok(bytes) = item.to_bytes() {
-                        if tx.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() { break; }
-                    }
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-
-    let (m_rx, un_rx, uq_rx, mut tasks, rxs) = generate_annotated_fasta_stream(
-        config,
-        ReceiverStream::new(rx),
-        duplicate_clusters,
-        nt_map,
-        nr_map,
-        concurrency
-    ).await?;
-    
-    tasks.push(convert_handle);
-    Ok((m_rx, un_rx, uq_rx, tasks, rxs))
-}
-
-async fn generate_annotated_fasta_from_files(
-    config: Arc<RunConfig>,
-    r1_path: PathBuf,
-    r2_path_opt: Option<PathBuf>,
-    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed
-    nt_map: HashMap<String, String>,
-    nr_map: HashMap<String, String>,
-    concurrency: usize,
-) -> Result<(
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
-    Vec<JoinHandle<Result<()>>>,
-    Vec<oneshot::Receiver<Result<()>>>,
-)> {
-    let mut cleanup_tasks = vec![];
-
-    // Open and read R1
-    let r1_file = TokioFile::open(&r1_path).await?;
-    let r1_stream = parse_bytes::<TokioFile>(r1_file, config.base_buffer_size).await?;
-
-    let interleaved_stream = if let Some(ref r2_path) = r2_path_opt {
-        let r2_file = TokioFile::open(r2_path).await?;
-        let r2_stream = parse_bytes::<TokioFile>(r2_file, config.base_buffer_size).await?;
-
-        let (inter_rx, inter_task) = interleave_fastq_streams(
-            r1_stream,
-            r2_stream,
-            config.base_buffer_size,
-        ).await?;
-
-        cleanup_tasks.push(inter_task);
-        ReceiverStream::new(inter_rx)
-    } else {
-        ReceiverStream::new(r1_stream)
-    };
-
-    generate_annotated_fasta(
-        config,
-        interleaved_stream,
-        duplicate_clusters,          // ← pass DashMap instead of cluster_stream
-        nt_map,
-        nr_map,
-        concurrency
-    ).await
-}
 
 async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow::Error> {
     let contigs     = assembly_dir.join("contigs.fasta");
@@ -6249,7 +6159,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
         call_summary_stream,
-        4,
+        6,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6266,6 +6176,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_hit_summary_for_refined = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nt_hit_summary_for_taxid    = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     let nt_summary_taxon_stream = monitor_stream(
@@ -6396,22 +6308,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_summary_streams, nr_summary_done_rx) = t_junction(
         nr_call_summary_stream,
-        3,
+        6,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
         config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
+        StreamDataType::JustBytes,
         "nr_call_summary".to_string(),
         None,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
     cleanup_receivers.push(nr_summary_done_rx);
+
     let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
     let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_summary_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_blast_hit_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_summary_hit_stream   = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_initial_stream       = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_blast_hit_stream     = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_hit_summary_for_refined = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let nr_hit_summary_for_taxid    = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nr_summary_hit_stream), 0));
 
@@ -6469,25 +6385,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ReceiverStream::new(r1_stream)
     };
 
-    let (nt_map, nr_map) = tokio::try_join!(
-        async { nt_map_task.await.map_err(|e| PipelineError::Other(anyhow!(e.to_string()))) },
-        async { nr_map_task.await.map_err(|e| PipelineError::Other(anyhow!(e.to_string()))) },
-    )?;
-    let nt_map = nt_map?;
-    let nr_map = nr_map?;
 
-    let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) = generate_annotated_fasta_stream(
-        config.clone(),
-        interleaved_stream,
-        duplicate_clusters.clone(),
-        nt_map,
-        nr_map,
-        annot_concurrency
-    ).await
-        .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
+        let (nt_map, nr_map) = tokio::try_join!(
+        collect_hit_summary_to_accession_map_concurrent(
+            config.clone(),
+            nt_initial_stream
+        ),
+        collect_hit_summary_to_accession_map_concurrent(
+            config.clone(),
+            ReceiverStream::new(nr_initial_stream)
+        )
+    )?;
+
+    let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) =
+        generate_annotated_fasta_stream(
+            config.clone(),
+            interleaved_stream,
+            duplicate_clusters.clone(),
+            nt_map,                     // small contig → NT accession map
+            nr_map,                     // small  contig → NR accession map
+            annot_concurrency,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
 
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
+
 
     let assembly_dir = out_dir.join("assembly");
 
@@ -7111,14 +7035,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(refined_write_json_task);
 
 
-    // Build refined accession maps
+    // ────────────────────────────────────────────────────────────────
+    // NEW: Build tiny contig-level maps for the REFINED path
+    // ────────────────────────────────────────────────────────────────
     let (nt_refined_map, nr_refined_map) = tokio::try_join!(
-    collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nt_m8_map)),
-    collect_m8_to_accession_map(config.clone(), ReceiverStream::new(nr_m8_map)),
-)
-        .map_err(|e| PipelineError::Other(anyhow!("refined accession map failed: {}", e)))?;
-
-
+        collect_hit_summary_to_accession_map_concurrent(
+            config.clone(),
+            ReceiverStream::new(nt_hit_summary_for_refined)
+        ),
+        collect_hit_summary_to_accession_map_concurrent(
+            config.clone(),
+            ReceiverStream::new(nr_hit_summary_for_refined)
+        )
+    )?;
 
     // Contig FASTA stream (from assembly)
     // ───────────────────────────────────────────────────────────────
@@ -7160,8 +7089,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         contigs_stream,
         duplicate_clusters.clone(),
-        nt_refined_map.into_iter().collect(),
-        nr_refined_map.into_iter().collect(),
+        nt_refined_map,                     // tiny contig → NT accession
+        nr_refined_map,                     // tiny contig → NR accession
         nr_annot_concurrency,
     ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
@@ -7260,8 +7189,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(initial_annotated_taxon_stream),
         ReceiverStream::new(initial_unidentified_taxon_stream),
-        nt_initial_stream,
-        ReceiverStream::new(nr_initial_stream),
+        ReceiverStream::new(nt_hit_summary_for_taxid),
+        ReceiverStream::new(nr_hit_summary_for_taxid),
         lineage_map.clone(),
     )
         .await
