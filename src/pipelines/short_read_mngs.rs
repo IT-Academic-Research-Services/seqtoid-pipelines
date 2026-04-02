@@ -6116,6 +6116,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
+    // ────────────────────────────────────────────────────────────────
+    // Monitor the raw output from call_hits_m8
+    // ────────────────────────────────────────────────────────────────
+    let call_stream = monitor_stream(
+        call_stream,
+        "nt_call_stream_from_call_hits_m8",
+        Duration::from_secs(10),
+    );
+
+    let call_summary_stream = monitor_stream(
+        call_summary_stream,
+        "nt_call_summary_stream_from_call_hits_m8",
+        Duration::from_secs(10),
+    );
+
 
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
@@ -6136,7 +6151,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    info!("nt_call t_junction completed - 3 branches created. Starting consumers...");
+    info!("nt_call t_junction completed - 2 branches created. Starting consumers...");
 
     let nt_call_stream = monitor_stream(
         ReceiverStream::new(nt_call_stream),
@@ -6202,7 +6217,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Before launching any heavy downstream tasks
     info!("Launching downstream consumers for NT results:");
     info!("  → nt_call_stream (to generate_taxon_counts + nt_map_task)");
-    info!("  → nt_m8_stream (to collect_m8_to_accession_map)");
     info!("  → nt_blast_stream (to blast_contigs later)");
     info!("  → nt_summary_hit_stream (to summarize_hits)");
     info!("  → nt_summary_taxon_stream (to generate_taxon_counts)");
