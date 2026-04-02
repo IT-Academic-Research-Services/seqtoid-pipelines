@@ -6119,7 +6119,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
-        3,
+        2,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6134,7 +6134,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let mut nt_streams_iter = nt_streams.into_iter();
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_m8_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     info!("nt_call t_junction completed - 3 branches created. Starting consumers...");
@@ -6143,12 +6142,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ReceiverStream::new(nt_call_stream),
         "nt_call_stream_to_taxon_counts",
         Duration::from_secs(10),   // log every 10s
-    );
-
-    let nt_m8_stream = monitor_stream(
-        ReceiverStream::new(nt_m8_stream),
-        "nt_m8_stream_to_accession_map",
-        Duration::from_secs(10),
     );
 
     let nt_blast_stream = monitor_stream(
@@ -6233,12 +6226,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
-    let nt_map_task = tokio::spawn({
-        let config = config.clone();
-        async move {
-            collect_m8_to_accession_map(config, nt_m8_stream).await
-        }
-    });
 
     // Temporary: Skip Diamond by providing empty outputs
     let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
@@ -6286,7 +6273,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_streams, nr_done_rx) = t_junction(
         nr_call_stream,
-        3,
+        2,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6301,7 +6288,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let mut nr_streams_iter = nr_streams.into_iter();
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
@@ -6347,12 +6333,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
-    let nr_map_task = tokio::spawn({
-        let config = config.clone();
-        async move {
-            collect_m8_to_accession_map(config, ReceiverStream::new(nr_m8_stream)).await
-        }
-    });
 
 
     let annot_concurrency = compute_phase_concurrency(
