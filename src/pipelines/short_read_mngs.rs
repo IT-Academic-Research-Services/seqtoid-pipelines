@@ -6286,7 +6286,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_streams, nr_done_rx) = t_junction(
         nr_call_stream,
-        4,
+        3,
         config.base_buffer_size,
         config.args.stall_threshold,
         None,
@@ -6302,7 +6302,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut nr_streams_iter = nr_streams.into_iter();
     let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_m8_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_initial_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
