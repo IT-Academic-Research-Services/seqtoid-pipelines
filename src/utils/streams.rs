@@ -287,28 +287,17 @@ where
                 return;
             }
 
-            // Adaptive backpressure sleep
-            let pause_ms = if lowest_capacity_ratio < 0.1 {
-                backpressure_pause_ms
-            } else if lowest_capacity_ratio < 0.3 {
-                backpressure_pause_ms / 2
-            } else if lowest_capacity_ratio < 0.5 {
-                backpressure_pause_ms / 4
-            } else {
-                0
-            };
-
-            if pause_ms > 0 {
-                if item_count % 10000 == 0 {
-                debug!(
-                    "{}: Adaptive backpressure pause {}ms (lowest capacity {:.1}%) at item {}",
-                    label,
-                    pause_ms,
-                    lowest_capacity_ratio * 100.0,
-                    item_count
-                );
-            }
-            sleep(Duration::from_millis(pause_ms)).await;
+            // Per-item backpressure: only slow down when the SLOWEST receiver is truly full.
+            if lowest_capacity_ratio < 0.05 {
+                if item_count % 5000 == 0 {
+                    debug!(
+                        "{}: Heavy backpressure detected (lowest capacity {:.1}%). Sleep 10ms.",
+                        label, lowest_capacity_ratio * 100.0
+                    );
+                }
+                sleep(Duration::from_millis(10)).await;
+            } else if lowest_capacity_ratio < 0.20 {
+                tokio::task::yield_now().await;
             }
 
             if item_count % stall_threshold == 0 {
