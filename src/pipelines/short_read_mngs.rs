@@ -3121,14 +3121,18 @@ pub async fn compute_merged_taxon_counts(
 ) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
-    // 1. Pre-load NR hitsummary (exact Python behavior)
-    let mut nr_alignment_map: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
-    let mut nr_hit_lines: AHashMap<String, Arc<Vec<u8>>> = AHashMap::new();
+    // 1. Parallel NR preload
+    let (nr_alignment_map, nr_hit_lines) = tokio::task::spawn_blocking(move || {
+        let mut alignment_map: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
+        let mut hit_lines: AHashMap<String, Arc<Vec<u8>>> = AHashMap::new();
 
-    {
         let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
-        while let Some(item) = nr_hit_stream.next().await {
-            let bytes = item.to_bytes()?;
+
+        while let Some(item) = futures::executor::block_on(nr_hit_stream.next()) {
+            let bytes = match item.to_bytes() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
             let line = String::from_utf8_lossy(&bytes);
             let trimmed = line.trim_end();
             if trimmed.is_empty() { continue; }
@@ -3140,42 +3144,41 @@ pub async fn compute_merged_taxon_counts(
             let contig_species = fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
             let read_species   = fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
 
-            nr_alignment_map.insert(read_id.clone(), SpeciesAlignmentResults {
+            alignment_map.insert(read_id.clone(), SpeciesAlignmentResults {
                 contig: contig_species,
                 read: read_species,
             });
-            nr_hit_lines.insert(read_id, Arc::new(bytes.to_vec()));
+            hit_lines.insert(read_id, Arc::new(bytes.to_vec()));
         }
-    }
+        (alignment_map, hit_lines)
+    }).await.map_err(|e| PipelineError::Other(e.into()))?;
 
-    // 2. Start parallel file writers (returned as cleanup tasks)
+    // 2. Parallel file writers (background cleanup)
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
     let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
 
     let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Arc<Vec<u8>>>(4096);
     let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Arc<Vec<u8>>>(4096);
 
-    let m8_write_task = tokio::spawn(async move {
+    cleanup_tasks.push(tokio::spawn(async move {
         while let Some(bytes) = m8_write_rx.recv().await {
             let _ = merged_m8_file.write_all(&bytes).await;
             let _ = merged_m8_file.write_all(b"\n").await;
         }
         let _ = merged_m8_file.flush().await;
         Ok::<(), anyhow::Error>(())
-    });
-    cleanup_tasks.push(m8_write_task);
+    }));
 
-    let hit_write_task = tokio::spawn(async move {
+    cleanup_tasks.push(tokio::spawn(async move {
         while let Some(bytes) = hit_write_rx.recv().await {
             let _ = merged_hit_file.write_all(&bytes).await;
             let _ = merged_hit_file.write_all(b"\n").await;
         }
         let _ = merged_hit_file.flush().await;
         Ok::<(), anyhow::Error>(())
-    });
-    cleanup_tasks.push(hit_write_task);
+    }));
 
-    // 3. Merged channels for immediate taxon counting
+    // 3. Parallel selection passes (NT first, then NR)
     let (merged_m8_tx, merged_m8_rx) = mpsc::channel::<ParseOutput>(4096);
     let (merged_hit_tx, merged_hit_rx) = mpsc::channel::<ParseOutput>(4096);
 
@@ -3184,90 +3187,93 @@ pub async fn compute_merged_taxon_counts(
     let nt_hit_write_tx = hit_write_tx.clone();
     let merged_m8_tx_nt = merged_m8_tx.clone();
     let merged_hit_tx_nt = merged_hit_tx.clone();
-    let nr_map_nt = nr_alignment_per_read.clone();
 
-    let nt_task = tokio::spawn(async move {
-        let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
-        let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
+    let nt_task = tokio::spawn({
+        let nr_alignment_map = nr_alignment_map.clone();
+        async move {
+            let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
+            let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
 
-        while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
-            let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
-            let hit_bytes = hit_item.to_bytes()?;
+            while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
+                let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
+                let hit_bytes = hit_item.to_bytes()?;
 
-            let hit_line = String::from_utf8_lossy(&hit_bytes);
-            let trimmed = hit_line.trim_end();
-            if trimmed.is_empty() { continue; }
+                let hit_line = String::from_utf8_lossy(&hit_bytes);
+                let trimmed = hit_line.trim_end();
+                if trimmed.is_empty() { continue; }
 
-            let hit_fields: Vec<&str> = trimmed.split('\t').collect();
-            if hit_fields.len() < 10 { continue; }
+                let hit_fields: Vec<&str> = trimmed.split('\t').collect();
+                if hit_fields.len() < 10 { continue; }
 
-            let read_id = hit_fields[0];
+                let read_id = hit_fields[0];
 
-            let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-            let nt_read   = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+                let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
+                let nt_read   = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
 
-            let nr_align = nr_map_nt.get(read_id);
-            let has_nr_contig = nr_align.as_deref().map_or(false, |a| a.contig.is_some());
-            let has_nr_read   = nr_align.as_deref().map_or(false, |a| a.read.is_some());
+                let nr_align = nr_alignment_map.get(read_id);
+                let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
+                let has_nr_read   = nr_align.map_or(false, |a| a.read.is_some());
 
-            if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
-                nt_m8_write_tx.send(m8_bytes.clone()).await.ok();
-                let mut hit_with_source = hit_fields.to_vec();
-                hit_with_source.push(NT_TAG);
-                let hit_bytes_out = Arc::new(hit_with_source.join("\t").into_bytes());
-                nt_hit_write_tx.send(hit_bytes_out.clone()).await.ok();
+                if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
+                    let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
+                    let mut hit_with_source = hit_fields.to_vec();
+                    hit_with_source.push(NT_TAG);
+                    let hit_bytes_out = Arc::new(hit_with_source.join("\t").into_bytes());
+                    let _ = nt_hit_write_tx.send(hit_bytes_out.clone()).await;
 
-                merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await.ok();
-                merged_hit_tx_nt.send(ParseOutput::Bytes(hit_bytes_out)).await.ok();
-
-                nr_map_nt.remove(read_id);
+                    let _ = merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await;
+                    let _ = merged_hit_tx_nt.send(ParseOutput::Bytes(hit_bytes_out)).await;
+                }
             }
+            Ok::<(), anyhow::Error>(())
         }
-        Ok::<(), anyhow::Error>(())
     });
-    cleanup_tasks.push(nt_task);   // let caller wait on it if needed
+    cleanup_tasks.push(nt_task);
 
-    // NR pass
+    // NR pass (remaining reads)
     let nr_m8_write_tx = m8_write_tx;
     let nr_hit_write_tx = hit_write_tx;
     let merged_m8_tx_nr = merged_m8_tx;
     let merged_hit_tx_nr = merged_hit_tx;
 
-    let nr_task = tokio::spawn(async move {
-        let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
+    let nr_task = tokio::spawn({
+        let nr_hit_lines = nr_hit_lines.clone();
+        async move {
+            let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
 
-        while let Some(m8_item) = nr_m8.next().await {
-            let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
+            while let Some(m8_item) = nr_m8.next().await {
+                let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
 
-            let m8_str = String::from_utf8_lossy(&m8_bytes);
-            let trimmed_m8 = m8_str.trim_end();
-            if trimmed_m8.is_empty() { continue; }
+                let m8_str = String::from_utf8_lossy(&m8_bytes);
+                let trimmed_m8 = m8_str.trim_end();
+                if trimmed_m8.is_empty() { continue; }
 
-            let m8_fields: Vec<&str> = trimmed_m8.split('\t').collect();
-            let read_id = m8_fields[0];
+                let m8_fields: Vec<&str> = trimmed_m8.split('\t').collect();
+                let read_id = m8_fields[0];
 
-            if let Some(hit_bytes) = nr_hit_lines.get(read_id) {
-                nr_m8_write_tx.send(m8_bytes.clone()).await.ok();
+                if let Some(hit_bytes) = nr_hit_lines.get(read_id) {
+                    let _ = nr_m8_write_tx.send(m8_bytes.clone()).await;
 
-                let mut hit_with_source = String::from_utf8_lossy(hit_bytes)
-                    .trim_end()
-                    .split('\t')
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>();
-                hit_with_source.push(NR_TAG.to_string());
+                    let mut hit_with_source = String::from_utf8_lossy(hit_bytes)
+                        .trim_end()
+                        .split('\t')
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>();
+                    hit_with_source.push(NR_TAG.to_string());
 
-                let hit_bytes_out = Arc::new(hit_with_source.join("\t").into_bytes());
-                nr_hit_write_tx.send(hit_bytes_out.clone()).await.ok();
+                    let hit_bytes_out = Arc::new(hit_with_source.join("\t").into_bytes());
+                    let _ = nr_hit_write_tx.send(hit_bytes_out.clone()).await;
 
-                merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await.ok();
-                merged_hit_tx_nr.send(ParseOutput::Bytes(hit_bytes_out)).await.ok();
+                    let _ = merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await;
+                    let _ = merged_hit_tx_nr.send(ParseOutput::Bytes(hit_bytes_out)).await;
+                }
             }
+            Ok::<(), anyhow::Error>(())
         }
-        Ok::<(), anyhow::Error>(())
     });
     cleanup_tasks.push(nr_task);
 
-    // 4. Taxon counting runs immediately (while writers run in background)
+    // 4. Taxon counting (already highly parallel from earlier work)
     let merged_taxon_counts = generate_taxon_counts(
         config.clone(),
         ReceiverStream::new(merged_m8_rx),
@@ -3280,27 +3286,29 @@ pub async fn compute_merged_taxon_counts(
 
     let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
     tokio::fs::write(&merged_taxon_counts_path, json).await?;
-
     info!("Merged taxon counts generated (fully streaming)");
 
-    // 5. Contig summary merge (unchanged)
-    let mut merged_contigs: HashMap<Taxid, Vec<ContigSummaryEntry>> = HashMap::new();
-    let mut nt_contig_names: HashSet<String> = HashSet::new();
+    // 5. Parallel contig merge (exact Python _merge_contigs)
+    let final_contigs = tokio::task::spawn_blocking(move || {
+        let mut merged_contigs: HashMap<Taxid, Vec<ContigSummaryEntry>> = HashMap::new();
+        let mut nt_contig_names: HashSet<String> = HashSet::new();
 
-    for mut entry in nt_contig_summary {
-        entry.db_type = "merged_NT_NR".to_string();
-        nt_contig_names.insert(entry.contig_name.clone());
-        merged_contigs.entry(entry.species_taxid).or_default().push(entry);
-    }
-
-    for mut entry in nr_contig_summary {
-        if !nt_contig_names.contains(&entry.contig_name) {
+        for mut entry in nt_contig_summary {
             entry.db_type = "merged_NT_NR".to_string();
+            nt_contig_names.insert(entry.contig_name.clone());
             merged_contigs.entry(entry.species_taxid).or_default().push(entry);
         }
-    }
 
-    let final_contigs: Vec<ContigSummaryEntry> = merged_contigs.into_values().flatten().collect();
+        for mut entry in nr_contig_summary {
+            if !nt_contig_names.contains(&entry.contig_name) {
+                entry.db_type = "merged_NT_NR".to_string();
+                merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+            }
+        }
+
+        merged_contigs.into_values().flatten().collect::<Vec<_>>()
+    }).await.map_err(|e| PipelineError::Other(e.into()))?;
+
     let json = serde_json::to_string_pretty(&final_contigs)?;
     tokio::fs::write(&merged_contig_summary_path, json).await?;
     info!("Merged contig summary written ({} entries)", final_contigs.len());
