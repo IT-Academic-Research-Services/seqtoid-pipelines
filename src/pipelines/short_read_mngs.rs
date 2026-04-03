@@ -4508,33 +4508,23 @@ pub async fn summarize_hits(
     HashMap<i32, Vec<String>>,
     usize,
 )> {
-    let read_dict = Arc::new(DashMap::with_capacity(8_000_000));
-    let accession_dict = Arc::new(DashMap::with_capacity(2_000_000));
-
-    let genus_read_counts: Arc<DashMap<i32, usize>> = Arc::new(DashMap::new());
-    let genus_species: Arc<DashMap<i32, HashSet<i32>>> = Arc::new(DashMap::new());
-    let genus_accessions: Arc<DashMap<i32, HashSet<String>>> = Arc::new(DashMap::new());
-
-    let total_reads = Arc::new(AtomicUsize::new(0));
-
     let concurrency = compute_phase_concurrency(
         &config,
         "summarize_hits",
-        0.4,
+        0.35,
         4.0,
-        64,
+        96,
         8,
     );
 
-    // Producer: collect into batches
     let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
     let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
     let producer = tokio::spawn(async move {
-        let mut batch = Vec::with_capacity(4096);
+        let mut batch = Vec::with_capacity(8192);
         while let Some(item) = stream.next().await {
             batch.push(item);
-            if batch.len() >= 4096 {
+            if batch.len() >= 8192 {
                 let _ = batch_tx.send(std::mem::take(&mut batch)).await;
             }
         }
@@ -4544,19 +4534,33 @@ pub async fn summarize_hits(
         Ok::<(), anyhow::Error>(())
     });
 
-    // Workers
+    let final_read_dict = Arc::new(DashMap::with_capacity(8_000_000));
+    let final_accession_dict = Arc::new(DashMap::with_capacity(2_000_000));
+    let final_genus_read = Arc::new(DashMap::<i32, usize>::new());           // usize, +1 per read
+    let final_genus_species = Arc::new(DashMap::<i32, HashSet<i32>>::new());
+    let final_genus_accessions = Arc::new(DashMap::<i32, HashSet<String>>::new());
+
+    let total_reads = Arc::new(AtomicUsize::new(0));
+
     let mut worker_handles = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let rx = batch_rx.clone();
-        let rd = read_dict.clone();
-        let ad = accession_dict.clone();
-        let grc = genus_read_counts.clone();
-        let gs = genus_species.clone();
-        let ga = genus_accessions.clone();
-        let tr = total_reads.clone();
         let dup_clusters = duplicate_clusters.clone();
 
+        let f_read = final_read_dict.clone();
+        let f_acc = final_accession_dict.clone();
+        let f_gr = final_genus_read.clone();
+        let f_gs = final_genus_species.clone();
+        let f_ga = final_genus_accessions.clone();
+        let tr = total_reads.clone();
+
         worker_handles.push(tokio::spawn(async move {
+            let mut local_read_dict: AHashMap<String, Arc<ReadHit>> = AHashMap::with_capacity(8192);
+            let mut local_accession_dict: AHashMap<String, AccessionHit> = AHashMap::with_capacity(4096);
+            let mut local_genus_read: AHashMap<i32, usize> = AHashMap::with_capacity(2048);
+            let mut local_genus_species: AHashMap<i32, HashSet<i32>> = AHashMap::with_capacity(1024);
+            let mut local_genus_accessions: AHashMap<i32, HashSet<String>> = AHashMap::with_capacity(1024);
+
             loop {
                 let batch = {
                     let mut guard = rx.lock().await;
@@ -4568,7 +4572,6 @@ pub async fn summarize_hits(
                     None => break,
                 };
 
-                // Rayon parse
                 let parsed: Vec<(String, String, i32, i32, i32, u8)> = tokio::task::spawn_blocking({
                     let batch = batch;
                     move || {
@@ -4605,7 +4608,6 @@ pub async fn summarize_hits(
                     }
                 }).await.expect("summarize_hits batch parsing panicked");
 
-                // Correct DCR aggregation
                 for (read_id, accession_id, hit_taxid, genus_taxid, family_taxid, level) in parsed {
                     let species_taxid = if level >= 3 && hit_taxid > 0 { hit_taxid } else { 0 };
                     let assigned_taxid = if level >= 3 {
@@ -4621,7 +4623,7 @@ pub async fn summarize_hits(
                         .map(|e| e.value().size)
                         .unwrap_or(1);
 
-                    rd.insert(
+                    local_read_dict.insert(
                         read_id.clone(),
                         Arc::new(ReadHit {
                             level,
@@ -4640,11 +4642,10 @@ pub async fn summarize_hits(
                         }),
                     );
 
-                    tr.fetch_add(cluster_size as usize, AtomicOrdering::Relaxed);
-
                     if accession_id != "-" && genus_taxid > 0 {
-                        ad.entry(accession_id.clone())
-                            .and_modify(|e: &mut AccessionHit| e.count += cluster_size)  // explicit type
+                        local_accession_dict
+                            .entry(accession_id.clone())
+                            .and_modify(|e| e.count += cluster_size)
                             .or_insert(AccessionHit {
                                 taxid: species_taxid,
                                 genus_taxid,
@@ -4652,17 +4653,37 @@ pub async fn summarize_hits(
                                 count: cluster_size,
                             });
 
-                        *grc.entry(genus_taxid).or_insert(0) += cluster_size as usize;
-                        gs.entry(genus_taxid).or_default().insert(species_taxid);
-                        ga.entry(genus_taxid).or_default().insert(accession_id);
+                        // IMPORTANT: +1 per read (matches Python exactly)
+                        *local_genus_read.entry(genus_taxid).or_insert(0) += 1;
+                        local_genus_species.entry(genus_taxid).or_default().insert(species_taxid);
+                        local_genus_accessions.entry(genus_taxid).or_default().insert(accession_id);
                     }
                 }
             }
+
+            // Merge into final structures
+            for (k, v) in local_read_dict {
+                f_read.insert(k, v);
+            }
+            for (k, v) in local_accession_dict {
+                f_acc.entry(k)
+                    .and_modify(|e: &mut AccessionHit| e.count += v.count)
+                    .or_insert(v);
+            }
+            for (g, c) in local_genus_read {
+                *f_gr.entry(g).or_insert(0) += c;
+            }
+            for (g, s) in local_genus_species {
+                f_gs.entry(g).or_default().extend(s);
+            }
+            for (g, a) in local_genus_accessions {
+                f_ga.entry(g).or_default().extend(a);
+            }
+
             Ok::<(), anyhow::Error>(())
         }));
     }
 
-    // Wait for completion
     producer.await??;
     for h in worker_handles {
         h.await??;
@@ -4670,13 +4691,13 @@ pub async fn summarize_hits(
 
     let total_reads_val = total_reads.load(AtomicOrdering::SeqCst);
     info!(
-        "summarize_hits: processed {} reads, {} unique accessions ({} workers)",
-        total_reads_val, accession_dict.len(), concurrency
+        "summarize_hits: processed {} reads, {} unique accessions ({} workers, local maps)",
+        total_reads_val, final_accession_dict.len(), concurrency
     );
 
-    // Final selected_genera (exact original logic)
+    // Final selected_genera (exact original Python logic)
     let mut selected_genera: HashMap<i32, Vec<String>> = HashMap::new();
-    for entry in genus_read_counts.iter() {
+    for entry in final_genus_read.iter() {
         let genus_taxid = *entry.key();
         let read_count = *entry.value();
 
@@ -4684,23 +4705,28 @@ pub async fn summarize_hits(
             continue;
         }
 
-        let species_set = genus_species.get(&genus_taxid);
-        let species_count = species_set.as_ref().map(|s| s.len()).unwrap_or(0);
-
+        let species_count = final_genus_species.get(&genus_taxid).map(|s| s.len()).unwrap_or(0);
         if species_count <= 1 {
             continue;
         }
 
-        if let Some(acc_set) = genus_accessions.get(&genus_taxid) {
+        if let Some(acc_set) = final_genus_accessions.get(&genus_taxid) {
             let accessions: Vec<String> = acc_set.iter().cloned().collect();
             selected_genera.insert(genus_taxid, accessions);
         }
     }
 
     let read_dict_final: AHashMap<String, Arc<ReadHit>> =
-        Arc::try_unwrap(read_dict).unwrap().into_iter().collect();
+        Arc::try_unwrap(final_read_dict)
+            .map_err(|_| anyhow!("Failed to unwrap final_read_dict"))?
+            .into_iter()
+            .collect();
+
     let accession_dict_final: AHashMap<String, AccessionHit> =
-        Arc::try_unwrap(accession_dict).unwrap().into_iter().collect();
+        Arc::try_unwrap(final_accession_dict)
+            .map_err(|_| anyhow!("Failed to unwrap final_accession_dict"))?
+            .into_iter()
+            .collect();
 
     Ok((
         read_dict_final,
@@ -6392,7 +6418,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_hit_summary_handle = tokio::spawn(summarize_hits(
         config.clone(),
         nt_summary_hit_stream,
-        duplicate_clusters.clone(),      // ← required for correct DCR
+        duplicate_clusters.clone(),
         0,
     ));
 
