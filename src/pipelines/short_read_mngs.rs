@@ -3002,7 +3002,7 @@ pub async fn generate_taxon_counts(
     let (work_tx, mut work_rx) = mpsc::channel::<TaxonCountWorkItem>(4096);
     let work_tx = Arc::new(work_tx);
 
-    // Producer: paired streaming (exact lockstep with Python)
+    // Producer: paired lockstep with batching
     let producer = tokio::spawn({
         let work_tx = work_tx.clone();
         let duplicate_clusters = duplicate_clusters.clone();
@@ -3010,6 +3010,9 @@ pub async fn generate_taxon_counts(
             let mut paired_count = 0usize;
             let mut summary_iter = summary_stream;
             let mut m8_iter = m8_stream;
+
+            const PRODUCER_BATCH: usize = 4096;   // tune if needed (larger = less await overhead)
+            let mut batch = Vec::with_capacity(PRODUCER_BATCH);
 
             while let (Some(summary_item), Some(m8_item)) = (summary_iter.next().await, m8_iter.next().await) {
                 paired_count += 1;
@@ -3083,9 +3086,20 @@ pub async fn generate_taxon_counts(
                     source_count_type: source_count_type.clone(),
                 };
 
-                if work_tx.send(work_item).await.is_err() {
-                    break; // receiver dropped
+                batch.push(work_item);
+
+                if batch.len() >= PRODUCER_BATCH {
+                    for item in std::mem::take(&mut batch) {
+                        if work_tx.send(item).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                 }
+            }
+
+            // final flush
+            for item in batch {
+                let _ = work_tx.send(item).await;
             }
 
             debug!("generate_taxon_counts producer: sent {} paired records", paired_count);
