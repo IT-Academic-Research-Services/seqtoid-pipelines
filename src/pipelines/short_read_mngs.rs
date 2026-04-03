@@ -4518,28 +4518,22 @@ pub async fn summarize_hits(
     let concurrency = compute_phase_concurrency(
         &config,
         "summarize_hits",
-        0.5,           // ~0.5 GB per thread max
+        0.5,
         3.5,
-        32,            // CPU bound
-        8,             // min for meaningful parallelism
+        32,
+        8,
     );
 
-    const BATCH_SIZE: usize = 10_000;
-    let (batch_tx, batch_rx) = mpsc::channel::<Vec<Arc<Vec<u8>>>>(concurrency * 2);
-    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+    // Producer: collect raw ParseOutput into batches
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
+    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));   // shared safely
 
-    let batcher_handle = tokio::spawn(async move {
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let producer = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(4096);
         while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(b) => {
-                    batch.push(b);
-                    if batch.len() >= BATCH_SIZE {
-                        batch_tx.send(std::mem::take(&mut batch)).await
-                            .map_err(|_| anyhow!("batch_tx dropped unexpectedly in summarize_hits"))?;
-                    }
-                }
-                _ => return Err(anyhow!("Expected Bytes in summarize_hits stream")),
+            batch.push(item);
+            if batch.len() >= 4096 {
+                let _ = batch_tx.send(std::mem::take(&mut batch)).await;
             }
         }
         if !batch.is_empty() {
@@ -4548,6 +4542,7 @@ pub async fn summarize_hits(
         Ok::<(), anyhow::Error>(())
     });
 
+    // Workers
     let mut worker_handles = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let rx = batch_rx.clone();
@@ -4561,8 +4556,8 @@ pub async fn summarize_hits(
         worker_handles.push(tokio::spawn(async move {
             loop {
                 let batch = {
-                    let mut lock = rx.lock().await;
-                    lock.recv().await
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
                 };
 
                 let batch = match batch {
@@ -4570,41 +4565,51 @@ pub async fn summarize_hits(
                     None => break,
                 };
 
-                for bytes in batch {
-                    let line = match std::str::from_utf8(&bytes) {
-                        Ok(s) => s.trim_end(),
-                        Err(_) => {
-                            warn!("Non-UTF8 line in hit summary stream");
-                            continue;
-                        }
-                    };
+                // Parse batch in parallel with rayon
+                let parsed: Vec<(String, String, i32, i32, i32, u8)> = tokio::task::spawn_blocking({
+                    let batch = batch;
+                    move || {
+                        batch
+                            .par_iter()
+                            .filter_map(|item| {
+                                let bytes = match item.to_bytes() {
+                                    Ok(b) => b,
+                                    Err(_) => return None,
+                                };
+                                let line = match std::str::from_utf8(&bytes) {
+                                    Ok(s) => s.trim_end(),
+                                    Err(_) => return None,
+                                };
+                                if line.is_empty() {
+                                    return None;
+                                }
 
-                    if line.is_empty() {
-                        continue;
+                                let parts: Vec<&str> = line.split('\t').collect();
+                                if parts.len() != 6 {
+                                    return None;
+                                }
+
+                                let read_id = parts[0].to_string();
+                                let accession_id = if parts[1].is_empty() || parts[1] == "-" {
+                                    "-".to_string()
+                                } else {
+                                    parts[1].to_string()
+                                };
+                                let hit_taxid: i32 = parts[2].parse().unwrap_or(0);
+                                let genus_taxid: i32 = parts[3].parse().unwrap_or(0);
+                                let family_taxid: i32 = parts[4].parse().unwrap_or(0);
+                                let level: u8 = parts[5].parse().unwrap_or(0);
+
+                                Some((read_id, accession_id, hit_taxid, genus_taxid, family_taxid, level))
+                            })
+                            .collect()
                     }
+                }).await
+                    .expect("summarize_hits batch parsing panicked");
 
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() != 6 {
-                        warn!("Malformed hit_summary line (expected exactly 6 fields, got {}): {}", parts.len(), line);
-                        continue;
-                    }
-
-                    let read_id       = parts[0].to_string();
-                    let accession_id  = if parts[1].is_empty() || parts[1] == "-" {
-                        "-".to_string()
-                    } else {
-                        parts[1].to_string()
-                    };
-                    let hit_taxid: i32 = parts[2].parse().unwrap_or(0);
-                    let genus_taxid: i32 = parts[3].parse().unwrap_or(0);
-                    let family_taxid: i32 = parts[4].parse().unwrap_or(0);
-                    let level: u8 = parts[5].parse().unwrap_or(0);
-
-                    let species_taxid = if level >= 3 && hit_taxid > 0 {
-                        hit_taxid
-                    } else {
-                        0
-                    };
+                // Update DashMaps
+                for (read_id, accession_id, hit_taxid, genus_taxid, family_taxid, level) in parsed {
+                    let species_taxid = if level >= 3 && hit_taxid > 0 { hit_taxid } else { 0 };
 
                     let assigned_taxid = if level >= 3 {
                         species_taxid
@@ -4629,7 +4634,7 @@ pub async fn summarize_hits(
                             contig_genus_taxid: 0,
                             contig_family_taxid: 0,
                             from_assembly: false,
-                            source_count_type: None
+                            source_count_type: None,
                         }),
                     );
 
@@ -4637,7 +4642,7 @@ pub async fn summarize_hits(
 
                     if accession_id != "-" && genus_taxid > 0 {
                         ad.entry(accession_id.clone())
-                            .and_modify(|e: &mut AccessionHit| e.count += 1)
+                            .and_modify(|e: &mut AccessionHit| e.count += 1)   // ← added type
                             .or_insert(AccessionHit {
                                 taxid: species_taxid,
                                 genus_taxid,
@@ -4655,10 +4660,11 @@ pub async fn summarize_hits(
         }));
     }
 
+    // Wait for everything
+    producer.await??;
     for h in worker_handles {
         h.await??;
     }
-    batcher_handle.await??;
 
     let total_reads_val = total_reads.load(AtomicOrdering::SeqCst);
     info!(
