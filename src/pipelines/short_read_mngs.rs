@@ -61,7 +61,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
                           SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters};
 use crate::utils::blast::{parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
-                          TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits};
+                          TaxonCount, ContigSummaryEntry, compute_merged_taxon_counts, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
@@ -2993,245 +2993,109 @@ pub async fn generate_taxon_counts(
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,
-    source_count_type: Option<String>,
+    source_count_type: Option<String>,   // kept for exact call-site compatibility
 ) -> Result<Vec<TaxonCount>, PipelineError> {
-
-    let start_total = Instant::now();
-    debug!("generate_taxon_counts[{}]: starting concurrent streaming aggregation", count_type);
-
-    // Work channel for parallel aggregation
-    let (work_tx, mut work_rx) = mpsc::channel::<TaxonCountWorkItem>(8192);
-    let work_tx = Arc::new(work_tx);
-
-    // Producer: real batched parsing with rayon
-    let producer = tokio::spawn({
-        let work_tx = work_tx.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        let should_keep_filter = should_keep_filter.clone();
-
-        async move {
-            let mut paired_count = 0usize;
-            let mut summary_iter = summary_stream;
-            let mut m8_iter = m8_stream;
-
-            const PRODUCER_BATCH: usize = 2048;
-
-            while let (Some(summary_item), Some(m8_item)) = (summary_iter.next().await, m8_iter.next().await) {
-                paired_count += 1;
-
-                let summary_bytes = match summary_item.to_bytes() {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                let m8_bytes = match m8_item.to_bytes() {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-
-                // Collect a batch of raw bytes
-                let mut batch = vec![(summary_bytes, m8_bytes)];
-                for _ in 1..PRODUCER_BATCH {
-                    if let (Some(s), Some(m)) = (summary_iter.next().await, m8_iter.next().await) {
-                        paired_count += 1;
-                        let sb = match s.to_bytes() { Ok(b) => b, Err(_) => continue };
-                        let mb = match m.to_bytes() { Ok(b) => b, Err(_) => continue };
-                        batch.push((sb, mb));
-                    } else {
-                        break;
-                    }
-                }
-
-                // Parse batch in parallel with rayon
-                let work_items: Vec<TaxonCountWorkItem> = tokio::task::spawn_blocking({
-                    let duplicate_clusters = duplicate_clusters.clone();
-                    let should_keep_filter = should_keep_filter.clone();
-                    let source_count_type = source_count_type.clone();
-
-                    move || {
-                        batch
-                            .par_iter()
-                            .filter_map(|(summary_bytes, m8_bytes)| {
-                                let summary_line = String::from_utf8_lossy(summary_bytes).trim_end().to_string();
-                                if summary_line.is_empty() || summary_line.starts_with('#') {
-                                    return None;
-                                }
-
-                                let cols: Vec<&str> = summary_line.split('\t').collect();
-                                if cols.len() != 6 {
-                                    return None;
-                                }
-
-                                let read_id = cols[0].to_string();
-                                let level: u8 = cols[5].parse().unwrap_or(0);
-                                let species: i32 = cols[2].parse().unwrap_or(0);
-                                let genus: i32 = cols[3].parse().unwrap_or(0);
-                                let family: i32 = cols[4].parse().unwrap_or(0);
-
-                                let consensus_taxid = match level {
-                                    1 => species,
-                                    2 => genus,
-                                    3 => family,
-                                    _ => 0,
-                                };
-
-                                let raw_lineage = vec![species, genus, family];
-                                let cleaned_lineage = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
-
-                                if !should_keep_filter(&cleaned_lineage) {
-                                    return None;
-                                }
-
-                                let m8_line = String::from_utf8_lossy(m8_bytes).trim_end().to_string();
-                                let rec = match M8Record::parse_line_nr(&m8_line) {
-                                    Ok(r) => r,
-                                    Err(_) => return None,
-                                };
-
-                                let cluster_size = duplicate_clusters
-                                    .get(&read_id)
-                                    .map(|e| e.value().size)
-                                    .unwrap_or(1u64);
-
-                                let evalue_log10 = if rec.evalue <= 0.0 || !rec.evalue.is_finite() {
-                                    MIN_NORMAL_POSITIVE_DOUBLE.log10()
-                                } else {
-                                    rec.evalue.log10()
-                                };
-
-                                Some(TaxonCountWorkItem {
-                                    cleaned_lineage,
-                                    cluster_size,
-                                    alen: rec.alen,
-                                    pident: rec.pident,
-                                    evalue_log10,
-                                    source_count_type: source_count_type.clone(),
-                                })
-                            })
-                            .collect()
-                    }
-                }).await
-                    .expect("producer batch parsing panicked");
-
-                // Send the parsed batch
-                for item in work_items {
-                    if work_tx.send(item).await.is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-
-            debug!("generate_taxon_counts producer: sent {} paired records", paired_count);
-            Ok::<(), anyhow::Error>(())
-        }
-    });
-
-    // Parallel aggregation (rayon inside spawn_blocking)
-    let aggregation = tokio::task::spawn_blocking({
-        let config = config.clone();
-        move || -> Result<AHashMap<Vec<i32>, AggBucket>, anyhow::Error> {
-            let mut aggregation: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
-
-            config.thread_pool.install(|| {
-                while let Some(work_item) = work_rx.blocking_recv() {
-                    let mut agg_key = work_item.cleaned_lineage.clone();
-                    while !agg_key.is_empty() {
-                        let bucket = aggregation.entry(agg_key.clone()).or_default();
-
-                        bucket.nonunique_count += work_item.cluster_size;
-                        bucket.unique_count += 1;
-                        bucket.base_count += work_item.alen * work_item.cluster_size;
-                        bucket.sum_percent_identity += work_item.pident;
-                        bucket.sum_alignment_length += work_item.alen as f64;
-                        bucket.sum_e_value += work_item.evalue_log10;
-
-                        if let Some(src) = &work_item.source_count_type {
-                            bucket.source_count_type.insert(src.clone());
-                        }
-
-                        agg_key.remove(0);
-                    }
-                }
-            });
-
-            Ok(aggregation)
-        }
-    }).await
-        .map_err(|e| PipelineError::Other(anyhow!("Aggregation spawn_blocking panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(e))?;
-
-    // Wait for producer to finish (important for error propagation and cleanup)
-    producer.await
-        .map_err(|e| PipelineError::Other(anyhow!("Producer task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(e))?;
-
-    // Build final TaxonCount list (identical to Python)
-    let mut taxon_counts = Vec::with_capacity(aggregation.len());
-
-    for (agg_key, bucket) in aggregation {
-        if bucket.unique_count == 0 {
-            continue;
-        }
-
-        let remaining = agg_key.len() as u8;
-        let tax_level = 4 - remaining;
-        let tax_id = agg_key[0];
-
-        let genus_taxid = if tax_level <= 2 {
-            *agg_key.get(agg_key.len().saturating_sub(2)).unwrap_or(&-200)
-        } else {
-            -200
-        };
-        let family_taxid = if tax_level <= 3 {
-            *agg_key.get(agg_key.len().saturating_sub(3)).unwrap_or(&-300)
-        } else {
-            -300
-        };
-
-        let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
-            bucket.nonunique_count
-        } else {
-            bucket.unique_count
-        };
-
-        let dcr = bucket.nonunique_count as f64 / bucket.unique_count as f64;
-        let percent_identity = bucket.sum_percent_identity / bucket.unique_count as f64;
-        let alignment_length = bucket.sum_alignment_length / bucket.unique_count as f64;
-        let e_value = bucket.sum_e_value / bucket.unique_count as f64;
-
-        let source_vec = if bucket.source_count_type.is_empty() {
-            None
-        } else {
-            let mut v: Vec<_> = bucket.source_count_type.into_iter().collect();
-            v.sort_unstable();
-            Some(v)
-        };
-
-        taxon_counts.push(TaxonCount {
-            tax_id,
-            tax_level,
-            genus_taxid,
-            family_taxid,
-            count,
-            nonunique_count: bucket.nonunique_count,
-            unique_count: bucket.unique_count,
-            dcr,
-            percent_identity,
-            alignment_length,
-            e_value,
-            count_type: count_type.clone(),
-            base_count: bucket.base_count,
-            source_count_type: source_vec,
-        });
-    }
-
-    debug!(
-        "generate_taxon_counts[{}]: processed {} taxa in {:?}",
-        count_type,
-        taxon_counts.len(),
-        start_total.elapsed()
+    let num_workers = compute_phase_concurrency(
+        &config,
+        "generate_taxon_counts",
+        0.6,   // ~600 MB transient per worker (lineage cache + agg map)
+        2.5,
+        128,   // EPYC 84c sweet spot
+        8,     // still useful on MacBook Air
     );
 
-    Ok(taxon_counts)
+    info!(
+        "generate_taxon_counts({}) — {} workers, per-worker local AHashMap + lineage cache (exact Python semantics)",
+        count_type, num_workers
+    );
+
+    let (worker_txs, worker_rxs): (Vec<_>, Vec<_>) = (0..num_workers)
+        .map(|_| mpsc::channel::<(Vec<Vec<u8>>, Vec<Vec<u8>>)>(64))
+        .unzip();
+
+    // Spawn workers — each owns a completely private aggregation map + cache
+    let worker_handles: Vec<_> = worker_rxs
+        .into_iter()
+        .map(|mut rx| {   // ←←← THIS IS THE FIX (was |rx|)
+            let dup = duplicate_clusters.clone();
+            let keep = should_keep_filter.clone();
+            let src = source_count_type.clone();
+            let ct = count_type.clone();
+            tokio::spawn(async move {
+                let mut agg: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
+                let mut lineage_cache: AHashMap<i32, Vec<i32>> = AHashMap::new();
+
+                while let Some((m8_batch, hit_batch)) = rx.recv().await {
+                    for (m8_bytes, hit_bytes) in m8_batch.into_iter().zip(hit_batch) {
+                        process_record_pair(
+                            &m8_bytes,
+                            &hit_bytes,
+                            &mut agg,
+                            &mut lineage_cache,
+                            &dup,
+                            &*keep,
+                            &ct,
+                            src.as_deref(),
+                        )?;
+                    }
+                }
+                Ok::<AHashMap<Vec<i32>, AggBucket>, anyhow::Error>(agg)
+            })
+        })
+        .collect();
+
+    // Producer: pair the two streams and round-robin to workers
+    let mut m8_batch = Vec::with_capacity(8192);
+    let mut hit_batch = Vec::with_capacity(8192);
+    let mut batch_idx = 0usize;
+
+    let mut m8_iter = m8_stream;
+    let mut hit_iter = summary_stream;
+
+    while let (Some(m8_item), Some(hit_item)) = (m8_iter.next().await, hit_iter.next().await) {
+        if let ParseOutput::Bytes(b) = m8_item {
+            if !b.is_empty() { m8_batch.push(b.to_vec()); }
+        }
+        if let ParseOutput::Bytes(b) = hit_item {
+            if !b.is_empty() { hit_batch.push(b.to_vec()); }
+        }
+
+        if m8_batch.len() >= 8192 && hit_batch.len() >= 8192 {
+            let worker_idx = batch_idx % num_workers;
+            let _ = worker_txs[worker_idx]
+                .send((std::mem::take(&mut m8_batch), std::mem::take(&mut hit_batch)))
+                .await;
+            batch_idx += 1;
+        }
+    }
+
+    // Final partial batch
+    if !m8_batch.is_empty() || !hit_batch.is_empty() {
+        let worker_idx = batch_idx % num_workers;
+        let _ = worker_txs[worker_idx].send((m8_batch, hit_batch)).await;
+    }
+
+    drop(worker_txs); // close all workers
+
+    // Merge the tiny partial maps from each worker
+    let partials: Vec<AHashMap<Vec<i32>, AggBucket>> = try_join_all(worker_handles)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let global_agg = merge_aggregations(partials);
+
+    // Final Python Loop 2 — identical output shape
+    let result = build_taxon_counts_list(global_agg, &count_type);
+
+    info!(
+        "generate_taxon_counts({}) complete — {} taxa",
+        count_type,
+        result.len(),
+    );
+
+    Ok(result)
 }
 
 /// Concats the nt and nr and writes a json

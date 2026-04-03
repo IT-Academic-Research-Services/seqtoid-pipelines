@@ -26,7 +26,7 @@ use tokio::time::{sleep, Duration, Instant};
 use ahash::RandomState as AHashRandomState;
 
 
-use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo};
+use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
@@ -288,6 +288,163 @@ pub struct TaxonCount {
 }
 
 
+
+pub fn process_record_pair(
+    m8_bytes: &[u8],
+    hit_bytes: &[u8],
+    agg: &mut AHashMap<Vec<i32>, AggBucket>,
+    lineage_cache: &mut AHashMap<i32, Vec<i32>>,
+    duplicate_clusters: &DashMap<String, ClusterInfo>,
+    should_keep: &dyn Fn(&[i32]) -> bool,
+    count_type: &str,
+    source_count_type: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let hit_str = std::str::from_utf8(hit_bytes)?;
+    let hit_fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
+    if hit_fields.len() < 7 {
+        return Ok(()); // malformed hit summary line → skip (matches Python)
+    }
+
+    let read_id = hit_fields[0].to_string();
+    let level: u8 = hit_fields.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let consensus_taxid: i32 = hit_fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    if consensus_taxid <= 0 || level == 0 {
+        return Ok(());
+    }
+
+    // Parse m8 line (NT or NR)
+    let m8_str = std::str::from_utf8(m8_bytes)?;
+    let m8 = if count_type.starts_with("NT") || count_type == "merged_NT_NR" {
+        M8Record::parse_line_nt(m8_str)?
+    } else {
+        M8Record::parse_line_nr(m8_str)?
+    };
+
+    let mut alen = m8.alen as f64;
+    let pident = m8.pident;
+    let mut ev = m8.evalue;
+    if ev <= MIN_NORMAL_POSITIVE_DOUBLE {
+        ev = MIN_NORMAL_POSITIVE_DOUBLE;
+    }
+    let ev_log10 = ev.log10();
+
+    // Exact Python merged_NT_NR adjustment
+    if count_type == "merged_NT_NR" && source_count_type == Some("NR") {
+        alen *= 3.0;
+    }
+
+    // Build raw lineage from the hit summary columns that summarize_hits always emits:
+    // [species_taxid, genus_taxid, family_taxid] (indices 4,5,6)
+    let species = hit_fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let genus   = hit_fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let family  = hit_fields.get(6).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let raw = vec![species, genus, family];
+
+    // Lineage cache
+    let cleaned = if let Some(cached) = lineage_cache.get(&consensus_taxid) {
+        cached.clone()
+    } else {
+        let c = validate_taxid_lineage(&raw, consensus_taxid, level); // level is already u8
+        lineage_cache.insert(consensus_taxid, c.clone());
+        c
+    };
+
+    if !should_keep(&cleaned) {
+        return Ok(());
+    }
+
+    let cluster_size = duplicate_clusters
+        .get(&read_id)
+        .map(|e| e.value().size)
+        .unwrap_or(1);
+
+    let mut agg_key = cleaned;
+    while !agg_key.is_empty() {
+        let bucket = agg.entry(agg_key.clone()).or_default();
+
+        bucket.nonunique_count += cluster_size;
+        bucket.unique_count += 1;
+        bucket.base_count += (m8.alen as u64) * cluster_size;
+        bucket.sum_percent_identity += pident;
+        bucket.sum_alignment_length += alen;
+        bucket.sum_e_value += ev_log10;
+
+        if let Some(src) = source_count_type {
+            bucket.source_count_type.insert(src.to_string());
+        }
+
+        agg_key = agg_key[1..].to_vec();
+    }
+
+    Ok(())
+}
+
+pub fn merge_aggregations(parts: Vec<AHashMap<Vec<i32>, AggBucket>>) -> AHashMap<Vec<i32>, AggBucket> {
+    let mut merged = AHashMap::new();
+    for part in parts {
+        for (k, b) in part {
+            let e: &mut AggBucket = merged.entry(k).or_default();
+
+            e.nonunique_count += b.nonunique_count;
+            e.unique_count += b.unique_count;
+            e.base_count += b.base_count;
+            e.sum_percent_identity += b.sum_percent_identity;
+            e.sum_alignment_length += b.sum_alignment_length;
+            e.sum_e_value += b.sum_e_value;
+
+            if !b.source_count_type.is_empty() {
+                e.source_count_type.extend(b.source_count_type);
+            }
+        }
+    }
+    merged
+}
+
+pub fn build_taxon_counts_list(agg: AHashMap<Vec<i32>, AggBucket>, count_type: &str) -> Vec<TaxonCount> {
+    let mut rows = Vec::with_capacity(agg.len());
+    for (agg_key, bucket) in agg {
+        if bucket.unique_count == 0 { continue; }
+
+        let len_key = agg_key.len();
+        let tax_level = (3 - len_key + 1) as u8;   // exact Python: species=1, genus=2, family=3
+
+        let genus_taxid = if tax_level <= 2 { agg_key[2 - tax_level as usize] } else { -200 };
+        let family_taxid = if tax_level <= 3 { agg_key[3 - tax_level as usize] } else { -300 };
+
+        let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
+            bucket.nonunique_count
+        } else {
+            bucket.unique_count
+        };
+
+        let source_vec = if bucket.source_count_type.is_empty() {
+            None
+        } else {
+            let mut v: Vec<_> = bucket.source_count_type.into_iter().collect();
+            v.sort_unstable();
+            Some(v)
+        };
+
+        rows.push(TaxonCount {
+            tax_id: agg_key[0],
+            tax_level,
+            genus_taxid,
+            family_taxid,
+            count,
+            nonunique_count: bucket.nonunique_count,
+            unique_count: bucket.unique_count,
+            dcr: bucket.nonunique_count as f64 / bucket.unique_count as f64,
+            percent_identity: bucket.sum_percent_identity / bucket.unique_count as f64,
+            alignment_length: bucket.sum_alignment_length / bucket.unique_count as f64,
+            e_value: bucket.sum_e_value / bucket.unique_count as f64,
+            count_type: count_type.to_string(),
+            base_count: bucket.base_count,
+            source_count_type: source_vec,
+        });
+    }
+    rows
+}
 // *******************
 // Taxonomy helper functions based on m8 records
 // *******************
