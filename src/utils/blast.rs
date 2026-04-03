@@ -313,13 +313,8 @@ pub fn process_record_pair(
         return Ok(());
     }
 
-    // Parse m8 line (NT or NR)
     let m8_str = std::str::from_utf8(m8_bytes)?;
-    let m8 = if count_type.starts_with("NT") || count_type == "merged_NT_NR" {
-        M8Record::parse_line_nt(m8_str)?
-    } else {
-        M8Record::parse_line_nr(m8_str)?
-    };
+    let m8 = M8Record::parse_line_nr(m8_str)?;
 
     let mut alen = m8.alen as f64;
     let pident = m8.pident;
@@ -329,23 +324,22 @@ pub fn process_record_pair(
     }
     let ev_log10 = ev.log10();
 
-    // Exact Python merged_NT_NR adjustment
+    // Exact Python merged_NT_NR adjustment (still needed)
     if count_type == "merged_NT_NR" && source_count_type == Some("NR") {
         alen *= 3.0;
     }
 
-    // Build raw lineage from the hit summary columns that summarize_hits always emits:
-    // [species_taxid, genus_taxid, family_taxid] (indices 4,5,6)
+    // Build raw lineage from hit summary columns (indices 4,5,6)
     let species = hit_fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1);
     let genus   = hit_fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
     let family  = hit_fields.get(6).and_then(|s| s.parse().ok()).unwrap_or(-1);
     let raw = vec![species, genus, family];
 
-    // Lineage cache
+    // Lineage cache (exactly like summarize_hits)
     let cleaned = if let Some(cached) = lineage_cache.get(&consensus_taxid) {
         cached.clone()
     } else {
-        let c = validate_taxid_lineage(&raw, consensus_taxid, level); // level is already u8
+        let c = validate_taxid_lineage(&raw, consensus_taxid, level);
         lineage_cache.insert(consensus_taxid, c.clone());
         c
     };
