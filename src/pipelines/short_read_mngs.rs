@@ -2999,20 +2999,21 @@ pub async fn generate_taxon_counts(
     debug!("generate_taxon_counts[{}]: starting concurrent streaming aggregation", count_type);
 
     // Work channel for parallel aggregation
-    let (work_tx, mut work_rx) = mpsc::channel::<TaxonCountWorkItem>(4096);
+    let (work_tx, mut work_rx) = mpsc::channel::<TaxonCountWorkItem>(8192);
     let work_tx = Arc::new(work_tx);
 
-    // Producer: paired lockstep with batching
+    // Producer: real batched parsing with rayon
     let producer = tokio::spawn({
         let work_tx = work_tx.clone();
         let duplicate_clusters = duplicate_clusters.clone();
+        let should_keep_filter = should_keep_filter.clone();
+
         async move {
             let mut paired_count = 0usize;
             let mut summary_iter = summary_stream;
             let mut m8_iter = m8_stream;
 
-            const PRODUCER_BATCH: usize = 4096;   // tune if needed (larger = less await overhead)
-            let mut batch = Vec::with_capacity(PRODUCER_BATCH);
+            const PRODUCER_BATCH: usize = 2048;
 
             while let (Some(summary_item), Some(m8_item)) = (summary_iter.next().await, m8_iter.next().await) {
                 paired_count += 1;
@@ -3026,80 +3027,96 @@ pub async fn generate_taxon_counts(
                     Err(_) => continue,
                 };
 
-                let summary_line = String::from_utf8_lossy(&summary_bytes).trim_end().to_string();
-                if summary_line.is_empty() || summary_line.starts_with('#') {
-                    continue;
-                }
-
-                let cols: Vec<&str> = summary_line.split('\t').collect();
-                if cols.len() != 6 {
-                    warn!("Malformed summary line: {}", summary_line);
-                    continue;
-                }
-
-                let read_id = cols[0].to_string();
-                let level: u8 = cols[5].parse().unwrap_or(0);
-                let species: i32 = cols[2].parse().unwrap_or(0);
-                let genus: i32 = cols[3].parse().unwrap_or(0);
-                let family: i32 = cols[4].parse().unwrap_or(0);
-
-                let consensus_taxid = match level {
-                    1 => species,
-                    2 => genus,
-                    3 => family,
-                    _ => 0,
-                };
-
-                let raw_lineage = vec![species, genus, family];
-                let cleaned_lineage = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
-
-                if !should_keep_filter(&cleaned_lineage) {
-                    continue;
-                }
-
-                let m8_line = String::from_utf8_lossy(&m8_bytes).trim_end().to_string();
-                let rec = match M8Record::parse_line_nr(&m8_line) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        debug!("Failed to parse m8 for {}: {}", read_id, e);
-                        continue;
-                    }
-                };
-
-                let cluster_size = duplicate_clusters
-                    .get(&read_id)
-                    .map(|e| e.value().size)
-                    .unwrap_or(1u64);
-
-                let evalue_log10 = if rec.evalue <= 0.0 || !rec.evalue.is_finite() {
-                    MIN_NORMAL_POSITIVE_DOUBLE.log10()
-                } else {
-                    rec.evalue.log10()
-                };
-
-                let work_item = TaxonCountWorkItem {
-                    cleaned_lineage,
-                    cluster_size,
-                    alen: rec.alen,
-                    pident: rec.pident,
-                    evalue_log10,
-                    source_count_type: source_count_type.clone(),
-                };
-
-                batch.push(work_item);
-
-                if batch.len() >= PRODUCER_BATCH {
-                    for item in std::mem::take(&mut batch) {
-                        if work_tx.send(item).await.is_err() {
-                            return Ok(());
-                        }
+                // Collect a batch of raw bytes
+                let mut batch = vec![(summary_bytes, m8_bytes)];
+                for _ in 1..PRODUCER_BATCH {
+                    if let (Some(s), Some(m)) = (summary_iter.next().await, m8_iter.next().await) {
+                        paired_count += 1;
+                        let sb = match s.to_bytes() { Ok(b) => b, Err(_) => continue };
+                        let mb = match m.to_bytes() { Ok(b) => b, Err(_) => continue };
+                        batch.push((sb, mb));
+                    } else {
+                        break;
                     }
                 }
-            }
 
-            // final flush
-            for item in batch {
-                let _ = work_tx.send(item).await;
+                // Parse batch in parallel with rayon
+                let work_items: Vec<TaxonCountWorkItem> = tokio::task::spawn_blocking({
+                    let duplicate_clusters = duplicate_clusters.clone();
+                    let should_keep_filter = should_keep_filter.clone();
+                    let source_count_type = source_count_type.clone();
+
+                    move || {
+                        batch
+                            .par_iter()
+                            .filter_map(|(summary_bytes, m8_bytes)| {
+                                let summary_line = String::from_utf8_lossy(summary_bytes).trim_end().to_string();
+                                if summary_line.is_empty() || summary_line.starts_with('#') {
+                                    return None;
+                                }
+
+                                let cols: Vec<&str> = summary_line.split('\t').collect();
+                                if cols.len() != 6 {
+                                    return None;
+                                }
+
+                                let read_id = cols[0].to_string();
+                                let level: u8 = cols[5].parse().unwrap_or(0);
+                                let species: i32 = cols[2].parse().unwrap_or(0);
+                                let genus: i32 = cols[3].parse().unwrap_or(0);
+                                let family: i32 = cols[4].parse().unwrap_or(0);
+
+                                let consensus_taxid = match level {
+                                    1 => species,
+                                    2 => genus,
+                                    3 => family,
+                                    _ => 0,
+                                };
+
+                                let raw_lineage = vec![species, genus, family];
+                                let cleaned_lineage = validate_taxid_lineage(&raw_lineage, consensus_taxid, level);
+
+                                if !should_keep_filter(&cleaned_lineage) {
+                                    return None;
+                                }
+
+                                let m8_line = String::from_utf8_lossy(m8_bytes).trim_end().to_string();
+                                let rec = match M8Record::parse_line_nr(&m8_line) {
+                                    Ok(r) => r,
+                                    Err(_) => return None,
+                                };
+
+                                let cluster_size = duplicate_clusters
+                                    .get(&read_id)
+                                    .map(|e| e.value().size)
+                                    .unwrap_or(1u64);
+
+                                let evalue_log10 = if rec.evalue <= 0.0 || !rec.evalue.is_finite() {
+                                    MIN_NORMAL_POSITIVE_DOUBLE.log10()
+                                } else {
+                                    rec.evalue.log10()
+                                };
+
+                                Some(TaxonCountWorkItem {
+                                    cleaned_lineage,
+                                    cluster_size,
+                                    alen: rec.alen,
+                                    pident: rec.pident,
+                                    evalue_log10,
+                                    source_count_type: source_count_type.clone(),
+                                })
+                            })
+                            .collect()
+                    }
+                }).await
+                    .expect("producer batch parsing panicked");
+
+                // Send the parsed batch
+                for item in work_items {
+                    if work_tx.send(item).await.is_err() {
+                        return Ok(());
+                    }
+                }
             }
 
             debug!("generate_taxon_counts producer: sent {} paired records", paired_count);
