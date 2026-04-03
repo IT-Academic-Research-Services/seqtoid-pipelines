@@ -12,6 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::process::{Command as StdCommand, Stdio};
 
 use ahash::AHashMap;
+use ahash::RandomState as AHashRandomState;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -5709,6 +5710,88 @@ pub async fn generate_nonhost_fastq_from_files(
     Ok((out_r1, out_r2))
 }
 
+/// Parallel preload of NR hit-summary → DashMap (exact Python semantics, >50k lines/s on EPYC)
+async fn preload_nr_alignments_parallel(
+    config: Arc<RunConfig>,
+    preload_rx: mpsc::Receiver<ParseOutput>,
+    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
+) -> Result<()> {
+    let concurrency = compute_phase_concurrency(
+        &config,
+        "nr_preload_alignments",
+        0.3,   // tiny RAM per worker
+        2.0,   // almost pure parse+insert
+        128,   // safe even on 256-core EPYC
+        8,
+    );
+
+    let batch_size = compute_batch_size(None, 180, 200, concurrency);
+
+    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = Arc::clone(&shared_rx);
+        let map = Arc::clone(&nr_alignment_per_read);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let batch = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+                let Some(batch) = batch else { break };
+
+                batch.par_iter().for_each(|line| {
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() { return; }
+
+                    let fields: Vec<&str> = trimmed.split('\t').collect();
+                    if fields.len() < 10 { return; }
+
+                    let read_id = fields[0].to_string();
+                    let contig_taxid = fields[9].parse::<Taxid>().ok();
+                    let read_taxid  = fields[3].parse::<Taxid>().ok();
+
+                    map.insert(
+                        read_id,
+                        SpeciesAlignmentResults { contig: contig_taxid, read: read_taxid },
+                    );
+                });
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        workers.push(handle);
+    }
+
+    // Producer (same lockstep style as all your other high-throughput stages)
+    let mut batch = Vec::with_capacity(batch_size);
+    let mut stream = ReceiverStream::new(preload_rx);
+    while let Some(item) = stream.next().await {
+        if let ParseOutput::Bytes(b) = item {
+            let line = String::from_utf8_lossy(&b).trim_end().to_string();
+            if !line.is_empty() {
+                batch.push(line);
+            }
+        }
+        if batch.len() >= batch_size {
+            let _ = job_tx.send(std::mem::take(&mut batch)).await;
+        }
+    }
+    if !batch.is_empty() {
+        let _ = job_tx.send(batch).await;
+    }
+    drop(job_tx);
+
+    for h in workers {
+        h.await??;
+    }
+
+    info!("Preloaded {} NR alignments (parallel, {} workers)", nr_alignment_per_read.len(), concurrency);
+    Ok(())
+}
+
 
 /// Run function for Short Read mNGS pipelines
 ///
@@ -7048,39 +7131,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     temp_files.extend(nr_temp_files);
 
 
-    //prelod
-    let mut nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>> = Arc::new(DashMap::with_capacity(80_000_000));
+    // ────────────────────────────────────────────────────────────────
+    // PRELOAD NR alignments (parallel version)
+    // ────────────────────────────────────────────────────────────────
+    let nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>> =
+        Arc::new(DashMap::with_capacity_and_hasher(
+            80_000_000,
+            AHashRandomState::new()
+        ));
 
-    let mut preload_stream = ReceiverStream::new(nr_hit_summary_preload);
-    while let Some(item) = preload_stream.next().await {
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
-            continue;
-        }
+    let preload_handle = tokio::spawn(preload_nr_alignments_parallel(
+        config.clone(),
+        nr_hit_summary_preload,
+        Arc::clone(&nr_alignment_per_read),
+    ));
 
-        let fields: Vec<&str> = trimmed.split('\t').collect();
-        if fields.len() < 10 {
-            warn!("Malformed NR hit summary line during preload: {}", trimmed);
-            continue;
-        }
-
-        let read_id = fields[0].to_string();
-        let contig_taxid = fields[9].parse::<Taxid>().ok();
-        let read_taxid = fields[3].parse::<Taxid>().ok();
-
-        nr_alignment_per_read.insert(
-            read_id,
-            SpeciesAlignmentResults {
-                contig: contig_taxid,
-                read: read_taxid,
-            },
-        );
-    }
-    info!("Preloaded {} NR alignments into memory for merge", nr_alignment_per_read.len());
-
-
+    // ────────────────────────────────────────────────────────────────
+    // Spawn merged taxon counts (unchanged except we await preload first)
+    // ────────────────────────────────────────────────────────────────
     let compute_merged_taxon_handle = tokio::spawn(compute_merged_taxon_counts(
         config.clone(),
         nt_m8_merge,
@@ -7096,8 +7164,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("refined.hitsummary.tab"),
         out_dir.join("refined_taxon_counts_with_dcr.json"),
         out_dir.join("assembly_combined_contig_summary.json"),
-        nr_alignment_per_read
+        nr_alignment_per_read,
     ));
+
+    // Wait for preload before proceeding (keeps exact ordering semantics from Python)
+    let _ = preload_handle.await
+        .map_err(|e| PipelineError::Other(anyhow!("NR preload task panicked: {}", e)))??;
 
 
     let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));

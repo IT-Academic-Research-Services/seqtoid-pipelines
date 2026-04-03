@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use dashmap::DashMap;
 use tokio::time::{sleep, Duration, Instant};
+use ahash::RandomState as AHashRandomState;
 
 
 use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo};
@@ -755,7 +756,7 @@ pub async fn compute_merged_taxon_counts(
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults>>,
+    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
 ) -> Result<()> {
     // Write merged m8 and hit summary to disk
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
