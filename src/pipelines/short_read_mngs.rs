@@ -4500,6 +4500,7 @@ pub async fn build_reference_fasta_from_selected_genera(
 pub async fn summarize_hits(
     config: Arc<RunConfig>,
     mut stream: ReceiverStream<ParseOutput>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     min_reads_per_genus: usize,
 ) -> Result<(
     AHashMap<String, Arc<ReadHit>>,
@@ -4519,15 +4520,15 @@ pub async fn summarize_hits(
     let concurrency = compute_phase_concurrency(
         &config,
         "summarize_hits",
-        0.5,
-        3.5,
-        32,
+        0.4,
+        4.0,
+        64,
         8,
     );
 
-    // Producer: collect raw ParseOutput into batches
+    // Producer: collect into batches
     let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
-    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));   // shared safely
+    let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
     let producer = tokio::spawn(async move {
         let mut batch = Vec::with_capacity(4096);
@@ -4553,6 +4554,7 @@ pub async fn summarize_hits(
         let gs = genus_species.clone();
         let ga = genus_accessions.clone();
         let tr = total_reads.clone();
+        let dup_clusters = duplicate_clusters.clone();
 
         worker_handles.push(tokio::spawn(async move {
             loop {
@@ -4566,7 +4568,7 @@ pub async fn summarize_hits(
                     None => break,
                 };
 
-                // Parse batch in parallel with rayon
+                // Rayon parse
                 let parsed: Vec<(String, String, i32, i32, i32, u8)> = tokio::task::spawn_blocking({
                     let batch = batch;
                     move || {
@@ -4581,14 +4583,10 @@ pub async fn summarize_hits(
                                     Ok(s) => s.trim_end(),
                                     Err(_) => return None,
                                 };
-                                if line.is_empty() {
-                                    return None;
-                                }
+                                if line.is_empty() { return None; }
 
                                 let parts: Vec<&str> = line.split('\t').collect();
-                                if parts.len() != 6 {
-                                    return None;
-                                }
+                                if parts.len() != 6 { return None; }
 
                                 let read_id = parts[0].to_string();
                                 let accession_id = if parts[1].is_empty() || parts[1] == "-" {
@@ -4605,13 +4603,11 @@ pub async fn summarize_hits(
                             })
                             .collect()
                     }
-                }).await
-                    .expect("summarize_hits batch parsing panicked");
+                }).await.expect("summarize_hits batch parsing panicked");
 
-                // Update DashMaps
+                // Correct DCR aggregation
                 for (read_id, accession_id, hit_taxid, genus_taxid, family_taxid, level) in parsed {
                     let species_taxid = if level >= 3 && hit_taxid > 0 { hit_taxid } else { 0 };
-
                     let assigned_taxid = if level >= 3 {
                         species_taxid
                     } else if level == 2 || level == 1 {
@@ -4619,6 +4615,11 @@ pub async fn summarize_hits(
                     } else {
                         hit_taxid
                     };
+
+                    let cluster_size: u64 = dup_clusters
+                        .get(&read_id)
+                        .map(|e| e.value().size)
+                        .unwrap_or(1);
 
                     rd.insert(
                         read_id.clone(),
@@ -4639,19 +4640,19 @@ pub async fn summarize_hits(
                         }),
                     );
 
-                    tr.fetch_add(1, AtomicOrdering::Relaxed);
+                    tr.fetch_add(cluster_size as usize, AtomicOrdering::Relaxed);
 
                     if accession_id != "-" && genus_taxid > 0 {
                         ad.entry(accession_id.clone())
-                            .and_modify(|e: &mut AccessionHit| e.count += 1)   // ← added type
+                            .and_modify(|e: &mut AccessionHit| e.count += cluster_size)  // explicit type
                             .or_insert(AccessionHit {
                                 taxid: species_taxid,
                                 genus_taxid,
                                 family_taxid,
-                                count: 1,
+                                count: cluster_size,
                             });
 
-                        *grc.entry(genus_taxid).or_insert(0) += 1;
+                        *grc.entry(genus_taxid).or_insert(0) += cluster_size as usize;
                         gs.entry(genus_taxid).or_default().insert(species_taxid);
                         ga.entry(genus_taxid).or_default().insert(accession_id);
                     }
@@ -4661,7 +4662,7 @@ pub async fn summarize_hits(
         }));
     }
 
-    // Wait for everything
+    // Wait for completion
     producer.await??;
     for h in worker_handles {
         h.await??;
@@ -4669,11 +4670,11 @@ pub async fn summarize_hits(
 
     let total_reads_val = total_reads.load(AtomicOrdering::SeqCst);
     info!(
-        "summarize_hits: processed {} reads, {} unique accessions",
-        total_reads_val,
-        accession_dict.len()
+        "summarize_hits: processed {} reads, {} unique accessions ({} workers)",
+        total_reads_val, accession_dict.len(), concurrency
     );
 
+    // Final selected_genera (exact original logic)
     let mut selected_genera: HashMap<i32, Vec<String>> = HashMap::new();
     for entry in genus_read_counts.iter() {
         let genus_taxid = *entry.key();
@@ -4696,8 +4697,10 @@ pub async fn summarize_hits(
         }
     }
 
-    let read_dict_final: AHashMap<String, Arc<ReadHit>> = Arc::try_unwrap(read_dict).unwrap().into_iter().collect();
-    let accession_dict_final: AHashMap<String, AccessionHit> = Arc::try_unwrap(accession_dict).unwrap().into_iter().collect();
+    let read_dict_final: AHashMap<String, Arc<ReadHit>> =
+        Arc::try_unwrap(read_dict).unwrap().into_iter().collect();
+    let accession_dict_final: AHashMap<String, AccessionHit> =
+        Arc::try_unwrap(accession_dict).unwrap().into_iter().collect();
 
     Ok((
         read_dict_final,
@@ -4706,7 +4709,6 @@ pub async fn summarize_hits(
         total_reads_val,
     ))
 }
-
 
 /// Helper for writing empty output of blast_contigs in no assemled results
 ///
@@ -6387,7 +6389,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("  → nt_summary_hit_stream (to summarize_hits)");
     info!("  → nt_summary_taxon_stream (to generate_taxon_counts)");
 
-    let nt_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), nt_summary_hit_stream, 0));
+    let nt_hit_summary_handle = tokio::spawn(summarize_hits(
+        config.clone(),
+        nt_summary_hit_stream,
+        duplicate_clusters.clone(),      // ← required for correct DCR
+        0,
+    ));
 
     let nt_counts_task = tokio::spawn({
         let config = config.clone();
@@ -6494,7 +6501,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_hit_summary_for_refined = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_hit_summary_for_taxid    = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let nr_hit_summary_handle = tokio::spawn(summarize_hits(config.clone(), ReceiverStream::new(nr_summary_hit_stream), 0));
+
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(
+        config.clone(),
+        ReceiverStream::new(nr_summary_hit_stream),
+        duplicate_clusters.clone(),
+        0,
+    ));
 
     let nr_counts_task = tokio::spawn({
         let config = config.clone();
