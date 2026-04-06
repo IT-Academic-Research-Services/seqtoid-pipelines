@@ -2631,16 +2631,17 @@ pub async fn call_hits_m8(
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 ), PipelineError> {
-    let worker_count = concurrency.max(1);
+    use std::time::Duration;
 
+    let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
 
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
 
-    let mut worker_txs = Vec::with_capacity(worker_count);
-    let mut worker_rxs = Vec::with_capacity(worker_count);
+    let mut worker_txs: Vec<mpsc::Sender<WorkerMsg>> = Vec::with_capacity(worker_count);
+    let mut worker_rxs: Vec<mpsc::Receiver<WorkerMsg>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
         let (tx, rx) = mpsc::channel::<WorkerMsg>(config.base_buffer_size * 8);
@@ -2648,20 +2649,41 @@ pub async fn call_hits_m8(
         worker_rxs.push(rx);
     }
 
-    for mut rx in worker_rxs {
+    // One worker per shard. Each worker owns a private read map and emits to both outputs.
+    for (worker_idx, mut rx) in worker_rxs.into_iter().enumerate() {
         let lineage_map = lineage_map.clone();
         let acc2taxid_map = acc2taxid_map.clone();
         let should_keep_filter = should_keep_filter.clone();
         let dedup_tx = dedup_tx.clone();
         let summary_tx = summary_tx.clone();
-        let tag = tag.clone();
+        let worker_tag = tag.clone();
 
         let worker_handle = tokio::spawn(async move {
             let mut reads: AHashMap<u64, PendingRead> = AHashMap::new();
+            let mut total_lines = 0usize;
+            let mut total_emitted = 0usize;
+            let mut max_recv_wait = Duration::from_secs(0);
+            let mut max_emit_wait = Duration::from_secs(0);
+            let mut max_summarize_time = Duration::from_secs(0);
+            let mut last_log = Instant::now();
+            let start = Instant::now();
 
-            while let Some(msg) = rx.recv().await {
+            loop {
+                let recv_start = Instant::now();
+                let msg = rx.recv().await;
+                let recv_wait = recv_start.elapsed();
+                if recv_wait > max_recv_wait {
+                    max_recv_wait = recv_wait;
+                }
+
+                let Some(msg) = msg else {
+                    break;
+                };
+
                 match msg {
                     WorkerMsg::Line { seq, line } => {
+                        total_lines += 1;
+
                         let line_str = match std::str::from_utf8(&line) {
                             Ok(s) => s.trim_end(),
                             Err(_) => continue,
@@ -2670,14 +2692,13 @@ pub async fn call_hits_m8(
                             continue;
                         }
 
-                        // Both NT (minimap2 → paf2blast6) and NR (diamond) produce standard 12-column m8 files.
-                        // The original Python BlastnOutput6Reader / BlastnOutput6NTRerankedReader always used
-                        // the 12-column parser for both paths. qlen/slen were never present in the real data.
-                        // Using parse_line_nr for both is therefore correct and matches the original results exactly.
                         let rec = match M8Record::parse_line_nr(line_str) {
                             Ok(r) => r,
                             Err(e) => {
-                                debug!("Failed to parse m8 line (12-column): {} — {}", line_str, e);
+                                debug!(
+                                    "[call_hits_m8:{}] worker {} parse error: {}",
+                                    worker_tag, worker_idx, e
+                                );
                                 continue;
                             }
                         };
@@ -2688,13 +2709,32 @@ pub async fn call_hits_m8(
                         });
                         entry.hits.push(rec);
                     }
-                    WorkerMsg::Flush => break,
+
+                    WorkerMsg::Flush => {
+                        break;
+                    }
+                }
+
+                if last_log.elapsed() >= Duration::from_secs(10) {
+                    info!(
+                        "[call_hits_m8:{}] worker {} progress: lines={} pending_reads={} emitted={} max_recv_wait={:?} max_emit_wait={:?} max_summarize_time={:?} elapsed={:?}",
+                        worker_tag,
+                        worker_idx,
+                        total_lines,
+                        reads.len(),
+                        total_emitted,
+                        max_recv_wait,
+                        max_emit_wait,
+                        max_summarize_time,
+                        start.elapsed(),
+                    );
+                    last_log = Instant::now();
                 }
             }
 
-            // Stream each read group's result immediately
             for (seq, pending) in reads {
-                if let Some(reduced) = summarize_m8_hits(
+                let summarize_start = Instant::now();
+                let reduced = summarize_m8_hits(
                     seq,
                     pending.read_id,
                     &pending.hits,
@@ -2702,15 +2742,81 @@ pub async fn call_hits_m8(
                     &acc2taxid_map,
                     &*should_keep_filter,
                     min_aln_len,
-                ) {
-                    if dedup_tx.send(ParseOutput::Bytes(Arc::new(reduced.dedup))).await.is_err() {
-                        return Err(anyhow!("dedup channel closed"));
-                    }
-                    if summary_tx.send(ParseOutput::Bytes(Arc::new(reduced.summary))).await.is_err() {
-                        return Err(anyhow!("summary channel closed"));
-                    }
+                );
+                let summarize_time = summarize_start.elapsed();
+                if summarize_time > max_summarize_time {
+                    max_summarize_time = summarize_time;
+                }
+
+                let Some(reduced) = reduced else {
+                    continue;
+                };
+
+                total_emitted += 1;
+
+                let dedup_send_start = Instant::now();
+                dedup_tx
+                    .send(ParseOutput::Bytes(Arc::new(reduced.dedup)))
+                    .await
+                    .map_err(|_| anyhow!("dedup channel closed"))?;
+                let dedup_wait = dedup_send_start.elapsed();
+
+                let summary_send_start = Instant::now();
+                summary_tx
+                    .send(ParseOutput::Bytes(Arc::new(reduced.summary)))
+                    .await
+                    .map_err(|_| anyhow!("summary channel closed"))?;
+                let summary_wait = summary_send_start.elapsed();
+
+                let emit_wait = dedup_wait.max(summary_wait);
+                if emit_wait > max_emit_wait {
+                    max_emit_wait = emit_wait;
+                }
+
+                if summarize_time >= Duration::from_millis(50)
+                    || dedup_wait >= Duration::from_millis(50)
+                    || summary_wait >= Duration::from_millis(50)
+                {
+                    debug!(
+                        "[call_hits_m8:{}] worker {} slow item: summarize={:?} dedup_send={:?} summary_send={:?} seq={} hits={}",
+                        worker_tag,
+                        worker_idx,
+                        summarize_time,
+                        dedup_wait,
+                        summary_wait,
+                        seq,
+                        pending.hits.len(),
+                    );
+                }
+
+                if last_log.elapsed() >= Duration::from_secs(10) {
+                    info!(
+                        "[call_hits_m8:{}] worker {} progress: lines={} emitted={} pending_reads={} max_recv_wait={:?} max_emit_wait={:?} max_summarize_time={:?} elapsed={:?}",
+                        worker_tag,
+                        worker_idx,
+                        total_lines,
+                        total_emitted,
+                        pending.hits.len(),
+                        max_recv_wait,
+                        max_emit_wait,
+                        max_summarize_time,
+                        start.elapsed(),
+                    );
+                    last_log = Instant::now();
                 }
             }
+
+            info!(
+                "[call_hits_m8:{}] worker {} done: lines={} emitted={} max_recv_wait={:?} max_emit_wait={:?} max_summarize_time={:?} elapsed={:?}",
+                worker_tag,
+                worker_idx,
+                total_lines,
+                total_emitted,
+                max_recv_wait,
+                max_emit_wait,
+                max_summarize_time,
+                start.elapsed(),
+            );
 
             Ok::<(), anyhow::Error>(())
         });
@@ -2718,18 +2824,41 @@ pub async fn call_hits_m8(
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator
+    // Coordinator: read M8, shard to workers, and measure await time on the input and worker sends.
+    let coordinator_tag = tag.clone();
+    let coordinator_worker_txs = worker_txs.clone();
+
     let coordinator_handle = tokio::spawn(async move {
         let mut seen: AHashMap<String, u64> = AHashMap::new();
         let mut next_seq: u64 = 0;
         let mut line_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
 
-        while let Some(item) = m8_input.next().await {
+        let mut total_bytes = 0usize;
+        let mut total_lines = 0usize;
+        let mut total_sent = 0usize;
+        let mut max_input_wait = Duration::from_secs(0);
+        let mut max_worker_send_wait = Duration::from_secs(0);
+        let mut last_log = Instant::now();
+        let start = Instant::now();
+
+        loop {
+            let input_start = Instant::now();
+            let item = m8_input.next().await;
+            let input_wait = input_start.elapsed();
+            if input_wait > max_input_wait {
+                max_input_wait = input_wait;
+            }
+
+            let Some(item) = item else {
+                break;
+            };
+
             let bytes = match item.to_bytes() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
 
+            total_bytes += bytes.len();
             line_buffer.extend_from_slice(&bytes);
 
             let mut start_idx = 0usize;
@@ -2739,6 +2868,7 @@ pub async fn call_hits_m8(
                 if line_buffer[i] == b'\n' {
                     let line = &line_buffer[start_idx..i];
                     start_idx = i + 1;
+                    total_lines += 1;
 
                     if !line.is_empty() && line[0] != b'#' {
                         let line_str = match std::str::from_utf8(line) {
@@ -2764,8 +2894,32 @@ pub async fn call_hits_m8(
                         });
 
                         let shard = shard_for_read_id(read_id, worker_count);
-                        if worker_txs[shard].send(WorkerMsg::Line { seq, line: line.to_vec() }).await.is_err() {
+                        let send_start = Instant::now();
+                        if coordinator_worker_txs[shard]
+                            .send(WorkerMsg::Line {
+                                seq,
+                                line: line.to_vec(),
+                            })
+                            .await
+                            .is_err()
+                        {
                             return Err(anyhow!("worker channel closed"));
+                        }
+                        let send_wait = send_start.elapsed();
+                        if send_wait > max_worker_send_wait {
+                            max_worker_send_wait = send_wait;
+                        }
+                        total_sent += 1;
+
+                        if send_wait >= Duration::from_millis(50) {
+                            debug!(
+                                "[call_hits_m8:{}] coordinator slow worker send: shard={} wait={:?} seq={} read_id={}",
+                                coordinator_tag,
+                                shard,
+                                send_wait,
+                                seq,
+                                read_id,
+                            );
                         }
                     }
                 }
@@ -2775,11 +2929,49 @@ pub async fn call_hits_m8(
             if start_idx > 0 {
                 line_buffer.drain(..start_idx);
             }
+
+            if last_log.elapsed() >= Duration::from_secs(10) {
+                info!(
+                    "[call_hits_m8:{}] coordinator progress: bytes={} lines={} sent={} seen={} max_input_wait={:?} max_worker_send_wait={:?} pending_buffer={} elapsed={:?}",
+                    coordinator_tag,
+                    total_bytes,
+                    total_lines,
+                    total_sent,
+                    seen.len(),
+                    max_input_wait,
+                    max_worker_send_wait,
+                    line_buffer.len(),
+                    start.elapsed(),
+                );
+                last_log = Instant::now();
+            }
         }
 
-        for tx in worker_txs {
+        for (idx, tx) in coordinator_worker_txs.into_iter().enumerate() {
+            let flush_start = Instant::now();
             let _ = tx.send(WorkerMsg::Flush).await;
+            let flush_wait = flush_start.elapsed();
+            if flush_wait >= Duration::from_millis(50) {
+                debug!(
+                    "[call_hits_m8:{}] coordinator flush wait on worker {}: {:?}",
+                    coordinator_tag,
+                    idx,
+                    flush_wait
+                );
+            }
         }
+
+        info!(
+            "[call_hits_m8:{}] coordinator done: bytes={} lines={} sent={} seen={} max_input_wait={:?} max_worker_send_wait={:?} elapsed={:?}",
+            coordinator_tag,
+            total_bytes,
+            total_lines,
+            total_sent,
+            seen.len(),
+            max_input_wait,
+            max_worker_send_wait,
+            start.elapsed(),
+        );
 
         Ok::<(), anyhow::Error>(())
     });
@@ -2789,8 +2981,12 @@ pub async fn call_hits_m8(
     let dedup_tag = format!("{}.dedup.m8", tag);
     let summary_tag = format!("{}.summary.txt", tag);
 
-    let m8_dedup_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some(&dedup_tag), "_"));
-    let summary_file_path = config.out_dir.join(rename_file_path(&sample_base_buf, None, Some(&summary_tag), "_"));
+    let m8_dedup_file_path = config
+        .out_dir
+        .join(rename_file_path(&sample_base_buf, None, Some(&dedup_tag), "_"));
+    let summary_file_path = config
+        .out_dir
+        .join(rename_file_path(&sample_base_buf, None, Some(&summary_tag), "_"));
 
     let dedup_stream = ReceiverStream::new(dedup_rx);
     let (mut dedup_branches, dedup_done) = t_junction(
@@ -2803,7 +2999,9 @@ pub async fn call_hits_m8(
         StreamDataType::JustBytes,
         "call_hits_m8_dedup".to_string(),
         None,
-    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_receivers.push(dedup_done);
 
     let dedup_main = dedup_branches.remove(0);
@@ -2813,8 +3011,10 @@ pub async fn call_hits_m8(
         &m8_dedup_file_path,
         ReceiverStream::new(dedup_file_stream),
         Some(config.base_buffer_size),
-        "call_hits_m8_dedup"
-    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+        "call_hits_m8_dedup",
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(call_file_write_task);
 
     let summary_stream = ReceiverStream::new(summary_rx);
@@ -2828,7 +3028,9 @@ pub async fn call_hits_m8(
         StreamDataType::JustBytes,
         "call_hits_m8_summary".to_string(),
         None,
-    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_receivers.push(summary_done);
 
     let summary_main = summary_branches.remove(0);
@@ -2838,8 +3040,10 @@ pub async fn call_hits_m8(
         &summary_file_path,
         ReceiverStream::new(summary_file_stream),
         Some(config.base_buffer_size),
-        "call_hits_m8_summary"
-    ).await.map_err(|e| PipelineError::IOError(e.to_string()))?;
+        "call_hits_m8_summary",
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(summary_file_write_task);
 
     Ok((
