@@ -6907,6 +6907,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
     info!("call hits nt concurrency {}", nt_concurrency);
 
+
     let nt_call_hits_start = Instant::now();
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
         config.clone(),
@@ -6926,6 +6927,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
+    info!("[run] wrapping NT outputs with monitor_stream");
+
     let call_stream = monitor_stream(
         call_stream,
         "nt_call_stream_from_call_hits_m8",
@@ -6939,6 +6942,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
 
     let nt_split_start = Instant::now();
+    info!("[run] starting t_junction(nt_call)");
     let (nt_streams, nt_done_rx) = t_junction(
         call_stream,
         2,
@@ -6953,8 +6957,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
     info!(
-        "[run] t_junction(nt_call) returned after {:?}",
-        nt_split_start.elapsed()
+        "[run] t_junction(nt_call) returned after {:?} with {} branches",
+        nt_split_start.elapsed(),
+        nt_streams.len()
     );
     cleanup_receivers.push(nt_done_rx);
 
@@ -6963,6 +6968,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let nt_summary_split_start = Instant::now();
+    info!("[run] starting t_junction(nt_call_summary)");
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
         call_summary_stream,
         6,
@@ -6977,8 +6983,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
     info!(
-        "[run] t_junction(nt_call_summary) returned after {:?}",
-        nt_summary_split_start.elapsed()
+        "[run] t_junction(nt_call_summary) returned after {:?} with {} branches",
+        nt_summary_split_start.elapsed(),
+        nt_summary_streams.len()
     );
     cleanup_receivers.push(nt_summary_done_rx);
 
@@ -6989,6 +6996,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_hit_summary_for_refined = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_hit_summary_for_taxid = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    info!("[run] NT split wiring complete");
+    info!("[run] nt_summary_taxon_stream -> generate_taxon_counts");
+    info!("[run] nt_summary_hit_stream -> summarize_hits");
+    info!("[run] nt_initial_stream -> initial_taxid_fasta");
+    info!("[run] nt_blast_hit_stream -> blast_contigs");
 
     let nt_summary_taxon_stream = monitor_stream(
         ReceiverStream::new(nt_summary_taxon_stream),
@@ -7047,6 +7060,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         async move {
             let start = Instant::now();
             info!("[run] generate_taxon_counts(NT) started");
+            info!("[run] generate_taxon_counts(NT) awaiting nt_call_stream + nt_summary_taxon_stream");
             let res = generate_taxon_counts(
                 config,
                 ReceiverStream::new(nt_call_stream),
