@@ -4874,65 +4874,77 @@ pub async fn update_read_dict(
 ) -> Result<()> {
 
     let update_concurrency = compute_phase_concurrency(
-        &config,                    // you already have this in scope
+        &config,
         "update_read_dict",
-        0.05,   // ~50 MB per batch of reads (very light)
-        8.0,    // extremely light CPU work → allow ~1 thread per core
-        128,    // max cap (you can raise later)
-        4,      // minimum for small machines
+        0.05,
+        8.0,
+        128,
+        4,
     );
     info!("update_read_dict concurrency: {} jobs", update_concurrency);
-    // Bounded channel + fixed worker pool
 
-    let (job_tx, job_rx) = mpsc::channel::<(String, Arc<ReadHit>)>(update_concurrency);
-
-    // Share the receiver safely
-    let job_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-    // Fixed worker pool (exactly READ_UPDATE_CONCURRENCY workers)
-    let mut workers = Vec::with_capacity(update_concurrency);
-    for _ in 0..update_concurrency{
-        let mut rx = job_rx.clone();
-        let read_dict = read_dict.clone();
-        let updated_tx = updated_tx.clone();
-        let added_tx = added_tx.clone();
-
-        let w = tokio::spawn(async move {
-            while let Some((read_id, shared_hit)) = {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            } {
-                let final_line = shared_hit.to_full_tab_line(&read_id);
-                let bytes = Arc::new(final_line.into_bytes());
-
-                let was_present = {
-                    let mut dict = read_dict.lock().unwrap();
-                    let present = dict.contains_key(&read_id);
-                    dict.insert(read_id, shared_hit);
-                    present
-                };
-
-                if was_present {
-                    let _ = updated_tx.send(ParseOutput::Bytes(bytes)).await;
-                } else {
-                    let _ = added_tx.send(ParseOutput::Bytes(bytes)).await;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        workers.push(w);
+    #[derive(Default)]
+    struct FanoutBatch {
+        updated: Vec<(String, Arc<ReadHit>)>,
+        added: Vec<(String, Arc<ReadHit>)>,
+        contig2lineage_lines: Vec<Vec<u8>>,
+        read2blastm8_lines: Vec<Vec<u8>>,
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Original main loop (only fan-out changed)
-    // ─────────────────────────────────────────────────────────────
+    fn merge_m8_rows(curr: &mut M8Record, row: &M8Record) {
+        let curr_len = curr.alen as f64;
+        let row_len = row.alen as f64;
+        let denom = curr_len + row_len;
+
+        if denom > 0.0 {
+            curr.pident = (curr.pident * curr_len + row.pident * row_len) / denom;
+            curr.evalue = (curr.evalue * curr_len + row.evalue * row_len) / denom;
+        }
+
+        curr.mismatch += row.mismatch;
+        curr.gapopen += row.gapopen;
+        curr.bitscore += row.bitscore;
+        curr.alen += row.alen;
+
+        curr.qstart = curr.qstart.min(row.qstart);
+        curr.qend = curr.qend.max(row.qend);
+        curr.tstart = curr.tstart.min(row.tstart);
+        curr.tend = curr.tend.max(row.tend);
+    }
+
+    // Snapshot the current read dict once so the fan-out stage does not keep
+    // taking the mutex for every contig/read pair.
+    let existing_reads: AHashMap<String, Arc<ReadHit>> = {
+        let guard = read_dict
+            .lock()
+            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
+        guard.clone()
+    };
+    let existing_reads = Arc::new(existing_reads);
+
+    // Invert read2contig once: contig -> reads.
+    let mut contig2reads: AHashMap<String, Vec<String>> = AHashMap::with_capacity(read2contig.len());
+    for (read_id, contig_id) in read2contig.iter() {
+        contig2reads
+            .entry(contig_id.clone())
+            .or_default()
+            .push(read_id.clone());
+    }
+    let contig2reads = Arc::new(contig2reads);
+
+    // Pass 1: read top m8 stream and build one merged row per contig.
+    // This mirrors the Python logic: contig2accession stores the merged row,
+    // and duplicate contig rows are merged into that row.
+    let mut contig2accession: AHashMap<String, (String, M8Record, Lineage)> = AHashMap::new();
+    let db_type_upper = db_type.to_uppercase();
+
     while let Some(item) = top_m8_stream.next().await {
         let bytes = match item {
             ParseOutput::Bytes(b) => b,
             _ => continue,
         };
 
-        let line = String::from_utf8_lossy(&**bytes);
+        let line = String::from_utf8_lossy(&bytes);
         let line_trimmed = line.trim_end();
         if line_trimmed.is_empty() {
             continue;
@@ -4945,10 +4957,10 @@ pub async fn update_read_dict(
         };
 
         let contig_id = m8.qname.clone();
-        let accession = m8.tname.clone();
+        let accession_id = m8.tname.clone();
 
         let taxid = accession_map
-            .get(&accession)
+            .get(&accession_id)
             .map(|hit| hit.taxid)
             .unwrap_or(0);
 
@@ -4962,52 +4974,158 @@ pub async fn update_read_dict(
             continue;
         }
 
-        let json = json!({
-            "contig_name": contig_id,
-            "species_taxid": lineage[0],
-            "genus_taxid": lineage[1],
-            "family_taxid": lineage[2],
-        });
-        let mut json_line = serde_json::to_string(&json)?;
-        json_line.push('\n');
-        let _ = contig2lineage_tx.send(ParseOutput::Bytes(Arc::new(json_line.into_bytes()))).await?;
-
-        let mut m8_line = m8.to_tab_string();
-        m8_line.push('\n');
-        let _ = read2blastm8_tx.send(ParseOutput::Bytes(Arc::new(m8_line.into_bytes()))).await?;
-
-        // Get all reads in this contig
-        let reads_in_contig: Vec<String> = read2contig
-            .iter()
-            .filter(|&(_, c)| c == &contig_id)
-            .map(|(r, _)| r.clone())
-            .collect();
-
-        let shared_hit: Arc<ReadHit> = Arc::new(ReadHit {
-            level: 1,
-            taxid: lineage[0],
-            accession_id: accession.clone(),
-            species_taxid: lineage[0],
-            genus_taxid: lineage[1],
-            family_taxid: lineage[2],
-            contig_id: Some(contig_id.clone()),
-            contig_accession_id: Some(accession.clone()),
-            contig_species_taxid: lineage[0],
-            contig_genus_taxid: lineage[1],
-            contig_family_taxid: lineage[2],
-            from_assembly: true,
-            source_count_type: Some(db_type.to_uppercase()),
-        });
-
-        // Fan-out to bounded channel (backpressure if workers are busy)
-        for read_id in reads_in_contig {
-            let _ = job_tx.send((read_id, shared_hit.clone())).await;
+        if let Some((_, curr_row, _)) = contig2accession.get_mut(&contig_id) {
+            merge_m8_rows(curr_row, &m8);
+        } else {
+            contig2accession.insert(
+                contig_id.clone(),
+                (accession_id.clone(), m8.clone(), lineage),
+            );
         }
     }
 
-    drop(job_tx);               // close channel so workers exit cleanly
-    for w in workers {
-        w.await??;
+    // Pass 2: parallel fan-out by contig.
+    // Each worker only builds local vectors, then we merge once at the end.
+    let fanout_batches: Vec<FanoutBatch> = {
+        let contig2accession = Arc::new(contig2accession);
+        let accession_map = accession_map.clone();
+        let existing_reads = existing_reads.clone();
+        let contig2reads = contig2reads.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<FanoutBatch>> {
+            let batches = contig2reads
+                .par_iter()
+                .map(|(contig_id, read_ids)| {
+                    let mut batch = FanoutBatch::default();
+
+                    let Some((accession, m8_row, lineage)) = contig2accession.get(contig_id) else {
+                        return batch;
+                    };
+
+                    let Some(acc_hit) = accession_map.get(accession) else {
+                        return batch;
+                    };
+
+                    let species_taxid = acc_hit.taxid;
+                    let genus_taxid = acc_hit.genus_taxid;
+                    let family_taxid = acc_hit.family_taxid;
+
+                    let mut lineage_line = json!({
+                        "contig_name": contig_id,
+                        "species_taxid": lineage[0],
+                        "genus_taxid": lineage[1],
+                        "family_taxid": lineage[2],
+                    })
+                        .to_string();
+                    lineage_line.push('\n');
+                    batch.contig2lineage_lines.push(lineage_line.into_bytes());
+
+                    let mut m8_line = m8_row.to_tab_string();
+                    m8_line.push('\n');
+                    let m8_bytes = m8_line.into_bytes();
+
+                    for read_id in read_ids {
+                        if let Some(existing) = existing_reads.get(read_id) {
+                            let mut hit: ReadHit = (**existing).clone();
+                            hit.taxid = species_taxid;
+                            hit.contig_id = Some(contig_id.clone());
+                            hit.contig_accession_id = Some(accession.clone());
+                            hit.contig_species_taxid = species_taxid;
+                            hit.contig_genus_taxid = genus_taxid;
+                            hit.contig_family_taxid = family_taxid;
+                            hit.from_assembly = true;
+                            hit.source_count_type = Some(db_type_upper.clone());
+
+                            batch.updated.push((read_id.clone(), Arc::new(hit)));
+                        } else {
+                            let hit = ReadHit {
+                                level: 1,
+                                taxid: species_taxid,
+                                accession_id: accession.clone(),
+                                species_taxid,
+                                genus_taxid,
+                                family_taxid,
+                                contig_id: Some(contig_id.clone()),
+                                contig_accession_id: Some(accession.clone()),
+                                contig_species_taxid: species_taxid,
+                                contig_genus_taxid: genus_taxid,
+                                contig_family_taxid: family_taxid,
+                                from_assembly: true,
+                                source_count_type: Some(db_type_upper.clone()),
+                            };
+
+                            batch.added.push((read_id.clone(), Arc::new(hit)));
+                        }
+
+                        batch.read2blastm8_lines.push(m8_bytes.clone());
+                    }
+
+                    batch
+                })
+                .collect();
+
+            Ok(batches)
+        })
+            .await
+            .map_err(|e| anyhow!("update_read_dict fan-out task panicked: {}", e))??
+    };
+
+    // Merge local results once.
+    let mut updated_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
+    let mut added_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
+    let mut contig2lineage_lines: Vec<Vec<u8>> = Vec::new();
+    let mut read2blastm8_lines: Vec<Vec<u8>> = Vec::new();
+
+    for mut batch in fanout_batches {
+        updated_entries.append(&mut batch.updated);
+        added_entries.append(&mut batch.added);
+        contig2lineage_lines.append(&mut batch.contig2lineage_lines);
+        read2blastm8_lines.append(&mut batch.read2blastm8_lines);
+    }
+
+    {
+        let mut dict = read_dict
+            .lock()
+            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
+
+        for (read_id, hit) in &updated_entries {
+            dict.insert(read_id.clone(), hit.clone());
+        }
+        for (read_id, hit) in &added_entries {
+            dict.insert(read_id.clone(), hit.clone());
+        }
+    }
+
+    for line in contig2lineage_lines {
+        contig2lineage_tx
+            .send(ParseOutput::Bytes(Arc::new(line)))
+            .await
+            .map_err(|_| anyhow!("contig2lineage_tx closed"))?;
+    }
+
+    for line in read2blastm8_lines {
+        read2blastm8_tx
+            .send(ParseOutput::Bytes(Arc::new(line)))
+            .await
+            .map_err(|_| anyhow!("read2blastm8_tx closed"))?;
+    }
+
+    for (read_id, hit) in updated_entries {
+        let mut line = hit.to_full_tab_line(&read_id);
+        line.push('\n');
+        updated_tx
+            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .await
+            .map_err(|_| anyhow!("updated_tx closed"))?;
+    }
+
+    for (read_id, hit) in added_entries {
+        let mut line = hit.to_full_tab_line(&read_id);
+        line.push('\n');
+        added_tx
+            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .await
+            .map_err(|_| anyhow!("added_tx closed"))?;
     }
 
     Ok(())
