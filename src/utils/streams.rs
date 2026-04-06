@@ -222,14 +222,15 @@ where
     const MAX_BUFFER_PER_STREAM: usize = 2_000_000;
 
     let record_size = match data_type {
-        StreamDataType::IlluminaFastq => 1_000, // ~1KB per FASTQ record
-        StreamDataType::OntFastq => 10_000,     // ~10KB per ONT read
-        StreamDataType::JustBytes => 500,       // ~500B for SAM/BAM/VCF
+        StreamDataType::IlluminaFastq => 1_000,
+        StreamDataType::OntFastq => 10_000,
+        StreamDataType::JustBytes => 500,
     };
 
     let min_buffer_size = MIN_BUFFER_PER_STREAM * n_outputs.max(1);
     let max_buffer_size = if available_ram > 0 {
-        let calculated = ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / record_size as f64) as usize;
+        let calculated =
+            ((available_ram as f64 * RAM_FRACTION / MAX_PROCESSES as f64) / record_size as f64) as usize;
         calculated.max(min_buffer_size)
     } else {
         warn!("Failed to detect available RAM in {}, using fallback", label);
@@ -237,6 +238,16 @@ where
     };
     let buffer_size = (base_buffer_size * n_outputs.max(1))
         .clamp(min_buffer_size, max_buffer_size.min(MAX_BUFFER_PER_STREAM));
+
+    debug!(
+        "{}: t_junction start — n_outputs={}, buffer_size={}, base_buffer_size={}, record_size={}, available_ram={}",
+        label,
+        n_outputs,
+        buffer_size,
+        base_buffer_size,
+        record_size,
+        available_ram
+    );
 
     let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
     let mut output_txs: Vec<(usize, mpsc::Sender<ParseOutput>)> = Vec::with_capacity(n_outputs);
@@ -248,51 +259,95 @@ where
         output_rxs.push(rx);
     }
 
+    let label_for_task = label.clone();
+
     tokio::spawn(async move {
         let mut input = Box::pin(input);
-        let mut item_count = 0;
+        let mut item_count: u64 = 0;
         let mut last_progress_time = Instant::now();
         let mut dropped_receivers = Vec::new();
+        let mut total_branch_sends: u64 = 0;
+        let mut max_send_wait = Duration::from_secs(0);
+        let mut max_lowest_capacity_seen = 1.0f64;
 
         while let Some(item) = input.next().await {
             item_count += 1;
             let mut active_txs = Vec::new();
-            let mut lowest_capacity_ratio = 1.0f64; // tracks the worst receiver
+            let mut lowest_capacity_ratio = 1.0f64;
 
-            for (i, tx) in output_txs.into_iter() {
-                let capacity_ratio = tx.capacity() as f64 / buffer_size as f64;
+            for (branch_idx, tx) in output_txs.into_iter() {
+                let max_cap = tx.max_capacity();
+                let cap_before = tx.capacity();
+                let capacity_ratio = if max_cap == 0 {
+                    0.0
+                } else {
+                    cap_before as f64 / max_cap as f64
+                };
                 lowest_capacity_ratio = lowest_capacity_ratio.min(capacity_ratio);
 
-                match tx.try_send(item.clone()) {
-                    Ok(()) => active_txs.push((i, tx)),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        if tx.send(item.clone()).await.is_err() {
-                            error!("{}: Receiver {} dropped at item {}", label, i, item_count);
-                            dropped_receivers.push(i);
-                        } else {
-                            active_txs.push((i, tx));
+                let send_start = Instant::now();
+                match tx.send(item.clone()).await {
+                    Ok(()) => {
+                        let send_wait = send_start.elapsed();
+                        if send_wait > max_send_wait {
+                            max_send_wait = send_wait;
                         }
+                        total_branch_sends += 1;
+
+                        let cap_after = tx.capacity();
+                        if send_wait >= Duration::from_micros(500) || cap_after <= (max_cap / 10).max(1) {
+                            debug!(
+                                "[{}] branch {} send item {} wait={:?} cap_before={}/{} cap_after={}/{} lowest_capacity={:.1}%",
+                                label_for_task,
+                                branch_idx,
+                                item_count,
+                                send_wait,
+                                cap_before,
+                                max_cap,
+                                cap_after,
+                                max_cap,
+                                lowest_capacity_ratio * 100.0
+                            );
+                        }
+
+                        active_txs.push((branch_idx, tx));
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        error!("{}: Receiver {} dropped at item {}", label, i, item_count);
-                        dropped_receivers.push(i);
+                    Err(_e) => {
+                        error!(
+                            "{}: Receiver {} dropped at item {} (cap_before={}/{})",
+                            label_for_task,
+                            branch_idx,
+                            item_count,
+                            cap_before,
+                            max_cap
+                        );
+                        dropped_receivers.push(branch_idx);
                     }
                 }
             }
 
+            if lowest_capacity_ratio < max_lowest_capacity_seen {
+                max_lowest_capacity_seen = lowest_capacity_ratio;
+            }
+
             output_txs = active_txs;
             if output_txs.is_empty() {
-                error!("{}: All receivers dropped at item {}. Dropped: {:?}", label, item_count, dropped_receivers);
+                error!(
+                    "{}: All receivers dropped at item {}. Dropped: {:?}",
+                    label_for_task,
+                    item_count,
+                    dropped_receivers
+                );
                 let _ = done_tx.send(Err(anyhow!("All receivers dropped at item {}", item_count)));
                 return;
             }
 
-            // Per-item backpressure: only slow down when the SLOWEST receiver is truly full.
             if lowest_capacity_ratio < 0.05 {
-                if item_count % 5000 == 0 {
+                if item_count % 5_000 == 0 {
                     debug!(
                         "{}: Heavy backpressure detected (lowest capacity {:.1}%). Sleep 10ms.",
-                        label, lowest_capacity_ratio * 100.0
+                        label_for_task,
+                        lowest_capacity_ratio * 100.0
                     );
                 }
                 sleep(Duration::from_millis(10)).await;
@@ -302,19 +357,36 @@ where
 
             if item_count % stall_threshold == 0 {
                 if let Some(sleep_ms) = stream_sleep_ms {
-                    debug!("{}: Periodic stall check sleep {}ms at item {}", label, sleep_ms, item_count);
+                    debug!(
+                        "{}: Periodic stall check sleep {}ms at item {}",
+                        label_for_task,
+                        sleep_ms,
+                        item_count
+                    );
                     sleep(Duration::from_millis(sleep_ms)).await;
                 }
             }
 
             if last_progress_time.elapsed() > Duration::from_secs(60) {
-                debug!("{}: Progress update — processed {} items", label, item_count);
+                info!(
+                    "{}: Progress update — processed {} items, total_branch_sends={}, max_send_wait={:?}, lowest_capacity_seen={:.1}%",
+                    label_for_task,
+                    item_count,
+                    total_branch_sends,
+                    max_send_wait,
+                    max_lowest_capacity_seen * 100.0
+                );
                 last_progress_time = Instant::now();
             }
         }
 
-        for (i, _) in output_txs {
-            debug!("{}: Closed sender for receiver {} after {} items", label, i, item_count);
+        for (branch_idx, _) in output_txs {
+            debug!(
+                "{}: Closed sender for receiver {} after {} items",
+                label_for_task,
+                branch_idx,
+                item_count
+            );
         }
 
         if let Some(n) = notify {
@@ -326,11 +398,20 @@ where
         } else {
             let _ = done_tx.send(Err(anyhow!(
                 "{}: {} receivers dropped: {:?}",
-                label,
+                label_for_task,
                 dropped_receivers.len(),
                 dropped_receivers
             )));
         }
+
+        debug!(
+            "{}: t_junction done — items={}, total_branch_sends={}, max_send_wait={:?}, lowest_capacity_seen={:.1}%",
+            label_for_task,
+            item_count,
+            total_branch_sends,
+            max_send_wait,
+            max_lowest_capacity_seen * 100.0
+        );
     });
 
     Ok((output_rxs, done_rx))
