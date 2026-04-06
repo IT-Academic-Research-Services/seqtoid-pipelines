@@ -3340,17 +3340,17 @@ pub async fn generate_taxon_counts(
 
     loop {
         let (m8_res, hit_res) = tokio::join!(
-            async {
-                let start = Instant::now();
-                let item = m8_iter.next().await;
-                (item, start.elapsed())
-            },
-            async {
-                let start = Instant::now();
-                let item = hit_iter.next().await;
-                (item, start.elapsed())
-            }
-        );
+        async {
+            let start = Instant::now();
+            let item = m8_iter.next().await;
+            (item, start.elapsed())
+        },
+        async {
+            let start = Instant::now();
+            let item = hit_iter.next().await;
+            (item, start.elapsed())
+        }
+    );
 
         let (m8_item, m8_wait) = m8_res;
         let (hit_item, hit_wait) = hit_res;
@@ -3362,7 +3362,45 @@ pub async fn generate_taxon_counts(
             max_hit_wait = hit_wait;
         }
 
+        if m8_wait >= Duration::from_millis(50) || hit_wait >= Duration::from_millis(50) {
+            let ratio = if hit_wait.as_nanos() > 0 {
+                m8_wait.as_secs_f64() / hit_wait.as_secs_f64()
+            } else {
+                0.0
+            };
+
+            let classification = if m8_wait > hit_wait * 5 {
+                "STARVING_ON_M8"
+            } else if hit_wait > m8_wait * 5 {
+                "STARVING_ON_SUMMARY"
+            } else {
+                "BOTH_SLOW"
+            };
+
+            warn!(
+            "[generate_taxon_counts:{}] WAIT: m8={:?} hit={:?} ratio={:.2} class={} total_pairs={} batches={}",
+            count_type,
+            m8_wait,
+            hit_wait,
+            ratio,
+            classification,
+            total_pairs,
+            batch_idx,
+        );
+        }
+
+        let m8_present = m8_item.is_some();
+        let hit_present = hit_item.is_some();
+
         let (Some(m8_item), Some(hit_item)) = (m8_item, hit_item) else {
+            warn!(
+            "[generate_taxon_counts:{}] STREAM CLOSED: m8_present={} hit_present={} total_pairs={} batches={}",
+            count_type,
+            m8_present,
+            hit_present,
+            total_pairs,
+            batch_idx
+        );
             break;
         };
 
@@ -3388,10 +3426,10 @@ pub async fn generate_taxon_counts(
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                        "generate_taxon_counts({}) worker send failed: {}",
-                        count_type,
-                        e
-                    ))
+                    "generate_taxon_counts({}) worker send failed: {}",
+                    count_type,
+                    e
+                ))
                 })?;
             let send_wait = send_start.elapsed();
 
@@ -3404,15 +3442,15 @@ pub async fn generate_taxon_counts(
                 || send_wait >= Duration::from_millis(100)
             {
                 info!(
-                    "[generate_taxon_counts:{}] batch {} waits: m8={:?} hit={:?} send={:?} total_pairs={} worker={}",
-                    count_type,
-                    batch_idx,
-                    m8_wait,
-                    hit_wait,
-                    send_wait,
-                    total_pairs,
-                    worker_idx,
-                );
+                "[generate_taxon_counts:{}] batch {} waits: m8={:?} hit={:?} send={:?} total_pairs={} worker={}",
+                count_type,
+                batch_idx,
+                m8_wait,
+                hit_wait,
+                send_wait,
+                total_pairs,
+                worker_idx,
+            );
             }
 
             batch_idx += 1;
@@ -3420,15 +3458,15 @@ pub async fn generate_taxon_counts(
 
         if last_log.elapsed() >= Duration::from_secs(10) {
             info!(
-                "[generate_taxon_counts:{}] producer progress: pairs={} batches={} max_waits(m8={:?}, hit={:?}, send={:?}) elapsed={:?}",
-                count_type,
-                total_pairs,
-                batch_idx,
-                max_m8_wait,
-                max_hit_wait,
-                max_send_wait,
-                producer_start.elapsed(),
-            );
+            "[generate_taxon_counts:{}] producer progress: pairs={} batches={} max_waits(m8={:?}, hit={:?}, send={:?}) elapsed={:?}",
+            count_type,
+            total_pairs,
+            batch_idx,
+            max_m8_wait,
+            max_hit_wait,
+            max_send_wait,
+            producer_start.elapsed(),
+        );
             last_log = Instant::now();
         }
     }
