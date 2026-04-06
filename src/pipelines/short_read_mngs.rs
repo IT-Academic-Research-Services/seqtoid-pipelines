@@ -2995,6 +2995,8 @@ pub async fn generate_taxon_counts(
     count_type: String,
     source_count_type: Option<String>,   // kept for exact call-site compatibility
 ) -> Result<Vec<TaxonCount>, PipelineError> {
+    use std::time::Duration;
+
     let num_workers = compute_phase_concurrency(
         &config,
         "generate_taxon_counts",
@@ -3013,20 +3015,45 @@ pub async fn generate_taxon_counts(
         .map(|_| mpsc::channel::<(Vec<Vec<u8>>, Vec<Vec<u8>>)>(64))
         .unzip();
 
-    // Spawn workers — each owns a completely private aggregation map + cache
+    // Spawn workers — each owns a completely private aggregation map + cache.
+    // We also time each recv() so we can see whether workers are starved or blocked.
     let worker_handles: Vec<_> = worker_rxs
         .into_iter()
-        .map(|mut rx| {   // ←←← THIS IS THE FIX (was |rx|)
+        .enumerate()
+        .map(|(worker_idx, mut rx)| {
             let dup = duplicate_clusters.clone();
             let keep = should_keep_filter.clone();
             let src = source_count_type.clone();
             let ct = count_type.clone();
+
             tokio::spawn(async move {
                 let mut agg: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
                 let mut lineage_cache: AHashMap<i32, Vec<i32>> = AHashMap::new();
 
-                while let Some((m8_batch, hit_batch)) = rx.recv().await {
+                let mut batches = 0usize;
+                let mut total_pairs = 0usize;
+                let mut max_recv_wait = Duration::from_secs(0);
+                let mut max_batch_process = Duration::from_secs(0);
+                let mut last_log = Instant::now();
+                let start = Instant::now();
+
+                loop {
+                    let recv_start = Instant::now();
+                    let maybe_batch = rx.recv().await;
+                    let recv_wait = recv_start.elapsed();
+                    if recv_wait > max_recv_wait {
+                        max_recv_wait = recv_wait;
+                    }
+
+                    let Some((m8_batch, hit_batch)) = maybe_batch else {
+                        break;
+                    };
+
+                    batches += 1;
+                    let batch_start = Instant::now();
+
                     for (m8_bytes, hit_bytes) in m8_batch.into_iter().zip(hit_batch) {
+                        total_pairs += 1;
                         process_record_pair(
                             &m8_bytes,
                             &hit_bytes,
@@ -3038,46 +3065,198 @@ pub async fn generate_taxon_counts(
                             src.as_deref(),
                         )?;
                     }
+
+                    let batch_elapsed = batch_start.elapsed();
+                    if batch_elapsed > max_batch_process {
+                        max_batch_process = batch_elapsed;
+                    }
+
+                    if recv_wait >= Duration::from_millis(100) || batch_elapsed >= Duration::from_millis(100) {
+                        debug!(
+                            "[generate_taxon_counts:{}] worker {} recv_wait={:?} batch_time={:?} batches={} pairs={} agg={} cache={}",
+                            ct,
+                            worker_idx,
+                            recv_wait,
+                            batch_elapsed,
+                            batches,
+                            total_pairs,
+                            agg.len(),
+                            lineage_cache.len(),
+                        );
+                    }
+
+                    if last_log.elapsed() >= Duration::from_secs(10) {
+                        info!(
+                            "[generate_taxon_counts:{}] worker {} progress: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} agg={} cache={} elapsed={:?}",
+                            ct,
+                            worker_idx,
+                            batches,
+                            total_pairs,
+                            max_recv_wait,
+                            max_batch_process,
+                            agg.len(),
+                            lineage_cache.len(),
+                            start.elapsed(),
+                        );
+                        last_log = Instant::now();
+                    }
                 }
+
+                info!(
+                    "[generate_taxon_counts:{}] worker {} done: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} elapsed={:?}",
+                    ct,
+                    worker_idx,
+                    batches,
+                    total_pairs,
+                    max_recv_wait,
+                    max_batch_process,
+                    start.elapsed(),
+                );
+
                 Ok::<AHashMap<Vec<i32>, AggBucket>, anyhow::Error>(agg)
             })
         })
         .collect();
 
-    // Producer: pair the two streams and round-robin to workers
+    // Producer: pair the two streams and round-robin to workers.
+    // We time each await boundary separately, but keep the original lockstep semantics.
     let mut m8_batch = Vec::with_capacity(8192);
     let mut hit_batch = Vec::with_capacity(8192);
     let mut batch_idx = 0usize;
+    let mut total_pairs = 0usize;
 
     let mut m8_iter = m8_stream;
     let mut hit_iter = summary_stream;
 
-    while let (Some(m8_item), Some(hit_item)) = (m8_iter.next().await, hit_iter.next().await) {
-        if let ParseOutput::Bytes(b) = m8_item {
-            if !b.is_empty() { m8_batch.push(b.to_vec()); }
+    let mut max_m8_wait = Duration::from_secs(0);
+    let mut max_hit_wait = Duration::from_secs(0);
+    let mut max_send_wait = Duration::from_secs(0);
+    let mut last_log = Instant::now();
+    let producer_start = Instant::now();
+
+    loop {
+        let (m8_res, hit_res) = tokio::join!(
+            async {
+                let start = Instant::now();
+                let item = m8_iter.next().await;
+                (item, start.elapsed())
+            },
+            async {
+                let start = Instant::now();
+                let item = hit_iter.next().await;
+                (item, start.elapsed())
+            }
+        );
+
+        let (m8_item, m8_wait) = m8_res;
+        let (hit_item, hit_wait) = hit_res;
+
+        if m8_wait > max_m8_wait {
+            max_m8_wait = m8_wait;
         }
+        if hit_wait > max_hit_wait {
+            max_hit_wait = hit_wait;
+        }
+
+        let (Some(m8_item), Some(hit_item)) = (m8_item, hit_item) else {
+            break;
+        };
+
+        if let ParseOutput::Bytes(b) = m8_item {
+            if !b.is_empty() {
+                m8_batch.push(b.to_vec());
+                total_pairs += 1;
+            }
+        }
+
         if let ParseOutput::Bytes(b) = hit_item {
-            if !b.is_empty() { hit_batch.push(b.to_vec()); }
+            if !b.is_empty() {
+                hit_batch.push(b.to_vec());
+            }
         }
 
         if m8_batch.len() >= 8192 && hit_batch.len() >= 8192 {
             let worker_idx = batch_idx % num_workers;
-            let _ = worker_txs[worker_idx]
+
+            let send_start = Instant::now();
+            worker_txs[worker_idx]
                 .send((std::mem::take(&mut m8_batch), std::mem::take(&mut hit_batch)))
-                .await;
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "generate_taxon_counts({}) worker send failed: {}",
+                        count_type,
+                        e
+                    ))
+                })?;
+            let send_wait = send_start.elapsed();
+
+            if send_wait > max_send_wait {
+                max_send_wait = send_wait;
+            }
+
+            if m8_wait >= Duration::from_millis(100)
+                || hit_wait >= Duration::from_millis(100)
+                || send_wait >= Duration::from_millis(100)
+            {
+                info!(
+                    "[generate_taxon_counts:{}] batch {} waits: m8={:?} hit={:?} send={:?} total_pairs={} worker={}",
+                    count_type,
+                    batch_idx,
+                    m8_wait,
+                    hit_wait,
+                    send_wait,
+                    total_pairs,
+                    worker_idx,
+                );
+            }
+
             batch_idx += 1;
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            info!(
+                "[generate_taxon_counts:{}] producer progress: pairs={} batches={} max_waits(m8={:?}, hit={:?}, send={:?}) elapsed={:?}",
+                count_type,
+                total_pairs,
+                batch_idx,
+                max_m8_wait,
+                max_hit_wait,
+                max_send_wait,
+                producer_start.elapsed(),
+            );
+            last_log = Instant::now();
         }
     }
 
     // Final partial batch
     if !m8_batch.is_empty() || !hit_batch.is_empty() {
         let worker_idx = batch_idx % num_workers;
-        let _ = worker_txs[worker_idx].send((m8_batch, hit_batch)).await;
+        let send_start = Instant::now();
+        worker_txs[worker_idx]
+            .send((m8_batch, hit_batch))
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "generate_taxon_counts({}) final worker send failed: {}",
+                    count_type,
+                    e
+                ))
+            })?;
+        let send_wait = send_start.elapsed();
+        if send_wait > max_send_wait {
+            max_send_wait = send_wait;
+        }
+
+        info!(
+            "[generate_taxon_counts:{}] final batch sent to worker {} in {:?}",
+            count_type, worker_idx, send_wait
+        );
     }
 
     drop(worker_txs); // close all workers
 
-    // Merge the tiny partial maps from each worker
+    // Merge the tiny partial maps from each worker.
     let partials: Vec<AHashMap<Vec<i32>, AggBucket>> = try_join_all(worker_handles)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?
@@ -3090,9 +3269,12 @@ pub async fn generate_taxon_counts(
     let result = build_taxon_counts_list(global_agg, &count_type);
 
     info!(
-        "generate_taxon_counts({}) complete — {} taxa",
+        "generate_taxon_counts({}) complete — {} taxa (max waits: m8={:?}, hit={:?}, send={:?})",
         count_type,
         result.len(),
+        max_m8_wait,
+        max_hit_wait,
+        max_send_wait,
     );
 
     Ok(result)
