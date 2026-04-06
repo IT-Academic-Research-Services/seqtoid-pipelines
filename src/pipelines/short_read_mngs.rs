@@ -5268,6 +5268,26 @@ async fn collect_rows(
     Ok(rows)
 }
 
+// collect a stream into keyed rows and preserve first-seen key order.
+async fn collect_keyed_rows(
+    mut stream: ReceiverStream<ParseOutput>,
+) -> Result<(Vec<(String, Arc<Vec<u8>>)>, Vec<String>)> {
+    let mut rows: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+
+    while let Some(item) = stream.next().await {
+        let ParseOutput::Bytes(bytes) = item else {
+            continue;
+        };
+
+        let key = first_field(bytes.as_slice());
+        order.push(key.clone());
+        rows.push((key, bytes));
+    }
+
+    Ok((rows, order))
+}
+
 pub async fn generate_m8_and_hit_summary(
     config: Arc<RunConfig>,
     updated_reads_stream: ReceiverStream<ParseOutput>,
@@ -5282,51 +5302,55 @@ pub async fn generate_m8_and_hit_summary(
     let updated_fut = collect_line_map(updated_reads_stream);
     let added_fut = collect_line_map(added_reads_stream);
     let blast_hits_fut = collect_line_map(blast_hits_stream);
-    let hit_rows_fut = collect_rows(original_hit_summary_stream);
-    let m8_rows_fut = collect_rows(original_deduped_m8_stream);
+    let hit_rows_fut = collect_keyed_rows(original_hit_summary_stream);
+    let m8_rows_fut = collect_keyed_rows(original_deduped_m8_stream);
 
-    let ((updated_reads, _updated_order), (added_reads, added_order), (blast_hits, blast_order), original_hit_rows, original_m8_rows) =
-        tokio::try_join!(updated_fut, added_fut, blast_hits_fut, hit_rows_fut, m8_rows_fut)?;
+    let (
+        (updated_reads, _updated_order),
+        (added_reads, added_order),
+        (blast_hits, blast_order),
+        (original_hit_rows, original_hit_order),
+        (original_m8_rows, original_m8_order),
+    ) = tokio::try_join!(
+        updated_fut,
+        added_fut,
+        blast_hits_fut,
+        hit_rows_fut,
+        m8_rows_fut
+    )?;
 
     // Original IDs for append checks.
-    let original_hit_ids: HashSet<String> = original_hit_rows
-        .iter()
-        .map(|row| first_field(row.as_slice()))
-        .collect();
+    let original_hit_ids: HashSet<String> = original_hit_order.iter().cloned().collect();
+    let original_m8_ids: HashSet<String> = original_m8_order.iter().cloned().collect();
 
-    let original_m8_ids: HashSet<String> = original_m8_rows
-        .iter()
-        .map(|row| first_field(row.as_slice()))
-        .collect();
-
-    // Rewrite both outputs in parallel.
     let thread_pool = config.thread_pool.clone();
 
     let (rewritten_m8, rewritten_hit_summary) = thread_pool.install(|| {
-        let m8_out: Vec<Arc<Vec<u8>>> = original_m8_rows
-            .par_iter()
-            .map(|row| {
-                let qseqid = first_field(row.as_slice());
-                blast_hits
-                    .get(&qseqid)
-                    .cloned()
-                    .unwrap_or_else(|| row.clone())
-            })
-            .collect();
-
-        let hit_out: Vec<Arc<Vec<u8>>> = original_hit_rows
-            .par_iter()
-            .map(|row| {
-                let read_id = first_field(row.as_slice());
-                updated_reads
-                    .get(&read_id)
-                    .or_else(|| added_reads.get(&read_id))
-                    .cloned()
-                    .unwrap_or_else(|| row.clone())
-            })
-            .collect();
-
-        (m8_out, hit_out)
+        rayon::join(
+            || {
+                original_m8_rows
+                    .par_iter()
+                    .map(|(qseqid, row)| {
+                        blast_hits
+                            .get(qseqid)
+                            .cloned()
+                            .unwrap_or_else(|| row.clone())
+                    })
+                    .collect::<Vec<Arc<Vec<u8>>>>()
+            },
+            || {
+                original_hit_rows
+                    .par_iter()
+                    .map(|(read_id, row)| {
+                        updated_reads
+                            .get(read_id)
+                            .or_else(|| added_reads.get(read_id))
+                            .cloned()
+                            .unwrap_or_else(|| row.clone())
+                    })
+                    .collect::<Vec<Arc<Vec<u8>>>>()
+            },
+        )
     });
 
     // Emit M8.
