@@ -2688,6 +2688,7 @@ pub async fn sort_m8_by_read_id(
 }
 
 /// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
+/// NB:THIS NOW ASSUMES THE M8 IS READ ID SORTED
 /// # Arguments
 ///
 /// * `config` - RunConfig struct
@@ -2708,7 +2709,7 @@ pub async fn sort_m8_by_read_id(
 /// - Vec of cleanup receivers
 pub async fn call_hits_m8(
     config: Arc<RunConfig>,
-    mut m8_input: ReceiverStream<ParseOutput>,
+    mut m8_input: ReceiverStream<ParseOutput>,   // ← MUST be sorted by read ID
     sample_base_buf: PathBuf,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     acc2taxid_map: Arc<Map<Vec<u8>>>,
@@ -2717,39 +2718,37 @@ pub async fn call_hits_m8(
     concurrency: usize,
     mut tag: String,
 ) -> Result<(
-    ReceiverStream<ParseOutput>,
-    ReceiverStream<ParseOutput>,
+    ReceiverStream<ParseOutput>,  // dedup m8 stream
+    ReceiverStream<ParseOutput>,  // summary stream
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 ), PipelineError> {
-    use std::time::Duration;
 
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
 
     info!(
-        "[call_hits_m8:{}] starting — workers={}, base_buffer_size={}, min_aln_len={}",
-        tag,
-        worker_count,
-        config.base_buffer_size,
-        min_aln_len
+        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
+        tag, worker_count, min_aln_len
     );
 
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
 
-    let mut worker_txs: Vec<mpsc::Sender<WorkerMsg>> = Vec::with_capacity(worker_count);
-    let mut worker_rxs: Vec<mpsc::Receiver<WorkerMsg>> = Vec::with_capacity(worker_count);
-
-    for _ in 0..worker_count {
-        let (tx, rx) = mpsc::channel::<WorkerMsg>(config.base_buffer_size * 8);
-        worker_txs.push(tx);
-        worker_rxs.push(rx);
+    #[derive(Debug)]
+    enum WorkerMsg {
+        ProcessRead { read_id: String, hits: Vec<M8Record> },
+        Flush,
     }
 
-    // One worker per shard. Each worker owns a private read map and emits to both outputs.
-    for (worker_idx, mut rx) in worker_rxs.into_iter().enumerate() {
+    // Create one sender per worker
+    let mut worker_txs: Vec<mpsc::Sender<WorkerMsg>> = Vec::with_capacity(worker_count);
+
+    for worker_idx in 0..worker_count {
+        let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerMsg>(config.base_buffer_size * 16);
+        worker_txs.push(worker_tx);
+
         let lineage_map = lineage_map.clone();
         let acc2taxid_map = acc2taxid_map.clone();
         let should_keep_filter = should_keep_filter.clone();
@@ -2758,481 +2757,124 @@ pub async fn call_hits_m8(
         let worker_tag = tag.clone();
 
         let worker_handle = tokio::spawn(async move {
-            let mut reads: AHashMap<u64, PendingRead> = AHashMap::new();
-            let mut total_lines = 0usize;
             let mut total_emitted = 0usize;
-            let mut total_summary_sends = 0usize;
-            let mut total_dedup_sends = 0usize;
-            let mut max_recv_wait = Duration::from_secs(0);
-            let mut max_emit_wait = Duration::from_secs(0);
-            let mut max_summarize_time = Duration::from_secs(0);
-            let mut max_summary_wait = Duration::from_secs(0);
-            let mut max_dedup_wait = Duration::from_secs(0);
-            let mut last_log = Instant::now();
-            let mut first_emit_logged = false;
             let start = Instant::now();
 
-            debug!(
-                "[call_hits_m8:{}] worker {} started",
-                worker_tag,
-                worker_idx
-            );
+            debug!("[call_hits_m8:{}] worker {} started (streaming mode)", worker_tag, worker_idx);
 
-            loop {
-                let recv_start = Instant::now();
-                let msg = rx.recv().await;
-                let recv_wait = recv_start.elapsed();
-                if recv_wait > max_recv_wait {
-                    max_recv_wait = recv_wait;
-                }
-
-                if recv_wait >= Duration::from_millis(100) {
-                    warn!(
-                        "[call_hits_m8:{}] worker {} recv wait {:?} (pending_reads={}, total_lines={}, emitted={})",
-                        worker_tag,
-                        worker_idx,
-                        recv_wait,
-                        reads.len(),
-                        total_lines,
-                        total_emitted
-                    );
-                }
-
-                let Some(msg) = msg else {
-                    break;
-                };
-
+            while let Some(msg) = worker_rx.recv().await {
                 match msg {
-                    WorkerMsg::Line { seq, line } => {
-                        total_lines += 1;
-
-                        let line_str = match std::str::from_utf8(&line) {
-                            Ok(s) => s.trim_end(),
-                            Err(_) => continue,
-                        };
-                        if line_str.is_empty() || line_str.starts_with('#') {
-                            continue;
-                        }
-
-                        let rec = match M8Record::parse_line_nr(line_str) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                debug!(
-                                    "[call_hits_m8:{}] worker {} parse error: {}",
-                                    worker_tag, worker_idx, e
-                                );
-                                continue;
-                            }
-                        };
-
-                        let entry = reads.entry(seq).or_insert_with(|| PendingRead {
-                            read_id: rec.qname.clone(),
-                            hits: Vec::new(),
-                        });
-                        entry.hits.push(rec);
-                    }
-
-                    WorkerMsg::Flush => {
-                        debug!(
-                            "[call_hits_m8:{}] worker {} received flush with {} pending reads",
-                            worker_tag,
-                            worker_idx,
-                            reads.len()
+                    WorkerMsg::ProcessRead { read_id, hits } => {
+                        let reduced = summarize_m8_hits(
+                            0,
+                            read_id,
+                            &hits,
+                            &lineage_map,
+                            &acc2taxid_map,
+                            &*should_keep_filter,
+                            min_aln_len,
                         );
-                        break;
+
+                        if let Some(reduced) = reduced {
+                            total_emitted += 1;
+
+                            let _ = dedup_tx.send(ParseOutput::Bytes(Arc::new(reduced.dedup))).await;
+                            let _ = summary_tx.send(ParseOutput::Bytes(Arc::new(reduced.summary))).await;
+                        }
                     }
-                }
-
-                if last_log.elapsed() >= Duration::from_secs(10) {
-                    info!(
-                        "[call_hits_m8:{}] worker {} progress: lines={} pending_reads={} emitted={} summary_sends={} dedup_sends={} max_recv_wait={:?} max_emit_wait={:?} max_summarize_time={:?} elapsed={:?}",
-                        worker_tag,
-                        worker_idx,
-                        total_lines,
-                        reads.len(),
-                        total_emitted,
-                        total_summary_sends,
-                        total_dedup_sends,
-                        max_recv_wait,
-                        max_emit_wait,
-                        max_summarize_time,
-                        start.elapsed(),
-                    );
-                    last_log = Instant::now();
-                }
-            }
-
-            let pending_reads_at_flush = reads.len();
-
-            for (seq, pending) in reads {
-                let summarize_start = Instant::now();
-                let reduced = summarize_m8_hits(
-                    seq,
-                    pending.read_id,
-                    &pending.hits,
-                    &lineage_map,
-                    &acc2taxid_map,
-                    &*should_keep_filter,
-                    min_aln_len,
-                );
-                let summarize_time = summarize_start.elapsed();
-                if summarize_time > max_summarize_time {
-                    max_summarize_time = summarize_time;
-                }
-
-                let Some(reduced) = reduced else {
-                    continue;
-                };
-
-                total_emitted += 1;
-
-                let dedup_max_cap = dedup_tx.max_capacity();
-                let dedup_cap_before = dedup_tx.capacity();
-                let dedup_send_start = Instant::now();
-                dedup_tx
-                    .send(ParseOutput::Bytes(Arc::new(reduced.dedup)))
-                    .await
-                    .map_err(|_| anyhow!("dedup channel closed"))?;
-                let dedup_wait = dedup_send_start.elapsed();
-                let dedup_cap_after = dedup_tx.capacity();
-                total_dedup_sends += 1;
-                if dedup_wait > max_dedup_wait {
-                    max_dedup_wait = dedup_wait;
-                }
-
-                let summary_max_cap = summary_tx.max_capacity();
-                let summary_cap_before = summary_tx.capacity();
-                let summary_send_start = Instant::now();
-                summary_tx
-                    .send(ParseOutput::Bytes(Arc::new(reduced.summary)))
-                    .await
-                    .map_err(|_| anyhow!("summary channel closed"))?;
-                let summary_wait = summary_send_start.elapsed();
-                let summary_cap_after = summary_tx.capacity();
-                total_summary_sends += 1;
-                if summary_wait > max_summary_wait {
-                    max_summary_wait = summary_wait;
-                }
-
-                let emit_wait = dedup_wait.max(summary_wait);
-                if emit_wait > max_emit_wait {
-                    max_emit_wait = emit_wait;
-                }
-
-                if !first_emit_logged {
-                    first_emit_logged = true;
-                    info!(
-                        "[call_hits_m8:{}] worker {} first emit: summarize={:?} dedup_wait={:?} summary_wait={:?} dedup_cap={}/{} summary_cap={}/{} hits={}",
-                        worker_tag,
-                        worker_idx,
-                        summarize_time,
-                        dedup_wait,
-                        summary_wait,
-                        dedup_cap_before,
-                        dedup_max_cap,
-                        summary_cap_before,
-                        summary_max_cap,
-                        pending.hits.len(),
-                    );
-                }
-
-                if summarize_time >= Duration::from_millis(20)
-                    || dedup_wait >= Duration::from_millis(20)
-                    || summary_wait >= Duration::from_millis(20)
-                    || summary_wait >= dedup_wait.saturating_mul(10)
-                {
-                    warn!(
-                        "[call_hits_m8:{}] worker {} slow item: summarize={:?} dedup_send={:?} summary_send={:?} dedup_cap={}/{} summary_cap={}/{} seq={} hits={}",
-                        worker_tag,
-                        worker_idx,
-                        summarize_time,
-                        dedup_wait,
-                        summary_wait,
-                        dedup_cap_before,
-                        dedup_max_cap,
-                        summary_cap_before,
-                        summary_max_cap,
-                        seq,
-                        pending.hits.len(),
-                    );
-                } else if summarize_time >= Duration::from_millis(5)
-                    || dedup_wait >= Duration::from_millis(5)
-                    || summary_wait >= Duration::from_millis(5)
-                {
-                    debug!(
-                        "[call_hits_m8:{}] worker {} item: summarize={:?} dedup_send={:?} summary_send={:?} dedup_cap={}/{} summary_cap={}/{} seq={} hits={}",
-                        worker_tag,
-                        worker_idx,
-                        summarize_time,
-                        dedup_wait,
-                        summary_wait,
-                        dedup_cap_before,
-                        dedup_max_cap,
-                        summary_cap_before,
-                        summary_max_cap,
-                        seq,
-                        pending.hits.len(),
-                    );
-                }
-
-                if last_log.elapsed() >= Duration::from_secs(10) {
-                    info!(
-                        "[call_hits_m8:{}] worker {} progress: lines={} emitted={} pending_reads={} summary_sends={} dedup_sends={} max_recv_wait={:?} max_emit_wait={:?} max_summary_wait={:?} max_dedup_wait={:?} max_summarize_time={:?} elapsed={:?}",
-                        worker_tag,
-                        worker_idx,
-                        total_lines,
-                        total_emitted,
-                        pending_reads_at_flush,
-                        total_summary_sends,
-                        total_dedup_sends,
-                        max_recv_wait,
-                        max_emit_wait,
-                        max_summary_wait,
-                        max_dedup_wait,
-                        max_summarize_time,
-                        start.elapsed(),
-                    );
-                    last_log = Instant::now();
+                    WorkerMsg::Flush => break,
                 }
             }
 
             info!(
-                "[call_hits_m8:{}] worker {} done: lines={} emitted={} summary_sends={} dedup_sends={} max_recv_wait={:?} max_emit_wait={:?} max_summary_wait={:?} max_dedup_wait={:?} max_summarize_time={:?} elapsed={:?}",
-                worker_tag,
-                worker_idx,
-                total_lines,
-                total_emitted,
-                total_summary_sends,
-                total_dedup_sends,
-                max_recv_wait,
-                max_emit_wait,
-                max_summary_wait,
-                max_dedup_wait,
-                max_summarize_time,
-                start.elapsed(),
+                "[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}",
+                worker_tag, worker_idx, total_emitted, start.elapsed()
             );
-
             Ok::<(), anyhow::Error>(())
         });
 
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator: read M8, shard to workers, and measure await time on the input and worker sends.
+    // Coordinator: reads sorted m8, groups by read_id, sends complete reads to correct worker
     let coordinator_tag = tag.clone();
-    let coordinator_worker_txs = worker_txs.clone();
-
     let coordinator_handle = tokio::spawn(async move {
-        let mut seen: AHashMap<String, u64> = AHashMap::new();
-        let mut next_seq: u64 = 0;
-        let mut line_buffer: Vec<u8> = Vec::with_capacity(1024 * 1024);
-
-        let mut total_bytes = 0usize;
+        let mut current_read_id: Option<String> = None;
+        let mut current_hits: Vec<M8Record> = Vec::with_capacity(32);
         let mut total_lines = 0usize;
-        let mut total_sent = 0usize;
-        let mut max_input_wait = Duration::from_secs(0);
-        let mut max_worker_send_wait = Duration::from_secs(0);
-        let mut last_log = Instant::now();
-        let mut first_input_logged = false;
         let start = Instant::now();
 
-        debug!(
-            "[call_hits_m8:{}] coordinator started",
-            coordinator_tag
-        );
+        debug!("[call_hits_m8:{}] coordinator started (streaming group-by)", coordinator_tag);
 
-        loop {
-            let input_start = Instant::now();
-            let item = m8_input.next().await;
-            let input_wait = input_start.elapsed();
-            if input_wait > max_input_wait {
-                max_input_wait = input_wait;
-            }
-
-            if input_wait >= Duration::from_millis(100) {
-                warn!(
-                    "[call_hits_m8:{}] coordinator input wait {:?} (bytes={}, lines={}, sent={}, seen={})",
-                    coordinator_tag,
-                    input_wait,
-                    total_bytes,
-                    total_lines,
-                    total_sent,
-                    seen.len(),
-                );
-            }
-
-            let Some(item) = item else {
-                break;
-            };
-
-            if !first_input_logged {
-                first_input_logged = true;
-                info!(
-                    "[call_hits_m8:{}] coordinator got first input after {:?}",
-                    coordinator_tag,
-                    input_wait
-                );
-            }
-
+        while let Some(item) = m8_input.next().await {
             let bytes = match item.to_bytes() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
 
-            total_bytes += bytes.len();
-            line_buffer.extend_from_slice(&bytes);
+            let line_str = match std::str::from_utf8(&bytes) {
+                Ok(s) => s.trim_end(),
+                Err(_) => continue,
+            };
 
-            let mut start_idx = 0usize;
-            let mut i = 0usize;
-
-            while i < line_buffer.len() {
-                if line_buffer[i] == b'\n' {
-                    let line = &line_buffer[start_idx..i];
-                    start_idx = i + 1;
-                    total_lines += 1;
-
-                    if !line.is_empty() && line[0] != b'#' {
-                        let line_str = match std::str::from_utf8(line) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                i += 1;
-                                continue;
-                            }
-                        };
-
-                        let read_id = match read_id_from_m8_line(line_str) {
-                            Some(r) => r,
-                            None => {
-                                i += 1;
-                                continue;
-                            }
-                        };
-
-                        let seq = *seen.entry(read_id.to_string()).or_insert_with(|| {
-                            let s = next_seq;
-                            next_seq += 1;
-                            s
-                        });
-
-                        let shard = shard_for_read_id(read_id, worker_count);
-                        let worker_tx = &coordinator_worker_txs[shard];
-                        let worker_max_cap = worker_tx.max_capacity();
-                        let worker_cap_before = worker_tx.capacity();
-
-                        let send_start = Instant::now();
-                        if worker_tx
-                            .send(WorkerMsg::Line {
-                                seq,
-                                line: line.to_vec(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Err(anyhow!("worker channel closed"));
-                        }
-                        let send_wait = send_start.elapsed();
-                        let worker_cap_after = worker_tx.capacity();
-
-                        if send_wait > max_worker_send_wait {
-                            max_worker_send_wait = send_wait;
-                        }
-                        total_sent += 1;
-
-                        if send_wait >= Duration::from_millis(50) {
-                            warn!(
-                                "[call_hits_m8:{}] coordinator slow worker send: shard={} wait={:?} cap_before={}/{} cap_after={}/{} seq={} read_id={}",
-                                coordinator_tag,
-                                shard,
-                                send_wait,
-                                worker_cap_before,
-                                worker_max_cap,
-                                worker_cap_after,
-                                worker_max_cap,
-                                seq,
-                                read_id,
-                            );
-                        }
-
-                        if send_wait >= Duration::from_millis(5) {
-                            debug!(
-                                "[call_hits_m8:{}] coordinator worker send: shard={} wait={:?} cap_before={}/{} cap_after={}/{} seq={} read_id={}",
-                                coordinator_tag,
-                                shard,
-                                send_wait,
-                                worker_cap_before,
-                                worker_max_cap,
-                                worker_cap_after,
-                                worker_max_cap,
-                                seq,
-                                read_id,
-                            );
-                        }
-                    }
-                }
-                i += 1;
+            if line_str.is_empty() || line_str.starts_with('#') {
+                continue;
             }
 
-            if start_idx > 0 {
-                line_buffer.drain(..start_idx);
+            total_lines += 1;
+
+            let read_id = match read_id_from_m8_line(line_str) {
+                Some(r) => r.to_string(),
+                None => continue,
+            };
+
+            let rec = match M8Record::parse_line_nr(line_str) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Read ID changed → previous read is complete
+            if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
+                let shard = shard_for_read_id(current_read_id.as_ref().unwrap(), worker_count);
+
+                let _ = worker_txs[shard].send(WorkerMsg::ProcessRead {
+                    read_id: current_read_id.take().unwrap(),
+                    hits: std::mem::take(&mut current_hits),
+                }).await;
             }
 
-            if last_log.elapsed() >= Duration::from_secs(10) {
-                info!(
-                    "[call_hits_m8:{}] coordinator progress: bytes={} lines={} sent={} seen={} max_input_wait={:?} max_worker_send_wait={:?} pending_buffer={} elapsed={:?}",
-                    coordinator_tag,
-                    total_bytes,
-                    total_lines,
-                    total_sent,
-                    seen.len(),
-                    max_input_wait,
-                    max_worker_send_wait,
-                    line_buffer.len(),
-                    start.elapsed(),
-                );
-                last_log = Instant::now();
+            if current_read_id.is_none() {
+                current_read_id = Some(read_id.clone());
+            }
+
+            current_hits.push(rec);
+        }
+
+        // Final read
+        if let Some(read_id) = current_read_id {
+            if !current_hits.is_empty() {
+                let shard = shard_for_read_id(&read_id, worker_count);
+                let _ = worker_txs[shard].send(WorkerMsg::ProcessRead {
+                    read_id,
+                    hits: current_hits,
+                }).await;
             }
         }
 
-        for (idx, tx) in coordinator_worker_txs.into_iter().enumerate() {
-            let flush_start = Instant::now();
+        // Flush all workers
+        for tx in &worker_txs {
             let _ = tx.send(WorkerMsg::Flush).await;
-            let flush_wait = flush_start.elapsed();
-            if flush_wait >= Duration::from_millis(50) {
-                debug!(
-                    "[call_hits_m8:{}] coordinator flush wait on worker {}: {:?}",
-                    coordinator_tag,
-                    idx,
-                    flush_wait
-                );
-            }
         }
 
         info!(
-            "[call_hits_m8:{}] coordinator done: bytes={} lines={} sent={} seen={} max_input_wait={:?} max_worker_send_wait={:?} elapsed={:?}",
-            coordinator_tag,
-            total_bytes,
-            total_lines,
-            total_sent,
-            seen.len(),
-            max_input_wait,
-            max_worker_send_wait,
-            start.elapsed(),
+            "[call_hits_m8:{}] coordinator done — processed {} lines in {:?}",
+            coordinator_tag, total_lines, start.elapsed()
         );
 
         Ok::<(), anyhow::Error>(())
     });
 
     cleanup_tasks.push(coordinator_handle);
-
-    let dedup_tag = format!("{}.dedup.m8", tag);
-    let summary_tag = format!("{}.summary.txt", tag);
-
-    let m8_dedup_file_path = config
-        .out_dir
-        .join(rename_file_path(&sample_base_buf, None, Some(&dedup_tag), "_"));
-    let summary_file_path = config
-        .out_dir
-        .join(rename_file_path(&sample_base_buf, None, Some(&summary_tag), "_"));
 
     let dedup_stream = ReceiverStream::new(dedup_rx);
     let (mut dedup_branches, dedup_done) = t_junction(
@@ -3254,7 +2896,7 @@ pub async fn call_hits_m8(
     let dedup_file_stream = dedup_branches.remove(0);
 
     let call_file_write_task = write_byte_stream_to_file(
-        &m8_dedup_file_path,
+        &config.out_dir.join(rename_file_path(&sample_base_buf, None, Some(&format!("{}.dedup.m8", tag)), "_")),
         ReceiverStream::new(dedup_file_stream),
         Some(config.base_buffer_size),
         "call_hits_m8_dedup",
@@ -3283,7 +2925,7 @@ pub async fn call_hits_m8(
     let summary_file_stream = summary_branches.remove(0);
 
     let summary_file_write_task = write_byte_stream_to_file(
-        &summary_file_path,
+        &config.out_dir.join(rename_file_path(&sample_base_buf, None, Some(&format!("{}.summary.txt", tag)), "_")),
         ReceiverStream::new(summary_file_stream),
         Some(config.base_buffer_size),
         "call_hits_m8_summary",
@@ -3292,10 +2934,7 @@ pub async fn call_hits_m8(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(summary_file_write_task);
 
-    info!(
-        "[call_hits_m8:{}] wiring complete — outputs ready: dedup + summary",
-        tag
-    );
+    info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
 
     Ok((
         ReceiverStream::new(dedup_main),
