@@ -2605,7 +2605,6 @@ pub async fn sort_m8_by_read_id(
     db_type: &str,
 ) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
     let tag = format!("sort_m8_{}", db_type);
-
     let estimated_bytes = (config.input_size * 4).max(1_000_000_000);
 
     let temp_dir = choose_temp_dir(
@@ -2617,12 +2616,11 @@ pub async fn sort_m8_by_read_id(
     ).await?;
 
     let unsorted_path = temp_dir.path().join(format!("{}_unsorted.m8", db_type));
-    let sorted_path   = temp_dir.path().join(format!("{}_sorted_by_read.m8", db_type));
+    let sorted_path = temp_dir.path().join(format!("{}_sorted_by_read.m8", db_type));
 
-    info!("[{}] m8 sort started (est {} bytes) → temp: {}",
-          tag, estimated_bytes, temp_dir.path().display());
+    info!("[{}] Starting m8 sort (est {} bytes) using RAM/NVMe scratch", tag, estimated_bytes);
 
-    // Write unsorted m8 (re-uses your fast writer)
+    // 1. Write unsorted m8
     let write_task = write_byte_stream_to_file(
         &unsorted_path,
         input_stream,
@@ -2630,14 +2628,14 @@ pub async fn sort_m8_by_read_id(
         &tag,
     ).await?;
 
-    // Sort configuration
+    // 2. Prepare sort config
     let sort_config = crate::utils::command::sort::SortConfig {
         key: "-k1,1".to_string(),
         parallel: None,
         buffer_size: Some("50%".to_string()),
         temp_dir: Some(temp_dir.path().to_string_lossy().into_owned()),
         output: Some(sorted_path.to_string_lossy().into_owned()),
-        extra_fields: std::collections::HashMap::new(),
+        extra_fields: HashMap::new(),
     };
 
     let sort_args = crate::utils::command::generate_cli(
@@ -2645,45 +2643,48 @@ pub async fn sort_m8_by_read_id(
         &config,
         Some(&sort_config),
     ).map_err(|e| PipelineError::ToolExecution {
-        tool: "sort".to_string(),
+        tool: crate::config::defs::SORT_TAG.to_string(),
         error: e.to_string(),
     })?;
 
-    // Run GNU sort (one-shot via your standard spawn_cmd)
+    // 3. Run GNU sort
     let (mut sort_child, sort_err_task) = spawn_cmd(
         config.clone(),
-        "sort",
+        crate::config::defs::SORT_TAG,
         sort_args,
         config.args.verbose,
     ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: "sort".to_string(),
+        tool: crate::config::defs::SORT_TAG.to_string(),
         error: e.to_string(),
     })?;
 
-    write_task.await??;   // wait for input file
+    write_task.await??;   // wait for write to finish
 
     let status = sort_child.wait().await
-        .map_err(|e| PipelineError::ToolExecution { tool: "sort".into(), error: e.to_string() })?;
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     if !status.success() {
         return Err(PipelineError::ToolExecution {
-            tool: "sort".into(),
-            error: format!("GNU sort failed with code {:?}", status.code()),
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: format!("GNU sort exited with {:?}", status.code()),
         });
     }
     sort_err_task.await??;
 
     info!("[{}] m8 sort completed → {}", tag, sorted_path.display());
 
-    // Stream sorted m8 back as bytes (uses your existing parser)
-    let sorted_file = TokioFile::open(&sorted_path).await
+    // 4. Stream sorted file back (parse_bytes already spawns its own task)
+    let sorted_file = TokioFile::open(&sorted_path)
+        .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     let rx = parse_bytes::<TokioFile>(sorted_file, config.base_buffer_size)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // parse_bytes already spawns its own background task — nothing more to do.
     Ok(ReceiverStream::new(rx))
 }
 
