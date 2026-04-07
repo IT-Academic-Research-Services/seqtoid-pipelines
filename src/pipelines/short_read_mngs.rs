@@ -7184,23 +7184,37 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut m8_cleanup_tasks);
     cleanup_receivers.append(&mut m8_cleanup_receivers);
 
+    // ────────────────────────────────────────────────────────────────
+    // Sort m8 by read ID before call_hits_m8
+    // This guarantees consecutive lines per read → streaming group-by
+    // ────────────────────────────────────────────────────────────────
+    let m8_sorted_start = Instant::now();
+    let m8_sorted = sort_m8_by_read_id(
+        config.clone(),
+        m8_stream,
+        "nt",                    // label for logging + temp files
+    ).await?;
+    info!(
+    "[run] sort_m8_by_read_id(nt) completed after {:?}",
+    m8_sorted_start.elapsed()
+);
+
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
     let nt_concurrency = compute_phase_concurrency(
         &config,
         "call_hits_nt",
-        1.0,           // ~1 GB per thread max (mostly transient)
+        1.0,
         3.5,
         64,
         16,
     );
     info!("call hits nt concurrency {}", nt_concurrency);
 
-
     let nt_call_hits_start = Instant::now();
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
         config.clone(),
-        m8_stream,
+        m8_sorted,                    // ←←← NOW SORTED
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -7210,9 +7224,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "nt".to_string(),
     ).await?;
     info!(
-        "[run] call_hits_m8(nt) returned after {:?}",
-        nt_call_hits_start.elapsed()
-    );
+    "[run] call_hits_m8(nt) returned after {:?}",
+    nt_call_hits_start.elapsed()
+);
+
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
@@ -7394,10 +7409,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("call hits nr concurrency {}", nr_concurrency);
 
+    // ────────────────────────────────────────────────────────────────
+    // Sort NR m8 by read ID before call_hits_m8
+    // Guarantees consecutive lines per read → enables true streaming group-by
+    // ────────────────────────────────────────────────────────────────
+    let nr_sort_start = Instant::now();
+    let nr_m8_sorted = sort_m8_by_read_id(
+        config.clone(),
+        ReceiverStream::new(non_host_diamond_m8_stream),   // your original unsorted stream
+        "nr",
+    ).await?;
+    info!(
+    "[run] sort_m8_by_read_id(nr) completed after {:?}",
+    nr_sort_start.elapsed()
+);
 
     let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8(
         config.clone(),
-        ReceiverStream::new(non_host_diamond_m8_stream),
+        nr_m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
