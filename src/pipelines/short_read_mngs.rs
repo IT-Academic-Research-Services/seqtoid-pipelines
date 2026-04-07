@@ -2596,6 +2596,97 @@ pub async fn load_lineage_and_acc2tax_maps(
     Ok((lineage_map, acc2taxid_map))
 }
 
+/// Sorts an m8 byte stream by read ID (first column) using GNU sort.
+/// RAM-first via choose_temp_dir, falls back to NVMe scratch.
+/// Guarantees consecutive lines per read ID. Never drops data.
+pub async fn sort_m8_by_read_id(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    db_type: &str,
+) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
+    let tag = format!("sort_m8_{}", db_type);
+
+    let estimated_bytes = (config.input_size * 4).max(1_000_000_000);
+
+    let temp_dir = choose_temp_dir(
+        estimated_bytes,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    ).await?;
+
+    let unsorted_path = temp_dir.path().join(format!("{}_unsorted.m8", db_type));
+    let sorted_path   = temp_dir.path().join(format!("{}_sorted_by_read.m8", db_type));
+
+    info!("[{}] m8 sort started (est {} bytes) → temp: {}",
+          tag, estimated_bytes, temp_dir.path().display());
+
+    // Write unsorted m8 (re-uses your fast writer)
+    let write_task = write_byte_stream_to_file(
+        &unsorted_path,
+        input_stream,
+        Some(config.base_buffer_size * 4),
+        &tag,
+    ).await?;
+
+    // Sort configuration
+    let sort_config = crate::utils::command::sort::SortConfig {
+        key: "-k1,1".to_string(),
+        parallel: None,
+        buffer_size: Some("50%".to_string()),
+        temp_dir: Some(temp_dir.path().to_string_lossy().into_owned()),
+        output: Some(sorted_path.to_string_lossy().into_owned()),
+        extra_fields: std::collections::HashMap::new(),
+    };
+
+    let sort_args = crate::utils::command::generate_cli(
+        crate::config::defs::SORT_TAG,
+        &config,
+        Some(&sort_config),
+    ).map_err(|e| PipelineError::ToolExecution {
+        tool: "sort".to_string(),
+        error: e.to_string(),
+    })?;
+
+    // Run GNU sort (one-shot via your standard spawn_cmd)
+    let (mut sort_child, sort_err_task) = spawn_cmd(
+        config.clone(),
+        "sort",
+        sort_args,
+        config.args.verbose,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: "sort".to_string(),
+        error: e.to_string(),
+    })?;
+
+    write_task.await??;   // wait for input file
+
+    let status = sort_child.wait().await
+        .map_err(|e| PipelineError::ToolExecution { tool: "sort".into(), error: e.to_string() })?;
+
+    if !status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: "sort".into(),
+            error: format!("GNU sort failed with code {:?}", status.code()),
+        });
+    }
+    sort_err_task.await??;
+
+    info!("[{}] m8 sort completed → {}", tag, sorted_path.display());
+
+    // Stream sorted m8 back as bytes (uses your existing parser)
+    let sorted_file = TokioFile::open(&sorted_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let rx = parse_bytes::<TokioFile>(sorted_file, config.base_buffer_size)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // parse_bytes already spawns its own background task — nothing more to do.
+    Ok(ReceiverStream::new(rx))
+}
+
 /// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
 /// # Arguments
 ///
