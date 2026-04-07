@@ -2462,29 +2462,57 @@ pub async fn paf_to_m8(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 )> {
-
-
     let genome_size = config.args.nt_db_size as f64;
+
+    // Counters for visibility — no data dropped
+    let paf_record_count = Arc::new(AtomicUsize::new(0));
+    let m8_line_count = Arc::new(AtomicUsize::new(0));
+
+    let paf_counter = paf_record_count.clone();
+    let m8_counter = m8_line_count.clone();
 
     let batched_stream = batch_rayon_process(
         config.clone(),
         input_stream,
-        move |batch: Vec<u8>| parse_paf_batch_to_m8(batch, genome_size),
+        move |batch: Vec<u8>| {
+            let m8_lines = parse_paf_batch_to_m8(batch, genome_size);
+
+            // Update counters safely inside rayon closure
+            paf_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed); // approximate PAF count = number of output groups
+            m8_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed);
+
+            m8_lines
+        },
         "paf_to_m8",
-        16 * 1024 * 1024,   //  (16 MiB = good starting point)
+        16 * 1024 * 1024, // 16 MiB batches
     );
 
-    let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+    let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 4);
 
-    let config_clone = config.clone();
+    let paf_counter_final = paf_record_count.clone();
+    let m8_counter_final = m8_line_count.clone();
 
     let conversion_handle = tokio::spawn(async move {
         let mut stream = batched_stream;
         while let Some(item) = stream.next().await {
             if m8_tx.send(item).await.is_err() {
+                error!("[paf_to_m8] downstream m8 channel dropped");
                 return Err(anyhow!("m8 channel send failed"));
             }
         }
+
+        let paf_total = paf_counter_final.load(std::sync::atomic::Ordering::Relaxed);
+        let m8_total = m8_counter_final.load(std::sync::atomic::Ordering::Relaxed);
+
+        info!(
+            "[paf_to_m8] FINISHED — processed ~{} PAF records → emitted {} m8 lines",
+            paf_total, m8_total
+        );
+
+        if m8_total == 0 {
+            warn!("[paf_to_m8] ZERO m8 lines produced. This explains why call_hits_m8 sees nothing.");
+        }
+
         Ok(())
     });
 
@@ -2520,7 +2548,6 @@ pub async fn paf_to_m8(
         vec![done_rx],
     ))
 }
-
 
 
 /// Loads the taxid (taxid → [species, genus, family])
