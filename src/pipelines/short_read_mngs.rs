@@ -2116,20 +2116,17 @@ pub async fn minimap2_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
-) -> Result<
-    (
-        ReceiverStream<ParseOutput>,
-        Vec<JoinHandle<Result<(), anyhow::Error>>>,
-        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-        TempDir
-    ),
-    PipelineError,
-> {
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+), PipelineError> {
+
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
     let base_buffer_size = config.base_buffer_size;
-    let channel_buffer = base_buffer_size * 4;
+    let channel_buffer = base_buffer_size * 8;
 
     // 1. Discover NT split .mmi chunks + sort largest-first
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
@@ -2142,7 +2139,6 @@ pub async fn minimap2_non_host_align(
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-
         if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
             if let Ok(meta) = path.metadata() {
                 let size: u64 = meta.len();
@@ -2166,12 +2162,12 @@ pub async fn minimap2_non_host_align(
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 2. Memory & concurrency estimation —
-    const MEASURED_SINGLE_JOB_GB: f64 = 40.0;           //real runs show ~15–35 GiB/job
+    // 2. Memory & concurrency estimation
+    const MEASURED_SINGLE_JOB_GB: f64 = 40.0;
     const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
-    const TARGET_RAM_FRACTION: f64 = 0.50;              // aim for ≤50% usage
-    const HARD_MAX_CONCURRENCY: usize = 24;             // (allows ~600–800 GiB peak)
+    const TARGET_RAM_FRACTION: f64 = 0.50;
+    const HARD_MAX_CONCURRENCY: usize = 24;
     const MIN_CONCURRENCY: usize = 2;
     const MIN_THREADS_PER_JOB: usize = 8;
     const MAX_THREADS_PER_JOB: usize = 32;
@@ -2185,12 +2181,12 @@ pub async fn minimap2_non_host_align(
     let est_gb_per_job = ((largest_gb * 0.95).ceil() as f64)
         .max(MEASURED_SINGLE_JOB_GB * 0.9)
         .min(MEASURED_SINGLE_JOB_GB * 1.15)
-        .max(20.0);  // floor — prevent tiny-chunk underestimation
+        .max(20.0);
 
     info!(
-    "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
-    largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
-);
+        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
+        largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
+    );
 
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
     let ram_based_concurrency = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
@@ -2198,14 +2194,13 @@ pub async fn minimap2_non_host_align(
     let mut concurrency = ram_based_concurrency
         .clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
 
-    // Safety: never push past ~75% of available RAM
     let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
     if estimated_peak_gb > available_ram_gb * 0.75 {
         let new_conc = concurrency.saturating_sub(2).max(MIN_CONCURRENCY);
         warn!(
-        "Estimated peak {:.0} GiB exceeds 75% of available ({:.0} GiB) → reducing concurrency from {} to {}",
-        estimated_peak_gb, available_ram_gb, concurrency, new_conc
-    );
+            "Estimated peak {:.0} GiB exceeds 75% of available ({:.0} GiB) → reducing concurrency from {} to {}",
+            estimated_peak_gb, available_ram_gb, concurrency, new_conc
+        );
         concurrency = new_conc;
     }
 
@@ -2213,82 +2208,53 @@ pub async fn minimap2_non_host_align(
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
-    concat!(
-        "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
-        "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-        "  single-job baseline: ~{:.0} s real time (measured)\n",
-        "  largest chunk: {:.1} GiB → est/job: {:.0} GiB"
-    ),
-    concurrency,
-    threads_per_job,
-    estimated_peak_gb,
-    (estimated_peak_gb / available_ram_gb * 100.0).round(),
-    MEASURED_SINGLE_JOB_SEC,
-    largest_gb,
-    est_gb_per_job
-);
+        concat!(
+            "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
+            "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
+            "  single-job baseline: ~{:.0} s real time (measured)\n",
+            "  largest chunk: {:.1} GiB → est/job: {:.0} GiB"
+        ),
+        concurrency,
+        threads_per_job,
+        estimated_peak_gb,
+        (estimated_peak_gb / available_ram_gb * 100.0).round(),
+        MEASURED_SINGLE_JOB_SEC,
+        largest_gb,
+        est_gb_per_job
+    );
 
+    // One merged channel for all workers' PAF output
+    let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
 
-    // 4. Create temp dir for all chunk PAF outputs (NVMe preferred)
-    let paf_temp_dir = choose_temp_dir(
-        max_size_bytes * num_chunks as u64 / 10,  // conservative estimate
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        4,
-        true,
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-
-    // Extract path for cloning into chunk tasks
-    let paf_temp_dir_path = paf_temp_dir.path().to_path_buf();
-
-
-    let (job_tx, job_rx) = mpsc::channel::<(PathBuf, String)>(concurrency); // capacity = max running jobs
-
-    // Producer: enqueue all jobs (will block when queue full → backpressure)
+    // Producer: enqueue all chunk jobs
+    let (job_tx, job_rx) = mpsc::channel::<(PathBuf, String)>(concurrency);
     let producer_handle = tokio::spawn({
         let chunk_paths = chunk_paths.clone();
-        let temp_dir_path = paf_temp_dir_path.clone();
         async move {
             for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
                 let chunk_name = chunk_mmi
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| format!("chunk_{}", idx));
-
-                // Clone name only if needed for error logging
-                let chunk_name_for_log = chunk_name.clone();
-
-                if let Err(e) = job_tx
-                    .send((chunk_mmi, chunk_name))
-                    .await
-                {
-                    error!("Failed to enqueue job for {}: {}", chunk_name_for_log, e);
-                    break;
-                }
+                let _ = job_tx.send((chunk_mmi, chunk_name)).await;
             }
-            drop(job_tx);
             Ok::<(), anyhow::Error>(())
         }
     });
 
-
-
     let config_clone = config.clone();
     let r1_clone = r1_path.clone();
     let r2_clone = r2_path_opt.clone();
-    let temp_dir_path_clone = paf_temp_dir_path.clone();
-
 
     let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
     let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(concurrency);
+
     for _ in 0..concurrency {
         let rx = shared_rx.clone();
         let config = config_clone.clone();
         let r1 = r1_clone.clone();
         let r2 = r2_clone.clone();
-        let temp_dir_path = temp_dir_path_clone.clone();
+        let merged_tx_clone = merged_tx.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -2297,52 +2263,60 @@ pub async fn minimap2_non_host_align(
                     guard.recv().await
                 };
 
-                if let Some((chunk_mmi, chunk_name)) = job {
-                    let paf_path = temp_dir_path.join(format!("{}.paf", chunk_name));
+                let Some((chunk_mmi, chunk_name)) = job else { break; };
 
-                    // ── your exact worker body from here ──
-                    let mut options = HashMap::new();
-                    options.insert("-c".to_string(), None);
-                    options.insert("-x".to_string(), Some("sr".to_string()));
-                    options.insert("--secondary".to_string(), Some("yes".to_string()));
+                let mut options = HashMap::new();
+                options.insert("-c".to_string(), None);
+                options.insert("-x".to_string(), Some("sr".to_string()));
+                options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-                    let mm_config = Minimap2Config {
-                        minimap2_index_path: chunk_mmi,
-                        r1_path: Some(r1.clone()),
-                        r2_path: r2.clone(),
-                        option_fields: options,
-                        num_threads: Some(threads_per_job),
-                    };
+                let mm_config = Minimap2Config {
+                    minimap2_index_path: chunk_mmi,
+                    r1_path: Some(r1.clone()),
+                    r2_path: r2.clone(),
+                    option_fields: options,
+                    num_threads: Some(threads_per_job),
+                };
 
-                    let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
-                        .context("Failed to generate minimap2 args")?;
+                let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
+                    .context("Failed to generate minimap2 args")?;
 
-                    args.push("-o".to_string());
-                    args.push(paf_path.to_string_lossy().to_string());
+                info!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
 
-                    info!("Launching minimap2 for {} to file {}: minimap2 {}", chunk_name, paf_path.display(), args.join(" "));
+                let (mut child, stderr_task) = spawn_cmd(
+                    config.clone(),
+                    MINIMAP2_TAG,
+                    args,
+                    config.args.verbose,
+                ).await.context("Failed to spawn minimap2")?;
 
-                    let (mut child, stderr_task) = spawn_cmd(
-                        config.clone(),
-                        MINIMAP2_TAG,
-                        args,
-                        config.args.verbose,
-                    )
-                        .await
-                        .context("Failed to spawn minimap2")?;
-
-                    if let Some(pid) = child.id() {
-                        info!("minimap2 PID for {}: {}", chunk_name, pid);
-                    }
-
-                    let status = child.wait().await.context("Failed to wait for minimap2 child")?;
-                    if !status.success() {
-                        warn!("minimap2 for {} exited with status: {}", chunk_name, status);
-                    }
-                    info!("minimap2 process for {} finished", chunk_name);
-                } else {
-                    break; // channel closed
+                if let Some(pid) = child.id() {
+                    info!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
+
+                let paf_bytes_rx = parse_child_output(
+                    &mut child,
+                    ChildStream::Stdout,
+                    ParseMode::Bytes,
+                    base_buffer_size,
+                ).await.context("Failed to parse minimap2 stdout")?;
+
+                // Forward this worker's bytes into the merged stream
+                let mut paf_stream = ReceiverStream::new(paf_bytes_rx);
+                while let Some(item) = paf_stream.next().await {
+                    if merged_tx_clone.send(item).await.is_err() {
+                        break; // downstream closed
+                    }
+                }
+
+                let status = child.wait().await.context("minimap2 wait failed")?;
+                if !status.success() {
+                    warn!("minimap2 for {} exited with status: {}", chunk_name, status);
+                } else {
+                    info!("minimap2 for {} finished streaming", chunk_name);
+                }
+
+                let _ = stderr_task.await;
             }
             Ok(())
         });
@@ -2351,58 +2325,15 @@ pub async fn minimap2_non_host_align(
     }
 
 
-    // 5. Wait for producer and all workers
     producer_handle.await??;
-    try_join_all(worker_handles).await?
-        .into_iter()
-        .try_for_each(|r| r)?;
+    cleanup_tasks.extend(worker_handles);
 
-    // Collect all generated PAF paths (same naming as before)
-    let mut paf_paths = Vec::with_capacity(num_chunks);
-    for chunk_mmi in &chunk_paths {
-        let chunk_name = chunk_mmi
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let paf_path = paf_temp_dir_path.join(format!("{}.paf", chunk_name));
-        if paf_path.exists() {
-            paf_paths.push(paf_path);
-        } else {
-            warn!("PAF file missing for chunk {}", chunk_name);
-        }
-    }
-
-    info!("[minimap2 NT] Generated {} PAF files in {}", paf_paths.len(), paf_temp_dir_path.display());
-    for p in &paf_paths {
-        if let Ok(meta) = p.metadata() {
-            info!("  {}  ({:.1} GiB)", p.display(), meta.len() as f64 / 1_073_741_824.0);
-        }
-    }
-
-    let genome_size = config.args.nt_db_size as f64;
-    // 6. Merge from temp files — unchanged
-    let (merged_tx, merged_rx) = mpsc::channel(channel_buffer);
-
-    let gather_handle = tokio::spawn(async move {
-        if let Err(e) = PafRecord::merge_paf_files(&paf_paths, merged_tx).await {
-            warn!("PAF merge from files failed: {}", e);
-            return Err(e);
-        }
-        Ok(())
-    });
-
-    // CRITICAL: wait for the merge to finish pushing all PAF lines into the channel
-    // before we hand the receiver to the caller.
-    gather_handle.await??;
-
-    info!("[minimap2_non_host_align] PAF merge completed — all lines sent downstream");
+    info!("[minimap2_non_host_align] Launched {} minimap2 workers — PAF streaming directly to paf_to_m8", num_chunks);
 
     Ok((
         ReceiverStream::new(merged_rx),
         cleanup_tasks,
         cleanup_receivers,
-        paf_temp_dir,
-
     ))
 }
 
@@ -6837,7 +6768,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
-    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers, non_host_mm2_paf_dir) = minimap2_non_host_align(
+    let (non_host_mm2_out_stream, mut non_host_mm2_cleanup_tasks, mut non_host_mm2_cleanup_receivers) = minimap2_non_host_align(
         config.clone(),
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
@@ -6845,7 +6776,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
-    final_temp_dirs.push(non_host_mm2_paf_dir);
 
 
     let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
