@@ -2276,6 +2276,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         BLASTN_TAG => Box::new(blastn::BlastnArgGenerator),
         BLASTX_TAG => Box::new(blastx::BlastxArgGenerator),
         MAKEBLASTDB_TAG => {Box::new(makeblastdb::MakeblastdbArgGenerator)},
+        SORT_TAG => Box::new(sort::SortArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
