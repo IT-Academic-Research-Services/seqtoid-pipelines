@@ -2294,26 +2294,35 @@ pub async fn minimap2_non_host_align(
                     info!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
 
-                let byte_rx = parse_child_output(
-                    &mut child,
-                    ChildStream::Stdout,
-                    ParseMode::Bytes,
-                    base_buffer_size * 4,
-                ).await.context("Failed to parse minimap2 stdout as bytes")?;
+                // Direct tokio read — this is what worked when you ran the command manually
+                if let Some(stdout) = child.stdout.take() {
+                    let mut reader = tokio::io::BufReader::new(stdout);
+                    let mut line = String::new();
+                    let mut lines_sent = 0u64;
 
-                // Forward the byte chunks directly to the merged stream
-                let mut byte_stream = ReceiverStream::new(byte_rx);
-                while let Some(item) = byte_stream.next().await {
-                    if merged_tx_clone.send(item).await.is_err() {
-                        break; // downstream closed
+                    while reader.read_line(&mut line).await? > 0 {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            let bytes = (trimmed.to_string() + "\n").into_bytes();
+                            if merged_tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
+                                debug!("[minimap2 {}] downstream closed, stopping forward", chunk_name);
+                                break;
+                            }
+                            lines_sent += 1;
+                            if lines_sent % 100_000 == 0 {
+                                info!("[minimap2 {}] streamed {} PAF lines so far", chunk_name, lines_sent);
+                            }
+                        }
+                        line.clear();
                     }
+                    info!("[minimap2 {}] finished streaming — sent {} lines", chunk_name, lines_sent);
                 }
 
                 let status = child.wait().await.context("minimap2 wait failed")?;
                 if !status.success() {
                     warn!("minimap2 for {} exited with status: {}", chunk_name, status);
                 } else {
-                    info!("minimap2 for {} finished", chunk_name);
+                    info!("minimap2 for {} completed successfully", chunk_name);
                 }
 
                 let _ = stderr_task.await;
