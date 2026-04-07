@@ -2372,6 +2372,12 @@ pub async fn minimap2_non_host_align(
         }
     }
 
+    info!("[minimap2 NT] Generated {} PAF files in {}", paf_paths.len(), paf_temp_dir_path.display());
+    for p in &paf_paths {
+        if let Ok(meta) = p.metadata() {
+            info!("  {}  ({:.1} GiB)", p.display(), meta.len() as f64 / 1_073_741_824.0);
+        }
+    }
 
     let genome_size = config.args.nt_db_size as f64;
     // 6. Merge from temp files — unchanged
