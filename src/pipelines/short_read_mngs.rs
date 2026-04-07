@@ -2391,9 +2391,11 @@ pub async fn minimap2_non_host_align(
         Ok(())
     });
 
-    cleanup_tasks.push(gather_handle);
+    // CRITICAL: wait for the merge to finish pushing all PAF lines into the channel
+    // before we hand the receiver to the caller.
+    gather_handle.await??;
 
-    info!("minimap2 NT alignment launched — {} chunks → temp files → merge", num_chunks);
+    info!("[minimap2_non_host_align] PAF merge completed — all lines sent downstream");
 
     Ok((
         ReceiverStream::new(merged_rx),
