@@ -2128,7 +2128,7 @@ pub async fn minimap2_non_host_align(
     let base_buffer_size = config.base_buffer_size;
     let channel_buffer = base_buffer_size * 8;
 
-    // 1. Discover NT split .mmi chunks + sort largest-first
+    // 1. Discover NT split .mmi chunks + sort largest-first (unchanged)
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
     let mut max_size_bytes: u64 = 0;
@@ -2162,7 +2162,7 @@ pub async fn minimap2_non_host_align(
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 2. Memory & concurrency estimation
+    // 2. Memory & concurrency estimation — your exact original block (unchanged)
     const MEASURED_SINGLE_JOB_GB: f64 = 40.0;
     const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
@@ -2294,18 +2294,25 @@ pub async fn minimap2_non_host_align(
                     info!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
 
-                let paf_bytes_rx = parse_child_output(
-                    &mut child,
-                    ChildStream::Stdout,
-                    ParseMode::Bytes,
-                    base_buffer_size,
-                ).await.context("Failed to parse minimap2 stdout")?;
+                // Stream stdout using tokio::io types (ChildStdout implements AsyncRead)
+                if let Some(stdout) = child.stdout.take() {
+                    let mut reader = tokio::io::BufReader::new(stdout);
+                    let mut line = String::new();
+                    let mut lines_sent = 0u64;
 
-                // Forward this worker's bytes into the merged stream
-                let mut paf_stream = ReceiverStream::new(paf_bytes_rx);
-                while let Some(item) = paf_stream.next().await {
-                    if merged_tx_clone.send(item).await.is_err() {
-                        break; // downstream closed
+                    while reader.read_line(&mut line).await? > 0 {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            let bytes = (trimmed.to_string() + "\n").into_bytes();
+                            if merged_tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
+                                break; // downstream closed
+                            }
+                            lines_sent += 1;
+                            if lines_sent % 500_000 == 0 {
+                                info!("[minimap2 {}] streamed {} PAF lines", chunk_name, lines_sent);
+                            }
+                        }
+                        line.clear();
                     }
                 }
 
@@ -2324,8 +2331,10 @@ pub async fn minimap2_non_host_align(
         worker_handles.push(handle);
     }
 
-
+    // Only wait for the producer (quick)
     producer_handle.await??;
+
+    // Hand all worker tasks to cleanup — do NOT await them here
     cleanup_tasks.extend(worker_handles);
 
     info!("[minimap2_non_host_align] Launched {} minimap2 workers — PAF streaming directly to paf_to_m8", num_chunks);
