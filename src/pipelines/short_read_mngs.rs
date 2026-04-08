@@ -2305,23 +2305,30 @@ pub async fn minimap2_non_host_align(
                     let mut line = String::new();
                     let mut lines_sent = 0u64;
 
+                    info!("[minimap2 {}] STARTED reading stdout", chunk_name);
+
                     while reader.read_line(&mut line).await? > 0 {
                         let trimmed = line.trim_end();
                         if !trimmed.is_empty() && !trimmed.starts_with('#') {
                             let mut bytes = trimmed.as_bytes().to_vec();
                             bytes.push(b'\n');
+
                             if merged_tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
-                                debug!("[minimap2 {}] downstream closed, stopping forward", chunk_name);
+                                warn!("[minimap2 {}] downstream closed while sending line {}", chunk_name, lines_sent);
                                 break;
                             }
+
                             lines_sent += 1;
-                            if lines_sent % 100_000 == 0 {
-                                info!("[minimap2 {}] streamed {} PAF lines so far", chunk_name, lines_sent);
+                            if lines_sent % 50_000 == 0 {   // more frequent for visibility
+                                info!("[minimap2 {}] streamed {} PAF lines so far (last: {})",
+                      chunk_name, lines_sent, &trimmed[..std::cmp::min(120, trimmed.len())]);
                             }
                         }
                         line.clear();
                     }
-                    info!("[minimap2 {}] finished streaming — sent {} lines", chunk_name, lines_sent);
+                    info!("[minimap2 {}] FINISHED reading stdout — sent {} complete PAF lines", chunk_name, lines_sent);
+                } else {
+                    warn!("[minimap2 {}] no stdout handle!", chunk_name);
                 }
 
                 let status = child.wait().await.context("minimap2 wait failed")?;
