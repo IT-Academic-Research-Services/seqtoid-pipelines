@@ -2171,11 +2171,11 @@ pub async fn minimap2_non_host_align(
     const MEASURED_SINGLE_JOB_GB: f64 = 40.0;
     const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
-    const TARGET_RAM_FRACTION: f64 = 0.50;
-    const HARD_MAX_CONCURRENCY: usize = 24;
+    const TARGET_RAM_FRACTION: f64 = 0.35;
+    const HARD_MAX_CONCURRENCY: usize = 8;
     const MIN_CONCURRENCY: usize = 2;
     const MIN_THREADS_PER_JOB: usize = 8;
-    const MAX_THREADS_PER_JOB: usize = 32;
+    const MAX_THREADS_PER_JOB: usize = 16;
 
     let largest_gb = if max_size_bytes > 0 {
         ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as f64
@@ -2299,7 +2299,7 @@ pub async fn minimap2_non_host_align(
                     info!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
 
-                // LINE-BY-LINE streaming — guarantees complete PAF lines 
+                // LINE-BY-LINE streaming — guarantees complete PAF lines
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = tokio::io::BufReader::new(stdout);
                     let mut line = String::new();
