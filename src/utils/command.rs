@@ -2188,6 +2188,7 @@ pub mod sort {
         pub temp_dir: Option<String>,       // -T /path
         pub output: Option<String>,         // -o sorted.m8
         pub extra_fields: HashMap<String, Option<String>>,
+        pub input: Option<String>,
     }
 
     pub struct SortArgGenerator;
@@ -2245,6 +2246,11 @@ pub mod sort {
                 if let Some(v) = value {
                     args.push(v.clone());
                 }
+            }
+
+            // Input
+            if let Some(input_file) = &config.input{
+                args.push(input_file.clone());
             }
 
             Ok(args)

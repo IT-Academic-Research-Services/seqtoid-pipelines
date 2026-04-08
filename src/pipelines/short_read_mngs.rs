@@ -2661,6 +2661,7 @@ pub async fn sort_m8_by_read_id(
         temp_dir: Some(temp_dir.path().to_string_lossy().into_owned()),
         output: Some(sorted_path.to_string_lossy().into_owned()),
         extra_fields: HashMap::new(),
+        input: Some(unsorted_path.to_string_lossy().into_owned()),
     };
 
     let sort_args = crate::utils::command::generate_cli(
