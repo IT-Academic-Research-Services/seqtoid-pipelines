@@ -2617,22 +2617,33 @@ pub async fn sort_m8_by_read_id(
         &config.args.nvme_scratch,
         4,
         false,
-    ).await?;
+    )
+        .await?;
 
     let unsorted_path = temp_dir.path().join(format!("{}_unsorted.m8", db_type));
     let sorted_path = temp_dir.path().join(format!("{}_sorted_by_read.m8", db_type));
 
-    info!("[{}] Starting m8 sort (est {} bytes) using RAM/NVMe scratch", tag, estimated_bytes);
+    info!(
+        "[{}] Starting m8 sort (est {} bytes) using RAM/NVMe scratch",
+        tag, estimated_bytes
+    );
 
-    // 1. Write unsorted m8
+    // 1) Write the unsorted stream to disk and wait for the file to be fully closed.
     let write_task = write_byte_stream_to_file(
         &unsorted_path,
         input_stream,
         Some(config.base_buffer_size * 4),
         &tag,
-    ).await?;
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // 2. Prepare sort config
+    write_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("{} writer task panicked: {}", tag, e)))?
+        .map_err(|e| PipelineError::IOError(format!("{} writer task failed: {}", tag, e)))?;
+
+    // 2) Only now spawn GNU sort, so it reads a complete file.
     let sort_config = crate::utils::command::sort::SortConfig {
         key: "-k1,1".to_string(),
         parallel: None,
@@ -2646,41 +2657,48 @@ pub async fn sort_m8_by_read_id(
         crate::config::defs::SORT_TAG,
         &config,
         Some(&sort_config),
-    ).map_err(|e| PipelineError::ToolExecution {
-        tool: crate::config::defs::SORT_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-    // 3. Run GNU sort
     let (mut sort_child, sort_err_task) = spawn_cmd(
         config.clone(),
         crate::config::defs::SORT_TAG,
         sort_args,
         config.args.verbose,
-    ).await.map_err(|e| PipelineError::ToolExecution {
-        tool: crate::config::defs::SORT_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-    write_task.await??;   // wait for write to finish
-
-    let status = sort_child.wait().await
+    let status = sort_child
+        .wait()
+        .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: crate::config::defs::SORT_TAG.to_string(),
             error: e.to_string(),
         })?;
 
     if !status.success() {
+        let _ = sort_err_task.await;
         return Err(PipelineError::ToolExecution {
             tool: crate::config::defs::SORT_TAG.to_string(),
             error: format!("GNU sort exited with {:?}", status.code()),
         });
     }
-    sort_err_task.await??;
+
+    sort_err_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("sort stderr task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("sort stderr task failed: {}", e)))?;
 
     info!("[{}] m8 sort completed → {}", tag, sorted_path.display());
 
-    // 4. Stream sorted file back (parse_bytes already spawns its own task)
+    // 3) Stream the sorted file back.
     let sorted_file = TokioFile::open(&sorted_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
