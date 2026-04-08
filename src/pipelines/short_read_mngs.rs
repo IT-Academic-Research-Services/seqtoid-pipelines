@@ -2126,14 +2126,13 @@ pub async fn minimap2_non_host_align(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 ), PipelineError> {
-
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
     let base_buffer_size = config.base_buffer_size;
-    let channel_buffer = base_buffer_size * 8;
+    let channel_buffer = (base_buffer_size * 8).max(1024);
 
-    // 1. Discover NT split .mmi chunks + sort largest-first (unchanged from your working version)
+    // 1) Discover NT split .mmi chunks and sort largest-first.
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
     let mut max_size_bytes: u64 = 0;
@@ -2162,12 +2161,14 @@ pub async fn minimap2_non_host_align(
         )));
     }
 
-    chunk_paths.sort_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(0));
+    chunk_paths.sort_by_key(|p| {
+        std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0))
+    });
 
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 2. Memory & concurrency estimation — your exact original block (unchanged)
+    // 2) Memory & concurrency estimation.
     const MEASURED_SINGLE_JOB_GB: f64 = 40.0;
     const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
 
@@ -2194,10 +2195,10 @@ pub async fn minimap2_non_host_align(
     );
 
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
-    let ram_based_concurrency = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
+    let ram_based_concurrency =
+        (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
 
-    let mut concurrency = ram_based_concurrency
-        .clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
+    let mut concurrency = ram_based_concurrency.clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
 
     let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
     if estimated_peak_gb > available_ram_gb * 0.75 {
@@ -2228,48 +2229,27 @@ pub async fn minimap2_non_host_align(
         est_gb_per_job
     );
 
-    // One merged channel for all workers' PAF output
-    let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
+    // Global merged output stream.
+    let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(channel_buffer * 4);
 
-    // Producer: enqueue all chunk jobs
-    let (job_tx, job_rx) = mpsc::channel::<(PathBuf, String)>(concurrency);
-    let producer_handle = tokio::spawn({
-        let chunk_paths = chunk_paths.clone();
-        async move {
-            for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
-                let chunk_name = chunk_mmi
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| format!("chunk_{}", idx));
-                let _ = job_tx.send((chunk_mmi, chunk_name)).await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    });
-
-    let config_clone = config.clone();
-    let r1_clone = r1_path.clone();
-    let r2_clone = r2_path_opt.clone();
-
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+    // Each worker gets its own job queue and its own output queue.
+    let mut worker_job_txs: Vec<mpsc::Sender<(PathBuf, String)>> = Vec::with_capacity(concurrency);
+    let mut worker_output_streams: Vec<ReceiverStream<ParseOutput>> = Vec::with_capacity(concurrency);
     let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(concurrency);
 
-    for _ in 0..concurrency {
-        let rx = shared_rx.clone();
-        let config = config_clone.clone();
-        let r1 = r1_clone.clone();
-        let r2 = r2_clone.clone();
-        let merged_tx_clone = merged_tx.clone();
+    for _worker_idx in 0..concurrency {
+        let (job_tx, mut job_rx) = mpsc::channel::<(PathBuf, String)>(num_chunks.max(1));
+        let (out_tx, out_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
+
+        worker_job_txs.push(job_tx);
+        worker_output_streams.push(ReceiverStream::new(out_rx));
+
+        let config = config.clone();
+        let r1 = r1_path.clone();
+        let r2 = r2_path_opt.clone();
 
         let handle = tokio::spawn(async move {
-            loop {
-                let job = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-
-                let Some((chunk_mmi, chunk_name)) = job else { break; };
-
+            while let Some((chunk_mmi, chunk_name)) = job_rx.recv().await {
                 let mut options = HashMap::new();
                 options.insert("-c".to_string(), None);
                 options.insert("-x".to_string(), Some("sr".to_string()));
@@ -2293,13 +2273,14 @@ pub async fn minimap2_non_host_align(
                     MINIMAP2_TAG,
                     args,
                     config.args.verbose,
-                ).await.context("Failed to spawn minimap2")?;
+                )
+                    .await
+                    .context("Failed to spawn minimap2")?;
 
                 if let Some(pid) = child.id() {
                     info!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
 
-                // LINE-BY-LINE streaming — guarantees complete PAF lines
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = tokio::io::BufReader::new(stdout);
                     let mut line = String::new();
@@ -2313,20 +2294,35 @@ pub async fn minimap2_non_host_align(
                             let mut bytes = trimmed.as_bytes().to_vec();
                             bytes.push(b'\n');
 
-                            if merged_tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
-                                warn!("[minimap2 {}] downstream closed while sending line {}", chunk_name, lines_sent);
+                            if out_tx
+                                .send(ParseOutput::Bytes(Arc::new(bytes)))
+                                .await
+                                .is_err()
+                            {
+                                warn!(
+                                    "[minimap2 {}] local output channel closed while sending line {}",
+                                    chunk_name, lines_sent
+                                );
                                 break;
                             }
 
                             lines_sent += 1;
-                            if lines_sent % 50_000 == 0 {   // more frequent for visibility
-                                info!("[minimap2 {}] streamed {} PAF lines so far (last: {})",
-                      chunk_name, lines_sent, &trimmed[..std::cmp::min(120, trimmed.len())]);
+                            if lines_sent % 50_000 == 0 {
+                                info!(
+                                    "[minimap2 {}] streamed {} PAF lines so far (last: {})",
+                                    chunk_name,
+                                    lines_sent,
+                                    &trimmed[..std::cmp::min(120, trimmed.len())]
+                                );
                             }
                         }
                         line.clear();
                     }
-                    info!("[minimap2 {}] FINISHED reading stdout — sent {} complete PAF lines", chunk_name, lines_sent);
+
+                    info!(
+                        "[minimap2 {}] FINISHED reading stdout — sent {} complete PAF lines",
+                        chunk_name, lines_sent
+                    );
                 } else {
                     warn!("[minimap2 {}] no stdout handle!", chunk_name);
                 }
@@ -2340,19 +2336,56 @@ pub async fn minimap2_non_host_align(
 
                 let _ = stderr_task.await;
             }
-            Ok(())
+
+            Ok::<(), anyhow::Error>(())
         });
 
         worker_handles.push(handle);
     }
 
-    // Only wait for the producer
-    producer_handle.await??;
+    // Merge all worker output streams fairly.
+    let merger_handle = tokio::spawn({
+        let mut merged_tx = merged_tx;
+        let mut merged_stream = futures::stream::select_all(worker_output_streams);
+        async move {
+            while let Some(item) = merged_stream.next().await {
+                if merged_tx.send(item).await.is_err() {
+                    warn!("[minimap2_non_host_align] downstream closed while merging worker output");
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    cleanup_tasks.push(merger_handle);
 
-    // Hand all worker tasks to cleanup — do NOT await them here
+    // Assign chunks round-robin to workers.
+    for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
+        let chunk_name = chunk_mmi
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("chunk_{}", idx));
+
+        let worker_idx = idx % worker_job_txs.len();
+        worker_job_txs[worker_idx]
+            .send((chunk_mmi, chunk_name))
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to dispatch NT chunk {} to worker {}: {}",
+                    idx, worker_idx, e
+                ))
+            })?;
+    }
+
+    drop(worker_job_txs);
+
     cleanup_tasks.extend(worker_handles);
 
-    info!("[minimap2_non_host_align] Launched {} minimap2 workers — PAF streaming directly to paf_to_m8", num_chunks);
+    info!(
+        "[minimap2_non_host_align] Launched {} minimap2 workers — PAF stream now feeding paf_to_m8",
+        concurrency
+    );
 
     Ok((
         ReceiverStream::new(merged_rx),
@@ -2420,7 +2453,7 @@ pub async fn minimap2_non_host_align(
 /// - Vec of cleanup receivers
 pub async fn paf_to_m8(
     config: Arc<RunConfig>,
-    mut input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,
     m8_path: PathBuf,
 ) -> Result<(
     ReceiverStream<ParseOutput>,
@@ -2429,7 +2462,6 @@ pub async fn paf_to_m8(
 )> {
     let genome_size = config.args.nt_db_size as f64;
 
-    // Counters for visibility — no data dropped
     let paf_record_count = Arc::new(AtomicUsize::new(0));
     let m8_line_count = Arc::new(AtomicUsize::new(0));
 
@@ -2440,10 +2472,21 @@ pub async fn paf_to_m8(
         config.clone(),
         input_stream,
         move |batch: Vec<u8>| {
-            let m8_lines = parse_paf_batch_to_m8(batch, genome_size);
+            let m8_lines = parse_paf_batch_to_m8(batch.clone(), genome_size);
 
-            // Update counters safely inside rayon closure
-            paf_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed); // approximate PAF count = number of output groups
+            // Count input PAF lines in the batch.
+            let paf_lines_in_batch = {
+                let newline_count = batch.iter().filter(|&&b| b == b'\n').count();
+                if batch.is_empty() {
+                    0
+                } else if *batch.last().unwrap_or(&b'\n') == b'\n' {
+                    newline_count
+                } else {
+                    newline_count + 1
+                }
+            };
+
+            paf_counter.fetch_add(paf_lines_in_batch, std::sync::atomic::Ordering::Relaxed);
             m8_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed);
 
             m8_lines
@@ -2452,51 +2495,9 @@ pub async fn paf_to_m8(
         16 * 1024 * 1024, // 16 MiB batches
     );
 
-    let (m8_tx, m8_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 4);
-
-    let paf_counter_final = paf_record_count.clone();
-    let m8_counter_final = m8_line_count.clone();
-
-    let conversion_handle = tokio::spawn(async move {
-        let mut stream = batched_stream;
-        let mut received_batches = 0usize;
-        let mut total_bytes = 0usize;
-
-        while let Some(item) = stream.next().await {
-            received_batches += 1;
-            if let ParseOutput::Bytes(b) = &item {
-                total_bytes += b.len();
-            }
-
-            if received_batches % 10 == 0 {
-                info!("[paf_to_m8] received batch #{} (total ~{} bytes so far)", received_batches, total_bytes);
-            }
-
-            if m8_tx.send(item).await.is_err() {
-                error!("[paf_to_m8] downstream m8 channel dropped");
-                return Err(anyhow!("m8 channel send failed"));
-            }
-        }
-
-        let paf_total = paf_counter_final.load(std::sync::atomic::Ordering::Relaxed);
-        let m8_total = m8_counter_final.load(std::sync::atomic::Ordering::Relaxed);
-
-        info!(
-        "[paf_to_m8] FINISHED — processed ~{} PAF records → emitted {} m8 lines (received {} batches, {} bytes)",
-        paf_total, m8_total, received_batches, total_bytes
-    );
-
-        if m8_total == 0 {
-            warn!("[paf_to_m8] ZERO m8 lines produced. This explains why call_hits_m8 sees nothing.");
-        }
-
-        Ok(())
-    });
-
-    let m8_stream = ReceiverStream::new(m8_rx);
-
+    // Split the converted stream immediately; no extra intermediate mpsc queue.
     let (mut streams, done_rx) = t_junction(
-        m8_stream,
+        batched_stream,
         2,
         config.base_buffer_size,
         config.args.stall_threshold,
@@ -2517,11 +2518,20 @@ pub async fn paf_to_m8(
         Some(config.base_buffer_size),
         "paf_to_m8_m8",
     )
-        .await?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let paf_total = paf_record_count.load(std::sync::atomic::Ordering::Relaxed);
+    let m8_total = m8_line_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    info!(
+        "[paf_to_m8] wired conversion stage — ~{} PAF lines seen, {} m8 lines emitted so far",
+        paf_total, m8_total
+    );
 
     Ok((
         ReceiverStream::new(main_stream),
-        vec![conversion_handle, write_task],
+        vec![write_task],
         vec![done_rx],
     ))
 }
@@ -2732,7 +2742,7 @@ pub async fn sort_m8_by_read_id(
 /// - Vec of cleanup receivers
 pub async fn call_hits_m8(
     config: Arc<RunConfig>,
-    mut m8_input: ReceiverStream<ParseOutput>,   // ← MUST be sorted by read ID
+    mut m8_input: ReceiverStream<ParseOutput>, // MUST be sorted by read ID
     sample_base_buf: PathBuf,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     acc2taxid_map: Arc<Map<Vec<u8>>>,
@@ -2741,12 +2751,11 @@ pub async fn call_hits_m8(
     concurrency: usize,
     mut tag: String,
 ) -> Result<(
-    ReceiverStream<ParseOutput>,  // dedup m8 stream
-    ReceiverStream<ParseOutput>,  // summary stream
+    ReceiverStream<ParseOutput>, // dedup m8 stream
+    ReceiverStream<ParseOutput>, // summary stream
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 ), PipelineError> {
-
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
@@ -2761,11 +2770,14 @@ pub async fn call_hits_m8(
 
     #[derive(Debug)]
     enum WorkerMsg {
-        ProcessRead { read_id: String, hits: Vec<M8Record> },
+        ProcessRead {
+            read_id: String,
+            hits: Vec<M8Record>,
+        },
         Flush,
     }
 
-    // Create one sender per worker
+    // One sender per worker; reads are sharded by read_id.
     let mut worker_txs: Vec<mpsc::Sender<WorkerMsg>> = Vec::with_capacity(worker_count);
 
     for worker_idx in 0..worker_count {
@@ -2783,7 +2795,10 @@ pub async fn call_hits_m8(
             let mut total_emitted = 0usize;
             let start = Instant::now();
 
-            debug!("[call_hits_m8:{}] worker {} started (streaming mode)", worker_tag, worker_idx);
+            debug!(
+                "[call_hits_m8:{}] worker {} started (streaming mode)",
+                worker_tag, worker_idx
+            );
 
             while let Some(msg) = worker_rx.recv().await {
                 match msg {
@@ -2801,8 +2816,15 @@ pub async fn call_hits_m8(
                         if let Some(reduced) = reduced {
                             total_emitted += 1;
 
-                            let _ = dedup_tx.send(ParseOutput::Bytes(Arc::new(reduced.dedup))).await;
-                            let _ = summary_tx.send(ParseOutput::Bytes(Arc::new(reduced.summary))).await;
+                            dedup_tx
+                                .send(ParseOutput::Bytes(Arc::new(reduced.dedup)))
+                                .await
+                                .context("dedup output channel closed")?;
+
+                            summary_tx
+                                .send(ParseOutput::Bytes(Arc::new(reduced.summary)))
+                                .await
+                                .context("summary output channel closed")?;
                         }
                     }
                     WorkerMsg::Flush => break,
@@ -2819,15 +2841,24 @@ pub async fn call_hits_m8(
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator: reads sorted m8, groups by read_id, sends complete reads to correct worker
+    // Coordinator: consume the sorted stream, accumulate one read at a time,
+    // and dispatch finished read blocks to a shard.
+
+    #[cfg(debug_assertions)]
+    let mut last_seen_read_id: Option<String> = None;
+
     let coordinator_tag = tag.clone();
     let coordinator_handle = tokio::spawn(async move {
         let mut current_read_id: Option<String> = None;
         let mut current_hits: Vec<M8Record> = Vec::with_capacity(32);
         let mut total_lines = 0usize;
+        let mut total_reads = 0usize;
         let start = Instant::now();
 
-        debug!("[call_hits_m8:{}] coordinator started (streaming group-by)", coordinator_tag);
+        debug!(
+        "[call_hits_m8:{}] coordinator started (streaming group-by)",
+        coordinator_tag
+    );
 
         while let Some(item) = m8_input.next().await {
             let bytes = match item.to_bytes() {
@@ -2856,14 +2887,32 @@ pub async fn call_hits_m8(
                 Err(_) => continue,
             };
 
-            // Read ID changed → previous read is complete
-            if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
-                let shard = shard_for_read_id(current_read_id.as_ref().unwrap(), worker_count);
+            #[cfg(debug_assertions)]
+            {
+                if let Some(prev) = &last_seen_read_id {
+                    if prev > &read_id {
+                        warn!(
+                        "[call_hits_m8:{}] read IDs appear to go backwards: prev={} current={}",
+                        coordinator_tag, prev, read_id
+                    );
+                    }
+                }
+                last_seen_read_id = Some(read_id.clone());
+            }
 
-                let _ = worker_txs[shard].send(WorkerMsg::ProcessRead {
-                    read_id: current_read_id.take().unwrap(),
-                    hits: std::mem::take(&mut current_hits),
-                }).await;
+            if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
+                let prev_read_id = current_read_id.take().unwrap();
+                let shard = shard_for_read_id(&prev_read_id, worker_count);
+
+                worker_txs[shard]
+                    .send(WorkerMsg::ProcessRead {
+                        read_id: prev_read_id,
+                        hits: std::mem::take(&mut current_hits),
+                    })
+                    .await
+                    .context("failed to dispatch completed read to worker")?;
+
+                total_reads += 1;
             }
 
             if current_read_id.is_none() {
@@ -2873,25 +2922,36 @@ pub async fn call_hits_m8(
             current_hits.push(rec);
         }
 
-        // Final read
+        // final flush ...
+
+        // Final read.
         if let Some(read_id) = current_read_id {
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
-                let _ = worker_txs[shard].send(WorkerMsg::ProcessRead {
-                    read_id,
-                    hits: current_hits,
-                }).await;
+                worker_txs[shard]
+                    .send(WorkerMsg::ProcessRead {
+                        read_id,
+                        hits: current_hits,
+                    })
+                    .await
+                    .context("failed to dispatch final read to worker")?;
+                total_reads += 1;
             }
         }
 
-        // Flush all workers
+        // Flush all workers after all reads have been dispatched.
         for tx in &worker_txs {
-            let _ = tx.send(WorkerMsg::Flush).await;
+            tx.send(WorkerMsg::Flush)
+                .await
+                .context("failed to flush worker")?;
         }
 
         info!(
-            "[call_hits_m8:{}] coordinator done — processed {} lines in {:?}",
-            coordinator_tag, total_lines, start.elapsed()
+            "[call_hits_m8:{}] coordinator done — processed {} lines, {} reads in {:?}",
+            coordinator_tag,
+            total_lines,
+            total_reads,
+            start.elapsed()
         );
 
         Ok::<(), anyhow::Error>(())
@@ -2919,7 +2979,14 @@ pub async fn call_hits_m8(
     let dedup_file_stream = dedup_branches.remove(0);
 
     let call_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(&sample_base_buf, None, Some(&format!("{}.dedup.m8", tag)), "_")),
+        &config
+            .out_dir
+            .join(rename_file_path(
+                &sample_base_buf,
+                None,
+                Some(&format!("{}.dedup.m8", tag)),
+                "_",
+            )),
         ReceiverStream::new(dedup_file_stream),
         Some(config.base_buffer_size),
         "call_hits_m8_dedup",
@@ -2948,7 +3015,14 @@ pub async fn call_hits_m8(
     let summary_file_stream = summary_branches.remove(0);
 
     let summary_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(&sample_base_buf, None, Some(&format!("{}.summary.txt", tag)), "_")),
+        &config
+            .out_dir
+            .join(rename_file_path(
+                &sample_base_buf,
+                None,
+                Some(&format!("{}.summary.txt", tag)),
+                "_",
+            )),
         ReceiverStream::new(summary_file_stream),
         Some(config.base_buffer_size),
         "call_hits_m8_summary",
