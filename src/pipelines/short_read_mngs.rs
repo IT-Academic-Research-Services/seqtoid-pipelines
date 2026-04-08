@@ -2713,6 +2713,40 @@ pub async fn sort_m8_by_read_id(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
+    let meta = tokio::fs::metadata(&sorted_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    info!(
+    "[{}] sorted output exists: {} bytes at {}",
+    tag,
+    meta.len(),
+    sorted_path.display()
+);
+    // Debug copy of sorted file to out_dir
+    let debug_sorted_path = config
+        .out_dir
+        .join(format!("{}_sorted_by_read.debug.m8", db_type));
+
+    tokio::fs::copy(&sorted_path, &debug_sorted_path)
+        .await
+        .map_err(|e| PipelineError::IOError(format!(
+            "Failed to copy sorted file to {}: {}",
+            debug_sorted_path.display(),
+            e
+        )))?;
+
+    info!(
+    "[{}] copied sorted file to {}",
+    tag,
+    debug_sorted_path.display()
+);
+    let meta = tokio::fs::metadata(&debug_sorted_path).await?;
+    info!(
+    "[{}] debug sorted file size: {} bytes",
+    tag,
+    meta.len()
+);
+
     let rx = parse_bytes::<TokioFile>(sorted_file, config.base_buffer_size)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -2803,6 +2837,14 @@ pub async fn call_hits_m8(
             while let Some(msg) = worker_rx.recv().await {
                 match msg {
                     WorkerMsg::ProcessRead { read_id, hits } => {
+                        debug!(
+                            "[call_hits_m8:{}] worker {} processing read_id={} hits={}",
+                            worker_tag,
+                            worker_idx,
+                            read_id,
+                            hits.len()
+                        );
+
                         let reduced = summarize_m8_hits(
                             0,
                             read_id,
@@ -2843,10 +2885,6 @@ pub async fn call_hits_m8(
 
     // Coordinator: consume the sorted stream, accumulate one read at a time,
     // and dispatch finished read blocks to a shard.
-
-    #[cfg(debug_assertions)]
-    let mut last_seen_read_id: Option<String> = None;
-
     let coordinator_tag = tag.clone();
     let coordinator_handle = tokio::spawn(async move {
         let mut current_read_id: Option<String> = None;
@@ -2855,10 +2893,13 @@ pub async fn call_hits_m8(
         let mut total_reads = 0usize;
         let start = Instant::now();
 
+        #[cfg(debug_assertions)]
+        let mut last_seen_read_id: Option<String> = None;
+
         debug!(
-        "[call_hits_m8:{}] coordinator started (streaming group-by)",
-        coordinator_tag
-    );
+            "[call_hits_m8:{}] coordinator started (streaming group-by)",
+            coordinator_tag
+        );
 
         while let Some(item) = m8_input.next().await {
             let bytes = match item.to_bytes() {
@@ -2887,22 +2928,45 @@ pub async fn call_hits_m8(
                 Err(_) => continue,
             };
 
+            if total_lines == 1 {
+                info!(
+                    "[call_hits_m8:{}] first input line: read_id={} line={}",
+                    coordinator_tag, read_id, line_str
+                );
+            }
+
+            if total_lines % 1_000_000 == 0 {
+                info!(
+                    "[call_hits_m8:{}] coordinator saw {} lines so far (current read_id={})",
+                    coordinator_tag, total_lines, read_id
+                );
+            }
+
             #[cfg(debug_assertions)]
             {
                 if let Some(prev) = &last_seen_read_id {
                     if prev > &read_id {
                         warn!(
-                        "[call_hits_m8:{}] read IDs appear to go backwards: prev={} current={}",
-                        coordinator_tag, prev, read_id
-                    );
+                            "[call_hits_m8:{}] read IDs appear to go backwards: prev={} current={}",
+                            coordinator_tag, prev, read_id
+                        );
                     }
                 }
                 last_seen_read_id = Some(read_id.clone());
             }
 
+            // If the read ID changes, the previous read is complete.
             if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
                 let prev_read_id = current_read_id.take().unwrap();
                 let shard = shard_for_read_id(&prev_read_id, worker_count);
+
+                debug!(
+                    "[call_hits_m8:{}] dispatching read_id={} with {} hits to worker {}",
+                    coordinator_tag,
+                    prev_read_id,
+                    current_hits.len(),
+                    shard
+                );
 
                 worker_txs[shard]
                     .send(WorkerMsg::ProcessRead {
@@ -2922,12 +2986,19 @@ pub async fn call_hits_m8(
             current_hits.push(rec);
         }
 
-        // final flush ...
-
         // Final read.
         if let Some(read_id) = current_read_id {
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
+
+                debug!(
+                    "[call_hits_m8:{}] dispatching final read_id={} with {} hits to worker {}",
+                    coordinator_tag,
+                    read_id,
+                    current_hits.len(),
+                    shard
+                );
+
                 worker_txs[shard]
                     .send(WorkerMsg::ProcessRead {
                         read_id,
@@ -2935,12 +3006,17 @@ pub async fn call_hits_m8(
                     })
                     .await
                     .context("failed to dispatch final read to worker")?;
+
                 total_reads += 1;
             }
         }
 
         // Flush all workers after all reads have been dispatched.
-        for tx in &worker_txs {
+        for (idx, tx) in worker_txs.iter().enumerate() {
+            debug!(
+                "[call_hits_m8:{}] flushing worker {}",
+                coordinator_tag, idx
+            );
             tx.send(WorkerMsg::Flush)
                 .await
                 .context("failed to flush worker")?;
@@ -2953,6 +3029,13 @@ pub async fn call_hits_m8(
             total_reads,
             start.elapsed()
         );
+
+        if total_lines == 0 {
+            warn!(
+                "[call_hits_m8:{}] coordinator saw zero input lines; upstream sort/stream wiring is wrong",
+                coordinator_tag
+            );
+        }
 
         Ok::<(), anyhow::Error>(())
     });
@@ -2979,14 +3062,12 @@ pub async fn call_hits_m8(
     let dedup_file_stream = dedup_branches.remove(0);
 
     let call_file_write_task = write_byte_stream_to_file(
-        &config
-            .out_dir
-            .join(rename_file_path(
-                &sample_base_buf,
-                None,
-                Some(&format!("{}.dedup.m8", tag)),
-                "_",
-            )),
+        &config.out_dir.join(rename_file_path(
+            &sample_base_buf,
+            None,
+            Some(&format!("{}.dedup.m8", tag)),
+            "_",
+        )),
         ReceiverStream::new(dedup_file_stream),
         Some(config.base_buffer_size),
         "call_hits_m8_dedup",
@@ -3015,14 +3096,12 @@ pub async fn call_hits_m8(
     let summary_file_stream = summary_branches.remove(0);
 
     let summary_file_write_task = write_byte_stream_to_file(
-        &config
-            .out_dir
-            .join(rename_file_path(
-                &sample_base_buf,
-                None,
-                Some(&format!("{}.summary.txt", tag)),
-                "_",
-            )),
+        &config.out_dir.join(rename_file_path(
+            &sample_base_buf,
+            None,
+            Some(&format!("{}.summary.txt", tag)),
+            "_",
+        )),
         ReceiverStream::new(summary_file_stream),
         Some(config.base_buffer_size),
         "call_hits_m8_summary",
