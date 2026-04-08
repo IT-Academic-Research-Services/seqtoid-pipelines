@@ -1721,9 +1721,12 @@ pub fn monitor_stream(
 }
 
 
-
-
 /// Guarantees: zero data drops, respects t_junction backpressure, cleanup_receivers untouched.
+///
+/// Speed improvements
+/// - reuses the input batch buffer allocation instead of `std::mem::take`
+/// - reserves space for incoming chunks before extending
+/// - surfaces downstream send failure instead of silently ignoring it
 pub fn batch_rayon_process<F>(
     config: Arc<RunConfig>,
     mut input: ReceiverStream<ParseOutput>,
@@ -1737,54 +1740,107 @@ where
     let (tx, rx) = mpsc::channel(1024);
     let processor = Arc::new(processor);
 
+    // Small helper so we do not duplicate the send loop for the normal batch and final flush.
+    async fn send_lines(
+        tx: &mpsc::Sender<ParseOutput>,
+        lines: Vec<Vec<u8>>,
+        stage_name: &'static str,
+        label: &'static str,
+    ) -> bool {
+        for line in lines {
+            if tx.send(ParseOutput::Bytes(Arc::new(line))).await.is_err() {
+                warn!(
+                    "{}: downstream closed while sending {}",
+                    stage_name, label
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(batch_target_bytes / 4);
+        // Start with the target size, so we are not constantly growing the buffer.
+        let mut buf = Vec::with_capacity(batch_target_bytes.max(1));
         let mut processed = 0u64;
 
         while let Some(item) = input.next().await {
-            if let ParseOutput::Bytes(b) = item {
-                buf.extend_from_slice(&b);
-                if buf.len() >= batch_target_bytes {
-                    let batch = std::mem::take(&mut buf);
-                    let p = processor.clone();
-                    let config_clone = config.clone();
+            let ParseOutput::Bytes(b) = item else {
+                continue;
+            };
 
-                    debug!("{}: starting batch of {} bytes", stage_name, batch.len());
+            // Reserve exactly what we need for this chunk when possible.
+            buf.reserve(b.len());
+            buf.extend_from_slice(&b);
 
-                    let lines = tokio::task::spawn_blocking(move || {
-                        config_clone.thread_pool.install(|| p(batch))
-                    })
-                        .await
-                        .expect("batch_rayon_process panicked");
+            if buf.len() >= batch_target_bytes {
+                // Preserve the allocation already sitting inside `buf`.
+                let mut batch = Vec::with_capacity(buf.len());
+                batch.append(&mut buf);
 
-                    debug!("{}: batch complete — produced {} lines", stage_name, lines.len());
+                let p = Arc::clone(&processor);
+                let config_clone = Arc::clone(&config);
 
-                    let batch_len = lines.len() as u64;
-                    for line in lines {
-                        let _ = tx.send(ParseOutput::Bytes(Arc::new(line))).await;
+                debug!("{}: starting batch of {} bytes", stage_name, batch.len());
+
+                let lines = match tokio::task::spawn_blocking(move || {
+                    config_clone.thread_pool.install(|| p(batch))
+                })
+                    .await
+                {
+                    Ok(lines) => lines,
+                    Err(join_err) => {
+                        error!("{}: batch task panicked: {}", stage_name, join_err);
+                        break;
                     }
-                    processed += batch_len;
-                    if processed % 1_000 == 0 || processed % 100_000 == 0 {
-                        info!("{}: {} items (batch {} bytes)", stage_name, processed, batch_target_bytes);
-                    }
+                };
+
+                debug!(
+                    "{}: batch complete — produced {} lines",
+                    stage_name,
+                    lines.len()
+                );
+
+                let batch_len = lines.len() as u64;
+                if !send_lines(&tx, lines, stage_name, "batch").await {
+                    break;
+                }
+
+                processed += batch_len;
+                if processed % 1_000 == 0 || processed % 100_000 == 0 {
+                    info!(
+                        "{}: {} items (batch target {} bytes)",
+                        stage_name, processed, batch_target_bytes
+                    );
                 }
             }
         }
 
-        // final flush
+        // Final flush.
         if !buf.is_empty() {
-            let config_clone = config.clone();
+            let mut batch = Vec::with_capacity(buf.len());
+            batch.append(&mut buf);
 
-            let lines = tokio::task::spawn_blocking(move || {
-                config_clone.thread_pool.install(|| processor(buf))
+            let config_clone = Arc::clone(&config);
+            let p = Arc::clone(&processor);
+
+            let lines = match tokio::task::spawn_blocking(move || {
+                config_clone.thread_pool.install(|| p(batch))
             })
                 .await
-                .expect("final batch panicked");
+            {
+                Ok(lines) => lines,
+                Err(join_err) => {
+                    error!("{}: final batch task panicked: {}", stage_name, join_err);
+                    return;
+                }
+            };
 
             let batch_len = lines.len() as u64;
-            for line in lines {
-                let _ = tx.send(ParseOutput::Bytes(Arc::new(line))).await;
+            if !send_lines(&tx, lines, stage_name, "final batch").await {
+                return;
             }
+
             processed += batch_len;
         }
 
