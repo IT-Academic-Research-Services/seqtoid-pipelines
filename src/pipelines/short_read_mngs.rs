@@ -92,7 +92,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
                             stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
                             ChannelReader, ChildStream, ParseMode,
-                            ParseOutput, ToBytes, monitor_stream, batch_rayon_process, parse_bytes};
+                            ParseOutput, ToBytes, monitor_stream, batch_rayon_process, parse_bytes, parse_lines};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::system::{detect_ram, compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
@@ -2748,7 +2748,7 @@ pub async fn sort_m8_by_read_id(
     meta.len()
 );
 
-    let rx = parse_bytes::<TokioFile>(sorted_file, config.base_buffer_size)
+    let rx = parse_lines(sorted_file, config.base_buffer_size)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
