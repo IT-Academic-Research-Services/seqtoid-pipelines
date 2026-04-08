@@ -2459,7 +2459,19 @@ pub async fn paf_to_m8(
 
     let conversion_handle = tokio::spawn(async move {
         let mut stream = batched_stream;
+        let mut received_batches = 0usize;
+        let mut total_bytes = 0usize;
+
         while let Some(item) = stream.next().await {
+            received_batches += 1;
+            if let ParseOutput::Bytes(b) = &item {
+                total_bytes += b.len();
+            }
+
+            if received_batches % 10 == 0 {
+                info!("[paf_to_m8] received batch #{} (total ~{} bytes so far)", received_batches, total_bytes);
+            }
+
             if m8_tx.send(item).await.is_err() {
                 error!("[paf_to_m8] downstream m8 channel dropped");
                 return Err(anyhow!("m8 channel send failed"));
@@ -2470,9 +2482,9 @@ pub async fn paf_to_m8(
         let m8_total = m8_counter_final.load(std::sync::atomic::Ordering::Relaxed);
 
         info!(
-            "[paf_to_m8] FINISHED — processed ~{} PAF records → emitted {} m8 lines",
-            paf_total, m8_total
-        );
+        "[paf_to_m8] FINISHED — processed ~{} PAF records → emitted {} m8 lines (received {} batches, {} bytes)",
+        paf_total, m8_total, received_batches, total_bytes
+    );
 
         if m8_total == 0 {
             warn!("[paf_to_m8] ZERO m8 lines produced. This explains why call_hits_m8 sees nothing.");
