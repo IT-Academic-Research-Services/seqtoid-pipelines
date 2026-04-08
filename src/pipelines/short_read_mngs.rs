@@ -2100,6 +2100,11 @@ async fn subsample_uniform(
 /// Alignment of deduped/subsampled stream to a non-host DB (canoncially NT)
 /// for output in PAF format, allowing downstream metagenomic calling.
 ///
+/// - One task per chunk (concurrency already limited by estimation)
+/// - Direct byte streaming from stdout
+///  - Workers fire-and-forget into cleanup_tasks (no blocking here)
+/// - Merged stream returns immediately so paf_to_m8 can start consuming right away
+///
 /// # Arguments
 ///
 /// * `config` - RunConfig struct
@@ -2126,9 +2131,8 @@ pub async fn minimap2_non_host_align(
     let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
     let base_buffer_size = config.base_buffer_size;
-    let channel_buffer = base_buffer_size * 8;
 
-    // 1. Discover NT split .mmi chunks + sort largest-first (unchanged)
+    // 1. Discover NT .mmi chunks
     let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
     let mut chunk_paths: Vec<PathBuf> = Vec::new();
     let mut max_size_bytes: u64 = 0;
@@ -2141,7 +2145,7 @@ pub async fn minimap2_non_host_align(
         let path = entry.path();
         if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
             if let Ok(meta) = path.metadata() {
-                let size: u64 = meta.len();
+                let size = meta.len();
                 if size > max_size_bytes {
                     max_size_bytes = size;
                 }
@@ -2151,21 +2155,16 @@ pub async fn minimap2_non_host_align(
     }
 
     if chunk_paths.is_empty() {
-        return Err(PipelineError::Other(anyhow!(
-            "No .mmi chunk files found in {}",
-            nt_split_dir.display()
-        )));
+        return Err(PipelineError::Other(anyhow!("No NT .mmi chunks found")));
     }
 
-    chunk_paths.sort_by_key(|p| p.metadata().map(|m| m.len()).unwrap_or(0));
+    chunk_paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
 
     let num_chunks = chunk_paths.len();
-    info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
+    info!("Found {} minimap2 NT index chunks", num_chunks);
 
-    // 2. Memory & concurrency estimation — your exact original block (unchanged)
+    // 2. Concurrency estimation (your original block)
     const MEASURED_SINGLE_JOB_GB: f64 = 40.0;
-    const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
-
     const TARGET_RAM_FRACTION: f64 = 0.50;
     const HARD_MAX_CONCURRENCY: usize = 24;
     const MIN_CONCURRENCY: usize = 2;
@@ -2183,163 +2182,109 @@ pub async fn minimap2_non_host_align(
         .min(MEASURED_SINGLE_JOB_GB * 1.15)
         .max(20.0);
 
-    info!(
-        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
-        largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
-    );
-
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
-    let ram_based_concurrency = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
 
-    let mut concurrency = ram_based_concurrency
+    let mut concurrency = ((available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job)
+        .floor() as usize)
         .clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
 
-    let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
-    if estimated_peak_gb > available_ram_gb * 0.75 {
-        let new_conc = concurrency.saturating_sub(2).max(MIN_CONCURRENCY);
-        warn!(
-            "Estimated peak {:.0} GiB exceeds 75% of available ({:.0} GiB) → reducing concurrency from {} to {}",
-            estimated_peak_gb, available_ram_gb, concurrency, new_conc
-        );
-        concurrency = new_conc;
+    if (concurrency as f64 * est_gb_per_job) > available_ram_gb * 0.75 {
+        concurrency = concurrency.saturating_sub(2).max(MIN_CONCURRENCY);
     }
 
     let threads_per_job = (config.max_cores / concurrency)
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
-        concat!(
-            "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
-            "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-            "  single-job baseline: ~{:.0} s real time (measured)\n",
-            "  largest chunk: {:.1} GiB → est/job: {:.0} GiB"
-        ),
-        concurrency,
-        threads_per_job,
-        estimated_peak_gb,
-        (estimated_peak_gb / available_ram_gb * 100.0).round(),
-        MEASURED_SINGLE_JOB_SEC,
-        largest_gb,
-        est_gb_per_job
+        "NT minimap2 stage : {} concurrent jobs × {} threads/job (est peak ~{} GiB)",
+        concurrency, threads_per_job, (concurrency as f64 * est_gb_per_job).round() as usize
     );
 
-    // One merged channel for all workers' PAF output
-    let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
+    // 3. Merged stream
+    let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(base_buffer_size * 8);
+    let merged_tx = Arc::new(merged_tx);
 
-    // Producer: enqueue all chunk jobs
-    let (job_tx, job_rx) = mpsc::channel::<(PathBuf, String)>(concurrency);
-    let producer_handle = tokio::spawn({
-        let chunk_paths = chunk_paths.clone();
-        async move {
-            for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
-                let chunk_name = chunk_mmi
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| format!("chunk_{}", idx));
-                let _ = job_tx.send((chunk_mmi, chunk_name)).await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    });
+    // 4. Workers — line-by-line for perfect PAF line integrity
+    for chunk_mmi in chunk_paths {
+        let chunk_name = chunk_mmi
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    let config_clone = config.clone();
-    let r1_clone = r1_path.clone();
-    let r2_clone = r2_path_opt.clone();
-
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-    let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::with_capacity(concurrency);
-
-    for _ in 0..concurrency {
-        let rx = shared_rx.clone();
-        let config = config_clone.clone();
-        let r1 = r1_clone.clone();
-        let r2 = r2_clone.clone();
         let merged_tx_clone = merged_tx.clone();
+        let config_clone = config.clone();
+        let r1_clone = r1_path.clone();
+        let r2_clone = r2_path_opt.clone();
 
         let handle = tokio::spawn(async move {
-            loop {
-                let job = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
+            let mut minimap2_options = HashMap::new();
+            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
+            minimap2_options.insert("-c".to_string(), None);
+            minimap2_options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-                let Some((chunk_mmi, chunk_name)) = job else { break; };
+            let minimap2_config = Minimap2Config {
+                minimap2_index_path: chunk_mmi,
+                r1_path: Some(r1_clone),
+                r2_path: r2_clone,
+                option_fields: minimap2_options,
+                num_threads: Some(threads_per_job),
+            };
 
-                let mut options = HashMap::new();
-                options.insert("-c".to_string(), None);
-                options.insert("-x".to_string(), Some("sr".to_string()));
-                options.insert("--secondary".to_string(), Some("yes".to_string()));
+            let minimap2_args = generate_cli(MINIMAP2_TAG, &config_clone, Some(&minimap2_config))
+                .map_err(|e| anyhow!("args for {}: {}", chunk_name, e))?;
 
-                let mm_config = Minimap2Config {
-                    minimap2_index_path: chunk_mmi,
-                    r1_path: Some(r1.clone()),
-                    r2_path: r2.clone(),
-                    option_fields: options,
-                    num_threads: Some(threads_per_job),
-                };
+            let (mut child, stderr_task) = spawn_cmd(
+                config_clone.clone(),
+                MINIMAP2_TAG,
+                minimap2_args,
+                config_clone.args.verbose,
+            ).await
+                .map_err(|e| anyhow!("spawn for {} failed: {}", chunk_name, e))?;
 
-                let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
-                    .context("Failed to generate minimap2 args")?;
-
-                info!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
-
-                let (mut child, stderr_task) = spawn_cmd(
-                    config.clone(),
-                    MINIMAP2_TAG,
-                    args,
-                    config.args.verbose,
-                ).await.context("Failed to spawn minimap2")?;
-
-                if let Some(pid) = child.id() {
-                    info!("minimap2 PID for {}: {}", chunk_name, pid);
-                }
-
-                // Direct tokio read — this is what worked when you ran the command manually
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = tokio::io::BufReader::new(stdout);
-                    let mut line = String::new();
-                    let mut lines_sent = 0u64;
-
-                    while reader.read_line(&mut line).await? > 0 {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                            let bytes = (trimmed.to_string() + "\n").into_bytes();
-                            if merged_tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
-                                debug!("[minimap2 {}] downstream closed, stopping forward", chunk_name);
-                                break;
-                            }
-                            lines_sent += 1;
-                            if lines_sent % 100_000 == 0 {
-                                info!("[minimap2 {}] streamed {} PAF lines so far", chunk_name, lines_sent);
-                            }
-                        }
-                        line.clear();
-                    }
-                    info!("[minimap2 {}] finished streaming — sent {} lines", chunk_name, lines_sent);
-                }
-
-                let status = child.wait().await.context("minimap2 wait failed")?;
-                if !status.success() {
-                    warn!("minimap2 for {} exited with status: {}", chunk_name, status);
-                } else {
-                    info!("minimap2 for {} completed successfully", chunk_name);
-                }
-
-                let _ = stderr_task.await;
+            if let Some(pid) = child.id() {
+                info!("minimap2 PID for {}: {}", chunk_name, pid);
             }
+
+            // LINE-BY-LINE streaming — guarantees complete PAF lines
+            if let Some(stdout) = child.stdout.take() {
+                let mut reader = tokio::io::BufReader::new(stdout);
+                let mut line = String::new();
+                let mut lines_sent = 0u64;
+
+                while reader.read_line(&mut line).await? > 0 {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        let mut bytes = trimmed.as_bytes().to_vec();
+                        bytes.push(b'\n');
+                        if merged_tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
+                            break;
+                        }
+                        lines_sent += 1;
+                        if lines_sent % 100_000 == 0 {
+                            info!("[minimap2 {}] streamed {} PAF lines", chunk_name, lines_sent);
+                        }
+                    }
+                    line.clear();
+                }
+                info!("[minimap2 {}] finished streaming — sent {} lines", chunk_name, lines_sent);
+            }
+
+            let status = child.wait().await.context("wait failed")?;
+            if !status.success() {
+                warn!("minimap2 {} exited: {}", chunk_name, status);
+            } else {
+                info!("minimap2 {} completed", chunk_name);
+            }
+
+            let _ = stderr_task.await;
             Ok(())
         });
 
-        worker_handles.push(handle);
+        cleanup_tasks.push(handle);
     }
 
-    // Only wait for the producer
-    producer_handle.await??;
-
-    // Hand all worker tasks to cleanup — do NOT await them here
-    cleanup_tasks.extend(worker_handles);
-
-    info!("[minimap2_non_host_align] Launched {} minimap2 workers — PAF streaming directly to paf_to_m8", num_chunks);
+    info!("[minimap2_non_host_align] Launched {} minimap2 workers — streaming complete PAF lines to paf_to_m8", num_chunks);
 
     Ok((
         ReceiverStream::new(merged_rx),
@@ -2347,6 +2292,8 @@ pub async fn minimap2_non_host_align(
         cleanup_receivers,
     ))
 }
+
+
 
 
 // ────────────────────────────────────────────────────────────────
