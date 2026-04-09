@@ -235,7 +235,7 @@ pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
             if let Ok(line) = std::str::from_utf8(line_bytes) {
                 if let Ok(record) = PafRecord::parse_line(line) {
                     let m8_line = record.to_m8_line(genome_size);
-                    return vec![(m8_line + "\n").into_bytes()];
+                    return vec![m8_line.into_bytes()];
                 }
             }
             vec![]
