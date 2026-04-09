@@ -5968,6 +5968,7 @@ pub async fn blast_contigs(
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
 )> {
+    info!("blast_contigs start you piece of shit");
     use std::time::{Duration, Instant};
 
     let fn_start = Instant::now();
@@ -6112,6 +6113,8 @@ pub async fn blast_contigs(
         db_type, MAKEBLASTDB_TAG
     );
 
+    info!("blast_contigs right before making its stupid worthless db");
+
     let (_, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
         MAKEBLASTDB_TAG,
@@ -6126,6 +6129,7 @@ pub async fn blast_contigs(
     } else {
         BLASTX_TAG
     };
+
 
     let blast_args = if db_type == NT_TAG {
         let blastn_config = BlastnConfig {
@@ -6161,7 +6165,7 @@ pub async fn blast_contigs(
         db_type,
         blast_command
     );
-
+    info!("blast_contigs right before spawing FUCK");
     let blast_spawn_start = Instant::now();
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
@@ -6178,7 +6182,7 @@ pub async fn blast_contigs(
         blast_command,
         blast_spawn_start.elapsed()
     );
-
+    info!("blast_contigs right before output aAAAAAAAAAA");
     let blast_out_stream = parse_child_output(
         &mut blast_child,
         ChildStream::Stdout,
@@ -8216,6 +8220,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let read2contig = assembly_outputs.read2contig.clone();
 
         async move {
+            info!("hey blast_contigs you pile of shit are you starting?");
             blast_contigs(
                 config,
                 NT_TAG,
