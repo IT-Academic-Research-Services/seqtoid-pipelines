@@ -5998,6 +5998,17 @@ pub async fn blast_contigs(
     let refined_counts_path = out_dir.join("refined_counts_with_dcr.json");
     let contig_summary_path = out_dir.join("contig_summary.json");
 
+    info!(
+        "[blast_contigs:{}] output files prepared: blast_m8={}, blast_top_m8={}, refined_m8={}, refined_hit_summary={}, refined_counts={}, contig_summary={}",
+        db_type,
+        blast_m8_path.display(),
+        blast_top_m8_path.display(),
+        refined_m8_path.display(),
+        refined_hit_summary_path.display(),
+        refined_counts_path.display(),
+        contig_summary_path.display()
+    );
+
     let contig_size = file_size(assembled_contig_fasta).await?;
     let ref_size = file_size(reference_fasta).await?;
 
@@ -6062,10 +6073,10 @@ pub async fn blast_contigs(
     )
         .await?;
     info!(
-    "[blast_contigs:{}] temp dir chosen: {}",
-    db_type,
-    temp_dir.path().display()
-);
+        "[blast_contigs:{}] temp dir chosen: {}",
+        db_type,
+        temp_dir.path().display()
+    );
 
     let blastdb_suffix = format!("{}_blastindex", db_type);
     let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
@@ -6090,12 +6101,11 @@ pub async fn blast_contigs(
         option_fields: HashMap::new(),
     };
 
-    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config)).map_err(|e| {
-        PipelineError::ToolExecution {
+    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
+        .map_err(|e| PipelineError::ToolExecution {
             tool: MAKEBLASTDB_TAG.to_string(),
             error: e.to_string(),
-        }
-    })?;
+        })?;
 
     info!(
         "[blast_contigs:{}] launching {}",
@@ -6146,6 +6156,11 @@ pub async fn blast_contigs(
         assembled_contig_fasta.display(),
         blastdb_path.display()
     );
+    info!(
+        "[blast_contigs:{}] blast args prepared for {}",
+        db_type,
+        blast_command
+    );
 
     let blast_spawn_start = Instant::now();
     let (mut blast_child, err_task) = spawn_cmd(
@@ -6156,6 +6171,7 @@ pub async fn blast_contigs(
     )
         .await?;
     cleanup_tasks.push(err_task);
+
     info!(
         "[blast_contigs:{}] {} spawned after {:?}",
         db_type,
@@ -6183,6 +6199,11 @@ pub async fn blast_contigs(
     let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
     let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
 
+    info!(
+        "[blast_contigs:{}] top-hits fanout channels created (1024 each)",
+        db_type
+    );
+
     let top_handle = if db_type == NT_TAG {
         let top_nt_concurrency = compute_phase_concurrency(
             &config,
@@ -6192,7 +6213,11 @@ pub async fn blast_contigs(
             128,
             2,
         );
-        info!("[blast_contigs:{}] NT top_m8 concurrency={}", db_type, top_nt_concurrency);
+        info!(
+            "[blast_contigs:{}] NT top_m8 concurrency={}",
+            db_type,
+            top_nt_concurrency
+        );
 
         let avg_line_bytes = 200;
         let target_batch_mb = if config.available_ram < 64 { 100 } else { 250 };
@@ -6203,7 +6228,11 @@ pub async fn blast_contigs(
             target_batch_mb,
             top_nt_concurrency,
         );
-        info!("[blast_contigs:{}] NT top_m8 batch_size={}", db_type, top_nt_batch_size);
+        info!(
+            "[blast_contigs:{}] NT top_m8 batch_size={}",
+            db_type,
+            top_nt_batch_size
+        );
 
         let top_start = Instant::now();
         tokio::spawn(async move {
@@ -6231,7 +6260,11 @@ pub async fn blast_contigs(
             128,
             2,
         );
-        info!("[blast_contigs:{}] NR top_m8 concurrency={}", db_type, top_nr_concurrency);
+        info!(
+            "[blast_contigs:{}] NR top_m8 concurrency={}",
+            db_type,
+            top_nr_concurrency
+        );
 
         let avg_line_bytes = 200;
         let target_batch_mb = if config.available_ram < 64 { 100 } else { 250 };
@@ -6242,7 +6275,11 @@ pub async fn blast_contigs(
             target_batch_mb,
             top_nr_concurrency,
         );
-        info!("[blast_contigs:{}] NR top_m8 batch_size={}", db_type, top_nr_batch_size);
+        info!(
+            "[blast_contigs:{}] NR top_m8 batch_size={}",
+            db_type,
+            top_nr_batch_size
+        );
 
         let top_start = Instant::now();
         tokio::spawn(async move {
@@ -6268,14 +6305,16 @@ pub async fn blast_contigs(
         let tx_update = top_for_update_tx;
         let tx_caller = top_for_caller_tx;
         async move {
+            let start = Instant::now();
             let mut total = 0usize;
             let mut last_log = Instant::now();
-            let start = Instant::now();
+
+            info!("[blast_contigs:{}] top forward task started", db_type);
 
             while let Some(item) = rx.recv().await {
                 total += 1;
 
-                let send_update_start = Instant::now();
+                let update_send_start = Instant::now();
                 if tx_update.send(item.clone()).await.is_err() {
                     warn!(
                         "[blast_contigs:{}] top forward: update branch dropped at item {} after {:?}",
@@ -6285,9 +6324,9 @@ pub async fn blast_contigs(
                     );
                     break;
                 }
-                let update_wait = send_update_start.elapsed();
+                let update_wait = update_send_start.elapsed();
 
-                let send_caller_start = Instant::now();
+                let caller_send_start = Instant::now();
                 if tx_caller.send(item).await.is_err() {
                     warn!(
                         "[blast_contigs:{}] top forward: caller branch dropped at item {} after {:?}",
@@ -6297,7 +6336,7 @@ pub async fn blast_contigs(
                     );
                     break;
                 }
-                let caller_wait = send_caller_start.elapsed();
+                let caller_wait = caller_send_start.elapsed();
 
                 if update_wait >= Duration::from_millis(50)
                     || caller_wait >= Duration::from_millis(50)
@@ -6321,6 +6360,7 @@ pub async fn blast_contigs(
                 total,
                 start.elapsed()
             );
+
             Ok::<(), anyhow::Error>(())
         }
     });
@@ -6330,6 +6370,11 @@ pub async fn blast_contigs(
     let (read2blastm8_tx, read2blastm8_rx) = mpsc::channel(1024);
     let (updated_tx, updated_rx) = mpsc::channel(1024);
     let (added_tx, added_rx) = mpsc::channel(1024);
+
+    info!(
+        "[blast_contigs:{}] downstream fanout channels created (contig2lineage/read2blastm8/updated/added)",
+        db_type
+    );
 
     let update_handle = tokio::spawn({
         let start = Instant::now();
@@ -6382,7 +6427,7 @@ pub async fn blast_contigs(
                 contig2lineage.insert(contig, [species, genus, family]);
             }
 
-            if total % 50_000 == 0 {
+            if total % 10_000 == 0 {
                 info!(
                     "[blast_contigs:{}] contig2lineage collector progress: {} records after {:?}",
                     db_type,
@@ -6404,6 +6449,11 @@ pub async fn blast_contigs(
 
     let (refined_m8_local_tx, refined_m8_local_rx) = mpsc::channel(2_000_000);
     let (refined_hit_summary_local_tx, refined_hit_summary_local_rx) = mpsc::channel(2_000_000);
+
+    info!(
+        "[blast_contigs:{}] refined local channels created (2,000,000 each)",
+        db_type
+    );
 
     let generate_m8_handle = tokio::spawn({
         let start = Instant::now();
@@ -6436,14 +6486,21 @@ pub async fn blast_contigs(
     let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
     let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
 
+    info!(
+        "[blast_contigs:{}] refined export/count split channels created",
+        db_type
+    );
+
     let m8_forward_handle = tokio::spawn({
         let mut rx = refined_m8_local_rx;
         let out_tx = refined_m8_tx.clone();
         let counts_tx = refined_m8_for_counts_tx.clone();
         async move {
+            let start = Instant::now();
             let mut total = 0usize;
             let mut last_log = Instant::now();
-            let start = Instant::now();
+
+            info!("[blast_contigs:{}] refined m8 forward task started", db_type);
 
             while let Some(item) = rx.recv().await {
                 total += 1;
@@ -6505,9 +6562,11 @@ pub async fn blast_contigs(
         let out_tx = refined_hit_summary_tx.clone();
         let counts_tx = refined_hit_for_counts_tx.clone();
         async move {
+            let start = Instant::now();
             let mut total = 0usize;
             let mut last_log = Instant::now();
-            let start = Instant::now();
+
+            info!("[blast_contigs:{}] refined hit forward task started", db_type);
 
             while let Some(item) = rx.recv().await {
                 total += 1;
@@ -6591,6 +6650,10 @@ pub async fn blast_contigs(
     );
 
     let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
+    info!(
+        "[blast_contigs:{}] refined_counts output channel created",
+        db_type
+    );
 
     let counts_handle = tokio::spawn({
         let start = Instant::now();
@@ -6629,6 +6692,11 @@ pub async fn blast_contigs(
     );
 
     let (contig_summary_tx, contig_summary_rx) = mpsc::channel(1024);
+    info!(
+        "[blast_contigs:{}] contig_summary output channel created",
+        db_type
+    );
+
     let contig_summary_handle = tokio::spawn({
         let start = Instant::now();
         info!("[blast_contigs:{}] generate_contig_summary_json started", db_type);
@@ -6652,6 +6720,11 @@ pub async fn blast_contigs(
             res
         }
     });
+
+    info!(
+        "[blast_contigs:{}] awaiting processing task joins",
+        db_type
+    );
 
     let results = try_join_all(vec![
         top_handle,
@@ -6682,7 +6755,7 @@ pub async fn blast_contigs(
         let count: TaxonCount = serde_json::from_str(&line)?;
         refined_counts.push(count);
 
-        if refined_counts_seen % 50_000 == 0 {
+        if refined_counts_seen % 10_000 == 0 {
             info!(
                 "[blast_contigs:{}] refined_counts decoded {} records",
                 db_type,
@@ -6706,7 +6779,7 @@ pub async fn blast_contigs(
         let entry: ContigSummaryEntry = serde_json::from_str(&line)?;
         contig_summary.push(entry);
 
-        if contig_summary_seen % 50_000 == 0 {
+        if contig_summary_seen % 10_000 == 0 {
             info!(
                 "[blast_contigs:{}] contig_summary decoded {} records",
                 db_type,
@@ -6723,12 +6796,15 @@ pub async fn blast_contigs(
     let final_read_dict = read_dict.lock().unwrap().clone();
 
     info!(
-        "[blast_contigs:{}] DONE after {:?} — refined_counts={}, contig_summary={}, read_dict_size={}",
+        "[blast_contigs:{}] DONE after {:?} — refined_counts={}, contig_summary={}, read_dict_size={}, cleanup_tasks={}, cleanup_receivers={}, temp_files={}",
         db_type,
         fn_start.elapsed(),
         refined_counts.len(),
         contig_summary.len(),
-        final_read_dict.len()
+        final_read_dict.len(),
+        cleanup_tasks.len(),
+        cleanup_receivers.len(),
+        temp_files.len()
     );
 
     Ok((
