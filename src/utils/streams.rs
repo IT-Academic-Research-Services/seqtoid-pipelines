@@ -835,8 +835,10 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
 
     tokio::spawn(async move {
         let mut line = String::new();
+
         loop {
             line.clear();
+
             let bytes_read = match reader.read_line(&mut line).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -844,15 +846,25 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
                     return;
                 }
             };
+
             if bytes_read == 0 {
                 break;
             }
-            let trimmed = line.trim_end().to_string();
-            if !trimmed.is_empty() {
-                if tx.send(ParseOutput::Bytes(Arc::new(trimmed.into_bytes()))).await.is_err() {
-                    error!("Receiver dropped while sending line");
-                    break;
-                }
+
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let bytes = trimmed.as_bytes().to_vec();
+
+            if tx
+                .send(ParseOutput::Bytes(Arc::new(bytes)))
+                .await
+                .is_err()
+            {
+                error!("Receiver dropped while sending line");
+                break;
             }
         }
     });
