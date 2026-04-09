@@ -7126,6 +7126,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
+
+    let nt_call_stream = monitor_stream(
+        ReceiverStream::new(nt_call_stream),
+        "nt_call_stream_to_generate_taxon_counts",
+        Duration::from_secs(15),
+    );
+
+    let nt_blast_stream = monitor_stream(
+        ReceiverStream::new(nt_blast_stream),
+        "nt_blast_stream_to_blast_contigs",
+        Duration::from_secs(15),
+    );
+
     let nt_summary_split_start = Instant::now();
     info!("[run] starting t_junction(nt_call_summary)");
     let (nt_summary_streams, nt_summary_done_rx) = t_junction(
@@ -7222,7 +7235,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             info!("[run] generate_taxon_counts(NT) awaiting nt_call_stream + nt_summary_taxon_stream");
             let res = generate_taxon_counts(
                 config,
-                ReceiverStream::new(nt_call_stream),
+                nt_call_stream,
                 nt_summary_taxon_stream,
                 duplicate_clusters,
                 should_keep_filter,

@@ -1661,75 +1661,126 @@ pub async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyh
 
 
 pub fn monitor_stream(
-    input: ReceiverStream<ParseOutput>,  // Take ReceiverStream as input
+    input: ReceiverStream<ParseOutput>,
     stage_name: &str,
     log_interval: Duration,
-) -> ReceiverStream<ParseOutput> {  // Return ReceiverStream
+) -> ReceiverStream<ParseOutput> {
     let count = Arc::new(AtomicUsize::new(0));
     let stage = stage_name.to_string();
     let count_clone = count.clone();
 
-    // Notify when the stream ends or is dropped.
     let stop_notify = Arc::new(Notify::new());
     let stop_notify_clone = stop_notify.clone();
     let stage_clone = stage.clone();
 
-    // Spawn a separate task for logging to avoid blocking the stream.
     tokio::spawn(async move {
         let mut heartbeat: Interval = interval(log_interval);
         let mut last_count: usize = 0;
+        let start = Instant::now();
+
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
                     let current = count_clone.load(Ordering::Relaxed);
                     let delta = current - last_count;
                     let velocity = (delta as f64) / log_interval.as_secs_f64();
+
                     if delta == 0 {
-                        warn!("{}: Stalled (0 records in last {:?})", stage_clone, log_interval);
+                        warn!(
+                            "{}: Stalled (0 records in last {:?}, total={})",
+                            stage_clone,
+                            log_interval,
+                            current
+                        );
                     } else {
-                        info!("{}: Output velocity: {:.0} records/s ({} total)", stage_clone, velocity, current);
+                        info!(
+                            "{}: Output velocity: {:.0} records/s ({} total, +{} since last tick, elapsed {:?})",
+                            stage_clone,
+                            velocity,
+                            current,
+                            delta,
+                            start.elapsed()
+                        );
                     }
+
                     last_count = current;
                 }
                 _ = stop_notify_clone.notified() => {
-                    debug!("{}: Logging task stopped", stage_clone);
+                    let final_count = count_clone.load(Ordering::Relaxed);
+                    debug!(
+                        "{}: Logging task stopped after {} total records in {:?}",
+                        stage_clone,
+                        final_count,
+                        start.elapsed()
+                    );
                     break;
                 }
             }
         }
     });
 
-    // Create a new channel to forward the monitored data
-    let mut input_receiver = input.into_inner();  // Consume to get Receiver
-    let buf_size = input_receiver.capacity();  // Get buffer size
-    let (forward_tx, forward_rx) = mpsc::channel::<ParseOutput>(buf_size);  // Match buffer size
+    let mut input_receiver = input.into_inner();
+    let buf_size = input_receiver.capacity();
+    let (forward_tx, forward_rx) = mpsc::channel::<ParseOutput>(buf_size);
     let stop_notify_forward = stop_notify.clone();
+    let stage_forward = stage.clone();
+    let count_forward = count.clone();
 
-    // Spawn a forwarding task: Consume input, monitor/count, send to new tx
     tokio::spawn(async move {
         struct DropGuard {
             notify: Arc<Notify>,
         }
+
         impl Drop for DropGuard {
             fn drop(&mut self) {
                 self.notify.notify_one();
             }
         }
-        let _guard = DropGuard { notify: stop_notify };
+
+        let _guard = DropGuard {
+            notify: stop_notify,
+        };
+
+        let mut forwarded = 0usize;
+        let mut last_log = Instant::now();
 
         while let Some(item) = input_receiver.recv().await {
-            count.fetch_add(1, Ordering::Relaxed);
+            count_forward.fetch_add(1, Ordering::Relaxed);
+            forwarded += 1;
+
             if forward_tx.send(item).await.is_err() {
-                warn!("{}: Forward send failed (downstream dropped)", stage);
+                warn!(
+                    "{}: Forward send failed (downstream dropped after {} records)",
+                    stage_forward,
+                    forwarded
+                );
                 break;
             }
+
+            if last_log.elapsed() >= Duration::from_secs(10) {
+                let current = count_forward.load(Ordering::Relaxed);
+                info!(
+                    "{}: forwarded {} records total (receiver total={})",
+                    stage_forward,
+                    forwarded,
+                    current
+                );
+                last_log = Instant::now();
+            }
         }
-        info!("{}: Stream complete ({} total records)", stage, count.load(Ordering::Relaxed));
-        drop(forward_tx);  // Explicitly drop to close downstream
-        stop_notify_forward.notify_one();  // Ensure logging stops
+
+        let final_total = count_forward.load(Ordering::Relaxed);
+        info!(
+            "{}: Stream complete ({} total records)",
+            stage_forward,
+            final_total
+        );
+
+        drop(forward_tx);
+        stop_notify_forward.notify_one();
     });
 
-    ReceiverStream::new(forward_rx)  // Return as ReceiverStream
+    ReceiverStream::new(forward_rx)
 }
 
 
