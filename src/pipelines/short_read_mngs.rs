@@ -7856,7 +7856,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
 
-
     let annot_concurrency = compute_phase_concurrency(
         &config,
         "generate_annotated_fasta",
@@ -7889,8 +7888,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let interleaved_stream = ReceiverStream::new(interleaved_rx);
 
-
-        let (nt_map, nr_map) = tokio::try_join!(
+    // Build the small accession maps for NT/NR in parallel
+    let (nt_map, nr_map) = tokio::try_join!(
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
             nt_initial_stream
@@ -7901,13 +7900,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         )
     )?;
 
+    // Generate the annotated FASTA stream
     let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) =
         generate_annotated_fasta_stream(
             config.clone(),
             interleaved_stream,
             duplicate_clusters.clone(),
             nt_map,                     // small contig → NT accession map
-            nr_map,                     // small  contig → NR accession map
+            nr_map,                     // small contig → NR accession map
             annot_concurrency,
         )
             .await
@@ -7916,60 +7916,65 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
 
-
     let assembly_dir = out_dir.join("assembly");
 
     let annotated_path = assembly_dir.join("annotated_merged.fa");
     let unidentified_path = assembly_dir.join("unidentified.fa");
     let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
 
+    // ────────────────────────────────────────────────────────────────
+    // FINAL fanout_to_channels (the last two old t_junctions are gone)
+    // ────────────────────────────────────────────────────────────────
+    info!("[run] starting fanout_to_channels for annotated FASTA (2 private channels)");
 
-    let (initial_annotated_streams, initial_annotated_done_rx) = t_junction(
+    let (annotated_rxs, annotated_router) = fanout_to_channels(
         ReceiverStream::new(annotated_rx),
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nr_annotated_summary".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(initial_annotated_done_rx);
-    let mut initial_annotated_streams_iter = initial_annotated_streams.into_iter();
-    let initial_annotated_file_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_annotated_taxon_stream = initial_annotated_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+        config.base_buffer_size * 64,
+        "initial_annotated",
+    ).await?;
 
+    cleanup_tasks.push(annotated_router);
 
-    let (initial_unidentified_streams, initial_unidentified_done_rx) = t_junction(
+    let mut annotated_rxs_iter = annotated_rxs.into_iter();
+    let initial_annotated_file_stream = annotated_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_annotated_taxon_stream = annotated_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let (unidentified_rxs, unidentified_router) = fanout_to_channels(
         ReceiverStream::new(unidentified_rx),
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nr_unidentified_summary".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(initial_unidentified_done_rx);
-    let mut initial_unidentified_streams_iter = initial_unidentified_streams.into_iter();
-    let initial_unidentified_file_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_unidentified_taxon_stream = initial_unidentified_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+        config.base_buffer_size * 64,
+        "initial_unidentified",
+    ).await?;
 
+    cleanup_tasks.push(unidentified_router);
 
-    cleanup_tasks.push(write_fasta_stream_to_file(
+    let mut unidentified_rxs_iter = unidentified_rxs.into_iter();
+    let initial_unidentified_file_stream = unidentified_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_unidentified_taxon_stream = unidentified_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // Add monitors so you can actually see progress (no more 30-minute silences)
+    let initial_annotated_file_stream = monitor_stream(
         ReceiverStream::new(initial_annotated_file_stream),
+        "initial_annotated_file_stream_to_write",
+        Duration::from_secs(15),
+    );
+
+    let initial_unidentified_file_stream = monitor_stream(
+        ReceiverStream::new(initial_unidentified_file_stream),
+        "initial_unidentified_file_stream_to_write",
+        Duration::from_secs(15),
+    );
+
+    // Write tasks are now eager consumers → EOF propagates instantly
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        initial_annotated_file_stream,
         annotated_path.clone(),
         config.base_buffer_size,
     ));
 
     cleanup_tasks.push(write_fasta_stream_to_file(
-        ReceiverStream::new(initial_unidentified_file_stream),
+        initial_unidentified_file_stream,
         unidentified_path.clone(),
         config.base_buffer_size,
     ));
@@ -7980,7 +7985,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.base_buffer_size,
     ));
 
-
+    info!("[run] annotated FASTA wiring complete (fanout_to_channels used everywhere)");
     // *******************
     // Post-processing
     // *******************
