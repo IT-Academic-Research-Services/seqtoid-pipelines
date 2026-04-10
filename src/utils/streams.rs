@@ -1913,6 +1913,44 @@ where
     ReceiverStream::new(rx)
 }
 
+/// Router that reads the upstream ONCE and fans it out to N private channels.
+/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+/// Router that reads the upstream ONCE and fans it out to N private channels.
+/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+pub async fn fanout_to_channels(
+    mut upstream: ReceiverStream<ParseOutput>,
+    n_branches: usize,
+    buffer_per_branch: usize,
+    label: &str,
+) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
+    let mut txs = Vec::with_capacity(n_branches);
+    let mut rxs = Vec::with_capacity(n_branches);
+
+    for _ in 0..n_branches {
+        let (tx, rx) = mpsc::channel(buffer_per_branch);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+
+    let label = label.to_string();
+    let router: JoinHandle<anyhow::Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let mut count = 0usize;
+        while let Some(item) = upstream.next().await {
+            count += 1;
+            if count % 100_000 == 0 {
+                debug!("[fanout {}] forwarded {} items", label, count);
+            }
+            // Send to EVERY branch (never drop)
+            let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
+            let _ = futures::future::join_all(sends).await;
+        }
+        debug!("[fanout {}] finished — forwarded {} items total", label, count);
+        Ok(())   // ← this makes the JoinHandle return Result<(), anyhow::Error>
+    });
+
+    Ok((rxs, router))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

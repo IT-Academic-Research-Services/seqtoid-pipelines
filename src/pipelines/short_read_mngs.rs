@@ -92,7 +92,7 @@ use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_f
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
                             stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
                             ChannelReader, ChildStream, ParseMode,
-                            ParseOutput, ToBytes, monitor_stream, batch_rayon_process, parse_bytes, parse_lines};
+                            ParseOutput, ToBytes, monitor_stream, batch_rayon_process, parse_bytes, parse_lines, fanout_to_channels};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::system::{detect_ram, compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
@@ -7557,7 +7557,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("call hits nt concurrency {}", nt_concurrency);
 
     let nt_call_hits_start = Instant::now();
-    let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
+    let (nt_call_stream, nt_call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
         config.clone(),
         m8_sorted,                    // ←←← NOW SORTED
         sample_base_buf.clone(),
@@ -7578,86 +7578,76 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("[run] wrapping NT outputs with monitor_stream");
 
-    let call_stream = monitor_stream(
-        call_stream,
+    let nt_call_stream = monitor_stream(
+        nt_call_stream,
         "nt_call_stream_from_call_hits_m8",
         Duration::from_secs(10),
     );
 
-    let call_summary_stream = monitor_stream(
-        call_summary_stream,
+    let nt_call_summary_stream = monitor_stream(
+        nt_call_summary_stream,
         "nt_call_summary_stream_from_call_hits_m8",
         Duration::from_secs(10),
     );
 
     let nt_split_start = Instant::now();
-    info!("[run] starting t_junction(nt_call)");
-    let (nt_streams, nt_done_rx) = t_junction(
-        call_stream,
-        2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nt_call".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    info!(
-        "[run] t_junction(nt_call) returned after {:?} with {} branches",
-        nt_split_start.elapsed(),
-        nt_streams.len()
-    );
-    cleanup_receivers.push(nt_done_rx);
+    info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
 
-    let mut nt_streams_iter = nt_streams.into_iter();
-    let nt_call_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_blast_stream = nt_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let (nt_call_rxs, nt_call_router) = fanout_to_channels(
+        nt_call_stream,                    // already the monitored stream from call_hits_m8
+        2,
+        config.base_buffer_size * 48,      // generous buffer for m8 lines
+        "nt_call",
+    ).await?;
+
+    cleanup_tasks.push(nt_call_router);    // router returns the correct JoinHandle type
+
+    info!(
+        "[run] fanout_to_channels(nt_call) ready after {:?} with 2 private channels",
+        nt_split_start.elapsed()
+    );
+
+    let mut nt_call_rxs_iter = nt_call_rxs.into_iter();
+    let nt_call_stream = ReceiverStream::new(nt_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nt_blast_stream = ReceiverStream::new(nt_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
 
 
     let nt_call_stream = monitor_stream(
-        ReceiverStream::new(nt_call_stream),
+        nt_call_stream,
         "nt_call_stream_to_generate_taxon_counts",
         Duration::from_secs(15),
     );
 
     let nt_blast_stream = monitor_stream(
-        ReceiverStream::new(nt_blast_stream),
+        nt_blast_stream,
         "nt_blast_stream_to_blast_contigs",
         Duration::from_secs(15),
     );
 
     let nt_summary_split_start = Instant::now();
-    info!("[run] starting t_junction(nt_call_summary)");
-    let (nt_summary_streams, nt_summary_done_rx) = t_junction(
-        call_summary_stream,
-        6,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nt_call_summary".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    info!(
-        "[run] t_junction(nt_call_summary) returned after {:?} with {} branches",
-        nt_summary_split_start.elapsed(),
-        nt_summary_streams.len()
-    );
-    cleanup_receivers.push(nt_summary_done_rx);
+    info!("[run] starting fanout_to_channels for NT summary (6 private channels)");
 
-    let mut nt_summary_streams_iter = nt_summary_streams.into_iter();
-    let nt_summary_taxon_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_summary_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_initial_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_blast_hit_stream = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_hit_summary_for_refined = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nt_hit_summary_for_taxid = nt_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let (nt_summary_rxs, nt_summary_router) = fanout_to_channels(
+        nt_call_summary_stream,
+        6,
+        config.base_buffer_size * 64,           // generous per-branch buffer
+        "nt_call_summary",
+    ).await?;
+
+    cleanup_tasks.push(nt_summary_router);     // now the correct type
+
+    info!(
+        "[run] fanout_to_channels(nt_call_summary) ready after {:?} with 6 private channels",
+        nt_summary_split_start.elapsed()
+    );
+
+    let mut nt_summary_rxs_iter = nt_summary_rxs.into_iter();
+    let nt_summary_taxon_stream       = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nt_summary_hit_stream         = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nt_initial_stream             = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nt_blast_hit_stream           = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nt_hit_summary_for_refined    = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nt_hit_summary_for_taxid      = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
 
     info!("[run] NT split wiring complete");
     info!("[run] nt_summary_taxon_stream -> generate_taxon_counts");
@@ -7666,25 +7656,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("[run] nt_blast_hit_stream -> blast_contigs");
 
     let nt_summary_taxon_stream = monitor_stream(
-        ReceiverStream::new(nt_summary_taxon_stream),
+        nt_summary_taxon_stream,
         "nt_summary_taxon_stream_to_generate_taxon_counts",
         Duration::from_secs(10),
     );
 
     let nt_summary_hit_stream = monitor_stream(
-        ReceiverStream::new(nt_summary_hit_stream),
+        nt_summary_hit_stream,
         "nt_summary_hit_stream_to_summarize_hits",
         Duration::from_secs(10),
     );
 
     let nt_initial_stream = monitor_stream(
-        ReceiverStream::new(nt_initial_stream),
+        nt_initial_stream,
         "nt_initial_stream_to_initial_taxid_fasta",
         Duration::from_secs(15),
     );
 
     let nt_blast_hit_stream = monitor_stream(
-        ReceiverStream::new(nt_blast_hit_stream),
+        nt_blast_hit_stream,
         "nt_blast_hit_stream_to_blast_contigs",
         Duration::from_secs(15),
     );
@@ -7796,53 +7786,54 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
-    let (nr_streams, nr_done_rx) = t_junction(
-        nr_call_stream,
+    let nr_split_start = Instant::now();
+    info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
+
+    let (nr_call_rxs, nr_call_router) = fanout_to_channels(
+        nr_call_stream,                    // already the monitored stream from call_hits_m8
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "nr_call".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(nr_done_rx);
+        config.base_buffer_size * 48,      // generous buffer for m8 lines
+        "nr_call",
+    ).await?;
 
-    let mut nr_streams_iter = nr_streams.into_iter();
-    let nr_call_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_blast_stream = nr_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    cleanup_tasks.push(nr_call_router);    // router returns the correct JoinHandle type
 
+    info!(
+    "[run] fanout_to_channels(nr_call) ready after {:?} with 2 private channels",
+    nr_split_start.elapsed()
+);
 
-    let (nr_summary_streams, nr_summary_done_rx) = t_junction(
+    let mut nr_call_rxs_iter = nr_call_rxs.into_iter();
+    let nr_call_stream = ReceiverStream::new(nr_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_blast_stream = ReceiverStream::new(nr_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+
+    let nr_summary_split_start = Instant::now();
+    info!("[run] starting fanout_to_channels for NR summary (6 private channels)");
+    let (nr_summary_rxs, nr_summary_router) = fanout_to_channels(
         nr_call_summary_stream,
         6,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "nr_call_summary".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(nr_summary_done_rx);
+        config.base_buffer_size * 64,           // generous per-branch buffer
+        "nr_call_summary",
+    ).await?;
 
-    let mut nr_summary_streams_iter = nr_summary_streams.into_iter();
-    let nr_summary_taxon_stream = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_summary_hit_stream   = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_initial_stream       = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_blast_hit_stream     = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_hit_summary_for_refined = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let nr_hit_summary_for_taxid    = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    cleanup_tasks.push(nr_summary_router);     // now the correct type
 
+    info!(
+     "[run] fanout_to_channels(nr_call_summary) ready after {:?} with 6 private channels",
+     nr_summary_split_start.elapsed()
+ );
+
+    let mut nr_summary_rxs_iter = nr_summary_rxs.into_iter();
+    let nr_summary_taxon_stream       = ReceiverStream::new(nr_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_summary_hit_stream         = ReceiverStream::new(nr_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_initial_stream             = ReceiverStream::new(nr_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_blast_hit_stream           = ReceiverStream::new(nr_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_hit_summary_for_refined    = ReceiverStream::new(nr_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_hit_summary_for_taxid      = ReceiverStream::new(nr_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(
         config.clone(),
-        ReceiverStream::new(nr_summary_hit_stream),
+        nr_summary_hit_stream,
         duplicate_clusters.clone(),
         0,
     ));
@@ -7854,8 +7845,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         async move {
             generate_taxon_counts(
                 config, // RunConfig
-                ReceiverStream::new(nr_call_stream), //m8_stream
-                ReceiverStream::new(nr_summary_taxon_stream), //summary_stream
+                nr_call_stream, //m8_stream
+                nr_summary_taxon_stream, //summary_stream
                 duplicate_clusters, //duplicate_clusters
                 should_keep_filter, //should_keep_filter
                 "NR".to_string(), // count_type
@@ -7903,7 +7894,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ),
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            ReceiverStream::new(nr_initial_stream)
+            nr_initial_stream
         )
     )?;
 
@@ -8244,8 +8235,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             blast_contigs(
                 config,
                 NR_TAG,
-                ReceiverStream::new(nr_blast_stream),
-                ReceiverStream::new(nr_blast_hit_stream),
+                nr_blast_stream,
+                nr_blast_hit_stream,
                 nr_read_dict.clone(),
                 nr_accession_dict,
                 nr_counts,
@@ -8543,11 +8534,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nt_refined_map, nr_refined_map) = tokio::try_join!(
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            ReceiverStream::new(nt_hit_summary_for_refined)
+            nt_hit_summary_for_refined
         ),
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            ReceiverStream::new(nr_hit_summary_for_refined)
+            nr_hit_summary_for_refined
         )
     )?;
 
@@ -8691,8 +8682,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         ReceiverStream::new(initial_annotated_taxon_stream),
         ReceiverStream::new(initial_unidentified_taxon_stream),
-        ReceiverStream::new(nt_hit_summary_for_taxid),
-        ReceiverStream::new(nr_hit_summary_for_taxid),
+        nt_hit_summary_for_taxid,
+        nr_hit_summary_for_taxid,
         lineage_map.clone(),
     )
         .await
