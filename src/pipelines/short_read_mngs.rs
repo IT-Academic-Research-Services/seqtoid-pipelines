@@ -7770,6 +7770,83 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
+
+    let nt_file = config
+        .args
+        .nt
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT file required for fasta extraction".into(),
+        ))?;
+
+    let nt_offset_db_file = config
+        .args
+        .nt_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NT offset DB file required for fasta extraction".into(),
+        ))?;
+
+
+    let nr_file = config
+        .args
+        .nr
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR file required for fasta extraction".into(),
+        ))?;
+
+    let nr_offset_db_file = config
+        .args
+        .nr_offset_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "NR offset DB file required for fasta extraction".into(),
+        ))?;
+
+
+
+    let nt_prep_handle = tokio::spawn({
+        let config = config.clone();
+        let nt_file = nt_file.clone();
+        let nt_offset_db_file = nt_offset_db_file.clone();
+        async move {
+            info!("[NT prep] waiting for hit_summary_handle...");
+            let (
+                nt_read_dict_map,
+                nt_accession_dict_noarc,
+                nt_selected_genera,
+                _nt_total_reads,
+            ) = nt_hit_summary_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
+                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
+
+            info!("[NT prep] hit_summary_handle finished! Starting build_reference_fasta...");
+
+            let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
+                config.clone(),
+                &nt_selected_genera,
+                NT_TAG,
+                &PathBuf::from(nt_file),
+                &PathBuf::from(nt_offset_db_file),
+            )
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+
+            info!("[NT prep] build_reference_fasta finished! Sending oneshot...");
+
+            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
+                nt_read_dict_map,
+                Arc::new(nt_accession_dict_noarc),
+                nt_ref_fasta_path,
+                nt_ref_fasta_temp_dir,
+            ))
+        }
+    });
+
+
+
     let (nt_prep_tx, nt_prep_rx) = oneshot::channel::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf)>();
     let (nt_assembly_tx, nt_assembly_rx) = oneshot::channel::<CoverageOutputs>();
     let (nt_counts_tx, nt_counts_rx) = oneshot::channel::<Vec<TaxonCount>>();
@@ -7996,6 +8073,45 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 "NR".to_string(), // count_type
                 None, //source_count type, only relevantif/when i later implement the merged path (NT + NR together) pass Some("NT".to_string()) or Some("NR".to_string()) on the respective streams.
             ).await
+        }
+    });
+
+    let nr_prep_handle = tokio::spawn({
+        let config = config.clone();
+        let nr_file = nr_file.clone();
+        let nr_offset_db_file = nr_offset_db_file.clone();
+        async move {
+            info!("[NR prep] waiting for hit_summary_handle...");
+            let (
+                nr_read_dict_map,
+                nr_accession_dict_noarc,
+                nr_selected_genera,
+                _nr_total_reads,
+            ) = nr_hit_summary_handle
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
+                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
+
+            info!("[NR prep] hit_summary_handle finished! Starting build_reference_fasta...");
+
+            let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
+                config.clone(),
+                &nr_selected_genera,
+                NR_TAG,
+                &PathBuf::from(nr_file),
+                &PathBuf::from(nr_offset_db_file),
+            )
+                .await
+                .map_err(|e| PipelineError::Other(e.into()))?;
+
+            info!("[NR prep] build_reference_fasta finished! Sending oneshot...");
+
+            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
+                nr_read_dict_map,
+                Arc::new(nr_accession_dict_noarc),
+                nr_ref_fasta_path,
+                nr_ref_fasta_temp_dir,
+            ))
         }
     });
 
@@ -8271,111 +8387,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     eprintln!("coverage result {:?}", generate_assembly_coverage_result);
 
 
-    let nt_file = config
-        .args
-        .nt
-        .clone()
-        .ok_or(PipelineError::MissingArgument(
-            "NT file required for fasta extraction".into(),
-        ))?;
-
-    let nt_offset_db_file = config
-        .args
-        .nt_offset_db
-        .clone()
-        .ok_or(PipelineError::MissingArgument(
-            "NT offset DB file required for fasta extraction".into(),
-        ))?;
 
 
-    let nr_file = config
-        .args
-        .nr
-        .clone()
-        .ok_or(PipelineError::MissingArgument(
-            "NR file required for fasta extraction".into(),
-        ))?;
-
-    let nr_offset_db_file = config
-        .args
-        .nr_offset_db
-        .clone()
-        .ok_or(PipelineError::MissingArgument(
-            "NR offset DB file required for fasta extraction".into(),
-        ))?;
-
-
-    // Blast contigs
-    // NT and NR prep in parallel
-    let nt_prep_handle = tokio::spawn({
-        let config = config.clone();
-        let nt_file = nt_file.clone();
-        let nt_offset_db_file = nt_offset_db_file.clone();
-        async move {
-            info!("[NT prep] waiting for hit_summary_handle...");
-            let (
-                nt_read_dict_map,
-                nt_accession_dict_noarc,
-                nt_selected_genera,
-                _nt_total_reads,
-            ) = nt_hit_summary_handle
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
-                .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
-            info!("[NT prep] hit_summary_handle finished! Starting build_reference_fasta...");
-            let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
-                config.clone(),
-                &nt_selected_genera,
-                NT_TAG,
-                &PathBuf::from(nt_file),
-                &PathBuf::from(nt_offset_db_file),
-            )
-                .await
-                .map_err(|e| PipelineError::Other(e.into()))?;
-            info!("[NT prep] build_reference_fasta finished! Sending oneshot...");
-            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
-                nt_read_dict_map,
-                Arc::new(nt_accession_dict_noarc),
-                nt_ref_fasta_path,
-                nt_ref_fasta_temp_dir,
-            ))
-        }
-    });
-
-    let nr_prep_handle = tokio::spawn({
-        let config = config.clone();
-        let nr_file = nr_file.clone();
-        let nr_offset_db_file = nr_offset_db_file.clone();
-        async move {
-            info!("[NR prep] waiting for hit_summary_handle...");
-            let (
-                nr_read_dict_map,
-                nr_accession_dict_noarc,
-                nr_selected_genera,
-                _nr_total_reads,
-            ) = nr_hit_summary_handle
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
-                .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
-            info!("[NR prep] hit_summary_handle finished! Starting build_reference_fasta...");
-            let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
-                config.clone(),
-                &nr_selected_genera,
-                NR_TAG,
-                &PathBuf::from(nr_file),
-                &PathBuf::from(nr_offset_db_file),
-            )
-                .await
-                .map_err(|e| PipelineError::Other(e.into()))?;
-            info!("[NR prep] build_reference_fasta finished! Sending oneshot...");
-            Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
-                nr_read_dict_map,
-                Arc::new(nr_accession_dict_noarc),
-                nr_ref_fasta_path,
-                nr_ref_fasta_temp_dir,
-            ))
-        }
-    });
 
     let (nt_prep_res, nr_prep_res) = tokio::try_join!(nt_prep_handle, nr_prep_handle)
         .map_err(|e| PipelineError::Other(anyhow!("Reference prep task panicked: {e}")))?;
