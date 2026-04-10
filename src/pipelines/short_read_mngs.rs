@@ -8594,25 +8594,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(taxid_main_task);
 
 
-    let (taxid_mapped_streams, taxid_mapped_rx) = t_junction(
+    let (taxid_mapped_rxs, taxid_mapped_router) = fanout_to_channels(
         ReceiverStream::new(taxid_mapped_rx),
-        3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "taxid_mapped".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(taxid_mapped_rx);
+        2,
+        config.base_buffer_size * 64,
+        "taxid_mapped",
+    ).await?;
+    cleanup_tasks.push(taxid_mapped_router);
 
-    let mut taxid_mapped_streams_iter = taxid_mapped_streams.into_iter();
-    let taxid_mapped_file = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let taxid_mapped_locator = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let taxid_mapped_nonhost = taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mut taxid_mapped_iter = taxid_mapped_rxs.into_iter();
+    let taxid_mapped_file   = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let taxid_mapped_locator = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
     let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
