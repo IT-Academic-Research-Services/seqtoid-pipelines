@@ -23,6 +23,7 @@ use crate::utils::fastx::{SequenceRecord, r1r2_base};
 use crate::config::defs::{RunConfig, PipelineError};
 use sysinfo::{Disks, DiskUsage};
 use nix::sys::statvfs;
+use regex::Regex;
 
 
 
@@ -504,59 +505,107 @@ pub async fn write_parse_output_to_file(
     Ok(task)
 }
 
+fn resolve_existing_input_path(input: &str, cwd: &Path) -> Result<PathBuf, PipelineError> {
+    let resolved = resolve_to_absolute(input, cwd);
+
+    if !resolved.exists() {
+        return Err(PipelineError::FileNotFound(resolved));
+    }
+    if !resolved.is_file() {
+        return Err(PipelineError::InvalidConfig(format!(
+            "Not a file: {}",
+            resolved.display()
+        )));
+    }
+
+    Ok(resolved)
+}
+
+fn basename_without_extensions(path: &Path) -> Result<String, PipelineError> {
+    let (stem, _) = extension_remover(path);
+    stem.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            PipelineError::InvalidConfig(format!(
+                "Could not derive basename from {}",
+                path.display()
+            ))
+        })
+}
+
+fn strip_common_read_suffixes(base: &str) -> String {
+    // Ordered from most specific to least specific.
+    // This covers common Illumina / SRA-like layouts:
+    //   sample_S1_L001_R1_001
+    //   sample_L001_R1_001
+    //   sample_R1_001
+    //   sample_R1
+    //   sample_1
+    //   sample.1
+    //   sample-1
+    let patterns = [
+        r"(?i)^(?P<base>.+?)[._-]S\d+[._-]L\d{3}[._-]R[12][._-]\d{3}$",
+        r"(?i)^(?P<base>.+?)[._-]L\d{3}[._-]R[12][._-]\d{3}$",
+        r"(?i)^(?P<base>.+?)[._-]R[12][._-]\d{3}$",
+        r"(?i)^(?P<base>.+?)[._-]R?[12]$",
+    ];
+
+    for pat in patterns {
+        let re = Regex::new(pat).expect("valid mate-suffix regex");
+        if let Some(caps) = re.captures(base) {
+            return caps
+                .name("base")
+                .map(|m| m.as_str().trim_end_matches(&['_', '-', '.'][..]).to_string())
+                .unwrap_or_else(|| base.to_string());
+        }
+    }
+
+    base.to_string()
+}
+
+fn derive_sample_base_from_file1(file1_path: &Path) -> Result<PathBuf, PipelineError> {
+    let basename = basename_without_extensions(file1_path)?;
+    let stripped = strip_common_read_suffixes(&basename);
+    Ok(PathBuf::from(stripped))
+}
+
 pub async fn validate_file_inputs(
     config: &RunConfig,
     cwd: &PathBuf,
 ) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
-    // Resolve and validate file1 (required)
-    let file1_path: PathBuf = match &config.args.file1 {
-        Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
-            if file1_full_path.exists() {
-                file1_full_path
-            } else {
-                return Err(PipelineError::FileNotFound(file1_full_path));
-            }
-        }
-        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
-    };
-
-    // Compute sample_base (same as before)
-    let sample_base: String;
-    let file1_r1r2 = r1r2_base(&file1_path);
-    sample_base = match file1_r1r2.prefix {
-        Some(prefix) => prefix,
+    let file1_path = match &config.args.file1 {
+        Some(file) => resolve_existing_input_path(file, cwd)?,
         None => {
-            info!("No R1 tag found. Using bare file 1 stem as sample_base.");
-            file1_path.to_string_lossy().into_owned()
+            return Err(PipelineError::InvalidConfig(
+                "File1 path required".to_string(),
+            ))
         }
     };
 
-    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
-    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-
-    // Validate file1 exists (redundant but kept for safety)
-    if !file1_path.exists() {
-        return Err(PipelineError::FileNotFound(file1_path));
-    }
-
-    // Resolve and validate file2 (optional)
-    let file2_path: Option<PathBuf> = match &config.args.file2 {
+    let file2_path = match &config.args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
-            if file2_full_path.exists() {
-                Some(file2_full_path)
-            } else {
-                error!("File2 path does not exist: {}", file2_full_path.display());
-                None
-            }
+            let resolved = resolve_existing_input_path(file, cwd)?;
+            Some(resolved)
         }
         None => None,
     };
-    
 
-    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base))
+    let sample_base_buf = derive_sample_base_from_file1(&file1_path)?;
+    let sample_base = sample_base_buf.to_string_lossy().into_owned();
+
+    if let Some(ref file2) = file2_path {
+        let file2_base = derive_sample_base_from_file1(file2)?;
+        if file2_base != sample_base_buf {
+            warn!(
+                "file1/file2 sample bases do not match: '{}' vs '{}'",
+                sample_base_buf.display(),
+                file2_base.display()
+            );
+        }
+    }
+
+    Ok((file1_path, file2_path, sample_base_buf, sample_base))
 }
 
 
@@ -573,51 +622,84 @@ pub async fn write_byte_stream_to_file(
     output_path: &PathBuf,
     mut input_stream: ReceiverStream<ParseOutput>,
     buffer_size: Option<usize>,
+    tag: &str,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
     let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
     let output_path_clone = output_path.clone();
+    let tag = tag.to_string();
 
     let task = tokio::spawn(async move {
+        debug!("[{}] writer: START {}", tag, output_path_clone.display());
+
         let file = TokioFile::create(&output_path_clone)
             .await
             .map_err(|e| anyhow!("Failed to create output file at {}: {}",
                                output_path_clone.display(), e))?;
+
         let mut writer = BufWriter::with_capacity(buffer_capacity, file);
         let mut stream = input_stream;
+
         let mut total_bytes = 0u64;
+        let mut item_count = 0usize;
+        let mut first = true;
 
         while let Some(item) = stream.next().await {
             match item {
                 ParseOutput::Bytes(bytes) => {
+                    if first {
+                        debug!("[{}] writer: FIRST CHUNK ({} bytes)", tag, bytes.len());
+                        first = false;
+                    }
+
                     writer.write_all(&bytes)
                         .await
                         .map_err(|e| anyhow!("Failed to write to {}: {}",
                                            output_path_clone.display(), e))?;
+
                     total_bytes += bytes.len() as u64;
+                    item_count += 1;
+
+                    if item_count % 50_000 == 0 {
+                        debug!(
+                            "[{}] writer: progress {} items, {} bytes",
+                            tag,
+                            item_count,
+                            total_bytes
+                        );
+                    }
                 }
                 _ => {
-                    // Log unexpected non-Bytes items but continue
-                    warn!("write_byte_stream_to_file: Skipping non-Bytes item for {}",
-                              output_path_clone.display());
+                    warn!(
+                        "[{}] writer: Skipping non-Bytes item for {}",
+                        tag,
+                        output_path_clone.display()
+                    );
                 }
             }
         }
+
+        debug!("[{}] writer: STREAM CLOSED after {} items", tag, item_count);
 
         writer.flush()
             .await
             .map_err(|e| anyhow!("Failed to flush {}: {}",
                                output_path_clone.display(), e))?;
+
         writer.shutdown()
             .await
             .map_err(|e| anyhow!("Failed to shutdown {}: {}",
                                output_path_clone.display(), e))?;
 
         if total_bytes == 0 {
-            warn!("No bytes written to file at {}", output_path_clone.display());
+            warn!("[{}] writer: No bytes written to {}", tag, output_path_clone.display());
         }
 
-        debug!("write_byte_stream_to_file: Wrote {} bytes to {}",
-                  total_bytes, output_path_clone.display());
+        debug!(
+            "[{}] writer: DONE {} bytes ({} items)",
+            tag,
+            total_bytes,
+            item_count
+        );
 
         Ok(())
     });

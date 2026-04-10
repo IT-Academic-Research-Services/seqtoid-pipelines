@@ -5,7 +5,7 @@ use log::{self, LevelFilter, debug, info, error, warn};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -2170,6 +2170,94 @@ pub mod blastx {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// GNU sort
+// ────────────────────────────────────────────────────────────────
+pub mod sort {
+    use std::collections::HashMap;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::{RunConfig, PipelineError};
+    use crate::utils::command::{ArgGenerator, version_check};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct SortConfig {
+        pub key: String,                    // e.g. "-k1,1"
+        pub parallel: Option<usize>,
+        pub buffer_size: Option<String>,    // e.g. "50%"
+        pub temp_dir: Option<String>,       // -T /path
+        pub output: Option<String>,         // -o sorted.m8
+        pub extra_fields: HashMap<String, Option<String>>,
+        pub input: Option<String>,
+    }
+
+    pub struct SortArgGenerator;
+
+    pub async fn sort_presence_check() -> Result<f32> {
+        // GNU sort doesn't have a clean --version that always works the same way,
+        // but "sort --version" is reliable on all modern coreutils.
+        let version = version_check("sort", vec!["--version"], 0, 1, ChildStream::Stdout, None).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for SortArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<SortConfig>())
+                .ok_or_else(|| anyhow!("sort requires a SortConfig as extra argument"))?;
+
+            let mut args: Vec<String> = vec![];
+
+            // Core sorting key (required for m8: sort by read ID = column 1)
+            args.push(config.key.clone());
+
+            // Parallelism — default to full allocation unless overridden
+            let threads = config.parallel
+                .unwrap_or_else(|| run_config.thread_allocation("sort", None));
+            if threads > 1 {
+                args.push("--parallel".to_string());
+                args.push(threads.to_string());
+            }
+
+            // Memory buffer
+            if let Some(buf) = &config.buffer_size {
+                args.push("-S".to_string());
+                args.push(buf.clone());
+            } else {
+                args.push("-S".to_string());
+                args.push("50%".to_string());
+            }
+
+            // Temp directory (critical for large sorts on NVMe)
+            if let Some(td) = &config.temp_dir {
+                args.push("-T".to_string());
+                args.push(td.clone());
+            }
+
+            // Output file (-o)
+            if let Some(out) = &config.output {
+                args.push("-o".to_string());
+                args.push(out.clone());
+            }
+
+            // Any extra flags the caller wants
+            for (key, value) in &config.extra_fields {
+                args.push(key.clone());
+                if let Some(v) = value {
+                    args.push(v.clone());
+                }
+            }
+
+            // Input
+            if let Some(input_file) = &config.input{
+                args.push(input_file.clone());
+            }
+
+            Ok(args)
+        }
+    }
+}
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -2194,6 +2282,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         BLASTN_TAG => Box::new(blastn::BlastnArgGenerator),
         BLASTX_TAG => Box::new(blastx::BlastxArgGenerator),
         MAKEBLASTDB_TAG => {Box::new(makeblastdb::MakeblastdbArgGenerator)},
+        SORT_TAG => Box::new(sort::SortArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -2243,6 +2332,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
                 BLASTN_TAG => blastn::blastn_presence_check().await,
                 BLASTX_TAG => blastx::blastx_presence_check().await,
                 MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
+                SORT_TAG => sort::sort_presence_check().await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

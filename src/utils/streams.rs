@@ -44,7 +44,6 @@ use crate::config::defs::{PipelineError, StreamDataType};
 use crate::config::defs::{CoreAllocation, RunConfig};
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 
-const BATCH_SIZE_BYTES: usize = 16 * 1024 * 1024; // ~128k alignments
 
 
 pub trait ToBytes {
@@ -288,28 +287,17 @@ where
                 return;
             }
 
-            // Adaptive backpressure sleep
-            let pause_ms = if lowest_capacity_ratio < 0.1 {
-                backpressure_pause_ms
-            } else if lowest_capacity_ratio < 0.3 {
-                backpressure_pause_ms / 2
-            } else if lowest_capacity_ratio < 0.5 {
-                backpressure_pause_ms / 4
-            } else {
-                0
-            };
-
-            if pause_ms > 0 {
-                if item_count % 10000 == 0 {
-                debug!(
-                    "{}: Adaptive backpressure pause {}ms (lowest capacity {:.1}%) at item {}",
-                    label,
-                    pause_ms,
-                    lowest_capacity_ratio * 100.0,
-                    item_count
-                );
-            }
-            sleep(Duration::from_millis(pause_ms)).await;
+            // Per-item backpressure: only slow down when the SLOWEST receiver is truly full.
+            if lowest_capacity_ratio < 0.05 {
+                if item_count % 5000 == 0 {
+                    debug!(
+                        "{}: Heavy backpressure detected (lowest capacity {:.1}%). Sleep 10ms.",
+                        label, lowest_capacity_ratio * 100.0
+                    );
+                }
+                sleep(Duration::from_millis(10)).await;
+            } else if lowest_capacity_ratio < 0.20 {
+                tokio::task::yield_now().await;
             }
 
             if item_count % stall_threshold == 0 {
@@ -347,6 +335,7 @@ where
 
     Ok((output_rxs, done_rx))
 }
+
 
 /// Asynchronously spawn an external process and feed it a stream as stdin.
 /// Capture stdout and return from function.
@@ -846,8 +835,10 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
 
     tokio::spawn(async move {
         let mut line = String::new();
+
         loop {
             line.clear();
+
             let bytes_read = match reader.read_line(&mut line).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -855,15 +846,25 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
                     return;
                 }
             };
+
             if bytes_read == 0 {
                 break;
             }
-            let trimmed = line.trim_end().to_string();
-            if !trimmed.is_empty() {
-                if tx.send(ParseOutput::Bytes(Arc::new(trimmed.into_bytes()))).await.is_err() {
-                    error!("Receiver dropped while sending line");
-                    break;
-                }
+
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let bytes = trimmed.as_bytes().to_vec();
+
+            if tx
+                .send(ParseOutput::Bytes(Arc::new(bytes)))
+                .await
+                .is_err()
+            {
+                error!("Receiver dropped while sending line");
+                break;
             }
         }
     });
@@ -1660,86 +1661,141 @@ pub async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyh
 
 
 pub fn monitor_stream(
-    input: ReceiverStream<ParseOutput>,  // Take ReceiverStream as input
+    input: ReceiverStream<ParseOutput>,
     stage_name: &str,
     log_interval: Duration,
-) -> ReceiverStream<ParseOutput> {  // Return ReceiverStream
+) -> ReceiverStream<ParseOutput> {
     let count = Arc::new(AtomicUsize::new(0));
     let stage = stage_name.to_string();
     let count_clone = count.clone();
 
-    // Notify when the stream ends or is dropped.
     let stop_notify = Arc::new(Notify::new());
     let stop_notify_clone = stop_notify.clone();
     let stage_clone = stage.clone();
 
-    // Spawn a separate task for logging to avoid blocking the stream.
     tokio::spawn(async move {
         let mut heartbeat: Interval = interval(log_interval);
         let mut last_count: usize = 0;
+        let start = Instant::now();
+
         loop {
             tokio::select! {
                 _ = heartbeat.tick() => {
                     let current = count_clone.load(Ordering::Relaxed);
                     let delta = current - last_count;
                     let velocity = (delta as f64) / log_interval.as_secs_f64();
+
                     if delta == 0 {
-                        warn!("{}: Stalled (0 records in last {:?})", stage_clone, log_interval);
+                        warn!(
+                            "{}: Stalled (0 records in last {:?}, total={})",
+                            stage_clone,
+                            log_interval,
+                            current
+                        );
                     } else {
-                        info!("{}: Output velocity: {:.0} records/s ({} total)", stage_clone, velocity, current);
+                        info!(
+                            "{}: Output velocity: {:.0} records/s ({} total, +{} since last tick, elapsed {:?})",
+                            stage_clone,
+                            velocity,
+                            current,
+                            delta,
+                            start.elapsed()
+                        );
                     }
+
                     last_count = current;
                 }
                 _ = stop_notify_clone.notified() => {
-                    debug!("{}: Logging task stopped", stage_clone);
+                    let final_count = count_clone.load(Ordering::Relaxed);
+                    debug!(
+                        "{}: Logging task stopped after {} total records in {:?}",
+                        stage_clone,
+                        final_count,
+                        start.elapsed()
+                    );
                     break;
                 }
             }
         }
     });
 
-    // Create a new channel to forward the monitored data
-    let mut input_receiver = input.into_inner();  // Consume to get Receiver
-    let buf_size = input_receiver.capacity();  // Get buffer size
-    let (forward_tx, forward_rx) = mpsc::channel::<ParseOutput>(buf_size);  // Match buffer size
+    let mut input_receiver = input.into_inner();
+    let buf_size = input_receiver.capacity();
+    let (forward_tx, forward_rx) = mpsc::channel::<ParseOutput>(buf_size);
     let stop_notify_forward = stop_notify.clone();
+    let stage_forward = stage.clone();
+    let count_forward = count.clone();
 
-    // Spawn a forwarding task: Consume input, monitor/count, send to new tx
     tokio::spawn(async move {
         struct DropGuard {
             notify: Arc<Notify>,
         }
+
         impl Drop for DropGuard {
             fn drop(&mut self) {
                 self.notify.notify_one();
             }
         }
-        let _guard = DropGuard { notify: stop_notify };
+
+        let _guard = DropGuard {
+            notify: stop_notify,
+        };
+
+        let mut forwarded = 0usize;
+        let mut last_log = Instant::now();
 
         while let Some(item) = input_receiver.recv().await {
-            count.fetch_add(1, Ordering::Relaxed);
+            count_forward.fetch_add(1, Ordering::Relaxed);
+            forwarded += 1;
+
             if forward_tx.send(item).await.is_err() {
-                warn!("{}: Forward send failed (downstream dropped)", stage);
+                warn!(
+                    "{}: Forward send failed (downstream dropped after {} records)",
+                    stage_forward,
+                    forwarded
+                );
                 break;
             }
+
+            if last_log.elapsed() >= Duration::from_secs(10) {
+                let current = count_forward.load(Ordering::Relaxed);
+                info!(
+                    "{}: forwarded {} records total (receiver total={})",
+                    stage_forward,
+                    forwarded,
+                    current
+                );
+                last_log = Instant::now();
+            }
         }
-        info!("{}: Stream complete ({} total records)", stage, count.load(Ordering::Relaxed));
-        drop(forward_tx);  // Explicitly drop to close downstream
-        stop_notify_forward.notify_one();  // Ensure logging stops
+
+        let final_total = count_forward.load(Ordering::Relaxed);
+        info!(
+            "{}: Stream complete ({} total records)",
+            stage_forward,
+            final_total
+        );
+
+        drop(forward_tx);
+        stop_notify_forward.notify_one();
     });
 
-    ReceiverStream::new(forward_rx)  // Return as ReceiverStream
+    ReceiverStream::new(forward_rx)
 }
 
 
-
-
 /// Guarantees: zero data drops, respects t_junction backpressure, cleanup_receivers untouched.
+///
+/// Speed improvements
+/// - reuses the input batch buffer allocation instead of `std::mem::take`
+/// - reserves space for incoming chunks before extending
+/// - surfaces downstream send failure instead of silently ignoring it
 pub fn batch_rayon_process<F>(
     config: Arc<RunConfig>,
     mut input: ReceiverStream<ParseOutput>,
     processor: F,
     stage_name: &'static str,
+    batch_target_bytes: usize,
 ) -> ReceiverStream<ParseOutput>
 where
     F: Fn(Vec<u8>) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -1747,53 +1803,152 @@ where
     let (tx, rx) = mpsc::channel(1024);
     let processor = Arc::new(processor);
 
+    // Small helper so we do not duplicate the send loop for the normal batch and final flush.
+    async fn send_lines(
+        tx: &mpsc::Sender<ParseOutput>,
+        lines: Vec<Vec<u8>>,
+        stage_name: &'static str,
+        label: &'static str,
+    ) -> bool {
+        for line in lines {
+            if tx.send(ParseOutput::Bytes(Arc::new(line))).await.is_err() {
+                warn!(
+                    "{}: downstream closed while sending {}",
+                    stage_name, label
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(BATCH_SIZE_BYTES);
+        // Start with the target size, so we are not constantly growing the buffer.
+        let mut buf = Vec::with_capacity(batch_target_bytes.max(1));
         let mut processed = 0u64;
 
         while let Some(item) = input.next().await {
-            if let ParseOutput::Bytes(b) = item {
-                buf.extend_from_slice(&b);
-                if buf.len() >= BATCH_SIZE_BYTES {
-                    let batch = std::mem::take(&mut buf);
-                    let p = processor.clone();
-                    let cfg = config.clone();
+            let ParseOutput::Bytes(b) = item else {
+                continue;
+            };
 
-                    let lines = tokio::task::spawn_blocking(move || {
-                        cfg.thread_pool.install(|| p(batch))
-                    }).await
-                        .expect("batch_rayon_process panicked");
+            // Reserve exactly what we need for this chunk when possible.
+            buf.reserve(b.len());
+            buf.extend_from_slice(&b);
 
-                    let batch_len = lines.len() as u64;
-                    for line in lines {
-                        let _ = tx.send(ParseOutput::Bytes(line.into())).await;
+            if buf.len() >= batch_target_bytes {
+                // Preserve the allocation already sitting inside `buf`.
+                let mut batch = Vec::with_capacity(buf.len());
+                batch.append(&mut buf);
+
+                let p = Arc::clone(&processor);
+                let config_clone = Arc::clone(&config);
+
+                debug!("{}: starting batch of {} bytes", stage_name, batch.len());
+
+                let lines = match tokio::task::spawn_blocking(move || {
+                    config_clone.thread_pool.install(|| p(batch))
+                })
+                    .await
+                {
+                    Ok(lines) => lines,
+                    Err(join_err) => {
+                        error!("{}: batch task panicked: {}", stage_name, join_err);
+                        break;
                     }
-                    processed += batch_len;
-                    if processed % 1_000_000 == 0 {
-                        debug!("{}: processed {} alignments (batched)", stage_name, processed);
-                    }
+                };
+
+                debug!(
+                    "{}: batch complete — produced {} lines",
+                    stage_name,
+                    lines.len()
+                );
+
+                let batch_len = lines.len() as u64;
+                if !send_lines(&tx, lines, stage_name, "batch").await {
+                    break;
+                }
+
+                processed += batch_len;
+                if processed % 1_000 == 0 || processed % 100_000 == 0 {
+                    info!(
+                        "{}: {} items (batch target {} bytes)",
+                        stage_name, processed, batch_target_bytes
+                    );
                 }
             }
         }
 
-        // final flush
+        // Final flush.
         if !buf.is_empty() {
-            let p = processor;
-            let cfg = config;
-            let lines = tokio::task::spawn_blocking(move || cfg.thread_pool.install(|| p(buf)))
-                .await.expect("final batch panicked");
+            let mut batch = Vec::with_capacity(buf.len());
+            batch.append(&mut buf);
+
+            let config_clone = Arc::clone(&config);
+            let p = Arc::clone(&processor);
+
+            let lines = match tokio::task::spawn_blocking(move || {
+                config_clone.thread_pool.install(|| p(batch))
+            })
+                .await
+            {
+                Ok(lines) => lines,
+                Err(join_err) => {
+                    error!("{}: final batch task panicked: {}", stage_name, join_err);
+                    return;
+                }
+            };
 
             let batch_len = lines.len() as u64;
-            for line in lines {
-                let _ = tx.send(ParseOutput::Bytes(line.into())).await;
+            if !send_lines(&tx, lines, stage_name, "final batch").await {
+                return;
             }
+
             processed += batch_len;
         }
 
-        debug!("{}: finished — total {} alignments, stream closed cleanly", stage_name, processed);
+        debug!("{}: finished — total {} items", stage_name, processed);
     });
 
     ReceiverStream::new(rx)
+}
+
+/// Router that reads the upstream ONCE and fans it out to N private channels.
+/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+/// Router that reads the upstream ONCE and fans it out to N private channels.
+/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+pub async fn fanout_to_channels(
+    mut upstream: ReceiverStream<ParseOutput>,
+    n_branches: usize,
+    buffer_per_branch: usize,
+    label: &str,
+) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
+    let mut txs = Vec::with_capacity(n_branches);
+    let mut rxs = Vec::with_capacity(n_branches);
+
+    for _ in 0..n_branches {
+        let (tx, rx) = mpsc::channel(buffer_per_branch);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+
+    let label = label.to_string();
+    let router: JoinHandle<anyhow::Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let mut count = 0usize;
+        while let Some(item) = upstream.next().await {
+            count += 1;
+            if count % 100_000 == 0 {
+                debug!("[fanout {}] forwarded {} items", label, count);
+            }
+            // Send to EVERY branch (never drop)
+            let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
+            let _ = futures::future::join_all(sends).await;
+        }
+        debug!("[fanout {}] finished — forwarded {} items total", label, count);
+        Ok(())   // ← this makes the JoinHandle return Result<(), anyhow::Error>
+    });
+
+    Ok((rxs, router))
 }
 
 #[cfg(test)]
