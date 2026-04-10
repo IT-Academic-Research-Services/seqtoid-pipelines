@@ -8310,6 +8310,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let nt_file = nt_file.clone();
         let nt_offset_db_file = nt_offset_db_file.clone();
         async move {
+            info!("[NT prep] waiting for hit_summary_handle...");
             let (
                 nt_read_dict_map,
                 nt_accession_dict_noarc,
@@ -8319,7 +8320,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("NT hit summary task panicked: {}", e)))?
                 .map_err(|e| PipelineError::Other(anyhow!("NT hit summary parsing failed: {}", e)))?;
-
+            info!("[NT prep] hit_summary_handle finished! Starting build_reference_fasta...");
             let (nt_ref_fasta_path, nt_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
                 config.clone(),
                 &nt_selected_genera,
@@ -8329,6 +8330,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             )
                 .await
                 .map_err(|e| PipelineError::Other(e.into()))?;
+            info!("[NT prep] build_reference_fasta finished! Sending oneshot...");
             Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
                 nt_read_dict_map,
                 Arc::new(nt_accession_dict_noarc),
@@ -8343,6 +8345,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let nr_file = nr_file.clone();
         let nr_offset_db_file = nr_offset_db_file.clone();
         async move {
+            info!("[NR prep] waiting for hit_summary_handle...");
             let (
                 nr_read_dict_map,
                 nr_accession_dict_noarc,
@@ -8352,7 +8355,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("NR hit summary task panicked: {}", e)))?
                 .map_err(|e| PipelineError::Other(anyhow!("NR hit summary parsing failed: {}", e)))?;
-
+            info!("[NR prep] hit_summary_handle finished! Starting build_reference_fasta...");
             let (nr_ref_fasta_path, nr_ref_fasta_temp_dir) = build_reference_fasta_from_selected_genera(
                 config.clone(),
                 &nr_selected_genera,
@@ -8362,6 +8365,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             )
                 .await
                 .map_err(|e| PipelineError::Other(e.into()))?;
+            info!("[NR prep] build_reference_fasta finished! Sending oneshot...");
             Ok::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf, TempDir), PipelineError>((
                 nr_read_dict_map,
                 Arc::new(nr_accession_dict_noarc),
