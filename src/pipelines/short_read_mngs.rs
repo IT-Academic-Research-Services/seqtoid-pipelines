@@ -7860,31 +7860,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let annot_concurrency = compute_phase_concurrency(
         &config,
         "generate_annotated_fasta",
-        0.4,   // ~400 MB/thread — mostly transient
+        0.4,
         4.0,
         128,
         8,
     );
 
-    // Open and read R1
-    let r1_file = TokioFile::open(&non_host_r1_path).await?;
-    let r1_stream = parse_bytes::<TokioFile>(r1_file, config.base_buffer_size).await?;
+    // Read non-host R1/R2 as proper parsed Fastq records (this fixes the Non-FASTQ error)
+    let (interleaved_rx, read_stats_task) = read_fastq(
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        None,                    // technology
+        u64::MAX,
+        None,
+        None,
+        config.base_buffer_size,
+    ).map_err(|e| PipelineError::Other(e))?;
 
-    let interleaved_stream = if let Some(ref r2_path) = non_host_r2_path_opt {
-        let r2_file = TokioFile::open(r2_path).await?;
-        let r2_stream = parse_bytes::<TokioFile>(r2_file, config.base_buffer_size).await?;
+    // Wrap the stats task so it matches cleanup_tasks type
+    let stats_wrapper = tokio::spawn(async move {
+        match read_stats_task.await {
+            Ok(Ok(_stats)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(join_err) => Err(anyhow::anyhow!("read_stats_task join failed: {}", join_err)),
+        }
+    });
+    cleanup_tasks.push(stats_wrapper);
 
-        let (inter_rx, inter_task) = interleave_fastq_streams(
-            r1_stream,
-            r2_stream,
-            config.base_buffer_size,
-        ).await?;
-
-        cleanup_tasks.push(inter_task);
-        ReceiverStream::new(inter_rx)
-    } else {
-        ReceiverStream::new(r1_stream)
-    };
+    let interleaved_stream = ReceiverStream::new(interleaved_rx);
 
 
         let (nt_map, nr_map) = tokio::try_join!(
