@@ -7744,17 +7744,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let duplicate_clusters = duplicate_clusters.clone();
 
         async move {
+            info!("[NT blast task] waiting for prep oneshot...");
             let (nt_read_dict_map, nt_accession_dict, nt_ref_fasta_path) = nt_prep_rx
                 .await
                 .map_err(|e| anyhow!("NT prep oneshot dropped: {}", e))?;
+            info!("[NT blast task] prep oneshot received!");
 
+            info!("[NT blast task] waiting for assembly oneshot...");
             let assembly_outputs = nt_assembly_rx
                 .await
                 .map_err(|e| anyhow!("NT assembly oneshot dropped: {}", e))?;
-
+            info!("[NT blast task] assembly oneshot received!");
+            info!("[NT blast task] waiting for counts oneshot...");
             let nt_counts = nt_counts_rx
                 .await
                 .map_err(|e| anyhow!("NT counts oneshot dropped: {}", e))?;
+            info!("[NT blast task] counts oneshot received!");
 
             let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_map));
 
