@@ -8704,56 +8704,57 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let initial_mapped_path = out_dir.join("taxid_annot_mapped_only.fasta");
     let initial_combined_path = out_dir.join("taxid_annot.fasta");
 
-    let (initial_taxid_mapped_streams, initial_taxid_mapped_rx) = t_junction(
+
+    info!("[run] starting fanout_to_channels for initial taxid FASTA (mapped + combined)");
+
+    let (initial_mapped_rxs, initial_mapped_router) = fanout_to_channels(
         ReceiverStream::new(initial_taxid_mapped_rx),
         3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "initial_taxid_mapped".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(initial_taxid_mapped_rx);
+        config.base_buffer_size * 64,
+        "initial_taxid_mapped",
+    ).await?;
+    cleanup_tasks.push(initial_mapped_router);
 
-    let mut initial_taxid_mapped_streams_iter = initial_taxid_mapped_streams.into_iter();
-    let initial_taxid_mapped_file = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
-    let initial_taxid_mapped_locator = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_taxid_mapped_count = initial_taxid_mapped_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mut initial_mapped_iter = initial_mapped_rxs.into_iter();
+    let initial_taxid_mapped_file = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_taxid_mapped_locator = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_taxid_mapped_count = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-
-    let (initial_taxid_combined_streams, initial_taxid_combined_rx) = t_junction(
+    let (initial_combined_rxs, initial_combined_router) = fanout_to_channels(
         ReceiverStream::new(initial_taxid_combined_rx),
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "initial_taxid_combined".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(initial_taxid_combined_rx);
+        config.base_buffer_size * 64,
+        "initial_taxid_combined",
+    ).await?;
+    cleanup_tasks.push(initial_combined_router);
 
-    let mut initial_taxid_combined_streams_iter = initial_taxid_combined_streams.into_iter();
-    let initial_taxid_combined_file = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?; // Optional write
-    let initial_taxid_combined_count = initial_taxid_combined_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let mut initial_combined_iter = initial_combined_rxs.into_iter();
+    let initial_taxid_combined_file = initial_combined_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let initial_taxid_combined_count = initial_combined_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // Add monitors so we finally see progress logs again
+    let initial_taxid_mapped_file = monitor_stream(
+        ReceiverStream::new(initial_taxid_mapped_file),
+        "initial_taxid_mapped_file_to_write",
+        Duration::from_secs(15),
+    );
+    let initial_taxid_combined_file = monitor_stream(
+        ReceiverStream::new(initial_taxid_combined_file),
+        "initial_taxid_combined_file_to_write",
+        Duration::from_secs(15),
+    );
+
 
 
     let initial_write_mapped_handle = write_fasta_stream_to_file(
-        ReceiverStream::new(initial_taxid_mapped_file), // Clone rx if needed for logging
+        initial_taxid_mapped_file, // Clone rx if needed for logging
         initial_mapped_path.clone(),
         config.base_buffer_size,
     );
     cleanup_tasks.push(initial_write_mapped_handle);
 
     let initial_write_combined_handle = write_fasta_stream_to_file(
-        ReceiverStream::new(initial_taxid_combined_file),
+        initial_taxid_combined_file,
         initial_combined_path.clone(),
         config.base_buffer_size,
     );
