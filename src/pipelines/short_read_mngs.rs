@@ -8800,16 +8800,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None
     };
 
-    // shutting this off as: 1. needletail is more picky than seqkit and finds mismatcxhes too easily
-    // 2. It is unlikely we'll be allowed to keep the non host FASTQ's
-    // let (nonhost_r1, nonhost_r2_opt) = generate_nonhost_fastq_from_files(
-    //     config.clone(),
-    //     file1_path.clone(),
-    //     file2_path.clone(),
-    //     ReceiverStream::new(taxid_mapped_nonhost),
-    //     clusters_opt,
-    //     out_dir.clone(),
-    // ).await?;
 
 
     // *******************
