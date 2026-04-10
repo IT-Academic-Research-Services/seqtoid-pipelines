@@ -8283,45 +8283,31 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut cleanup_receivers = nt_cleanup_receivers;
             let mut temp_files = nt_temp_files;
 
-            let (nt_m8_streams, nt_m8_rx) = t_junction(
+            let (nt_m8_rxs, nt_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_m8_stream_out),
                 3,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "nt_m8".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nt_m8_rx);
+                config.base_buffer_size * 64,
+                "nt_m8",
+            ).await?;
+            cleanup_tasks.push(nt_m8_router);
 
-            let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
-            let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let mut nt_m8_iter = nt_m8_rxs.into_iter();
+            let nt_m8_merge = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_map = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_viz = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-            let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
+            let (nt_hitsummary_rxs, nt_hitsummary_router) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_hit_summary_stream_out),
                 3,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "validate_input".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nt_hitsummary_rx);
+                config.base_buffer_size * 64,
+                "nt_hitsummary",
+            ).await?;
+            cleanup_tasks.push(nt_hitsummary_router);
 
-            let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
-            let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let mut nt_hitsummary_iter = nt_hitsummary_rxs.into_iter();
+            let nt_hit_summary_merge = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_taxid = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_coverage = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
 
             Ok::<_, PipelineError>((
                 nt_read_dict,
@@ -8364,44 +8350,30 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut cleanup_receivers = nr_cleanup_receivers;
             let mut temp_files = nr_temp_files;
 
-            let (nr_m8_streams, nr_m8_rx) = t_junction(
+            let (nr_m8_rxs, nr_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_m8_stream_out),
                 2,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "nr_m8".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nr_m8_rx);
+                config.base_buffer_size * 64,
+                "nr_m8",
+            ).await?;
+            cleanup_tasks.push(nr_m8_router);
 
-            let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
-            let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let mut nr_m8_iter = nr_m8_rxs.into_iter();
+            let nr_m8_merge = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_m8_map = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-            let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
+            let (nr_hitsummary_rxs, nr_hitsummary_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_hit_summary_stream_out),
                 3,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "validate_input".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nr_hitsummary_rx);
+                config.base_buffer_size * 64,
+                "nr_hitsummary",
+            ).await?;
+            cleanup_tasks.push(nr_hitsummary_router);
 
-            let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
-            let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let mut nr_hitsummary_iter = nr_hitsummary_rxs.into_iter();
+            let nr_hit_summary_merge = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_preload = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_taxid = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
 
             Ok::<_, PipelineError>((
                 nr_read_dict,
