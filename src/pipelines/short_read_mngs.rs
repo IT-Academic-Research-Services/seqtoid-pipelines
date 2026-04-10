@@ -7995,26 +7995,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
     let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
 
-    let spades_task = spades_assembly(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-        &out_dir,
-    ).await?;
 
-    let spades_completion = spades_task.await;
-
-    match spades_completion {
-        Ok(Ok(())) => {
-            info!("SPAdes assembly task completed successfully");
-        }
-        Ok(Err(e)) => {
-            warn!("SPAdes assembly failed: {}", e);
-        }
-        Err(join_err) => {
-            error!("SPAdes task panicked or was cancelled: {}", join_err);
-        }
-    }
 
     let (assembly_outputs, assembly_bam_out_stream,
         mut post_assembly_cleanup_tasks,
@@ -8482,6 +8463,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(nr_cleanup_receivers);
     temp_files.extend(nr_temp_files);
 
+    let spades_task = spades_assembly(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+        &out_dir,
+    ).await?;
+
+    let spades_completion = spades_task.await;
+
+    match spades_completion {
+        Ok(Ok(())) => {
+            info!("SPAdes assembly task completed successfully");
+        }
+        Ok(Err(e)) => {
+            warn!("SPAdes assembly failed: {}", e);
+        }
+        Err(join_err) => {
+            error!("SPAdes task panicked or was cancelled: {}", join_err);
+        }
+    }
 
     // ────────────────────────────────────────────────────────────────
     // PRELOAD NR alignments (parallel version)
