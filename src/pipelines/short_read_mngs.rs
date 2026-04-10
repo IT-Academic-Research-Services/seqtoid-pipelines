@@ -7728,6 +7728,47 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("  -> nt_summary_hit_stream (to summarize_hits)");
     info!("  -> nt_summary_taxon_stream (to generate_taxon_counts)");
 
+    let nt_hit_summary_handle = tokio::spawn({
+        let config = config.clone();
+        let nt_summary_hit_stream = nt_summary_hit_stream;
+        let duplicate_clusters = duplicate_clusters.clone();
+        async move {
+            let start = Instant::now();
+            info!("[run] summarize_hits(nt) started");
+            let res = summarize_hits(
+                config.clone(),
+                nt_summary_hit_stream,
+                duplicate_clusters,
+                0,
+            ).await;
+            info!("[run] summarize_hits(nt) finished after {:?}", start.elapsed());
+            res
+        }
+    });
+
+    let nt_counts_task = tokio::spawn({
+        let config = config.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        let nt_call_stream = nt_call_stream;
+        let nt_summary_taxon_stream = nt_summary_taxon_stream;
+        async move {
+            let start = Instant::now();
+            info!("[run] generate_taxon_counts(NT) started");
+            info!("[run] generate_taxon_counts(NT) awaiting nt_call_stream + nt_summary_taxon_stream");
+            let res = generate_taxon_counts(
+                config,
+                nt_call_stream,
+                nt_summary_taxon_stream,
+                duplicate_clusters,
+                should_keep_filter,
+                "NT".to_string(),
+                None,
+            ).await;
+            info!("[run] generate_taxon_counts(NT) finished after {:?}", start.elapsed());
+            res
+        }
+    });
 
     let (nt_prep_tx, nt_prep_rx) = oneshot::channel::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf)>();
     let (nt_assembly_tx, nt_assembly_rx) = oneshot::channel::<CoverageOutputs>();
@@ -7839,47 +7880,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
-    let nt_hit_summary_handle = tokio::spawn({
-        let config = config.clone();
-        let nt_summary_hit_stream = nt_summary_hit_stream;
-        let duplicate_clusters = duplicate_clusters.clone();
-        async move {
-            let start = Instant::now();
-            info!("[run] summarize_hits(nt) started");
-            let res = summarize_hits(
-                config.clone(),
-                nt_summary_hit_stream,
-                duplicate_clusters,
-                0,
-            ).await;
-            info!("[run] summarize_hits(nt) finished after {:?}", start.elapsed());
-            res
-        }
-    });
 
-    let nt_counts_task = tokio::spawn({
-        let config = config.clone();
-        let should_keep_filter = should_keep_filter.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        let nt_call_stream = nt_call_stream;
-        let nt_summary_taxon_stream = nt_summary_taxon_stream;
-        async move {
-            let start = Instant::now();
-            info!("[run] generate_taxon_counts(NT) started");
-            info!("[run] generate_taxon_counts(NT) awaiting nt_call_stream + nt_summary_taxon_stream");
-            let res = generate_taxon_counts(
-                config,
-                nt_call_stream,
-                nt_summary_taxon_stream,
-                duplicate_clusters,
-                should_keep_filter,
-                "NT".to_string(),
-                None,
-            ).await;
-            info!("[run] generate_taxon_counts(NT) finished after {:?}", start.elapsed());
-            res
-        }
-    });
 
 
     // Temporary: Skip Diamond by providing empty outputs
@@ -7974,6 +7975,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_hit_summary_for_refined = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_hit_summary_for_taxid    = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
+    let nr_hit_summary_handle = tokio::spawn(summarize_hits(
+        config.clone(),
+        ReceiverStream::new(nr_summary_hit_stream),
+        duplicate_clusters.clone(),
+        0,
+    ));
+
+    let nr_counts_task = tokio::spawn({
+        let config = config.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+        async move {
+            generate_taxon_counts(
+                config, // RunConfig
+                ReceiverStream::new(nr_call_stream), //m8_stream
+                ReceiverStream::new(nr_summary_taxon_stream), //summary_stream
+                duplicate_clusters, //duplicate_clusters
+                should_keep_filter, //should_keep_filter
+                "NR".to_string(), // count_type
+                None, //source_count type, only relevantif/when i later implement the merged path (NT + NR together) pass Some("NT".to_string()) or Some("NR".to_string()) on the respective streams.
+            ).await
+        }
+    });
 
     let (nr_prep_tx, nr_prep_rx) = oneshot::channel::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf)>();
     let (nr_assembly_tx, nr_assembly_rx) = oneshot::channel::<CoverageOutputs>();
@@ -8077,29 +8101,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
 
-    let nr_hit_summary_handle = tokio::spawn(summarize_hits(
-        config.clone(),
-        ReceiverStream::new(nr_summary_hit_stream),
-        duplicate_clusters.clone(),
-        0,
-    ));
 
-    let nr_counts_task = tokio::spawn({
-        let config = config.clone();
-        let should_keep_filter = should_keep_filter.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        async move {
-            generate_taxon_counts(
-                config, // RunConfig
-                ReceiverStream::new(nr_call_stream), //m8_stream
-                ReceiverStream::new(nr_summary_taxon_stream), //summary_stream
-                duplicate_clusters, //duplicate_clusters
-                should_keep_filter, //should_keep_filter
-                "NR".to_string(), // count_type
-                None, //source_count type, only relevantif/when i later implement the merged path (NT + NR together) pass Some("NT".to_string()) or Some("NR".to_string()) on the respective streams.
-            ).await
-        }
-    });
 
 
 
