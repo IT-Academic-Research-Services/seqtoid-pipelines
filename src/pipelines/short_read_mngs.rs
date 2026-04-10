@@ -187,7 +187,7 @@ pub struct AssemblyHandle {
     pub out_dir: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CoverageOutputs {
     pub contigs_fasta: PathBuf,
     pub contigs_ram_fasta: PathBuf,
@@ -7546,6 +7546,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
+
+    //Compute concurrencies up at the top for
     let nt_concurrency = compute_phase_concurrency(
         &config,
         "call_hits_nt",
@@ -7555,6 +7557,37 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         16,
     );
     info!("call hits nt concurrency {}", nt_concurrency);
+
+    let nt_blast_concurrency = compute_phase_concurrency(
+        &config,
+        "nt_blast_contigs",
+        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
+        5.0,           // strong CPU-bound phase (alignment + scoring)
+        128,           // high cap — BLAST scales decently to 128 on EPYC
+        8,             // min — still want parallelism on MacBook Air
+    );
+    info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
+
+    let nr_concurrency = compute_phase_concurrency(
+        &config,
+        "call_hits_nr",
+        1.0,           // ~1 GB per thread max (mostly transient)
+        3.5,
+        64,            // higher cap for CPU-bound phase
+        16,            // min for meaningful parallelism
+    );
+
+    info!("call hits nr concurrency {}", nr_concurrency);
+
+    let nr_blast_concurrency = compute_phase_concurrency(
+        &config,
+        "nr_blast_contigs",
+        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
+        5.0,           // strong CPU-bound phase (alignment + scoring)
+        128,           // high cap — BLAST scales decently to 128 on EPYC
+        8,             // min — still want parallelism on MacBook Air
+    );
+    info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
 
     let nt_call_hits_start = Instant::now();
     let (call_stream, call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
@@ -7695,6 +7728,112 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("  -> nt_summary_hit_stream (to summarize_hits)");
     info!("  -> nt_summary_taxon_stream (to generate_taxon_counts)");
 
+
+    let (nt_prep_tx, nt_prep_rx) = oneshot::channel::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf)>();
+    let (nt_assembly_tx, nt_assembly_rx) = oneshot::channel::<CoverageOutputs>();
+    let (nt_counts_tx, nt_counts_rx) = oneshot::channel::<Vec<TaxonCount>>();
+
+    // ────────────────────────────────────────────────────────────────
+    // EARLY BLAST SPAWN (NT) — final corrected version
+    // This does the blast + the post-processing t_junctions so the returned tuple matches what your later unpacking code expects
+    // ────────────────────────────────────────────────────────────────
+    let nt_blast_handle: JoinHandle<Result<_, PipelineError>> = tokio::spawn({
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+
+        async move {
+            let (nt_read_dict_map, nt_accession_dict, nt_ref_fasta_path) = nt_prep_rx
+                .await
+                .map_err(|e| anyhow!("NT prep oneshot dropped: {}", e))?;
+
+            let assembly_outputs = nt_assembly_rx
+                .await
+                .map_err(|e| anyhow!("NT assembly oneshot dropped: {}", e))?;
+
+            let nt_counts = nt_counts_rx
+                .await
+                .map_err(|e| anyhow!("NT counts oneshot dropped: {}", e))?;
+
+            let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_map));
+
+            let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+            let read2contig = assembly_outputs.read2contig.clone();
+
+            info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
+
+            // Call blast_contigs
+            let blast_result = blast_contigs(
+                config.clone(),
+                NT_TAG,
+                nt_blast_stream,
+                nt_blast_hit_stream,
+                nt_read_dict,
+                nt_accession_dict,
+                nt_counts,
+                &contigs_fasta_path,
+                read2contig,
+                &nt_ref_fasta_path,
+                duplicate_clusters,
+                lineage_map,
+                should_keep_filter,
+                4,
+                nt_blast_concurrency
+            ).await?;
+
+            let (nt_m8_streams, nt_m8_rx) = t_junction(
+                ReceiverStream::new(blast_result.3),  // refined m8 from blast_contigs
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "nt_m8".to_string(),
+                None,
+            ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+
+            let mut nt_m8_iter = nt_m8_streams.into_iter();
+            let nt_m8_merge = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_map = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_viz = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
+                ReceiverStream::new(blast_result.4),  // refined hit summary
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "validate_input".to_string(),
+                None,
+            ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+
+            let mut nt_hitsummary_iter = nt_hitsummary_streams.into_iter();
+            let nt_hit_summary_merge = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_taxid = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_coverage = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            Ok((
+                blast_result.0,  // nt_read_dict
+                blast_result.1,  // nt_refined_counts
+                blast_result.2,  // nt_contig_summary
+                nt_m8_merge,
+                nt_m8_map,
+                nt_m8_viz,
+                nt_hit_summary_merge,
+                nt_hit_summary_taxid,
+                nt_hit_summary_coverage,
+                blast_result.5,  // top stream
+                blast_result.6,  // cleanup_tasks
+                blast_result.7,  // cleanup_receivers
+                blast_result.8,  // temp_files
+            ))
+        }
+    });
+
     let nt_hit_summary_handle = tokio::spawn({
         let config = config.clone();
         let nt_summary_hit_stream = nt_summary_hit_stream;
@@ -7756,16 +7895,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
     // final_temp_dirs.extend(non_host_diamond_temp_dirs);
 
-    let nr_concurrency = compute_phase_concurrency(
-        &config,
-        "call_hits_nr",
-        1.0,           // ~1 GB per thread max (mostly transient)
-        3.5,
-        64,            // higher cap for CPU-bound phase
-        16,            // min for meaningful parallelism
-    );
 
-    info!("call hits nr concurrency {}", nr_concurrency);
 
     // ────────────────────────────────────────────────────────────────
     // Sort NR m8 by read ID before call_hits_m8
@@ -7838,6 +7968,108 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_blast_hit_stream     = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_hit_summary_for_refined = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let nr_hit_summary_for_taxid    = nr_summary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+
+    let (nr_prep_tx, nr_prep_rx) = oneshot::channel::<(AHashMap<String, Arc<ReadHit>>, Arc<AHashMap<String, AccessionHit>>, PathBuf)>();
+    let (nr_assembly_tx, nr_assembly_rx) = oneshot::channel::<CoverageOutputs>();
+    let (nr_counts_tx, nr_counts_rx) = oneshot::channel::<Vec<TaxonCount>>();
+
+    // ────────────────────────────────────────────────────────────────
+    // EARLY BLAST SPAWN (NR)
+    // ────────────────────────────────────────────────────────────────
+    let nr_blast_handle: JoinHandle<Result<_, PipelineError>> = tokio::spawn({
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let duplicate_clusters = duplicate_clusters.clone();
+
+        async move {
+            let (nr_read_dict_map, nr_accession_dict, nr_ref_fasta_path) = nr_prep_rx
+                .await
+                .map_err(|e| anyhow!("NR prep oneshot dropped: {}", e))?;
+
+            let assembly_outputs = nr_assembly_rx
+                .await
+                .map_err(|e| anyhow!("NR assembly oneshot dropped: {}", e))?;
+
+            let nr_counts = nr_counts_rx
+                .await
+                .map_err(|e| anyhow!("NR counts oneshot dropped: {}", e))?;
+
+            let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_map));
+
+            let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+            let read2contig = assembly_outputs.read2contig.clone();
+
+            info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
+
+            // Call blast_contigs
+            let blast_result = blast_contigs(
+                config.clone(),
+                NR_TAG,
+                ReceiverStream::new(nr_blast_stream),
+                ReceiverStream::new(nr_blast_hit_stream),
+                nr_read_dict,
+                nr_accession_dict,
+                nr_counts,
+                &contigs_fasta_path,
+                read2contig,
+                &nr_ref_fasta_path,
+                duplicate_clusters,
+                lineage_map,
+                should_keep_filter,
+                4,
+                nr_blast_concurrency
+            ).await?;
+
+            let (nr_m8_streams, nr_m8_rx) = t_junction(
+                ReceiverStream::new(blast_result.3),   // refined m8
+                2,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "nr_m8".to_string(),
+                None,
+            ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+
+            let mut nr_m8_iter = nr_m8_streams.into_iter();
+            let nr_m8_merge = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_m8_map = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
+                ReceiverStream::new(blast_result.4),   // refined hit summary
+                3,
+                config.base_buffer_size,
+                config.args.stall_threshold,
+                None,
+                config.base_backpressure_pause,
+                StreamDataType::IlluminaFastq,
+                "validate_input".to_string(),
+                None,
+            ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+
+            let mut nr_hitsummary_iter = nr_hitsummary_streams.into_iter();
+            let nr_hit_summary_merge = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_preload = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_taxid = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            Ok((
+                blast_result.0,          // nr_read_dict
+                blast_result.1,          // nr_refined_counts
+                blast_result.2,          // nr_contig_summary
+                nr_m8_merge,
+                nr_m8_map,
+                nr_hit_summary_merge,
+                nr_hit_summary_preload,
+                nr_hit_summary_taxid,
+                blast_result.6,          // cleanup_tasks (adjust index if your blast_result has different order)
+                blast_result.7,          // cleanup_receivers
+                blast_result.8,          // temp_files
+            ))
+        }
+    });
 
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(
@@ -8015,6 +8247,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
     temp_files.extend(post_assembly_temp_files);
 
+    let _ = nt_assembly_tx.send(assembly_outputs.clone());
+    let _ = nr_assembly_tx.send(assembly_outputs.clone());
+
     let _ = fs::remove_dir_all(assembly_work_dir).await;
 
     let generate_assembly_coverage_result = generate_assembly_coverage(
@@ -8137,6 +8372,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nt_read_dict_map, nt_accession_dict, nt_ref_fasta_path, nt_ref_fasta_temp_dir) = nt_prep_res?;
     let (nr_read_dict_map, nr_accession_dict, nr_ref_fasta_path, nr_ref_fasta_temp_dir) = nr_prep_res?;
 
+    let _ = nt_prep_tx.send((nt_read_dict_map.clone(), nt_accession_dict, nt_ref_fasta_path.clone()));
+    let _ = nr_prep_tx.send((nr_read_dict_map.clone(), nr_accession_dict, nr_ref_fasta_path.clone()));
+
     let nt_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nt_read_dict_map));
     let nr_read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>> = Arc::new(Mutex::new(nr_read_dict_map));
 
@@ -8153,6 +8391,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )?;
     let nt_counts = nt_counts?;
     let nr_counts = nr_counts?;
+
+    let _ = nt_counts_tx.send(nt_counts.clone());
+    let _ = nr_counts_tx.send(nr_counts.clone());
 
 
     let combined_path = out_dir.join(rename_file_path(
@@ -8182,251 +8423,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(combine_handle);
 
 
-    let nt_blast_concurrency = compute_phase_concurrency(
-        &config,
-        "nt_blast_contigs",
-        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
-        5.0,           // strong CPU-bound phase (alignment + scoring)
-        128,           // high cap — BLAST scales decently to 128 on EPYC
-        8,             // min — still want parallelism on MacBook Air
-    );
-    info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
+    // ===================================================================
+    //  AWAIT THE EARLY BLAST TASKS
+    // ===================================================================
 
-    let nt_handle = tokio::spawn({
-        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
-        let config = config.clone();
-        let lineage_map = lineage_map.clone();
-        let should_keep_filter = should_keep_filter.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        let read2contig = assembly_outputs.read2contig.clone();
+    let (nt_res, nr_res) = tokio::join!(nt_blast_handle, nr_blast_handle);
 
-        async move {
-            info!("hey blast_contigs you pile of shit are you starting?");
-            blast_contigs(
-                config,
-                NT_TAG,
-                nt_blast_stream.into(),
-                nt_blast_hit_stream,
-                nt_read_dict.clone(),
-                nt_accession_dict,
-                nt_counts,
-                &contigs_fasta_path.clone(),
-                read2contig,
-                &nt_ref_fasta_path,
-                duplicate_clusters,
-                lineage_map,
-                should_keep_filter,
-                4,
-                nt_blast_concurrency
-            ).await
-        }
-    });
+    let nt_res = nt_res
+        .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs panicked: {}", e)))??;
 
-    let nr_blast_concurrency = compute_phase_concurrency(
-        &config,
-        "nr_blast_contigs",
-        2.0,           // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
-        5.0,           // strong CPU-bound phase (alignment + scoring)
-        128,           // high cap — BLAST scales decently to 128 on EPYC
-        8,             // min — still want parallelism on MacBook Air
-    );
-    info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
+    let nr_res = nr_res
+        .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs panicked: {}", e)))??;
 
-    let nr_handle = tokio::spawn({
-        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
-        let config = config.clone();
-        let lineage_map = lineage_map.clone();
-        let should_keep_filter = should_keep_filter.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        let read2contig = assembly_outputs.read2contig.clone();
-
-        async move {
-            blast_contigs(
-                config,
-                NR_TAG,
-                ReceiverStream::new(nr_blast_stream),
-                ReceiverStream::new(nr_blast_hit_stream),
-                nr_read_dict.clone(),
-                nr_accession_dict,
-                nr_counts,
-                &contigs_fasta_path.clone(),
-                read2contig,
-                &nr_ref_fasta_path,
-                duplicate_clusters,
-                lineage_map,
-                should_keep_filter,
-                4,
-                nr_blast_concurrency
-            ).await
-        }
-    });
-
-    let nt_post_handle = tokio::spawn({
-        let config = config.clone();
-        async move {
-            let nt_res = nt_handle
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs task panicked: {e}")))??;
-
-            let (
-                nt_read_dict,
-                nt_refined_counts,
-                nt_contig_summary,
-                nt_refined_m8_stream_out,
-                nt_refined_hit_summary_stream_out,
-                nt_refined_m8_top_stream_out,
-                nt_cleanup_tasks,
-                nt_cleanup_receivers,
-                nt_temp_files,
-            ) = nt_res;
-
-            let mut cleanup_tasks = nt_cleanup_tasks;
-            let mut cleanup_receivers = nt_cleanup_receivers;
-            let mut temp_files = nt_temp_files;
-
-            let (nt_m8_streams, nt_m8_rx) = t_junction(
-                ReceiverStream::new(nt_refined_m8_stream_out),
-                3,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "nt_m8".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nt_m8_rx);
-
-            let mut nt_m8_streams_iter = nt_m8_streams.into_iter();
-            let nt_m8_merge = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_m8_map = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_m8_viz = nt_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-            let (nt_hitsummary_streams, nt_hitsummary_rx) = t_junction(
-                ReceiverStream::new(nt_refined_hit_summary_stream_out),
-                3,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "validate_input".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nt_hitsummary_rx);
-
-            let mut nt_hitsummary_streams_iter = nt_hitsummary_streams.into_iter();
-            let nt_hit_summary_merge = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_hit_summary_taxid = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_hit_summary_coverage = nt_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-            Ok::<_, PipelineError>((
-                nt_read_dict,
-                nt_refined_counts,
-                nt_contig_summary,
-                nt_m8_merge,
-                nt_m8_map,
-                nt_m8_viz,
-                nt_hit_summary_merge,
-                nt_hit_summary_taxid,
-                nt_hit_summary_coverage,
-                nt_refined_m8_top_stream_out,
-                cleanup_tasks,
-                cleanup_receivers,
-                temp_files,
-            ))
-        }
-    });
-
-    let nr_post_handle = tokio::spawn({
-        let config = config.clone();
-        async move {
-            let nr_res = nr_handle
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs task panicked: {e}")))??;
-
-            let (
-                nr_read_dict,
-                nr_refined_counts,
-                nr_contig_summary,
-                nr_refined_m8_stream_out,
-                nr_refined_hit_summary_stream_out,
-                _nr_refined_m8_top_stream_out,
-                nr_cleanup_tasks,
-                nr_cleanup_receivers,
-                nr_temp_files,
-            ) = nr_res;
-
-            let mut cleanup_tasks = nr_cleanup_tasks;
-            let mut cleanup_receivers = nr_cleanup_receivers;
-            let mut temp_files = nr_temp_files;
-
-            let (nr_m8_streams, nr_m8_rx) = t_junction(
-                ReceiverStream::new(nr_refined_m8_stream_out),
-                2,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "nr_m8".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nr_m8_rx);
-
-            let mut nr_m8_streams_iter = nr_m8_streams.into_iter();
-            let nr_m8_merge = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_m8_map = nr_m8_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-            let (nr_hitsummary_streams, nr_hitsummary_rx) = t_junction(
-                ReceiverStream::new(nr_refined_hit_summary_stream_out),
-                3,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
-                StreamDataType::IlluminaFastq,
-                "validate_input".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(nr_hitsummary_rx);
-
-            let mut nr_hitsummary_streams_iter = nr_hitsummary_streams.into_iter();
-            let nr_hit_summary_merge = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_preload = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_taxid = nr_hitsummary_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-            Ok::<_, PipelineError>((
-                nr_read_dict,
-                nr_refined_counts,
-                nr_contig_summary,
-                nr_m8_merge,
-                nr_m8_map,
-                nr_hit_summary_merge,
-                nr_hit_summary_preload,
-                nr_hit_summary_taxid,
-                cleanup_tasks,
-                cleanup_receivers,
-                temp_files,
-            ))
-        }
-    });
-
-    let (nt_post_res, nr_post_res) = tokio::join!(nt_post_handle, nr_post_handle);
-
-    let nt_post_res = nt_post_res
-        .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs postprocess task panicked: {e}")))??;
-    let nr_post_res = nr_post_res
-        .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs postprocess task panicked: {e}")))??;
-
+    // Unpack
     let (
         nt_read_dict,
         nt_refined_counts,
@@ -8441,10 +8450,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nt_cleanup_tasks,
         nt_cleanup_receivers,
         nt_temp_files,
-    ) = nt_post_res;
-    cleanup_tasks.extend(nt_cleanup_tasks);
-    cleanup_receivers.extend(nt_cleanup_receivers);
-    temp_files.extend(nt_temp_files);
+    ) = nt_res;
 
     let (
         nr_read_dict,
@@ -8458,10 +8464,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_cleanup_tasks,
         nr_cleanup_receivers,
         nr_temp_files,
-    ) = nr_post_res;
+    ) = nr_res;
+
+    // Extend the main cleanup lists (exactly as you did before)
+    cleanup_tasks.extend(nt_cleanup_tasks);
     cleanup_tasks.extend(nr_cleanup_tasks);
+    cleanup_receivers.extend(nt_cleanup_receivers);
     cleanup_receivers.extend(nr_cleanup_receivers);
+    temp_files.extend(nt_temp_files);
     temp_files.extend(nr_temp_files);
+
 
     let spades_task = spades_assembly(
         config.clone(),
