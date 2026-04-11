@@ -7,6 +7,7 @@ use std::process::Output;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::process::Command;
+use std::arch::is_x86_feature_detected;
 
 use log::{self, LevelFilter, debug, info, error, warn};
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
@@ -18,7 +19,7 @@ use rand::SeedableRng;
 use rand_core::{OsRng, RngCore};
 
 use crate::cli::args::{Arguments, Technology};
-use crate::config::defs::{RunConfig, StreamDataType};
+use crate::config::defs::{RunConfig, StreamDataType, SimdLevel};
 
 
 #[derive(Debug, Clone)]
@@ -568,4 +569,29 @@ pub fn compute_batch_size(
         base_batch  // Fixed if unknown
     }
         .clamp(10_000, 500_000)  // Min/max
+}
+
+pub fn detect_simd_level() -> SimdLevel {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        info!("Non-x86_64 platform → forcing Scalar SIMD (MacBook Pro is safe here)");
+        return SimdLevel::Scalar;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") &&
+            is_x86_feature_detected!("avx512bw") &&
+            is_x86_feature_detected!("avx512vl") &&
+            is_x86_feature_detected!("avx512dq") {
+            info!("AVX-512 (F+BW+VL+DQ) detected → enabling AVX512 path (r8id.48xlarge / EPYC)");
+            SimdLevel::Avx512
+        } else if is_x86_feature_detected!("avx2") {
+            debug!("AVX2 detected (no AVX-512) → falling back to AVX2");
+            SimdLevel::Avx2
+        } else {
+            info!("No vector extensions detected → Scalar fallback (safe on all hardware)");
+            SimdLevel::Scalar
+        }
+    }
 }

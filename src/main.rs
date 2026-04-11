@@ -33,7 +33,7 @@ use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
                            compute_base_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
-                           GpuDetection, GpuInfo};
+                           GpuDetection, GpuInfo, detect_simd_level};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 use pipelines::db;
@@ -120,6 +120,8 @@ async fn main() -> Result<()> {
     };
     let base_buffer_size = compute_base_buffer_size(input_size);
 
+    let simd = detect_simd_level();
+
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
     let run_config = Arc::new(RunConfig {
@@ -136,7 +138,8 @@ async fn main() -> Result<()> {
         available_ram,
         rng,
         log_level,
-        base_backpressure_pause: 1000 // NB: hardcoded for testing
+        base_backpressure_pause: 1000, // NB: hardcoded for testing
+        simd: simd
 
     });
 

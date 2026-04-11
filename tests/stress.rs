@@ -24,6 +24,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Semaphore};
 use seqtoid_pipelines::cli::Arguments;
 use seqtoid_pipelines::utils::system::{detect_cores_and_load, detect_ram, generate_rng};
+use seqtoid_pipelines::config::defs::SimdLevel;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -164,6 +165,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
         rng: rng,
         log_level: LevelFilter::Debug,
         base_backpressure_pause: 1000,
+        simd: SimdLevel::Scalar
     })
 }
 

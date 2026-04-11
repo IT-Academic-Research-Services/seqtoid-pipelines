@@ -199,6 +199,13 @@ pub const FASTQ_TAG: &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdLevel {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -214,7 +221,8 @@ pub struct RunConfig {
     pub available_ram: u64,
     pub rng: StdRng,
     pub log_level: LevelFilter,
-    pub base_backpressure_pause: u64
+    pub base_backpressure_pause: u64,
+    pub simd: SimdLevel,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -41,7 +41,7 @@ use rayon::prelude::*;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType};
-use crate::config::defs::{CoreAllocation, RunConfig};
+use crate::config::defs::{CoreAllocation, RunConfig, SimdLevel};
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 
 
@@ -2001,7 +2001,8 @@ mod tests {
             available_ram: available_ram,
             rng: rng,
             log_level: LevelFilter::Debug,
-            base_backpressure_pause: 1000
+            base_backpressure_pause: 1000,
+            simd: SimdLevel::Scalar
         })
     }
 
