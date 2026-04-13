@@ -3266,21 +3266,21 @@ pub async fn generate_taxon_counts(
                         max_batch_process = batch_elapsed;
                     }
 
-                    if recv_wait >= Duration::from_millis(100)
-                        || batch_elapsed >= Duration::from_millis(100)
-                    {
-                        debug!(
-                            "[generate_taxon_counts:{}] worker {} recv_wait={:?} batch_time={:?} batches={} pairs={} agg={} cache={}",
-                            ct,
-                            worker_idx,
-                            recv_wait,
-                            batch_elapsed,
-                            batches,
-                            total_pairs,
-                            agg.len(),
-                            lineage_cache.len(),
-                        );
-                    }
+                    // if recv_wait >= Duration::from_millis(100)
+                    //     || batch_elapsed >= Duration::from_millis(100)
+                    // {
+                    //     debug!(
+                    //         "[generate_taxon_counts:{}] worker {} recv_wait={:?} batch_time={:?} batches={} pairs={} agg={} cache={}",
+                    //         ct,
+                    //         worker_idx,
+                    //         recv_wait,
+                    //         batch_elapsed,
+                    //         batches,
+                    //         total_pairs,
+                    //         agg.len(),
+                    //         lineage_cache.len(),
+                    //     );
+                    // }
 
                     // if last_log.elapsed() >= Duration::from_secs(10) {
                     //     info!(
