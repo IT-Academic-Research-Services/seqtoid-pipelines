@@ -825,33 +825,25 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
         return true;
     }
 
-    // Convert to str with fallback (safe, no panic)
-    let s1 = std::str::from_utf8(id1).unwrap_or("");
-    let s2 = std::str::from_utf8(id2).unwrap_or("");
+    let mut base1 = id1;
+    let mut base2 = id2;
 
-    // Strip common suffixes
-    let suffixes: [&str; 24] = [
-        "/1", "/2",
-        ".1", ".2",
-        " 1:", " 2:",
-        " 1:N:0:", " 2:N:0:",
-        "/1:N:0:", "/2:N:0:",
-        "_1", "_2",
-        " 1#0/1", " 2#0/2",
-        "|1", "|2",
-        " 1#", " 2#",
-        "/R1", "/R2",
-        "_R1", "_R2",
-        " 1:0", " 2:0",
+    // Strip common suffixes (byte-level)
+    let suffixes: [&[u8]; 24] = [
+        b"/1", b"/2",
+        b".1", b".2",
+        b" 1:", b" 2:",
+        b" 1:N:0:", b" 2:N:0:",
+        b"/1:N:0:", b"/2:N:0:",
+        b"_1", b"_2",
+        b" 1#0/1", b" 2#0/2",
+        b"|1", b"|2",
+        b" 1#", b" 2#",
+        b"/R1", b"/R2",
+        b"_R1", b"_R2",
+        b" 1:0", b" 2:0",
     ];
 
-    let mut base1 = s1;
-    let mut base2 = s2;
-
-    // Check if the IDs are SRA-style: "ACCESSION.N.1" and "ACCESSION.N.2"
-    // or fastq-dump style: "ACCESSION.N 1" and "ACCESSION.N 2"
-    
-    // Attempt to strip suffixes
     let mut stripped1 = false;
     for &suffix in &suffixes {
         if base1.ends_with(suffix) {
@@ -870,27 +862,35 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
         }
     }
 
-    // Special case for SRA-style if not already handled by suffixes
-    // e.g. "SRR8073913.1.1" -> base1 "SRR8073913.1" if ".1" was stripped
-    // But sometimes it's "SRR8073913.1" (R1) and "SRR8073913.1" (R2) - handled by exact match
-    
-    // If we stripped something and they now match, return true
     if (stripped1 || stripped2) && base1 == base2 {
         return true;
     }
 
-    // Try a more aggressive approach: strip everything after the first space or last dot/slash/underscore
-    // but only if they then match.
-    if let Some(space_idx) = base1.find(' ') {
+    // Try a more aggressive approach: strip everything after the first space
+    if let Some(space_idx) = base1.iter().position(|&b| b == b' ') {
         base1 = &base1[..space_idx];
     }
-    if let Some(space_idx) = base2.find(' ') {
+    if let Some(space_idx) = base2.iter().position(|&b| b == b' ') {
         base2 = &base2[..space_idx];
     }
 
     // Clean up any trailing characters
-    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#' || c == '.' || c == '/' || c == '_');
-    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#' || c == '.' || c == '/' || c == '_');
+    while !base1.is_empty() {
+        let last = base1[base1.len() - 1];
+        if last == b' ' || last == b'\t' || last == b':' || last == b'#' || last == b'.' || last == b'/' || last == b'_' {
+            base1 = &base1[..base1.len() - 1];
+        } else {
+            break;
+        }
+    }
+    while !base2.is_empty() {
+        let last = base2[base2.len() - 1];
+        if last == b' ' || last == b'\t' || last == b':' || last == b'#' || last == b'.' || last == b'/' || last == b'_' {
+            base2 = &base2[..base2.len() - 1];
+        } else {
+            break;
+        }
+    }
 
     base1 == base2
 }
