@@ -420,7 +420,7 @@ unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Optio
 
     let mut i = 0usize;
     while i + 64 <= len {
-        let chunk = _mm512_loadu_si512(head.as_ptr().add(i) as *const __m512i);
+        let chunk = _mm512_loadu_si512(head.as_ptr().add(i).cast::<__m512i>());
         let mask: u64 =
             _mm512_cmpeq_epi8_mask(chunk, space_splat) |
             _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |

@@ -89,6 +89,7 @@ impl PafRecord {
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn parse_line_avx512_inner(line: &str) -> Result<Self> {
         use std::arch::x86_64::*;
+        use std::arch::x86_64::__m512i;
 
         let bytes = line.trim_end().as_bytes();
         let len = bytes.len();
@@ -102,7 +103,7 @@ impl PafRecord {
         let mut i = 0usize;
 
         while i + 64 <= len {
-            let chunk = _mm512_loadu_si512(bytes.as_ptr().add(i) as *const i32);
+            let chunk = _mm512_loadu_si512(bytes.as_ptr().add(i).cast::<__m512i>());
             let mut mask: u64 = _mm512_cmpeq_epi8_mask(chunk, tab_splat);
             while mask != 0 {
                 let bit = mask.trailing_zeros() as usize;

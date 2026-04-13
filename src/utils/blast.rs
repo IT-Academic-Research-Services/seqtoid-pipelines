@@ -207,12 +207,13 @@ impl M8Record {
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn collect_tab_positions(bytes: &[u8]) -> Vec<usize> {
         use std::arch::x86_64::*;
+        use std::arch::x86_64::__m512i;
         let len = bytes.len();
         let mut tab_pos: Vec<usize> = Vec::with_capacity(16);
         let tab_splat = _mm512_set1_epi8(b'\t' as i8);
         let mut i = 0usize;
         while i + 64 <= len {
-            let chunk = _mm512_loadu_si512(bytes.as_ptr().add(i) as *const i32);
+            let chunk = _mm512_loadu_si512(bytes.as_ptr().add(i).cast::<__m512i>());
             let mut mask: u64 = _mm512_cmpeq_epi8_mask(chunk, tab_splat);
             while mask != 0 {
                 let bit = mask.trailing_zeros() as usize;
