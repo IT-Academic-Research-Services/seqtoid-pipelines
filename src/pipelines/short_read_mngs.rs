@@ -2266,7 +2266,7 @@ pub async fn minimap2_non_host_align(
                 let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
                     .context("Failed to generate minimap2 args")?;
 
-                info!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
+                debug!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
 
                 let (mut child, stderr_task) = spawn_cmd(
                     config.clone(),
@@ -2278,7 +2278,7 @@ pub async fn minimap2_non_host_align(
                     .context("Failed to spawn minimap2")?;
 
                 if let Some(pid) = child.id() {
-                    info!("minimap2 PID for {}: {}", chunk_name, pid);
+                    debug!("minimap2 PID for {}: {}", chunk_name, pid);
                 }
 
                 if let Some(stdout) = child.stdout.take() {
@@ -2286,7 +2286,7 @@ pub async fn minimap2_non_host_align(
                     let mut line = String::new();
                     let mut lines_sent = 0u64;
 
-                    info!("[minimap2 {}] STARTED reading stdout", chunk_name);
+                    debug!("[minimap2 {}] STARTED reading stdout", chunk_name);
 
                     while reader.read_line(&mut line).await? > 0 {
                         let trimmed = line.trim_end();
@@ -2307,19 +2307,19 @@ pub async fn minimap2_non_host_align(
                             }
 
                             lines_sent += 1;
-                            if lines_sent % 50_000 == 0 {
-                                info!(
-                                    "[minimap2 {}] streamed {} PAF lines so far (last: {})",
-                                    chunk_name,
-                                    lines_sent,
-                                    &trimmed[..std::cmp::min(120, trimmed.len())]
-                                );
-                            }
+                            // if lines_sent % 50_000 == 0 {
+                            //     debug!(
+                            //         "[minimap2 {}] streamed {} PAF lines so far (last: {})",
+                            //         chunk_name,
+                            //         lines_sent,
+                            //         &trimmed[..std::cmp::min(120, trimmed.len())]
+                            //     );
+                            // }
                         }
                         line.clear();
                     }
 
-                    info!(
+                    debug!(
                         "[minimap2 {}] FINISHED reading stdout — sent {} complete PAF lines",
                         chunk_name, lines_sent
                     );
