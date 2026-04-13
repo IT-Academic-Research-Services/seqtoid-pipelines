@@ -3125,8 +3125,8 @@ async fn diamond_non_host_align(
     ).await?;
 
     // Take pipes upfront (before any move)
+    // Note: stderr is already consumed by spawn_cmd's internal stderr_task; do not take it again.
     let diamond_stdout = diamond_child.stdout.take().ok_or_else(|| anyhow!("diamond stdout missing"))?;
-    let diamond_stderr = diamond_child.stderr.take().ok_or_else(|| anyhow!("diamond stderr missing"))?;
 
     // Parse stdout to m8 stream
     let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
