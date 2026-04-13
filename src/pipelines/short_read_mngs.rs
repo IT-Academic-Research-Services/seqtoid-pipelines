@@ -7706,22 +7706,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Temporary: Skip Diamond by providing empty outputs
-    let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    drop(dummy_tx); // Immediately drop sender to create an empty stream
-    let non_host_diamond_m8_stream = dummy_rx;
-    let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
+    // drop(dummy_tx); // Immediately drop sender to create an empty stream
+    // let non_host_diamond_m8_stream = dummy_rx;
+    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
 
     // Diamond non_host alignment
-    // let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
-    //     config.clone(),
-    //     non_host_r1_path.clone(),
-    //     non_host_r2_path_opt.clone(),
-    // ).await?;
-    // cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    // cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
-    // final_temp_dirs.extend(non_host_diamond_temp_dirs);
+    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+    ).await?;
+    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
+    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
+    final_temp_dirs.extend(non_host_diamond_temp_dirs);
 
     let nr_concurrency = compute_phase_concurrency(
         &config,
