@@ -2762,13 +2762,13 @@ pub async fn call_hits_m8(
             while let Some(msg) = worker_rx.recv().await {
                 match msg {
                     WorkerMsg::ProcessRead { read_id, hits } => {
-                        debug!(
-                            "[call_hits_m8:{}] worker {} processing read_id={} hits={}",
-                            worker_tag,
-                            worker_idx,
-                            read_id,
-                            hits.len()
-                        );
+                        // debug!(
+                        //     "[call_hits_m8:{}] worker {} processing read_id={} hits={}",
+                        //     worker_tag,
+                        //     worker_idx,
+                        //     read_id,
+                        //     hits.len()
+                        // );
 
                         let reduced = summarize_m8_hits(
                             0,
@@ -2885,13 +2885,13 @@ pub async fn call_hits_m8(
                 let prev_read_id = current_read_id.take().unwrap();
                 let shard = shard_for_read_id(&prev_read_id, worker_count);
 
-                debug!(
-                    "[call_hits_m8:{}] dispatching read_id={} with {} hits to worker {}",
-                    coordinator_tag,
-                    prev_read_id,
-                    current_hits.len(),
-                    shard
-                );
+                // debug!(
+                //     "[call_hits_m8:{}] dispatching read_id={} with {} hits to worker {}",
+                //     coordinator_tag,
+                //     prev_read_id,
+                //     current_hits.len(),
+                //     shard
+                // );
 
                 worker_txs[shard]
                     .send(WorkerMsg::ProcessRead {
@@ -2916,13 +2916,13 @@ pub async fn call_hits_m8(
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
 
-                debug!(
-                    "[call_hits_m8:{}] dispatching final read_id={} with {} hits to worker {}",
-                    coordinator_tag,
-                    read_id,
-                    current_hits.len(),
-                    shard
-                );
+                // debug!(
+                //     "[call_hits_m8:{}] dispatching final read_id={} with {} hits to worker {}",
+                //     coordinator_tag,
+                //     read_id,
+                //     current_hits.len(),
+                //     shard
+                // );
 
                 worker_txs[shard]
                     .send(WorkerMsg::ProcessRead {

@@ -1844,7 +1844,7 @@ where
                 let p = Arc::clone(&processor);
                 let config_clone = Arc::clone(&config);
 
-                debug!("{}: starting batch of {} bytes", stage_name, batch.len());
+                // debug!("{}: starting batch of {} bytes", stage_name, batch.len());
 
                 let lines = match tokio::task::spawn_blocking(move || {
                     config_clone.thread_pool.install(|| p(batch))
@@ -1858,11 +1858,11 @@ where
                     }
                 };
 
-                debug!(
-                    "{}: batch complete — produced {} lines",
-                    stage_name,
-                    lines.len()
-                );
+                // debug!(
+                //     "{}: batch complete — produced {} lines",
+                //     stage_name,
+                //     lines.len()
+                // );
 
                 let batch_len = lines.len() as u64;
                 if !send_lines(&tx, lines, stage_name, "batch").await {
@@ -1870,12 +1870,12 @@ where
                 }
 
                 processed += batch_len;
-                if processed % 1_000 == 0 || processed % 100_000 == 0 {
-                    info!(
-                        "{}: {} items (batch target {} bytes)",
-                        stage_name, processed, batch_target_bytes
-                    );
-                }
+                // if processed % 1_000 == 0 || processed % 100_000 == 0 {
+                //     info!(
+                //         "{}: {} items (batch target {} bytes)",
+                //         stage_name, processed, batch_target_bytes
+                //     );
+                // }
             }
         }
 
@@ -1937,9 +1937,9 @@ pub async fn fanout_to_channels(
         let mut count = 0usize;
         while let Some(item) = upstream.next().await {
             count += 1;
-            if count % 100_000 == 0 {
-                debug!("[fanout {}] forwarded {} items", label, count);
-            }
+            // if count % 100_000 == 0 {
+            //     debug!("[fanout {}] forwarded {} items", label, count);
+            // }
             // Send to EVERY branch (never drop)
             let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
             let _ = futures::future::join_all(sends).await;
