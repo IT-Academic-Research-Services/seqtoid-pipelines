@@ -118,9 +118,11 @@ impl M8Record {
         }
 
         macro_rules! parse_u64 {
-            () => {
-                next!().parse::<u64>().map_err(|e| anyhow!("invalid u64: {}", e))?
-            };
+            () => {{
+                let s = next!();
+                lexical_parse::<u64, _>(s.as_bytes())
+                    .map_err(|e| anyhow!("invalid u64 '{}': {}", s, e))?
+            }};
         }
 
         let qname = next!().to_string();
@@ -191,9 +193,11 @@ impl M8Record {
         }
 
         macro_rules! parse_u64 {
-            () => {
-                next!().parse::<u64>().map_err(|e| anyhow!("invalid u64: {}", e))?
-            };
+            () => {{
+                let s = next!();
+                lexical_parse::<u64, _>(s.as_bytes())
+                    .map_err(|e| anyhow!("invalid u64 '{}': {}", s, e))?
+            }};
         }
 
         let qname = next!().to_string();
