@@ -659,14 +659,14 @@ pub async fn write_byte_stream_to_file(
                     total_bytes += bytes.len() as u64;
                     item_count += 1;
 
-                    if item_count % 50_000 == 0 {
-                        debug!(
-                            "[{}] writer: progress {} items, {} bytes",
-                            tag,
-                            item_count,
-                            total_bytes
-                        );
-                    }
+                    // if item_count % 50_000 == 0 {
+                    //     debug!(
+                    //         "[{}] writer: progress {} items, {} bytes",
+                    //         tag,
+                    //         item_count,
+                    //         total_bytes
+                    //     );
+                    // }
                 }
                 _ => {
                     warn!(

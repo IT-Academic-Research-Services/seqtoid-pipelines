@@ -2723,30 +2723,7 @@ pub async fn sort_m8_by_read_id(
     meta.len(),
     sorted_path.display()
 );
-    // Debug copy of sorted file to out_dir
-    let debug_sorted_path = config
-        .out_dir
-        .join(format!("{}_sorted_by_read.debug.m8", db_type));
 
-    tokio::fs::copy(&sorted_path, &debug_sorted_path)
-        .await
-        .map_err(|e| PipelineError::IOError(format!(
-            "Failed to copy sorted file to {}: {}",
-            debug_sorted_path.display(),
-            e
-        )))?;
-
-    info!(
-    "[{}] copied sorted file to {}",
-    tag,
-    debug_sorted_path.display()
-);
-    let meta = tokio::fs::metadata(&debug_sorted_path).await?;
-    info!(
-    "[{}] debug sorted file size: {} bytes",
-    tag,
-    meta.len()
-);
 
     let rx = parse_lines(sorted_file, config.base_buffer_size)
         .await
