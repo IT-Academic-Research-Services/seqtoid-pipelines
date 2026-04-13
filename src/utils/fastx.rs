@@ -411,6 +411,7 @@ fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Option<String>) {
     use std::arch::x86_64::*;
+    use std::arch::x86_64::__m512i;
 
     let len = head.len();
     let space_splat = _mm512_set1_epi8(b' ' as i8);
@@ -419,7 +420,7 @@ unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Optio
 
     let mut i = 0usize;
     while i + 64 <= len {
-        let chunk = _mm512_loadu_si512(head.as_ptr().add(i) as *const i32);
+        let chunk = _mm512_loadu_si512(head.as_ptr().add(i) as *const __m512i);
         let mask: u64 =
             _mm512_cmpeq_epi8_mask(chunk, space_splat) |
             _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
