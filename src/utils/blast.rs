@@ -26,7 +26,9 @@ use tokio::time::{sleep, Duration, Instant};
 use ahash::RandomState as AHashRandomState;
 
 
-use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode};
+use once_cell::sync::Lazy;
+
+use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
@@ -94,152 +96,273 @@ pub enum WorkerMsg {
 }
 
 impl M8Record {
-    /// Parse 14-column NT (blastn) output — matches BlastnOutput6NTReader
-    pub fn parse_line_nt(line: &str) -> Result<Self> {
+    // ── NT scalar ──────────────────────────────────────────────────────────
+
+    /// Parse 14-column NT (blastn) output — scalar baseline.
+    fn parse_line_nt_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
             return Err(anyhow!("empty line"));
         }
-
         let mut fields = line.split('\t');
 
         macro_rules! next {
-            () => {
-                fields.next().ok_or_else(|| anyhow!("missing field in NT m8 line"))?
+            ($name:literal) => {
+                fields.next().ok_or_else(|| anyhow!(concat!("missing ", $name, " in NT m8 line")))?
             };
         }
-
         macro_rules! parse_float {
-            () => {{
-                let s = next!();
+            ($name:literal) => {{
+                let s = next!($name);
                 lexical_parse::<f64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!("invalid float '{}': {}", s, e))?
+                    .map_err(|e| anyhow!(concat!("invalid float ", $name, ": {}"), e))?
             }};
         }
-
         macro_rules! parse_u64 {
-            () => {{
-                let s = next!();
+            ($name:literal) => {{
+                let s = next!($name);
                 lexical_parse::<u64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!("invalid u64 '{}': {}", s, e))?
+                    .map_err(|e| anyhow!(concat!("invalid u64 ", $name, ": {}"), e))?
             }};
         }
 
-        let qname = next!().to_string();
-        let raw_accession = next!(); // e.g., "NC_123456.2"
-        let tname = raw_accession
-            .split('.')
-            .next()
-            .unwrap_or(raw_accession)
-            .to_string(); // → "NC_123456"
+        let qname           = next!("qname").to_string();
+        let raw_accession   = next!("tname");
+        let tname           = raw_accession.split('.').next().unwrap_or(raw_accession).to_string();
+        let pident          = parse_float!("pident");
+        let alen            = parse_u64!("alen");
+        let mismatch        = parse_u64!("mismatch");
+        let gapopen         = parse_u64!("gapopen");
+        let qstart          = parse_u64!("qstart");
+        let qend            = parse_u64!("qend");
+        let tstart          = parse_u64!("tstart");
+        let tend            = parse_u64!("tend");
+        let evalue          = parse_float!("evalue");
+        let bitscore        = parse_float!("bitscore");
+        let qlen            = parse_u64!("qlen");
+        let slen            = parse_u64!("slen");
 
-        let pident = parse_float!();
-        let alen = parse_u64!();
-        let mismatch = parse_u64!();
-        let gapopen = parse_u64!();
-        let qstart = parse_u64!();
-        let qend = parse_u64!();
-        let tstart = parse_u64!();
-        let tend = parse_u64!();
-        let evalue = parse_float!();
-        let bitscore = parse_float!();
-        let qlen = parse_u64!();
-        let slen = parse_u64!();
-
-        // Defensive: Warn on extra columns
         if fields.next().is_some() {
             warn!("Extra columns in NT m8 line (expected 14): {}", line);
         }
-
-        Ok(Self {
-            qname,
-            tname,
-            pident,
-            alen,
-            mismatch,
-            gapopen,
-            qstart,
-            qend,
-            tstart,
-            tend,
-            evalue,
-            bitscore,
-            qlen,
-            slen,
-        })
+        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen, slen })
     }
 
-    /// Parse 12-column NR (blastx) output — matches BlastnOutput6Reader
-    pub fn parse_line_nr(line: &str) -> Result<Self> {
+    // ── NR scalar ──────────────────────────────────────────────────────────
+
+    /// Parse 12-column NR (blastx) output — scalar baseline.
+    fn parse_line_nr_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
             return Err(anyhow!("empty line"));
         }
-
         let mut fields = line.split('\t');
 
         macro_rules! next {
-            () => {
-                fields.next().ok_or_else(|| anyhow!("missing field in NR m8 line"))?
+            ($name:literal) => {
+                fields.next().ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
             };
         }
-
         macro_rules! parse_float {
-            () => {{
-                let s = next!();
+            ($name:literal) => {{
+                let s = next!($name);
                 lexical_parse::<f64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!("invalid float '{}': {}", s, e))?
+                    .map_err(|e| anyhow!(concat!("invalid float ", $name, ": {}"), e))?
             }};
         }
-
         macro_rules! parse_u64 {
-            () => {{
-                let s = next!();
+            ($name:literal) => {{
+                let s = next!($name);
                 lexical_parse::<u64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!("invalid u64 '{}': {}", s, e))?
+                    .map_err(|e| anyhow!(concat!("invalid u64 ", $name, ": {}"), e))?
             }};
         }
 
-        let qname = next!().to_string();
-        let raw_accession = next!(); // e.g., "QIK02963.1"
-        let tname = raw_accession
-            .split('.')
-            .next()
-            .unwrap_or(raw_accession)
-            .to_string(); // → "QIK02963"
+        let qname           = next!("qname").to_string();
+        let raw_accession   = next!("tname");
+        let tname           = raw_accession.split('.').next().unwrap_or(raw_accession).to_string();
+        let pident          = parse_float!("pident");
+        let alen            = parse_u64!("alen");
+        let mismatch        = parse_u64!("mismatch");
+        let gapopen         = parse_u64!("gapopen");
+        let qstart          = parse_u64!("qstart");
+        let qend            = parse_u64!("qend");
+        let tstart          = parse_u64!("tstart");
+        let tend            = parse_u64!("tend");
+        let evalue          = parse_float!("evalue");
+        let bitscore        = parse_float!("bitscore");
 
-        let pident = parse_float!();
-        let alen = parse_u64!();
-        let mismatch = parse_u64!();
-        let gapopen = parse_u64!();
-        let qstart = parse_u64!();
-        let qend = parse_u64!();
-        let tstart = parse_u64!();
-        let tend = parse_u64!();
-        let evalue = parse_float!();
-        let bitscore = parse_float!();
-
-        // Defensive: Warn on extra columns
         if fields.next().is_some() {
             warn!("Extra columns in NR m8 line (expected 12): {}", line);
         }
+        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen: 0, slen: 0 })
+    }
 
-        Ok(Self {
-            qname,
-            tname,
-            pident,
-            alen,
-            mismatch,
-            gapopen,
-            qstart,
-            qend,
-            tstart,
-            tend,
-            evalue,
-            bitscore,
-            qlen: 0,  // Safe default: Not present/used in NR logic
-            slen: 0,  // Safe default: Not present/used anywhere
-        })
+    // ── shared AVX-512 tab scanner ─────────────────────────────────────────
+
+    /// Collect every tab position in `bytes` using a 64-byte AVX-512 sweep.
+    /// Falls back to scalar for the tail (< 64 remaining bytes).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn collect_tab_positions(bytes: &[u8]) -> Vec<usize> {
+        use std::arch::x86_64::*;
+        let len = bytes.len();
+        let mut tab_pos: Vec<usize> = Vec::with_capacity(16);
+        let tab_splat = _mm512_set1_epi8(b'\t' as i8);
+        let mut i = 0usize;
+        while i + 64 <= len {
+            let chunk = _mm512_loadu_si512(bytes.as_ptr().add(i) as *const i32);
+            let mut mask: u64 = _mm512_cmpeq_epi8_mask(chunk, tab_splat);
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                tab_pos.push(i + bit);
+                mask &= mask - 1;
+            }
+            i += 64;
+        }
+        while i < len {
+            if bytes[i] == b'\t' { tab_pos.push(i); }
+            i += 1;
+        }
+        tab_pos
+    }
+
+    // ── NT AVX-512 ─────────────────────────────────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn parse_line_nt_avx512_inner(line: &str) -> Result<Self> {
+        let bytes = line.trim_end().as_bytes();
+        if bytes.is_empty() { return Err(anyhow!("empty line")); }
+
+        let tab_pos = Self::collect_tab_positions(bytes);
+        let len = bytes.len();
+
+        if tab_pos.len() < 13 {
+            return Err(anyhow!("NT m8 line has {} tabs, need ≥13 for 14 fields", tab_pos.len()));
+        }
+
+        macro_rules! field {
+            ($n:expr) => {{
+                let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
+                let end   = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+                &bytes[start..end]
+            }};
+        }
+        macro_rules! parse_u64 {
+            ($n:expr, $name:literal) => {
+                lexical_parse::<u64, _>(field!($n))
+                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+            };
+        }
+        macro_rules! parse_f64 {
+            ($n:expr, $name:literal) => {
+                lexical_parse::<f64, _>(field!($n))
+                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+            };
+        }
+
+        let qname = std::str::from_utf8(field!(0)).map_err(|_| anyhow!("qname not UTF-8"))?.to_string();
+        let raw   = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
+        let tname = raw.split('.').next().unwrap_or(raw).to_string();
+
+        let pident   = parse_f64!(2,  "pident");
+        let alen     = parse_u64!(3,  "alen");
+        let mismatch = parse_u64!(4,  "mismatch");
+        let gapopen  = parse_u64!(5,  "gapopen");
+        let qstart   = parse_u64!(6,  "qstart");
+        let qend     = parse_u64!(7,  "qend");
+        let tstart   = parse_u64!(8,  "tstart");
+        let tend     = parse_u64!(9,  "tend");
+        let evalue   = parse_f64!(10, "evalue");
+        let bitscore = parse_f64!(11, "bitscore");
+        let qlen     = parse_u64!(12, "qlen");
+        let slen     = parse_u64!(13, "slen");
+
+        if tab_pos.len() > 13 {
+            warn!("Extra columns in NT m8 line (expected 14)");
+        }
+        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen, slen })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn parse_line_nt_avx512(line: &str) -> Result<Self> {
+        // Safety: only reachable when SIMD_LEVEL == Avx512, confirmed at startup.
+        unsafe { Self::parse_line_nt_avx512_inner(line) }
+    }
+
+    // ── NR AVX-512 ─────────────────────────────────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn parse_line_nr_avx512_inner(line: &str) -> Result<Self> {
+        let bytes = line.trim_end().as_bytes();
+        if bytes.is_empty() { return Err(anyhow!("empty line")); }
+
+        let tab_pos = Self::collect_tab_positions(bytes);
+        let len = bytes.len();
+
+        if tab_pos.len() < 11 {
+            return Err(anyhow!("NR m8 line has {} tabs, need ≥11 for 12 fields", tab_pos.len()));
+        }
+
+        macro_rules! field {
+            ($n:expr) => {{
+                let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
+                let end   = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+                &bytes[start..end]
+            }};
+        }
+        macro_rules! parse_u64 {
+            ($n:expr, $name:literal) => {
+                lexical_parse::<u64, _>(field!($n))
+                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+            };
+        }
+        macro_rules! parse_f64 {
+            ($n:expr, $name:literal) => {
+                lexical_parse::<f64, _>(field!($n))
+                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+            };
+        }
+
+        let qname = std::str::from_utf8(field!(0)).map_err(|_| anyhow!("qname not UTF-8"))?.to_string();
+        let raw   = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
+        let tname = raw.split('.').next().unwrap_or(raw).to_string();
+
+        let pident   = parse_f64!(2,  "pident");
+        let alen     = parse_u64!(3,  "alen");
+        let mismatch = parse_u64!(4,  "mismatch");
+        let gapopen  = parse_u64!(5,  "gapopen");
+        let qstart   = parse_u64!(6,  "qstart");
+        let qend     = parse_u64!(7,  "qend");
+        let tstart   = parse_u64!(8,  "tstart");
+        let tend     = parse_u64!(9,  "tend");
+        let evalue   = parse_f64!(10, "evalue");
+        let bitscore = parse_f64!(11, "bitscore");
+
+        if tab_pos.len() > 11 {
+            warn!("Extra columns in NR m8 line (expected 12)");
+        }
+        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen: 0, slen: 0 })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn parse_line_nr_avx512(line: &str) -> Result<Self> {
+        // Safety: only reachable when SIMD_LEVEL == Avx512, confirmed at startup.
+        unsafe { Self::parse_line_nr_avx512_inner(line) }
+    }
+
+    // ── public dispatch ────────────────────────────────────────────────────
+
+    /// Parse 14-column NT (blastn) output — dispatches to best available path.
+    pub fn parse_line_nt(line: &str) -> Result<Self> {
+        PARSE_M8_NT(line)
+    }
+
+    /// Parse 12-column NR (blastx) output — dispatches to best available path.
+    pub fn parse_line_nr(line: &str) -> Result<Self> {
+        PARSE_M8_NR(line)
     }
 
 
@@ -261,6 +384,26 @@ impl M8Record {
         )
     }
 }
+
+static PARSE_M8_NT: Lazy<fn(&str) -> Result<M8Record>> = Lazy::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(*SIMD_LEVEL, SimdLevel::Avx512) {
+        debug!("M8 NT parser: using AVX-512 path");
+        return M8Record::parse_line_nt_avx512;
+    }
+    debug!("M8 NT parser: using scalar path");
+    M8Record::parse_line_nt_scalar
+});
+
+static PARSE_M8_NR: Lazy<fn(&str) -> Result<M8Record>> = Lazy::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(*SIMD_LEVEL, SimdLevel::Avx512) {
+        debug!("M8 NR parser: using AVX-512 path");
+        return M8Record::parse_line_nr_avx512;
+    }
+    debug!("M8 NR parser: using scalar path");
+    M8Record::parse_line_nr_scalar
+});
 
 #[derive(Default)]
 pub struct AggBucket {
@@ -1157,3 +1300,170 @@ pub async fn generate_taxon_count_json_from_m8(
 //     info!("compute_merged_taxon_counts complete");
 //     Ok(())
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_m8_eq(a: &M8Record, b: &M8Record, ctx: &str) {
+        assert_eq!(a.qname,    b.qname,    "{ctx}: qname");
+        assert_eq!(a.tname,    b.tname,    "{ctx}: tname");
+        assert!((a.pident - b.pident).abs() < 1e-9, "{ctx}: pident");
+        assert_eq!(a.alen,     b.alen,     "{ctx}: alen");
+        assert_eq!(a.mismatch, b.mismatch, "{ctx}: mismatch");
+        assert_eq!(a.gapopen,  b.gapopen,  "{ctx}: gapopen");
+        assert_eq!(a.qstart,   b.qstart,   "{ctx}: qstart");
+        assert_eq!(a.qend,     b.qend,     "{ctx}: qend");
+        assert_eq!(a.tstart,   b.tstart,   "{ctx}: tstart");
+        assert_eq!(a.tend,     b.tend,     "{ctx}: tend");
+        assert!((a.evalue   - b.evalue  ).abs() < 1e-30, "{ctx}: evalue");
+        assert!((a.bitscore - b.bitscore).abs() < 1e-9,  "{ctx}: bitscore");
+        assert_eq!(a.qlen,     b.qlen,     "{ctx}: qlen");
+        assert_eq!(a.slen,     b.slen,     "{ctx}: slen");
+    }
+
+    fn compare_nt(line: &str) {
+        let scalar = M8Record::parse_line_nt_scalar(line).expect("NT scalar failed");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx = M8Record::parse_line_nt_avx512(line).expect("NT avx512 failed");
+            assert_m8_eq(&scalar, &avx, line);
+        }
+    }
+
+    fn compare_nr(line: &str) {
+        let scalar = M8Record::parse_line_nr_scalar(line).expect("NR scalar failed");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx = M8Record::parse_line_nr_avx512(line).expect("NR avx512 failed");
+            assert_m8_eq(&scalar, &avx, line);
+        }
+    }
+
+    // ── NT test lines (14 columns) ─────────────────────────────────────────
+
+    const NT_BASIC: &str =
+        "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903";
+
+    const NT_ZERO_EVALUE: &str =
+        "read2\tNC_000001.1\t100.000\t250\t0\t0\t1\t250\t1\t250\t0.0\t462.000\t250\t248956422";
+
+    const NT_MISMATCHES: &str =
+        "read3\tKJ660346.2\t95.238\t210\t10\t2\t5\t214\t500\t709\t4.56e-88\t330.000\t220\t18958";
+
+    // Long enough to span two 64-byte SIMD chunks
+    const NT_LONG_QNAME: &str =
+        "a_very_long_read_identifier_that_exceeds_sixty_four_bytes_total\tNC_045512.2\t98.667\t150\t2\t0\t1\t150\t1\t150\t2.34e-70\t275.000\t150\t29903";
+
+    const NT_TRAILING_WHITESPACE: &str =
+        "read4\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903   ";
+
+    // ── NR test lines (12 columns) ─────────────────────────────────────────
+
+    const NR_BASIC: &str =
+        "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000";
+
+    const NR_ZERO_EVALUE: &str =
+        "read2\tAAA12345.1\t100.000\t300\t0\t0\t1\t300\t1\t300\t0.0\t600.000";
+
+    const NR_GAPS: &str =
+        "read3\tXYZ99999.2\t78.431\t153\t33\t3\t10\t162\t5\t155\t8.9e-20\t89.700";
+
+    // ── NT tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_nt_basic() { compare_nt(NT_BASIC); }
+
+    #[test]
+    fn test_nt_zero_evalue() { compare_nt(NT_ZERO_EVALUE); }
+
+    #[test]
+    fn test_nt_mismatches_gaps() { compare_nt(NT_MISMATCHES); }
+
+    #[test]
+    fn test_nt_long_qname_spans_two_chunks() { compare_nt(NT_LONG_QNAME); }
+
+    #[test]
+    fn test_nt_trailing_whitespace() {
+        compare_nt(NT_TRAILING_WHITESPACE);
+        let r = M8Record::parse_line_nt_scalar(NT_TRAILING_WHITESPACE).unwrap();
+        assert_eq!(r.qname, "read4");
+        assert_eq!(r.slen, 29903);
+    }
+
+    #[test]
+    fn test_nt_accession_version_stripped() {
+        let r = M8Record::parse_line_nt_scalar(NT_BASIC).unwrap();
+        assert_eq!(r.tname, "NC_045512", "version suffix must be stripped");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx = M8Record::parse_line_nt_avx512(NT_BASIC).unwrap();
+            assert_eq!(avx.tname, "NC_045512");
+        }
+    }
+
+    #[test]
+    fn test_nt_error_on_empty() {
+        assert!(M8Record::parse_line_nt_scalar("").is_err());
+        #[cfg(target_arch = "x86_64")]
+        assert!(M8Record::parse_line_nt_avx512("").is_err());
+    }
+
+    #[test]
+    fn test_nt_error_on_too_few_fields() {
+        let short = "read1\tNC_045512.2\t99.333\t150";
+        assert!(M8Record::parse_line_nt_scalar(short).is_err());
+        #[cfg(target_arch = "x86_64")]
+        assert!(M8Record::parse_line_nt_avx512(short).is_err());
+    }
+
+    // ── NR tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_nr_basic() { compare_nr(NR_BASIC); }
+
+    #[test]
+    fn test_nr_zero_evalue() { compare_nr(NR_ZERO_EVALUE); }
+
+    #[test]
+    fn test_nr_gaps() { compare_nr(NR_GAPS); }
+
+    #[test]
+    fn test_nr_qlen_slen_zero() {
+        let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
+        assert_eq!(r.qlen, 0, "NR qlen must default to 0");
+        assert_eq!(r.slen, 0, "NR slen must default to 0");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx = M8Record::parse_line_nr_avx512(NR_BASIC).unwrap();
+            assert_eq!(avx.qlen, 0);
+            assert_eq!(avx.slen, 0);
+        }
+    }
+
+    #[test]
+    fn test_nr_accession_version_stripped() {
+        let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
+        assert_eq!(r.tname, "QIK02963");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx = M8Record::parse_line_nr_avx512(NR_BASIC).unwrap();
+            assert_eq!(avx.tname, "QIK02963");
+        }
+    }
+
+    #[test]
+    fn test_nr_error_on_empty() {
+        assert!(M8Record::parse_line_nr_scalar("").is_err());
+        #[cfg(target_arch = "x86_64")]
+        assert!(M8Record::parse_line_nr_avx512("").is_err());
+    }
+
+    #[test]
+    fn test_nr_error_on_too_few_fields() {
+        let short = "read1\tQIK02963.1\t87.500";
+        assert!(M8Record::parse_line_nr_scalar(short).is_err());
+        #[cfg(target_arch = "x86_64")]
+        assert!(M8Record::parse_line_nr_avx512(short).is_err());
+    }
+}
