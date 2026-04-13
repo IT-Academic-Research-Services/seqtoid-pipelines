@@ -13,6 +13,7 @@ use tokio::task::JoinError;
 use serde_json::Error as SerdeJsonError;
 use serde::{Deserialize, Serialize};
 use log::LevelFilter;
+use once_cell::sync::Lazy;
 
 use crate::cli::Arguments;
 
@@ -58,6 +59,10 @@ pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 pub const CONFORMING_PREAMBLE: &str = ">family_nr:-300:family_nt:-300:genus_nr:-200:genus_nt:-200:species_nr:-100:species_nt:-100:";
 
 pub const SMT_MODEST_MULTIPLIER: f32 = 1.3_f32;
+
+pub static SIMD_LEVEL: Lazy<SimdLevel> = Lazy::new(|| {
+    crate::utils::system::detect_simd_level()
+});
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
