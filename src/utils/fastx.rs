@@ -36,7 +36,7 @@ use fst::{MapBuilder};
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 
@@ -404,6 +404,7 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 pub fn read_fastq(
     path1: PathBuf,
     path2: Option<PathBuf>,
+    pairing_mode: PairingMode,
     technology: Option<Technology>,
     max_reads: u64,
     min_read_len: Option<usize>,
@@ -550,16 +551,16 @@ pub fn read_fastq(
                                                     validated_reads + undersized_reads + oversized_reads + 1));
                             }
 
-    if !compare_read_ids_bytes(r1.id(), r2.id()) {
-        warn!("{}: ID mismatch at pair {} — discarding unpaired: {} vs {}",
-              tag,
-              validated_reads + undersized_reads + oversized_reads + 1,
-              String::from_utf8_lossy(r1.id()),
-              String::from_utf8_lossy(r2.id()));
-        unpaired_r1 += 1;
-        unpaired_r2 += 1;
-        continue;
-    }
+                            if matches!(pairing_mode, PairingMode::Strict) && !compare_read_ids_bytes(r1.id(), r2.id()) {
+                                warn!("{}: ID mismatch at pair {} — discarding unpaired: {} vs {}",
+                                      tag,
+                                      validated_reads + undersized_reads + oversized_reads + 1,
+                                      String::from_utf8_lossy(r1.id()),
+                                      String::from_utf8_lossy(r2.id()));
+                                unpaired_r1 += 1;
+                                unpaired_r2 += 1;
+                                continue;
+                            }
 
                             let r1_len = r1.seq().len();
                             let r2_len = r2.seq().len();

@@ -59,7 +59,7 @@ use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, Pipeli
                           KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG,
                           MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
                           NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
-                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters};
+                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters, PairingMode};
 use crate::utils::blast::{parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
@@ -345,6 +345,7 @@ async fn validate_input(
     let (rx, val_count_task) = read_fastq(
         file1_path,
         file2_path,
+        PairingMode::Strict,
         Some(config.args.technology.clone()),
         config.args.max_reads as u64,
         config.args.min_read_len,
@@ -926,6 +927,7 @@ async fn hisat2_filter(
     let (unmapped_receiver, read_task) = read_fastq(
         fq1_path,
         fq2_path_opt,
+        PairingMode::Strict,
         None,
         u64::MAX,
         None,
@@ -6814,6 +6816,7 @@ pub async fn generate_nonhost_fastq_from_files(
     let (r1_rx, _r1_stats_task) = read_fastq(
         original_r1_path.clone(),
         None,
+        PairingMode::Relaxed,
         None,
         u64::MAX,
         None,
@@ -6830,6 +6833,7 @@ pub async fn generate_nonhost_fastq_from_files(
         let (r2_rx, _r2_stats_task) = read_fastq(
             r2_path.clone(),
             None,
+            PairingMode::Relaxed,
             None,
             u64::MAX,
             None,
@@ -7744,6 +7748,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (interleaved_rx, read_stats_task) = read_fastq(
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
+        PairingMode::Relaxed,
         None,                    // technology
         u64::MAX,
         None,

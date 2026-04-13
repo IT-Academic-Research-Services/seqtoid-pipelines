@@ -244,6 +244,12 @@ pub struct ClusterInfo {
     pub members: Vec<String>,       // All member IDs (rep at [0]) — used by non-host in CountAll
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingMode {
+    Strict,
+    Relaxed,
+}
+
 pub type DuplicateClusters = HashMap<String, ClusterInfo>;
 
 impl RunConfig {
