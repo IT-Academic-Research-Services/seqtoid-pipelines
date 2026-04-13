@@ -101,6 +101,7 @@ async fn validate_input(
         config.args.min_read_len,
         config.args.max_read_len,
         config.base_buffer_size,  // Use as chunk_size
+        "validate_input",
     )
         .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
 

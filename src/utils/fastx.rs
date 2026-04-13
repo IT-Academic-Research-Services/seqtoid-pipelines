@@ -409,10 +409,13 @@ pub fn read_fastq(
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
     chunk_size: usize,
+    tag: &str,
 ) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<ReadStats, anyhow::Error>>)> {
     let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
 
+    let tag_owned = tag.to_string();
     let task = tokio::spawn(async move {
+        let tag = &tag_owned;
         debug!("read_fastq: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
                   path1, path2, max_reads, min_read_len, max_read_len, chunk_size);
 
@@ -486,7 +489,7 @@ pub fn read_fastq(
                 debug!("read_fastq: Processed {} single-end reads (undersized: {}, validated: {}, oversized: {})",
                           validated_reads + undersized_reads + oversized_reads, undersized_reads, validated_reads, oversized_reads);
                 if validated_reads == 0 {
-                    warn!("read_fastq: Warning: No reads processed from {:?}", path1);
+                    warn!("{}: No reads processed from {:?}", tag, path1);
                 }
                 Ok(ReadStats {
                     undersized: undersized_reads,
@@ -548,7 +551,8 @@ pub fn read_fastq(
                             }
 
     if !compare_read_ids_bytes(r1.id(), r2.id()) {
-        warn!("ID mismatch at pair {} — discarding unpaired: {} vs {}",
+        warn!("{}: ID mismatch at pair {} — discarding unpaired: {} vs {}",
+              tag,
               validated_reads + undersized_reads + oversized_reads + 1,
               String::from_utf8_lossy(r1.id()),
               String::from_utf8_lossy(r2.id()));
@@ -611,13 +615,13 @@ pub fn read_fastq(
                         (Some(_), None) => {
                             unpaired_r1 += 1;
                             if unpaired_r1 <= 10 {
-                                warn!("Unpaired R1 read after R2 ended — discarding");
+                                warn!("{}: Unpaired R1 read after R2 ended — discarding", tag);
                             }
                         }
                         (None, Some(_)) => {
                             unpaired_r2 += 1;
                             if unpaired_r2 <= 10 {
-                                warn!("Unpaired R2 read after R1 ended — discarding");
+                                warn!("{}: Unpaired R2 read after R1 ended — discarding", tag);
                             }
                         }
                         (None, None) => break,
@@ -632,7 +636,7 @@ pub fn read_fastq(
                 }
 
                 if unpaired_r1 > 0 || unpaired_r2 > 0 {
-                    warn!("Discarded {} unpaired R1 reads and {} unpaired R2 reads from raw input", unpaired_r1, unpaired_r2);
+                    warn!("{}: Discarded {} unpaired R1 reads and {} unpaired R2 reads from raw input", tag, unpaired_r1, unpaired_r2);
                 }
 
                 debug!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {}, unpaired R1: {}, unpaired R2: {})",
@@ -640,7 +644,7 @@ pub fn read_fastq(
                           undersized_reads, validated_reads, oversized_reads, unpaired_r1, unpaired_r2);
 
                 if validated_reads == 0 {
-                    warn!("read_fastq: Warning: No valid paired reads processed from R1={:?}, R2={:?}", path1, path2);
+                    warn!("{}: No valid paired reads processed from R1={:?}, R2={:?}", tag, path1, path2);
                 }
 
                 Ok(ReadStats {
