@@ -10,8 +10,6 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow, Context};
 use log::{self, debug, info, error, warn};
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use std::sync::Mutex;
 
 use std::collections::HashMap;
@@ -549,13 +547,15 @@ pub fn read_fastq(
                                                     validated_reads + undersized_reads + oversized_reads + 1));
                             }
 
-                            if !compare_read_ids_bytes(r1.id(), r2.id()) {
-                                warn!("ID mismatch at pair {} — discarding unpaired",
-                                      validated_reads + undersized_reads + oversized_reads + 1);
-                                unpaired_r1 += 1;
-                                unpaired_r2 += 1;
-                                continue;
-                            }
+    if !compare_read_ids_bytes(r1.id(), r2.id()) {
+        warn!("ID mismatch at pair {} — discarding unpaired: {} vs {}",
+              validated_reads + undersized_reads + oversized_reads + 1,
+              String::from_utf8_lossy(r1.id()),
+              String::from_utf8_lossy(r2.id()));
+        unpaired_r1 += 1;
+        unpaired_r2 += 1;
+        continue;
+    }
 
                             let r1_len = r1.seq().len();
                             let r2_len = r2.seq().len();
@@ -829,70 +829,69 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
     let s1 = std::str::from_utf8(id1).unwrap_or("");
     let s2 = std::str::from_utf8(id2).unwrap_or("");
 
-    // Expanded suffix list — ordered roughly by frequency / importance
-    // Each group is labeled with the platforms / formats it covers
+    // Strip common suffixes
     let suffixes: [&str; 24] = [
-        // Classic Illumina / most common overall
         "/1", "/2",
-
-        // Older Illumina, some custom pipelines
         ".1", ".2",
-
-        // Illumina with space + colon (HiSeq, NovaSeq, NextSeq)
         " 1:", " 2:",
-
-        // Full Illumina flowcell/lane info suffix (very common on NovaSeq)
         " 1:N:0:", " 2:N:0:",
-
-        // Variant with slash instead of space (some demux tools)
         "/1:N:0:", "/2:N:0:",
-
-        // BGISEQ, DNBSEQ, MGISEQ, many Chinese platforms
         "_1", "_2",
-
-        // Very old Illumina CASAVA format (pre-2011, rare but still seen)
         " 1#0/1", " 2#0/2",
-
-        // Nanopore, Oxford Nanopore, some custom / long-read paired
         "|1", "|2",
-
-        // Rare 10x Genomics / Parse / custom variants
         " 1#", " 2#",
-
-        // 10x Genomics, Parse Biosciences, some single-cell demux
         "/R1", "/R2",
-
-        // Sometimes appears in headers instead of file names
         "_R1", "_R2",
-
-        // Rare variant without N (some older or custom)
         " 1:0", " 2:0",
     ];
 
     let mut base1 = s1;
     let mut base2 = s2;
 
-    // Strip the longest matching suffix from each ID
-    // We break after the first match to avoid over-trimming
+    // Check if the IDs are SRA-style: "ACCESSION.N.1" and "ACCESSION.N.2"
+    // or fastq-dump style: "ACCESSION.N 1" and "ACCESSION.N 2"
+    
+    // Attempt to strip suffixes
+    let mut stripped1 = false;
     for &suffix in &suffixes {
         if base1.ends_with(suffix) {
             base1 = &base1[..base1.len() - suffix.len()];
+            stripped1 = true;
             break;
         }
     }
 
+    let mut stripped2 = false;
     for &suffix in &suffixes {
         if base2.ends_with(suffix) {
             base2 = &base2[..base2.len() - suffix.len()];
+            stripped2 = true;
             break;
         }
     }
 
-    // Clean up any trailing whitespace, colon, or hash that might remain
-    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
-    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
+    // Special case for SRA-style if not already handled by suffixes
+    // e.g. "SRR8073913.1.1" -> base1 "SRR8073913.1" if ".1" was stripped
+    // But sometimes it's "SRR8073913.1" (R1) and "SRR8073913.1" (R2) - handled by exact match
+    
+    // If we stripped something and they now match, return true
+    if (stripped1 || stripped2) && base1 == base2 {
+        return true;
+    }
 
-    // Final comparison
+    // Try a more aggressive approach: strip everything after the first space or last dot/slash/underscore
+    // but only if they then match.
+    if let Some(space_idx) = base1.find(' ') {
+        base1 = &base1[..space_idx];
+    }
+    if let Some(space_idx) = base2.find(' ') {
+        base2 = &base2[..space_idx];
+    }
+
+    // Clean up any trailing characters
+    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#' || c == '.' || c == '/' || c == '_');
+    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#' || c == '.' || c == '/' || c == '_');
+
     base1 == base2
 }
 
@@ -998,30 +997,7 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
 /// bool: true if reads are a matched pair.
 ///
 pub fn compare_read_ids(id1: &str, id2: &str) -> bool {
-    // Extract ID parts without @
-    let id_part1 = id1.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
-    let id_part2 = id2.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
-
-    // Check for identical IDs (SRA and some Casava 1.8+ cases)
-    if id_part1 == id_part2 {
-        return true;
-    }
-
-    // Check for /1 and /2 format (pre-Casava 1.8 Illumina and custom formats)
-    let full_id_part1 = id1.splitn(2, ' ').next().unwrap_or("");
-    let full_id_part2 = id2.splitn(2, ' ').next().unwrap_or("");
-
-
-    if (full_id_part1.ends_with("/1") && full_id_part2.ends_with("/2")) ||
-        (full_id_part1.ends_with("/2") && full_id_part2.ends_with("/1")) {
-        let base1 = &full_id_part1[..full_id_part1.len() - 2];
-        let base2 = &full_id_part2[..full_id_part2.len() - 2];
-        if base1 == base2 {
-            return true;
-        }
-    }
-
-    false
+    compare_read_ids_bytes(id1.as_bytes(), id2.as_bytes())
 }
 
 /// Writes out a FASTA file to a FIFO pipe.

@@ -2860,12 +2860,12 @@ pub async fn call_hits_m8(
                 );
             }
 
-            if total_lines % 1_000_000 == 0 {
-                info!(
-                    "[call_hits_m8:{}] coordinator saw {} lines so far (current read_id={})",
-                    coordinator_tag, total_lines, read_id
-                );
-            }
+            // if total_lines % 1_000_000 == 0 {
+            //     info!(
+            //         "[call_hits_m8:{}] coordinator saw {} lines so far (current read_id={})",
+            //         coordinator_tag, total_lines, read_id
+            //     );
+            // }
 
             #[cfg(debug_assertions)]
             {
@@ -3282,21 +3282,21 @@ pub async fn generate_taxon_counts(
                         );
                     }
 
-                    if last_log.elapsed() >= Duration::from_secs(10) {
-                        info!(
-                            "[generate_taxon_counts:{}] worker {} progress: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} agg={} cache={} elapsed={:?}",
-                            ct,
-                            worker_idx,
-                            batches,
-                            total_pairs,
-                            max_recv_wait,
-                            max_batch_process,
-                            agg.len(),
-                            lineage_cache.len(),
-                            start.elapsed(),
-                        );
-                        last_log = Instant::now();
-                    }
+                    // if last_log.elapsed() >= Duration::from_secs(10) {
+                    //     info!(
+                    //         "[generate_taxon_counts:{}] worker {} progress: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} agg={} cache={} elapsed={:?}",
+                    //         ct,
+                    //         worker_idx,
+                    //         batches,
+                    //         total_pairs,
+                    //         max_recv_wait,
+                    //         max_batch_process,
+                    //         agg.len(),
+                    //         lineage_cache.len(),
+                    //         start.elapsed(),
+                    //     );
+                    //     last_log = Instant::now();
+                    // }
                 }
 
                 info!(
