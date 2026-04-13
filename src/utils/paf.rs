@@ -12,6 +12,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
 use dashmap::DashMap;
 use rayon::prelude::*;
+use memchr::memchr2_iter;
 
 use crate::utils::streams::ParseOutput;
 
@@ -161,14 +162,8 @@ impl PafRecord {
     }
 
     fn calc_gap_openings(&self) -> u64 {
-        let cigar = self.tags.get("cg").cloned().unwrap_or_default();
-        let mut go = 0;
-        for c in cigar.chars() {
-            if c == 'I' || c == 'D' {
-                go += 1;
-            }
-        }
-        go
+        let cigar = self.tags.get("cg").map(|s| s.as_bytes()).unwrap_or(b"");
+        memchr2_iter(b'I', b'D', cigar).count() as u64
     }
 
     fn percent_identity(&self) -> f64 {
