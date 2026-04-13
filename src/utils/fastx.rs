@@ -30,13 +30,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::sync::mpsc::Receiver;
 use tokio::io::AsyncSeekExt;
-use memchr::memmem;
+use memchr::{memmem, memchr3};
 use fst::{MapBuilder};
+use once_cell::sync::Lazy;
 
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode};
+use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 
@@ -369,22 +370,123 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
 
 /// Parses a FASTX header.
 ///
-///
 /// # Arguments
-///
-/// * `head` - Header line of a FASTX record.
-/// * 'prefix' - Leading, defining character of the header. > for FASTA, @ for FASTQ.
+/// * `head`   - Header bytes (needletail has already stripped the leading `>`/`@`).
+/// * `prefix` - The leading character (`>` or `@`) to strip from the id field.
 ///
 /// # Returns
-/// Tuple: (id, desc) split of header on whitespace.
-///
+/// `(id, desc)` — desc is `None` when the header has no whitespace.
 pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
-    let head_str = String::from_utf8_lossy(head).into_owned();
-    let parts: Vec<&str> = head_str.splitn(2, |c: char| c.is_whitespace()).collect();
-    let id = parts[0].trim_start_matches(prefix).to_string();
-    let desc = parts.get(1).map(|s| s.to_string()).filter(|s| !s.is_empty());
-    (id, desc)
+    PARSE_HEADER_FN(head, prefix)
 }
+
+/// Scalar path — used on non-AVX-512 hardware.
+fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
+    match memchr3(b' ', b'\t', b'\n', head) {
+        Some(pos) => {
+            let id_bytes = &head[..pos];
+            let desc_bytes = &head[pos + 1..];
+            let id = String::from_utf8_lossy(id_bytes)
+                .trim_start_matches(prefix)
+                .to_string();
+            let desc = if desc_bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(desc_bytes).into_owned())
+            };
+            (id, desc)
+        }
+        None => {
+            // id-only header (e.g. ">NC_045512.2" with no description)
+            let id = String::from_utf8_lossy(head)
+                .trim_start_matches(prefix)
+                .to_string();
+            (id, None)
+        }
+    }
+}
+
+/// AVX-512 path — 64-byte sweep to find the first whitespace byte.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Option<String>) {
+    use std::arch::x86_64::*;
+
+    let len = head.len();
+    let space_splat = _mm512_set1_epi8(b' ' as i8);
+    let tab_splat   = _mm512_set1_epi8(b'\t' as i8);
+    let nl_splat    = _mm512_set1_epi8(b'\n' as i8);
+
+    let mut i = 0usize;
+    while i + 64 <= len {
+        let chunk = _mm512_loadu_si512(head.as_ptr().add(i) as *const i32);
+        let mask: u64 =
+            _mm512_cmpeq_epi8_mask(chunk, space_splat) |
+            _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
+            _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+        if mask != 0 {
+            let pos = i + mask.trailing_zeros() as usize;
+            let id_bytes   = &head[..pos];
+            let desc_bytes = &head[pos + 1..];
+            let id = String::from_utf8_lossy(id_bytes)
+                .trim_start_matches(prefix)
+                .to_string();
+            let desc = if desc_bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(desc_bytes).into_owned())
+            };
+            return (id, desc);
+        }
+        i += 64;
+    }
+    // Scalar tail for remaining < 64 bytes (also handles id-only headers)
+    parse_header_scalar(&head[i..], prefix).map_id_offset(i, head, prefix)
+}
+
+// Helper to re-run scalar on tail bytes and merge the offset back.
+// Only called for headers whose whitespace (if any) falls in the tail.
+#[cfg(target_arch = "x86_64")]
+trait MergeOffset {
+    fn map_id_offset(self, offset: usize, full: &[u8], prefix: char) -> Self;
+}
+#[cfg(target_arch = "x86_64")]
+impl MergeOffset for (String, Option<String>) {
+    fn map_id_offset(self, offset: usize, full: &[u8], prefix: char) -> Self {
+        // If scalar found a split in the tail, the id must be re-extracted
+        // from the full slice (offset..split) to be complete.
+        let (tail_id, desc) = self;
+        if desc.is_some() {
+            // whitespace was in the tail — id spans from 0..offset + tail_id length
+            let full_id = String::from_utf8_lossy(&full[..offset + tail_id.len()])
+                .trim_start_matches(prefix)
+                .to_string();
+            (full_id, desc)
+        } else {
+            // no whitespace anywhere — id is the full header
+            let full_id = String::from_utf8_lossy(full)
+                .trim_start_matches(prefix)
+                .to_string();
+            (full_id, None)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_header_avx512(head: &[u8], prefix: char) -> (String, Option<String>) {
+    // Safety: only reachable when SIMD_LEVEL == Avx512, confirmed at startup.
+    unsafe { parse_header_avx512_inner(head, prefix) }
+}
+
+static PARSE_HEADER_FN: Lazy<fn(&[u8], char) -> (String, Option<String>)> = Lazy::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(*SIMD_LEVEL, SimdLevel::Avx512) {
+        debug!("parse_header: using AVX-512 path");
+        return parse_header_avx512;
+    }
+    debug!("parse_header: using scalar path");
+    parse_header_scalar
+});
 
 
 /// Reads a FASTQ file.
@@ -1849,6 +1951,97 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    // ── parse_header tests ────────────────────────────────────────────────
+
+    fn compare_header(head: &[u8], prefix: char) {
+        let scalar = parse_header_scalar(head, prefix);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx = parse_header_avx512(head, prefix);
+            assert_eq!(scalar.0, avx.0, "id mismatch for {:?}", std::str::from_utf8(head));
+            assert_eq!(scalar.1, avx.1, "desc mismatch for {:?}", std::str::from_utf8(head));
+        }
+    }
+
+    #[test]
+    fn test_header_id_only_fasta() {
+        // No whitespace — most common reference genome format
+        let head = b"NC_045512.2";
+        let (id, desc) = parse_header_scalar(head, '>');
+        assert_eq!(id, "NC_045512.2");
+        assert!(desc.is_none());
+        compare_header(head, '>');
+    }
+
+    #[test]
+    fn test_header_with_space_desc() {
+        let head = b"NC_045512.2 Severe acute respiratory syndrome coronavirus 2";
+        let (id, desc) = parse_header_scalar(head, '>');
+        assert_eq!(id, "NC_045512.2");
+        assert_eq!(desc.as_deref(), Some("Severe acute respiratory syndrome coronavirus 2"));
+        compare_header(head, '>');
+    }
+
+    #[test]
+    fn test_header_with_tab_desc() {
+        let head = b"read1\tsome description";
+        let (id, desc) = parse_header_scalar(head, '@');
+        assert_eq!(id, "read1");
+        assert_eq!(desc.as_deref(), Some("some description"));
+        compare_header(head, '@');
+    }
+
+    #[test]
+    fn test_header_fastq_prefix_stripped() {
+        let head = b"@SRR12345.1 length=150";
+        // needletail passes bytes including the prefix in some paths
+        let (id, desc) = parse_header_scalar(head, '@');
+        assert_eq!(id, "SRR12345.1");
+        assert_eq!(desc.as_deref(), Some("length=150"));
+        compare_header(head, '@');
+    }
+
+    #[test]
+    fn test_header_empty_desc_after_space() {
+        // Space at end but nothing after it — desc should be None
+        let head = b"contig_00001 ";
+        let (id, desc) = parse_header_scalar(head, '>');
+        assert_eq!(id, "contig_00001");
+        assert!(desc.is_none(), "trailing space with empty desc should give None");
+        compare_header(head, '>');
+    }
+
+    #[test]
+    fn test_header_long_id_spans_two_simd_chunks() {
+        // id > 64 bytes with description after — whitespace in second chunk
+        let long_id = "a".repeat(70);
+        let head = format!("{} some description", long_id);
+        let (id, desc) = parse_header_scalar(head.as_bytes(), '>');
+        assert_eq!(id, long_id);
+        assert_eq!(desc.as_deref(), Some("some description"));
+        compare_header(head.as_bytes(), '>');
+    }
+
+    #[test]
+    fn test_header_long_id_only_no_whitespace() {
+        // id > 64 bytes, no whitespace anywhere
+        let long_id = "a".repeat(100);
+        let (id, desc) = parse_header_scalar(long_id.as_bytes(), '>');
+        assert_eq!(id, long_id);
+        assert!(desc.is_none());
+        compare_header(long_id.as_bytes(), '>');
+    }
+
+    #[test]
+    fn test_header_sra_style() {
+        // SRA format: "SRR12345.1.1 SRR12345.1 length=150"
+        let head = b"SRR12345.1.1 SRR12345.1 length=150";
+        let (id, desc) = parse_header_scalar(head, '@');
+        assert_eq!(id, "SRR12345.1.1");
+        assert_eq!(desc.as_deref(), Some("SRR12345.1 length=150"));
+        compare_header(head, '@');
+    }
 
     #[test]
     fn test_sequence_reader_fasta() -> io::Result<()> {
