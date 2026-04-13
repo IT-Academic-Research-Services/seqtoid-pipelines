@@ -2938,10 +2938,10 @@ pub async fn call_hits_m8(
 
         // Flush all workers after all reads have been dispatched.
         for (idx, tx) in worker_txs.iter().enumerate() {
-            debug!(
-                "[call_hits_m8:{}] flushing worker {}",
-                coordinator_tag, idx
-            );
+            // debug!(
+            //     "[call_hits_m8:{}] flushing worker {}",
+            //     coordinator_tag, idx
+            // );
             tx.send(WorkerMsg::Flush)
                 .await
                 .context("failed to flush worker")?;
@@ -3337,10 +3337,10 @@ pub async fn generate_taxon_counts(
     let mut hit_closed = false;
 
     loop {
-        debug!(
-            "[generate_taxon_counts:{}] awaiting next pair: pairs={} batches={} m8_seen={} hit_seen={}",
-            count_type, total_pairs, batch_idx, m8_items_seen, hit_items_seen
-        );
+        // debug!(
+        //     "[generate_taxon_counts:{}] awaiting next pair: pairs={} batches={} m8_seen={} hit_seen={}",
+        //     count_type, total_pairs, batch_idx, m8_items_seen, hit_items_seen
+        // );
 
         let (m8_res, hit_res) = tokio::join!(
             async {
@@ -3365,16 +3365,16 @@ pub async fn generate_taxon_counts(
             max_hit_wait = hit_wait;
         }
 
-        debug!(
-            "[generate_taxon_counts:{}] got next pair: m8_present={} hit_present={} m8_wait={:?} hit_wait={:?} pairs={} batches={}",
-            count_type,
-            m8_item.is_some(),
-            hit_item.is_some(),
-            m8_wait,
-            hit_wait,
-            total_pairs,
-            batch_idx
-        );
+        // debug!(
+        //     "[generate_taxon_counts:{}] got next pair: m8_present={} hit_present={} m8_wait={:?} hit_wait={:?} pairs={} batches={}",
+        //     count_type,
+        //     m8_item.is_some(),
+        //     hit_item.is_some(),
+        //     m8_wait,
+        //     hit_wait,
+        //     total_pairs,
+        //     batch_idx
+        // );
 
         if m8_wait >= Duration::from_millis(50) || hit_wait >= Duration::from_millis(50) {
             let ratio = if hit_wait.as_nanos() > 0 {
