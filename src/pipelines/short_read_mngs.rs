@@ -201,16 +201,6 @@ pub struct CoverageOutputs {
     pub read2contig: Arc<HashMap<String, String>>,
 }
 
-#[derive(Clone)]
-struct TaxonCountWorkItem {
-    cleaned_lineage: Vec<i32>,
-    cluster_size: u64,
-    alen: u64,
-    pident: f64,
-    evalue_log10: f64,
-    source_count_type: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ReadHit {
     pub level: u8,
@@ -2396,49 +2386,6 @@ pub async fn minimap2_non_host_align(
 
 
 
-
-// ────────────────────────────────────────────────────────────────
-    //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
-    //   (comment out or delete this whole block when done debugging)
-    // ────────────────────────────────────────────────────────────────
-
-    // ────────────────────────────────────────────────────────────────
-    //   TEMP BYPASS: SKIP REAL MINIMAP2 SCATTER-GATHER TO TEST OOM
-    //   Comment out or delete this whole block when finished debugging
-    // ────────────────────────────────────────────────────────────────
-
-//     info!("=== MINIMAP2 SCATTER-GATHER BYPASSED FOR OOM DEBUG ===");
-//     info!("Returning fake single-line ParseOutput stream instead of real PAF");
-//
-//     use tokio::sync::mpsc;
-//
-//     let (fake_tx, fake_rx) = mpsc::channel::<ParseOutput>(4);
-//
-//     // Create a fake ParseOutput::Bytes containing one valid-looking PAF line
-//     let fake_paf_content = b"read_000001\t150\t0\t150\t+\tNT_dummy_accession\t200\t10\t160\t140\t93\t0\n".to_vec();
-//
-//     fake_tx.send(ParseOutput::Bytes(fake_paf_content.into()))
-//         .await
-//         .expect("Failed to send fake ParseOutput in debug bypass");
-//
-//     drop(fake_tx);  // Close the channel → downstream sees EOF
-//
-//     let fake_paf_stream = ReceiverStream::new(fake_rx);
-//
-//     info!("Fake ParseOutput::Bytes PAF stream created — pipeline continues without real minimap2");
-//
-//     Ok((
-//         fake_paf_stream,
-//         cleanup_tasks,
-//         cleanup_receivers,
-//         Some(temp_dir),
-//     ))
-// }
-
-// ────────────────────────────────────────────────────────────────
-    //   End of temporary OOM-test bypass
-    // ────────────────────────────────────────────────────────────────
-
 /// Converts a PAF stream to an m8 stream, splits it with t_junction for file writing,
 /// and returns the main m8 stream along with cleanup handles.
 /// # Arguments
@@ -3878,59 +3825,6 @@ pub async fn combine_taxon_counts(
     );
 
     Ok((output_path, write_task))
-}
-
-
-/// Generates an accession map from streamed m8 data
-///
-/// # Arguments
-///
-/// * `m8_stream` -stream in m8 format as defined in blast.rs
-///
-/// # Returns
-/// Result of hashmap of id:accession
-///
-async fn collect_m8_to_accession_map(
-    config: Arc<RunConfig>,
-    mut m8_stream: ReceiverStream<ParseOutput>,
-) -> Result<HashMap<String, String>> {
-    let mut map: HashMap<String, String> = HashMap::new();
-    let mut item_count = 0;
-    let start_time = Instant::now();
-
-    let mut batched_stream = batch_rayon_process(
-        config.clone(),
-        m8_stream,
-        parse_m8_acc_batch,
-        "collect_m8_to_accession_map",
-        8 * 1024 * 1024,
-    );
-
-    while let Some(item) = batched_stream.next().await {
-        item_count += 1;
-        if let ParseOutput::Bytes(bytes) = item {
-            let line = String::from_utf8_lossy(&*bytes).to_string();
-            let fields: Vec<&str> = line.trim().split('\t').collect();
-            if fields.len() >= 2 {
-                let read_id = fields[0].to_string();
-                let accession = fields[1].to_string();
-                if map.insert(read_id.clone(), accession).is_some() {
-                    warn!("Duplicate read_id in deduped m8: {}", read_id);
-                }
-            } else {
-                warn!("Invalid m8 line: {}", line);
-            }
-        } else {
-            return Err(anyhow!("Non-Bytes in m8 stream"));
-        }
-
-        if item_count % 100_000 == 0 {
-            debug!("Processed {} m8 lines in {:?}", item_count, start_time.elapsed());
-        }
-    }
-
-    info!("Collected {} accessions from m8 stream", map.len());
-    Ok(map)
 }
 
 
@@ -7899,9 +7793,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let unidentified_path = assembly_dir.join("unidentified.fa");
     let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
 
-    // ────────────────────────────────────────────────────────────────
-    // FINAL fanout_to_channels (the last two old t_junctions are gone)
-    // ────────────────────────────────────────────────────────────────
     info!("[run] starting fanout_to_channels for annotated FASTA (2 private channels)");
 
     let (annotated_rxs, annotated_router) = fanout_to_channels(
