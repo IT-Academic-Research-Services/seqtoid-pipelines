@@ -3102,7 +3102,7 @@ async fn diamond_non_host_align(
         ("-f".to_string(), Some("6".to_string())),
         ("--tmpdir".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
         ("--unal".to_string(), Some("0".to_string())),
-        ("--verbose".to_string(), None),
+        // ("--verbose".to_string(), None),
     ]);
 
     let diamond_config = DiamondConfig {
@@ -8078,7 +8078,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let read2contig = assembly_outputs.read2contig.clone();
 
         async move {
-            info!("hey blast_contigs you pile of shit are you starting?");
             blast_contigs(
                 config,
                 NT_TAG,

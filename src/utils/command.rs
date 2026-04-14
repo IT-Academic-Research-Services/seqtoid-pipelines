@@ -1827,11 +1827,13 @@ pub mod diamond {
         let total_letters_billions = db_stats.1 as f64 / 1e9;
 
         // RAM scaling — blastx needs roughly 10–14 GB per billion letters
-        let ram_factor = if available_ram_gb >= 1000.0 {  // EPYC / r6id
+        let ram_factor = if available_ram_gb >= 1400.0 {
+            9.0
+        } else if available_ram_gb >= 900.0 {
             10.0
-        } else if available_ram_gb >= 128.0 {  // decent server
+        } else if available_ram_gb >= 128.0 {
             12.0
-        } else {  // laptop
+        } else {
             15.0
         };
 
@@ -1848,8 +1850,8 @@ pub mod diamond {
         let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
         let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
         let db_size_gb = std::fs::metadata(&db_path)
-            .map(|m| m.len() as f64 / 1e9 / 1_073_741_824.0)
-            .unwrap_or(50.0);  // fallback ~50 GB for NR
+            .map(|m| m.len() as f64 / 1_073_741_824.0)  // bytes → GiB
+            .unwrap_or(50.0);
 
         if scratch_avail < (db_size_gb * 2.0) as u64 {
             warn!("Low scratch space — reducing block size by 30%");
