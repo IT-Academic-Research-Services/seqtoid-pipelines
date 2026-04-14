@@ -5,7 +5,7 @@ use log::{self, LevelFilter, debug, info, error, warn};
 use num_cpus;
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG};
+use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG, MMSEQS_TAG};
 use crate::cli::Arguments;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
@@ -2276,6 +2276,8 @@ pub mod sort {
         }
     }
 }
+
+
 
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
