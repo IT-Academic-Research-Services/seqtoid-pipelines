@@ -1853,8 +1853,25 @@ pub mod diamond {
             .map(|m| m.len() as f64 / 1_073_741_824.0)  // bytes → GiB
             .unwrap_or(50.0);
 
-        if scratch_avail < (db_size_gb * 2.0) as u64 {
-            warn!("Low scratch space — reducing block size by 30%");
+
+
+        let scratch_avail_gib = scratch_avail as f64 / 1_073_741_824.0;
+
+        let estimated_scratch_gib = block_size * 3.0 + 20.0;
+
+        if scratch_avail_gib < estimated_scratch_gib * 1.2 {
+                warn!(
+            "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 50%",
+            estimated_scratch_gib,
+            scratch_avail_gib
+        );
+            block_size *= 0.5;
+        } else if scratch_avail_gib < estimated_scratch_gib * 1.5 {
+            warn!(
+            "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 30%",
+            estimated_scratch_gib,
+            scratch_avail_gib
+        );
             block_size *= 0.7;
         }
 
