@@ -87,6 +87,7 @@ lazy_static! {
         m.insert(BLASTN_TAG, 2.12);
         m.insert(BLASTX_TAG, 2.12);
         m.insert(MAKEBLASTDB_TAG, 2.12);
+        m.insert(MMSEQS_TAG, 0.0);
         m
     };
 }

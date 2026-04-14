@@ -222,4 +222,7 @@ pub struct Arguments {
     #[arg(long, default_value_t = false)]
     pub use_diamond: bool,
 
+    #[arg(long, default_value = "nrDB")]
+    pub mmseqs_db: Option<String>,
+
 }

@@ -1959,7 +1959,7 @@ mod tests {
     use tokio::fs::File as TokioFile;
     use tokio::time::{self, Duration};
     use crate::utils::fastx::fastx_generator;
-    use crate::config::defs::{RunConfig, StreamDataType};
+    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend, GpuInfo};
     use std::sync::Arc;
     use rayon::ThreadPoolBuilder;
     use tokio::sync::{Semaphore, Mutex};
@@ -1998,7 +1998,10 @@ mod tests {
             rng: rng,
             log_level: LevelFilter::Debug,
             base_backpressure_pause: 1000,
-            simd: SimdLevel::Scalar
+            simd: SimdLevel::Scalar,
+            gpu_info: GpuDetection { count: 0, gpus: vec![] },
+            has_gpu: false,
+            alignment_backend: NRAlignmentBackend::Diamond,
         })
     }
 

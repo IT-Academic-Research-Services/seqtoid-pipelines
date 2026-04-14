@@ -2277,16 +2277,18 @@ pub mod sort {
     }
 }
 
+
+
 pub mod mmseqs {
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use anyhow::{anyhow, Result};
-    use log::debug;
+    use log::{debug, warn};
+    use tokio::process::Command;
 
     use crate::config::defs::{MMSEQS_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::ChildStream;
+    use crate::utils::command::ArgGenerator;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum MmseqsBackend {
@@ -2296,41 +2298,79 @@ pub mod mmseqs {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum MmseqsSubcommand {
-        Search,
-        ConvertAlis,
-        Createdb,
-        MakePaddedSeqDb,
+        EasySearch,
     }
 
     #[derive(Debug)]
     pub struct MmseqsConfig {
         pub subcommand: MmseqsSubcommand,
         pub backend: MmseqsBackend,
-
-        // Common paths used by the different subcommands.
-        pub query: Option<PathBuf>,
-        pub target_db: Option<PathBuf>,
-        pub result_db: Option<PathBuf>,
-        pub tmp_dir: Option<PathBuf>,
-        pub input: Option<PathBuf>,
-        pub output: Option<PathBuf>,
-
-        // Search controls.
+        pub query: PathBuf,
+        pub output: PathBuf,
+        pub tmp_dir: PathBuf,
         pub threads: Option<usize>,
-        pub translation_mode: Option<u8>,
         pub sensitivity: Option<String>,
         pub format_output: Option<String>,
-
-        // Extra flags, kept generic so the caller can tune without changing the wrapper.
         pub option_fields: HashMap<String, Option<String>>,
     }
 
     pub struct MmseqsArgGenerator;
 
     pub async fn mmseqs_presence_check() -> Result<f32> {
-        // `mmseqs version` is the least noisy and most stable check.
-        let version = version_check(MMSEQS_TAG, vec!["version"], 0, 0, ChildStream::Stdout, None).await?;
-        Ok(version)
+        // MMseqs2 prints a commit hash for `mmseqs version`, so treat this as a
+        // presence-only probe rather than a semantic version check.
+        let output = Command::new(MMSEQS_TAG)
+            .arg("version")
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to spawn mmseqs. Is it installed? Error: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "mmseqs version check failed with exit code {:?}",
+                output.status.code()
+            ));
+        }
+
+        Ok(0.0)
+    }
+
+    fn resolve_mmseqs_db(run_config: &RunConfig) -> Result<PathBuf> {
+        let db = run_config
+            .args
+            .mmseqs_db
+            .as_ref()
+            .ok_or_else(|| anyhow!("MMseqs requires --mmseqs-db"))?;
+
+        let path = PathBuf::from(db);
+        if !path.exists() {
+            return Err(anyhow!("MMseqs DB path does not exist: {}", path.display()));
+        }
+
+        Ok(path)
+    }
+
+    fn validate_cpu_index(db_prefix: &Path) -> Result<()> {
+        // Soft sanity check for a prebuilt CPU-side MMseqs database index.
+        // MMseqs DBs are prefix-based, so we check for a few common sidecars.
+        let candidates = [
+            db_prefix.with_extension("index"),
+            db_prefix.with_extension("idx"),
+            db_prefix.with_extension("lookup"),
+            db_prefix.with_extension("source"),
+        ];
+
+        if candidates.iter().any(|p| p.exists()) {
+            return Ok(());
+        }
+
+        warn!(
+            "MMseqs CPU backend: no obvious index sidecar found near {}. \
+             Proceeding anyway, but repeated searches will be slower.",
+            db_prefix.display()
+        );
+
+        Ok(())
     }
 
     fn push_threads(args: &mut Vec<String>, run_config: &RunConfig, threads: Option<usize>) {
@@ -2365,93 +2405,42 @@ pub mod mmseqs {
                 .and_then(|e| e.downcast_ref::<MmseqsConfig>())
                 .ok_or_else(|| anyhow!("MMseqs requires a MmseqsConfig as extra argument"))?;
 
+            let target_db = resolve_mmseqs_db(run_config)?;
+            if config.backend == MmseqsBackend::Cpu {
+                validate_cpu_index(&target_db)?;
+            } else {
+                debug!("MMseqs GPU backend selected; skipping CPU index validation");
+            }
+
             let mut args_vec: Vec<String> = Vec::new();
 
             match config.subcommand {
-                MmseqsSubcommand::Createdb => {
-                    args_vec.push("createdb".to_string());
+                MmseqsSubcommand::EasySearch => {
+                    args_vec.push("easy-search".to_string());
                     push_backend(&mut args_vec, config.backend);
                     push_threads(&mut args_vec, run_config, config.threads);
-
-                    let input = config.input.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs createdb requires input"))?;
-                    let output = config.output.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs createdb requires output"))?;
-
-                    args_vec.push(input.to_string_lossy().to_string());
-                    args_vec.push(output.to_string_lossy().to_string());
-                    push_option_fields(&mut args_vec, &config.option_fields);
-                }
-
-                MmseqsSubcommand::MakePaddedSeqDb => {
-                    args_vec.push("makepaddedseqdb".to_string());
-                    push_threads(&mut args_vec, run_config, config.threads);
-
-                    let input = config.input.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs makepaddedseqdb requires input"))?;
-                    let output = config.output.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs makepaddedseqdb requires output"))?;
-
-                    args_vec.push(input.to_string_lossy().to_string());
-                    args_vec.push(output.to_string_lossy().to_string());
-                    push_option_fields(&mut args_vec, &config.option_fields);
-                }
-
-                MmseqsSubcommand::Search => {
-                    args_vec.push("search".to_string());
-                    push_backend(&mut args_vec, config.backend);
-                    push_threads(&mut args_vec, run_config, config.threads);
-
-                    if let Some(mode) = config.translation_mode {
-                        args_vec.push("--translation-mode".to_string());
-                        args_vec.push(mode.to_string());
-                    }
 
                     if let Some(s) = &config.sensitivity {
                         args_vec.push("-s".to_string());
                         args_vec.push(s.clone());
                     }
 
-                    let query = config.query.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs search requires query DB"))?;
-                    let target = config.target_db.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs search requires target DB"))?;
-                    let result = config.result_db.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs search requires result DB"))?;
-                    let tmp = config.tmp_dir.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs search requires tmp dir"))?;
-
-                    args_vec.push(query.to_string_lossy().to_string());
-                    args_vec.push(target.to_string_lossy().to_string());
-                    args_vec.push(result.to_string_lossy().to_string());
-                    args_vec.push(tmp.to_string_lossy().to_string());
-                    push_option_fields(&mut args_vec, &config.option_fields);
-                }
-
-                MmseqsSubcommand::ConvertAlis => {
-                    args_vec.push("convertalis".to_string());
-                    push_backend(&mut args_vec, config.backend);
-                    push_threads(&mut args_vec, run_config, config.threads);
-
-                    let query = config.query.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs convertalis requires query DB"))?;
-                    let target = config.target_db.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs convertalis requires target DB"))?;
-                    let result = config.result_db.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs convertalis requires result DB"))?;
-                    let output = config.output.as_ref()
-                        .ok_or_else(|| anyhow!("MMseqs convertalis requires output path"))?;
-
-                    args_vec.push(query.to_string_lossy().to_string());
-                    args_vec.push(target.to_string_lossy().to_string());
-                    args_vec.push(result.to_string_lossy().to_string());
-                    args_vec.push(output.to_string_lossy().to_string());
+                    args_vec.push(config.query.to_string_lossy().to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(config.output.to_string_lossy().to_string());
+                    args_vec.push(config.tmp_dir.to_string_lossy().to_string());
 
                     args_vec.push("--format-output".to_string());
-                    args_vec.push(config.format_output.clone().unwrap_or_else(|| {
-                        // BLAST m8-like default.
-                        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits".to_string()
-                    }));
+                    args_vec.push(
+                        config
+                            .format_output
+                            .clone()
+                            .unwrap_or_else(|| {
+                                // BLAST m8-like default.
+                                "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                                    .to_string()
+                            }),
+                    );
 
                     push_option_fields(&mut args_vec, &config.option_fields);
                 }
@@ -2462,6 +2451,7 @@ pub mod mmseqs {
         }
     }
 }
+
 
 
 

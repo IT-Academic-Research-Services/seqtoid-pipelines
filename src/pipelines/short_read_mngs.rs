@@ -7119,9 +7119,6 @@ async fn preload_nr_alignments_parallel(
     info!("Preloaded {} NR alignments (parallel, {} workers)", nr_alignment_per_read.len(), concurrency);
     Ok(())
 }
-
-
-
 async fn run_mmseqs_step(
     config: Arc<RunConfig>,
     args: Vec<String>,
@@ -7161,13 +7158,10 @@ async fn run_mmseqs_step(
 async fn mmseqs_fastq_to_m8_file(
     config: Arc<RunConfig>,
     input_fastq: PathBuf,
-    target_db: PathBuf,
     temp_dir: &TempDir,
     label: &str,
     backend: MmseqsBackend,
 ) -> Result<PathBuf, PipelineError> {
-    let query_db = temp_dir.path().join(format!("{}.querydb", label));
-    let result_db = temp_dir.path().join(format!("{}.resultdb", label));
     let tmp_dir = temp_dir.path().join(format!("{}.tmp", label));
     let m8_path = temp_dir.path().join(format!("{}.m8", label));
 
@@ -7175,78 +7169,30 @@ async fn mmseqs_fastq_to_m8_file(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let createdb_cfg = MmseqsConfig {
-        subcommand: MmseqsSubcommand::Createdb,
+    let easy_search_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::EasySearch,
         backend,
-        query: None,
-        target_db: None,
-        result_db: None,
-        tmp_dir: None,
-        input: Some(input_fastq),
-        output: Some(query_db.clone()),
-        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("createdb"))),
-        translation_mode: None,
-        sensitivity: None,
-        format_output: None,
-        option_fields: HashMap::new(),
-    };
-
-    let createdb_args = generate_cli(MMSEQS_TAG, &config, Some(&createdb_cfg))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MMSEQS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    run_mmseqs_step(config.clone(), createdb_args, "createdb").await?;
-
-    let search_cfg = MmseqsConfig {
-        subcommand: MmseqsSubcommand::Search,
-        backend,
-        query: Some(query_db.clone()),
-        target_db: Some(target_db.clone()),
-        result_db: Some(result_db.clone()),
-        tmp_dir: Some(tmp_dir.clone()),
-        input: None,
-        output: None,
+        query: input_fastq,
+        output: m8_path.clone(),
+        tmp_dir: tmp_dir.clone(),
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
-        translation_mode: Some(1),
         sensitivity: Some("7.5".to_string()),
-        format_output: None,
+        format_output: Some(
+            "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                .to_string(),
+        ),
         option_fields: HashMap::from([
             ("--search-type".to_string(), Some("3".to_string())),
         ]),
     };
 
-    let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))
+    let easy_search_args = generate_cli(MMSEQS_TAG, &config, Some(&easy_search_cfg))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MMSEQS_TAG.to_string(),
             error: e.to_string(),
         })?;
-    run_mmseqs_step(config.clone(), search_args, "search").await?;
 
-    let convert_cfg = MmseqsConfig {
-        subcommand: MmseqsSubcommand::ConvertAlis,
-        backend,
-        query: Some(query_db),
-        target_db: Some(target_db),
-        result_db: Some(result_db),
-        tmp_dir: None,
-        input: None,
-        output: Some(m8_path.clone()),
-        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("convertalis"))),
-        translation_mode: None,
-        sensitivity: None,
-        format_output: Some(
-            "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits".to_string(),
-        ),
-        option_fields: HashMap::new(),
-    };
-
-    let convert_args = generate_cli(MMSEQS_TAG, &config, Some(&convert_cfg))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MMSEQS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-    run_mmseqs_step(config.clone(), convert_args, "convertalis").await?;
+    run_mmseqs_step(config.clone(), easy_search_args, "easy-search").await?;
 
     let meta = fs::metadata(&m8_path)
         .await
@@ -7265,7 +7211,6 @@ pub async fn mmseqs_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
-    target_db: PathBuf,
     backend: MmseqsBackend,
 ) -> Result<(
     tokio::sync::mpsc::Receiver<ParseOutput>,
@@ -7290,7 +7235,6 @@ pub async fn mmseqs_non_host_align(
     let r1_m8 = mmseqs_fastq_to_m8_file(
         config.clone(),
         r1_path,
-        target_db.clone(),
         &temp_dir,
         "nr_r1",
         backend,
@@ -7313,7 +7257,6 @@ pub async fn mmseqs_non_host_align(
         let r2_m8 = mmseqs_fastq_to_m8_file(
             config.clone(),
             r2_path,
-            target_db,
             &temp_dir,
             "nr_r2",
             backend,
@@ -8040,9 +7983,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                     config.clone(),
                     non_host_r1_path.clone(),
                     non_host_r2_path_opt.clone(),
-                    PathBuf::from(config.args.nr.as_ref().ok_or_else(|| {
-                        PipelineError::MissingArgument("nr DB required for MMseqs alignment".into())
-                    })?),
                     MmseqsBackend::Cpu,
                 ).await?
             }
@@ -8051,9 +7991,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                     config.clone(),
                     non_host_r1_path.clone(),
                     non_host_r2_path_opt.clone(),
-                    PathBuf::from(config.args.nr.as_ref().ok_or_else(|| {
-                        PipelineError::MissingArgument("nr DB required for MMseqs alignment".into())
-                    })?),
                     MmseqsBackend::Gpu,
                 ).await?
             }

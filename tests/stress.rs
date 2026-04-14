@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 use tokio::fs::File as TokioFile;
 use futures::future::join_all;
-use seqtoid_pipelines::config::defs::{RunConfig, StreamDataType};
+use seqtoid_pipelines::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, StreamDataType};
 use std::path::PathBuf;
 use rayon::ThreadPoolBuilder;
 use tokio::io::AsyncReadExt;
@@ -165,7 +165,10 @@ fn create_test_run_config() -> Arc<RunConfig> {
         rng: rng,
         log_level: LevelFilter::Debug,
         base_backpressure_pause: 1000,
-        simd: SimdLevel::Scalar
+        simd: SimdLevel::Scalar,
+        gpu_info: GpuDetection { count: 0, gpus: vec![] },
+        has_gpu: false,
+        alignment_backend: NRAlignmentBackend::Diamond,  // NB: might want this to be variable!
     })
 }
 
