@@ -107,11 +107,7 @@ impl ToBytes for ParseOutput {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
             ParseOutput::Fasta(record) => record.to_bytes(),
-            ParseOutput::Bytes(bytes) => {
-                // Avoid cloning if possible; return Vec only if needed
-                Arc::try_unwrap(bytes.clone()).map_err(|_| anyhow!("Cannot unwrap Arc with multiple references"))
-                    .or_else(|_| Ok((**bytes).clone())) // Fallback to clone if Arc is shared
-            }
+            ParseOutput::Bytes(bytes) => Ok((**bytes).clone()),
         }
     }
 }
