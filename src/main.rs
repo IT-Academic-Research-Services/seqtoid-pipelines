@@ -27,13 +27,13 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_core::{RngCore, OsRng};
 use crate::cli::parse;
-use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
+use crate::config::defs::{RunConfig, StreamDataType, PipelineError, NRAlignmentBackend, GpuDetection, GpuInfo};
 use crate::cli::args::Technology;
 use crate::utils::file::file_path_manipulator;
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
                            compute_base_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
-                           GpuDetection, GpuInfo, detect_simd_level};
+                           detect_simd_level};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 use pipelines::db;
@@ -86,9 +86,12 @@ async fn main() -> Result<()> {
 
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
+    let mut has_gpu = false;
+    let mut use_mmseqs_gpu = false;
     let gpu_info = detect_gpus().unwrap_or(GpuDetection { count: 0, gpus: vec![] });
 
     if gpu_info.count > 0 {
+        has_gpu = true;
         for gpu in &gpu_info.gpus {
             info!(
             "GPU {}: {} ({}{} MiB)",
@@ -99,11 +102,18 @@ async fn main() -> Result<()> {
         );
         }
 
-        // Example: decide whether to use MMseqs2-GPU
-        // if gpu_info.gpus.iter().any(|g| g.name.contains("H100") || g.name.contains("L40")) {
-        //     // enable GPU path
-        // }
+        use_mmseqs_gpu = gpu_info.gpus.iter().any(|g| {
+            g.name.contains("H100") || g.name.contains("L40") || g.name.contains("A10")
+        });
     }
+
+    let backend = if args.use_diamond {
+        NRAlignmentBackend::Diamond
+    } else if use_mmseqs_gpu {
+        NRAlignmentBackend::MmseqsGpu
+    } else {
+        NRAlignmentBackend::MmseqsCpu
+    };
 
     let (total_ram, available_ram) = detect_ram()?;
     debug!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
@@ -139,7 +149,10 @@ async fn main() -> Result<()> {
         rng,
         log_level,
         base_backpressure_pause: 1000, // NB: hardcoded for testing
-        simd: simd
+        simd: simd,
+        gpu_info: gpu_info,
+        has_gpu: has_gpu,
+        alignment_backend: backend,
 
     });
 

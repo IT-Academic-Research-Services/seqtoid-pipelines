@@ -19,23 +19,8 @@ use rand::SeedableRng;
 use rand_core::{OsRng, RngCore};
 
 use crate::cli::args::{Arguments, Technology};
-use crate::config::defs::{RunConfig, StreamDataType, SimdLevel};
+use crate::config::defs::{RunConfig, StreamDataType, SimdLevel, GpuDetection, GpuInfo};
 
-
-#[derive(Debug, Clone)]
-pub struct GpuInfo {
-    pub index: usize,              // 0-based
-    pub name: String,              // e.g. "NVIDIA H100 80GB HBM3" or "Apple M2"
-    pub memory_mib: Option<u64>,   // total VRAM in MiB (None if unknown)
-    pub is_discrete: bool,         // true for dedicated card, false for integrated
-    pub driver: Option<String>,    // e.g. "550.90.07" or None
-}
-
-#[derive(Debug, Clone)]
-pub struct GpuDetection {
-    pub count: usize,
-    pub gpus: Vec<GpuInfo>,
-}
 
 
 /// Detects physical cores (not logical) — fallback to lscpu if sysinfo doesn't distinguish

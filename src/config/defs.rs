@@ -212,6 +212,29 @@ pub enum SimdLevel {
     Avx512,
 }
 
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    pub index: usize,              // 0-based
+    pub name: String,              // e.g. "NVIDIA H100 80GB HBM3" or "Apple M2"
+    pub memory_mib: Option<u64>,   // total VRAM in MiB (None if unknown)
+    pub is_discrete: bool,         // true for dedicated card, false for integrated
+    pub driver: Option<String>,    // e.g. "550.90.07" or None
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuDetection {
+    pub count: usize,
+    pub gpus: Vec<GpuInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NRAlignmentBackend {
+    Diamond,          // always CPU
+    MmseqsCpu,
+    MmseqsGpu,
+}
+
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -229,6 +252,9 @@ pub struct RunConfig {
     pub log_level: LevelFilter,
     pub base_backpressure_pause: u64,
     pub simd: SimdLevel,
+    pub gpu_info: GpuDetection,
+    pub has_gpu: bool,
+    pub alignment_backend: NRAlignmentBackend,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -52,14 +52,7 @@ use tokio::task::spawn_blocking;
 use twox_hash::XxHash64;
 use rayon::prelude::*;
 use crate::cli::Technology;
-use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode,
-                          ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType,
-                          Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG,
-                          CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG,
-                          KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG,
-                          MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG,
-                          NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE,
-                          SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, ClusterInfo, DuplicateClusters, PairingMode};
+use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode, ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType, Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE, SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, MMSEQS_TAG, ClusterInfo, DuplicateClusters, PairingMode, NRAlignmentBackend, SORT_TAG};
 use crate::utils::blast::{parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
@@ -74,6 +67,7 @@ use crate::utils::command::makeblastdb::{MakeblastdbArgGenerator, MakeblastdbCon
 use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2ArgGenerator, Minimap2Config};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
+use crate::utils::command::mmseqs::{MmseqsBackend, MmseqsConfig, MmseqsSubcommand};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
@@ -7127,6 +7121,228 @@ async fn preload_nr_alignments_parallel(
 }
 
 
+
+async fn run_mmseqs_step(
+    config: Arc<RunConfig>,
+    args: Vec<String>,
+    label: &'static str,
+) -> Result<(), PipelineError> {
+    let (mut child, stderr_task) = spawn_cmd(
+        config.clone(),
+        MMSEQS_TAG,
+        args,
+        config.args.verbose,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let wait_task = tokio::spawn(async move {
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("mmseqs {} exited with code {:?}", label, status.code()));
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    wait_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("mmseqs {} wait task panicked: {}", label, e)))??;
+
+    stderr_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("mmseqs {} stderr task panicked: {}", label, e)))??;
+
+    Ok(())
+}
+
+async fn mmseqs_fastq_to_m8_file(
+    config: Arc<RunConfig>,
+    input_fastq: PathBuf,
+    target_db: PathBuf,
+    temp_dir: &TempDir,
+    label: &str,
+    backend: MmseqsBackend,
+) -> Result<PathBuf, PipelineError> {
+    let query_db = temp_dir.path().join(format!("{}.querydb", label));
+    let result_db = temp_dir.path().join(format!("{}.resultdb", label));
+    let tmp_dir = temp_dir.path().join(format!("{}.tmp", label));
+    let m8_path = temp_dir.path().join(format!("{}.m8", label));
+
+    fs::create_dir_all(&tmp_dir)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let createdb_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::Createdb,
+        backend,
+        query: None,
+        target_db: None,
+        result_db: None,
+        tmp_dir: None,
+        input: Some(input_fastq),
+        output: Some(query_db.clone()),
+        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("createdb"))),
+        translation_mode: None,
+        sensitivity: None,
+        format_output: None,
+        option_fields: HashMap::new(),
+    };
+
+    let createdb_args = generate_cli(MMSEQS_TAG, &config, Some(&createdb_cfg))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    run_mmseqs_step(config.clone(), createdb_args, "createdb").await?;
+
+    let search_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::Search,
+        backend,
+        query: Some(query_db.clone()),
+        target_db: Some(target_db.clone()),
+        result_db: Some(result_db.clone()),
+        tmp_dir: Some(tmp_dir.clone()),
+        input: None,
+        output: None,
+        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
+        translation_mode: Some(1),
+        sensitivity: Some("7.5".to_string()),
+        format_output: None,
+        option_fields: HashMap::from([
+            ("--search-type".to_string(), Some("3".to_string())),
+        ]),
+    };
+
+    let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    run_mmseqs_step(config.clone(), search_args, "search").await?;
+
+    let convert_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::ConvertAlis,
+        backend,
+        query: Some(query_db),
+        target_db: Some(target_db),
+        result_db: Some(result_db),
+        tmp_dir: None,
+        input: None,
+        output: Some(m8_path.clone()),
+        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("convertalis"))),
+        translation_mode: None,
+        sensitivity: None,
+        format_output: Some(
+            "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits".to_string(),
+        ),
+        option_fields: HashMap::new(),
+    };
+
+    let convert_args = generate_cli(MMSEQS_TAG, &config, Some(&convert_cfg))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+    run_mmseqs_step(config.clone(), convert_args, "convertalis").await?;
+
+    let meta = fs::metadata(&m8_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    if meta.len() == 0 {
+        return Err(PipelineError::Other(anyhow!(
+            "mmseqs produced an empty m8 file: {}",
+            m8_path.display()
+        )));
+    }
+
+    Ok(m8_path)
+}
+
+pub async fn mmseqs_non_host_align(
+    config: Arc<RunConfig>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+    target_db: PathBuf,
+    backend: MmseqsBackend,
+) -> Result<(
+    tokio::sync::mpsc::Receiver<ParseOutput>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>>,
+    Vec<TempDir>,
+), PipelineError> {
+    let cleanup_tasks = Vec::new();
+    let cleanup_receivers = Vec::new();
+
+    info!("Running mmseqs non-host align");
+
+    let temp_dir = choose_temp_dir(
+        100_000_000_000,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        true,
+    )
+        .await?;
+
+    let r1_m8 = mmseqs_fastq_to_m8_file(
+        config.clone(),
+        r1_path,
+        target_db.clone(),
+        &temp_dir,
+        "nr_r1",
+        backend,
+    )
+        .await?;
+
+    let merged_unsorted_m8 = temp_dir.path().join("mmseqs_unsorted_nr.m8");
+    let mut merged = fs::File::create(&merged_unsorted_m8)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let mut f1 = fs::File::open(&r1_m8)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    tokio::io::copy(&mut f1, &mut merged)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    if let Some(r2_path) = r2_path_opt {
+        let r2_m8 = mmseqs_fastq_to_m8_file(
+            config.clone(),
+            r2_path,
+            target_db,
+            &temp_dir,
+            "nr_r2",
+            backend,
+        )
+            .await?;
+
+        let mut f2 = fs::File::open(&r2_m8)
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        tokio::io::copy(&mut f2, &mut merged)
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    }
+
+    merged.flush()
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let m8_file = fs::File::open(&merged_unsorted_m8)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let m8_rx = parse_lines(m8_file, config.base_buffer_size)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
+}
+
 /// Run function for Short Read mNGS pipelines
 ///
 /// # Arguments
@@ -7160,8 +7376,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // External tools check
-    check_versions(vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
-                        BLASTN_TAG, BLASTX_TAG, DIAMOND_TAG], &out_dir.clone())
+
+    let mut versions_vec = vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
+                        BLASTN_TAG, BLASTX_TAG, SORT_TAG];
+
+    match config.alignment_backend {
+        NRAlignmentBackend::Diamond => {
+            versions_vec.push(DIAMOND_TAG);
+        }
+        _ => {
+            versions_vec.push(MMSEQS_TAG);
+
+        }
+    }
+
+    check_versions(versions_vec, &out_dir.clone())
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -7796,15 +8025,43 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
 
-    // Diamond non_host alignment
-    let (non_host_diamond_m8_stream, mut non_host_diamond_cleanup_tasks, mut non_host_diamond_cleanup_receivers, non_host_diamond_temp_dirs) = diamond_non_host_align(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-    ).await?;
-    cleanup_tasks.append(&mut non_host_diamond_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_diamond_cleanup_receivers);
-    final_temp_dirs.extend(non_host_diamond_temp_dirs);
+    // Diamond or MMseqs2 non_host alignment
+    let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_temp_dirs) =
+        match config.alignment_backend {
+            NRAlignmentBackend::Diamond => {
+                diamond_non_host_align(
+                    config.clone(),
+                    non_host_r1_path.clone(),
+                    non_host_r2_path_opt.clone(),
+                ).await?
+            }
+            NRAlignmentBackend::MmseqsCpu => {
+                mmseqs_non_host_align(
+                    config.clone(),
+                    non_host_r1_path.clone(),
+                    non_host_r2_path_opt.clone(),
+                    PathBuf::from(config.args.nr.as_ref().ok_or_else(|| {
+                        PipelineError::MissingArgument("nr DB required for MMseqs alignment".into())
+                    })?),
+                    MmseqsBackend::Cpu,
+                ).await?
+            }
+            NRAlignmentBackend::MmseqsGpu => {
+                mmseqs_non_host_align(
+                    config.clone(),
+                    non_host_r1_path.clone(),
+                    non_host_r2_path_opt.clone(),
+                    PathBuf::from(config.args.nr.as_ref().ok_or_else(|| {
+                        PipelineError::MissingArgument("nr DB required for MMseqs alignment".into())
+                    })?),
+                    MmseqsBackend::Gpu,
+                ).await?
+            }
+        };
+
+    cleanup_tasks.append(&mut non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut non_host_cleanup_receivers);
+    final_temp_dirs.extend(non_host_temp_dirs);
 
     let nr_concurrency = compute_phase_concurrency(
         &config,
@@ -7824,7 +8081,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_sort_start = Instant::now();
     let nr_m8_sorted = sort_m8_by_read_id(
         config.clone(),
-        ReceiverStream::new(non_host_diamond_m8_stream),   // your original unsorted stream
+        ReceiverStream::new(non_host_m8_stream),
         "nr",
     ).await?;
     info!(
@@ -7832,17 +8089,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     nr_sort_start.elapsed()
 );
 
-    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) = call_hits_m8(
-        config.clone(),
-        nr_m8_sorted,
-        sample_base_buf.clone(),
-        lineage_map.clone(),
-        acc2taxid_map.clone(),
-        should_keep_filter.clone(),
-        0,
-        nr_concurrency,
-        "nr".to_string(),
-    ).await?;
+    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) =
+        call_hits_m8(
+            config.clone(),
+            nr_m8_sorted,
+            sample_base_buf.clone(),
+            lineage_map.clone(),
+            acc2taxid_map.clone(),
+            should_keep_filter.clone(),
+            0,
+            nr_concurrency,
+            "nr".to_string(),
+        ).await?;
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
