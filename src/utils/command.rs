@@ -2277,6 +2277,193 @@ pub mod sort {
     }
 }
 
+pub mod mmseqs {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use anyhow::{anyhow, Result};
+    use log::debug;
+
+    use crate::config::defs::{MMSEQS_TAG, RunConfig};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MmseqsBackend {
+        Cpu,
+        Gpu,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MmseqsSubcommand {
+        Search,
+        ConvertAlis,
+        Createdb,
+        MakePaddedSeqDb,
+    }
+
+    #[derive(Debug)]
+    pub struct MmseqsConfig {
+        pub subcommand: MmseqsSubcommand,
+        pub backend: MmseqsBackend,
+
+        // Common paths used by the different subcommands.
+        pub query: Option<PathBuf>,
+        pub target_db: Option<PathBuf>,
+        pub result_db: Option<PathBuf>,
+        pub tmp_dir: Option<PathBuf>,
+        pub input: Option<PathBuf>,
+        pub output: Option<PathBuf>,
+
+        // Search controls.
+        pub threads: Option<usize>,
+        pub translation_mode: Option<u8>,
+        pub sensitivity: Option<String>,
+        pub format_output: Option<String>,
+
+        // Extra flags, kept generic so the caller can tune without changing the wrapper.
+        pub option_fields: HashMap<String, Option<String>>,
+    }
+
+    pub struct MmseqsArgGenerator;
+
+    pub async fn mmseqs_presence_check() -> Result<f32> {
+        // `mmseqs version` is the least noisy and most stable check.
+        let version = version_check(MMSEQS_TAG, vec!["version"], 0, 0, ChildStream::Stdout, None).await?;
+        Ok(version)
+    }
+
+    fn push_threads(args: &mut Vec<String>, run_config: &RunConfig, threads: Option<usize>) {
+        let n = threads.unwrap_or_else(|| run_config.thread_allocation(MMSEQS_TAG, None));
+        args.push("--threads".to_string());
+        args.push(n.to_string());
+    }
+
+    fn push_backend(args: &mut Vec<String>, backend: MmseqsBackend) {
+        if backend == MmseqsBackend::Gpu {
+            args.push("--gpu".to_string());
+            args.push("1".to_string());
+        }
+    }
+
+    fn push_option_fields(args: &mut Vec<String>, fields: &HashMap<String, Option<String>>) {
+        for (key, value) in fields {
+            args.push(key.clone());
+            if let Some(v) = value {
+                args.push(v.clone());
+            }
+        }
+    }
+
+    impl ArgGenerator for MmseqsArgGenerator {
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<MmseqsConfig>())
+                .ok_or_else(|| anyhow!("MMseqs requires a MmseqsConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                MmseqsSubcommand::Createdb => {
+                    args_vec.push("createdb".to_string());
+                    push_backend(&mut args_vec, config.backend);
+                    push_threads(&mut args_vec, run_config, config.threads);
+
+                    let input = config.input.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs createdb requires input"))?;
+                    let output = config.output.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs createdb requires output"))?;
+
+                    args_vec.push(input.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::MakePaddedSeqDb => {
+                    args_vec.push("makepaddedseqdb".to_string());
+                    push_threads(&mut args_vec, run_config, config.threads);
+
+                    let input = config.input.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs makepaddedseqdb requires input"))?;
+                    let output = config.output.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs makepaddedseqdb requires output"))?;
+
+                    args_vec.push(input.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::Search => {
+                    args_vec.push("search".to_string());
+                    push_backend(&mut args_vec, config.backend);
+                    push_threads(&mut args_vec, run_config, config.threads);
+
+                    if let Some(mode) = config.translation_mode {
+                        args_vec.push("--translation-mode".to_string());
+                        args_vec.push(mode.to_string());
+                    }
+
+                    if let Some(s) = &config.sensitivity {
+                        args_vec.push("-s".to_string());
+                        args_vec.push(s.clone());
+                    }
+
+                    let query = config.query.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs search requires query DB"))?;
+                    let target = config.target_db.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs search requires target DB"))?;
+                    let result = config.result_db.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs search requires result DB"))?;
+                    let tmp = config.tmp_dir.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs search requires tmp dir"))?;
+
+                    args_vec.push(query.to_string_lossy().to_string());
+                    args_vec.push(target.to_string_lossy().to_string());
+                    args_vec.push(result.to_string_lossy().to_string());
+                    args_vec.push(tmp.to_string_lossy().to_string());
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::ConvertAlis => {
+                    args_vec.push("convertalis".to_string());
+                    push_backend(&mut args_vec, config.backend);
+                    push_threads(&mut args_vec, run_config, config.threads);
+
+                    let query = config.query.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs convertalis requires query DB"))?;
+                    let target = config.target_db.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs convertalis requires target DB"))?;
+                    let result = config.result_db.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs convertalis requires result DB"))?;
+                    let output = config.output.as_ref()
+                        .ok_or_else(|| anyhow!("MMseqs convertalis requires output path"))?;
+
+                    args_vec.push(query.to_string_lossy().to_string());
+                    args_vec.push(target.to_string_lossy().to_string());
+                    args_vec.push(result.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    args_vec.push("--format-output".to_string());
+                    args_vec.push(config.format_output.clone().unwrap_or_else(|| {
+                        // BLAST m8-like default.
+                        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits".to_string()
+                    }));
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+            }
+
+            debug!("MMseqs argv: {:?}", args_vec);
+            Ok(args_vec)
+        }
+    }
+}
+
+
 
 
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
@@ -2304,6 +2491,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         BLASTX_TAG => Box::new(blastx::BlastxArgGenerator),
         MAKEBLASTDB_TAG => {Box::new(makeblastdb::MakeblastdbArgGenerator)},
         SORT_TAG => Box::new(sort::SortArgGenerator),
+        MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -2354,6 +2542,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
                 BLASTX_TAG => blastx::blastx_presence_check().await,
                 MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
                 SORT_TAG => sort::sort_presence_check().await,
+                MMSEQS_TAG => mmseqs::mmseqs_presence_check().await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))
