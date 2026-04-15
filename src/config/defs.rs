@@ -104,6 +104,7 @@ lazy_static! {
         m.insert("fastp", 32);        // I/O-bound
         m.insert("pigz", 16);         // Compression scales poorly >16
         m.insert("kraken2", 64);      // Memory/I/O heavy
+        m.insert("mmseqs", 192);
         m
     };
 }
@@ -286,7 +287,7 @@ impl RunConfig {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
             (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _) | (HISAT2_TAG, _)
-            | (MAKEBLASTDB_TAG, _) => CoreAllocation::Maximal,
+            | (MAKEBLASTDB_TAG, _) | (MMSEQS_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
