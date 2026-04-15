@@ -7320,8 +7320,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // External tools check
 
-    let mut versions_vec = vec![BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG,
-                        BLASTN_TAG, BLASTX_TAG, SORT_TAG];
+    let mut versions_vec = vec![
+        BOWTIE2_TAG,
+        MINIMAP2_TAG,
+        KALLISTO_TAG,
+        SPADES_TAG,
+        MAKEBLASTDB_TAG,
+        BLASTN_TAG,
+        BLASTX_TAG,
+        SORT_TAG,
+        SAMTOOLS_TAG,
+        FASTP_TAG,
+        HISAT2_TAG,
+    ];
 
     match config.alignment_backend {
         NRAlignmentBackend::Diamond => {
