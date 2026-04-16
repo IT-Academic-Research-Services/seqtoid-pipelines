@@ -3043,6 +3043,73 @@ pub async fn call_hits_m8(
     ))
 }
 
+
+async fn run_diamond_single_file(
+    config: Arc<RunConfig>,
+    query_path: PathBuf,
+    db_prefix: PathBuf,
+    mut options: HashMap<String, Option<String>>,
+    temp_dir: &TempDir,
+    label: &str,
+) -> Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let m8_path = temp_dir.path().join(format!("diamond_{}.m8", label));
+
+    options.insert("--query".to_string(), Some(query_path.to_string_lossy().to_string()));
+
+    let diamond_config = DiamondConfig {
+        subcommand: DiamondSubcommand::Blastx,
+        db: db_prefix,
+        r1_path: Some(query_path),
+        r2_path: None,
+        subcommand_fields: options,
+    };
+
+    let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: DIAMOND_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
+        config.clone(),
+        DIAMOND_TAG,
+        diamond_args,
+        config.args.verbose,
+    ).await?;
+
+    let diamond_stdout = diamond_child.stdout.take()
+        .ok_or_else(|| anyhow!("diamond stdout missing"))?;
+
+    let m8_stream = parse_child_output(
+        &mut diamond_child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        config.base_buffer_size,
+    ).await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: DIAMOND_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let write_task = write_byte_stream_to_file(
+        &m8_path,
+        ReceiverStream::new(m8_stream),
+        Some(config.base_buffer_size),
+        &format!("diamond_{}", label),
+    ).await?;
+
+    // Wait for Diamond itself to finish (the write_task runs in parallel)
+    let status = diamond_child.wait().await?;
+    if !status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: DIAMOND_TAG.to_string(),
+            error: format!("exited with code {:?}", status.code()),
+        });
+    }
+
+    Ok((m8_path, write_task))
+}
+
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3056,7 +3123,6 @@ async fn diamond_non_host_align(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    // Temp dir
     let temp_dir = choose_temp_dir(
         100_000_000_000,
         &config.ram_temp_dir,
@@ -3083,84 +3149,73 @@ async fn diamond_non_host_align(
     else if threads >= 64 { 12 }
     else { 4 };
 
-    // Safety cap for Epyc nodes
     index_chunks = index_chunks.min((config.available_ram / 12_000_000_000) as usize);
 
     info!("Diamond non-host: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
           threads, index_chunks, optimal_block_size, temp_dir.path().display());
 
-    let diamond_options = HashMap::from([
+    let base_diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
         ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
         ("-c".to_string(), Some(index_chunks.to_string())),
         ("-f".to_string(), Some("6".to_string())),
         ("--tmpdir".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
         ("--unal".to_string(), Some("0".to_string())),
-        // ("--verbose".to_string(), None),
     ]);
 
-    let diamond_config = DiamondConfig {
-        subcommand: DiamondSubcommand::Blastx,
-        db: db_prefix,
-        r1_path: Some(r1_path.clone()),
-        r2_path: r2_path_opt.clone(),
-        subcommand_fields: diamond_options,
+    // === Run on R1 ===
+    let (r1_m8, r1_write_task) = run_diamond_single_file(
+        config.clone(),
+        r1_path,
+        db_prefix.clone(),
+        base_diamond_options.clone(),
+        &temp_dir,
+        "nr_r1",
+    ).await?;
+    cleanup_tasks.push(r1_write_task);
+
+    // === Run on R2 (if present) ===
+    let r2_m8_opt = if let Some(r2_path) = r2_path_opt {
+        let (r2_m8, r2_write_task) = run_diamond_single_file(
+            config.clone(),
+            r2_path,
+            db_prefix,
+            base_diamond_options,
+            &temp_dir,
+            "nr_r2",
+        ).await?;
+        cleanup_tasks.push(r2_write_task);
+        Some(r2_m8)
+    } else {
+        None
     };
 
-    let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config))
-        .map_err(|e| PipelineError::ToolExecution { tool: DIAMOND_TAG.to_string(), error: e.to_string() })?;
+    // === Concatenate m8 files ===
+    let merged_m8 = temp_dir.path().join("diamond_merged_nr.m8");
+    let mut merged = TokioFile::create(&merged_m8)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
+    let mut f1 = TokioFile::open(&r1_m8).await?;
+    tokio::io::copy(&mut f1, &mut merged).await?;
 
-    let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
-        config.clone(),
-        DIAMOND_TAG,
-        diamond_args,
-        config.args.verbose,
-    ).await?;
+    if let Some(r2_m8) = r2_m8_opt {
+        let mut f2 = TokioFile::open(&r2_m8).await?;
+        tokio::io::copy(&mut f2, &mut merged).await?;
+    }
 
-    // Take pipes upfront (before any move)
-    // Note: stderr is already consumed by spawn_cmd's internal stderr_task; do not take it again.
-    let diamond_stdout = diamond_child.stdout.take().ok_or_else(|| anyhow!("diamond stdout missing"))?;
+    merged.flush().await?;
 
-    // Parse stdout to m8 stream
-    let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
+    // === Stream the merged m8 downstream ===
+    let m8_file = TokioFile::open(&merged_m8)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let parse_task = tokio::spawn(async move {
-        let mut reader = TokioBufReader::new(diamond_stdout);
-        let mut line = Vec::with_capacity(1024);
+    let m8_rx = parse_lines(m8_file, config.base_buffer_size)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line).await? == 0 {
-                break;
-            }
-            if !line.is_empty() && line[0] != b'#' {
-                let arc_line = Arc::new(line.clone());
-                if m8_tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    });
-
-    // Wait for diamond exit
-    let wait_task = tokio::spawn(async move {
-        let status = diamond_child.wait().await?;
-        if !status.success() {
-            return Err(anyhow!("diamond exited with code {:?}", status.code()));
-        }
-        Ok(())
-    });
-
-    // Cleanup
-    cleanup_tasks.push(parse_task);
-    cleanup_tasks.push(wait_task);
-    cleanup_tasks.push(diamond_stderr_task);  // your stderr logging
-
-    let mut temp_dirs = vec![temp_dir];
-
-    Ok((m8_rx, cleanup_tasks, cleanup_receivers, temp_dirs))
+    Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
 
 /// Generates ytaxon counts from a called m8 stream
