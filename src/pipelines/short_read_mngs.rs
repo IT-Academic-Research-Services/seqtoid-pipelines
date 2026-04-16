@@ -7231,13 +7231,19 @@ async fn mmseqs_fastq_to_m8_file(
         output: m8_path.clone(),
         tmp_dir: tmp_dir.clone(),
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
-        sensitivity: Some("7.5".to_string()),
+
+        // ── Closest match to Diamond --mid-sensitive ─────────────────────
+        sensitivity: Some("5.7".to_string()),
+
         format_output: Some(
             "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
                 .to_string(),
         ),
         option_fields: HashMap::from([
-            ("--search-type".to_string(), Some("3".to_string())),
+            ("--search-type".to_string(), Some("3".to_string())),   // translated search (BLASTX-like)
+            ("--max-seqs".to_string(), Some("500".to_string())),    // similar to Diamond behavior
+            ("--evalue".to_string(), Some("0.001".to_string())),    // reasonable filter
+            ("--min-seq-id".to_string(), Some("0.25".to_string())),
         ]),
     };
 
@@ -7252,6 +7258,7 @@ async fn mmseqs_fastq_to_m8_file(
     let meta = fs::metadata(&m8_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
     if meta.len() == 0 {
         return Err(PipelineError::Other(anyhow!(
             "mmseqs produced an empty m8 file: {}",
@@ -7273,10 +7280,10 @@ pub async fn mmseqs_non_host_align(
     Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>>,
     Vec<TempDir>,
 ), PipelineError> {
-    let cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
-    info!("Running mmseqs non-host align");
+    info!("Running mmseqs non-host align (backend: {:?})", backend);
 
     let temp_dir = choose_temp_dir(
         100_000_000_000,
@@ -7284,18 +7291,18 @@ pub async fn mmseqs_non_host_align(
         &config.args.nvme_scratch,
         4,
         true,
-    )
-        .await?;
+    ).await?;
 
+    // Run on R1
     let r1_m8 = mmseqs_fastq_to_m8_file(
         config.clone(),
         r1_path,
         &temp_dir,
         "nr_r1",
         backend,
-    )
-        .await?;
+    ).await?;
 
+    // Concatenate into final merged m8
     let merged_unsorted_m8 = temp_dir.path().join("mmseqs_unsorted_nr.m8");
     let mut merged = fs::File::create(&merged_unsorted_m8)
         .await
@@ -7308,6 +7315,7 @@ pub async fn mmseqs_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
+    // Run on R2 (if present) and append
     if let Some(r2_path) = r2_path_opt {
         let r2_m8 = mmseqs_fastq_to_m8_file(
             config.clone(),
@@ -7315,8 +7323,7 @@ pub async fn mmseqs_non_host_align(
             &temp_dir,
             "nr_r2",
             backend,
-        )
-            .await?;
+        ).await?;
 
         let mut f2 = fs::File::open(&r2_m8)
             .await
@@ -7330,6 +7337,7 @@ pub async fn mmseqs_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
+    // Stream the merged m8
     let m8_file = fs::File::open(&merged_unsorted_m8)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
