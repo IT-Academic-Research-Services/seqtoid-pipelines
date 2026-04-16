@@ -1786,12 +1786,7 @@ pub mod diamond {
 
             args_vec.push("-d".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
-
-
-            if let Some(r1_path) = &config.r1_path {
-                args_vec.push("--query".to_string());
-                args_vec.push(r1_path.to_string_lossy().to_string());
-            } // if no input paths, automatically accpet stdin
+            
 
             let threads = run_config.thread_allocation(DIAMOND_TAG, None);
             args_vec.push("--threads".to_string());

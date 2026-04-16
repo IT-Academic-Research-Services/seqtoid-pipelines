@@ -3048,20 +3048,19 @@ async fn run_diamond_single_file(
     config: Arc<RunConfig>,
     query_path: PathBuf,
     db_prefix: PathBuf,
-    base_options: HashMap<String, Option<String>>,   // pass a clean copy, do NOT mutate shared one
+    mut options: HashMap<String, Option<String>>,   // take ownership of a clean map
     temp_dir: &TempDir,
     label: &str,
 ) -> Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
     let m8_path = temp_dir.path().join(format!("diamond_{}.m8", label));
 
-    // Build options fresh — do NOT insert into the caller's base_options
-    let mut options = base_options.clone();
+    // Add --query ONLY here. Do not let DiamondArgGenerator add it again.
     options.insert("--query".to_string(), Some(query_path.to_string_lossy().to_string()));
 
     let diamond_config = DiamondConfig {
         subcommand: DiamondSubcommand::Blastx,
         db: db_prefix,
-        r1_path: Some(query_path.clone()),
+        r1_path: Some(query_path),   // still needed for the struct
         r2_path: None,
         subcommand_fields: options,
     };
@@ -3100,7 +3099,6 @@ async fn run_diamond_single_file(
         &format!("diamond_{}", label),
     ).await?;
 
-    // Wait for the diamond process itself
     let status = diamond_child.wait().await?;
     if !status.success() {
         return Err(PipelineError::ToolExecution {
