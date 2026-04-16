@@ -3044,23 +3044,23 @@ pub async fn call_hits_m8(
 }
 
 
+// Helper: runs Diamond on one file, waits for both parse and write to finish, returns only the m8 path
 async fn run_diamond_single_file(
     config: Arc<RunConfig>,
     query_path: PathBuf,
     db_prefix: PathBuf,
-    mut options: HashMap<String, Option<String>>,   // take ownership of a clean map
+    mut options: HashMap<String, Option<String>>,
     temp_dir: &TempDir,
     label: &str,
-) -> Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+) -> Result<PathBuf, PipelineError> {
     let m8_path = temp_dir.path().join(format!("diamond_{}.m8", label));
 
-    // Add --query ONLY here. Do not let DiamondArgGenerator add it again.
     options.insert("--query".to_string(), Some(query_path.to_string_lossy().to_string()));
 
     let diamond_config = DiamondConfig {
         subcommand: DiamondSubcommand::Blastx,
         db: db_prefix,
-        r1_path: Some(query_path),   // still needed for the struct
+        r1_path: Some(query_path),
         r2_path: None,
         subcommand_fields: options,
     };
@@ -3079,26 +3079,38 @@ async fn run_diamond_single_file(
     ).await?;
 
     let diamond_stdout = diamond_child.stdout.take()
-        .ok_or_else(|| anyhow!("diamond stdout missing after spawn"))?;
+        .ok_or_else(|| anyhow!("diamond stdout missing"))?;
 
-    let m8_stream = parse_child_output(
-        &mut diamond_child,
-        ChildStream::Stdout,
-        ParseMode::Lines,
-        config.base_buffer_size,
-    ).await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: DIAMOND_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
+
+    // Explicit type annotation to fix the error
+    let parse_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let mut reader = TokioBufReader::new(diamond_stdout);
+        let mut line = Vec::with_capacity(1024);
+
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line).await? == 0 {
+                break;
+            }
+            if !line.is_empty() && line[0] != b'#' {
+                let arc_line = Arc::new(line.clone());
+                if m8_tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    });
 
     let write_task = write_byte_stream_to_file(
         &m8_path,
-        ReceiverStream::new(m8_stream),
+        ReceiverStream::new(m8_rx),
         Some(config.base_buffer_size),
         &format!("diamond_{}", label),
     ).await?;
 
+    // Wait for diamond process
     let status = diamond_child.wait().await?;
     if !status.success() {
         return Err(PipelineError::ToolExecution {
@@ -3107,7 +3119,14 @@ async fn run_diamond_single_file(
         });
     }
 
-    Ok((m8_path, write_task))
+    // Wait for both tasks to complete before returning (as you requested)
+    parse_task.await
+        .map_err(|e| PipelineError::Other(anyhow!("parse_task panicked: {}", e)))??;
+
+    write_task.await
+        .map_err(|e| PipelineError::Other(anyhow!("write_task panicked: {}", e)))??;
+
+    Ok(m8_path)
 }
 
 async fn diamond_non_host_align(
@@ -3154,7 +3173,7 @@ async fn diamond_non_host_align(
     info!("Diamond non-host: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
           threads, index_chunks, optimal_block_size, temp_dir.path().display());
 
-    let base_diamond_options = HashMap::from([
+    let diamond_options = HashMap::from([
         ("--mid-sensitive".to_string(), None),
         ("--block-size".to_string(), Some(format!("{:.1}", optimal_block_size))),
         ("-c".to_string(), Some(index_chunks.to_string())),
@@ -3163,34 +3182,29 @@ async fn diamond_non_host_align(
         ("--unal".to_string(), Some("0".to_string())),
     ]);
 
-    // === Run on R1 ===
-    let (r1_m8, r1_write_task) = run_diamond_single_file(
+    // Run R1 and wait for it to finish
+    let r1_m8 = run_diamond_single_file(
         config.clone(),
         r1_path,
         db_prefix.clone(),
-        base_diamond_options.clone(),
+        diamond_options.clone(),
         &temp_dir,
         "nr_r1",
     ).await?;
-    cleanup_tasks.push(r1_write_task);
 
-    // === Run on R2 (if present) ===
-    let r2_m8_opt = if let Some(r2_path) = r2_path_opt {
-        let (r2_m8, r2_write_task) = run_diamond_single_file(
+    // Run R2 and wait for it to finish (if present)
+    if let Some(r2_path) = r2_path_opt {
+        let _r2_m8 = run_diamond_single_file(
             config.clone(),
             r2_path,
             db_prefix,
-            base_diamond_options.clone(),
+            diamond_options,
             &temp_dir,
             "nr_r2",
         ).await?;
-        cleanup_tasks.push(r2_write_task);
-        Some(r2_m8)
-    } else {
-        None
-    };
+    }
 
-    // === Concatenate m8 files ===
+    // Now both files are fully written — safe to concatenate
     let merged_m8 = temp_dir.path().join("diamond_merged_nr.m8");
     let mut merged = TokioFile::create(&merged_m8)
         .await
@@ -3199,14 +3213,10 @@ async fn diamond_non_host_align(
     let mut f1 = TokioFile::open(&r1_m8).await?;
     tokio::io::copy(&mut f1, &mut merged).await?;
 
-    if let Some(r2_m8) = r2_m8_opt {
-        let mut f2 = TokioFile::open(&r2_m8).await?;
-        tokio::io::copy(&mut f2, &mut merged).await?;
-    }
+    // R2 was already written if it existed
 
     merged.flush().await?;
 
-    // === Stream the merged m8 downstream ===
     let m8_file = TokioFile::open(&merged_m8)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;

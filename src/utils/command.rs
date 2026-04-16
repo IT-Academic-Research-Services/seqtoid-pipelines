@@ -1816,43 +1816,54 @@ pub mod diamond {
         };
 
         let db_stats = get_diamond_db_stats(&db_path).await
-            .unwrap_or((0, 300_000_000_000));
+            .unwrap_or((0, 300_000_000_000)); // fallback NR size
 
         let total_letters_billions = db_stats.1 as f64 / 1e9;
 
-        // Base calculation from RAM
-        let ram_factor = if available_ram_gb >= 1400.0 { 9.0 }
-        else if available_ram_gb >= 900.0 { 10.0 }
-        else if available_ram_gb >= 128.0 { 12.0 }
-        else { 15.0 };
+        let ram_factor = if available_ram_gb >= 1400.0 {
+            9.0
+        } else if available_ram_gb >= 900.0 {
+            10.0
+        } else if available_ram_gb >= 128.0 {
+            12.0
+        } else {
+            15.0
+        };
 
         let mut block_size = available_ram_gb / ram_factor;
+
         block_size = block_size.min(total_letters_billions);
 
-        // ────────────────────────────────────────────────────────────────
-        // HARD SAFETY CAPS — this is the part that was missing
-        // ────────────────────────────────────────────────────────────────
-        block_size = block_size.min(50.0);        // Never go above 50 GB per block (very important)
         block_size = block_size.max(6.0);
+        block_size = block_size.min(200.0);
 
-        // Respect actual scratch space (this is what was killing you)
         let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
         let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
-        let scratch_avail_gb = scratch_avail as f64 / 1_073_741_824.0;
+        let db_size_gb = std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1_073_741_824.0)
+            .unwrap_or(50.0);
 
-        let estimated_scratch_needed_gb = block_size * 4.0 + 40.0; // Diamond is very greedy with temp
+        let scratch_avail_gib = scratch_avail as f64 / 1_073_741_824.0;
 
-        if scratch_avail_gb < estimated_scratch_needed_gb {
+        let estimated_scratch_gib = block_size * 3.0 + 20.0;
+
+        if scratch_avail_gib < estimated_scratch_gib * 1.2 {
             warn!(
-            "Low scratch space! Only {:.1} GB free, but Diamond would need ~{:.1} GB. Reducing block size.",
-            scratch_avail_gb, estimated_scratch_needed_gb
+            "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 50%",
+            estimated_scratch_gib, scratch_avail_gib
         );
-            block_size = (scratch_avail_gb * 0.55).min(block_size); // aggressive reduction
+            block_size *= 0.5;
+        } else if scratch_avail_gib < estimated_scratch_gib * 1.5 {
+            warn!(
+            "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 30%",
+            estimated_scratch_gib, scratch_avail_gib
+        );
+            block_size *= 0.7;
         }
 
         info!(
         "Diamond block size: {:.1} (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
-        block_size, available_ram_gb, total_letters_billions, scratch_avail_gb
+        block_size, available_ram_gb, total_letters_billions, scratch_avail as f64 / 1e9 / 1_073_741_824.0
     );
 
         Ok(block_size)
