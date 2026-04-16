@@ -3048,18 +3048,20 @@ async fn run_diamond_single_file(
     config: Arc<RunConfig>,
     query_path: PathBuf,
     db_prefix: PathBuf,
-    mut options: HashMap<String, Option<String>>,
+    base_options: HashMap<String, Option<String>>,   // pass a clean copy, do NOT mutate shared one
     temp_dir: &TempDir,
     label: &str,
 ) -> Result<(PathBuf, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
     let m8_path = temp_dir.path().join(format!("diamond_{}.m8", label));
 
+    // Build options fresh — do NOT insert into the caller's base_options
+    let mut options = base_options.clone();
     options.insert("--query".to_string(), Some(query_path.to_string_lossy().to_string()));
 
     let diamond_config = DiamondConfig {
         subcommand: DiamondSubcommand::Blastx,
         db: db_prefix,
-        r1_path: Some(query_path),
+        r1_path: Some(query_path.clone()),
         r2_path: None,
         subcommand_fields: options,
     };
@@ -3078,7 +3080,7 @@ async fn run_diamond_single_file(
     ).await?;
 
     let diamond_stdout = diamond_child.stdout.take()
-        .ok_or_else(|| anyhow!("diamond stdout missing"))?;
+        .ok_or_else(|| anyhow!("diamond stdout missing after spawn"))?;
 
     let m8_stream = parse_child_output(
         &mut diamond_child,
@@ -3098,7 +3100,7 @@ async fn run_diamond_single_file(
         &format!("diamond_{}", label),
     ).await?;
 
-    // Wait for Diamond itself to finish (the write_task runs in parallel)
+    // Wait for the diamond process itself
     let status = diamond_child.wait().await?;
     if !status.success() {
         return Err(PipelineError::ToolExecution {
@@ -3180,7 +3182,7 @@ async fn diamond_non_host_align(
             config.clone(),
             r2_path,
             db_prefix,
-            base_diamond_options,
+            base_diamond_options.clone(),
             &temp_dir,
             "nr_r2",
         ).await?;
