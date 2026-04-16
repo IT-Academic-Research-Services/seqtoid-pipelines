@@ -7232,8 +7232,11 @@ async fn mmseqs_fastq_to_m8_file(
         tmp_dir: tmp_dir.clone(),
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
 
-        // ── Closest match to Diamond --mid-sensitive ─────────────────────
-        sensitivity: Some("5.7".to_string()),
+        // Sensitivity only applies to CPU. GPU always runs at maximum sensitivity.
+        sensitivity: match backend {
+            MmseqsBackend::Cpu => Some("5.7".to_string()),   // Closest to Diamond --mid-sensitive
+            MmseqsBackend::Gpu => None,
+        },
 
         format_output: Some(
             "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
@@ -7258,7 +7261,6 @@ async fn mmseqs_fastq_to_m8_file(
     let meta = fs::metadata(&m8_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
     if meta.len() == 0 {
         return Err(PipelineError::Other(anyhow!(
             "mmseqs produced an empty m8 file: {}",
@@ -7302,7 +7304,7 @@ pub async fn mmseqs_non_host_align(
         backend,
     ).await?;
 
-    // Concatenate into final merged m8
+    // Concatenate R1 + R2 (if present)
     let merged_unsorted_m8 = temp_dir.path().join("mmseqs_unsorted_nr.m8");
     let mut merged = fs::File::create(&merged_unsorted_m8)
         .await
@@ -7315,7 +7317,6 @@ pub async fn mmseqs_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // Run on R2 (if present) and append
     if let Some(r2_path) = r2_path_opt {
         let r2_m8 = mmseqs_fastq_to_m8_file(
             config.clone(),
@@ -7337,7 +7338,6 @@ pub async fn mmseqs_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // Stream the merged m8
     let m8_file = fs::File::open(&merged_unsorted_m8)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;

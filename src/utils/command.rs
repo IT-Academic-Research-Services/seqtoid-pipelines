@@ -2317,8 +2317,6 @@ pub mod mmseqs {
     pub struct MmseqsArgGenerator;
 
     pub async fn mmseqs_presence_check() -> Result<f32> {
-        // MMseqs2 prints a commit hash for `mmseqs version`, so treat this as a
-        // presence-only probe rather than a semantic version check.
         let output = Command::new(MMSEQS_TAG)
             .arg("version")
             .output()
@@ -2351,8 +2349,6 @@ pub mod mmseqs {
     }
 
     fn validate_cpu_index(db_prefix: &Path) -> Result<()> {
-        // Soft sanity check for a prebuilt CPU-side MMseqs database index.
-        // MMseqs DBs are prefix-based, so we check for a few common sidecars.
         let candidates = [
             db_prefix.with_extension("index"),
             db_prefix.with_extension("idx"),
@@ -2383,6 +2379,9 @@ pub mod mmseqs {
         if backend == MmseqsBackend::Gpu {
             args.push("--gpu".to_string());
             args.push("1".to_string());
+            debug!("MMseqs2: GPU mode enabled (--gpu 1)");
+        } else {
+            debug!("MMseqs2: CPU mode");
         }
     }
 
@@ -2406,10 +2405,12 @@ pub mod mmseqs {
                 .ok_or_else(|| anyhow!("MMseqs requires a MmseqsConfig as extra argument"))?;
 
             let target_db = resolve_mmseqs_db(run_config)?;
+
+            // ── Only validate CPU index when using CPU backend ──
             if config.backend == MmseqsBackend::Cpu {
                 validate_cpu_index(&target_db)?;
             } else {
-                debug!("MMseqs GPU backend selected; skipping CPU index validation");
+                debug!("MMseqs GPU backend selected; skipping CPU index validation (using padded GPU DB)");
             }
 
             let mut args_vec: Vec<String> = Vec::new();
@@ -2420,9 +2421,12 @@ pub mod mmseqs {
                     push_backend(&mut args_vec, config.backend);
                     push_threads(&mut args_vec, run_config, config.threads);
 
+                    // Only add -s for CPU (GPU ignores it anyway)
                     if let Some(s) = &config.sensitivity {
-                        args_vec.push("-s".to_string());
-                        args_vec.push(s.clone());
+                        if config.backend == MmseqsBackend::Cpu {
+                            args_vec.push("-s".to_string());
+                            args_vec.push(s.clone());
+                        }
                     }
 
                     args_vec.push(config.query.to_string_lossy().to_string());
@@ -2436,7 +2440,6 @@ pub mod mmseqs {
                             .format_output
                             .clone()
                             .unwrap_or_else(|| {
-                                // BLAST m8-like default.
                                 "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
                                     .to_string()
                             }),
