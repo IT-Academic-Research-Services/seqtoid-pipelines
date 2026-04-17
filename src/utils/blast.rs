@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use dashmap::DashMap;
 use tokio::time::{sleep, Duration, Instant};
 use ahash::RandomState as AHashRandomState;
+use bytes::Bytes;
 
 
 use once_cell::sync::Lazy;
@@ -1024,7 +1025,9 @@ pub async fn generate_taxon_count_json_from_m8(
                             };
 
                             let json = serde_json::to_string(&count)? + "\n";
-                            let _ = output_tx.send(ParseOutput::Bytes(Arc::new(json.into_bytes()))).await;
+                            let _ = output_tx
+                                .send(ParseOutput::Bytes(Bytes::from(json)))
+                                .await;
                         }
                     }
                 } else {

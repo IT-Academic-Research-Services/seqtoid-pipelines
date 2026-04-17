@@ -74,7 +74,7 @@ pub async fn generate_info_from_bam_stream(
     HashMap<String, usize>,            // contig_unique_counts
 )> {
     let byte_stream = ReceiverStream::new(rx).map(|item| match item {
-        ParseOutput::Bytes(arc) => Ok(Bytes::from((*arc).clone())),
+        ParseOutput::Bytes(bytes) => Ok(bytes),
         _ => Err(anyhow_to_io(anyhow!("BAM stream received non-Bytes variant"))),
     });
 

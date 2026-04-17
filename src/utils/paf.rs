@@ -15,6 +15,7 @@ use rayon::prelude::*;
 use memchr::memchr2_iter;
 use lexical::parse as lexical_parse;
 use once_cell::sync::Lazy;
+use bytes::Bytes;
 
 use crate::utils::streams::ParseOutput;
 use crate::config::defs::{SIMD_LEVEL, SimdLevel};
@@ -251,7 +252,7 @@ impl PafRecord {
 
                     // Forward raw PAF line unchanged
                     let bytes = (trimmed.to_string() + "\n").into_bytes();
-                    if tx_clone.send(ParseOutput::Bytes(Arc::new(bytes))).await.is_err() {
+                    if tx_clone.send(ParseOutput::Bytes(Bytes::from(bytes))).await.is_err() {
                         return Ok(());
                     }
 

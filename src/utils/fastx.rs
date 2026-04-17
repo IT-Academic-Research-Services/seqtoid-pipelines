@@ -33,6 +33,7 @@ use tokio::io::AsyncSeekExt;
 use memchr::{memmem, memchr3};
 use fst::{MapBuilder};
 use once_cell::sync::Lazy;
+use bytes::Bytes;
 
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
@@ -580,13 +581,13 @@ pub fn read_fastq(
                     validated_reads += 1;
 
                     if buffer.len() >= chunk_size {
-                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                        if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                             return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
                         }
                     }
                 }
                 if !buffer.is_empty() {
-                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                    if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
@@ -711,7 +712,7 @@ pub fn read_fastq(
                             validated_reads += 1;
 
                             if buffer.len() >= chunk_size {
-                                if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                                if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                                     return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
                                 }
                             }
@@ -734,7 +735,7 @@ pub fn read_fastq(
 
                 // Send remaining buffer
                 if !buffer.is_empty() {
-                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                    if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
@@ -844,7 +845,7 @@ pub fn read_fasta(
 
             // Send if chunk full
             if buffer.len() >= chunk_size {
-                if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                     return Err(anyhow!("Failed to send byte chunk at record {}", record_count));
                 }
             }
@@ -852,7 +853,7 @@ pub fn read_fasta(
 
         // Send remaining
         if !buffer.is_empty() {
-            if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                 return Err(anyhow!("Failed to send final byte chunk"));
             }
         }
@@ -1932,8 +1933,7 @@ pub async fn filter_fastq_to_bytes_stream(
                 if headers.contains(&record.id()[..]) {
                     match record.to_bytes() {
                         Ok(vec) => {
-                            let arc_data = Arc::new(vec);
-                            let _ = tx.send(ParseOutput::Bytes(arc_data)).await;
+                            let _ = tx.send(ParseOutput::Bytes(vec)).await;
                         }
                         Err(e) => error!("Failed to serialize FASTQ record: {}", e),
                     }

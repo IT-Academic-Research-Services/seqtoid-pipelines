@@ -7,11 +7,13 @@ use std::time::Instant;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::pin::Pin;
 
 
 use tokio::fs::File;
 use log::{self, LevelFilter, debug, info, error, warn};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter, ReadBuf};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
@@ -32,8 +34,10 @@ use tokio::fs::{self, set_permissions};
 use std::fs::Permissions;
 use futures::stream::BoxStream;
 use futures::pin_mut;
-
+use bytes::Bytes;
 use rayon::prelude::*;
+
+
 
 
 
@@ -47,12 +51,13 @@ use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect
 
 
 pub trait ToBytes {
-    fn to_bytes(&self) -> Result<Vec<u8>>;
+    fn to_bytes(&self) -> Result<Bytes>;
 }
 
 impl ToBytes for SequenceRecord {
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();  // Alloc only when needed (e.g., for stdin pipes)
+    fn to_bytes(&self) -> Result<Bytes> {
+        let mut buffer = Vec::new();
+
         match self {
             SequenceRecord::Fastq { id, desc, seq, qual } => {
                 if let Some(desc) = desc {
@@ -75,7 +80,8 @@ impl ToBytes for SequenceRecord {
                 buffer.push(b'\n');
             }
         }
-        Ok(buffer)
+
+        Ok(Bytes::from(buffer))
     }
 }
 
@@ -99,23 +105,24 @@ pub enum ParseMode {
 pub enum ParseOutput {
     Fastq(SequenceRecord),
     Fasta(SequenceRecord),
-    Bytes(Arc<Vec<u8>>),
+    Bytes(Bytes),
 }
 
 impl ToBytes for ParseOutput {
-    fn to_bytes(&self) -> Result<Vec<u8>> {
+    fn to_bytes(&self) -> Result<Bytes> {
         match self {
-            ParseOutput::Fastq(record) => record.to_bytes(),
-            ParseOutput::Fasta(record) => record.to_bytes(),
-            ParseOutput::Bytes(bytes) => Ok((**bytes).clone()),
+            ParseOutput::Fastq(record) => Ok(Bytes::from(record.to_bytes()?)),
+            ParseOutput::Fasta(record) => Ok(Bytes::from(record.to_bytes()?)),
+            ParseOutput::Bytes(bytes) => Ok(bytes.clone()), // cheap refcount bump
         }
     }
 }
 
-/// Converts mpsc::Receiver<ParseOutput> type output to AsyncRead suitable to parse_fasta. parse_fastq.
+/// Converts mpsc::Receiver<ParseOutput> type output to AsyncRead suitable to parse_fasta / parse_fastq.
 pub struct ChannelReader {
     rx: mpsc::Receiver<ParseOutput>,
-    buffer: Vec<u8>,
+    buffer: Option<Bytes>,
+    offset: usize,
     closed: bool,
 }
 
@@ -123,7 +130,8 @@ impl ChannelReader {
     pub fn new(rx: mpsc::Receiver<ParseOutput>) -> Self {
         Self {
             rx,
-            buffer: Vec::new(),
+            buffer: None,
+            offset: 0,
             closed: false,
         }
     }
@@ -131,44 +139,54 @@ impl ChannelReader {
 
 impl AsyncRead for ChannelReader {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.closed {
-            return std::task::Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()));
         }
 
-        // If buffer has data, copy to output
-        if !self.buffer.is_empty() {
-            let to_copy = std::cmp::min(self.buffer.len(), buf.remaining());
-            buf.put_slice(&self.buffer[0..to_copy]);
-            self.buffer.drain(0..to_copy);
-            return std::task::Poll::Ready(Ok(()));
-        }
-
-        // Fetch next chunk from channel
-        match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => {
-                match item {
-                    ParseOutput::Bytes(bytes) => {
-                        self.buffer = Arc::try_unwrap(bytes).unwrap_or_else(|arc| (*arc).clone());
-                        let to_copy = std::cmp::min(self.buffer.len(), buf.remaining());
-                        buf.put_slice(&self.buffer[0..to_copy]);
-                        self.buffer.drain(0..to_copy);
-                        std::task::Poll::Ready(Ok(()))
-                    }
-                    _ => std::task::Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Expected ParseOutput::Bytes, got another variant",
-                    ))),
+        loop {
+            if let Some(bytes) = self.buffer.clone() {
+                let remaining = &bytes[self.offset..];
+                if remaining.is_empty() {
+                    self.buffer = None;
+                    self.offset = 0;
+                    continue;
                 }
+
+                let to_copy = std::cmp::min(remaining.len(), buf.remaining());
+                buf.put_slice(&remaining[..to_copy]);
+                self.offset += to_copy;
+
+                if self.offset >= bytes.len() {
+                    self.buffer = None;
+                    self.offset = 0;
+                }
+
+                return Poll::Ready(Ok(()));
             }
-            std::task::Poll::Ready(None) => {
-                self.closed = true;
-                std::task::Poll::Ready(Ok(()))
+
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(item)) => match item {
+                    ParseOutput::Bytes(bytes) => {
+                        self.buffer = Some(bytes);
+                        self.offset = 0;
+                    }
+                    _ => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Expected ParseOutput::Bytes, got another variant",
+                        )));
+                    }
+                },
+                Poll::Ready(None) => {
+                    self.closed = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
@@ -803,7 +821,7 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
             if bytes_read == 0 {
                 break;
             }
-            if tx.send(ParseOutput::Bytes(Arc::new(buffer[..bytes_read].to_vec()))).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Bytes::from(buffer[..bytes_read].to_vec()))).await.is_err() {
                 error!("Receiver dropped while sending bytes");
                 break;
             }
@@ -855,7 +873,7 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
             let bytes = trimmed.as_bytes().to_vec();
 
             if tx
-                .send(ParseOutput::Bytes(Arc::new(bytes)))
+                .send(ParseOutput::Bytes(Bytes::from(bytes)))
                 .await
                 .is_err()
             {
@@ -1096,7 +1114,7 @@ pub async fn deinterleave_fastq_stream(
             record_count += 1;
             if let ParseOutput::Fastq(record) = item {
                 let bytes = record.to_bytes().map_err(|e| anyhow!("Failed to convert FASTQ to bytes: {}", e))?;
-                let bytes_output = ParseOutput::Bytes(Arc::new(bytes));
+                let bytes_output = ParseOutput::Bytes(Bytes::from(bytes));
                 if paired {
                     if is_r1 {
                         r1_tx.send(bytes_output.clone()).await
@@ -1614,7 +1632,7 @@ pub async fn bytes_to_lines(
                     let mut start = 0;
                     for i in 0..bytes.len() {
                         if bytes[i] == b'\n' {
-                            let line = Arc::new(bytes[start..=i].to_vec());
+                            let line = Bytes::copy_from_slice(&bytes[start..=i]);
                             if tx.send(ParseOutput::Bytes(line)).await.is_err() {
                                 warn!("Warning: Receiver dropped in bytes_to_lines, stopping line processing");
                                 break;
@@ -1634,7 +1652,7 @@ pub async fn bytes_to_lines(
         }
 
         if !leftover.is_empty() {
-            if tx.send(ParseOutput::Bytes(Arc::new(leftover))).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Bytes::from(leftover))).await.is_err() {
                 warn!("Warning: Receiver dropped when sending final leftover line");
             }
         }
@@ -1807,7 +1825,7 @@ where
         label: &'static str,
     ) -> bool {
         for line in lines {
-            if tx.send(ParseOutput::Bytes(Arc::new(line))).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Bytes::from(line))).await.is_err() {
                 warn!(
                     "{}: downstream closed while sending {}",
                     stage_name, label
@@ -2867,15 +2885,23 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_file_bytes_no_clone() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        let data = Arc::new(vec![b'A'; 1_000_000]); // 1MB chunk
-        tokio::spawn(async move { tx.send(ParseOutput::Bytes(data)).await.unwrap(); });
+        let data = Bytes::from(vec![b'A'; 1_000_000]);
+
+        tokio::spawn(async move {
+            tx.send(ParseOutput::Bytes(data)).await.unwrap();
+        });
+
         let path = PathBuf::from("test_bytes.fq");
-        let task = tokio::spawn(stream_to_file(rx, path.clone())); // Pass raw Receiver
+        let task = tokio::spawn(stream_to_file(rx, path.clone()));
         task.await??;
+
         let file = std::fs::File::open(&path)?;
         let mut contents = Vec::new();
-        std::io::BufReader::new(file).read_to_end(&mut contents)?; // Use std::io::Read
+        std::io::BufReader::new(file).read_to_end(&mut contents)?;
+
         assert_eq!(contents.len(), 1_000_000);
+        assert!(contents.iter().all(|&b| b == b'A'));
+
         std::fs::remove_file(&path)?;
         Ok(())
     }
@@ -3262,7 +3288,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<ParseOutput>(10);
         let stream = ReceiverStream::new(rx);
 
-        tx.send(ParseOutput::Bytes(Arc::new(b"invalid".to_vec()))).await?;
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"invalid"))).await?;
 
         let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),

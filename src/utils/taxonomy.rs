@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, Semaphore, Mutex};
 use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID, TaxonSeqLocation};
 use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
 use crate::utils::streams::ParseOutput;
+use bytes::Bytes;
 
 const SPECIES_NON_SPECIFIC: Taxid = -100;
 const GENUS_NON_SPECIFIC: Taxid = -200;
@@ -508,7 +509,7 @@ pub async fn get_top_m8_nt(
                     });
                     let best = hits.into_iter().next().expect("Non-empty vec after check");
                     let line = best.to_tab_string() + "\n";
-                    if out_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
+                    if out_tx.send(ParseOutput::Bytes(Bytes::from(line.into_bytes()))).await.is_err() {
                         return Err(anyhow!("Output send failed in worker {}", i));
                     }
                 }
@@ -637,7 +638,7 @@ pub async fn get_top_m8_nr(
                         rep.mismatch, rep.gapopen, rep.qstart, rep.qend,
                         rep.tstart, rep.tend, best.evalue, best.bitscore
                     );
-                    if out_tx.send(ParseOutput::Bytes(Arc::new(line.into_bytes()))).await.is_err() {
+                    if out_tx.send(ParseOutput::Bytes(Bytes::from(line.into_bytes()))).await.is_err() {
                         return Err(anyhow!("Output send failed in worker {}", i));
                     }
                 }

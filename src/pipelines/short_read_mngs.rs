@@ -2283,7 +2283,7 @@ pub async fn minimap2_non_host_align(
                             bytes.push(b'\n');
 
                             if out_tx
-                                .send(ParseOutput::Bytes(Arc::new(bytes)))
+                                .send(ParseOutput::Bytes(Bytes::from(bytes)))
                                 .await
                                 .is_err()
                             {
@@ -2782,12 +2782,12 @@ pub async fn call_hits_m8(
                             total_emitted += 1;
 
                             dedup_tx
-                                .send(ParseOutput::Bytes(Arc::new(reduced.dedup)))
+                                .send(ParseOutput::Bytes(Bytes::from(reduced.dedup)))
                                 .await
                                 .context("dedup output channel closed")?;
 
                             summary_tx
-                                .send(ParseOutput::Bytes(Arc::new(reduced.summary)))
+                                .send(ParseOutput::Bytes(Bytes::from(reduced.summary)))
                                 .await
                                 .context("summary output channel closed")?;
                         }
@@ -3094,8 +3094,8 @@ async fn run_diamond_single_file(
                 break;
             }
             if !line.is_empty() && line[0] != b'#' {
-                let arc_line = Arc::new(line.clone());
-                if m8_tx.send(ParseOutput::Bytes(arc_line)).await.is_err() {
+                let bytes = Bytes::from(std::mem::take(&mut line));
+                if m8_tx.send(ParseOutput::Bytes(bytes)).await.is_err() {
                     break;
                 }
             }
@@ -3642,7 +3642,7 @@ pub async fn compute_merged_taxon_counts(
     // 1. Parallel NR preload
     let (nr_alignment_map, nr_hit_lines) = tokio::task::spawn_blocking(move || {
         let mut alignment_map: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
-        let mut hit_lines: AHashMap<String, Arc<Vec<u8>>> = AHashMap::new();
+        let mut hit_lines: AHashMap<String, Bytes> = AHashMap::new();
 
         let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
 
@@ -3666,7 +3666,7 @@ pub async fn compute_merged_taxon_counts(
                 contig: contig_species,
                 read: read_species,
             });
-            hit_lines.insert(read_id, Arc::new(bytes.to_vec()));
+            hit_lines.insert(read_id, bytes);
         }
         (alignment_map, hit_lines)
     }).await.map_err(|e| PipelineError::Other(e.into()))?;
@@ -3675,8 +3675,8 @@ pub async fn compute_merged_taxon_counts(
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
     let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
 
-    let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Arc<Vec<u8>>>(4096);
-    let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Arc<Vec<u8>>>(4096);
+    let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Bytes>(4096);
+    let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Bytes>(4096);
 
     cleanup_tasks.push(tokio::spawn(async move {
         while let Some(bytes) = m8_write_rx.recv().await {
@@ -3736,7 +3736,7 @@ pub async fn compute_merged_taxon_counts(
                     let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
                     let mut hit_with_source = hit_fields.to_vec();
                     hit_with_source.push(NT_TAG);
-                    let hit_bytes_out = Arc::new(hit_with_source.join("\t").into_bytes());
+                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
                     let _ = nt_hit_write_tx.send(hit_bytes_out.clone()).await;
 
                     let _ = merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await;
@@ -3779,7 +3779,7 @@ pub async fn compute_merged_taxon_counts(
                         .collect::<Vec<_>>();
                     hit_with_source.push(NR_TAG.to_string());
 
-                    let hit_bytes_out = Arc::new(hit_with_source.join("\t").into_bytes());
+                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
                     let _ = nr_hit_write_tx.send(hit_bytes_out.clone()).await;
 
                     let _ = merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await;
@@ -4908,7 +4908,7 @@ pub async fn generate_assembly_coverage(
 
     // Stream BAM
     let byte_stream = assembly_bam_rx.map(|item| match item {
-        ParseOutput::Bytes(b) => Ok(Bytes::from(b.to_vec())),
+        ParseOutput::Bytes(b) => Ok(b),
         _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "non-bytes in BAM stream")),
     });
     let stream_reader = StreamReader::new(byte_stream);
@@ -5744,14 +5744,14 @@ pub async fn update_read_dict(
 
     for line in contig2lineage_lines {
         contig2lineage_tx
-            .send(ParseOutput::Bytes(Arc::new(line)))
+            .send(ParseOutput::Bytes(Bytes::from(line)))
             .await
             .map_err(|_| anyhow!("contig2lineage_tx closed"))?;
     }
 
     for line in read2blastm8_lines {
         read2blastm8_tx
-            .send(ParseOutput::Bytes(Arc::new(line)))
+            .send(ParseOutput::Bytes(Bytes::from(line)))
             .await
             .map_err(|_| anyhow!("read2blastm8_tx closed"))?;
     }
@@ -5760,7 +5760,7 @@ pub async fn update_read_dict(
         let mut line = hit.to_full_tab_line(&read_id);
         line.push('\n');
         updated_tx
-            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .send(ParseOutput::Bytes(Bytes::from(line)))
             .await
             .map_err(|_| anyhow!("updated_tx closed"))?;
     }
@@ -5769,7 +5769,7 @@ pub async fn update_read_dict(
         let mut line = hit.to_full_tab_line(&read_id);
         line.push('\n');
         added_tx
-            .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+            .send(ParseOutput::Bytes(Bytes::from(line)))
             .await
             .map_err(|_| anyhow!("added_tx closed"))?;
     }
@@ -5855,7 +5855,7 @@ pub async fn generate_contig_summary_json(
                 });
                 let line = format!("{entry}\n");
                 output_tx
-                    .send(ParseOutput::Bytes(Arc::new(line.into_bytes())))
+                    .send(ParseOutput::Bytes(Bytes::from(line)))
                     .await
                     .map_err(|_| anyhow!("contig_summary_tx dropped"))?;
             }
@@ -5879,8 +5879,8 @@ fn first_field(bytes: &[u8]) -> String {
 // while preserving first-seen key order for deterministic appends.
 async fn collect_line_map(
     mut stream: ReceiverStream<ParseOutput>,
-) -> Result<(AHashMap<String, Arc<Vec<u8>>>, Vec<String>)> {
-    let mut map: AHashMap<String, Arc<Vec<u8>>> = AHashMap::new();
+) -> Result<(AHashMap<String, Bytes>, Vec<String>)> {
+    let mut map: AHashMap<String, Bytes> = AHashMap::new();
     let mut order: Vec<String> = Vec::new();
 
     while let Some(item) = stream.next().await {
@@ -5901,7 +5901,7 @@ async fn collect_line_map(
 // Helper: collect a stream into ordered rows only.
 async fn collect_rows(
     mut stream: ReceiverStream<ParseOutput>,
-) -> Result<Vec<Arc<Vec<u8>>>> {
+) -> Result<Vec<Bytes>> {
     let mut rows = Vec::new();
 
     while let Some(item) = stream.next().await {
@@ -5917,8 +5917,8 @@ async fn collect_rows(
 // collect a stream into keyed rows and preserve first-seen key order.
 async fn collect_keyed_rows(
     mut stream: ReceiverStream<ParseOutput>,
-) -> Result<(Vec<(String, Arc<Vec<u8>>)>, Vec<String>)> {
-    let mut rows: Vec<(String, Arc<Vec<u8>>)> = Vec::new();
+) -> Result<(Vec<(String, Bytes)>, Vec<String>)> {
+    let mut rows: Vec<(String, Bytes)> = Vec::new();
     let mut order: Vec<String> = Vec::new();
 
     while let Some(item) = stream.next().await {
@@ -5926,7 +5926,7 @@ async fn collect_keyed_rows(
             continue;
         };
 
-        let key = first_field(bytes.as_slice());
+        let key = first_field(bytes.as_ref());
         order.push(key.clone());
         rows.push((key, bytes));
     }
@@ -5982,7 +5982,7 @@ pub async fn generate_m8_and_hit_summary(
                             .cloned()
                             .unwrap_or_else(|| row.clone())
                     })
-                    .collect::<Vec<Arc<Vec<u8>>>>()
+                    .collect::<Vec<Bytes>>()
             },
             || {
                 original_hit_rows
@@ -5994,7 +5994,7 @@ pub async fn generate_m8_and_hit_summary(
                             .cloned()
                             .unwrap_or_else(|| row.clone())
                     })
-                    .collect::<Vec<Arc<Vec<u8>>>>()
+                    .collect::<Vec<Bytes>>()
             },
         )
     });
