@@ -37,17 +37,10 @@ use futures::pin_mut;
 use bytes::Bytes;
 use rayon::prelude::*;
 
-
-
-
-
-
-
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType};
 use crate::config::defs::{CoreAllocation, RunConfig, SimdLevel};
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
-
 
 
 pub trait ToBytes {
@@ -85,8 +78,6 @@ impl ToBytes for SequenceRecord {
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug)]
 pub enum ChildStream {
     Stdout,
@@ -98,9 +89,10 @@ pub enum ParseMode {
     Fastq,
     Fasta,
     Bytes,
-    Lines
+    Lines,
 }
 
+// streams.rs
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
     Fastq(SequenceRecord),
@@ -111,14 +103,14 @@ pub enum ParseOutput {
 impl ToBytes for ParseOutput {
     fn to_bytes(&self) -> Result<Bytes> {
         match self {
-            ParseOutput::Fastq(record) => Ok(Bytes::from(record.to_bytes()?)),
-            ParseOutput::Fasta(record) => Ok(Bytes::from(record.to_bytes()?)),
-            ParseOutput::Bytes(bytes) => Ok(bytes.clone()), // cheap refcount bump
+            ParseOutput::Fastq(record) => record.to_bytes(),
+            ParseOutput::Fasta(record) => record.to_bytes(),
+            ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
         }
     }
 }
 
-/// Converts mpsc::Receiver<ParseOutput> type output to AsyncRead suitable to parse_fasta / parse_fastq.
+/// Converts mpsc::Receiver<ParseOutput> output to AsyncRead suitable for parse_fasta / parse_fastq.
 pub struct ChannelReader {
     rx: mpsc::Receiver<ParseOutput>,
     buffer: Option<Bytes>,
@@ -148,7 +140,7 @@ impl AsyncRead for ChannelReader {
         }
 
         loop {
-            if let Some(bytes) = self.buffer.clone() {
+            if let Some(bytes) = self.buffer.as_ref().cloned() {
                 let remaining = &bytes[self.offset..];
                 if remaining.is_empty() {
                     self.buffer = None;
@@ -416,7 +408,7 @@ pub async fn stream_to_cmd(
         let mut stream = ReceiverStream::new(rx);
         while let Some(item) = stream.next().await {
             match &item {
-                ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&**arc_bytes),
+                ParseOutput::Bytes(bytes) => batch.extend_from_slice(bytes.as_ref()),
                 ParseOutput::Fastq(record) => {  // Direct match on inner enum
                     if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
                         if let Some(d) = desc {
@@ -1615,14 +1607,16 @@ pub async fn bytes_to_lines(
     buffer_size: usize,
 ) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
     let (tx, output_rx) = mpsc::channel(buffer_size);
-    let mut leftover = Vec::new();
+    let mut leftover: Vec<u8> = Vec::new();
 
     let task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(rx);
+
         while let Some(item) = stream.next().await {
             match item {
-                ParseOutput::Bytes(arc_bytes) => {
-                    let mut bytes = arc_bytes.as_ref().to_vec();
+                ParseOutput::Bytes(bytes) => {
+                    let mut bytes = bytes.to_vec();
+
                     if !leftover.is_empty() {
                         leftover.append(&mut bytes);
                         bytes = leftover;
