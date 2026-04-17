@@ -103,7 +103,12 @@ async fn main() -> Result<()> {
         }
 
         use_mmseqs_gpu = gpu_info.gpus.iter().any(|g| {
-            g.name.contains("H100") || g.name.contains("L40") || g.name.contains("A10")
+            g.name.contains("H100")
+                || g.name.contains("L40S")
+                || g.name.contains("L40")
+                || g.name.contains("A10G")
+                || g.name.contains("A10")
+                || g.name.contains("L4")
         });
     }
 
