@@ -3270,7 +3270,7 @@ pub async fn generate_taxon_counts(
     );
 
     let (worker_txs, worker_rxs): (Vec<_>, Vec<_>) = (0..num_workers)
-        .map(|_| mpsc::channel::<(Vec<Vec<u8>>, Vec<Vec<u8>>)>(64))
+        .map(|_| mpsc::channel::<(Vec<Bytes>, Vec<Bytes>)>(64))
         .unzip();
 
     // Spawn workers — each owns a completely private aggregation map + cache.
@@ -3313,8 +3313,8 @@ pub async fn generate_taxon_counts(
                     for (m8_bytes, hit_bytes) in m8_batch.into_iter().zip(hit_batch) {
                         total_pairs += 1;
                         process_record_pair(
-                            &m8_bytes,
-                            &hit_bytes,
+                            m8_bytes.as_ref(),
+                            hit_bytes.as_ref(),
                             &mut agg,
                             &mut lineage_cache,
                             &dup,
@@ -3380,8 +3380,8 @@ pub async fn generate_taxon_counts(
 
     // Producer: pair the two streams and round-robin to workers.
     // Keep the original lockstep semantics, but add visibility at each await boundary.
-    let mut m8_batch = Vec::with_capacity(8192);
-    let mut hit_batch = Vec::with_capacity(8192);
+    let mut m8_batch: Vec<Bytes> = Vec::with_capacity(8192);
+    let mut hit_batch: Vec<Bytes> = Vec::with_capacity(8192);
     let mut batch_idx = 0usize;
     let mut total_pairs = 0usize;
     let mut m8_items_seen = 0usize;
@@ -3400,11 +3400,6 @@ pub async fn generate_taxon_counts(
     let mut hit_closed = false;
 
     loop {
-        // debug!(
-        //     "[generate_taxon_counts:{}] awaiting next pair: pairs={} batches={} m8_seen={} hit_seen={}",
-        //     count_type, total_pairs, batch_idx, m8_items_seen, hit_items_seen
-        // );
-
         let (m8_res, hit_res) = tokio::join!(
             async {
                 let start = Instant::now();
@@ -3427,17 +3422,6 @@ pub async fn generate_taxon_counts(
         if hit_wait > max_hit_wait {
             max_hit_wait = hit_wait;
         }
-
-        // debug!(
-        //     "[generate_taxon_counts:{}] got next pair: m8_present={} hit_present={} m8_wait={:?} hit_wait={:?} pairs={} batches={}",
-        //     count_type,
-        //     m8_item.is_some(),
-        //     hit_item.is_some(),
-        //     m8_wait,
-        //     hit_wait,
-        //     total_pairs,
-        //     batch_idx
-        // );
 
         if m8_wait >= Duration::from_millis(50) || hit_wait >= Duration::from_millis(50) {
             let ratio = if hit_wait.as_nanos() > 0 {
@@ -3499,7 +3483,7 @@ pub async fn generate_taxon_counts(
         if let ParseOutput::Bytes(b) = m8_item {
             if !b.is_empty() {
                 m8_items_seen += 1;
-                m8_batch.push(b.to_vec());
+                m8_batch.push(b);
                 total_pairs += 1;
             }
         }
@@ -3507,7 +3491,7 @@ pub async fn generate_taxon_counts(
         if let ParseOutput::Bytes(b) = hit_item {
             if !b.is_empty() {
                 hit_items_seen += 1;
-                hit_batch.push(b.to_vec());
+                hit_batch.push(b);
             }
         }
 
