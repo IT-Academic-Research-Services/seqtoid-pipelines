@@ -7266,6 +7266,8 @@ async fn mmseqs_fastq_to_m8_file(
             error: e.to_string(),
         })?;
 
+    info!("[mmseqs] args: {:?}", easy_search_args);
+
     run_mmseqs_step(config.clone(), easy_search_args, "easy-search").await?;
 
     let meta = fs::metadata(&m8_path)
