@@ -7433,7 +7433,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd).await?;
     let paired = file2_path.is_some();
 
-    info!("file1 path: {:?}  sample base buf: {:?}", file1_path.display(), sample_base_buf.display());
+    debug!("file1 path: {:?}  sample base buf: {:?}  sample base: {:?}", file1_path.display(), sample_base_buf.display(), sample_base);
 
     let seed = config.args.seed.unwrap_or_else(|| {
         let mut bytes = [0u8; 8];
