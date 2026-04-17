@@ -522,16 +522,26 @@ fn resolve_existing_input_path(input: &str, cwd: &Path) -> Result<PathBuf, Pipel
 }
 
 fn basename_without_extensions(path: &Path) -> Result<String, PipelineError> {
-    let (stem, _) = extension_remover(path);
-    stem.file_name()
+    let mut current = path
+        .file_name()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
         .ok_or_else(|| {
             PipelineError::InvalidConfig(format!(
                 "Could not derive basename from {}",
                 path.display()
             ))
-        })
+        })?
+        .to_string();
+
+    loop {
+        let p = Path::new(&current);
+        match p.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if stem != current => current = stem.to_string(),
+            _ => break,
+        }
+    }
+
+    Ok(current)
 }
 
 fn strip_common_read_suffixes(base: &str) -> String {
