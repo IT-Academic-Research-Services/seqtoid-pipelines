@@ -7255,7 +7255,7 @@ async fn mmseqs_fastq_to_m8_file(
         option_fields: HashMap::from([
             ("--search-type".to_string(), Some("3".to_string())),   // translated search (BLASTX-like)
             ("--max-seqs".to_string(), Some("500".to_string())),    // similar to Diamond behavior
-            ("--evalue".to_string(), Some("0.001".to_string())),    // reasonable filter
+            ("-e".to_string(), Some("0.001".to_string())),   // reasonable filter
             ("--min-seq-id".to_string(), Some("0.25".to_string())),
         ]),
     };
