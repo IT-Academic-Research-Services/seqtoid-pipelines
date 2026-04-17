@@ -505,7 +505,7 @@ pub async fn write_parse_output_to_file(
     Ok(task)
 }
 
-fn resolve_existing_input_path(input: &str, cwd: &Path) -> Result<PathBuf, PipelineError> {
+pub fn resolve_existing_input_path(input: &str, cwd: &Path) -> Result<PathBuf, PipelineError> {
     let resolved = resolve_to_absolute(input, cwd);
 
     if !resolved.exists() {
@@ -574,7 +574,7 @@ fn strip_common_read_suffixes(base: &str) -> String {
     base.to_string()
 }
 
-fn derive_sample_base_from_file1(file1_path: &Path) -> Result<PathBuf, PipelineError> {
+pub fn derive_sample_base_from_file1(file1_path: &Path) -> Result<PathBuf, PipelineError> {
     let basename = basename_without_extensions(file1_path)?;
     let stripped = strip_common_read_suffixes(&basename);
     Ok(PathBuf::from(stripped))

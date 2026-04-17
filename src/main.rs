@@ -29,7 +29,7 @@ use rand_core::{RngCore, OsRng};
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType, PipelineError, NRAlignmentBackend, GpuDetection, GpuInfo};
 use crate::cli::args::Technology;
-use crate::utils::file::file_path_manipulator;
+use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, derive_sample_base_from_file1};
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
                            compute_base_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
@@ -215,44 +215,20 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             }
         }
         None => {
-            let file1_path: PathBuf = match &args.file1 {
-                Some(file) => {
-                    let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
-                    if file1_full_path.exists() {
-                        file1_full_path
-                    } else {
-                        return Err(anyhow::anyhow!("Cannot find file 1 (-i)"));
-                    }
-                }
+            let file1 = match &args.file1 {
+                Some(file) => resolve_existing_input_path(file, cwd)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                 None => return Err(anyhow::anyhow!("File1 path required")),
             };
-            let file1_r1r2 = r1r2_base(&file1_path);
 
-            let dir_base = match file1_r1r2.prefix {
-                Some(prefix) => prefix,
-                None => {
-                    info!("No R1 tag found. Using bare file 1 stem as sample_base.");
-                    file1_r1r2.file_name.unwrap_or_else(|| {
-                        file1_path
-                            .file_stem()
-                            .map(|stem| stem.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "default_sample".to_string())
-                    })
-                }
-            };
+            let sample_base = derive_sample_base_from_file1(&file1)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-            let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .map(|secs| {
-                    let dt = DateTime::from_timestamp(secs as i64, 0)
-                        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-                    dt.format("%Y%m%d").to_string()
-                })
-                .unwrap_or_else(|_| "19700101".to_string());
-            cwd.join(format!("{}_{}", dir_base, timestamp))
+            let timestamp = chrono::Local::now().format("%Y%m%d").to_string();
+            cwd.join(format!("{}_{}", sample_base.display(), timestamp))
         }
     };
+
     fs::create_dir_all(&out_dir)?;
     Ok(out_dir)
 }
