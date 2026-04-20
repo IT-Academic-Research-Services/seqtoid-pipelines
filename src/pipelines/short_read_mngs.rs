@@ -73,7 +73,7 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file,
                           SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
-                          filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq};
+                          filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq, write_combined_fastq};
 use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
@@ -7279,7 +7279,7 @@ pub async fn mmseqs_non_host_align(
     Vec<TempDir>,
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     info!("Running mmseqs non-host align (backend: {:?})", backend);
 
@@ -7289,52 +7289,28 @@ pub async fn mmseqs_non_host_align(
         &config.args.nvme_scratch,
         4,
         true,
-    ).await?;
+    )
+        .await?;
 
-    // Run on R1
-    let r1_m8 = mmseqs_fastq_to_m8_file(
-        config.clone(),
+    let combined_fastq = temp_dir.path().join("mmseqs_non_host_combined.fastq");
+
+    write_combined_fastq(
         r1_path,
+        r2_path_opt.clone(),
+        &combined_fastq,
+    )
+        .await?;
+
+    let merged_m8 = mmseqs_fastq_to_m8_file(
+        config.clone(),
+        combined_fastq,
         &temp_dir,
-        "nr_r1",
+        "nr_merged",
         backend,
-    ).await?;
+    )
+        .await?;
 
-    // Concatenate R1 + R2 (if present)
-    let merged_unsorted_m8 = temp_dir.path().join("mmseqs_unsorted_nr.m8");
-    let mut merged = fs::File::create(&merged_unsorted_m8)
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    let mut f1 = fs::File::open(&r1_m8)
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    tokio::io::copy(&mut f1, &mut merged)
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    if let Some(r2_path) = r2_path_opt {
-        let r2_m8 = mmseqs_fastq_to_m8_file(
-            config.clone(),
-            r2_path,
-            &temp_dir,
-            "nr_r2",
-            backend,
-        ).await?;
-
-        let mut f2 = fs::File::open(&r2_m8)
-            .await
-            .map_err(|e| PipelineError::IOError(e.to_string()))?;
-        tokio::io::copy(&mut f2, &mut merged)
-            .await
-            .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    }
-
-    merged.flush()
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    let m8_file = fs::File::open(&merged_unsorted_m8)
+    let m8_file = fs::File::open(&merged_m8)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 

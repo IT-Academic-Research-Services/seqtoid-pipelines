@@ -1946,6 +1946,40 @@ pub async fn filter_fastq_to_bytes_stream(
     ReceiverStream::new(rx)
 }
 
+pub async fn write_combined_fastq(
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+    combined_path: &PathBuf,
+) -> Result<(), PipelineError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut out = TokioFile::create(combined_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let mut r1 = TokioFile::open(&r1_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    tokio::io::copy(&mut r1, &mut out)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    if let Some(r2_path) = r2_path_opt {
+        let mut r2 = TokioFile::open(&r2_path)
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        tokio::io::copy(&mut r2, &mut out)
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    }
+
+    out.flush()
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
