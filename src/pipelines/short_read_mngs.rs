@@ -7194,6 +7194,8 @@ async fn run_mmseqs_step(
     args: Vec<String>,
     label: &'static str,
 ) -> Result<(), PipelineError> {
+    let start = Instant::now();
+
     let (mut child, stderr_task) = spawn_cmd(
         config.clone(),
         MMSEQS_TAG,
@@ -7221,6 +7223,9 @@ async fn run_mmseqs_step(
     stderr_task
         .await
         .map_err(|e| PipelineError::Other(anyhow!("mmseqs {} stderr task panicked: {}", label, e)))??;
+
+    let elapsed = start.elapsed();
+    info!("[mmseqs:{}] completed in {:?}", label, elapsed);
 
     Ok(())
 }
@@ -7345,7 +7350,7 @@ async fn mmseqs_fastq_to_m8_file(
         tmp_dir: Some(tmp_dir.clone()),
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
         sensitivity: if backend == MmseqsBackend::Cpu {
-            Some("5.7".to_string())
+            Some("5.7".to_string())  // trying to amtch sentivity of diamond for the CPU side
         } else {
             None
         },
