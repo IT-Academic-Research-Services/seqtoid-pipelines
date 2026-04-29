@@ -2266,12 +2266,13 @@ pub mod sort {
 
 
 pub mod mmseqs {
+    use std::any::Any;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     use anyhow::{anyhow, Result};
-    use log::{debug, warn};
-    use tokio::process::Command;
+    use log::{debug, info, warn};
+    use tokio::process::{Child, Command};
 
     use crate::config::defs::{MMSEQS_TAG, RunConfig};
     use crate::utils::command::ArgGenerator;
@@ -2284,42 +2285,88 @@ pub mod mmseqs {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum MmseqsSubcommand {
+        Version,
+        Createdb,
+        MakePaddedSeqDb,
+        CreateIndex,
         EasySearch,
+        Search,
+        ConvertAlis,
+        GpuServer,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct MmseqsConfig {
         pub subcommand: MmseqsSubcommand,
         pub backend: MmseqsBackend,
-        pub query: PathBuf,
-        pub output: PathBuf,
-        pub tmp_dir: PathBuf,
+
+        pub input: Option<PathBuf>,
+        pub target_db: Option<PathBuf>,
+        pub result_db: Option<PathBuf>,
+        pub output: Option<PathBuf>,
+        pub tmp_dir: Option<PathBuf>,
+
         pub threads: Option<usize>,
         pub sensitivity: Option<String>,
+
+        pub search_type: Option<String>,
+        pub max_seqs: Option<String>,
+        pub prefilter_mode: Option<String>,
+        pub db_load_mode: Option<String>,
+        pub alignment_mode: Option<String>,
+        pub index_subset: Option<String>,
+
         pub format_output: Option<String>,
+        pub cuda_visible_devices: Option<String>,
+
+        /// Extra raw args appended verbatim. Use this for rare flags that do not
+        /// deserve a dedicated field yet.
         pub option_fields: HashMap<String, Option<String>>,
+
+        /// If true, generate client-side flags for MMseqs GPU server mode.
+        /// This is only meaningful for Search / ConvertAlis workflows, not GpuServer itself.
+        pub gpu_server: bool,
+    }
+
+    impl Default for MmseqsConfig {
+        fn default() -> Self {
+            Self {
+                subcommand: MmseqsSubcommand::EasySearch,
+                backend: MmseqsBackend::Cpu,
+                input: None,
+                target_db: None,
+                result_db: None,
+                output: None,
+                tmp_dir: None,
+                threads: None,
+                sensitivity: None,
+                search_type: None,
+                max_seqs: None,
+                prefilter_mode: None,
+                db_load_mode: None,
+                alignment_mode: None,
+                index_subset: None,
+                format_output: None,
+                cuda_visible_devices: None,
+                option_fields: HashMap::new(),
+                gpu_server: false,
+            }
+        }
     }
 
     pub struct MmseqsArgGenerator;
 
-    pub async fn mmseqs_presence_check() -> Result<f32> {
-        let output = Command::new(MMSEQS_TAG)
-            .arg("version")
-            .output()
-            .await
-            .map_err(|e| anyhow!("Failed to spawn mmseqs. Is it installed? Error: {}", e))?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "mmseqs version check failed with exit code {:?}",
-                output.status.code()
-            ));
-        }
-
-        Ok(0.0)
+    fn required_path<'a>(value: &'a Option<PathBuf>, what: &str) -> Result<&'a PathBuf> {
+        value
+            .as_ref()
+            .ok_or_else(|| anyhow!("MMseqs requires {}", what))
     }
 
-    fn resolve_mmseqs_db(run_config: &RunConfig) -> Result<PathBuf> {
+    fn resolve_mmseqs_db(run_config: &RunConfig, explicit: Option<&PathBuf>) -> Result<PathBuf> {
+        if let Some(p) = explicit {
+            return Ok(p.clone());
+        }
+
         let db = run_config
             .args
             .mmseqs_db
@@ -2361,13 +2408,10 @@ pub mod mmseqs {
         args.push(n.to_string());
     }
 
-    fn push_backend(args: &mut Vec<String>, backend: MmseqsBackend) {
-        if backend == MmseqsBackend::Gpu {
-            args.push("--gpu".to_string());
-            args.push("1".to_string());
-            debug!("MMseqs2: GPU mode enabled (--gpu 1)");
-        } else {
-            debug!("MMseqs2: CPU mode");
+    fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: &Option<String>) {
+        if let Some(v) = value {
+            args.push(flag.to_string());
+            args.push(v.clone());
         }
     }
 
@@ -2380,63 +2424,575 @@ pub mod mmseqs {
         }
     }
 
+    fn push_gpu_client_flags(args: &mut Vec<String>, config: &MmseqsConfig) {
+        if config.backend != MmseqsBackend::Gpu {
+            return;
+        }
+
+        args.push("--gpu".to_string());
+        args.push("1".to_string());
+        debug!("MMseqs2: GPU client mode enabled (--gpu 1)");
+
+        if config.gpu_server {
+            args.push("--gpu-server".to_string());
+            args.push("1".to_string());
+
+            args.push("--db-load-mode".to_string());
+            args.push(config.db_load_mode.clone().unwrap_or_else(|| "2".to_string()));
+
+            if config.prefilter_mode.is_none() {
+                args.push("--prefilter-mode".to_string());
+                args.push("1".to_string());
+            }
+
+            debug!("MMseqs2: GPU server client mode enabled (--gpu-server 1 --db-load-mode 2)");
+        }
+    }
+
+    fn push_search_common_flags(
+        args: &mut Vec<String>,
+        run_config: &RunConfig,
+        config: &MmseqsConfig,
+        is_easy_search: bool,
+    ) {
+        push_threads(args, run_config, config.threads);
+
+        if let Some(st) = &config.search_type {
+            args.push("--search-type".to_string());
+            args.push(st.clone());
+        }
+
+        if let Some(ms) = &config.max_seqs {
+            args.push("--max-seqs".to_string());
+            args.push(ms.clone());
+        }
+
+        if let Some(pm) = &config.prefilter_mode {
+            args.push("--prefilter-mode".to_string());
+            args.push(pm.clone());
+        }
+
+        if config.backend == MmseqsBackend::Cpu {
+            if let Some(s) = &config.sensitivity {
+                args.push("-s".to_string());
+                args.push(s.clone());
+            }
+        } else if !is_easy_search {
+            if let Some(s) = &config.sensitivity {
+                args.push("-s".to_string());
+                args.push(s.clone());
+            }
+        }
+
+        push_option_fields(args, &config.option_fields);
+    }
+
+    pub async fn mmseqs_presence_check() -> Result<f32> {
+        let output = Command::new(MMSEQS_TAG)
+            .arg("version")
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to spawn mmseqs. Is it installed? Error: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "mmseqs version check failed with exit code {:?}",
+                output.status.code()
+            ));
+        }
+
+        Ok(0.0)
+    }
+
+    pub async fn spawn_gpuserver(
+        target_db: &Path,
+        cuda_visible_devices: Option<&str>,
+    ) -> Result<Child> {
+        if !target_db.exists() {
+            return Err(anyhow!(
+                "MMseqs GPU server target DB does not exist: {}",
+                target_db.display()
+            ));
+        }
+
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("gpuserver");
+        cmd.arg(target_db);
+
+        if let Some(devices) = cuda_visible_devices {
+            cmd.env("CUDA_VISIBLE_DEVICES", devices);
+        }
+
+        // Important: current MMseqs2 release notes say gpuserver no longer accepts --gpu.
+        // The client gets the GPU flags; the server is started without --gpu.
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn mmseqs gpuserver: {}", e))?;
+
+        Ok(child)
+    }
+
+    pub async fn stop_gpuserver(child: &mut Child) -> Result<()> {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => return Err(anyhow!("Failed to query gpuserver state: {}", e)),
+        }
+
+        child
+            .kill()
+            .await
+            .map_err(|e| anyhow!("Failed to stop mmseqs gpuserver: {}", e))?;
+
+        let _ = child.wait().await;
+        Ok(())
+    }
+
     impl ArgGenerator for MmseqsArgGenerator {
         fn generate_args(
             &self,
             run_config: &RunConfig,
-            extra: Option<&dyn std::any::Any>,
+            extra: Option<&dyn Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<MmseqsConfig>())
                 .ok_or_else(|| anyhow!("MMseqs requires a MmseqsConfig as extra argument"))?;
 
-            let target_db = resolve_mmseqs_db(run_config)?;
-
-            // ── Only validate CPU index when using CPU backend ──
-            if config.backend == MmseqsBackend::Cpu {
-                validate_cpu_index(&target_db)?;
-            } else {
-                debug!("MMseqs GPU backend selected; skipping CPU index validation (using padded GPU DB)");
-            }
-
             let mut args_vec: Vec<String> = Vec::new();
 
             match config.subcommand {
+                MmseqsSubcommand::Version => {
+                    args_vec.push("version".to_string());
+                }
+
+                MmseqsSubcommand::Createdb => {
+                    let input = required_path(&config.input, "input FASTA/FASTQ for createdb")?;
+                    let output = required_path(&config.output, "output DB for createdb")?;
+
+                    args_vec.push("createdb".to_string());
+                    args_vec.push(input.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    // If the caller wants to create a GPU DB directly, pass --gpu via option_fields.
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::MakePaddedSeqDb => {
+                    let input = required_path(&config.input, "input DB for makepaddedseqdb")?;
+                    let output = required_path(&config.output, "output GPU DB for makepaddedseqdb")?;
+
+                    args_vec.push("makepaddedseqdb".to_string());
+                    args_vec.push(input.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::CreateIndex => {
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                    let tmp_dir = required_path(&config.tmp_dir, "tmp dir for createindex")?;
+
+                    args_vec.push("createindex".to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(tmp_dir.to_string_lossy().to_string());
+
+                    if let Some(subset) = &config.index_subset {
+                        args_vec.push("--index-subset".to_string());
+                        args_vec.push(subset.clone());
+                    }
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::GpuServer => {
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+
+                    args_vec.push("gpuserver".to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+
+                    // Do NOT add --gpu here. Current MMseqs2 release notes say gpuserver
+                    // no longer accepts --gpu; the client side gets the GPU flags.
+                    if let Some(devs) = &config.cuda_visible_devices {
+                        args_vec.push("--cuda-visible-devices".to_string());
+                        args_vec.push(devs.clone());
+                    }
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
                 MmseqsSubcommand::EasySearch => {
+                    let query = required_path(&config.input, "query FASTA/FASTQ for easy-search")?;
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                    let output = required_path(&config.output, "output m8 for easy-search")?;
+                    let tmp_dir = required_path(&config.tmp_dir, "tmp dir for easy-search")?;
+
                     args_vec.push("easy-search".to_string());
-                    push_backend(&mut args_vec, config.backend);
+                    push_gpu_client_flags(&mut args_vec, config);
                     push_threads(&mut args_vec, run_config, config.threads);
 
-                    // Only add -s for CPU (GPU ignores it anyway)
+                    if config.backend == MmseqsBackend::Cpu {
+                        push_optional_arg(&mut args_vec, "-s", &config.sensitivity);
+                    }
+
+                    if let Some(st) = &config.search_type {
+                        args_vec.push("--search-type".to_string());
+                        args_vec.push(st.clone());
+                    }
+
+                    if let Some(ms) = &config.max_seqs {
+                        args_vec.push("--max-seqs".to_string());
+                        args_vec.push(ms.clone());
+                    }
+
+                    if let Some(pm) = &config.prefilter_mode {
+                        args_vec.push("--prefilter-mode".to_string());
+                        args_vec.push(pm.clone());
+                    }
+
+                    args_vec.push(query.to_string_lossy().to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+                    args_vec.push(tmp_dir.to_string_lossy().to_string());
+
+                    args_vec.push("--format-output".to_string());
+                    args_vec.push(config.format_output.clone().unwrap_or_else(|| {
+                        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                            .to_string()
+                    }));
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::Search => {
+                    let query = required_path(&config.input, "query DB/FASTA for search")?;
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                    let result_db = required_path(&config.result_db, "result DB for search")?;
+                    let tmp_dir = required_path(&config.tmp_dir, "tmp dir for search")?;
+
+                    args_vec.push("search".to_string());
+                    push_gpu_client_flags(&mut args_vec, config);
+                    push_threads(&mut args_vec, run_config, config.threads);
+
                     if let Some(s) = &config.sensitivity {
-                        if config.backend == MmseqsBackend::Cpu {
-                            args_vec.push("-s".to_string());
-                            args_vec.push(s.clone());
+                        args_vec.push("-s".to_string());
+                        args_vec.push(s.clone());
+                    }
+
+                    // Production-safe default: search does not match easy-search identity semantics
+                    // unless alignment-mode is set. We default to 3 so pident is real rather than
+                    // estimated, unless the caller overrides it.
+                    args_vec.push("--alignment-mode".to_string());
+                    args_vec.push(
+                        config
+                            .alignment_mode
+                            .clone()
+                            .unwrap_or_else(|| "3".to_string()),
+                    );
+
+                    if let Some(st) = &config.search_type {
+                        args_vec.push("--search-type".to_string());
+                        args_vec.push(st.clone());
+                    }
+
+                    if let Some(ms) = &config.max_seqs {
+                        args_vec.push("--max-seqs".to_string());
+                        args_vec.push(ms.clone());
+                    }
+
+                    if let Some(pm) = &config.prefilter_mode {
+                        args_vec.push("--prefilter-mode".to_string());
+                        args_vec.push(pm.clone());
+                    }
+
+                    if config.gpu_server && config.backend == MmseqsBackend::Gpu {
+                        if config.prefilter_mode.is_none() {
+                            args_vec.push("--prefilter-mode".to_string());
+                            args_vec.push("1".to_string());
                         }
                     }
 
-                    args_vec.push(config.query.to_string_lossy().to_string());
+                    args_vec.push(query.to_string_lossy().to_string());
                     args_vec.push(target_db.to_string_lossy().to_string());
-                    args_vec.push(config.output.to_string_lossy().to_string());
-                    args_vec.push(config.tmp_dir.to_string_lossy().to_string());
+                    args_vec.push(result_db.to_string_lossy().to_string());
+                    args_vec.push(tmp_dir.to_string_lossy().to_string());
 
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::ConvertAlis => {
+                    let query_db = required_path(&config.input, "query DB for convertalis")?;
+                    let target_db = required_path(&config.target_db, "target DB for convertalis")?;
+                    let result_db = required_path(&config.result_db, "result DB for convertalis")?;
+                    let output = required_path(&config.output, "output m8 for convertalis")?;
+
+                    args_vec.push("convertalis".to_string());
+                    args_vec.push(query_db.to_string_lossy().to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(result_db.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    // Keep the same text columns you are already using unless overridden.
                     args_vec.push("--format-output".to_string());
-                    args_vec.push(
-                        config
-                            .format_output
-                            .clone()
-                            .unwrap_or_else(|| {
-                                "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
-                                    .to_string()
-                            }),
-                    );
+                    args_vec.push(config.format_output.clone().unwrap_or_else(|| {
+                        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                            .to_string()
+                    }));
 
                     push_option_fields(&mut args_vec, &config.option_fields);
                 }
             }
 
+            if matches!(config.subcommand, MmseqsSubcommand::EasySearch | MmseqsSubcommand::Search)
+                && config.backend == MmseqsBackend::Cpu
+            {
+                let target = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                validate_cpu_index(&target)?;
+            }
+
+            if config.backend == MmseqsBackend::Gpu
+                && matches!(config.subcommand, MmseqsSubcommand::EasySearch | MmseqsSubcommand::Search)
+            {
+                debug!(
+                    "MMseqs GPU client selected; GPU-compatible DB should be padded/indexed already"
+                );
+            }
+
             debug!("MMseqs argv: {:?}", args_vec);
             Ok(args_vec)
+        }
+    }
+
+    /// Convenience helper for the new GPU server workflow.
+    ///
+    /// Typical usage:
+    /// 1) createdb / makepaddedseqdb / createindex --index-subset 2
+    /// 2) spawn_gpuserver(...)
+    /// 3) run Search with backend=Gpu and gpu_server=true
+    /// 4) run ConvertAlis if you want m8 output
+    pub async fn build_gpu_server_client_args(
+        run_config: &RunConfig,
+        config: &MmseqsConfig,
+    ) -> Result<Vec<String>> {
+        let generator = MmseqsArgGenerator;
+        generator.generate_args(run_config, Some(config as &dyn Any))
+    }
+
+    pub fn mmseqs_gpu_server_note() -> &'static str {
+        "Use gpuserver without --gpu, then use search with --gpu 1 --gpu-server 1 --db-load-mode 2."
+    }
+
+    pub fn mmseqs_cpu_production_note() -> &'static str {
+        "Use search for production control; add --alignment-mode 3 to preserve real pident, or keep easy-search for compatibility."
+    }
+
+    pub fn mmseqs_gpu_db_prep_note() -> &'static str {
+        "GPU DB prep: createdb -> makepaddedseqdb -> createindex --index-subset 2."
+    }
+
+    pub fn default_easy_search_format_output() -> &'static str {
+        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+    }
+
+    pub fn default_search_alignment_mode() -> &'static str {
+        "3"
+    }
+
+    pub fn default_gpu_server_db_load_mode() -> &'static str {
+        "2"
+    }
+
+    pub fn default_gpu_server_prefilter_mode() -> &'static str {
+        "1"
+    }
+
+    pub fn default_gpu_createindex_subset() -> &'static str {
+        "2"
+    }
+
+    pub fn recommended_cuda_visible_devices_for_server(all_visible: bool) -> Option<String> {
+        if all_visible {
+            None
+        } else {
+            Some("0".to_string())
+        }
+    }
+
+    pub fn example_gpu_server_workflow(
+        query_db: PathBuf,
+        target_db: PathBuf,
+        result_db: PathBuf,
+        out_m8: PathBuf,
+        tmp_dir: PathBuf,
+    ) -> (MmseqsConfig, MmseqsConfig, MmseqsConfig) {
+        let search_cfg = MmseqsConfig {
+            subcommand: MmseqsSubcommand::Search,
+            backend: MmseqsBackend::Gpu,
+            input: Some(query_db),
+            target_db: Some(target_db.clone()),
+            result_db: Some(result_db),
+            output: None,
+            tmp_dir: Some(tmp_dir),
+            threads: None,
+            sensitivity: None,
+            search_type: None,
+            max_seqs: None,
+            prefilter_mode: None,
+            db_load_mode: Some(default_gpu_server_db_load_mode().to_string()),
+            alignment_mode: Some(default_search_alignment_mode().to_string()),
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+            option_fields: HashMap::new(),
+            gpu_server: true,
+        };
+
+        let convert_cfg = MmseqsConfig {
+            subcommand: MmseqsSubcommand::ConvertAlis,
+            backend: MmseqsBackend::Cpu,
+            input: None,
+            target_db: Some(target_db),
+            result_db: search_cfg.result_db.clone(),
+            output: Some(out_m8),
+            tmp_dir: None,
+            threads: None,
+            sensitivity: None,
+            search_type: None,
+            max_seqs: None,
+            prefilter_mode: None,
+            db_load_mode: None,
+            alignment_mode: None,
+            index_subset: None,
+            format_output: Some(default_easy_search_format_output().to_string()),
+            cuda_visible_devices: None,
+            option_fields: HashMap::new(),
+            gpu_server: false,
+        };
+
+        let server_cfg = MmseqsConfig {
+            subcommand: MmseqsSubcommand::GpuServer,
+            backend: MmseqsBackend::Gpu,
+            input: None,
+            target_db: search_cfg.target_db.clone(),
+            result_db: None,
+            output: None,
+            tmp_dir: None,
+            threads: None,
+            sensitivity: None,
+            search_type: None,
+            max_seqs: None,
+            prefilter_mode: None,
+            db_load_mode: None,
+            alignment_mode: None,
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+            option_fields: HashMap::new(),
+            gpu_server: false,
+        };
+
+        (server_cfg, search_cfg, convert_cfg)
+    }
+
+    pub async fn mmseqs_createdb(
+        input: &Path,
+        output: &Path,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("createdb");
+        cmd.arg(input);
+        cmd.arg(output);
+        Ok(cmd)
+    }
+
+    pub async fn mmseqs_makepaddedseqdb(
+        input_db: &Path,
+        output_db: &Path,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("makepaddedseqdb");
+        cmd.arg(input_db);
+        cmd.arg(output_db);
+        Ok(cmd)
+    }
+
+    pub async fn mmseqs_createindex(
+        target_db: &Path,
+        tmp_dir: &Path,
+        index_subset: Option<&str>,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("createindex");
+        cmd.arg(target_db);
+        cmd.arg(tmp_dir);
+
+        if let Some(subset) = index_subset {
+            cmd.arg("--index-subset");
+            cmd.arg(subset);
+        }
+
+        Ok(cmd)
+    }
+
+    pub async fn mmseqs_convertalis(
+        query_db: &Path,
+        target_db: &Path,
+        result_db: &Path,
+        output_m8: &Path,
+        format_output: Option<&str>,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("convertalis");
+        cmd.arg(query_db);
+        cmd.arg(target_db);
+        cmd.arg(result_db);
+        cmd.arg(output_m8);
+
+        if let Some(fmt) = format_output {
+            cmd.arg("--format-output");
+            cmd.arg(fmt);
+        }
+
+        Ok(cmd)
+    }
+
+    pub fn is_gpu_server_client(config: &MmseqsConfig) -> bool {
+        config.backend == MmseqsBackend::Gpu && config.gpu_server
+    }
+
+    pub fn uses_search_command(config: &MmseqsConfig) -> bool {
+        matches!(
+            config.subcommand,
+            MmseqsSubcommand::EasySearch | MmseqsSubcommand::Search
+        )
+    }
+
+    pub fn uses_convertalis_command(config: &MmseqsConfig) -> bool {
+        matches!(config.subcommand, MmseqsSubcommand::ConvertAlis)
+    }
+
+    pub fn uses_server_command(config: &MmseqsConfig) -> bool {
+        matches!(config.subcommand, MmseqsSubcommand::GpuServer)
+    }
+
+    pub fn uses_db_prep_command(config: &MmseqsConfig) -> bool {
+        matches!(
+            config.subcommand,
+            MmseqsSubcommand::Createdb
+                | MmseqsSubcommand::MakePaddedSeqDb
+                | MmseqsSubcommand::CreateIndex
+        )
+    }
+
+    pub fn maybe_warn_on_easy_search_cpu(config: &MmseqsConfig) {
+        if matches!(config.subcommand, MmseqsSubcommand::EasySearch)
+            && config.backend == MmseqsBackend::Cpu
+        {
+            info!(
+                "MMseqs CPU easy-search selected. This preserves current behavior."
+            );
         }
     }
 }

@@ -7168,6 +7168,27 @@ async fn preload_nr_alignments_parallel(
     info!("Preloaded {} NR alignments (parallel, {} workers)", nr_alignment_per_read.len(), concurrency);
     Ok(())
 }
+
+
+/// Resolve the production MMseqs database path once and reuse it everywhere.
+fn resolve_mmseqs_db_path(config: &RunConfig) -> Result<PathBuf, PipelineError> {
+    let db = config
+        .args
+        .mmseqs_db
+        .as_ref()
+        .ok_or_else(|| PipelineError::MissingArgument("mmseqs_db required".to_string()))?;
+
+    let db_path = PathBuf::from(db);
+    if !db_path.exists() {
+        return Err(PipelineError::IOError(format!(
+            "MMseqs DB path does not exist: {}",
+            db_path.display()
+        )));
+    }
+
+    Ok(db_path)
+}
+
 async fn run_mmseqs_step(
     config: Arc<RunConfig>,
     args: Vec<String>,
@@ -7204,6 +7225,55 @@ async fn run_mmseqs_step(
     Ok(())
 }
 
+async fn start_gpuserver(
+    db: &PathBuf,
+    verbose: bool,
+) -> Result<Child, PipelineError> {
+    let mut cmd = Command::new(MMSEQS_TAG);
+    cmd.arg("gpuserver")
+        .arg(db)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(if verbose {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        });
+
+    let child = cmd.spawn().map_err(|e| PipelineError::ToolExecution {
+        tool: "mmseqs gpuserver".to_string(),
+        error: e.to_string(),
+    })?;
+
+    info!("Started MMseqs GPU server for {}", db.display());
+    Ok(child)
+}
+
+async fn stop_gpuserver(child: &mut Child) -> Result<(), PipelineError> {
+    match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(PipelineError::Other(anyhow!(
+                "Failed to query gpuserver state: {}",
+                e
+            )));
+        }
+    }
+
+    child
+        .kill()
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: "mmseqs gpuserver".to_string(),
+            error: e.to_string(),
+        })?;
+
+    let _ = child.wait().await;
+    Ok(())
+}
+
+
 async fn mmseqs_fastq_to_m8_file(
     config: Arc<RunConfig>,
     input_fastq: PathBuf,
@@ -7212,47 +7282,147 @@ async fn mmseqs_fastq_to_m8_file(
     backend: MmseqsBackend,
 ) -> Result<PathBuf, PipelineError> {
     let tmp_dir = temp_dir.path().join(format!("{}.tmp", label));
+    let query_db = temp_dir.path().join(format!("{}.queryDB", label));
+    let result_db = temp_dir.path().join(format!("{}.resultDB", label));
     let m8_path = temp_dir.path().join(format!("{}.m8", label));
 
     fs::create_dir_all(&tmp_dir)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let easy_search_cfg = MmseqsConfig {
-        subcommand: MmseqsSubcommand::EasySearch,
-        backend,
-        query: input_fastq,
-        output: m8_path.clone(),
-        tmp_dir: tmp_dir.clone(),
+    let target_db = resolve_mmseqs_db_path(&config)?;
+
+    // 1) FASTQ -> query DB
+    let createdb_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::Createdb,
+        backend: MmseqsBackend::Cpu,
+        input: Some(input_fastq),
+        target_db: None,
+        result_db: None,
+        output: Some(query_db.clone()),
+        tmp_dir: None,
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
-
-        // Sensitivity only applies to CPU. GPU always runs at maximum sensitivity.
-        sensitivity: match backend {
-            MmseqsBackend::Cpu => Some("5.7".to_string()),   // Closest to Diamond --mid-sensitive
-            MmseqsBackend::Gpu => None,
-        },
-
-        format_output: Some(
-            "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
-                .to_string(),
-        ),
-        option_fields: HashMap::from([
-            ("--search-type".to_string(), Some("3".to_string())),   // translated search (BLASTX-like)
-            ("--max-seqs".to_string(), Some("500".to_string())),    // similar to Diamond behavior
-            ("-e".to_string(), Some("0.001".to_string())),   // reasonable filter
-            ("--min-seq-id".to_string(), Some("0.25".to_string())),
-        ]),
+        sensitivity: None,
+        search_type: None,
+        max_seqs: None,
+        prefilter_mode: None,
+        db_load_mode: None,
+        alignment_mode: None,
+        index_subset: None,
+        format_output: None,
+        cuda_visible_devices: None,
+        option_fields: HashMap::new(),
+        gpu_server: false,
     };
 
-    let easy_search_args = generate_cli(MMSEQS_TAG, &config, Some(&easy_search_cfg))
+    let createdb_args = generate_cli(MMSEQS_TAG, &config, Some(&createdb_cfg))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MMSEQS_TAG.to_string(),
             error: e.to_string(),
         })?;
 
-    info!("[mmseqs] args: {:?}", easy_search_args);
+    info!("[mmseqs:{}] createdb args: {:?}", label, createdb_args);
+    run_mmseqs_step(config.clone(), createdb_args, "createdb").await?;
 
-    run_mmseqs_step(config.clone(), easy_search_args, "easy-search").await?;
+    // 2) GPU server, only for GPU backend
+    let mut gpu_server: Option<Child> = None;
+
+    if backend == MmseqsBackend::Gpu {
+        gpu_server = Some(start_gpuserver(&target_db, config.args.verbose).await?);
+
+        // Small startup guard; replace with a readiness probe later if needed.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // 3) search -> result DB
+    let search_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::Search,
+        backend,
+        input: Some(query_db.clone()),
+        target_db: Some(target_db.clone()),
+        result_db: Some(result_db.clone()),
+        output: None,
+        tmp_dir: Some(tmp_dir.clone()),
+        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
+        sensitivity: if backend == MmseqsBackend::Cpu {
+            Some("5.7".to_string())
+        } else {
+            None
+        },
+        search_type: Some("3".to_string()),       // translated search
+        max_seqs: Some("500".to_string()),
+        prefilter_mode: if backend == MmseqsBackend::Gpu {
+            Some("1".to_string())
+        } else {
+            None
+        },
+        db_load_mode: if backend == MmseqsBackend::Gpu {
+            Some("2".to_string())
+        } else {
+            None
+        },
+        alignment_mode: Some("3".to_string()),    // preserve real pident semantics
+        index_subset: None,
+        format_output: None,
+        cuda_visible_devices: None,
+        option_fields: HashMap::from([
+            ("-e".to_string(), Some("0.001".to_string())),
+            ("--min-seq-id".to_string(), Some("0.25".to_string())),
+        ]),
+        gpu_server: backend == MmseqsBackend::Gpu,
+    };
+
+    let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    info!("[mmseqs:{}] search args: {:?}", label, search_args);
+    let search_res = run_mmseqs_step(config.clone(), search_args, "search").await;
+
+    // Stop the GPU server immediately after search, before convertalis.
+    if let Some(mut server) = gpu_server {
+        info!("Stopping MMseqs GPU server...");
+        stop_gpuserver(&mut server).await?;
+    }
+
+    search_res?;
+
+    // 4) convertalis -> m8
+    let convert_cfg = MmseqsConfig {
+        subcommand: MmseqsSubcommand::ConvertAlis,
+        backend: MmseqsBackend::Cpu,
+        input: Some(query_db.clone()),
+        target_db: Some(target_db.clone()),
+        result_db: Some(result_db.clone()),
+        output: Some(m8_path.clone()),
+        tmp_dir: None,
+        threads: None,
+        sensitivity: None,
+        search_type: None,
+        max_seqs: None,
+        prefilter_mode: None,
+        db_load_mode: None,
+        alignment_mode: None,
+        index_subset: None,
+        format_output: Some(
+            "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                .to_string(),
+        ),
+        cuda_visible_devices: None,
+        option_fields: HashMap::new(),
+        gpu_server: false,
+    };
+
+    let convert_args = generate_cli(MMSEQS_TAG, &config, Some(&convert_cfg))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    info!("[mmseqs:{}] convertalis args: {:?}", label, convert_args);
+    run_mmseqs_step(config.clone(), convert_args, "convertalis").await?;
 
     let meta = fs::metadata(&m8_path)
         .await
