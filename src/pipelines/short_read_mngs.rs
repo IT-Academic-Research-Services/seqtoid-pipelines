@@ -7857,45 +7857,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let unique_reads = uniques_count * if paired { 2 } else { 1 };
     info!("Uniques count after dedup (pairs counted separately): {}", unique_reads);
 
-
-    use tokio_stream::StreamExt;
-    info!("pairing debug");
-
-    let (dbg_tx, dbg_rx) = mpsc::channel(config.base_buffer_size);
-
-    let debug_handle = tokio::spawn(async move {
-        let mut stream = dedup_stream;
-        let mut count = 0;
-
-        while let Some(item) = stream.next().await {
-            if count < 20 {
-                match &item {
-                    ParseOutput::Fastq(rec) => {
-                        info!("[DEBUG {}] {}", count, rec.id());
-                    }
-                    _ => {
-                        info!("[DEBUG {}] non-fastq", count);
-                    }
-                }
-            }
-            count += 1;
-
-            // forward the item
-            if dbg_tx.send(item).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // cleanup_tasks.push(debug_handle);
-
-    // use THIS downstream instead
-    let dedup_stream = dbg_rx;
-
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
     let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
         config.clone(),
-        dedup_stream,
+        dedup_stream.into_inner(),
         config.args.max_subsample as u64,
         paired,
     ).await?;
