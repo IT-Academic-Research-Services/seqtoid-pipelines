@@ -996,6 +996,7 @@ async fn hisat2_filter(
 ///
 async fn fastp_qc(
     config: Arc<RunConfig>,
+    paired: bool,
     input_stream: ReceiverStream<ParseOutput>,
 ) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, oneshot::Receiver<Result<u64, anyhow::Error>>), PipelineError>{
     let mut cleanup_tasks = Vec::new();
@@ -1011,7 +1012,11 @@ async fn fastp_qc(
             ("--unqualified_percent_limit".to_string(), Some("15".to_string())),
             ("--n_base_limit".to_string(), Some("15".to_string())),
             ("--complexity_threshold".to_string(), Some("60".to_string())),
+            ("--sdust_complexity_filter".to_string(), None),
         ]),
+
+        paired: paired
+
     };
 
     let qc_fastp_args = generate_cli(FASTP_TAG, &config, Some(&qc_fastp_config_view))
@@ -7626,6 +7631,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // QC with fastp
     let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) = fastp_qc(
         config.clone(),
+        paired,
         ercc_bt2_out_stream,
     ).await?;
     cleanup_tasks.extend(qc_cleanup_tasks);

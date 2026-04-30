@@ -107,6 +107,7 @@ pub mod fastp {
     #[derive(Debug)]
     pub struct FastpConfig {
         pub command_fields: HashMap<String, Option<String>>,
+        pub paired: bool,
     }
     pub struct FastpArgGenerator;
 
@@ -128,8 +129,8 @@ pub mod fastp {
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
             args_vec.push("--interleaved_in".to_string());
-            args_vec.push("-q".to_string());
-            args_vec.push(args.quality.to_string());
+            // args_vec.push("-q".to_string());
+            // args_vec.push(args.quality.to_string());
 
             let json_out = run_config.out_dir.join("fastp.json");
             args_vec.push("-j".to_string());
@@ -148,6 +149,10 @@ pub mod fastp {
                 }
                 args_vec.push("--adapter_fasta".to_string());
                 args_vec.push(adapter_path.to_string_lossy().into_owned());
+            }
+
+            if args.adapter_fasta.is_some() && config.paired {
+                args_vec.push("--detect_adapter_for_pe".to_string());
             }
 
             for (key, value) in config.command_fields.iter() {
