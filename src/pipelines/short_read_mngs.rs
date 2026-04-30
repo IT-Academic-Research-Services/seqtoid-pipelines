@@ -2065,11 +2065,18 @@ async fn subsample_uniform(
         let mut records = Vec::new();
         let mut total = 0u64;
 
-        // Collect all records (same as before)
         while let Some(item) = stream.next().await {
-            if let ParseOutput::Fastq(_) = &item {
-                records.push(item);
-                total += 1;
+            match &item {
+                ParseOutput::Fastq(_) => {
+                    records.push(item);
+                    total += 1;
+                }
+                other => {
+                    return Err(anyhow!(
+                        "subsample_uniform: unexpected non-FASTQ item: {:?}",
+                        other
+                    ));
+                }
             }
         }
 
@@ -2082,7 +2089,6 @@ async fn subsample_uniform(
         let subsample_units = (max_subsample).min(num_units);
         let subsample_size = subsample_units * if paired { 2 } else { 1 };
 
-        // Send count early
         if count_tx.send(total).is_err() {
             warn!("Subsample count send failed (receiver might have dropped)");
         }
