@@ -7318,7 +7318,7 @@ async fn mmseqs_fastq_to_m8_file(
         result_db: None,
         output: Some(query_db.clone()),
         tmp_dir: None,
-        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
+        threads: None,
         sensitivity: None,
         search_type: None,
         max_seqs: None,
@@ -7328,7 +7328,9 @@ async fn mmseqs_fastq_to_m8_file(
         index_subset: None,
         format_output: None,
         cuda_visible_devices: None,
-        option_fields: HashMap::new(),
+        option_fields: HashMap::from([
+            ("--dbtype".to_string(), Some("2".to_string())), // nucleotide
+        ]),
         gpu_server: false,
     };
 
