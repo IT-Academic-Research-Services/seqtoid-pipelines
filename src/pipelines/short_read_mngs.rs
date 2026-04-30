@@ -1013,7 +1013,7 @@ async fn fastp_qc(
             ("--unqualified_percent_limit".to_string(), Some("15".to_string())),
             ("--n_base_limit".to_string(), Some("15".to_string())),
             ("--complexity_threshold".to_string(), Some("60".to_string())),
-            ("--sdust_complexity_filter".to_string(), None),
+            // ("--sdust_complexity_filter".to_string(), None),
         ]),
 
         paired: paired
