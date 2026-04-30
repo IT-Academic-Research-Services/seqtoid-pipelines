@@ -7823,6 +7823,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // 🔍 DEBUG BLOCK START
     use tokio_stream::StreamExt;
+    info!("pairing debug");
 
     let (dbg_tx, dbg_rx) = mpsc::channel(config.base_buffer_size);
 
@@ -7834,10 +7835,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             if count < 20 {
                 match &item {
                     ParseOutput::Fastq(rec) => {
-                        println!("[DEBUG {}] {}", count, rec.id());
+                        info!("[DEBUG {}] {}", count, rec.id());
                     }
                     _ => {
-                        println!("[DEBUG {}] non-fastq", count);
+                        info!("[DEBUG {}] non-fastq", count);
                     }
                 }
             }
