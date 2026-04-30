@@ -7842,14 +7842,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(parse_task);
 
-    // 🔍 DEBUG BLOCK START
+
+    let (dedup_stream, dedup_count_rx, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
+        config.clone(),
+        pre_dedup_parsed_stream,
+        paired,
+        Some(70), // Prefix length for deduplication. Hardcoded for now
+        out_dir.clone(),
+    ).await?;
+    cleanup_tasks.append(&mut dedup_cleanup_tasks);
+    cleanup_receivers.append(&mut dedup_cleanup_receivers);
+
+    let uniques_count = dedup_count_rx.await?;
+    let unique_reads = uniques_count * if paired { 2 } else { 1 };
+    info!("Uniques count after dedup (pairs counted separately): {}", unique_reads);
+
+
     use tokio_stream::StreamExt;
     info!("pairing debug");
 
     let (dbg_tx, dbg_rx) = mpsc::channel(config.base_buffer_size);
 
     let debug_handle = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(pre_dedup_parsed_stream);
+        let mut stream = dedup_stream;
         let mut count = 0;
 
         while let Some(item) = stream.next().await {
@@ -7875,29 +7890,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // cleanup_tasks.push(debug_handle);
 
     // use THIS downstream instead
-    let pre_dedup_parsed_stream = dbg_rx;
-
-    // let pre_dedup_parsed_stream = debug_stream.into_inner();
-
-
-    let (dedup_stream, dedup_count_rx, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
-        config.clone(),
-        pre_dedup_parsed_stream,
-        paired,
-        Some(70), // Prefix length for deduplication. Hardcoded for now
-        out_dir.clone(),
-    ).await?;
-    cleanup_tasks.append(&mut dedup_cleanup_tasks);
-    cleanup_receivers.append(&mut dedup_cleanup_receivers);
-
-    let uniques_count = dedup_count_rx.await?;
-    let unique_reads = uniques_count * if paired { 2 } else { 1 };
-    info!("Uniques count after dedup (pairs counted separately): {}", unique_reads);
+    let dedup_stream = dbg_rx;
 
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
     let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
         config.clone(),
-        dedup_stream.into_inner(),
+        dedup_stream,
         config.args.max_subsample as u64,
         paired,
     ).await?;
