@@ -676,9 +676,17 @@ async fn bowtie2_filter_files(
         output_bam_path.clone(),
     ).await?;
 
-    let fq1 = temp_dir.path().join("bt2_R1.fastq");
+    let fastq_temp_dir = choose_temp_dir(
+        config.input_size, // FASTQ size ~ input size
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        2,
+        false,
+    ).await?;
+
+    let fq1 = fastq_temp_dir.path().join("bt2_R1.fastq");
     let fq2 = if paired {
-        Some(temp_dir.path().join("bt2_R2.fastq"))
+        Some(fastq_temp_dir.path().join("bt2_R2.fastq"))
     } else {
         None
     };
@@ -727,7 +735,7 @@ async fn bowtie2_filter_files(
         cleanup_receivers,
         bam_write_task,
         output_bam_path,
-        vec![temp_dir]
+        vec![temp_dir, fastq_temp_dir]
     ))
 }
 
