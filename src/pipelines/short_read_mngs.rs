@@ -7824,29 +7824,39 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // 🔍 DEBUG BLOCK START
     use tokio_stream::StreamExt;
 
-    let mut debug_stream = ReceiverStream::new(pre_dedup_parsed_stream);
+    let (dbg_tx, dbg_rx) = mpsc::channel(config.base_buffer_size);
 
-    for i in 0..20 {
-        if let Some(item) = debug_stream.next().await {
-            if let ParseOutput::Fastq(rec) = &item {
-                println!("[DEBUG {}] {}", i, rec.id());
-            } else {
-                println!("[DEBUG {}] non-FASTQ item", i);
+    let debug_handle = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(pre_dedup_parsed_stream);
+        let mut count = 0;
+
+        while let Some(item) = stream.next().await {
+            if count < 20 {
+                match &item {
+                    ParseOutput::Fastq(rec) => {
+                        println!("[DEBUG {}] {}", count, rec.id());
+                    }
+                    _ => {
+                        println!("[DEBUG {}] non-fastq", count);
+                    }
+                }
             }
-        } else {
-            break;
+            count += 1;
+
+            // forward the item
+            if dbg_tx.send(item).await.is_err() {
+                break;
+            }
         }
-    }
+    });
 
-    let pre_dedup_parsed_stream = debug_stream.into_inner();
+    // cleanup_tasks.push(debug_handle);
 
+    // use THIS downstream instead
+    let pre_dedup_parsed_stream = dbg_rx;
 
+    // let pre_dedup_parsed_stream = debug_stream.into_inner();
 
-    // let pre_dedup_monitored = monitor_stream(
-    //     ReceiverStream::new(pre_dedup_parsed_stream),
-    //     "Pre_Dedup_Parse",
-    //     Duration::from_secs(5),
-    // );
 
     let (dedup_stream, dedup_count_rx, duplicate_clusters, mut dedup_cleanup_tasks, mut dedup_cleanup_receivers) = dedup(
         config.clone(),
@@ -7857,12 +7867,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
-
-    // let dedup_monitored = monitor_stream(
-    //     ReceiverStream::new(dedup_stream.into_inner()),
-    //     "Dedup",
-    //     Duration::from_secs(5),
-    // );
 
     let uniques_count = dedup_count_rx.await?;
     let unique_reads = uniques_count * if paired { 2 } else { 1 };
@@ -7877,11 +7881,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
    cleanup_tasks.push(subsample_send_task);
 
-    // let subsample_monitored = monitor_stream(
-    //     subsampled_stream,
-    //     "subsample",
-    //     Duration::from_secs(5),
-    // );
 
     let subsample_count = subsample_count_rx.await?;
     let subsample_reads = subsample_count * if paired { 2 } else { 1 };
