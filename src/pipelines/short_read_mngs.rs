@@ -7819,8 +7819,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.args.stall_threshold,
     ).await?;
 
-
     cleanup_tasks.push(parse_task);
+
+    // 🔍 DEBUG BLOCK START
+    use tokio_stream::StreamExt;
+
+    let mut debug_stream = ReceiverStream::new(pre_dedup_parsed_stream);
+
+    for i in 0..20 {
+        if let Some(item) = debug_stream.next().await {
+            if let ParseOutput::Fastq(rec) = &item {
+                println!("[DEBUG {}] {}", i, rec.id());
+            } else {
+                println!("[DEBUG {}] non-FASTQ item", i);
+            }
+        } else {
+            break;
+        }
+    }
+
+    let pre_dedup_parsed_stream = debug_stream.into_inner();
+
 
 
     // let pre_dedup_monitored = monitor_stream(
