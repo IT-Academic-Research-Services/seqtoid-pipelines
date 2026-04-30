@@ -2065,6 +2065,7 @@ async fn subsample_uniform(
         let mut records = Vec::new();
         let mut total = 0u64;
 
+        // Collect all records (same as before)
         while let Some(item) = stream.next().await {
             if let ParseOutput::Fastq(_) = &item {
                 records.push(item);
@@ -2072,37 +2073,47 @@ async fn subsample_uniform(
             }
         }
 
+        // Safety check: paired streams must be even-length
+        if paired && total % 2 != 0 {
+            return Err(anyhow!("Odd number of FASTQ records in paired mode"));
+        }
+
         let num_units = if paired { total / 2 } else { total };
         let subsample_units = (max_subsample).min(num_units);
         let subsample_size = subsample_units * if paired { 2 } else { 1 };
 
-        // Send count as soon as we know it to avoid deadlock with consumer
+        // Send count early
         if count_tx.send(total).is_err() {
             warn!("Subsample count send failed (receiver might have dropped)");
         }
 
         let mut rng = config.rng.clone();
-        let mut indices: Vec<usize> = if paired {
-            (0..(records.len() / 2)).collect()
-        } else {
-            (0..records.len()).collect()
-        };
-        indices.shuffle(&mut rng);
-
-        let sampled_indices: HashSet<usize> = indices.into_iter().take(subsample_units as usize).collect();
 
         if paired {
-            let mut iter = records.into_iter();
-            let mut i = 0;
-            while let Some(r1) = iter.next() {
-                let r2 = iter.next().ok_or_else(|| anyhow!("Incomplete pair at end of records"))?;
+            let pairs: Vec<(ParseOutput, ParseOutput)> = records
+                .chunks_exact(2)
+                .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
+                .collect();
+
+            let mut indices: Vec<usize> = (0..pairs.len()).collect();
+            indices.shuffle(&mut rng);
+
+            let sampled_indices: HashSet<usize> =
+                indices.into_iter().take(subsample_units as usize).collect();
+
+            for (i, (r1, r2)) in pairs.into_iter().enumerate() {
                 if sampled_indices.contains(&i) {
                     tx.send(r1).await.map_err(|_| anyhow!("Send R1 failed"))?;
                     tx.send(r2).await.map_err(|_| anyhow!("Send R2 failed"))?;
                 }
-                i += 1;
             }
         } else {
+            let mut indices: Vec<usize> = (0..records.len()).collect();
+            indices.shuffle(&mut rng);
+
+            let sampled_indices: HashSet<usize> =
+                indices.into_iter().take(subsample_units as usize).collect();
+
             for (i, item) in records.into_iter().enumerate() {
                 if sampled_indices.contains(&i) {
                     tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
@@ -2110,7 +2121,11 @@ async fn subsample_uniform(
             }
         }
 
-        info!("Subsample distributor processed {} uniques, sampled {}", total, subsample_size);
+        info!(
+            "Subsample distributor processed {} uniques, sampled {}",
+            total, subsample_size
+        );
+
         Ok(())
     });
 
