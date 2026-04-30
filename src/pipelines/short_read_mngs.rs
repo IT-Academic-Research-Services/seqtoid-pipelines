@@ -84,7 +84,7 @@ use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_st
 use crate::utils::stats::parse_samtools_stats;
 use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
                             parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
-                            stream_to_cmd, stream_to_file, t_junction, write_to_fifo,
+                            stream_to_cmd, stream_to_file, write_to_fifo,
                             ChannelReader, ChildStream, ParseMode,
                             ParseOutput, ToBytes, monitor_stream, batch_rayon_process, parse_bytes, parse_lines, fanout_to_channels};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
@@ -352,29 +352,31 @@ async fn validate_input(
     let val_rx_stream = ReceiverStream::new(rx);
 
     // Split the byte stream for fastp and write
-    let (val_streams, val_done_rx) = t_junction(
+    let (val_streams, val_router_handle) = fanout_to_channels(
         val_rx_stream,
         2,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "validate_input".to_string(),
-        None,
+        "validate_input",
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(val_done_rx);
+
+    cleanup_tasks.push(val_router_handle);
 
     let mut val_streams_iter = val_streams.into_iter();
-    let val_ercc_bowtie2_filter_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let val_file_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let val_ercc_bowtie2_filter_out_stream = ReceiverStream::new(
+        val_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let val_file_stream = ReceiverStream::new(
+        val_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
 
 
     let val_file_write_task = write_byte_stream_to_file(
         &validated_interleaved_file_path,
-        ReceiverStream::new(val_file_stream),
+        val_file_stream,
         Some(config.base_buffer_size),
         "validate_input",
     )
@@ -383,7 +385,7 @@ async fn validate_input(
 
     cleanup_tasks.push(val_file_write_task);
 
-    Ok((ReceiverStream::new(val_ercc_bowtie2_filter_out_stream),  cleanup_tasks, cleanup_receivers, raw_count_task, val_count_task))
+    Ok((val_ercc_bowtie2_filter_out_stream,  cleanup_tasks, cleanup_receivers, raw_count_task, val_count_task))
 }
 
 /// bowtie2 filter function where the passing stream contains the unmapped reads
@@ -412,7 +414,7 @@ async fn bowtie2_align_and_sort_stream(
     bowtie2_options: HashMap<String, Option<String>>,
     output_bam_path: PathBuf,
 ) -> Result<(
-    mpsc::Receiver<ParseOutput>,   // BAM → for fastq extraction
+    ReceiverStream<ParseOutput>,   // BAM → for fastq extraction
     JoinHandle<Result<()>>,        // BAM write task
     oneshot::Receiver<u64>,        // count rx
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
@@ -500,24 +502,23 @@ async fn bowtie2_align_and_sort_stream(
     // split stream
     // ─────────────────────────────
 
-    let (streams, done_rx) = t_junction(
+    let (streams, router_handle) = fanout_to_channels(
         ReceiverStream::new(sorted_bam_stream),
         3,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "bt2_split".to_string(),
-        None,
-    ).await?;
+        "bt2_split",
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_receivers.push(done_rx);
+    // track the task instead of a oneshot receiver
+    cleanup_tasks.push(router_handle);
 
     let mut it = streams.into_iter();
-    let fastq_stream = it.next().unwrap();
-    let count_stream = it.next().unwrap();
-    let bam_write_stream = it.next().unwrap();
+
+    let fastq_stream = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+    let count_stream = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+    let bam_write_stream = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
 
     // ─────────────────────────────
     // BAM write
@@ -528,7 +529,7 @@ async fn bowtie2_align_and_sort_stream(
         async move {
             write_byte_stream_to_file(
                 &output_bam_path,
-                ReceiverStream::new(bam_write_stream),
+                bam_write_stream,
                 Some(config.base_buffer_size),
                 "bt2_bam_write",
             ).await?;
@@ -542,7 +543,7 @@ async fn bowtie2_align_and_sort_stream(
 
     let (count_tx, count_rx) = oneshot::channel();
     let count_task = tokio::spawn(async move {
-        let mut s = ReceiverStream::new(count_stream);
+        let mut s = count_stream;
         let mut lines = 0u64;
         while let Some(item) = s.next().await {
             if let ParseOutput::Bytes(b) = item {
@@ -615,7 +616,7 @@ async fn bowtie2_filter_stream(
 
     let (mut child, stdin_task, err_task) = stream_to_cmd(
         config.clone(),
-        fastq_input_stream,
+        fastq_input_stream.into_inner(),
         SAMTOOLS_TAG,
         args,
         StreamDataType::JustBytes,
@@ -712,7 +713,7 @@ async fn bowtie2_filter_files(
 
     let (mut child, stdin_task, err_task) = stream_to_cmd(
         config.clone(),
-        fastq_input_stream,
+        fastq_input_stream.into_inner(),
         SAMTOOLS_TAG,
         args,
         StreamDataType::JustBytes,
@@ -1058,32 +1059,36 @@ async fn fastp_qc(
 
     // Tee the byte stream for counting
     let tee_count_input = ReceiverStream::new(qc_fastp_out_stream);
-    let (mut tee_count_streams, tee_count_done_rx) = t_junction(
+
+    let (tee_count_streams, tee_count_router_handle) = fanout_to_channels(
         tee_count_input,
         2,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "fastp_count".to_string(),
-        None,
+        "fastp_count",
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
-            tool: "t_junction".to_string(),
+            tool: "fanout_to_channels".to_string(),
             error: e.to_string(),
         })?;
-    cleanup_receivers.push(tee_count_done_rx);
+
+    // track the task instead of oneshot receiver
+    cleanup_tasks.push(tee_count_router_handle);
 
     let mut tee_count_streams_iter = tee_count_streams.into_iter();
-    let qc_out_stream = tee_count_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let qc_count_stream = tee_count_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let qc_out_stream = ReceiverStream::new(
+        tee_count_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let qc_count_stream = ReceiverStream::new(
+        tee_count_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
 
     let (count_tx, count_result_rx) = oneshot::channel::<Result<u64, anyhow::Error>>();
 
     let count_task = tokio::spawn(async move {
-        match stream_record_counter(qc_count_stream, false).await {
+        match stream_record_counter(qc_count_stream.into_inner(), false).await {
             Ok(count) => {
                 debug!("Fastp output reads: {}", count);
                 let _ = count_tx.send(Ok(count)); // Send the count result
@@ -1097,7 +1102,7 @@ async fn fastp_qc(
     });
     cleanup_tasks.push(count_task);
 
-    Ok((ReceiverStream::new(qc_out_stream), cleanup_tasks, cleanup_receivers, count_result_rx))
+    Ok((qc_out_stream, cleanup_tasks, cleanup_receivers, count_result_rx))
 }
 
 /// Runs Kallisto quant
@@ -1523,41 +1528,48 @@ async fn minimap2_filter(
             })?
     };
 
+    use tokio_stream::wrappers::ReceiverStream;
+
     let num_tees = 2 + if output_bam_path.is_some() { 1 } else { 0 };
+
     let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
-    let (bam_streams, bam_done_rx) = t_junction(
+
+    let (bam_streams, bam_router_handle) = fanout_to_channels(
         bam_rx_stream,
         num_tees,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "minimap2_bam_split".to_string(),
-        None,
+        "minimap2_bam_split",
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(bam_done_rx);
+
+    // track task instead of oneshot receiver
+    cleanup_tasks.push(bam_router_handle);
 
     let mut bam_streams_iter = bam_streams.into_iter();
 
     // Optional: Write BAM to file
     if let Some(bam_path) = output_bam_path {
-        let stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+        let stream = ReceiverStream::new(
+            bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+        );
+
         let bam_write_task = write_byte_stream_to_file(
             &bam_path,
-            ReceiverStream::new(stream),
+            stream,
             Some(config.base_buffer_size),
             "mm2_filter_bam"
         )
             .await
             .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
         cleanup_tasks.push(bam_write_task);
     }
 
     // Count total mapped reads
-    let bam_count_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let bam_count_stream = ReceiverStream::new(
+        bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
     let mapped_flag = if paired { "-F12".to_string() } else { "-F4".to_string() };
     let samtools_count_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::View,
@@ -1575,7 +1587,7 @@ async fn minimap2_filter(
 
     let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
         config.clone(),
-        bam_count_stream,
+        bam_count_stream.into_inner(),
         SAMTOOLS_TAG,
         samtools_count_args,
         StreamDataType::JustBytes,
@@ -1600,7 +1612,10 @@ async fn minimap2_filter(
     cleanup_tasks.push(count_future);
 
     // Extract unmapped FASTQ
-    let unmapped_stream = bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let unmapped_stream = ReceiverStream::new(
+        bam_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
     let unmapped_flag = if paired { "-f13".to_string() } else { "-f4".to_string() };
     let samtools_fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
@@ -1617,7 +1632,7 @@ async fn minimap2_filter(
 
     let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
         config.clone(),
-        unmapped_stream,
+        unmapped_stream.into_inner(),
         SAMTOOLS_TAG,
         samtools_fastq_args,
         StreamDataType::JustBytes,
@@ -2401,7 +2416,7 @@ pub async fn minimap2_non_host_align(
 
 
 
-/// Converts a PAF stream to an m8 stream, splits it with t_junction for file writing,
+/// Converts a PAF stream to an m8 stream, splits it for file writing,
 /// and returns the main m8 stream along with cleanup handles.
 /// # Arguments
 ///
@@ -2458,25 +2473,31 @@ pub async fn paf_to_m8(
     );
 
     // Split the converted stream immediately; no extra intermediate mpsc queue.
-    let (mut streams, done_rx) = t_junction(
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (streams, router_handle) = fanout_to_channels(
         batched_stream,
         2,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "paf_to_m8_stream".to_string(),
-        None,
+        "paf_to_m8_stream",
     )
-        .await?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    let main_stream = streams.remove(0);
-    let file_stream = streams.remove(0);
+
+    let mut streams = streams;
+
+    let main_stream = ReceiverStream::new(
+        streams.remove(0)
+    );
+
+    let file_stream = ReceiverStream::new(
+        streams.remove(0)
+    );
 
     let write_task = write_byte_stream_to_file(
         &m8_path,
-        ReceiverStream::new(file_stream),
+        file_stream,
         Some(config.base_buffer_size),
         "paf_to_m8_m8",
     )
@@ -2492,9 +2513,9 @@ pub async fn paf_to_m8(
     );
 
     Ok((
-        ReceiverStream::new(main_stream),
-        vec![write_task],
-        vec![done_rx],
+        main_stream,
+        vec![write_task, router_handle],
+        vec![],
     ))
 }
 
@@ -2983,23 +3004,27 @@ pub async fn call_hits_m8(
     cleanup_tasks.push(coordinator_handle);
 
     let dedup_stream = ReceiverStream::new(dedup_rx);
-    let (mut dedup_branches, dedup_done) = t_junction(
+    let (dedup_branches, dedup_router_handle) = fanout_to_channels(
         dedup_stream,
         2,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "call_hits_m8_dedup".to_string(),
-        None,
+        "call_hits_m8_dedup",
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_receivers.push(dedup_done);
 
-    let dedup_main = dedup_branches.remove(0);
-    let dedup_file_stream = dedup_branches.remove(0);
+    // track router task (replaces cleanup_receivers)
+    cleanup_tasks.push(dedup_router_handle);
+
+    let mut dedup_branches = dedup_branches.into_iter();
+
+    let dedup_main = ReceiverStream::new(
+        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let dedup_file_stream = ReceiverStream::new(
+        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
 
     let call_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
@@ -3008,7 +3033,7 @@ pub async fn call_hits_m8(
             Some(&format!("{}.dedup.m8", tag)),
             "_",
         )),
-        ReceiverStream::new(dedup_file_stream),
+        dedup_file_stream,
         Some(config.base_buffer_size),
         "call_hits_m8_dedup",
     )
@@ -3017,23 +3042,27 @@ pub async fn call_hits_m8(
     cleanup_tasks.push(call_file_write_task);
 
     let summary_stream = ReceiverStream::new(summary_rx);
-    let (mut summary_branches, summary_done) = t_junction(
+    let (summary_branches, summary_router_handle) = fanout_to_channels(
         summary_stream,
         2,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "call_hits_m8_summary".to_string(),
-        None,
+        "call_hits_m8_summary",
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_receivers.push(summary_done);
 
-    let summary_main = summary_branches.remove(0);
-    let summary_file_stream = summary_branches.remove(0);
+    // track router task instead of oneshot receiver
+    cleanup_tasks.push(summary_router_handle);
+
+    let mut summary_branches = summary_branches.into_iter();
+
+    let summary_main = ReceiverStream::new(
+        summary_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let summary_file_stream = ReceiverStream::new(
+        summary_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
 
     let summary_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
@@ -3042,7 +3071,7 @@ pub async fn call_hits_m8(
             Some(&format!("{}.summary.txt", tag)),
             "_",
         )),
-        ReceiverStream::new(summary_file_stream),
+        summary_file_stream,
         Some(config.base_buffer_size),
         "call_hits_m8_summary",
     )
@@ -3053,8 +3082,8 @@ pub async fn call_hits_m8(
     info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
 
     Ok((
-        ReceiverStream::new(dedup_main),
-        ReceiverStream::new(summary_main),
+        dedup_main,
+        summary_main,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -4768,32 +4797,39 @@ pub async fn process_assembly(
             })?
     };
 
-    let (non_host_streams, non_host_done_rx) = t_junction(
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (non_host_streams, non_host_router_handle) = fanout_to_channels(
         ReceiverStream::new(samtools_sort_out_stream),
-        2,
+        3,
         config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,
-        "process_assembly_sam".to_string(),
-        None,
+        "process_assembly_sam",
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_receivers.push(non_host_done_rx);
+    // track task
+    cleanup_tasks.push(non_host_router_handle);
 
     let mut non_host_streams_iter = non_host_streams.into_iter();
-    let bam_for_file = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let bam_for_stats = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let bam_for_output = non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let bam_for_file = ReceiverStream::new(
+        non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let bam_for_stats = ReceiverStream::new(
+        non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let bam_for_output = ReceiverStream::new(
+        non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
 
     let sam_path = out_dir.join("read-contig.bam");
 
     let write_sam_task = write_byte_stream_to_file(
         &sam_path,
-        ReceiverStream::new(bam_for_file),
+        bam_for_file,
         Some(config.base_buffer_size),
         "process_assembly",
     )
@@ -4811,7 +4847,7 @@ pub async fn process_assembly(
     info!("BAM info concurrency {}", bam_concurrency);
 
     let (read2contig, contig_stats, _contig_uniques) = generate_info_from_bam_stream(
-        bam_for_stats,
+        bam_for_stats.into_inner(),
         &duplicate_clusters,
         config.args.min_contig_length,
         bam_concurrency,
@@ -4837,7 +4873,7 @@ pub async fn process_assembly(
             contig_stats: Arc::new(contig_stats),
             read2contig: Arc::new(read2contig),
         },
-        ReceiverStream::new(bam_for_output),
+        bam_for_output,
         cleanup_tasks,
         cleanup_receivers,
         temp_files,
@@ -7638,24 +7674,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(qc_cleanup_receivers);
 
     // Split for Kallisto and Bowtie2
-    let (mut kallisto_streams, kallisto_split_done_rx) = t_junction(
+    let (kallisto_streams, kallisto_router_handle) = fanout_to_channels(
         qc_fastp_out_stream,
         2,
         config.base_buffer_size * 10,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::JustBytes,
-        "kallisto_split".to_string(),
-        None,
-    ).await?;
-    cleanup_receivers.push(kallisto_split_done_rx);
+        "kallisto_split",
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    // track router task
+    cleanup_tasks.push(kallisto_router_handle);
 
     let mut kallisto_streams_iter = kallisto_streams.into_iter();
-    let kallisto_bypass_stream = kallisto_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let kallisto_stream = kallisto_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let kallisto_stream = ReceiverStream::new(kallisto_stream);
+    let kallisto_bypass_stream = ReceiverStream::new(
+        kallisto_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let kallisto_stream = ReceiverStream::new(
+        kallisto_streams_iter.next().ok_or(PipelineError::EmptyStream)?
+    );
+
 
     let (kallisto_ercc_tx, kallisto_ercc_rx, kallisto_cleanup_tasks, kallisto_cleanup_receivers, kallisto_exit_task) = kallisto_quant(
         config.clone(),
@@ -7672,7 +7712,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
     let (host_bt2_r1, host_bt2_r2, host_bt2_count_rx, host_bt2_cleanup_tasks, host_bt2_cleanup_receivers, host_bt2_bam_write_handle, host_bt2_bam_path, host_bt2_temp_dirs) = bowtie2_filter_files(
         config.clone(),
-        ReceiverStream::new(kallisto_bypass_stream),
+        kallisto_bypass_stream,
         host_bt2_index_path,
         paired,
         host_bt2_options,

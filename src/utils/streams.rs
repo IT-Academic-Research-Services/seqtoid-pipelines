@@ -183,9 +183,12 @@ impl AsyncRead for ChannelReader {
     }
 }
 
-/// Generates any number of output streams from a single input stream.
-/// The streams are all asynchronous.
-///
+/// Fans oiut data piece by peiecve to donstream consumers
+/// NOTE: does NOT give each cocnusmer ALL data. NOT used for "splitting" streams!!
+/// if feeding reads a b c to two consumers
+/// Task A: recv() → gets `a`
+/// Task B: recv() → gets `b`
+/// Task A: recv() → gets `c`
 /// # Arguments
 ///
 /// * `input_stream`: An asynchronous stream yielding items of type `T`.
