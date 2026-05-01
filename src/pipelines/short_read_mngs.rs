@@ -4647,7 +4647,9 @@ pub async fn process_assembly(
     let write_handle = write_fasta_stream_to_file(
         ReceiverStream::new(rx),
         ram_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "process_assembly_contigs_filtering",
     );
 
     write_handle
@@ -8508,19 +8510,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(write_fasta_stream_to_file(
         initial_annotated_file_stream,
         annotated_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "initial_annotated_file_stream_to_write",
     ));
 
     cleanup_tasks.push(write_fasta_stream_to_file(
         initial_unidentified_file_stream,
         unidentified_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "initial_unidentified_file_stream_to_write",
     ));
 
     cleanup_tasks.push(write_fasta_stream_to_file(
         ReceiverStream::new(unique_unidentified_rx),
         unique_unidentified_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "unique_unidentified_file_stream_to_write",
     ));
 
     info!("[run] annotated FASTA wiring complete (fanout_to_channels used everywhere)");
@@ -9156,14 +9164,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let write_mapped_handle = write_fasta_stream_to_file(
         ReceiverStream::new(taxid_mapped_file),
         mapped_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "taxid_mapped_file_stream_to_write",
     );
     cleanup_tasks.push(write_mapped_handle);
 
     let write_combined_handle = write_fasta_stream_to_file(
         ReceiverStream::new(taxid_combined_rx),
         combined_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "taxid_combined_file_stream_to_write",
     );
     cleanup_tasks.push(write_combined_handle);
 
@@ -9257,14 +9269,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let initial_write_mapped_handle = write_fasta_stream_to_file(
         initial_taxid_mapped_file, // Clone rx if needed for logging
         initial_mapped_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "initial_taxid_mapped_file_stream_to_write",
     );
     cleanup_tasks.push(initial_write_mapped_handle);
 
     let initial_write_combined_handle = write_fasta_stream_to_file(
         initial_taxid_combined_file,
         initial_combined_path.clone(),
-        config.base_buffer_size,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "initial_taxid_combined_file_stream_to_write",
     );
     cleanup_tasks.push(initial_write_combined_handle);
 

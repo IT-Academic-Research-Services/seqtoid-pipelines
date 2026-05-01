@@ -38,7 +38,7 @@ use bytes::Bytes;
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
+use crate::config::defs::{StreamDataType, FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
 use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
 use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 
@@ -883,31 +883,40 @@ pub fn read_fasta(
 pub fn write_fasta_stream_to_file(
     stream: ReceiverStream<ParseOutput>,
     dest_path: PathBuf,
-    buffer_capacity: usize,
+    config: Arc<RunConfig>,           // ← Arc for 'static spawn
+    data_type: StreamDataType,        // ← added
+    label: &str,                      // optional label for logging
 ) -> JoinHandle<Result<()>> {
+
     let dest_path_clone = dest_path.clone();
+    let label_owned = label.to_string();
 
     tokio::spawn(async move {
         let file = TokioFile::create(&dest_path_clone)
             .await
             .map_err(|e| anyhow!("Cannot create FASTA file {}: {}", dest_path_clone.display(), e))?;
 
-        // Much larger effective buffer (16–32 MiB)
-        let effective_buffer = buffer_capacity.max(32 * 1024 * 1024);
+        // Dynamic hot buffer
+        let effective_buffer = crate::utils::system::compute_buffer_size(
+            &config,
+            "write_fasta_stream_to_file",
+            data_type,
+            2.0,                          // very hot write path
+        );
+
         let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
 
         let mut stream = stream;
-        let mut batch: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024); // 8 MiB batch
+        let mut batch: Vec<u8> = Vec::with_capacity(effective_buffer / 4); // 4:1 batch ratio
 
         while let Some(item) = stream.next().await {
             let bytes = item
                 .to_bytes()
-                .map_err(|e| anyhow!("Failed to convert FASTA record to bytes: {}", e))?;
+                .map_err(|e| anyhow!("Failed to convert record to bytes: {}", e))?;
 
             batch.extend_from_slice(&bytes);
 
-            // Flush batch when it hits 8 MiB — drastically reduces syscalls
-            if batch.len() >= 8 * 1024 * 1024 {
+            if batch.len() >= effective_buffer / 4 {
                 writer.write_all(&batch).await
                     .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
                 batch.clear();
@@ -923,7 +932,9 @@ pub fn write_fasta_stream_to_file(
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
         let final_size = writer.stream_position().await.unwrap_or(0);
-        info!("FASTA written to {} ({} bytes)", dest_path_clone.display(), final_size);
+        info!("{} written to {} ({} bytes, buffer {} MiB)",
+              label_owned, dest_path_clone.display(), final_size, effective_buffer / (1024*1024));
+
         Ok(())
     })
 }
