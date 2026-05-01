@@ -2578,33 +2578,6 @@ pub async fn load_lineage_and_acc2tax_maps(
 
     let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
 
-    // ────────────────────────────────────────────────────────────────
-    // TEMP SANITY CHECK: Verify a few known accession → taxid mappings
-    // ────────────────────────────────────────────────────────────────
-    let test_accessions = vec![
-        "NC_000834",
-        "NP_001107370",
-        "AC_000016",
-        "WP_000065373",
-    ];
-
-    info!("Sanity checking {} known accessions → taxid mappings", test_accessions.len());
-    for acc in test_accessions {
-        let key = acc.as_bytes();
-        if let Some(taxid_u64) = acc2taxid_map.get(key) {
-            let taxid = taxid_u64 as i32;
-            info!("  {} → taxid {}", acc, taxid);
-            // Optional: check lineage exists
-            if lineage_map.get(&taxid).is_some() {
-                debug!("     (lineage found for taxid {})", taxid);
-            } else {
-                warn!("     WARNING: No lineage found for taxid {}", taxid);
-            }
-        } else {
-            warn!("WARNING: Accession {} not found in acc2taxid map", acc);
-        }
-    }
-
     info!(
         "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
         lineage_map.len(),
