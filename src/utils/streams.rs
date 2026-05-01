@@ -1812,7 +1812,7 @@ pub fn batch_rayon_process<F>(
     mut input: ReceiverStream<ParseOutput>,
     processor: F,
     stage_name: &'static str,
-    batch_target_bytes: usize,
+    batch_target_bytes: usize,        // legacy fallback
 ) -> ReceiverStream<ParseOutput>
 where
     F: Fn(Vec<u8>) -> Vec<Vec<u8>> + Send + Sync + 'static,
@@ -1820,7 +1820,6 @@ where
     let (tx, rx) = mpsc::channel(1024);
     let processor = Arc::new(processor);
 
-    // Small helper so we do not duplicate the send loop for the normal batch and final flush.
     async fn send_lines(
         tx: &mpsc::Sender<ParseOutput>,
         lines: Vec<Vec<u8>>,
@@ -1829,10 +1828,7 @@ where
     ) -> bool {
         for line in lines {
             if tx.send(ParseOutput::Bytes(Bytes::from(line))).await.is_err() {
-                warn!(
-                    "{}: downstream closed while sending {}",
-                    stage_name, label
-                );
+                warn!("{}: downstream closed while sending {}", stage_name, label);
                 return false;
             }
         }
@@ -1840,34 +1836,32 @@ where
     }
 
     tokio::spawn(async move {
-        // Start with the target size, so we are not constantly growing the buffer.
-        let mut buf = Vec::with_capacity(batch_target_bytes.max(1));
+        let batch_target = crate::utils::system::compute_buffer_size(
+            &config,
+            "batch_rayon",
+            StreamDataType::JustBytes,
+            2.0,                          // hot CPU path — larger batches
+        ).max(batch_target_bytes);        // respect legacy param if larger
+
+        let mut buf = Vec::with_capacity(batch_target);
         let mut processed = 0u64;
 
         while let Some(item) = input.next().await {
-            let ParseOutput::Bytes(b) = item else {
-                continue;
-            };
+            let ParseOutput::Bytes(b) = item else { continue; };
 
-            // Reserve exactly what we need for this chunk when possible.
             buf.reserve(b.len());
             buf.extend_from_slice(&b);
 
-            if buf.len() >= batch_target_bytes {
-                // Preserve the allocation already sitting inside `buf`.
+            if buf.len() >= batch_target {
                 let mut batch = Vec::with_capacity(buf.len());
                 batch.append(&mut buf);
 
                 let p = Arc::clone(&processor);
                 let config_clone = Arc::clone(&config);
 
-                // debug!("{}: starting batch of {} bytes", stage_name, batch.len());
-
                 let lines = match tokio::task::spawn_blocking(move || {
                     config_clone.thread_pool.install(|| p(batch))
-                })
-                    .await
-                {
+                }).await {
                     Ok(lines) => lines,
                     Err(join_err) => {
                         error!("{}: batch task panicked: {}", stage_name, join_err);
@@ -1875,40 +1869,26 @@ where
                     }
                 };
 
-                // debug!(
-                //     "{}: batch complete — produced {} lines",
-                //     stage_name,
-                //     lines.len()
-                // );
-
                 let batch_len = lines.len() as u64;
                 if !send_lines(&tx, lines, stage_name, "batch").await {
                     break;
                 }
 
                 processed += batch_len;
-                // if processed % 1_000 == 0 || processed % 100_000 == 0 {
-                //     info!(
-                //         "{}: {} items (batch target {} bytes)",
-                //         stage_name, processed, batch_target_bytes
-                //     );
-                // }
             }
         }
 
-        // Final flush.
+        // Final flush
         if !buf.is_empty() {
             let mut batch = Vec::with_capacity(buf.len());
             batch.append(&mut buf);
 
-            let config_clone = Arc::clone(&config);
             let p = Arc::clone(&processor);
+            let config_clone = Arc::clone(&config);
 
             let lines = match tokio::task::spawn_blocking(move || {
                 config_clone.thread_pool.install(|| p(batch))
-            })
-                .await
-            {
+            }).await {
                 Ok(lines) => lines,
                 Err(join_err) => {
                     error!("{}: final batch task panicked: {}", stage_name, join_err);
@@ -1917,14 +1897,11 @@ where
             };
 
             let batch_len = lines.len() as u64;
-            if !send_lines(&tx, lines, stage_name, "final batch").await {
-                return;
-            }
-
+            let _ = send_lines(&tx, lines, stage_name, "final batch").await;
             processed += batch_len;
         }
 
-        debug!("{}: finished — total {} items", stage_name, processed);
+        debug!("{}: finished — total {} items (target batch {} bytes)", stage_name, processed, batch_target);
     });
 
     ReceiverStream::new(rx)
