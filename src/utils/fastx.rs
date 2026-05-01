@@ -783,20 +783,27 @@ pub fn read_fasta(
     max_records: u64,
     min_seq_len: Option<usize>,
     max_seq_len: Option<usize>,
-    chunk_size: usize,
+    chunk_size: usize,           // legacy
+    config: &RunConfig,       
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-    let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
+
+    let effective_chunk = crate::utils::system::compute_buffer_size(
+        config,
+        "read_fasta",
+        StreamDataType::JustBytes,
+        1.2,                         // moderate boost for FASTA reader
+    );
+
+    let (tx, rx) = mpsc::channel(effective_chunk / 1024);
 
     tokio::spawn(async move {
-        debug!("read_fasta: Starting with path={:?}, max_records={}, min_seq_len={:?}, max_seq_len={:?}, chunk_size={}",
-                  path, max_records, min_seq_len, max_seq_len, chunk_size);
+        debug!("read_fasta: Starting with path={:?}, max_records={}, min_seq_len={:?}, max_seq_len={:?}, effective_chunk={}",
+                  path, max_records, min_seq_len, max_seq_len, effective_chunk);
 
         let mut reader = parse_fastx_file(&path)
-            .map_err(|e| {
-                anyhow!("Failed to open FASTA {}: {}", path.display(), e)
-            })?;
+            .map_err(|e| anyhow!("Failed to open FASTA {}: {}", path.display(), e))?;
 
-        let mut buffer = Vec::with_capacity(chunk_size);
+        let mut buffer = Vec::with_capacity(effective_chunk);
         let mut record_count: u64 = 0;
 
         while let Some(result) = reader.next() {
@@ -808,16 +815,12 @@ pub fn read_fasta(
                 anyhow!("Parse error at record {}: {}", record_count + 1, e)
             })?;
 
-            // Ensure FASTA (not FASTQ)
             if record.qual().is_some() {
                 return Err(anyhow!("Expected FASTA, got FASTQ at record {}", record_count + 1));
             }
 
-            // Log record details
             let seq_len = record.seq().len();
-            let _id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
 
-            // Optional length filters
             if let Some(min) = min_seq_len {
                 if seq_len < min {
                     debug!("read_fasta: Skipping record {}: seq_len={} < min={}", record_count + 1, seq_len, min);
@@ -831,7 +834,6 @@ pub fn read_fasta(
                 }
             }
 
-            // Construct FASTA record
             let mut record_bytes = Vec::new();
             record_bytes.push(b'>');
             record_bytes.extend_from_slice(record.id());
@@ -842,15 +844,13 @@ pub fn read_fasta(
             buffer.extend_from_slice(&record_bytes);
             record_count += 1;
 
-            // Send if chunk full
-            if buffer.len() >= chunk_size {
+            if buffer.len() >= effective_chunk {
                 if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                     return Err(anyhow!("Failed to send byte chunk at record {}", record_count));
                 }
             }
         }
 
-        // Send remaining
         if !buffer.is_empty() {
             if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                 return Err(anyhow!("Failed to send final byte chunk"));

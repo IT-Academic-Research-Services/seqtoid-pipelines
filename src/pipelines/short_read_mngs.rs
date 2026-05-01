@@ -4645,6 +4645,7 @@ pub async fn process_assembly(
         Some(config.args.min_contig_length),
         None,
         8192,
+        &config
     )
         .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
 
@@ -7118,7 +7119,7 @@ pub async fn generate_nonhost_fastq_from_files(
         config.base_buffer_size * 4, // Large chunks for speed
         "generate_nonhost_fastq_from_files_r1",
         &config,
-        
+
     )?;
     let r1_input_stream = ReceiverStream::new(r1_rx);
     let r1_filtered = filter_fastq_to_bytes_stream(r1_input_stream, r1_headers).await;
