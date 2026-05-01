@@ -346,6 +346,7 @@ async fn validate_input(
         config.args.max_read_len,
         config.base_buffer_size,
         "validate_input",
+        &config,
     )
         .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
 
@@ -947,6 +948,7 @@ async fn hisat2_filter(
         None,
         config.base_buffer_size,
         "hisat2_filter",
+        &config,
     ).map_err(|e| PipelineError::Other(e))?;
 
     cleanup_tasks.push(tokio::spawn(async move {
@@ -7114,7 +7116,9 @@ pub async fn generate_nonhost_fastq_from_files(
         None,
         None,
         config.base_buffer_size * 4, // Large chunks for speed
-        "generate_nonhost_fastq_from_files_r1"
+        "generate_nonhost_fastq_from_files_r1",
+        &config,
+        
     )?;
     let r1_input_stream = ReceiverStream::new(r1_rx);
     let r1_filtered = filter_fastq_to_bytes_stream(r1_input_stream, r1_headers).await;
@@ -7131,7 +7135,8 @@ pub async fn generate_nonhost_fastq_from_files(
             None,
             None,
             config.base_buffer_size * 4,
-            "generate_nonhost_fastq_from_files_r2"
+            "generate_nonhost_fastq_from_files_r2",
+            &config,
         )?;
         let r2_input_stream = ReceiverStream::new(r2_rx);
         let r2_filtered = filter_fastq_to_bytes_stream(r2_input_stream, r2_headers).await;
@@ -8416,7 +8421,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None,
         None,
         config.base_buffer_size,
-        "run - Read non-host R1/R2 as proper parsed Fastq records"
+        "run - Read non-host R1/R2 as proper parsed Fastq records",
+        &config
     ).map_err(|e| PipelineError::Other(e))?;
 
     // Wrap the stats task so it matches cleanup_tasks type
