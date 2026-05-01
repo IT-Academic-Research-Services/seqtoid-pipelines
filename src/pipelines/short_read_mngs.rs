@@ -7437,11 +7437,7 @@ async fn mmseqs_fastq_to_m8_file(
         } else {
             None
         },
-        db_load_mode: if backend == MmseqsBackend::Gpu {
-            Some("2".to_string())
-        } else {
-            None
-        },
+        db_load_mode: Some("2".to_string()),
         alignment_mode: Some("3".to_string()),    // preserve real pident semantics
         index_subset: None,
         format_output: None,
