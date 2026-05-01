@@ -355,8 +355,9 @@ async fn validate_input(
     let (val_streams, val_router_handle) = fanout_to_channels(
         val_rx_stream,
         2,
-        config.base_buffer_size,
         "validate_input",
+        &config,
+        StreamDataType::IlluminaFastq
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -505,8 +506,9 @@ async fn bowtie2_align_and_sort_stream(
     let (streams, router_handle) = fanout_to_channels(
         ReceiverStream::new(sorted_bam_stream),
         3,
-        config.base_buffer_size,
         "bt2_split",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -1063,8 +1065,9 @@ async fn fastp_qc(
     let (tee_count_streams, tee_count_router_handle) = fanout_to_channels(
         tee_count_input,
         2,
-        config.base_buffer_size,
         "fastp_count",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1537,8 +1540,9 @@ async fn minimap2_filter(
     let (bam_streams, bam_router_handle) = fanout_to_channels(
         bam_rx_stream,
         num_tees,
-        config.base_buffer_size,
         "minimap2_bam_split",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -2499,8 +2503,9 @@ pub async fn paf_to_m8(
     let (streams, router_handle) = fanout_to_channels(
         batched_stream,
         2,
-        config.base_buffer_size,
         "paf_to_m8_stream",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -3001,8 +3006,9 @@ pub async fn call_hits_m8(
     let (dedup_branches, dedup_router_handle) = fanout_to_channels(
         dedup_stream,
         2,
-        config.base_buffer_size,
         "call_hits_m8_dedup",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -3039,8 +3045,9 @@ pub async fn call_hits_m8(
     let (summary_branches, summary_router_handle) = fanout_to_channels(
         summary_stream,
         2,
-        config.base_buffer_size,
         "call_hits_m8_summary",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -4796,8 +4803,9 @@ pub async fn process_assembly(
     let (non_host_streams, non_host_router_handle) = fanout_to_channels(
         ReceiverStream::new(samtools_sort_out_stream),
         3,
-        config.base_buffer_size,
         "process_assembly_sam",
+        &config,                          // ← added
+        StreamDataType::JustBytes,        // ← correct (BAM bytes from samtools sort)
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -7671,8 +7679,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (kallisto_streams, kallisto_router_handle) = fanout_to_channels(
         qc_fastp_out_stream,
         2,
-        config.base_buffer_size * 10,
         "kallisto_split",
+        &config,
+        StreamDataType::JustBytes
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -8087,9 +8096,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_call_rxs, nt_call_router) = fanout_to_channels(
         nt_call_stream,                    // already the monitored stream from call_hits_m8
-        2,
-        config.base_buffer_size * 48,      // generous buffer for m8 lines
+        2, // generous buffer for m8 lines
         "nt_call",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
 
     cleanup_tasks.push(nt_call_router);    // router returns the correct JoinHandle type
@@ -8122,8 +8132,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nt_summary_rxs, nt_summary_router) = fanout_to_channels(
         nt_call_summary_stream,
         6,
-        config.base_buffer_size * 64,           // generous per-branch buffer
         "nt_call_summary",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
 
     cleanup_tasks.push(nt_summary_router);     // now the correct type
@@ -8307,8 +8318,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nr_call_rxs, nr_call_router) = fanout_to_channels(
         nr_call_stream,                    // already the monitored stream from call_hits_m8
         2,
-        config.base_buffer_size * 48,      // generous buffer for m8 lines
         "nr_call",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
 
     cleanup_tasks.push(nr_call_router);    // router returns the correct JoinHandle type
@@ -8327,8 +8339,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nr_summary_rxs, nr_summary_router) = fanout_to_channels(
         nr_call_summary_stream,
         6,
-        config.base_buffer_size * 64,           // generous per-branch buffer
         "nr_call_summary",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
 
     cleanup_tasks.push(nr_summary_router);     // now the correct type
@@ -8444,8 +8457,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (annotated_rxs, annotated_router) = fanout_to_channels(
         ReceiverStream::new(annotated_rx),
         2,
-        config.base_buffer_size * 64,
         "initial_annotated",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
 
     cleanup_tasks.push(annotated_router);
@@ -8457,8 +8471,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (unidentified_rxs, unidentified_router) = fanout_to_channels(
         ReceiverStream::new(unidentified_rx),
         2,
-        config.base_buffer_size * 64,
         "initial_unidentified",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
 
     cleanup_tasks.push(unidentified_router);
@@ -8799,8 +8814,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let (nt_m8_rxs, nt_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_m8_stream_out),
                 3,
-                config.base_buffer_size * 64,
                 "nt_m8",
+                &config,
+                StreamDataType::JustBytes
             ).await?;
             cleanup_tasks.push(nt_m8_router);
 
@@ -8812,8 +8828,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let (nt_hitsummary_rxs, nt_hitsummary_router) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_hit_summary_stream_out),
                 3,
-                config.base_buffer_size * 64,
                 "nt_hitsummary",
+                &config,
+                StreamDataType::JustBytes
             ).await?;
             cleanup_tasks.push(nt_hitsummary_router);
 
@@ -8866,8 +8883,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let (nr_m8_rxs, nr_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_m8_stream_out),
                 2,
-                config.base_buffer_size * 64,
                 "nr_m8",
+                &config,
+                StreamDataType::JustBytes
             ).await?;
             cleanup_tasks.push(nr_m8_router);
 
@@ -8878,8 +8896,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let (nr_hitsummary_rxs, nr_hitsummary_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_hit_summary_stream_out),
                 3,
-                config.base_buffer_size * 64,
                 "nr_hitsummary",
+                &config,
+                StreamDataType::JustBytes
             ).await?;
             cleanup_tasks.push(nr_hitsummary_router);
 
@@ -9110,8 +9129,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (taxid_mapped_rxs, taxid_mapped_router) = fanout_to_channels(
         ReceiverStream::new(taxid_mapped_rx),
         2,
-        config.base_buffer_size * 64,
         "taxid_mapped",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
     cleanup_tasks.push(taxid_mapped_router);
 
@@ -9187,8 +9207,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (initial_mapped_rxs, initial_mapped_router) = fanout_to_channels(
         ReceiverStream::new(initial_taxid_mapped_rx),
         3,
-        config.base_buffer_size * 64,
         "initial_taxid_mapped",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
     cleanup_tasks.push(initial_mapped_router);
 
@@ -9200,8 +9221,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (initial_combined_rxs, initial_combined_router) = fanout_to_channels(
         ReceiverStream::new(initial_taxid_combined_rx),
         2,
-        config.base_buffer_size * 64,
         "initial_taxid_combined",
+        &config,
+        StreamDataType::JustBytes
     ).await?;
     cleanup_tasks.push(initial_combined_router);
 

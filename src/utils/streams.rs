@@ -378,7 +378,7 @@ pub async fn stream_to_cmd(
         &config,
         "stream_to_cmd",
         data_type,
-        1.0,                    // 1.0 = normal, 1.5–2.0 for very hot paths later
+        1.8,                    // 1.0 = normal, 1.5–2.0 for very hot paths later
     );
 
     let batch_size_bytes = writer_capacity / 4;   // keep ~4:1 batching ratio
@@ -1928,9 +1928,18 @@ where
 pub async fn fanout_to_channels(
     mut upstream: ReceiverStream<ParseOutput>,
     n_branches: usize,
-    buffer_per_branch: usize,
     label: &str,
+    config: &RunConfig,           // ← added
+    data_type: StreamDataType,    // ← added
 ) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
+
+    let buffer_per_branch = crate::utils::system::compute_buffer_size(
+        config,
+        "fanout",                     // phase name
+        data_type,
+        1.45,                         // good hot-path boost for fanout (not too aggressive)
+    );
+
     let mut txs = Vec::with_capacity(n_branches);
     let mut rxs = Vec::with_capacity(n_branches);
 
@@ -1945,15 +1954,12 @@ pub async fn fanout_to_channels(
         let mut count = 0usize;
         while let Some(item) = upstream.next().await {
             count += 1;
-            // if count % 100_000 == 0 {
-            //     debug!("[fanout {}] forwarded {} items", label, count);
-            // }
             // Send to EVERY branch (never drop)
             let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
             let _ = futures::future::join_all(sends).await;
         }
         debug!("[fanout {}] finished — forwarded {} items total", label, count);
-        Ok(())   // ← this makes the JoinHandle return Result<(), anyhow::Error>
+        Ok(())
     });
 
     Ok((rxs, router))
