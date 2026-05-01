@@ -32,7 +32,7 @@ use crate::cli::args::Technology;
 use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, derive_sample_base_from_file1};
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
-                           compute_base_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
+                           compute_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
                            detect_simd_level};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-    let base_buffer_size = compute_base_buffer_size(input_size);
+
 
     let simd = detect_simd_level();
 
@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
         args,
         thread_pool,
         maximal_semaphore,
-        base_buffer_size,
+        base_buffer_size: 0,
         input_size,
         physical_cores,
         max_cores,
@@ -160,6 +160,19 @@ async fn main() -> Result<()> {
         alignment_backend: backend,
 
     });
+
+    let base_buffer_size = compute_buffer_size(
+        &run_config,
+        "global_default",
+        sdt,
+        1.0,
+    );
+
+    let run_config = Arc::new(RunConfig {
+        base_buffer_size,   // now correct
+        ..(*run_config).clone()   // copy everything else
+    });
+
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config).await,

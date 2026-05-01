@@ -190,6 +190,68 @@ pub fn compute_base_buffer_size(total_input_size_bytes: u64) -> usize {
     records_per_channel
 }
 
+/// Single source of truth for buffer sizes — fully dynamic.
+pub fn compute_buffer_size(
+    config: &RunConfig,
+    phase: &str,
+    data_type: StreamDataType,
+    multiplier: f64,
+) -> usize {
+    let input_gb = config.input_size as f64 / 1_000_000_000.0;
+    let avail_gib = config.available_ram as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    let mut records_per_channel = (input_gb * 100_000.0) as usize;
+    records_per_channel = records_per_channel.clamp(10_000, 1_000_000);
+
+    let record_size = match data_type {
+        StreamDataType::IlluminaFastq => 1_000,
+        StreamDataType::OntFastq => 10_000,
+        StreamDataType::JustBytes => 512,
+    };
+
+    let mut bytes = (records_per_channel * record_size) as f64;
+
+    // Hardware scaling
+    if avail_gib >= 1000.0 {
+        bytes *= 2.5;
+        bytes = bytes.min(128.0 * 1024.0 * 1024.0);
+    } else if avail_gib >= 500.0 {
+        bytes *= 2.0;
+        bytes = bytes.min(96.0 * 1024.0 * 1024.0);
+    } else if avail_gib >= 128.0 {
+        bytes *= 1.5;
+        bytes = bytes.min(64.0 * 1024.0 * 1024.0);
+    } else {
+        bytes = bytes.min(16.0 * 1024.0 * 1024.0);
+    }
+
+    // Phase hot-path boost
+    match phase {
+        "stream_to_cmd" | "write_to_fifo" | "fanout" | "deinterleave" => {
+            bytes *= 1.8;
+            bytes = bytes.min(128.0 * 1024.0 * 1024.0);
+        }
+        "parse_fastq" | "parse_bytes" => {
+            bytes *= 0.5;
+            bytes = bytes.max(4.0 * 1024.0 * 1024.0);
+        }
+        "batch_rayon" => {
+            bytes *= 2.0;
+            bytes = bytes.min(64.0 * 1024.0 * 1024.0);
+        }
+        _ => {}
+    }
+
+    let final_bytes = (bytes * multiplier)
+        .clamp(4.0 * 1024.0 * 1024.0, 128.0 * 1024.0 * 1024.0) as usize;
+
+    debug!(
+        "compute_buffer_size({}/{:?}) = {} MiB (input {:.1}GB, avail {:.1}GiB, mult {:.1})",
+        phase, data_type, final_bytes / (1024*1024), input_gb, avail_gib, multiplier
+    );
+
+    final_bytes
+}
 
 /// Searches for a directory for RAM temp files.
 /// Prefers /dev/shm (RAM disk) for linux, otherwise returns the standard temp dir.

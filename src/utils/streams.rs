@@ -373,12 +373,15 @@ pub async fn stream_to_cmd(
     } else {
         None
     };
+    
+    let writer_capacity = crate::utils::system::compute_buffer_size(
+        &config,
+        "stream_to_cmd",
+        data_type,
+        1.0,                    // 1.0 = normal, 1.5–2.0 for very hot paths later
+    );
 
-    let (batch_size_bytes, writer_capacity) = match data_type {
-        StreamDataType::JustBytes => (65_536, 65_536),
-        StreamDataType::IlluminaFastq => (8_388_608, 8_388_608),
-        StreamDataType::OntFastq => (1_048_576, 1_048_576),
-    };
+    let batch_size_bytes = writer_capacity / 4;   // keep ~4:1 batching ratio
 
     let cmd_tag_owned = cmd_tag.to_string();
     let cmd_tag_err_owned = cmd_tag.to_string();
@@ -412,7 +415,7 @@ pub async fn stream_to_cmd(
         while let Some(item) = stream.next().await {
             match &item {
                 ParseOutput::Bytes(bytes) => batch.extend_from_slice(bytes.as_ref()),
-                ParseOutput::Fastq(record) => {  // Direct match on inner enum
+                ParseOutput::Fastq(record) => {
                     if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
                         if let Some(d) = desc {
                             batch.extend_from_slice(format!("@{} {}\n", id, d).as_bytes());
@@ -441,17 +444,15 @@ pub async fn stream_to_cmd(
             if batch.len() >= batch_size_bytes {
                 if let Err(e) = writer.write_all(&batch).await {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        // Check status before ignoring (non-blocking)
                         let mut guard = child_clone.lock().await;
                         if let Ok(Some(status)) = guard.try_wait() {
                             if status.success() {
-                                debug!("Ignoring BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
-                                break; // Safe: No loss, child done
+                                debug!("Ignoring BrokenPipe in {} after successful exit", cmd_tag_owned);
+                                break;
                             } else {
                                 return Err(anyhow!("BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
                             }
                         } else {
-                            // Child not exited yet; treat as error (potential loss)
                             return Err(anyhow!("BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
                         }
                     } else {
@@ -464,40 +465,38 @@ pub async fn stream_to_cmd(
             }
         }
 
+        // final flush (same logic as before)
         if !batch.is_empty() {
             if let Err(e) = writer.write_all(&batch).await {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     let mut guard = child_clone.lock().await;
                     if let Ok(Some(status)) = guard.try_wait() {
-                        if status.success() {
-                            debug!("Ignoring final BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
-                        } else {
-                            return Err(anyhow!("Final BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                        if !status.success() {
+                            return Err(anyhow!("Final BrokenPipe with failed exit: {:?}", status));
                         }
                     } else {
-                        return Err(anyhow!("Final BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                        return Err(anyhow!("Final BrokenPipe before exit: {}", e));
                     }
                 } else {
-                    return Err(anyhow!("Final write error in {}: {}", cmd_tag_owned, e));
+                    return Err(anyhow!("Final write error: {}", e));
                 }
             } else {
                 writer.flush().await?;
-                total_written += batch.len();
             }
         }
 
         writer.flush().await?;
-        drop(writer); // Close stdin, signal EOF
+        drop(writer);
 
-        // Final check: Await child completion and verify success
         let mut guard = child_clone.lock().await;
         let status = guard.wait().await?;
         if !status.success() {
-            return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
+            return Err(anyhow!("Child {} failed: {:?}", cmd_tag_owned, status));
         }
         Ok(())
     });
 
+    // stderr_task stays exactly the same
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::with_capacity(1_048_576, stderr);
         let mut buffer = vec![0u8; 8192];
@@ -509,9 +508,7 @@ pub async fn stream_to_cmd(
                         let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
                         debug!("[{} stderr]: {}", cmd_tag_err_owned, stderr_chunk);
                     }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to read stderr: {}", e));
-                    }
+                    Err(e) => return Err(anyhow!("Failed to read stderr: {}", e)),
                 }
             }
         } else {
