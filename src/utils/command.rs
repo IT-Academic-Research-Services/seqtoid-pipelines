@@ -42,6 +42,7 @@ pub async fn version_check(
     version_column: usize,
     child_stream: ChildStream,
     version_file: Option<PathBuf>,
+    config: &RunConfig
 ) -> Result<f32> {
     let cmd_tag_owned = command_tag.to_string();
     debug!("Running command: {}", &cmd_tag_owned);
@@ -55,7 +56,7 @@ pub async fn version_check(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}. Is it installed? Error: {}.", cmd_tag_owned.clone(), e))?;
 
-    let lines = read_child_output_to_vec(&mut child, child_stream).await?;
+    let lines = read_child_output_to_vec(&mut child, child_stream, &config).await?;
 
     if let Some(file_path) = version_file {
         if let Some(parent) = file_path.parent() {
@@ -111,8 +112,8 @@ pub mod fastp {
     }
     pub struct FastpArgGenerator;
 
-    pub async fn fastp_presence_check() -> Result<f32> {
-        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn fastp_presence_check(config: &RunConfig) -> Result<f32> {
+        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -174,8 +175,8 @@ mod pigz {
 
     pub struct PigzArgGenerator;
 
-    pub async fn pigz_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn pigz_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -193,12 +194,12 @@ mod pigz {
 mod h5dump {
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{H5DUMP_TAG, PIGZ_TAG};
+    use crate::config::defs::{H5DUMP_TAG, RunConfig};
     use crate::utils::command::version_check;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
-    pub async fn h5dump_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None).await?;
+    pub async fn h5dump_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 }
@@ -227,8 +228,8 @@ pub mod minimap2 {
 
     pub struct Minimap2ArgGenerator;
 
-    pub async fn minimap2_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
-        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file).await?;
+    pub async fn minimap2_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
+        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
@@ -516,8 +517,8 @@ pub mod samtools {
 
     pub struct SamtoolsArgGenerator;
 
-    pub async fn samtools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn samtools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -618,8 +619,8 @@ pub mod bcftools {
 
     pub struct BcftoolsArgGenerator;
 
-    pub async fn bcftools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn bcftools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -689,8 +690,8 @@ pub mod kraken2 {
 
     pub struct Kraken2ArgGenerator;
 
-    pub async fn kraken2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None).await?;
+    pub async fn kraken2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -752,8 +753,8 @@ pub mod ivar {
 
     pub struct IvarArgGenerator;
 
-    pub async fn ivar_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None).await?;
+    pub async fn ivar_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -793,13 +794,13 @@ pub mod ivar {
 pub mod muscle {
     use anyhow::anyhow;
     use tokio::process::Command;
-    use crate::config::defs::{IVAR_TAG, MUSCLE_TAG};
+    use crate::config::defs::{RunConfig,  MUSCLE_TAG};
     use crate::utils::command::version_check;
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct MuscleArgGenerator;
-    pub async fn muscle_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn muscle_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 }
@@ -812,8 +813,8 @@ pub mod mafft {
     use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
     pub struct MafftArgGenerator;
-    pub async fn mafft_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None).await?;
+    pub async fn mafft_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None, &config).await?;
         Ok(version)
     }
 
@@ -847,8 +848,8 @@ pub mod quast {
         pub assembly_fasta: String,
     }
 
-    pub async fn quast_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn quast_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -896,8 +897,8 @@ pub mod nucmer {
         pub assembly_fasta: PathBuf,
     }
 
-    pub async fn nucmer_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn nucmer_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -959,8 +960,8 @@ pub mod seqkit {
 
     pub struct SeqkitArgGenerator;
 
-    pub async fn seqkit_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None).await?;
+    pub async fn seqkit_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1021,8 +1022,8 @@ pub mod bowtie2 {
 
     pub struct Bowtie2ArgGenerator;
 
-    pub async fn bowtie2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None).await?;
+    pub async fn bowtie2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1227,8 +1228,8 @@ pub mod hisat2 {
 
     pub struct Hisat2ArgGenerator;
 
-    pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout, None).await?;
+    pub async fn hisat2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1407,8 +1408,8 @@ pub mod kallisto {
 
     pub struct KallistoArgGenerator;
 
-    pub async fn kallisto_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout, None).await?;
+    pub async fn kallisto_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1488,8 +1489,8 @@ pub mod star {
 
     pub struct StarArgGenerator;
 
-    pub async fn star_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, None).await?;
+    pub async fn star_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1652,8 +1653,8 @@ pub mod czid_dedup {
 
     pub struct CzidDedupArgGenerator;
 
-    pub async fn czid_dedup_presence_check() -> Result<f32> {
-        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn czid_dedup_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1732,8 +1733,8 @@ pub mod diamond {
 
     pub struct DiamondArgGenerator;
 
-    pub async fn diamond_presence_check(version_file: Option<PathBuf>) -> anyhow::Result<f32> {
-        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file).await?;
+    pub async fn diamond_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> anyhow::Result<f32> {
+        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
@@ -1932,8 +1933,8 @@ pub mod spades {
 
     pub struct SpadesArgGenerator;
 
-    pub async fn spades_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
-        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file).await?;
+    pub async fn spades_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
+        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
@@ -2014,8 +2015,8 @@ pub mod makeblastdb {
 
     pub struct MakeblastdbArgGenerator;
 
-    pub async fn makeblastdb_presence_check() -> Result<f32> {
-        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn makeblastdb_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -2068,8 +2069,8 @@ pub mod blastn {
 
     pub struct BlastnArgGenerator;
 
-    pub async fn blastn_presence_check() -> Result<f32> {
-        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn blastn_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -2135,8 +2136,8 @@ pub mod blastx {
 
     pub struct BlastxArgGenerator;
 
-    pub async fn blastx_presence_check() -> Result<f32> {
-        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn blastx_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -2203,10 +2204,10 @@ pub mod sort {
 
     pub struct SortArgGenerator;
 
-    pub async fn sort_presence_check() -> Result<f32> {
+    pub async fn sort_presence_check(config: &RunConfig)-> Result<f32> {
         // GNU sort doesn't have a clean --version that always works the same way,
         // but "sort --version" is reliable on all modern coreutils.
-        let version = version_check("sort", vec!["--version"], 0, 1, ChildStream::Stdout, None).await?;
+        let version = version_check("sort", vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -2492,7 +2493,7 @@ pub mod mmseqs {
         push_option_fields(args, &config.option_fields);
     }
 
-    pub async fn mmseqs_presence_check() -> Result<f32> {
+    pub async fn mmseqs_presence_check(config: &RunConfig)-> Result<f32> {
         let output = Command::new(MMSEQS_TAG)
             .arg("version")
             .output()
@@ -3038,7 +3039,7 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
     generator.generate_args(run_config, extra)
 }
 
-pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
+pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunConfig) -> Result<()> {
     let assembly_dir = out_dir.join("assembly");
     fs::create_dir_all(&assembly_dir).await
         .map_err(|e| anyhow!("Failed to create assembly directory: {}", e))?;
@@ -3059,30 +3060,30 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
             };
 
             let version = match tool {
-                FASTP_TAG => fastp::fastp_presence_check().await,
-                H5DUMP_TAG => h5dump::h5dump_presence_check().await,
-                MINIMAP2_TAG => minimap2::minimap2_presence_check(version_file).await,
-                SAMTOOLS_TAG => samtools::samtools_presence_check().await,
-                KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
-                BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
-                IVAR_TAG => ivar::ivar_presence_check().await,
-                MUSCLE_TAG => muscle::muscle_presence_check().await,
-                MAFFT_TAG => mafft::mafft_presence_check().await,
-                QUAST_TAG => quast::quast_presence_check().await,
-                NUCMER_TAG => nucmer::nucmer_presence_check().await,
-                SEQKIT_TAG => seqkit::seqkit_presence_check().await,
-                BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
-                HISAT2_TAG => hisat2::hisat2_presence_check().await,
-                KALLISTO_TAG => kallisto::kallisto_presence_check().await,
-                STAR_TAG => star::star_presence_check().await,
-                CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
-                DIAMOND_TAG => diamond::diamond_presence_check(version_file).await,
-                SPADES_TAG => spades::spades_presence_check(version_file).await,
-                BLASTN_TAG => blastn::blastn_presence_check().await,
-                BLASTX_TAG => blastx::blastx_presence_check().await,
-                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
-                SORT_TAG => sort::sort_presence_check().await,
-                MMSEQS_TAG => mmseqs::mmseqs_presence_check().await,
+                FASTP_TAG => fastp::fastp_presence_check(&config).await,
+                H5DUMP_TAG => h5dump::h5dump_presence_check(&config).await,
+                MINIMAP2_TAG => minimap2::minimap2_presence_check(&config, version_file).await,
+                SAMTOOLS_TAG => samtools::samtools_presence_check(&config).await,
+                KRAKEN2_TAG => kraken2::kraken2_presence_check(&config).await,
+                BCFTOOLS_TAG => bcftools::bcftools_presence_check(&config).await,
+                IVAR_TAG => ivar::ivar_presence_check(&config).await,
+                MUSCLE_TAG => muscle::muscle_presence_check(&config).await,
+                MAFFT_TAG => mafft::mafft_presence_check(&config).await,
+                QUAST_TAG => quast::quast_presence_check(&config).await,
+                NUCMER_TAG => nucmer::nucmer_presence_check(&config).await,
+                SEQKIT_TAG => seqkit::seqkit_presence_check(&config).await,
+                BOWTIE2_TAG => bowtie2::bowtie2_presence_check(&config).await,
+                HISAT2_TAG => hisat2::hisat2_presence_check(&config).await,
+                KALLISTO_TAG => kallisto::kallisto_presence_check(&config).await,
+                STAR_TAG => star::star_presence_check(&config).await,
+                CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check(&config).await,
+                DIAMOND_TAG => diamond::diamond_presence_check(&config, version_file).await,
+                SPADES_TAG => spades::spades_presence_check(&config, version_file).await,
+                BLASTN_TAG => blastn::blastn_presence_check(&config).await,
+                BLASTX_TAG => blastx::blastx_presence_check(&config).await,
+                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check(&config).await,
+                SORT_TAG => sort::sort_presence_check(&config).await,
+                MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

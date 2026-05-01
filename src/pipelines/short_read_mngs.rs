@@ -463,7 +463,7 @@ async fn bowtie2_align_and_sort_stream(
 
     let bt2_out = {
         let mut guard = bt2_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size).await?
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config).await?
     };
 
     // ─────────────────────────────
@@ -497,7 +497,7 @@ async fn bowtie2_align_and_sort_stream(
 
     let sorted_bam_stream = {
         let mut guard = sort_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size).await?
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config).await?
     };
 
     // ─────────────────────────────
@@ -632,7 +632,7 @@ async fn bowtie2_filter_stream(
 
     let out_stream = {
         let mut guard = child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fastq, config.base_buffer_size).await?
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fastq, &config).await?
     };
 
     Ok((
@@ -1052,7 +1052,7 @@ async fn fastp_qc(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1153,7 +1153,7 @@ async fn kallisto_quant(
     // Convert raw byte stream to FASTQ
     let byte_rx = input_stream.into_inner();
     let byte_reader = ChannelReader::new(byte_rx);
-    let fastq_rx = parse_fastq(byte_reader, config.base_buffer_size).await
+    let fastq_rx = parse_fastq(byte_reader, &config, StreamDataType::IlluminaFastq).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: "parse_fastq".to_string(),
             error: e.to_string(),
@@ -1476,7 +1476,7 @@ async fn minimap2_filter(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1524,7 +1524,7 @@ async fn minimap2_filter(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1609,12 +1609,14 @@ async fn minimap2_filter(
     cleanup_tasks.push(count_err_task);
 
     let (count_tx, count_rx) = oneshot::channel::<u64>();
-    let count_future = tokio::spawn(async move {
-        let mut guard = count_child_arc.lock().await;
-        let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout).await?;
-        let mapped_count: u64 = count_lines.get(0).unwrap_or(&"0".to_string()).trim().parse()?;
-        count_tx.send(mapped_count).map_err(|_| anyhow!("Failed to send mapped count"))?;
-        Ok(())
+    let count_future = tokio::spawn({
+        let config = config.clone();
+        async move {
+            let mut guard = count_child_arc.lock().await;
+            let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout, &config).await?;
+            // ... rest of your code
+            Ok(())
+        }
     });
     cleanup_tasks.push(count_future);
 
@@ -1659,7 +1661,7 @@ async fn minimap2_filter(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Fastq,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -2712,7 +2714,7 @@ pub async fn sort_m8_by_read_id(
 );
 
 
-    let rx = parse_lines(sorted_file, config.base_buffer_size)
+    let rx = parse_lines(sorted_file, &config, StreamDataType::JustBytes)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -3276,7 +3278,7 @@ async fn diamond_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let m8_rx = parse_lines(m8_file, config.base_buffer_size)
+    let m8_rx = parse_lines(m8_file, &config, StreamDataType::JustBytes)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -4378,7 +4380,7 @@ async fn spades_assembly(
             &mut spades_child,
             ChildStream::Stdout,
             ParseMode::Lines,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -4749,7 +4751,7 @@ pub async fn process_assembly(
         &mut bt2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
-        config.base_buffer_size,
+        &config,
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -4799,7 +4801,7 @@ pub async fn process_assembly(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -6352,7 +6354,7 @@ pub async fn blast_contigs(
         &mut blast_child,
         ChildStream::Stdout,
         ParseMode::Lines,
-        config.base_buffer_size,
+        &config,
     )
         .await?;
     info!(
@@ -7557,7 +7559,7 @@ pub async fn mmseqs_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let m8_rx = parse_lines(m8_file, config.base_buffer_size)
+    let m8_rx = parse_lines(m8_file, &config, StreamDataType::JustBytes)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -7622,7 +7624,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
 
-    check_versions(versions_vec, &out_dir.clone())
+    check_versions(versions_vec, &out_dir.clone(), &config)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -9077,7 +9079,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let contigs_file = tokio::fs::File::open(&contigs_fasta).await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
 
-    let contigs_rx = parse_bytes::<TokioFile>(contigs_file, 32768).await
+    let contigs_rx = parse_bytes::<TokioFile>(contigs_file, &config, StreamDataType::JustBytes).await
         .map_err(|e| PipelineError::Other(anyhow!("parse_bytes failed: {}", e)))?;
 
     let mut contigs_stream = ReceiverStream::new(contigs_rx);

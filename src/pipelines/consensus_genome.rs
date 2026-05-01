@@ -159,7 +159,7 @@ async fn validate_input(
             &mut guard, // Pass locked Child
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -237,7 +237,7 @@ async fn align_to_host(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -285,7 +285,7 @@ async fn align_to_host(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -327,7 +327,7 @@ async fn align_to_host(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -435,7 +435,7 @@ async fn align_to_host(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -542,7 +542,7 @@ async fn process_ercc(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -671,7 +671,7 @@ async fn process_ercc(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -713,7 +713,7 @@ async fn process_ercc(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Lines,
-            config.base_buffer_size / 2,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -882,7 +882,7 @@ async fn filter_with_kraken(
     let kraken2_file = tokio::fs::File::open(&kraken2_pipe_path)
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to open named pipe: {}", e)))?;
-    let parse_rx = parse_fastq(kraken2_file, config.base_buffer_size)
+    let parse_rx = parse_fastq(kraken2_file, &config, StreamDataType::IlluminaFastq)
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to parse FASTQ from named pipe: {}", e)))?;
 
@@ -997,7 +997,7 @@ async fn filter_with_kraken(
         let mut guard = pigz_child.lock().await;
         parse_child_output(
             &mut guard,
-            ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size)
+            ChildStream::Stdout, ParseMode::Bytes, &config)
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: PIGZ_TAG.to_string(),
@@ -1097,7 +1097,7 @@ async fn align_to_target(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1143,7 +1143,7 @@ async fn align_to_target(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1217,7 +1217,7 @@ async fn align_to_target(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1333,7 +1333,7 @@ async fn generate_consensus(
 
     let trimmed_bam_stream = {
         let mut guard = trim_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, config.base_buffer_size)
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config)
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: SAMTOOLS_TAG.to_string(),
@@ -1368,7 +1368,7 @@ async fn generate_consensus(
 
     let samtools_consensus_out_stream = {
         let mut guard = samtools_consensus_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fasta, config.base_buffer_size)
+        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fasta, &config)
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: SAMTOOLS_TAG.to_string(),
@@ -1466,7 +1466,7 @@ async fn call_variants(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1515,7 +1515,7 @@ async fn call_variants(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         )
             .await
             .map_err(|e| PipelineError::ToolExecution {
@@ -1572,7 +1572,7 @@ async fn realign_consensus_to_ref(
 ) -> Result<(Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let reference_file = TokioFile::open(&target_ref_fasta_path).await
         .map_err(|e| PipelineError::Other(e.into()))?;
-    let reference_rx = parse_bytes(reference_file, config.base_buffer_size).await
+    let reference_rx = parse_bytes(reference_file, &config, StreamDataType::JustBytes).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
     let realign_streams = vec![consensus_realign_stream, reference_rx];
@@ -1615,7 +1615,7 @@ async fn realign_consensus_to_ref(
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Bytes,
-            config.base_buffer_size,
+            &config,
         ).await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: MAFFT_TAG.to_string(),
@@ -1674,7 +1674,7 @@ async fn calculate_statistics(
             local_cleanup_tasks.push(stats_samtools_err_task_stats);
             {
                 let mut guard = stats_samtools_child_stats.lock().await;
-                parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Lines, config.base_buffer_size / 2).await?
+                parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Lines, &config).await?
             }
         }
         None => return Err(anyhow!("consensus_bam_stats_stream is not available")),
@@ -1713,7 +1713,7 @@ async fn calculate_statistics(
                     &mut guard,
                     ChildStream::Stdout,
                     ParseMode::Lines,
-                    config.base_buffer_size / 2,
+                    &config,
                 ).await?
             }
         }
@@ -1783,7 +1783,7 @@ async fn calculate_statistics(
                 &mut guard,
                 ChildStream::Stdout,
                 ParseMode::Lines,
-                config.base_buffer_size,
+                &config,
             ).await?
         };
 
@@ -1929,7 +1929,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         MAFFT_TAG,
         SEQKIT_TAG,
         QUAST_TAG,
-    ], &out_dir.clone())
+    ], &out_dir.clone(), &config)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -2035,7 +2035,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             &mut guard,
             ChildStream::Stdout,
             ParseMode::Lines,
-            config.base_buffer_size / 2,
+            &config,
         )
             .await?
     };
