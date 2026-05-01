@@ -378,7 +378,8 @@ async fn validate_input(
     let val_file_write_task = write_byte_stream_to_file(
         &validated_interleaved_file_path,
         val_file_stream,
-        Some(config.base_buffer_size),
+        config.clone(),
+        StreamDataType::IlluminaFastq,
         "validate_input",
     )
         .await
@@ -532,7 +533,8 @@ async fn bowtie2_align_and_sort_stream(
             write_byte_stream_to_file(
                 &output_bam_path,
                 bam_write_stream,
-                Some(config.base_buffer_size),
+                config.clone(),
+                StreamDataType::JustBytes,
                 "bt2_bam_write",
             ).await?;
             Ok(())
@@ -1561,7 +1563,8 @@ async fn minimap2_filter(
         let bam_write_task = write_byte_stream_to_file(
             &bam_path,
             stream,
-            Some(config.base_buffer_size),
+            config.clone(),
+            StreamDataType::JustBytes,
             "mm2_filter_bam"
         )
             .await
@@ -2524,7 +2527,8 @@ pub async fn paf_to_m8(
     let write_task = write_byte_stream_to_file(
         &m8_path,
         file_stream,
-        Some(config.base_buffer_size),
+        config.clone(),
+        StreamDataType::JustBytes,
         "paf_to_m8_m8",
     )
         .await
@@ -2624,7 +2628,8 @@ pub async fn sort_m8_by_read_id(
     let write_task = write_byte_stream_to_file(
         &unsorted_path,
         input_stream,
-        Some(config.base_buffer_size * 4),
+        config.clone(),
+        StreamDataType::JustBytes,
         &tag,
     )
         .await
@@ -3034,7 +3039,8 @@ pub async fn call_hits_m8(
             "_",
         )),
         dedup_file_stream,
-        Some(config.base_buffer_size),
+        config.clone(),
+        StreamDataType::JustBytes,
         "call_hits_m8_dedup",
     )
         .await
@@ -3073,7 +3079,8 @@ pub async fn call_hits_m8(
             "_",
         )),
         summary_file_stream,
-        Some(config.base_buffer_size),
+        config.clone(),
+        StreamDataType::JustBytes,
         "call_hits_m8_summary",
     )
         .await
@@ -3153,7 +3160,8 @@ async fn run_diamond_single_file(
     let write_task = write_byte_stream_to_file(
         &m8_path,
         ReceiverStream::new(m8_rx),
-        Some(config.base_buffer_size),
+        config.clone(),
+        StreamDataType::JustBytes,
         &format!("diamond_{}", label),
     ).await?;
 
@@ -4832,7 +4840,8 @@ pub async fn process_assembly(
     let write_sam_task = write_byte_stream_to_file(
         &sam_path,
         bam_for_file,
-        Some(config.base_buffer_size),
+        config.clone(),
+        StreamDataType::JustBytes,
         "process_assembly",
     )
         .await?;
@@ -7105,7 +7114,7 @@ pub async fn generate_nonhost_fastq_from_files(
     )?;
     let r1_input_stream = ReceiverStream::new(r1_rx);
     let r1_filtered = filter_fastq_to_bytes_stream(r1_input_stream, r1_headers).await;
-    let write_r1 = write_byte_stream_to_file(&out_r1, r1_filtered, Some(config.base_buffer_size), "nonhost_r1").await?;
+    let write_r1 = write_byte_stream_to_file(&out_r1, r1_filtered, config.clone(), StreamDataType::IlluminaFastq, "nonhost_r1").await?;
 
     // Stream and filter R2 if present
     let write_r2 = if let (Some(r2_path), Some(r2_headers)) = (original_r2_path, r2_headers) {
@@ -7122,7 +7131,7 @@ pub async fn generate_nonhost_fastq_from_files(
         )?;
         let r2_input_stream = ReceiverStream::new(r2_rx);
         let r2_filtered = filter_fastq_to_bytes_stream(r2_input_stream, r2_headers).await;
-        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_filtered, Some(config.base_buffer_size), "nonhost_r2").await?)
+        Some(write_byte_stream_to_file(&out_r2.clone().unwrap(), r2_filtered,config.clone(), StreamDataType::IlluminaFastq, "nonhost_r2").await?)
     } else {
         None
     };

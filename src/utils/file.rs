@@ -16,11 +16,12 @@ use crate::utils::streams::ParseOutput;
 use tokio::task::JoinHandle;
 use tokio::fs::File as TokioFile;
 use tokio::process::Command;
+use tokio::io::AsyncSeekExt;
 use tokio_stream::StreamExt;
 use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
 use crate::utils::fastx::{SequenceRecord, r1r2_base};
-use crate::config::defs::{RunConfig, PipelineError};
+use crate::config::defs::{RunConfig, PipelineError, StreamDataType};
 use sysinfo::{Disks, DiskUsage};
 use nix::sys::statvfs;
 use regex::Regex;
@@ -629,92 +630,63 @@ pub async fn validate_file_inputs(
 /// # Returns
 /// A `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
 pub async fn write_byte_stream_to_file(
-    output_path: &PathBuf,
-    mut input_stream: ReceiverStream<ParseOutput>,
-    buffer_size: Option<usize>,
-    tag: &str,
-) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
-    let output_path_clone = output_path.clone();
-    let tag = tag.to_string();
+    dest_path: &PathBuf,
+    stream: ReceiverStream<ParseOutput>,
+    config: Arc<RunConfig>,
+    data_type: StreamDataType,
+    label: &str,                    // still &str here
+) -> Result<JoinHandle<Result<()>>> {
 
-    let task = tokio::spawn(async move {
-        debug!("[{}] writer: START {}", tag, output_path_clone.display());
+    let dest_path_clone = dest_path.clone();
+    let label = label.to_string();  // ← clone to owned String
 
-        let file = TokioFile::create(&output_path_clone)
+    let write_handle = tokio::spawn(async move {
+        let file = TokioFile::create(&dest_path_clone)
             .await
-            .map_err(|e| anyhow!("Failed to create output file at {}: {}",
-                               output_path_clone.display(), e))?;
+            .map_err(|e| anyhow!("Cannot create file {}: {}", dest_path_clone.display(), e))?;
 
-        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
-        let mut stream = input_stream;
+        let effective_buffer = crate::utils::system::compute_buffer_size(
+            &config,
+            "write_byte_stream_to_file",
+            data_type,
+            1.8,
+        );
 
-        let mut total_bytes = 0u64;
-        let mut item_count = 0usize;
-        let mut first = true;
+        let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
+
+        let mut stream = stream;
+        let mut batch: Vec<u8> = Vec::with_capacity(effective_buffer / 4);
 
         while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(bytes) => {
-                    if first {
-                        debug!("[{}] writer: FIRST CHUNK ({} bytes)", tag, bytes.len());
-                        first = false;
-                    }
+            let bytes = item
+                .to_bytes()
+                .map_err(|e| anyhow!("Failed to convert to bytes: {}", e))?;
 
-                    writer.write_all(&bytes)
-                        .await
-                        .map_err(|e| anyhow!("Failed to write to {}: {}",
-                                           output_path_clone.display(), e))?;
+            batch.extend_from_slice(&bytes);
 
-                    total_bytes += bytes.len() as u64;
-                    item_count += 1;
-
-                    // if item_count % 50_000 == 0 {
-                    //     debug!(
-                    //         "[{}] writer: progress {} items, {} bytes",
-                    //         tag,
-                    //         item_count,
-                    //         total_bytes
-                    //     );
-                    // }
-                }
-                _ => {
-                    warn!(
-                        "[{}] writer: Skipping non-Bytes item for {}",
-                        tag,
-                        output_path_clone.display()
-                    );
-                }
+            if batch.len() >= effective_buffer / 4 {
+                writer.write_all(&batch).await
+                    .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+                batch.clear();
             }
         }
 
-        debug!("[{}] writer: STREAM CLOSED after {} items", tag, item_count);
-
-        writer.flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush {}: {}",
-                               output_path_clone.display(), e))?;
-
-        writer.shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown {}: {}",
-                               output_path_clone.display(), e))?;
-
-        if total_bytes == 0 {
-            warn!("[{}] writer: No bytes written to {}", tag, output_path_clone.display());
+        if !batch.is_empty() {
+            writer.write_all(&batch).await
+                .map_err(|e| anyhow!("Final write error to {}: {}", dest_path_clone.display(), e))?;
         }
 
-        debug!(
-            "[{}] writer: DONE {} bytes ({} items)",
-            tag,
-            total_bytes,
-            item_count
-        );
+        writer.flush().await
+            .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
+
+        let final_size = writer.stream_position().await.unwrap_or(0);
+        info!("{} written to {} ({} bytes, buffer {} MiB)",
+              label, dest_path_clone.display(), final_size, effective_buffer / (1024*1024));
 
         Ok(())
     });
 
-    Ok(task)
+    Ok(write_handle)
 }
 
 pub async fn file_size(path: &PathBuf) -> Result<u64> {
