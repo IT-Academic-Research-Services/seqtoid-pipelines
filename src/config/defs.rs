@@ -104,7 +104,6 @@ lazy_static! {
         m.insert("fastp", 32);        // I/O-bound
         m.insert("pigz", 16);         // Compression scales poorly >16
         m.insert("kraken2", 64);      // Memory/I/O heavy
-        m.insert("mmseqs", 192);
         m
     };
 }
@@ -308,7 +307,7 @@ impl RunConfig {
         };
 
         let prefer_physical = match tag {
-            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG => false, // allow modest SMT
+            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG | MMSEQS_TAG => false, // allow modest SMT
             BOWTIE2_TAG | HISAT2_TAG | SPADES_TAG | FASTP_TAG | PIGZ_TAG => true,      // physical only
             _ => false,  // default allow
         };
