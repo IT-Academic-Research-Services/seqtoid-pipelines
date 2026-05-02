@@ -1977,36 +1977,52 @@ mod tests {
 
 
     // Helper function to create a RunConfig for tests
+    // Helper function to create a RunConfig for tests
     fn create_test_run_config() -> Arc<RunConfig> {
         let args = Arguments {
-            threads: 8, // Laptop
+            threads: 8,
             ..Default::default()
         };
 
         let (total_ram, available_ram) = detect_ram()
             .unwrap_or((16u64 << 30, 8u64 << 30));
+
         let rng = generate_rng(Some(42));
 
-        Arc::new(RunConfig {
+        let mut run_config = RunConfig {
             cwd: PathBuf::from("."),
             ram_temp_dir: std::env::temp_dir(),
             out_dir: PathBuf::from("test"),
             args,
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
-            base_buffer_size: 5_000_000,
+            base_buffer_size: 0,                    // temporary placeholder
             input_size: 100 + 1_048_576,
             physical_cores: 4,
             max_cores: 8,
-            available_ram: available_ram,
-            rng: rng,
+            available_ram,
+            rng,
             log_level: LevelFilter::Debug,
             base_backpressure_pause: 1000,
             simd: SimdLevel::Scalar,
             gpu_info: GpuDetection { count: 0, gpus: vec![] },
             has_gpu: false,
             alignment_backend: NRAlignmentBackend::Diamond,
-        })
+        };
+
+        // Compute proper buffer size exactly like main.rs
+        let sdt = StreamDataType::IlluminaFastq; // default for tests
+
+        let base_buffer_size = crate::utils::system::compute_buffer_size(
+            &run_config,
+            "test_global_default",
+            sdt,
+            1.0,
+        );
+
+        run_config.base_buffer_size = base_buffer_size;
+
+        Arc::new(run_config)
     }
 
     #[tokio::test]
@@ -2694,10 +2710,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_child_output_fastq() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("echo");
         cmd.arg("@read1\nATCG\n+\nIIII\n@read2\nGCTA\n+\nHHHH\n");
         let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
+        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Fastq, &config).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut records = Vec::new();
         while let Some(ParseOutput::Fastq(record)) = stream.next().await {
@@ -2713,10 +2730,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_child_output_bytes() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("echo");
         cmd.arg("test data");
         let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, 100).await?;
+        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, &config).await?;
         let mut stream = ReceiverStream::new(rx);
         while let Some(ParseOutput::Bytes(chunk)) = stream.next().await {
             assert!(String::from_utf8_lossy(&*chunk).contains("test data"));
@@ -2727,6 +2745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_file_fastq() -> Result<()> {
+        let config = create_test_run_config();
         let _ = fs::remove_file("stream_to_file_test_illumina.fq");
         let num_records = 2;
         let mut records = fastx_generator(num_records, 150, 30.0, 8.0).map(ParseOutput::Fastq);
@@ -2751,7 +2770,7 @@ mod tests {
         assert!(output_path.exists(), "Output file was not created");
 
         let file = File::open(&output_path).await?;
-        let rx = parse_fastq(file, 1024).await?;
+        let rx = parse_fastq(file, &config, StreamDataType::IlluminaFastq).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut parsed_records = Vec::new();
 
@@ -2775,6 +2794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_file_no_records() -> Result<()> {
+        let config = create_test_run_config();
         let _ = fs::remove_file("stream_to_file_norecord_test.fq");
         let (tx, rx) = mpsc::channel(1024);
         let mut records = fastx_generator(0, 10, 35.0, 3.0).map(ParseOutput::Fastq);
@@ -2801,7 +2821,7 @@ mod tests {
         );
 
         let file = File::open(&output_path).await?;
-        let rx = parse_fastq(file, 1024).await?;
+        let rx = parse_fastq(file, &config, StreamDataType::IlluminaFastq).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut parsed_records = Vec::new();
 
@@ -2824,10 +2844,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_child_output_to_vec() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("echo");
         cmd.arg("line1\nline2\n\nline3");
         let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout, &config).await?;
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "line1");
         assert_eq!(lines[1], "line2");
@@ -2837,10 +2858,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_child_output_to_vec_stderr() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("echo error >&2");
         let mut child = cmd.stderr(std::process::Stdio::piped()).spawn()?;
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr, &config).await?;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "error");
         Ok(())
