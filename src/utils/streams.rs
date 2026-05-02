@@ -1999,7 +1999,7 @@ mod tests {
             base_buffer_size: 0,                    // temporary placeholder
             input_size: 100 + 1_048_576,
             physical_cores: 4,
-            max_cores: 8,
+            max_cores: 32,
             available_ram,
             rng,
             log_level: LevelFilter::Debug,
