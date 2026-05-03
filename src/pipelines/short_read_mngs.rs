@@ -7431,7 +7431,7 @@ async fn mmseqs_fastq_to_m8_file(
             None
         },
         search_type: Some("3".to_string()),       // translated search
-        max_seqs: Some("500".to_string()),
+        max_seqs: Some("1000".to_string()),
         prefilter_mode: if backend == MmseqsBackend::Gpu {
             Some("1".to_string())
         } else {
