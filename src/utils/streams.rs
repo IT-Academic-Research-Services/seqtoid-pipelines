@@ -2053,7 +2053,8 @@ mod tests {
     use tokio::fs::metadata;
     use std::os::unix::fs::FileTypeExt;
     use crate::utils::fastx::SequenceRecord;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::duplex;
 
 
     // Helper function to create a RunConfig for tests
@@ -2103,6 +2104,245 @@ mod tests {
         run_config.base_buffer_size = base_buffer_size;
 
         Arc::new(run_config)
+    }
+
+
+    #[tokio::test]
+    async fn test_to_bytes_formats_fastq_and_fasta() -> Result<()> {
+        let fastq = SequenceRecord::Fastq {
+            id: "read1".to_string(),
+            desc: Some("mate 1".to_string()),
+            seq: Arc::new(b"ATCG".to_vec()),
+            qual: Arc::new(b"IIII".to_vec()),
+        };
+        let fasta = SequenceRecord::Fasta {
+            id: "contig1".to_string(),
+            desc: Some("assembled contig".to_string()),
+            seq: Arc::new(b"GATTACA".to_vec()),
+        };
+
+        assert_eq!(fastq.to_bytes()?.as_ref(), b"@read1 mate 1\nATCG\n+\nIIII\n");
+        assert_eq!(fasta.to_bytes()?.as_ref(), b">contig1 assembled contig\nGATTACA\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_fasta_multiline_and_description() -> Result<()> {
+        let config = create_test_run_config();
+        let (mut writer, reader) = duplex(64 * 1024);
+        let input = b">seq1 first record\nACGT\nTGCA\n>seq2\nNNNN\n";
+
+        let write_task = tokio::spawn(async move {
+            writer.write_all(input).await?;
+            writer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let rx = parse_fasta(reader, &config, StreamDataType::JustBytes).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut records = Vec::new();
+        while let Some(item) = stream.next().await {
+            records.push(item);
+        }
+
+        write_task.await??;
+        assert_eq!(records.len(), 2);
+
+        match &records[0] {
+            ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
+                assert_eq!(id, "seq1");
+                assert_eq!(desc.as_deref(), Some("first record"));
+                assert_eq!(seq.as_ref().as_slice(), b"ACGTTGCA");
+            }
+            other => panic!("Expected first FASTA record, got {:?}", other),
+        }
+
+        match &records[1] {
+            ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
+                assert_eq!(id, "seq2");
+                assert_eq!(desc, &None);
+                assert_eq!(seq.as_ref().as_slice(), b"NNNN");
+            }
+            other => panic!("Expected second FASTA record, got {:?}", other),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_skips_blanks_and_trims_endings() -> Result<()> {
+        let config = create_test_run_config();
+        let (mut writer, reader) = duplex(64 * 1024);
+        let input = b"line1\n\nline2\r\nline3\n";
+
+        let write_task = tokio::spawn(async move {
+            writer.write_all(input).await?;
+            writer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let rx = parse_lines(reader, &config, StreamDataType::JustBytes).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut lines = Vec::new();
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            lines.push(String::from_utf8(bytes.to_vec())?);
+        }
+
+        write_task.await??;
+        assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bytes_to_lines_reassembles_chunk_boundaries() -> Result<()> {
+        let (tx, rx) = mpsc::channel(8);
+        let (mut out_rx, task) = bytes_to_lines(rx, 8).await?;
+
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"abc\nx"))).await?;
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"yz\n\nlast"))).await?;
+        drop(tx);
+
+        let mut got = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            match item {
+                ParseOutput::Bytes(bytes) => got.push(String::from_utf8(bytes.to_vec())?),
+                other => panic!("Expected bytes, got {:?}", other),
+            }
+        }
+
+        task.await??;
+        assert_eq!(got, vec!["abc\n", "xyz\n", "\n", "last"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_skips_blank_lines() -> Result<()> {
+        let config = create_test_run_config();
+        let (mut writer, reader) = tokio::io::duplex(64);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(b"abc\n\nxyz\n\nlast\n").await.unwrap();
+        });
+
+        let rx = parse_lines(reader, &config, StreamDataType::JustBytes).await?;
+        let mut stream = ReceiverStream::new(rx);
+
+        let mut got = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(bytes) => got.push(String::from_utf8(bytes.to_vec())?),
+                other => panic!("Expected bytes, got {:?}", other),
+            }
+        }
+
+        assert_eq!(got, vec!["abc", "xyz", "last"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_y_junction_concatenates_streams_in_order() -> Result<()> {
+        let (tx1, rx1) = mpsc::channel(8);
+        let (tx2, rx2) = mpsc::channel(8);
+
+        tx1.send(ParseOutput::Bytes(Bytes::from_static(b"a1"))).await?;
+        tx1.send(ParseOutput::Bytes(Bytes::from_static(b"a2"))).await?;
+        drop(tx1);
+        tx2.send(ParseOutput::Bytes(Bytes::from_static(b"b1"))).await?;
+        drop(tx2);
+
+        let (rx, task) = y_junction(vec![rx1, rx2], 8).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut got = Vec::new();
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            got.push(String::from_utf8(bytes.to_vec())?);
+        }
+
+        task.await??;
+        assert_eq!(got, vec!["a1", "a2", "b1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_convert_fasta_stream_to_sequence_record_filters_non_fasta() -> Result<()> {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(ParseOutput::Fasta(SequenceRecord::Fasta {
+            id: "seq1".to_string(),
+            desc: Some("desc".to_string()),
+            seq: Arc::new(b"ACGT".to_vec()),
+        })).await?;
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"ignored"))).await?;
+        drop(tx);
+
+        let (mut out_rx, task) = convert_fasta_stream_to_sequence_record(rx, 8).await?;
+        let mut records = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            records.push(item);
+        }
+
+        task.await??;
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            SequenceRecord::Fasta { id, desc, seq } => {
+                assert_eq!(id, "seq1");
+                assert_eq!(desc.as_deref(), Some("desc"));
+                assert_eq!(seq.as_ref().as_slice(), b"ACGT");
+            }
+            other => panic!("Expected FASTA record, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fanout_to_channels_duplicates_items_to_all_branches() -> Result<()> {
+        let config = create_test_run_config();
+        let (up_tx, up_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            up_tx.send(ParseOutput::Bytes(Bytes::from_static(b"first"))).await.unwrap();
+            up_tx.send(ParseOutput::Bytes(Bytes::from_static(b"second"))).await.unwrap();
+            drop(up_tx);
+        });
+        let upstream = ReceiverStream::new(up_rx);
+
+        let (receivers, router) = fanout_to_channels(
+            upstream,
+            3,
+            "test_fanout",
+            &config,
+            StreamDataType::JustBytes,
+        ).await?;
+
+        let mut branch_data = Vec::new();
+        for rx in receivers {
+            let mut stream = ReceiverStream::new(rx);
+            let mut items = Vec::new();
+            while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+                items.push(String::from_utf8(bytes.to_vec())?);
+            }
+            branch_data.push(items);
+        }
+
+        router.await??;
+        for branch in branch_data {
+            assert_eq!(branch, vec!["first", "second"]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_child_output_lines() -> Result<()> {
+        let config = create_test_run_config();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'alpha\\n\\n beta\\n gamma\\n'");
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Lines, &config).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut got = Vec::new();
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            got.push(String::from_utf8(bytes.to_vec())?);
+        }
+        assert_eq!(got, vec!["alpha", " beta", " gamma"]);
+        Ok(())
     }
 
     #[tokio::test]
