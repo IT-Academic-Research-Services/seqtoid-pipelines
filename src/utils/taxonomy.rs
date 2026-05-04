@@ -932,3 +932,197 @@ pub fn combine_taxon_loc_json(input_jsons: Vec<PathBuf>, output_json: PathBuf) -
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn taxon_loc(taxid: i32, first_byte: u64, last_byte: u64, hit_type: &str) -> TaxonSeqLocation {
+        TaxonSeqLocation {
+            taxid,
+            first_byte,
+            last_byte,
+            hit_type: hit_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_validate_taxid_lineage_no_consensus() {
+        let lineage = [10, 20, 30];
+        let cleaned = validate_taxid_lineage(&lineage, 999, 0);
+        assert_eq!(cleaned, [-100, -200, -300]);
+    }
+
+    #[test]
+    fn test_validate_taxid_lineage_species_consensus_keeps_values() {
+        let lineage = [10, 20, 30];
+        let cleaned = validate_taxid_lineage(&lineage, 10, 1);
+        assert_eq!(cleaned, [10, 20, 30]);
+    }
+
+    #[test]
+    fn test_validate_taxid_lineage_genus_consensus_invalidates_species() {
+        let lineage = [0, 20, 30];
+        let cleaned = validate_taxid_lineage(&lineage, 20, 2);
+        assert_eq!(cleaned, [-100, 20, 30]);
+    }
+
+    #[test]
+    fn test_validate_taxid_lineage_family_consensus_invalidates_species_and_genus() {
+        let lineage = [0, 0, 30];
+        let cleaned = validate_taxid_lineage(&lineage, 30, 3);
+        assert_eq!(cleaned, [-100, -200, 30]);
+    }
+
+    #[test]
+    fn test_get_taxid_parses_field_and_ignores_missing_field() {
+        let header = "sample:species_nt:123:readA";
+        assert_eq!(get_taxid(header, "species_nt").unwrap(), 123);
+        assert_eq!(get_taxid(header, "genus_nt").unwrap(), -1);
+    }
+
+    #[test]
+    fn test_get_taxid_handles_leading_gt_and_bad_number() {
+        let header = ">sample:species_nt:not_a_number:readA";
+        assert_eq!(get_taxid(header, "species_nt").unwrap(), -1);
+    }
+
+    #[test]
+    fn test_get_valid_lineage_species_hit_uses_map() {
+        let mut hits = AHashMap::new();
+        hits.insert("read1".to_string(), (42, 1));
+
+        let mut lineage_map = AHashMap::new();
+        lineage_map.insert(42, [11, 22, 33]);
+
+        let lineage_map = Arc::new(lineage_map);
+        let got = get_valid_lineage(&hits, &lineage_map, "read1");
+        assert_eq!(got, [11, 22, 33]);
+    }
+
+    #[test]
+    fn test_get_valid_lineage_non_species_hit_returns_non_specific_lineage() {
+        let mut hits = AHashMap::new();
+        hits.insert("read1".to_string(), (42, 2));
+
+        let mut lineage_map = AHashMap::new();
+        lineage_map.insert(42, [11, 22, 33]);
+
+        let lineage_map = Arc::new(lineage_map);
+        let got = get_valid_lineage(&hits, &lineage_map, "read1");
+        assert_eq!(got, [-100, -200, -300]);
+    }
+
+    #[test]
+    fn test_get_valid_lineage_missing_hit_returns_null_lineage() {
+        let hits: AHashMap<String, (Taxid, u8)> = AHashMap::new();
+        let lineage_map = Arc::new(AHashMap::new());
+
+        let got = get_valid_lineage(&hits, &lineage_map, "missing");
+        assert_eq!(got, [-1, -1, -1]);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_into_set_ignores_invalid_lines_and_dedups() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("taxids.txt");
+        fs::write(&path, b"1\n2\nabc\n2\n  3  \n")?;
+
+        let set = read_file_into_set(&path).await?;
+        assert_eq!(set.len(), 3);
+        assert!(set.contains(&1));
+        assert!(set.contains(&2));
+        assert!(set.contains(&3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_build_should_keep_filter_applies_white_black_lists() -> Result<()> {
+        let dir = tempdir()?;
+
+        let deuterostome = dir.path().join("deuterostome.txt");
+        let whitelist = dir.path().join("whitelist.txt");
+        let blacklist = dir.path().join("blacklist.txt");
+
+        fs::write(&deuterostome, b"111\n")?;
+        fs::write(&whitelist, b"333\n444\n")?;
+        fs::write(&blacklist, b"222\n")?;
+
+        let keep = build_should_keep_filter(
+            Some(deuterostome.clone()),
+            Some(whitelist.clone()),
+            Some(blacklist.clone()),
+        )
+            .await?;
+
+        assert!(keep(&[333]));
+        assert!(keep(&[444, 999]));
+        assert!(!keep(&[222]));
+        assert!(!keep(&[111]));
+        assert!(!keep(&[9605]));
+        assert!(!keep(&[9606]));
+        assert!(!keep(&[333, 222]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_combine_taxon_loc_json_concatenates_inputs() -> Result<()> {
+        let dir = tempdir()?;
+        let in1 = dir.path().join("one.json");
+        let in2 = dir.path().join("two.json");
+        let out = dir.path().join("combined.json");
+
+        let a = vec![
+            taxon_loc(10, 0, 9, "NT"),
+            taxon_loc(20, 10, 19, "NT"),
+        ];
+        let b = vec![taxon_loc(30, 0, 7, "NR")];
+
+        fs::write(&in1, serde_json::to_vec(&a)?)?;
+        fs::write(&in2, serde_json::to_vec(&b)?)?;
+
+        combine_taxon_loc_json(vec![in1, in2], out.clone())?;
+
+        let combined: Vec<TaxonSeqLocation> = serde_json::from_slice(&fs::read(out)?)?;
+        assert_eq!(combined.len(), 3);
+        assert_eq!(combined[0].taxid, 10);
+        assert_eq!(combined[1].taxid, 20);
+        assert_eq!(combined[2].taxid, 30);
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_locator_work_sorts_and_writes_locations() -> Result<()> {
+        let dir = tempdir()?;
+        let fasta_out = dir.path().join("locator.fasta");
+        let json_out = dir.path().join("locator.json");
+
+        let records = Arc::new(vec![
+            ("contig_b:species_nt:20:extra".to_string(), "TT".to_string()),
+            ("contig_a:species_nt:10:extra".to_string(), "AAAA".to_string()),
+        ]);
+
+        generate_locator_work(
+            records,
+            "species_nt".to_string(),
+            "NT".to_string(),
+            fasta_out.clone(),
+            json_out.clone(),
+        )?;
+
+        let fasta = fs::read_to_string(&fasta_out)?;
+        assert!(fasta.starts_with(">contig_a:species_nt:10:extra\nAAAA\n"));
+        assert!(fasta.contains(">contig_b:species_nt:20:extra\nTT\n"));
+
+        let locs: Vec<TaxonSeqLocation> = serde_json::from_slice(&fs::read(&json_out)?)?;
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].taxid, 10);
+        assert_eq!(locs[0].hit_type, "NT");
+        assert_eq!(locs[1].taxid, 20);
+        assert_eq!(locs[1].hit_type, "NT");
+        Ok(())
+    }
+}
+
