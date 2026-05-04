@@ -784,7 +784,7 @@ pub fn read_fasta(
     min_seq_len: Option<usize>,
     max_seq_len: Option<usize>,
     chunk_size: usize,           // legacy
-    config: &RunConfig,       
+    config: &RunConfig,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
 
     let effective_chunk = crate::utils::system::compute_buffer_size(
@@ -1994,10 +1994,13 @@ pub async fn write_combined_fastq(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    // ── parse_header tests ────────────────────────────────────────────────
+    use futures::StreamExt;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     fn compare_header(head: &[u8], prefix: char) {
         let scalar = parse_header_scalar(head, prefix);
@@ -2011,7 +2014,6 @@ mod tests {
 
     #[test]
     fn test_header_id_only_fasta() {
-        // No whitespace — most common reference genome format
         let head = b"NC_045512.2";
         let (id, desc) = parse_header_scalar(head, '>');
         assert_eq!(id, "NC_045512.2");
@@ -2040,7 +2042,6 @@ mod tests {
     #[test]
     fn test_header_fastq_prefix_stripped() {
         let head = b"@SRR12345.1 length=150";
-        // needletail passes bytes including the prefix in some paths
         let (id, desc) = parse_header_scalar(head, '@');
         assert_eq!(id, "SRR12345.1");
         assert_eq!(desc.as_deref(), Some("length=150"));
@@ -2049,7 +2050,6 @@ mod tests {
 
     #[test]
     fn test_header_empty_desc_after_space() {
-        // Space at end but nothing after it — desc should be None
         let head = b"contig_00001 ";
         let (id, desc) = parse_header_scalar(head, '>');
         assert_eq!(id, "contig_00001");
@@ -2059,7 +2059,6 @@ mod tests {
 
     #[test]
     fn test_header_long_id_spans_two_simd_chunks() {
-        // id > 64 bytes with description after — whitespace in second chunk
         let long_id = "a".repeat(70);
         let head = format!("{} some description", long_id);
         let (id, desc) = parse_header_scalar(head.as_bytes(), '>');
@@ -2070,7 +2069,6 @@ mod tests {
 
     #[test]
     fn test_header_long_id_only_no_whitespace() {
-        // id > 64 bytes, no whitespace anywhere
         let long_id = "a".repeat(100);
         let (id, desc) = parse_header_scalar(long_id.as_bytes(), '>');
         assert_eq!(id, long_id);
@@ -2080,7 +2078,6 @@ mod tests {
 
     #[test]
     fn test_header_sra_style() {
-        // SRA format: "SRR12345.1.1 SRR12345.1 length=150"
         let head = b"SRR12345.1.1 SRR12345.1 length=150";
         let (id, desc) = parse_header_scalar(head, '@');
         assert_eq!(id, "SRR12345.1.1");
@@ -2089,45 +2086,197 @@ mod tests {
     }
 
     #[test]
-    fn test_sequence_reader_fasta() -> io::Result<()> {
-        let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
-        let path = tmp.path().with_extension("fasta");
-        std::fs::rename(tmp.path(), &path)?;
-        writeln!(tmp, ">seq1 testFASTA\nATCG")?;
-        tmp.flush()?;
-        
-        let reader_result = sequence_reader(&path);
-        match reader_result {
-            Ok(reader) => {
-                match reader {
-                    SequenceReader::Fasta(_reader) => { Ok(()) },
-                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
-                }
-            }
-            Err(e) => Err(e),
-        }
-        
+    fn test_compare_read_ids_exact_and_suffix_variants() {
+        assert!(compare_read_ids("read1", "read1"));
+        assert!(compare_read_ids("read1/1", "read1/2"));
+        assert!(compare_read_ids("read1_R1", "read1_R2"));
+        assert!(compare_read_ids("read1.1", "read1.2"));
+        assert!(compare_read_ids("read1 1:N:0:", "read1 2:N:0:"));
+        assert!(!compare_read_ids("read1", "read2"));
+        assert!(!compare_read_ids("read1/1", "read2/2"));
     }
-    
+
+    #[test]
+    fn test_sequence_record_accessors() {
+        let fasta = SequenceRecord::Fasta {
+            id: "contig1".to_string(),
+            desc: Some("some desc".to_string()),
+            seq: Arc::new(b"ACGT".to_vec()),
+        };
+
+        assert_eq!(fasta.id(), "contig1");
+        assert_eq!(fasta.seq(), b"ACGT");
+        assert_eq!(fasta.seq_owned(), b"ACGT".to_vec());
+        assert_eq!(fasta.qual(), b"");
+        assert_eq!(fasta.desc(), Some("some desc"));
+        let fasta_arc = fasta.seq_arc();
+        assert!(Arc::ptr_eq(&fasta_arc, &fasta.seq_arc()));
+
+        let fastq = SequenceRecord::Fastq {
+            id: "read1".to_string(),
+            desc: None,
+            seq: Arc::new(b"TGCA".to_vec()),
+            qual: Arc::new(b"IIII".to_vec()),
+        };
+
+        assert_eq!(fastq.id(), "read1");
+        assert_eq!(fastq.seq(), b"TGCA");
+        assert_eq!(fastq.seq_owned(), b"TGCA".to_vec());
+        assert_eq!(fastq.qual(), b"IIII");
+        assert_eq!(fastq.desc(), None);
+        let fastq_arc = fastq.seq_arc();
+        assert!(Arc::ptr_eq(&fastq_arc, &fastq.seq_arc()));
+    }
+
+    #[test]
+    fn test_validate_sequence() {
+        let valid = Arc::new(b"ACGTACGT".to_vec());
+        assert!(validate_sequence(&valid, b"ACGT").is_ok());
+
+        let invalid = Arc::new(b"ACNT".to_vec());
+        let err = validate_sequence(&invalid, b"ACGT").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid nucleotide"));
+        assert!(msg.contains("N"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_sequence_parallel() -> Result<()> {
+        let valid = Arc::new(b"ACGTACGTACGT".to_vec());
+        validate_sequence_parallel(valid, b"ACGT", 3).await?;
+
+        let invalid = Arc::new(b"ACGTXCGT".to_vec());
+        let err = validate_sequence_parallel(invalid, b"ACGT", 3)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid nucleotide"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fastx_generator_yields_expected_records() -> Result<()> {
+        let mut stream = fastx_generator(4, 12, 30.0, 5.0);
+        let mut seen = 0usize;
+
+        while let Some(record) = stream.next().await {
+            seen += 1;
+            assert_eq!(record.id(), format!("read{}", seen));
+            assert_eq!(record.seq().len(), 12);
+            assert_eq!(record.qual().len(), 12);
+            assert!(matches!(record, SequenceRecord::Fastq { .. }));
+        }
+
+        assert_eq!(seen, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fastx_generator_zero_length_is_empty() -> Result<()> {
+        let mut stream = fastx_generator(10, 0, 30.0, 5.0);
+        assert!(stream.next().await.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_r1r2_base_detects_r1_and_builds_filename() {
+        let path = PathBuf::from("/tmp/sample_R1.fastq");
+        let result = r1r2_base(&path);
+
+        assert_eq!(result.delimiter, Some('_'));
+        assert_eq!(result.r1_tag.as_deref(), Some("R1"));
+        assert_eq!(result.prefix.as_deref(), Some("sample"));
+        assert_eq!(result.index, Some(1));
+        assert_eq!(result.file_name.as_deref(), Some("sample.fastq"));
+    }
+
+    #[test]
+    fn test_r1r2_base_non_matching_path_returns_empty_result() {
+        let path = PathBuf::from("/tmp/sample.fastq");
+        let result = r1r2_base(&path);
+
+        assert_eq!(
+            result,
+            R1R2Result {
+                delimiter: None,
+                r1_tag: None,
+                file_name: None,
+                index: None,
+                prefix: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_sequence_reader_fasta() -> io::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("sample.fasta");
+        fs::write(&path, b">seq1 testFASTA\nATCG\n")?;
+
+        match sequence_reader(&path)? {
+            SequenceReader::Fasta(_) => Ok(()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
+        }
+    }
+
     #[test]
     fn test_sequence_reader_fastq() -> io::Result<()> {
-        let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
-        let path = tmp.path().with_extension("fastq");
-        std::fs::rename(tmp.path(), &path)?;
-        writeln!(tmp, "@seq1\nATCG\n+\nIIII")?;
-        tmp.flush()?;
+        let dir = tempdir()?;
+        let path = dir.path().join("sample.fastq");
+        fs::write(&path, b"@seq1\nATCG\n+\nIIII\n")?;
 
-        let reader_result = sequence_reader(&path);
-        match reader_result {
-            Ok(reader) => {
-                match reader {
-                    SequenceReader::Fastq(_reader) => { Ok(()) },
-                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
-                }
-            }
-            Err(e) => Err(e),
+        match sequence_reader(&path)? {
+            SequenceReader::Fastq(_) => Ok(()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
         }
     }
+
+    #[test]
+    fn test_sequence_reader_invalid_extension() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        fs::write(&path, b"@seq1\nATCG\n+\nIIII\n").unwrap();
+
+        match sequence_reader(&path) {
+            Ok(_) => panic!("expected invalid extension error"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidData),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_raw_read_count_single_end() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("single.fastq");
+        fs::write(&path, b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nHHHH\n")?;
+
+        let handle = raw_read_count(path, None);
+        let count = handle.await??;
+        assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_read_count_paired_end() -> Result<()> {
+        let dir = tempdir()?;
+        let r1 = dir.path().join("r1.fastq");
+        let r2 = dir.path().join("r2.fastq");
+
+        fs::write(
+            &r1,
+            b"@read1/1\nACGT\n+\nIIII\n@read2/1\nTGCA\n+\nHHHH\n",
+        )?;
+        fs::write(
+            &r2,
+            b"@read1/2\nACGT\n+\nIIII\n@read2/2\nTGCA\n+\nHHHH\n",
+        )?;
+
+        let handle = raw_read_count(r1, Some(r2));
+        let count = handle.await??;
+        assert_eq!(count, 4);
+        Ok(())
+    }
+
+  
+
     #[tokio::test]
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
@@ -2148,7 +2297,7 @@ mod tests {
         });
 
         let count = stream_record_counter(rx, false).await?;
-        assert_eq!(count, 2, "Should count 2 FASTQ records");
+        assert_eq!(count, 2);
         Ok(())
     }
 
@@ -2171,16 +2320,86 @@ mod tests {
         });
 
         let count = stream_record_counter(rx, true).await?;
-        assert_eq!(count, 1, "Should stop at first FASTA record with early_exit");
+        assert_eq!(count, 1);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_stream_record_counter_empty() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        drop(tx); // Close immediately
+        drop(tx);
         let count = stream_record_counter(rx, false).await?;
-        assert_eq!(count, 0, "Should count 0 for empty stream");
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_and_filter_fastq_id() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "keep_me_01".to_string(),
+                desc: None,
+                seq: Arc::new(b"ATCG".to_vec()),
+                qual: Arc::new(b"IIII".to_vec()),
+            }))
+                .await
+                .unwrap();
+
+            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "ignore_me_02".to_string(),
+                desc: None,
+                seq: Arc::new(b"TGCA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
+            }))
+                .await
+                .unwrap();
+        });
+
+        let (filtered_rx, task) = parse_and_filter_fastq_id(rx, 10, "keep_me".to_string());
+        let mut filtered_rx = filtered_rx;
+        let mut results = Vec::new();
+
+        while let Some(record) = filtered_rx.recv().await {
+            results.push(record);
+        }
+
+        task.await??;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id(), "keep_me_01");
+        assert_eq!(results[0].seq(), b"ATCG");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_byte_stream_to_fastq_round_trip() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(ParseOutput::Bytes(
+            b"@read1\nACGT\n+\nIIII\n".to_vec().into(),
+        ))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (out_rx, task) = parse_byte_stream_to_fastq(rx, 10, 1).await?;
+        let mut out_stream = ReceiverStream::new(out_rx);
+        let mut records = Vec::new();
+
+        while let Some(item) = out_stream.next().await {
+            match item {
+                ParseOutput::Fastq(record) => records.push(record),
+                other => panic!("unexpected output item: {:?}", other),
+            }
+        }
+
+        task.await??;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id(), "read1");
+        assert_eq!(records[0].seq(), b"ACGT");
+        assert_eq!(records[0].qual(), b"IIII");
         Ok(())
     }
 
@@ -2201,23 +2420,27 @@ mod tests {
                 qual: Arc::new(b"HHHH".to_vec()),
             }),
         ];
+
         tokio::spawn(async move {
             for record in records {
                 tx.send(record).await.unwrap();
             }
         });
+
         let (concat_rx, task) = concatenate_paired_reads(ReceiverStream::new(rx), 10, 10).await?;
         let mut concat_records = Vec::new();
-        let mut stream = concat_rx;  // Directly use concat_rx (already a ReceiverStream)
+        let mut stream = concat_rx;
+
         while let Some(ParseOutput::Fastq(record)) = stream.next().await {
             concat_records.push(record);
         }
+
         task.await??;
+
         assert_eq!(concat_records.len(), 1);
         assert_eq!(concat_records[0].id(), "read1/1");
         assert_eq!(concat_records[0].seq(), b"ATCGNGCTA");
         assert_eq!(concat_records[0].qual(), b"IIII!HHHH");
         Ok(())
     }
-
 }
