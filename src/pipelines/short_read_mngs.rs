@@ -7443,13 +7443,13 @@ async fn mmseqs_fastq_to_m8_file(
         // GPU: go very fast first, then benchmark upward later.
         sensitivity: match backend {
             MmseqsBackend::Cpu => Some("5.7".to_string()),
-            MmseqsBackend::Gpu => Some("1.0".to_string()),
+            MmseqsBackend::Gpu => None,
         },
 
         search_type: Some("3".to_string()),
         max_seqs: Some(match backend {
             MmseqsBackend::Cpu => "1000".to_string(),
-            MmseqsBackend::Gpu => "20".to_string(),   // aggressive speed-first cap
+            MmseqsBackend::Gpu => "300".to_string(),
         }),
         prefilter_mode: if backend == MmseqsBackend::Gpu {
             Some("1".to_string())
@@ -7467,14 +7467,14 @@ async fn mmseqs_fastq_to_m8_file(
                 "-e".to_string(),
                 Some(match backend {
                     MmseqsBackend::Cpu => "0.001".to_string(),
-                    MmseqsBackend::Gpu => "0.01".to_string(),   // looser, faster first pass
+                    MmseqsBackend::Gpu => "0.001".to_string(),
                 }),
             ),
             (
                 "--min-seq-id".to_string(),
                 Some(match backend {
                     MmseqsBackend::Cpu => "0.25".to_string(),
-                    MmseqsBackend::Gpu => "0.30".to_string(),   // slightly stricter; helps prune hits
+                    MmseqsBackend::Gpu => "0.25".to_string(),
                 }),
             ),
         ]),
