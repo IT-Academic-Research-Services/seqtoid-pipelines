@@ -7425,26 +7425,45 @@ async fn mmseqs_fastq_to_m8_file(
         output: None,
         tmp_dir: Some(tmp_dir.clone()),
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
-        sensitivity: if backend == MmseqsBackend::Cpu {
-            Some("5.7".to_string())  // trying to amtch sentivity of diamond for the CPU side
-        } else {
-            None
+
+        // CPU: keep your current Diamond-matching sensitivity.
+        // GPU: go very fast first, then benchmark upward later.
+        sensitivity: match backend {
+            MmseqsBackend::Cpu => Some("5.7".to_string()),
+            MmseqsBackend::Gpu => Some("1.0".to_string()),
         },
-        search_type: Some("3".to_string()),       // translated search
-        max_seqs: Some("1000".to_string()),
+
+        search_type: Some("3".to_string()),
+        max_seqs: Some(match backend {
+            MmseqsBackend::Cpu => "1000".to_string(),
+            MmseqsBackend::Gpu => "20".to_string(),   // aggressive speed-first cap
+        }),
         prefilter_mode: if backend == MmseqsBackend::Gpu {
             Some("1".to_string())
         } else {
             None
         },
         db_load_mode: Some("2".to_string()),
-        alignment_mode: Some("3".to_string()),    // preserve real pident semantics
+        alignment_mode: Some("3".to_string()),
+
         index_subset: None,
         format_output: None,
         cuda_visible_devices: None,
         option_fields: HashMap::from([
-            ("-e".to_string(), Some("0.001".to_string())),
-            ("--min-seq-id".to_string(), Some("0.25".to_string())),
+            (
+                "-e".to_string(),
+                Some(match backend {
+                    MmseqsBackend::Cpu => "0.001".to_string(),
+                    MmseqsBackend::Gpu => "0.01".to_string(),   // looser, faster first pass
+                }),
+            ),
+            (
+                "--min-seq-id".to_string(),
+                Some(match backend {
+                    MmseqsBackend::Cpu => "0.25".to_string(),
+                    MmseqsBackend::Gpu => "0.30".to_string(),   // slightly stricter; helps prune hits
+                }),
+            ),
         ]),
         gpu_server: backend == MmseqsBackend::Gpu,
     };
