@@ -818,6 +818,7 @@ async fn hisat2_filter(
         HISAT2_TAG,
         hisat2_args,
         config.args.verbose,
+        None
     ).await.map_err(|e| PipelineError::ToolExecution {
         tool: HISAT2_TAG.to_string(),
         error: e.to_string(),
@@ -864,6 +865,7 @@ async fn hisat2_filter(
         SAMTOOLS_TAG,
         sort_args,
         config.args.verbose,
+        None
     ).await.map_err(|e| PipelineError::ToolExecution {
         tool: SAMTOOLS_TAG.to_string(),
         error: e.to_string(),
@@ -924,6 +926,7 @@ async fn hisat2_filter(
         SAMTOOLS_TAG,
         fastq_args,
         config.args.verbose,
+        None
     ).await.map_err(|e| PipelineError::ToolExecution {
         tool: SAMTOOLS_TAG.to_string(),
         error: e.to_string(),
@@ -1215,6 +1218,7 @@ async fn kallisto_quant(
         KALLISTO_TAG,
         kallisto_args,
         config.args.verbose,
+        None
     ).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: KALLISTO_TAG.to_string(),
@@ -2325,6 +2329,7 @@ pub async fn minimap2_non_host_align(
                     MINIMAP2_TAG,
                     args,
                     config.args.verbose,
+                    None
                 )
                     .await
                     .context("Failed to spawn minimap2")?;
@@ -2670,6 +2675,7 @@ pub async fn sort_m8_by_read_id(
         crate::config::defs::SORT_TAG,
         sort_args,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -3134,6 +3140,7 @@ async fn run_diamond_single_file(
         DIAMOND_TAG,
         diamond_args,
         config.args.verbose,
+        None
     ).await?;
 
     let diamond_stdout = diamond_child.stdout.take()
@@ -4369,6 +4376,7 @@ async fn spades_assembly(
             SPADES_TAG,
             spades_args,
             config.args.verbose,
+            None
         )
             .await?;
 
@@ -4745,6 +4753,7 @@ pub async fn process_assembly(
         BOWTIE2_TAG,
         bt2_args,
         config.args.verbose,
+        None
     )
         .await?;
 
@@ -6290,6 +6299,7 @@ pub async fn blast_contigs(
         MAKEBLASTDB_TAG,
         makeblastdb_args,
         config.args.verbose,
+        None
     )
         .await?;
     cleanup_tasks.push(makeblastdb_err_task);
@@ -6342,6 +6352,7 @@ pub async fn blast_contigs(
         blast_command,
         blast_args,
         config.args.verbose,
+        None
     )
         .await?;
     cleanup_tasks.push(err_task);
@@ -7270,11 +7281,13 @@ async fn run_mmseqs_step(
 ) -> Result<(), PipelineError> {
     let start = Instant::now();
 
+    let mmseqs_stderr_log = config.out_dir.join("mmseqs").join(format!("{}.stderr.log", label));
     let (mut child, stderr_task) = spawn_cmd(
         config.clone(),
         MMSEQS_TAG,
         args,
         config.args.verbose,
+        Some(mmseqs_stderr_log)
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {

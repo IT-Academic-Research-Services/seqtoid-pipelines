@@ -859,7 +859,7 @@ async fn filter_with_kraken(
     };
     let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))?;
 
-    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(config.clone(), KRAKEN2_TAG, kraken2_args, config.args.verbose)
+    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(config.clone(), KRAKEN2_TAG, kraken2_args, config.args.verbose, None)
         .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: KRAKEN2_TAG.to_string(),
@@ -1874,6 +1874,7 @@ async fn evaluate_assembly(
         QUAST_TAG,
         assembly_eval_quast_args,
         config.args.verbose,
+        None,
     ).await.map_err(|e| PipelineError::ToolExecution {
         tool: QUAST_TAG.to_string(),
         error: e.to_string(),

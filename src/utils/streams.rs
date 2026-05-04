@@ -525,6 +525,7 @@ pub async fn spawn_cmd(
     cmd_tag: &str,
     args: Vec<String>,
     verbose: bool,
+    stderr_log_path: Option<PathBuf>,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let core_allocation = config.get_core_allocation(cmd_tag, None);
     let _permit = if core_allocation == CoreAllocation::Maximal {
@@ -535,6 +536,7 @@ pub async fn spawn_cmd(
 
     let cmd_tag_owned = cmd_tag.to_string();
     eprintln!("[{} cmd]: {}", cmd_tag, args.join(" "));
+
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
         .stdin(std::process::Stdio::null())
@@ -548,31 +550,60 @@ pub async fn spawn_cmd(
             .stderr
             .take()
             .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+
         let cmd_tag_clone = cmd_tag_owned.clone();
+        let stderr_log_path_clone = stderr_log_path.clone();
+
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
             let mut buffer = vec![0u8; 8192];
-            if verbose {
-                loop {
-                    match reader.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
-                            debug!("[{} stderr]: {}", cmd_tag_clone, stderr_chunk);
-                        }
-                        Err(e) => {
-                            return Err(anyhow!("Failed to read stderr: {}", e));
-                        }
+
+            let mut stderr_file = if let Some(path) = stderr_log_path_clone {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await.map_err(|e| {
+                        anyhow!("Failed to create stderr log dir {}: {}", parent.display(), e)
+                    })?;
+                }
+                Some(TokioFile::create(&path).await.map_err(|e| {
+                    anyhow!("Failed to create stderr log file {}: {}", path.display(), e)
+                })?)
+            } else {
+                None
+            };
+
+            loop {
+                let n = reader.read(&mut buffer).await
+                    .map_err(|e| anyhow!("Failed to read stderr: {}", e))?;
+
+                if n == 0 {
+                    break;
+                }
+
+                if let Some(file) = stderr_file.as_mut() {
+                    file.write_all(&buffer[..n]).await.map_err(|e| {
+                        anyhow!("Failed to write stderr log for {}: {}", cmd_tag_clone, e)
+                    })?;
+                }
+
+                if verbose || stderr_log_path.is_some() {
+                    let chunk = String::from_utf8_lossy(&buffer[..n]);
+                    eprint!("[{} stderr]: {}", cmd_tag_clone, chunk);
+                    if !chunk.ends_with('\n') {
+                        eprintln!();
                     }
                 }
-            } else {
-                while reader.read(&mut buffer).await? != 0 {}
             }
+
+            if let Some(file) = stderr_file.as_mut() {
+                file.flush().await.map_err(|e| {
+                    anyhow!("Failed to flush stderr log for {}: {}", cmd_tag_clone, e)
+                })?;
+            }
+
             Ok(())
         })
     };
 
-    // Permit is automatically dropped when the function exits, releasing it
     Ok((child, stderr_task))
 }
 
@@ -2872,7 +2903,7 @@ mod tests {
     async fn test_spawn_cmd_stderr_verbose() -> Result<()> {
         let config = create_test_run_config();
         let args = vec!["-c".to_string(), "echo error >&2".to_string()];
-        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, true).await?;
+        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, true, None).await?;
         let status = child.wait().await?;
         stderr_task.await??;
         assert!(status.success(), "Child process should exit successfully");
@@ -2883,7 +2914,7 @@ mod tests {
     async fn test_spawn_cmd_stderr_non_verbose() -> Result<()> {
         let config = create_test_run_config();
         let args = vec!["-c".to_string(), "echo error >&2".to_string()];
-        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, false).await?;
+        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, false, None).await?;
         let status = child.wait().await?;
         stderr_task.await??;
         assert!(status.success(), "Child process should exit successfully");

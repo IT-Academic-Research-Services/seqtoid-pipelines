@@ -418,6 +418,7 @@ pub mod minimap2 {
                     MINIMAP2_TAG,
                     minimap2_args,
                     config.args.verbose,
+                    None
                 )
                     .await
                     .map_err(|e| PipelineError::ToolExecution {
