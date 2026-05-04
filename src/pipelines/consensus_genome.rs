@@ -145,6 +145,7 @@ async fn validate_input(
         val_pigz_args,
         StreamDataType::IlluminaFastq,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -223,6 +224,7 @@ async fn align_to_host(
         minimap2_args,
         StreamDataType::JustBytes,  // FASTQ bytes
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -271,6 +273,7 @@ async fn align_to_host(
         samtools_args_view,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -313,6 +316,7 @@ async fn align_to_host(
         samtools_args_fastq,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -421,6 +425,7 @@ async fn align_to_host(
         pigz_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -528,6 +533,7 @@ async fn process_ercc(
         minimap2_args,
         StreamDataType::JustBytes, // FASTQ bytes
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -657,6 +663,7 @@ async fn process_ercc(
         samtools_args_view,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -699,6 +706,7 @@ async fn process_ercc(
         stats_samtools_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -985,6 +993,7 @@ async fn filter_with_kraken(
         pigz_args,
         StreamDataType::IlluminaFastq,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1084,6 +1093,7 @@ async fn align_to_target(
         minimap2_args,
         StreamDataType::JustBytes,  // FASTQ bytes, not structured records
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1129,6 +1139,7 @@ async fn align_to_target(
         samtools_sort_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1203,6 +1214,7 @@ async fn align_to_target(
         sam_view_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1324,6 +1336,7 @@ async fn generate_consensus(
         trim_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     ).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -1359,6 +1372,7 @@ async fn generate_consensus(
         samtools_consensus_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     ).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -1452,6 +1466,7 @@ async fn call_variants(
         bcftools_mpileup_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1500,6 +1515,7 @@ async fn call_variants(
         bcftools_call_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1601,7 +1617,8 @@ async fn realign_consensus_to_ref(
                       MAFFT_TAG,
                       realign_mafft_args,
                       StreamDataType::JustBytes,
-                      config.args.verbose
+                      config.args.verbose,
+                      None
     ).await
         .map_err(|e| PipelineError::ToolExecution {
             tool: MAFFT_TAG.to_string(),
@@ -1670,6 +1687,7 @@ async fn calculate_statistics(
                                                                                                                            stats_samtools_args_stats.clone(),
                                                                                                                            StreamDataType::JustBytes,
                                                                                                                            config.args.verbose,
+                                                                                                                           None
             ).await?;
             local_cleanup_tasks.push(stats_samtools_task_stats);
             local_cleanup_tasks.push(stats_samtools_err_task_stats);
@@ -1705,6 +1723,7 @@ async fn calculate_statistics(
                                                                                                          depth_samtools_args,
                                                                                                          StreamDataType::JustBytes,
                                                                                                          config.args.verbose,
+                                                                                                         None
             ).await?;
             local_cleanup_tasks.push(depth_samtools_task);
             local_cleanup_tasks.push(depth_samtools_err_task);
@@ -1772,6 +1791,7 @@ async fn calculate_statistics(
             bcftools_stats_args,
             StreamDataType::JustBytes,
             config.args.verbose,
+            None
         ).await?;
 
         local_cleanup_tasks.push(bcftools_stats_stream_task);
@@ -2029,6 +2049,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         stats_seqkit_args_stats,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await?;
     let no_host_seqkit_out_stream_stats = {

@@ -366,25 +366,31 @@ pub async fn stream_to_cmd(
     args: Vec<String>,
     data_type: StreamDataType,
     verbose: bool,
-) -> Result<(Arc<tokio::sync::Mutex<Child>>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
+    stderr_log_path: Option<PathBuf>,
+) -> Result<(
+    Arc<tokio::sync::Mutex<Child>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+)> {
     let core_allocation = config.get_core_allocation(cmd_tag, None);
     let _permit = if core_allocation == CoreAllocation::Maximal {
         Some(config.maximal_semaphore.clone().acquire_owned().await?)
     } else {
         None
     };
-    
+
     let writer_capacity = crate::utils::system::compute_buffer_size(
         &config,
         "stream_to_cmd",
         data_type,
-        1.8,                    // 1.0 = normal, 1.5–2.0 for very hot paths later
+        1.8, // 1.0 = normal, 1.5–2.0 for very hot paths later
     );
 
-    let batch_size_bytes = writer_capacity / 4;   // keep ~4:1 batching ratio
+    let batch_size_bytes = writer_capacity / 4; // keep ~4:1 batching ratio
 
     let cmd_tag_owned = cmd_tag.to_string();
     let cmd_tag_err_owned = cmd_tag.to_string();
+    let stderr_log_path_clone = stderr_log_path.clone();
 
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
@@ -409,7 +415,7 @@ pub async fn stream_to_cmd(
     let stdin_task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(writer_capacity, stdin);
         let mut batch = Vec::with_capacity(batch_size_bytes);
-        let mut total_written = 0;
+        let mut total_written = 0usize;
 
         let mut stream = ReceiverStream::new(rx);
         while let Some(item) = stream.next().await {
@@ -447,13 +453,24 @@ pub async fn stream_to_cmd(
                         let mut guard = child_clone.lock().await;
                         if let Ok(Some(status)) = guard.try_wait() {
                             if status.success() {
-                                debug!("Ignoring BrokenPipe in {} after successful exit", cmd_tag_owned);
+                                debug!(
+                                    "Ignoring BrokenPipe in {} after successful exit",
+                                    cmd_tag_owned
+                                );
                                 break;
                             } else {
-                                return Err(anyhow!("BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                                return Err(anyhow!(
+                                    "BrokenPipe in {} with failed child exit: {:?}",
+                                    cmd_tag_owned,
+                                    status
+                                ));
                             }
                         } else {
-                            return Err(anyhow!("BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                            return Err(anyhow!(
+                                "BrokenPipe in {} before child exit: {}",
+                                cmd_tag_owned,
+                                e
+                            ));
                         }
                     } else {
                         return Err(anyhow!("Write error in {}: {}", cmd_tag_owned, e));
@@ -465,7 +482,6 @@ pub async fn stream_to_cmd(
             }
         }
 
-        // final flush (same logic as before)
         if !batch.is_empty() {
             if let Err(e) = writer.write_all(&batch).await {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
@@ -493,27 +509,60 @@ pub async fn stream_to_cmd(
         if !status.success() {
             return Err(anyhow!("Child {} failed: {:?}", cmd_tag_owned, status));
         }
+
+        debug!(
+            "[{} stdin] completed, wrote {} bytes",
+            cmd_tag_owned, total_written
+        );
+
         Ok(())
     });
 
-    // stderr_task stays exactly the same
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::with_capacity(1_048_576, stderr);
         let mut buffer = vec![0u8; 8192];
-        if verbose {
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
-                        debug!("[{} stderr]: {}", cmd_tag_err_owned, stderr_chunk);
-                    }
-                    Err(e) => return Err(anyhow!("Failed to read stderr: {}", e)),
-                }
+
+        let mut stderr_file = if let Some(path) = stderr_log_path_clone {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    anyhow!("Failed to create stderr log dir {}: {}", parent.display(), e)
+                })?;
             }
+            Some(TokioFile::create(&path).await.map_err(|e| {
+                anyhow!("Failed to create stderr log file {}: {}", path.display(), e)
+            })?)
         } else {
-            while reader.read(&mut buffer).await? != 0 {}
+            None
+        };
+
+        loop {
+            let n = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|e| anyhow!("Failed to read stderr: {}", e))?;
+
+            if n == 0 {
+                break;
+            }
+
+            if let Some(file) = stderr_file.as_mut() {
+                file.write_all(&buffer[..n]).await.map_err(|e| {
+                    anyhow!("Failed to write stderr log for {}: {}", cmd_tag_err_owned, e)
+                })?;
+            }
+
+            if verbose || stderr_log_path.is_some() {
+                let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
+                debug!("[{} stderr]: {}", cmd_tag_err_owned, stderr_chunk);
+            }
         }
+
+        if let Some(file) = stderr_file.as_mut() {
+            file.flush().await.map_err(|e| {
+                anyhow!("Failed to flush stderr log for {}: {}", cmd_tag_err_owned, e)
+            })?;
+        }
+
         Ok(())
     });
 
@@ -2428,6 +2477,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2465,6 +2515,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2516,6 +2567,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2556,6 +2608,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await;
         assert!(result.is_err(), "Should fail for invalid command");
@@ -2590,6 +2643,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2628,6 +2682,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2688,6 +2743,7 @@ mod tests {
             vec!["-n".to_string(), "1".to_string()],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2727,6 +2783,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         task.await??;

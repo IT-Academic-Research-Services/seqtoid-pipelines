@@ -406,6 +406,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         args,
         StreamDataType::IlluminaFastq,
         false,
+        None
     ).await?;
 
     match timeout(Duration::from_secs(30), inner_task).await {
@@ -536,6 +537,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         args,
                                         StreamDataType::IlluminaFastq,
                                         false,
+                                        None
                                     )
                                         .await {
                                         Ok(result) => result,

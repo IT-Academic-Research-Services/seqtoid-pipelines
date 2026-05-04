@@ -457,6 +457,7 @@ async fn bowtie2_align_and_sort_stream(
         bt2_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     ).await?;
 
     cleanup_tasks.push(bt2_stream_task);
@@ -491,6 +492,7 @@ async fn bowtie2_align_and_sort_stream(
         sort_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     ).await?;
 
     cleanup_tasks.push(sort_task);
@@ -626,6 +628,7 @@ async fn bowtie2_filter_stream(
         args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     ).await?;
 
     cleanup_tasks.push(stdin_task);
@@ -723,6 +726,7 @@ async fn bowtie2_filter_files(
         args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     ).await?;
 
     cleanup_tasks.push(stdin_task);
@@ -1042,6 +1046,7 @@ async fn fastp_qc(
         qc_fastp_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1467,6 +1472,7 @@ async fn minimap2_filter(
         minimap2_args,
         StreamDataType::IlluminaFastq, // Assuming interleaved FASTQ
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1515,6 +1521,7 @@ async fn minimap2_filter(
         samtools_sort_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1605,6 +1612,7 @@ async fn minimap2_filter(
         samtools_count_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -1652,6 +1660,7 @@ async fn minimap2_filter(
         samtools_fastq_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -4797,6 +4806,7 @@ pub async fn process_assembly(
         samtools_sort_args,
         StreamDataType::JustBytes,
         config.args.verbose,
+        None
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
