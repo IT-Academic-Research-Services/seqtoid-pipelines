@@ -7428,14 +7428,69 @@ async fn mmseqs_fastq_to_m8_file(
     info!("[mmseqs:{}] createdb args: {:?}", label, createdb_args);
     run_mmseqs_step(config.clone(), createdb_args, "createdb").await?;
 
+    // Validate that createdb produced the expected nucleotide DB type.
+    // This catches the "Generic" DB failure early, before the GPU search starts.
+    let dbinfo_output = tokio::process::Command::new(MMSEQS_TAG)
+        .arg("dbinfo")
+        .arg(&query_db)
+        .output()
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    if !dbinfo_output.status.success() {
+        return Err(PipelineError::Other(anyhow!(
+            "mmseqs dbinfo failed for {} with exit code {:?}\nstdout:\n{}\nstderr:\n{}",
+            query_db.display(),
+            dbinfo_output.status.code(),
+            String::from_utf8_lossy(&dbinfo_output.stdout),
+            String::from_utf8_lossy(&dbinfo_output.stderr),
+        )));
+    }
+
+    let dbinfo_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&dbinfo_output.stdout),
+        String::from_utf8_lossy(&dbinfo_output.stderr)
+    );
+    let dbinfo_lc = dbinfo_text.to_ascii_lowercase();
+
+    if dbinfo_lc.contains("generic")
+        || (!dbinfo_lc.contains("nucleotide")
+        && !dbinfo_lc.contains("nucl")
+        && !dbinfo_lc.contains("dbtype: 2")
+        && !dbinfo_lc.contains("db type: 2"))
+    {
+        return Err(PipelineError::Other(anyhow!(
+            "mmseqs query DB validation failed for {}: expected nucleotide DB, got:\n{}",
+            query_db.display(),
+            dbinfo_text
+        )));
+    }
+
     // 2) GPU server, only for GPU backend
     let mut gpu_server: Option<Child> = None;
 
     if backend == MmseqsBackend::Gpu {
         gpu_server = Some(start_gpuserver(&target_db, config.args.verbose).await?);
 
-        // Small startup guard; replace with a readiness probe later if needed.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Longer startup guard: MMseqs GPU server/client handoff is sensitive to
+        // timing, and a short fixed sleep was too aggressive in practice.
+        // This keeps the server alive and gives it time to settle before search.
+        for _ in 0..20 {
+            if let Some(server) = gpu_server.as_mut() {
+                if let Ok(Some(status)) = server.try_wait() {
+                    return Err(PipelineError::Other(anyhow!(
+                        "MMseqs GPU server exited during warmup for {} with status {:?}",
+                        target_db.display(),
+                        status
+                    )));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     // 3) search -> result DB
@@ -7449,14 +7504,17 @@ async fn mmseqs_fastq_to_m8_file(
         tmp_dir: Some(tmp_dir.clone()),
         threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
 
-        // CPU: keep your current Diamond-matching sensitivity.
-        // GPU: go very fast first, then benchmark upward later.
+        // CPU path stays exactly as before.
+        // GPU path matches the standalone working translated-search invocation.
         sensitivity: match backend {
             MmseqsBackend::Cpu => Some("5.7".to_string()),
             MmseqsBackend::Gpu => None,
         },
 
-        search_type: Some("3".to_string()),
+        search_type: Some(match backend {
+            MmseqsBackend::Cpu => "3".to_string(),
+            MmseqsBackend::Gpu => "2".to_string(),
+        }),
         max_seqs: Some(match backend {
             MmseqsBackend::Cpu => "1000".to_string(),
             MmseqsBackend::Gpu => "300".to_string(),
@@ -7500,7 +7558,6 @@ async fn mmseqs_fastq_to_m8_file(
     info!("[mmseqs:{}] search args: {:?}", label, search_args);
     let search_res = run_mmseqs_step(config.clone(), search_args, "search").await;
 
-    // Stop the GPU server immediately after search, before convertalis.
     if let Some(mut server) = gpu_server {
         info!("Stopping MMseqs GPU server...");
         stop_gpuserver(&mut server).await?;
