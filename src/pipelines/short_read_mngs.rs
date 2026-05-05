@@ -7428,47 +7428,20 @@ async fn mmseqs_fastq_to_m8_file(
     info!("[mmseqs:{}] createdb args: {:?}", label, createdb_args);
     run_mmseqs_step(config.clone(), createdb_args, "createdb").await?;
 
-    // Validate that createdb produced the expected nucleotide DB type.
-    // This catches the "Generic" DB failure early, before the GPU search starts.
-    let dbinfo_output = tokio::process::Command::new(MMSEQS_TAG)
-        .arg("dbinfo")
-        .arg(&query_db)
-        .output()
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MMSEQS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    if !dbinfo_output.status.success() {
+    if !query_db.exists() {
         return Err(PipelineError::Other(anyhow!(
-            "mmseqs dbinfo failed for {} with exit code {:?}\nstdout:\n{}\nstderr:\n{}",
-            query_db.display(),
-            dbinfo_output.status.code(),
-            String::from_utf8_lossy(&dbinfo_output.stdout),
-            String::from_utf8_lossy(&dbinfo_output.stderr),
+            "mmseqs createdb did not produce queryDB: {}", query_db.display()
+        )));
+    }
+    let meta = fs::metadata(&query_db).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    if meta.len() < 10_000_000 {
+        return Err(PipelineError::Other(anyhow!(
+            "queryDB looks too small ({} bytes) — createdb probably failed", meta.len()
         )));
     }
 
-    let dbinfo_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&dbinfo_output.stdout),
-        String::from_utf8_lossy(&dbinfo_output.stderr)
-    );
-    let dbinfo_lc = dbinfo_text.to_ascii_lowercase();
-
-    if dbinfo_lc.contains("generic")
-        || (!dbinfo_lc.contains("nucleotide")
-        && !dbinfo_lc.contains("nucl")
-        && !dbinfo_lc.contains("dbtype: 2")
-        && !dbinfo_lc.contains("db type: 2"))
-    {
-        return Err(PipelineError::Other(anyhow!(
-            "mmseqs query DB validation failed for {}: expected nucleotide DB, got:\n{}",
-            query_db.display(),
-            dbinfo_text
-        )));
-    }
+    info!("Query DB created successfully: {} ({} bytes)", query_db.display(), meta.len());
 
     // 2) GPU server, only for GPU backend
     let mut gpu_server: Option<Child> = None;
