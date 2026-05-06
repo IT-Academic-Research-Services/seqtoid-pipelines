@@ -7441,17 +7441,13 @@ async fn mmseqs_fastq_to_m8_file(
 
         search_type: Some(match backend {
             MmseqsBackend::Cpu => "3".to_string(),
-            MmseqsBackend::Gpu => "2".to_string(),
+            MmseqsBackend::Gpu => "3".to_string(),
         }),
         max_seqs: Some(match backend {
-            MmseqsBackend::Cpu => "500".to_string(),
-            MmseqsBackend::Gpu => "300".to_string(),
+            MmseqsBackend::Cpu => "8000".to_string(),
+            MmseqsBackend::Gpu => "3000".to_string(),
         }),
-        prefilter_mode: if backend == MmseqsBackend::Gpu {
-            Some("1".to_string())
-        } else {
-            None
-        },
+        prefilter_mode: Some("1".to_string()),
         db_load_mode: Some("2".to_string()),
         alignment_mode: Some("3".to_string()),
 
