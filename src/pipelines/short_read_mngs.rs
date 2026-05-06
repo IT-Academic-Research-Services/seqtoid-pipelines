@@ -2233,15 +2233,11 @@ pub async fn minimap2_non_host_align(
     let num_chunks = chunk_paths.len();
     info!("Found {} minimap2 NT index chunks (sorted largest first)", num_chunks);
 
-    // 2) Memory & concurrency estimation.
-    const MEASURED_SINGLE_JOB_GB: f64 = 40.0;
-    const MEASURED_SINGLE_JOB_SEC: f64 = 81.0;
-
-    const TARGET_RAM_FRACTION: f64 = 0.35;
-    const HARD_MAX_CONCURRENCY: usize = 8;
-    const MIN_CONCURRENCY: usize = 2;
-    const MIN_THREADS_PER_JOB: usize = 8;
-    const MAX_THREADS_PER_JOB: usize = 16;
+    const TARGET_RAM_FRACTION: f64 = 0.55;        // was 0.35
+    const HARD_MAX_CONCURRENCY: usize = 14;       // was 8
+    const MIN_CONCURRENCY: usize = 4;
+    const MIN_THREADS_PER_JOB: usize = 6;         // was 8
+    const MAX_THREADS_PER_JOB: usize = 12;        // was 16
 
     let largest_gb = if max_size_bytes > 0 {
         ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as f64
@@ -2249,50 +2245,50 @@ pub async fn minimap2_non_host_align(
         70.0
     };
 
-    let est_gb_per_job = ((largest_gb * 0.95).ceil() as f64)
-        .max(MEASURED_SINGLE_JOB_GB * 0.9)
-        .min(MEASURED_SINGLE_JOB_GB * 1.15)
-        .max(20.0);
+    // Tighter, more realistic per-job RAM estimate
+    let est_gb_per_job = (largest_gb * 0.85)
+        .max(35.0)
+        .min(65.0);
 
     info!(
-        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job (measured baseline: {:.0} GiB)",
-        largest_gb, est_gb_per_job, MEASURED_SINGLE_JOB_GB
+        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job",
+        largest_gb, est_gb_per_job
     );
 
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
-    let ram_based_concurrency =
-        (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
+    let ram_based = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
 
-    let mut concurrency = ram_based_concurrency.clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
+    let mut concurrency = ram_based.clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
 
-    let estimated_peak_gb = concurrency as f64 * est_gb_per_job;
-    if estimated_peak_gb > available_ram_gb * 0.75 {
+    // Extra safety valve
+    let estimated_peak = concurrency as f64 * est_gb_per_job;
+    if estimated_peak > available_ram_gb * 0.82 {
         let new_conc = concurrency.saturating_sub(2).max(MIN_CONCURRENCY);
         warn!(
-            "Estimated peak {:.0} GiB exceeds 75% of available ({:.0} GiB) → reducing concurrency from {} to {}",
-            estimated_peak_gb, available_ram_gb, concurrency, new_conc
+            "Estimated peak {:.0} GiB exceeds 82% of available ({:.0} GiB) → reducing concurrency from {} to {}",
+            estimated_peak, available_ram_gb, concurrency, new_conc
         );
         concurrency = new_conc;
     }
 
-    let threads_per_job = (config.max_cores / concurrency)
+    let threads_per_job = (config.max_cores / concurrency.max(1))
         .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
 
     info!(
         concat!(
             "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
             "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-            "  single-job baseline: ~{:.0} s real time (measured)\n",
+            "  single-job baseline: ~81 s real time (measured)\n",
             "  largest chunk: {:.1} GiB → est/job: {:.0} GiB"
         ),
         concurrency,
         threads_per_job,
-        estimated_peak_gb,
-        (estimated_peak_gb / available_ram_gb * 100.0).round(),
-        MEASURED_SINGLE_JOB_SEC,
+        estimated_peak,
+        (estimated_peak / available_ram_gb * 100.0).round(),
         largest_gb,
         est_gb_per_job
     );
+    // =========================================================
 
     // Global merged output stream.
     let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(channel_buffer * 4);
@@ -2343,16 +2339,10 @@ pub async fn minimap2_non_host_align(
                     .await
                     .context("Failed to spawn minimap2")?;
 
-                if let Some(pid) = child.id() {
-                    debug!("minimap2 PID for {}: {}", chunk_name, pid);
-                }
-
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = tokio::io::BufReader::new(stdout);
                     let mut line = String::new();
                     let mut lines_sent = 0u64;
-
-                    debug!("[minimap2 {}] STARTED reading stdout", chunk_name);
 
                     while reader.read_line(&mut line).await? > 0 {
                         let trimmed = line.trim_end();
@@ -2360,37 +2350,13 @@ pub async fn minimap2_non_host_align(
                             let mut bytes = trimmed.as_bytes().to_vec();
                             bytes.push(b'\n');
 
-                            if out_tx
-                                .send(ParseOutput::Bytes(Bytes::from(bytes)))
-                                .await
-                                .is_err()
-                            {
-                                warn!(
-                                    "[minimap2 {}] local output channel closed while sending line {}",
-                                    chunk_name, lines_sent
-                                );
+                            if out_tx.send(ParseOutput::Bytes(Bytes::from(bytes))).await.is_err() {
                                 break;
                             }
-
                             lines_sent += 1;
-                            // if lines_sent % 50_000 == 0 {
-                            //     debug!(
-                            //         "[minimap2 {}] streamed {} PAF lines so far (last: {})",
-                            //         chunk_name,
-                            //         lines_sent,
-                            //         &trimmed[..std::cmp::min(120, trimmed.len())]
-                            //     );
-                            // }
                         }
                         line.clear();
                     }
-
-                    debug!(
-                        "[minimap2 {}] FINISHED reading stdout — sent {} complete PAF lines",
-                        chunk_name, lines_sent
-                    );
-                } else {
-                    warn!("[minimap2 {}] no stdout handle!", chunk_name);
                 }
 
                 let status = child.wait().await.context("minimap2 wait failed")?;
@@ -2415,10 +2381,7 @@ pub async fn minimap2_non_host_align(
         let mut merged_stream = futures::stream::select_all(worker_output_streams);
         async move {
             while let Some(item) = merged_stream.next().await {
-                if merged_tx.send(item).await.is_err() {
-                    warn!("[minimap2_non_host_align] downstream closed while merging worker output");
-                    break;
-                }
+                let _ = merged_tx.send(item).await;
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -2433,15 +2396,7 @@ pub async fn minimap2_non_host_align(
             .unwrap_or_else(|| format!("chunk_{}", idx));
 
         let worker_idx = idx % worker_job_txs.len();
-        worker_job_txs[worker_idx]
-            .send((chunk_mmi, chunk_name))
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "Failed to dispatch NT chunk {} to worker {}: {}",
-                    idx, worker_idx, e
-                ))
-            })?;
+        let _ = worker_job_txs[worker_idx].send((chunk_mmi, chunk_name)).await;
     }
 
     drop(worker_job_txs);
