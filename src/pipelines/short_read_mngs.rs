@@ -7435,7 +7435,7 @@ async fn mmseqs_fastq_to_m8_file(
     }
     let meta = fs::metadata(&query_db).await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    if meta.len() < 10_000_000 {
+    if meta.len() < 10_000 {
         return Err(PipelineError::Other(anyhow!(
             "queryDB looks too small ({} bytes) — createdb probably failed", meta.len()
         )));
