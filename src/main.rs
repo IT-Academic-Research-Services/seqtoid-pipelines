@@ -33,7 +33,7 @@ use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, der
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
                            compute_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
-                           detect_simd_level};
+                           detect_simd_level, ensure_transparent_hugepages};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 use pipelines::db;
@@ -160,6 +160,10 @@ async fn main() -> Result<()> {
         alignment_backend: backend,
 
     });
+
+    if let Err(e) = ensure_transparent_hugepages(&run_config).await {
+        warn!("THP setup failed (non-fatal): {}", e);
+    }
 
     let base_buffer_size = compute_buffer_size(
         &run_config,

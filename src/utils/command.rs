@@ -98,17 +98,32 @@ pub async fn version_check(
 /// Prepends `numactl --interleave=all` for large multi-socket Linux machines (EPYC).
 /// Does nothing on MacBooks, small machines, or non-Linux.
 /// Prepends numactl for tools that benefit from memory interleaving on large EPYC nodes.
-pub fn prepend_numactl_if_beneficial(config: &RunConfig, mut args: Vec<String>, cmd_tag: &str) -> Vec<String> {
-    if cfg!(target_os = "linux") && config.max_cores >= 64 {
-        // Tools that are memory-bandwidth / large-table heavy
-        if matches!(cmd_tag, DIAMOND_TAG | MMSEQS_TAG | SPADES_TAG) {
-            let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag.to_string()];
-            numa_args.extend(args);
-            debug!("Prepended numactl --interleave=all for {}", cmd_tag);
-            return numa_args;
-        }
+/// Prepends numactl + explicit hugepage advice for memory-heavy tools
+pub fn prepend_numactl_if_beneficial(
+    config: &RunConfig,
+    args: Vec<String>,
+    cmd_tag: &str
+) -> Vec<String> {
+    if !cfg!(target_os = "linux") || config.max_cores < 64 {
+        return args;
     }
-    args
+
+    if matches!(cmd_tag, DIAMOND_TAG | MMSEQS_TAG | SPADES_TAG) {
+        let mut numa_args = vec![
+            "--interleave=all".to_string(),
+            "--".to_string(),           // end of numactl options
+            "prctl".to_string(),                    // set per-process hugepage hint
+            "--set-current".to_string(),
+            "madvise_hugepage".to_string(),         // tells kernel to prefer 2MB pages
+            cmd_tag.to_string(),
+        ];
+        numa_args.extend(args);
+
+        debug!("Prepended numactl --interleave=all + prctl madvise_hugepage for {}", cmd_tag);
+        numa_args
+    } else {
+        args
+    }
 }
 
 pub mod fastp {
@@ -2573,7 +2588,7 @@ pub mod mmseqs {
         let _ = child.wait().await;
         Ok(())
     }
-    
+
 
     impl ArgGenerator for MmseqsArgGenerator {
         fn generate_args(

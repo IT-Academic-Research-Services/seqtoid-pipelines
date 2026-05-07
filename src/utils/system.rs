@@ -642,3 +642,57 @@ pub fn detect_simd_level() -> SimdLevel {
         }
     }
 }
+
+/// Ensures Transparent Huge Pages are enabled in the best mode for MMseqs/Diamond.
+/// Should be called early in pipeline startup on big Linux nodes.
+pub async fn ensure_transparent_hugepages(config: &RunConfig) -> Result<()> {
+    if !cfg!(target_os = "linux") || config.max_cores < 64 {
+        debug!("THP optimization skipped (not a large Linux node)");
+        return Ok(());
+    }
+
+    info!("Ensuring Transparent Huge Pages (THP) are optimized for large EPYC nodes...");
+
+    let paths = [
+        "/sys/kernel/mm/transparent_hugepage/enabled",
+        "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+        "/sys/kernel/mm/transparent_hugepage/defrag",
+    ];
+
+    let target = "always";
+
+    for path in &paths {
+        let current = match tokio::fs::read_to_string(path).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                warn!("Could not read {}: {}", path, e);
+                continue;
+            }
+        };
+
+        if current.contains(target) {
+            debug!("{} already set to {}", path, target);
+            continue;
+        }
+
+        // Try to set it
+        if let Err(e) = tokio::fs::write(path, target).await {
+            warn!("Failed to write '{}' to {}: {}", target, path, e);
+            // Non-fatal — continue
+        } else {
+            info!("Set {} = {}", path, target);
+        }
+    }
+
+    // Also encourage defrag
+    let _ = tokio::fs::write("/sys/kernel/mm/transparent_hugepage/defrag", "always").await;
+
+    // Optional: drop caches to encourage promotion
+    if config.max_cores >= 128 {
+        let _ = tokio::fs::write("/proc/sys/vm/drop_caches", "3").await;
+        info!("Dropped page cache to encourage hugepage promotion");
+    }
+
+    info!("THP optimization complete (mode: always)");
+    Ok(())
+}
