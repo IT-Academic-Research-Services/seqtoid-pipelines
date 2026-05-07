@@ -3100,10 +3100,19 @@ async fn run_diamond_single_file(
             error: e.to_string(),
         })?;
 
+    // === NUMA INTEGRATION ===
+    let final_diamond_args = prepend_numactl_if_beneficial(
+        &config,
+        diamond_args,
+        DIAMOND_TAG
+    );
+
+    info!("[diamond:{}] final args (with possible numactl): {:?}", label, final_diamond_args);
+
     let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
         config.clone(),
         DIAMOND_TAG,
-        diamond_args,
+        final_diamond_args,          // ← Use the NUMA-wrapped args
         config.args.verbose,
         None
     ).await?;
@@ -3113,7 +3122,6 @@ async fn run_diamond_single_file(
 
     let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
 
-    // Explicit type annotation to fix the error
     let parse_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
         let mut reader = TokioBufReader::new(diamond_stdout);
         let mut line = Vec::with_capacity(1024);
@@ -3150,7 +3158,7 @@ async fn run_diamond_single_file(
         });
     }
 
-    // Wait for both tasks to complete before returning (as you requested)
+    // Wait for both tasks to complete
     parse_task.await
         .map_err(|e| PipelineError::Other(anyhow!("parse_task panicked: {}", e)))??;
 
@@ -3213,7 +3221,7 @@ async fn diamond_non_host_align(
         ("--unal".to_string(), Some("0".to_string())),
     ]);
 
-    // Run R1 and wait for it to finish
+    // Run R1
     let r1_m8 = run_diamond_single_file(
         config.clone(),
         r1_path,
@@ -3223,7 +3231,7 @@ async fn diamond_non_host_align(
         "nr_r1",
     ).await?;
 
-    // Run R2 and wait for it to finish (if present)
+    // Run R2 (if present)
     if let Some(r2_path) = r2_path_opt {
         let _r2_m8 = run_diamond_single_file(
             config.clone(),
@@ -3235,7 +3243,7 @@ async fn diamond_non_host_align(
         ).await?;
     }
 
-    // Now both files are fully written — safe to concatenate
+    // Merge results
     let merged_m8 = temp_dir.path().join("diamond_merged_nr.m8");
     let mut merged = TokioFile::create(&merged_m8)
         .await
@@ -3243,8 +3251,6 @@ async fn diamond_non_host_align(
 
     let mut f1 = TokioFile::open(&r1_m8).await?;
     tokio::io::copy(&mut f1, &mut merged).await?;
-
-    // R2 was already written if it existed
 
     merged.flush().await?;
 

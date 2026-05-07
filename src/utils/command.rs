@@ -2573,30 +2573,7 @@ pub mod mmseqs {
         let _ = child.wait().await;
         Ok(())
     }
-
-    pub fn spawn_with_numa(
-        config: &RunConfig,
-        program: &str,
-        mut args: Vec<String>,
-        label: &str,
-    ) -> Result<Command> {
-        let mut cmd = if cfg!(target_os = "linux") && config.max_cores >= 64 {
-            // Dual-socket EPYC (r6id, r8id, 256-core nodes) → use interleave
-            let mut c = Command::new("numactl");
-            c.arg("--interleave=all");           // Best for large memory workloads
-            c.arg(program);
-            c.args(&args);
-            debug!("{}: Launched with numactl --interleave=all", label);
-            c
-        } else {
-            // MacBook, small machines, or non-Linux → plain command
-            let mut c = Command::new(program);
-            c.args(&args);
-            c
-        };
-
-        Ok(cmd)
-    }
+    
 
     impl ArgGenerator for MmseqsArgGenerator {
         fn generate_args(
