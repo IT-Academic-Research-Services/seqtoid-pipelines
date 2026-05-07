@@ -7430,7 +7430,7 @@ async fn mmseqs_fastq_to_m8_file(
         result_db: Some(result_db.clone()),
         output: None,
         tmp_dir: Some(tmp_dir.clone()),
-        threads: Some(config.thread_allocation(MMSEQS_TAG, Some("search"))),
+        threads: Some(config.mmseqs_threads()),
 
         // CPU path stays exactly as before.
         // GPU path matches the standalone working translated-search invocation.
@@ -7473,12 +7473,7 @@ async fn mmseqs_fastq_to_m8_file(
         gpu_server: backend == MmseqsBackend::Gpu,
     };
 
-    let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MMSEQS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
+    let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))?;
     info!("[mmseqs:{}] search args: {:?}", label, search_args);
     let search_res = run_mmseqs_step(config.clone(), search_args, "search").await;
 
