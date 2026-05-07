@@ -95,6 +95,22 @@ pub async fn version_check(
     Ok(version)
 }
 
+/// Prepends `numactl --interleave=all` for large multi-socket Linux machines (EPYC).
+/// Does nothing on MacBooks, small machines, or non-Linux.
+pub fn prepend_numactl_if_beneficial(config: &RunConfig, mut args: Vec<String>) -> Vec<String> {
+    if cfg!(target_os = "linux") && config.max_cores >= 64 {
+        let mut numa_args = vec![
+            "--interleave=all".to_string(),
+            MMSEQS_TAG.to_string(),   // or whatever binary you're calling
+        ];
+        numa_args.extend(args);
+        debug!("Prepended numactl --interleave=all for large EPYC machine");
+        numa_args
+    } else {
+        args
+    }
+}
+
 pub mod fastp {
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2556,6 +2572,30 @@ pub mod mmseqs {
 
         let _ = child.wait().await;
         Ok(())
+    }
+
+    pub fn spawn_with_numa(
+        config: &RunConfig,
+        program: &str,
+        mut args: Vec<String>,
+        label: &str,
+    ) -> Result<Command> {
+        let mut cmd = if cfg!(target_os = "linux") && config.max_cores >= 64 {
+            // Dual-socket EPYC (r6id, r8id, 256-core nodes) → use interleave
+            let mut c = Command::new("numactl");
+            c.arg("--interleave=all");           // Best for large memory workloads
+            c.arg(program);
+            c.args(&args);
+            debug!("{}: Launched with numactl --interleave=all", label);
+            c
+        } else {
+            // MacBook, small machines, or non-Linux → plain command
+            let mut c = Command::new(program);
+            c.args(&args);
+            c
+        };
+
+        Ok(cmd)
     }
 
     impl ArgGenerator for MmseqsArgGenerator {
