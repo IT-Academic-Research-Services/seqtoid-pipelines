@@ -7444,7 +7444,7 @@ async fn mmseqs_fastq_to_m8_file(
             MmseqsBackend::Gpu => "3".to_string(),
         }),
         max_seqs: Some(match backend {
-            MmseqsBackend::Cpu => "8000".to_string(),
+            MmseqsBackend::Cpu => "3000".to_string(),
             MmseqsBackend::Gpu => "3000".to_string(),
         }),
         prefilter_mode: Some("1".to_string()),
