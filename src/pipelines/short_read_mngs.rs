@@ -7459,7 +7459,7 @@ async fn mmseqs_fastq_to_m8_file(
     let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))?;
     info!("[mmseqs:{}] search args: {:?}", label, search_args);
 
-    let final_search_args = prepend_numactl_if_beneficial(&config, search_args);
+    let final_search_args = prepend_numactl_if_beneficial(&config, search_args, MMSEQS_TAG);
     let search_res = run_mmseqs_step(config.clone(), final_search_args, "search").await;
 
     if let Some(mut server) = gpu_server {
@@ -7503,7 +7503,7 @@ async fn mmseqs_fastq_to_m8_file(
 
     info!("[mmseqs:{}] convertalis args: {:?}", label, convert_args);
 
-    let final_convert_args = prepend_numactl_if_beneficial(&config, convert_args);
+    let final_convert_args = prepend_numactl_if_beneficial(&config, convert_args, MMSEQS_TAG);
     run_mmseqs_step(config.clone(), final_convert_args, "convertalis").await?;
 
     let meta = fs::metadata(&m8_path)

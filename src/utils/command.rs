@@ -97,18 +97,18 @@ pub async fn version_check(
 
 /// Prepends `numactl --interleave=all` for large multi-socket Linux machines (EPYC).
 /// Does nothing on MacBooks, small machines, or non-Linux.
-pub fn prepend_numactl_if_beneficial(config: &RunConfig, mut args: Vec<String>) -> Vec<String> {
+/// Prepends numactl for tools that benefit from memory interleaving on large EPYC nodes.
+pub fn prepend_numactl_if_beneficial(config: &RunConfig, mut args: Vec<String>, cmd_tag: &str) -> Vec<String> {
     if cfg!(target_os = "linux") && config.max_cores >= 64 {
-        let mut numa_args = vec![
-            "--interleave=all".to_string(),
-            MMSEQS_TAG.to_string(),   // or whatever binary you're calling
-        ];
-        numa_args.extend(args);
-        debug!("Prepended numactl --interleave=all for large EPYC machine");
-        numa_args
-    } else {
-        args
+        // Tools that are memory-bandwidth / large-table heavy
+        if matches!(cmd_tag, DIAMOND_TAG | MMSEQS_TAG | SPADES_TAG) {
+            let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag.to_string()];
+            numa_args.extend(args);
+            debug!("Prepended numactl --interleave=all for {}", cmd_tag);
+            return numa_args;
+        }
     }
+    args
 }
 
 pub mod fastp {
