@@ -296,6 +296,21 @@ impl RunConfig {
         }
     }
 
+    pub fn mmseqs_threads(&self) -> usize {
+        let base = self.thread_allocation(MMSEQS_TAG, Some("search"));
+
+        // Scale based on physical scale of the machine
+        let threads = match self.max_cores {
+            0..=64   => base.min(56),                    // small machines / MacBook
+            65..=128 => base.min(112),                   // r6id.32xlarge
+            129..=192 => base.min(160),                  // r8id.48xlarge class
+            _        => base.min(224),                   // 256+ core EPYC permanent nodes
+        };
+
+        // Final safety cap (never use 100% of cores)
+        threads.min(self.max_cores * 9 / 10)
+    }
+
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
         let max_cores = min(self.max_cores, self.args.threads.max(1));
 
@@ -315,7 +330,7 @@ impl RunConfig {
         if prefer_physical && self.args.use_smt { // If a program does poorly with SMT, don't allow it even if use_smt true
             allocation = allocation.min(self.physical_cores);
         } else if !prefer_physical && self.args.use_smt {
-            // Modest SMT: allow up to ~1.3× physical cores 
+            // Modest SMT: allow up to ~1.3× physical cores
 
             let modest_max = (self.physical_cores as f32 * SMT_MODEST_MULTIPLIER).ceil() as usize;
             allocation = allocation.min(modest_max);
