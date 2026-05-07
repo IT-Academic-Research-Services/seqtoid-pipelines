@@ -7437,10 +7437,7 @@ async fn mmseqs_fastq_to_m8_file(
             MmseqsBackend::Gpu => None,
         },
 
-        search_type: Some(match backend {
-            MmseqsBackend::Cpu => "3".to_string(),
-            MmseqsBackend::Gpu => "3".to_string(),
-        }),
+        search_type: Some("3".to_string()),
         max_seqs: Some(match backend {
             MmseqsBackend::Cpu => "3000".to_string(),
             MmseqsBackend::Gpu => "3000".to_string(),
@@ -7453,20 +7450,8 @@ async fn mmseqs_fastq_to_m8_file(
         format_output: None,
         cuda_visible_devices: None,
         option_fields: HashMap::from([
-            (
-                "-e".to_string(),
-                Some(match backend {
-                    MmseqsBackend::Cpu => "0.001".to_string(),
-                    MmseqsBackend::Gpu => "0.001".to_string(),
-                }),
-            ),
-            (
-                "--min-seq-id".to_string(),
-                Some(match backend {
-                    MmseqsBackend::Cpu => "0.25".to_string(),
-                    MmseqsBackend::Gpu => "0.25".to_string(),
-                }),
-            ),
+            ("-e".to_string(), Some("0.001".to_string())),
+            ("--min-seq-id".to_string(), Some("0.25".to_string())),
         ]),
         gpu_server: backend == MmseqsBackend::Gpu,
     };
@@ -7474,9 +7459,7 @@ async fn mmseqs_fastq_to_m8_file(
     let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))?;
     info!("[mmseqs:{}] search args: {:?}", label, search_args);
 
-    // Apply numactl if appropriate
     let final_search_args = prepend_numactl_if_beneficial(&config, search_args);
-
     let search_res = run_mmseqs_step(config.clone(), final_search_args, "search").await;
 
     if let Some(mut server) = gpu_server {
@@ -7519,7 +7502,9 @@ async fn mmseqs_fastq_to_m8_file(
         })?;
 
     info!("[mmseqs:{}] convertalis args: {:?}", label, convert_args);
-    run_mmseqs_step(config.clone(), convert_args, "convertalis").await?;
+
+    let final_convert_args = prepend_numactl_if_beneficial(&config, convert_args);
+    run_mmseqs_step(config.clone(), final_convert_args, "convertalis").await?;
 
     let meta = fs::metadata(&m8_path)
         .await
