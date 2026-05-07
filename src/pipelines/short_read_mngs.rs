@@ -55,6 +55,7 @@ use crate::cli::Technology;
 use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode, ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType, Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE, SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, MMSEQS_TAG, ClusterInfo, DuplicateClusters, PairingMode, NRAlignmentBackend, SORT_TAG};
 use crate::utils::blast::{parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
+use crate::utils::command::prepend_numactl_if_beneficial;
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
@@ -7247,6 +7248,8 @@ async fn run_mmseqs_step(
     let start = Instant::now();
 
     let mmseqs_stderr_log = config.out_dir.join("mmseqs").join(format!("{}.stderr.log", label));
+
+    // spawn_cmd now handles numactl internally via prepend_numactl_if_beneficial
     let (mut child, stderr_task) = spawn_cmd(
         config.clone(),
         MMSEQS_TAG,
@@ -7404,9 +7407,6 @@ async fn mmseqs_fastq_to_m8_file(
     if backend == MmseqsBackend::Gpu {
         gpu_server = Some(start_gpuserver(&target_db, config.args.verbose).await?);
 
-        // Longer startup guard: MMseqs GPU server/client handoff is sensitive to
-        // timing, and a short fixed sleep was too aggressive in practice.
-        // This keeps the server alive and gives it time to settle before search.
         for _ in 0..20 {
             if let Some(server) = gpu_server.as_mut() {
                 if let Ok(Some(status)) = server.try_wait() {
@@ -7432,8 +7432,6 @@ async fn mmseqs_fastq_to_m8_file(
         tmp_dir: Some(tmp_dir.clone()),
         threads: Some(config.mmseqs_threads()),
 
-        // CPU path stays exactly as before.
-        // GPU path matches the standalone working translated-search invocation.
         sensitivity: match backend {
             MmseqsBackend::Cpu => Some("5.7".to_string()),
             MmseqsBackend::Gpu => None,
@@ -7475,7 +7473,11 @@ async fn mmseqs_fastq_to_m8_file(
 
     let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))?;
     info!("[mmseqs:{}] search args: {:?}", label, search_args);
-    let search_res = run_mmseqs_step(config.clone(), search_args, "search").await;
+
+    // Apply numactl if appropriate
+    let final_search_args = prepend_numactl_if_beneficial(&config, search_args);
+
+    let search_res = run_mmseqs_step(config.clone(), final_search_args, "search").await;
 
     if let Some(mut server) = gpu_server {
         info!("Stopping MMseqs GPU server...");

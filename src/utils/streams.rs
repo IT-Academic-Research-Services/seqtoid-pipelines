@@ -38,7 +38,7 @@ use bytes::Bytes;
 use rayon::prelude::*;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
-use crate::config::defs::{PipelineError, StreamDataType};
+use crate::config::defs::{PipelineError, StreamDataType, MMSEQS_TAG, SPADES_TAG};
 use crate::config::defs::{CoreAllocation, RunConfig, SimdLevel};
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
 
@@ -584,10 +584,21 @@ pub async fn spawn_cmd(
     };
 
     let cmd_tag_owned = cmd_tag.to_string();
-    eprintln!("[{} cmd]: {}", cmd_tag, args.join(" "));
 
-    let mut child = Command::new(&cmd_tag_owned)
-        .args(&args)
+    // === NUMA SUPPORT ===
+    let final_args = if should_use_numactl(config.as_ref(), cmd_tag) {
+        let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag_owned.clone()];
+        numa_args.extend(args);
+        debug!("spawn_cmd: Prepended numactl --interleave=all for {}", cmd_tag);
+        numa_args
+    } else {
+        args
+    };
+
+    eprintln!("[{} cmd]: {}", cmd_tag, final_args.join(" "));
+
+    let mut child = Command::new("numactl")   // numactl will be a no-op if not needed
+        .args(&final_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -654,6 +665,13 @@ pub async fn spawn_cmd(
     };
 
     Ok((child, stderr_task))
+}
+
+/// Determines whether we should wrap the command with `numactl --interleave=all`
+fn should_use_numactl(config: &RunConfig, cmd_tag: &str) -> bool {
+    cfg!(target_os = "linux")
+        && config.max_cores >= 64
+        && (cmd_tag == MMSEQS_TAG || cmd_tag == SPADES_TAG)  // Add more tools later if needed
 }
 
 /// Parse the output of a stream, either Fastq or simple bytes.
