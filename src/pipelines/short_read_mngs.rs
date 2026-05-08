@@ -55,7 +55,6 @@ use crate::cli::Technology;
 use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode, ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType, Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE, SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, MMSEQS_TAG, ClusterInfo, DuplicateClusters, PairingMode, NRAlignmentBackend, SORT_TAG};
 use crate::utils::blast::{parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
                           TaxonCount, ContigSummaryEntry, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
-use crate::utils::command::prepend_numactl_if_beneficial;
 use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
 use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
@@ -3100,19 +3099,10 @@ async fn run_diamond_single_file(
             error: e.to_string(),
         })?;
 
-    // === NUMA INTEGRATION ===
-    let final_diamond_args = prepend_numactl_if_beneficial(
-        &config,
-        diamond_args,
-        DIAMOND_TAG
-    );
-
-    info!("[diamond:{}] final args (with possible numactl): {:?}", label, final_diamond_args);
-
     let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
         config.clone(),
         DIAMOND_TAG,
-        final_diamond_args,          // ← Use the NUMA-wrapped args
+        diamond_args,          // ← Use the NUMA-wrapped args
         config.args.verbose,
         None
     ).await?;
@@ -7462,11 +7452,12 @@ async fn mmseqs_fastq_to_m8_file(
         gpu_server: backend == MmseqsBackend::Gpu,
     };
 
+    // 3) search -> result DB
     let search_args = generate_cli(MMSEQS_TAG, &config, Some(&search_cfg))?;
     info!("[mmseqs:{}] search args: {:?}", label, search_args);
 
-    let final_search_args = prepend_numactl_if_beneficial(&config, search_args, MMSEQS_TAG);
-    let search_res = run_mmseqs_step(config.clone(), final_search_args, "search").await;
+    // NO manual prepend here — spawn_cmd handles NUMA automatically
+    let search_res = run_mmseqs_step(config.clone(), search_args, "search").await;
 
     if let Some(mut server) = gpu_server {
         info!("Stopping MMseqs GPU server...");
@@ -7509,8 +7500,7 @@ async fn mmseqs_fastq_to_m8_file(
 
     info!("[mmseqs:{}] convertalis args: {:?}", label, convert_args);
 
-    let final_convert_args = prepend_numactl_if_beneficial(&config, convert_args, MMSEQS_TAG);
-    run_mmseqs_step(config.clone(), final_convert_args, "convertalis").await?;
+    run_mmseqs_step(config.clone(), convert_args, "convertalis").await?;
 
     let meta = fs::metadata(&m8_path)
         .await
