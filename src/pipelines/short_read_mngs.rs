@@ -7438,7 +7438,7 @@ async fn mmseqs_fastq_to_m8_file(
             MmseqsBackend::Cpu => "1000".to_string(),
             MmseqsBackend::Gpu => "3000".to_string(),
         }),
-        prefilter_mode: Some("1".to_string()),
+        prefilter_mode: Some("0".to_string()),
         db_load_mode: Some("2".to_string()),
         alignment_mode: Some("3".to_string()),
 
