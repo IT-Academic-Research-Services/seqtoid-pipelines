@@ -585,14 +585,14 @@ pub async fn spawn_cmd(
 
     let cmd_tag_owned = cmd_tag.to_string();
 
-    // === NUMA SUPPORT - ONLY for tools that actually benefit ===
+    // === NUMA SUPPORT - ONLY for tools that benefit ===
     let (binary, final_args) = if should_use_numactl(config.as_ref(), cmd_tag) {
         let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag_owned.clone()];
         numa_args.extend(args);
         debug!("spawn_cmd: Prepended numactl --interleave=all for {}", cmd_tag);
         ("numactl", numa_args)
     } else {
-        ("", args)  // empty string means use the original cmd_tag
+        ("", args)   // empty string = use original binary
     };
 
     eprintln!("[{} cmd]: {}", cmd_tag, final_args.join(" "));
