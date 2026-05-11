@@ -1995,7 +1995,7 @@ async fn subsample_weighted(
         return Ok((ReceiverStream::new(rx), count_rx, tokio::spawn(async { Ok(()) })));
     }
 
-    let mut rng = StdRng::seed_from_u64(seed); // reproducible
+    let mut rng = config.rng.clone();
 
     let mut reservoir: Vec<WeightedSampleItem> = Vec::with_capacity(max_subsample as usize);
     let mut stream = ReceiverStream::new(uniques_stream);
@@ -7605,13 +7605,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let paired = file2_path.is_some();
 
     debug!("file1 path: {:?}  sample base buf: {:?}  sample base: {:?}", file1_path.display(), sample_base_buf.display(), sample_base);
-
-    let _seed = config.args.seed.unwrap_or_else(|| {
-        let mut bytes = [0u8; 8];
-        OsRng.fill_bytes(&mut bytes);
-        let random_seed = u64::from_le_bytes(bytes);
-        random_seed
-    });
 
     let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
 
