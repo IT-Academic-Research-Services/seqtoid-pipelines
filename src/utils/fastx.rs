@@ -1999,7 +1999,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn compare_header(head: &[u8], prefix: char) {
-        let _scalar = parse_header_scalar(head, prefix);
+        let scalar = parse_header_scalar(head, prefix);
         #[cfg(target_arch = "x86_64")]
         {
             let avx = parse_header_avx512(head, prefix);
