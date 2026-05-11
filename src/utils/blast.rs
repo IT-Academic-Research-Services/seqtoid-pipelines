@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     fn compare_nt(line: &str) {
-        let _scalar = M8Record::parse_line_nt_scalar(line).expect("NT scalar failed");
+        let scalar = M8Record::parse_line_nt_scalar(line).expect("NT scalar failed");
         #[cfg(target_arch = "x86_64")]
         {
             let avx = M8Record::parse_line_nt_avx512(line).expect("NT avx512 failed");
@@ -1072,7 +1072,7 @@ mod tests {
     }
 
     fn compare_nr(line: &str) {
-        let _scalar = M8Record::parse_line_nr_scalar(line).expect("NR scalar failed");
+        let scalar = M8Record::parse_line_nr_scalar(line).expect("NR scalar failed");
         #[cfg(target_arch = "x86_64")]
         {
             let avx = M8Record::parse_line_nr_avx512(line).expect("NR avx512 failed");
