@@ -2000,12 +2000,9 @@ mod tests {
 
     fn compare_header(head: &[u8], prefix: char) {
         let scalar = parse_header_scalar(head, prefix);
-        #[cfg(target_arch = "x86_64")]
-        {
-            let avx = parse_header_avx512(head, prefix);
-            assert_eq!(scalar.0, avx.0, "id mismatch for {:?}", std::str::from_utf8(head));
-            assert_eq!(scalar.1, avx.1, "desc mismatch for {:?}", std::str::from_utf8(head));
-        }
+        let dispatched = parse_header(head, prefix);
+        assert_eq!(scalar.0, dispatched.0, "id mismatch for {:?}", std::str::from_utf8(head));
+        assert_eq!(scalar.1, dispatched.1, "desc mismatch for {:?}", std::str::from_utf8(head));
     }
 
     #[test]
