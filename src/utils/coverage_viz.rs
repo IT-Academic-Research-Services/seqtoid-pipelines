@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use log::{self, debug, error, info, warn, LevelFilter};
+use log::{self, warn};
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};

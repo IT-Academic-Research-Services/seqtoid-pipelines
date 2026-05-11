@@ -1,21 +1,14 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
-use log::{self, LevelFilter, debug, info, error, warn};
-use num_cpus;
+use log::{self, debug, info, warn};
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG, MMSEQS_TAG};
-use crate::cli::Arguments;
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG, MMSEQS_TAG};
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::fs;
-use tokio::task::JoinHandle;
-use tempfile::{NamedTempFile, TempDir};
-use fxhash::FxHashMap;
-use crate::utils::file::{write_vecu8_to_file, extension_remover};
-use crate::utils::streams::{spawn_cmd};
+use crate::utils::streams::spawn_cmd;
 
 
 pub trait ArgGenerator {
@@ -130,7 +123,7 @@ pub mod fastp {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug};
     use crate::config::defs::{FASTP_TAG,  RunConfig};
     use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
@@ -200,12 +193,13 @@ pub mod fastp {
 }
 
 mod pigz {
-    use crate::config::defs::{FASTP_TAG, PIGZ_TAG, RunConfig};
+    use crate::config::defs::{PIGZ_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct PigzArgGenerator;
 
+    #[allow(dead_code)]
     pub async fn pigz_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -223,11 +217,9 @@ mod pigz {
 }
 
 mod h5dump {
-    use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{H5DUMP_TAG, RunConfig};
     use crate::utils::command::version_check;
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub async fn h5dump_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None, &config).await?;
@@ -242,7 +234,7 @@ pub mod minimap2 {
     use tokio::fs;
     use tokio::task::JoinHandle;
     use tempfile::{NamedTempFile, TempDir};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug, info};
     use anyhow::{anyhow, Result};
     use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG, FASTA_EXTS};
     use crate::utils::file::available_space_for_path;
@@ -499,7 +491,7 @@ pub mod minimap2 {
 
             let mut args_vec: Vec<String> = Vec::new();
 
-            let mut threads = if let Some(override_threads) = config.num_threads {
+            let threads = if let Some(override_threads) = config.num_threads {
                 override_threads
             } else {
                 run_config.thread_allocation(MINIMAP2_TAG, None)
@@ -536,9 +528,8 @@ pub mod minimap2 {
 pub mod samtools {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
     use crate::utils::command::{version_check, ArgGenerator};
 
     #[derive(Debug)]
@@ -638,10 +629,9 @@ pub mod samtools {
 pub mod bcftools {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
-    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig, SAMTOOLS_TAG};
+    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
     pub struct BcftoolsConfig {
@@ -707,9 +697,8 @@ pub mod bcftools {
 pub mod kraken2 {
     use anyhow::anyhow;
     use std::path::PathBuf;
-    use tokio::process::Command;
     use crate::config::defs::{KRAKEN2_TAG, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
@@ -771,11 +760,10 @@ pub mod kraken2 {
 pub mod ivar {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::RunConfig;
     use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
     pub struct IvarConfig {
@@ -824,11 +812,9 @@ pub mod ivar {
 }
 
 pub mod muscle {
-    use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{RunConfig,  MUSCLE_TAG};
     use crate::utils::command::version_check;
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct MuscleArgGenerator;
     pub async fn muscle_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
@@ -838,11 +824,9 @@ pub mod muscle {
 }
 
 pub mod mafft {
-    use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{MAFFT_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct MafftArgGenerator;
     pub async fn mafft_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
@@ -867,10 +851,9 @@ pub mod mafft {
 
 pub mod quast {
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{QUAST_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct QuastArgGenerator;
 
@@ -887,7 +870,6 @@ pub mod quast {
 
     impl ArgGenerator for QuastArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<QuastConfig>())
                 .ok_or_else(|| anyhow!("Quast requires a QuastConfig as extra argument"))?;
@@ -917,10 +899,9 @@ pub mod quast {
 pub mod nucmer {
     use anyhow::anyhow;
     use std::path::PathBuf;
-    use tokio::process::Command;
-    use crate::config::defs::{NUCMER_DELTA, NUCMER_TAG, RunConfig};
+    use crate::config::defs::{NUCMER_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct NucmerArgGenerator;
 
@@ -955,15 +936,13 @@ pub mod nucmer {
 }
 
 pub mod show_coords {
-    use anyhow::anyhow;
-    use crate::config::defs::RunConfig;
-    use crate::config::defs::{SHOW_COORDS_TAG, NUCMER_DELTA};
+    use crate::config::defs::{RunConfig, NUCMER_DELTA};
     use crate::utils::command::ArgGenerator;
 
     pub struct ShowCoordsArgGenerator;
 
     impl ArgGenerator for ShowCoordsArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, _run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let mut args_vec: Vec<String> = Vec::new();
 
             args_vec.push("-r".to_string());
@@ -978,11 +957,10 @@ pub mod show_coords {
 pub mod seqkit {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::RunConfig;
     use crate::config::defs::{SeqkitSubcommand, SEQKIT_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
     pub struct SeqkitConfig {
@@ -998,7 +976,7 @@ pub mod seqkit {
     }
 
     impl ArgGenerator for SeqkitArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, _run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<SeqkitConfig>())
                 .ok_or_else(|| anyhow!("Seqkit requires a SeqkitConfig as extra argument"))?;
@@ -1039,7 +1017,7 @@ pub mod bowtie2 {
     use anyhow::{anyhow, Result};
     use std::fs::{self, DirEntry};
     use std::process::Command;
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self,debug};
     use crate::config::defs::{RunConfig, BOWTIE2_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
@@ -1243,7 +1221,7 @@ pub mod hisat2 {
     use std::path::{Path, PathBuf};
     use std::collections::HashMap;
     use anyhow::{anyhow, Result};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug};
     use std::fs::{self, DirEntry};
     use std::process::Command;
     use crate::config::defs::{RunConfig, HISAT2_TAG};
@@ -1504,7 +1482,7 @@ pub mod kallisto {
 pub mod star {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug};
     use anyhow::{anyhow, Result};
     use std::fs::{self, DirEntry};
     use std::process::Command;
@@ -1735,23 +1713,18 @@ pub mod czid_dedup {
 
 pub mod diamond {
 
-    const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::path::Path;
     use regex::Regex;
-    use log::{debug, info, error, warn};
-    use tokio::fs::{self, DirEntry};
+    use log::{debug, info, warn};
     use tokio::task::JoinHandle;
     use tokio::process::Command;
-    use tempfile::{NamedTempFile, TempDir};
     use anyhow::{anyhow, Result as AnyhowResult};
     use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, PipelineError};
-    use crate::utils::file::{available_space_for_path, choose_temp_dir};
+    use crate::utils::file::{available_space_for_path};
     use crate::utils::system::detect_ram;
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream, spawn_cmd};
+    use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
 
     #[derive(Debug)]
@@ -1877,9 +1850,9 @@ pub mod diamond {
 
         let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
         let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
-        let db_size_gb = std::fs::metadata(&db_path)
-            .map(|m| m.len() as f64 / 1_073_741_824.0)
-            .unwrap_or(50.0);
+        // let db_size_gb = std::fs::metadata(&db_path)
+        //     .map(|m| m.len() as f64 / 1_073_741_824.0)
+        //     .unwrap_or(50.0);
 
         let scratch_avail_gib = scratch_avail as f64 / 1_073_741_824.0;
 
@@ -1954,7 +1927,7 @@ pub mod spades {
     use crate::config::defs::{SPADES_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
-    use log::{debug, info, error, warn};
+    use log::{info};
 
     pub struct SpadesConfig {
         pub r1_path: PathBuf,                // Always required (R1 or single-end)
@@ -2053,7 +2026,7 @@ pub mod makeblastdb {
     }
 
     impl ArgGenerator for MakeblastdbArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, _run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<MakeblastdbConfig>())
                 .ok_or_else(|| anyhow!("makeblastdb requires MakeblastdbConfig as extra argument"))?;
@@ -2219,7 +2192,7 @@ pub mod blastx {
 pub mod sort {
     use std::collections::HashMap;
     use anyhow::{anyhow, Result};
-    use crate::config::defs::{RunConfig, PipelineError};
+    use crate::config::defs::RunConfig;
     use crate::utils::command::{ArgGenerator, version_check};
     use crate::utils::streams::ChildStream;
 
@@ -2486,46 +2459,9 @@ pub mod mmseqs {
             debug!("MMseqs2: GPU server client mode enabled (--gpu-server 1 --db-load-mode 2)");
         }
     }
+    
 
-    fn push_search_common_flags(
-        args: &mut Vec<String>,
-        run_config: &RunConfig,
-        config: &MmseqsConfig,
-        is_easy_search: bool,
-    ) {
-        push_threads(args, run_config, config.threads);
-
-        if let Some(st) = &config.search_type {
-            args.push("--search-type".to_string());
-            args.push(st.clone());
-        }
-
-        if let Some(ms) = &config.max_seqs {
-            args.push("--max-seqs".to_string());
-            args.push(ms.clone());
-        }
-
-        if let Some(pm) = &config.prefilter_mode {
-            args.push("--prefilter-mode".to_string());
-            args.push(pm.clone());
-        }
-
-        if config.backend == MmseqsBackend::Cpu {
-            if let Some(s) = &config.sensitivity {
-                args.push("-s".to_string());
-                args.push(s.clone());
-            }
-        } else if !is_easy_search {
-            if let Some(s) = &config.sensitivity {
-                args.push("-s".to_string());
-                args.push(s.clone());
-            }
-        }
-
-        push_option_fields(args, &config.option_fields);
-    }
-
-    pub async fn mmseqs_presence_check(config: &RunConfig)-> Result<f32> {
+    pub async fn mmseqs_presence_check(_config: &RunConfig)-> Result<f32> {
         let output = Command::new(MMSEQS_TAG)
             .arg("version")
             .output()

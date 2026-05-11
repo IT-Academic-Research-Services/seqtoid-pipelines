@@ -14,7 +14,7 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
 
 
 
-    let (taxid_dir_path, _file2_path, no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
+    let (taxid_dir_path, _file2_path, _no_ext_sample_base_buf, _no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
 
     let metadata = fs::metadata(taxid_dir_path.clone())?;
     let file_type = metadata.file_type();

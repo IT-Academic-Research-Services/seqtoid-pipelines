@@ -5,12 +5,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
-use std::collections::HashMap;
 use std::process::Command;
-use std::arch::is_x86_feature_detected;
 
-use log::{self, LevelFilter, debug, info, error, warn};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use log::{self, debug, info, error, warn};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::time::sleep;
 use tokio::process::Command as TokioCommand;
 use anyhow::{anyhow, Result};
@@ -18,7 +16,6 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_core::{OsRng, RngCore};
 
-use crate::cli::args::{Arguments, Technology};
 use crate::config::defs::{RunConfig, StreamDataType, SimdLevel, GpuDetection, GpuInfo};
 
 
@@ -283,6 +280,7 @@ pub fn get_ram_temp_dir() -> PathBuf {
 
 
 /// The iostat functions below are currently unused and just here for future use.
+#[allow(dead_code)]
 async fn monitor_io_utilization(device: String) {
     loop {
         match run_iostat(&device).await {
@@ -304,6 +302,7 @@ async fn monitor_io_utilization(device: String) {
 }
 
 // Helper: Run iostat -x -d <device> 1 1 (once, extended disk stats)
+#[allow(dead_code)]
 async fn run_iostat(device: &str) -> Result<Output> {
     TokioCommand::new("iostat")
         .args(&["-x", "-d", device, "1", "1"])  // Extended, device-specific, 1s interval, count=1
@@ -313,6 +312,7 @@ async fn run_iostat(device: &str) -> Result<Output> {
 }
 
 // Helper: Parse %util from iostat output (e.g., look for line with device and extract last column)
+#[allow(dead_code)]
 fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
     for line in output.lines() {
         if line.contains(device) && !line.contains("Device") {  // Skip header
@@ -367,7 +367,7 @@ pub fn detect_gpus() -> Result<GpuDetection> {
     }
 }
 
-
+#[allow(dead_code)]
 fn detect_nvidia() -> Result<GpuDetection> {
     // Query name + memory + driver
     let output = Command::new("nvidia-smi")
@@ -467,6 +467,7 @@ fn detect_macos() -> Result<GpuDetection> {
     })
 }
 
+#[allow(dead_code)]
 fn detect_lspci_basic() -> Result<GpuDetection> {
     let output = Command::new("lspci")
         .arg("-mm")           // machine-readable format, easier to parse

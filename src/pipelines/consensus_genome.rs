@@ -7,25 +7,20 @@ use tokio_stream::StreamExt;
 use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tempfile::{NamedTempFile, TempDir};
-use log::{self, LevelFilter, debug, info, error, warn};
+use log::{self, debug, info, error};
 use tokio::task::JoinHandle;
-use std::time::Instant;
-use tokio::fs;
 use tokio::fs::File as TokioFile;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc::Receiver;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use futures::future::try_join_all;
-use futures::TryFutureExt;
-use fxhash::FxHashMap as FxHashMap;
-use tokio::io::{BufWriter, AsyncWriteExt};
 
 use crate::cli::Technology;
 use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
-use crate::utils::file::{extension_remover, file_path_manipulator, write_parse_output_to_temp_fifo, write_vecu8_to_file, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir};
-use crate::utils::fastx::{read_fastq, r1r2_base, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
+use crate::utils::file::{file_path_manipulator, write_parse_output_to_temp_fifo, validate_file_inputs, choose_temp_dir};
+use crate::utils::fastx::{read_fastq, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
 use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand, PairingMode};
 use crate::utils::command::samtools::SamtoolsConfig;
@@ -34,7 +29,7 @@ use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
 use crate::config::defs::{RunConfig, ReadStats};
 use crate::utils::command::quast::QuastConfig;
-use crate::utils::command::minimap2::{Minimap2ArgGenerator, Minimap2Config, minimap2_index_prep};
+use crate::utils::command::minimap2::{Minimap2Config, minimap2_index_prep};
 use crate::utils::stats::{parse_samtools_stats, parse_samtools_depth, compute_depth_stats, parse_seqkit_stats, parse_ercc_stats, compute_allele_counts, compute_coverage_bins};
 use crate::utils::vcf::count_variants_from_bcftools_stats;
 use crate::utils::plotting::plot_depths;
@@ -84,7 +79,7 @@ async fn validate_input(
     out_dir: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -101,7 +96,6 @@ async fn validate_input(
         config.args.max_reads as u64,
         config.args.min_read_len,
         config.args.max_read_len,
-        config.base_buffer_size,  // Use as chunk_size
         "validate_input",
         &config,
     )
@@ -110,7 +104,7 @@ async fn validate_input(
     let val_rx_stream = ReceiverStream::new(rx);
 
     // Split the byte stream for output and quast write
-    let (val_streams, val_done_rx) = t_junction(
+    let (val_streams, _val_done_rx) = t_junction(
         val_rx_stream,
         2,
         config.base_buffer_size,
@@ -138,7 +132,7 @@ async fn validate_input(
             tool: PIGZ_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let (mut val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
+    let (val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
         config.clone(),
         val_pigz_stream,
         PIGZ_TAG,
@@ -217,7 +211,7 @@ async fn align_to_host(
             error: e.to_string(),
         })?;
 
-    let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
+    let (minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
@@ -266,7 +260,7 @@ async fn align_to_host(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
+    let (samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
         config.clone(),
         minimap2_out_stream,
         SAMTOOLS_TAG,
@@ -309,7 +303,7 @@ async fn align_to_host(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
+    let (samtools_child_fastq, samtools_task_fastq, samtools_err_task_fastq) = stream_to_cmd(
         config.clone(),
         samtools_out_stream_view,
         SAMTOOLS_TAG,
@@ -418,7 +412,7 @@ async fn align_to_host(
             tool: PIGZ_TAG.to_string(),
             error: e.to_string(),
         })?;
-    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
+    let (pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
         config.clone(),
         no_host_file_stream,
         PIGZ_TAG,
@@ -526,7 +520,7 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
-    let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
+    let (minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         alignment_stream, // Use alignment_stream, not input_stream
         MINIMAP2_TAG,
@@ -656,7 +650,7 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
+    let (samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
         config.clone(),
         sam_view_stream,
         SAMTOOLS_TAG,
@@ -699,7 +693,7 @@ async fn process_ercc(
             error: e.to_string(),
         })?;
 
-    let (mut stats_samtools_child, stats_samtools_task, stats_samtools_err_task) = stream_to_cmd(
+    let (stats_samtools_child, stats_samtools_task, stats_samtools_err_task) = stream_to_cmd(
         config.clone(),
         samtools_out_stream_view,
         SAMTOOLS_TAG,
@@ -781,7 +775,6 @@ async fn process_ercc(
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
-    target_ref_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
     target_taxid: &str,
@@ -974,19 +967,19 @@ async fn filter_with_kraken(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    let mut cleanup_receivers = vec![kraken_done_rx];
+    let cleanup_receivers = vec![kraken_done_rx];
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let check_count = check_rx.recv().await.ok_or_else(|| {
+    let _check_count = check_rx.recv().await.ok_or_else(|| {
         error!("check_rx.recv failed");
         PipelineError::EmptyStream
     })?;
 
 
     let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
-    let (mut pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
+    let (pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
         config.clone(),
         kraken_file_stream,
         PIGZ_TAG,
@@ -1086,7 +1079,7 @@ async fn align_to_target(
             error: e.to_string(),
         })?;
 
-    let (mut minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
+    let (minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
@@ -1132,7 +1125,7 @@ async fn align_to_target(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+    let (samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
         config.clone(),
         minimap2_out_stream,
         SAMTOOLS_TAG,
@@ -1207,7 +1200,7 @@ async fn align_to_target(
             error: e.to_string(),
         })?;
 
-    let (mut sam_view_child, sam_view_task, sam_view_err_task) = stream_to_cmd(
+    let (sam_view_child, sam_view_task, sam_view_err_task) = stream_to_cmd(
         config.clone(),
         sam_check_stream,
         SAMTOOLS_TAG,
@@ -1329,7 +1322,7 @@ async fn generate_consensus(
         })?;
 
 
-    let (mut trim_child, trim_task, trim_err_task) = stream_to_cmd(
+    let (trim_child, trim_task, trim_err_task) = stream_to_cmd(
         config.clone(),
         bam_stream.into_inner(),
         SAMTOOLS_TAG,
@@ -1459,7 +1452,7 @@ async fn call_variants(
             error: e.to_string(),
         })?;
 
-    let (mut bcftools_mpileup_child, bcftools_mpileup_task, bcftools_mpileup_err_task) = stream_to_cmd(
+    let (bcftools_mpileup_child, bcftools_mpileup_task, bcftools_mpileup_err_task) = stream_to_cmd(
         config.clone(),
         bam_stream.into_inner(),
         BCFTOOLS_TAG,
@@ -1508,7 +1501,7 @@ async fn call_variants(
             error: e.to_string(),
         })?;
 
-    let (mut bcftools_call_child, bcftools_call_task, bcftools_call_err_task) = stream_to_cmd(
+    let (bcftools_call_child, bcftools_call_task, bcftools_call_err_task) = stream_to_cmd(
         config.clone(),
         bcftools_mpileup_out_stream,
         BCFTOOLS_TAG,
@@ -1586,7 +1579,7 @@ async fn realign_consensus_to_ref(
     target_ref_fasta_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
-) -> Result<(Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let reference_file = TokioFile::open(&target_ref_fasta_path).await
         .map_err(|e| PipelineError::Other(e.into()))?;
     let reference_rx = parse_bytes(reference_file, &config, StreamDataType::JustBytes).await
@@ -1609,7 +1602,7 @@ async fn realign_consensus_to_ref(
             error: e.to_string(),
         })?;
     let (
-        mut realign_consensus_mafft_child,
+        realign_consensus_mafft_child,
         realign_consensus_mafft_task,
         realign_consensus_mafft_err_task
     ) = stream_to_cmd(config.clone(),
@@ -1681,7 +1674,7 @@ async fn calculate_statistics(
 
     let stats_samtools_out_stream_stats = match consensus_bam_stats_stream {
         Some(stream) => {
-            let (mut stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(config.clone(),
+            let (stats_samtools_child_stats, stats_samtools_task_stats, stats_samtools_err_task_stats) = stream_to_cmd(config.clone(),
                                                                                                                            stream.into_inner(),
                                                                                                                            SAMTOOLS_TAG,
                                                                                                                            stats_samtools_args_stats.clone(),
@@ -1717,7 +1710,7 @@ async fn calculate_statistics(
 
     let depth_samtools_out_stream = match consensus_bam_depth_stream {
         Some(stream) => {
-            let (mut depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(config.clone(),
+            let (depth_samtools_child, depth_samtools_task, depth_samtools_err_task) = stream_to_cmd(config.clone(),
                                                                                                          stream.into_inner(),
                                                                                                          SAMTOOLS_TAG,
                                                                                                          depth_samtools_args,
@@ -1784,7 +1777,7 @@ async fn calculate_statistics(
 
     let (ref_snps, ref_mnps, ref_indels) = if let Some(stream) = call_bcftools_stats_stream {
         let bcftools_stats_args = vec!["stats".to_string(), "-".to_string()];
-        let (mut bcftools_stats_child, bcftools_stats_stream_task, bcftools_stats_err_task) = stream_to_cmd(
+        let (bcftools_stats_child, bcftools_stats_stream_task, bcftools_stats_err_task) = stream_to_cmd(
             config.clone(),
             stream.into_inner(),
             BCFTOOLS_TAG,
@@ -1872,7 +1865,7 @@ async fn evaluate_assembly(
     target_ref_fasta_path: PathBuf,
     align_bam_path: PathBuf,
     consensus_file_path: PathBuf,
-) -> Result<(Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let mut cleanup_tasks = vec![];
     let quast_config = QuastConfig {
         ref_fasta: target_ref_fasta_path.to_string_lossy().into_owned(),
@@ -1959,7 +1952,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     let technology = config.args.technology.clone();
     
-    let (host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_temp_dir, host_ref_tasks) = minimap2_index_prep(
+    let (_host_ref_fasta_path, host_ref_index_path, host_ref_temp, host_index_temp, host_temp_dir, host_ref_tasks) = minimap2_index_prep(
         &config,
         &ram_temp_dir,
         config.args.host_sequence.clone(),
@@ -2042,7 +2035,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     };
     let stats_seqkit_args_stats = generate_cli(SEQKIT_TAG, &config, Some(&stats_seqkit_config_stats))?;
     let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
-    let (mut no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(
+    let (no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) = stream_to_cmd(
         config.clone(),
         no_host_seqkit_out_stream_stats,
         SEQKIT_TAG,
@@ -2105,7 +2098,6 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             let (filter_reads_out_stream, filter_reads_cleanup_tasks, filter_reads_cleanup_receivers) = filter_with_kraken(
                 config.clone(),
                 no_host_ercc_stream,
-                target_fasta.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
                 config.args.target_taxid.as_ref().expect("target_taxid must be set"),

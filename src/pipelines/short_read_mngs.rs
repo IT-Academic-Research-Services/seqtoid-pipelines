@@ -1,15 +1,12 @@
-use std::cmp::Reverse;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hash::Hasher;
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{BufRead, BufReader};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-use std::collections::hash_map::DefaultHasher;
-use std::process::{Command as StdCommand, Stdio};
 
 use ahash::AHashMap;
 use ahash::RandomState as AHashRandomState;
@@ -19,83 +16,74 @@ use dashmap::DashMap;
 use rand::seq::SliceRandom;
 use fst::Map;
 use futures::future::try_join_all;
-use log::{self, debug, error, info, warn, LevelFilter};
+use log::{self, debug, error, info, warn};
 use needletail::parse_fastx_file;
 use noodles::bam::r#async::io::Reader as BamAsyncReader;
 use noodles::bam::record::Record;
-use noodles::sam::alignment::record::cigar::{op::Kind as OpKind, Op};
-use once_cell::sync::Lazy;
+use noodles::sam::alignment::record::cigar::{op::Kind as OpKind};
 use rand::prelude::*;
 use rand_core::{OsRng, RngCore};
-use regex::Regex;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use tokio::fs;
-use tokio::fs::{File as TokioFile, OpenOptions as TokioOpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
+use tokio::fs::{File as TokioFile};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{Sender};
 use tokio::sync::oneshot;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::process::Child;
 use tokio::time::{sleep, Duration, Instant};
 use tokio::try_join;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::{StreamExt};
 use tokio_util::io::StreamReader;
-use tokio::runtime::Builder as RuntimeBuilder;
-use tokio::task::spawn_blocking;
 use twox_hash::XxHash64;
 use rayon::prelude::*;
-use crate::cli::Technology;
-use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode, ReadStats, RunConfig, SamtoolsStats, SamtoolsSubcommand, StreamDataType, Taxid, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, KRAKEN2_TAG, LOG_NORMAL_POSITIVE_DOUBLE, MAFFT_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, PIGZ_TAG, QUAST_TAG, READ_COUNTING_MODE, SAMTOOLS_TAG, SEQKIT_TAG, SPADES_TAG, STAR_TAG, MMSEQS_TAG, ClusterInfo, DuplicateClusters, PairingMode, NRAlignmentBackend, SORT_TAG};
-use crate::utils::blast::{parse_summary_batch, parse_m8_metrics_batch, parse_m8_acc_batch, consensus_level, generate_taxon_count_json_from_m8, AggBucket, M8Record,
-                          TaxonCount, ContigSummaryEntry, SpeciesAlignmentResults, ReducedRead, PendingRead, WorkerMsg, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
-use crate::utils::command::blastn::{BlastnArgGenerator, BlastnConfig};
-use crate::utils::command::blastx::{BlastxArgGenerator, BlastxConfig};
+
+
+use crate::config::defs::{DiamondSubcommand, KallistoSubcommand, Lineage, PipelineError, ReadCountingMode, ReadStats, RunConfig, SamtoolsSubcommand, StreamDataType, Taxid, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG,  DIAMOND_TAG, FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, NR_TAG, NT_TAG, READ_COUNTING_MODE, SAMTOOLS_TAG, SPADES_TAG, MMSEQS_TAG, ClusterInfo, DuplicateClusters, PairingMode, NRAlignmentBackend, SORT_TAG};
+use crate::utils::blast::{ generate_taxon_count_json_from_m8, AggBucket, M8Record,
+                          TaxonCount, ContigSummaryEntry, SpeciesAlignmentResults, read_id_from_m8_line, shard_for_read_id, summarize_m8_hits, process_record_pair, merge_aggregations, build_taxon_counts_list};
+use crate::utils::command::blastn::BlastnConfig;
+use crate::utils::command::blastx::BlastxConfig;
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
-use crate::utils::command::czid_dedup::CzidDedupConfig;
-use crate::utils::command::diamond::{diamond_index_prep, DiamondArgGenerator, DiamondConfig, compute_optimal_block_size};
+use crate::utils::command::diamond::{diamond_index_prep, DiamondConfig, compute_optimal_block_size};
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::hisat2::{hisat2_index_prep, Hisat2Config};
 use crate::utils::command::kallisto::KallistoConfig;
-use crate::utils::command::makeblastdb::{MakeblastdbArgGenerator, MakeblastdbConfig};
-use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2ArgGenerator, Minimap2Config};
+use crate::utils::command::makeblastdb::MakeblastdbConfig;
+use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2Config};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::mmseqs::{MmseqsBackend, MmseqsConfig, MmseqsSubcommand};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::coverage_viz::generate_coverage_viz;
-use crate::utils::fastx::{compare_read_ids, parse_header, raw_read_count, read_fasta,
+use crate::utils::fastx::{raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file,
                           SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
                           filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq, write_combined_fastq};
-use crate::utils::file::{available_space_for_path, choose_temp_dir, file_path_manipulator,
+use crate::utils::file::{choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
                          write_vecu8_to_file};
-use crate::utils::paf::{PafRecord, parse_paf_batch_to_m8};
+use crate::utils::paf::{parse_paf_batch_to_m8};
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
-use crate::utils::stats::parse_samtools_stats;
-use crate::utils::streams::{create_fifo, deinterleave_fastq_stream, interleave_fastq_streams, join_with_error_handling,
-                            parse_child_output, parse_fasta, parse_fastq, read_child_output_to_vec, spawn_cmd,
-                            stream_to_cmd, stream_to_file, write_to_fifo,
+use crate::utils::streams::{deinterleave_fastq_stream, join_with_error_handling,
+                            parse_child_output, parse_fastq, read_child_output_to_vec, spawn_cmd,
+                            stream_to_cmd, stream_to_file,
                             ChannelReader, ChildStream, ParseMode,
                             ParseOutput, ToBytes, monitor_stream, batch_rayon_process, parse_bytes, parse_lines, fanout_to_channels};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
-use crate::utils::system::{detect_ram, compute_phase_concurrency, compute_batch_size};
+use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
-                             get_top_m8_nt, load_taxid_lineages_db, validate_taxid_lineage};
+                             get_top_m8_nt, load_taxid_lineages_db};
 
-const UNMAPPED_HEADER_PREFIX: &str = ">NR::NT::";
-const MAX_ACCESSION_SEQUENCE_LEN: u64 = 100_000_000;
-const EST_BYTES_PER_ACCESSION: u64 = 20_000; // ~10k seq + header
-const MAX_PARSE_ERRORS: usize = 100; // Threshold before failing
 const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
@@ -104,20 +92,7 @@ const MIN_CONTIG_SIZE: u64 = 500;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
-const MIN_ASSEMBLY_READ_COUNT: usize = 56;
 
-const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
-
-const MM2_TARGET_THREADS_PER : usize = 8;
-
-const EST_GB_PER_MM2_JOB_STD: f64 = 80.0;   // conservative for 1 TB, gives ~6 jobs
-const EST_GB_PER_MM2_JOB_EXTRA: f64 = 100.0;  // for 1.5 TB, gives ~10–12 jobs
-const MM2_JOB_RAM_THRESHOLD: usize = 1400;
-
-
-static FIX_COMMA_REGEXP: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r",(?=[^\s])").unwrap()
-});
 
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -126,6 +101,7 @@ pub struct KallistoResults {
 }
 
 // SampleItem for reservoir sampling
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SampleItem {
     key: f64, // For A-Res sampling
@@ -287,6 +263,7 @@ pub struct AccessionHit {
 }
 
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct Cluster {
     rep_id: String,
@@ -295,6 +272,7 @@ struct Cluster {
 }
 
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct WeightedSampleItem {
     key: f64,
@@ -322,7 +300,7 @@ async fn validate_input(
     out_dir: &PathBuf,
 ) -> anyhow::Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<u64, anyhow::Error>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
 
     let validated_interleaved_file_path = file_path_manipulator(
@@ -344,7 +322,6 @@ async fn validate_input(
         config.args.max_reads as u64,
         config.args.min_read_len,
         config.args.max_read_len,
-        config.base_buffer_size,
         "validate_input",
         &config,
     )
@@ -426,7 +403,7 @@ async fn bowtie2_align_and_sort_stream(
 ), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     let temp_dir = choose_temp_dir(
         config.input_size,
@@ -450,7 +427,7 @@ async fn bowtie2_align_and_sort_stream(
 
     let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config))?;
 
-    let (mut bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
+    let (bt2_child, bt2_stream_task, bt2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),
         BOWTIE2_TAG,
@@ -485,7 +462,7 @@ async fn bowtie2_align_and_sort_stream(
 
     let sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&sort_config))?;
 
-    let (mut sort_child, sort_task, sort_err_task) = stream_to_cmd(
+    let (sort_child, sort_task, sort_err_task) = stream_to_cmd(
         config.clone(),
         bt2_out,
         SAMTOOLS_TAG,
@@ -621,7 +598,7 @@ async fn bowtie2_filter_stream(
 
     let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
 
-    let (mut child, stdin_task, err_task) = stream_to_cmd(
+    let (child, stdin_task, err_task) = stream_to_cmd(
         config.clone(),
         fastq_input_stream.into_inner(),
         SAMTOOLS_TAG,
@@ -719,7 +696,7 @@ async fn bowtie2_filter_files(
 
     let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
 
-    let (mut child, stdin_task, err_task) = stream_to_cmd(
+    let (child, stdin_task, err_task) = stream_to_cmd(
         config.clone(),
         fastq_input_stream.into_inner(),
         SAMTOOLS_TAG,
@@ -785,7 +762,7 @@ async fn hisat2_filter(
 ), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     let temp_dir = choose_temp_dir(
         config.input_size * headroom,
@@ -953,7 +930,6 @@ async fn hisat2_filter(
         u64::MAX,
         None,
         None,
-        config.base_buffer_size,
         "hisat2_filter",
         &config,
     ).map_err(|e| PipelineError::Other(e))?;
@@ -1014,7 +990,7 @@ async fn fastp_qc(
     input_stream: ReceiverStream<ParseOutput>,
 ) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, oneshot::Receiver<Result<u64, anyhow::Error>>), PipelineError>{
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     let qc_fastp_config_view = FastpConfig {
 
@@ -1039,7 +1015,7 @@ async fn fastp_qc(
             error: e.to_string(),
         })?;
 
-    let (mut qc_fastp_child, qc_fastp_stream_task, qc_fastp_err_task) = stream_to_cmd(
+    let (qc_fastp_child, qc_fastp_stream_task, qc_fastp_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),
         FASTP_TAG,
@@ -1142,7 +1118,7 @@ async fn kallisto_quant(
     JoinHandle<Result<(), anyhow::Error>>,
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     // Convert sample_base_buf to &str
     let sample_base = sample_base_buf
@@ -1156,9 +1132,6 @@ async fn kallisto_quant(
     fs::create_dir_all(&kallisto_out_dir).await
         .map_err(|e| PipelineError::IOError(format!("Failed to create Kallisto output directory: {}", e)))?;
     debug!("Kallisto output dir created/confirmed: {}", kallisto_out_dir.display());
-
-    let kallisto_index = config.args.kallisto_index.clone()
-        .ok_or(PipelineError::MissingArgument("kallisto_index required".to_string()))?;
 
     // Convert raw byte stream to FASTQ
     let byte_rx = input_stream.into_inner();
@@ -1390,6 +1363,7 @@ async fn kallisto_results(
 /// - Vec of cleanup receivers
 /// - Optional temporary FASTA file for host reference.
 /// - Optional temporary minimap2 index file.
+#[allow(dead_code)]
 async fn minimap2_filter(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -1407,7 +1381,7 @@ async fn minimap2_filter(
     PipelineError,
 > {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
     let mut temp_dirs: Vec<TempDir> = Vec::new();
     let mut named_temp_files: Vec<NamedTempFile> = Vec::new();
 
@@ -1420,7 +1394,7 @@ async fn minimap2_filter(
     ).await?;
 
 
-    let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, host_temp_dir,  mut host_ref_tasks) =
+    let (_host_ref_fasta_path, host_index_path, host_ref_temp, host_index_temp, host_temp_dir,  host_ref_tasks) =
         minimap2_index_prep(
             &config,
             &config.ram_temp_dir,
@@ -1465,7 +1439,7 @@ async fn minimap2_filter(
         })?;
 
 
-    let (mut minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
+    let (minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),
         MINIMAP2_TAG,
@@ -1514,7 +1488,7 @@ async fn minimap2_filter(
             error: e.to_string(),
         })?;
 
-    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+    let (samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
         config.clone(),
         minimap2_out_stream,
         SAMTOOLS_TAG,
@@ -1605,7 +1579,7 @@ async fn minimap2_filter(
             error: e.to_string(),
         })?;
 
-    let (mut count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
+    let (count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
         config.clone(),
         bam_count_stream.into_inner(),
         SAMTOOLS_TAG,
@@ -1628,7 +1602,6 @@ async fn minimap2_filter(
         async move {
             let mut guard = count_child_arc.lock().await;
             let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout, &config).await?;
-            // ... rest of your code
             Ok(())
         }
     });
@@ -1653,7 +1626,7 @@ async fn minimap2_filter(
             error: e.to_string(),
         })?;
 
-    let (mut fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
+    let (fastq_child, fastq_stream_task, fastq_err_task) = stream_to_cmd(
         config.clone(),
         unmapped_stream.into_inner(),
         SAMTOOLS_TAG,
@@ -1710,7 +1683,7 @@ async fn dedup(
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup rx
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     // CPU-bound hashing, moderate memory
     let num_workers = compute_phase_concurrency(
@@ -2002,6 +1975,7 @@ async fn dedup_worker(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn subsample_weighted(
     config: Arc<RunConfig>,
     uniques_stream: mpsc::Receiver<ParseOutput>,
@@ -2025,7 +1999,6 @@ async fn subsample_weighted(
 
     let mut reservoir: Vec<WeightedSampleItem> = Vec::with_capacity(max_subsample as usize);
     let mut stream = ReceiverStream::new(uniques_stream);
-    let mut seen = 0u64;
 
     while let Some(item) = stream.next().await {
         let record = match item {
@@ -2038,9 +2011,8 @@ async fn subsample_weighted(
             .get(&rep_id)
             .map_or(1u64, |c| c.size as u64);
 
-        seen += 1;
 
-        let key = rng.gen::<f64>().powf(1.0 / weight as f64);
+        let key = rng.random::<f64>().powf(1.0 / weight as f64);
 
         if reservoir.len() < max_subsample as usize {
             reservoir.push(WeightedSampleItem { key, record, weight });
@@ -2324,7 +2296,7 @@ pub async fn minimap2_non_host_align(
                     num_threads: Some(threads_per_job),
                 };
 
-                let mut args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
+                let args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
                     .context("Failed to generate minimap2 args")?;
 
                 debug!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
@@ -2342,7 +2314,6 @@ pub async fn minimap2_non_host_align(
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = tokio::io::BufReader::new(stdout);
                     let mut line = String::new();
-                    let mut lines_sent = 0u64;
 
                     while reader.read_line(&mut line).await? > 0 {
                         let trimmed = line.trim_end();
@@ -2353,7 +2324,6 @@ pub async fn minimap2_non_host_align(
                             if out_tx.send(ParseOutput::Bytes(Bytes::from(bytes))).await.is_err() {
                                 break;
                             }
-                            lines_sent += 1;
                         }
                         line.clear();
                     }
@@ -2377,7 +2347,7 @@ pub async fn minimap2_non_host_align(
 
     // Merge all worker output streams fairly.
     let merger_handle = tokio::spawn({
-        let mut merged_tx = merged_tx;
+        let merged_tx = merged_tx;
         let mut merged_stream = futures::stream::select_all(worker_output_streams);
         async move {
             while let Some(item) = merged_stream.next().await {
@@ -2722,7 +2692,7 @@ pub async fn call_hits_m8(
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     min_aln_len: u64,
     concurrency: usize,
-    mut tag: String,
+    tag: String,
 ) -> Result<(
     ReceiverStream<ParseOutput>, // dedup m8 stream
     ReceiverStream<ParseOutput>, // summary stream
@@ -2731,7 +2701,7 @@ pub async fn call_hits_m8(
 ), PipelineError> {
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
+    let cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
 
     info!(
         "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
@@ -2951,11 +2921,7 @@ pub async fn call_hits_m8(
         }
 
         // Flush all workers after all reads have been dispatched.
-        for (idx, tx) in worker_txs.iter().enumerate() {
-            // debug!(
-            //     "[call_hits_m8:{}] flushing worker {}",
-            //     coordinator_tag, idx
-            // );
+        for (_, tx) in worker_txs.iter().enumerate() {
             tx.send(WorkerMsg::Flush)
                 .await
                 .context("failed to flush worker")?;
@@ -3102,7 +3068,7 @@ async fn run_diamond_single_file(
     let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
         config.clone(),
         DIAMOND_TAG,
-        diamond_args,          // ← Use the NUMA-wrapped args
+        diamond_args,
         config.args.verbose,
         None
     ).await?;
@@ -3169,7 +3135,7 @@ async fn diamond_non_host_align(
     Vec<TempDir>
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
 
     let temp_dir = choose_temp_dir(
         100_000_000_000,
@@ -3319,7 +3285,6 @@ pub async fn generate_taxon_counts(
                 let mut total_pairs = 0usize;
                 let mut max_recv_wait = Duration::from_secs(0);
                 let mut max_batch_process = Duration::from_secs(0);
-                let mut last_log = Instant::now();
                 let start = Instant::now();
 
                 loop {
@@ -3638,7 +3603,7 @@ pub async fn compute_merged_taxon_counts(
     nr_hit_summary_stream: mpsc::Receiver<ParseOutput>,
     nr_contig_summary: Vec<ContigSummaryEntry>,
 
-    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    _lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
 
@@ -3646,7 +3611,7 @@ pub async fn compute_merged_taxon_counts(
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
+    _nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
 ) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
@@ -3741,7 +3706,7 @@ pub async fn compute_merged_taxon_counts(
 
                 let nr_align = nr_alignment_map.get(read_id);
                 let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
-                let has_nr_read   = nr_align.map_or(false, |a| a.read.is_some());
+                let _has_nr_read   = nr_align.map_or(false, |a| a.read.is_some());
 
                 if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
                     let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
@@ -4241,6 +4206,7 @@ pub async fn generate_annotated_fasta_stream(
 }
 
 
+#[allow(dead_code)]
 async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow::Error> {
     let contigs     = assembly_dir.join("contigs.fasta");
     let contigs_all = assembly_dir.join("contigs_all.fasta");
@@ -4463,7 +4429,7 @@ pub async fn process_assembly(
     Vec<NamedTempFile>,
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
     let raw_contigs_path = work_dir.join("contigs.fasta");
@@ -4613,7 +4579,6 @@ pub async fn process_assembly(
         u64::MAX,
         Some(config.args.min_contig_length),
         None,
-        8192,
         &config
     )
         .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
@@ -4751,7 +4716,7 @@ pub async fn process_assembly(
 
     info!("[assembly] samtools sort args generated: {:?}", samtools_sort_args);
 
-    let (mut samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+    let (samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
         config.clone(),
         bt2_out_stream,
         SAMTOOLS_TAG,
@@ -5166,7 +5131,6 @@ pub async fn build_reference_fasta_from_selected_genera(
     let mut reader = BufReader::new(file);
 
     // Estimate size (use existing temp_dir)
-    let estimated_size = (acc_vec.len() as u64) * 2000; // ~2KB per accession avg
 
     let output_path = temp_dir.path().join(format!("{}_ref_from_selected_genera.fasta", db_type));
     let mut writer = std::io::BufWriter::new(
@@ -5307,7 +5271,7 @@ pub async fn summarize_hits(
         let f_gr = final_genus_read.clone();
         let f_gs = final_genus_species.clone();
         let f_ga = final_genus_accessions.clone();
-        let tr = total_reads.clone();
+        let _tr = total_reads.clone();
 
         worker_handles.push(tokio::spawn(async move {
             let mut local_read_dict: AHashMap<String, Arc<ReadHit>> = AHashMap::with_capacity(8192);
@@ -5810,7 +5774,7 @@ pub async fn generate_contig_summary_json(
     db_type: &str,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed to DashMap
     min_contig_size: u64,
-    mut output_tx: Sender<ParseOutput>,
+    output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
     let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
     let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
@@ -5925,6 +5889,7 @@ async fn collect_line_map(
 }
 
 // Helper: collect a stream into ordered rows only.
+#[allow(dead_code)]
 async fn collect_rows(
     mut stream: ReceiverStream<ParseOutput>,
 ) -> Result<Vec<Bytes>> {
@@ -6085,8 +6050,8 @@ pub async fn generate_m8_and_hit_summary(
 pub async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
-    mut deduped_m8_stream: ReceiverStream<ParseOutput>,
-    mut hit_summary_stream: ReceiverStream<ParseOutput>,
+    deduped_m8_stream: ReceiverStream<ParseOutput>,
+    hit_summary_stream: ReceiverStream<ParseOutput>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     accession_map: Arc<AHashMap<String, AccessionHit>>,
     taxon_counts: Vec<TaxonCount>,
@@ -6122,7 +6087,7 @@ pub async fn blast_contigs(
     );
 
     let mut cleanup_tasks = Vec::new();
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
     let out_dir = config.out_dir.join(format!("blast_{}", db_type));
@@ -7089,7 +7054,6 @@ pub async fn generate_nonhost_fastq_from_files(
         u64::MAX,
         None,
         None,
-        config.base_buffer_size * 4, // Large chunks for speed
         "generate_nonhost_fastq_from_files_r1",
         &config,
 
@@ -7108,7 +7072,6 @@ pub async fn generate_nonhost_fastq_from_files(
             u64::MAX,
             None,
             None,
-            config.base_buffer_size * 4,
             "generate_nonhost_fastq_from_files_r2",
             &config,
         )?;
@@ -7526,7 +7489,7 @@ pub async fn mmseqs_non_host_align(
     Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>>,
     Vec<TempDir>,
 ), PipelineError> {
-    let mut cleanup_tasks = Vec::new();
+    let cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
 
     info!("Running mmseqs non-host align (backend: {:?})", backend);
@@ -7593,7 +7556,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
     let mut host_filter_temp_dirs: Vec<TempDir> = Vec::new();
     let mut final_temp_dirs: Vec<TempDir> = Vec::new();
-    let mut temp_paths: Vec<PathBuf> = Vec::new();
+    let temp_paths: Vec<PathBuf> = Vec::new();
 
     info!("Starting short read mNGS pipeline.");
 
@@ -7670,7 +7633,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
     let ercc_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
-    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, ercc_bt2_bam_write_handle, ercc_bt2_bam_path, ercc_bt2_temp_dirs) = bowtie2_filter_stream(
+    let (ercc_bt2_out_stream, ercc_count_rx, ercc_bt2_cleanup_tasks, ercc_bt2_cleanup_receivers, ercc_bt2_bam_write_handle, _ercc_bt2_bam_path, ercc_bt2_temp_dirs) = bowtie2_filter_stream(
         config.clone(),
         val_out_stream,
         ercc_bt2_index_path,
@@ -8418,7 +8381,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         u64::MAX,
         None,
         None,
-        config.base_buffer_size,
         "run - Read non-host R1/R2 as proper parsed Fastq records",
         &config
     ).map_err(|e| PipelineError::Other(e))?;
@@ -8549,9 +8511,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let (assembly_outputs, assembly_bam_out_stream,
-        mut post_assembly_cleanup_tasks,
-        mut post_assembly_cleanup_receivers,
-        mut post_assembly_temp_files) = process_assembly(
+        post_assembly_cleanup_tasks,
+        post_assembly_cleanup_receivers,
+        post_assembly_temp_files) = process_assembly(
         config.clone(),
         &assembly_out_dir,
         &assembly_work_dir,
@@ -8831,8 +8793,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ) = nt_res;
 
             let mut cleanup_tasks = nt_cleanup_tasks;
-            let mut cleanup_receivers = nt_cleanup_receivers;
-            let mut temp_files = nt_temp_files;
+            let cleanup_receivers = nt_cleanup_receivers;
+            let temp_files = nt_temp_files;
 
             let (nt_m8_rxs, nt_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_m8_stream_out),
@@ -8900,8 +8862,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ) = nr_res;
 
             let mut cleanup_tasks = nr_cleanup_tasks;
-            let mut cleanup_receivers = nr_cleanup_receivers;
-            let mut temp_files = nr_temp_files;
+            let cleanup_receivers = nr_cleanup_receivers;
+            let temp_files = nr_temp_files;
 
             let (nr_m8_rxs, nr_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_m8_stream_out),
@@ -8954,11 +8916,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs postprocess task panicked: {e}")))??;
 
     let (
-        nt_read_dict,
+        _nt_read_dict,
         nt_refined_counts,
         nt_contig_summary,
         nt_m8_merge,
-        nt_m8_map,
+        _nt_m8_map,
         nt_m8_viz,
         nt_hit_summary_merge,
         nt_hit_summary_taxid,
@@ -8973,11 +8935,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     temp_files.extend(nt_temp_files);
 
     let (
-        nr_read_dict,
+        _nr_read_dict,
         nr_refined_counts,
         nr_contig_summary,
         nr_m8_merge,
-        nr_m8_map,
+        _nr_m8_map,
         nr_hit_summary_merge,
         nr_hit_summary_preload,
         nr_hit_summary_taxid,
@@ -9086,12 +9048,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let contigs_rx = parse_bytes::<TokioFile>(contigs_file, &config, StreamDataType::JustBytes).await
         .map_err(|e| PipelineError::Other(anyhow!("parse_bytes failed: {}", e)))?;
 
-    let mut contigs_stream = ReceiverStream::new(contigs_rx);
+    let contigs_stream = ReceiverStream::new(contigs_rx);
 
     // Empty cluster stream (contigs have no duplicates)
-    let (_cluster_tx, cluster_rx) = mpsc::channel::<ParseOutput>(1);
+    let (_cluster_tx, _cluster_rx) = mpsc::channel::<ParseOutput>(1);
     drop(_cluster_tx);
-    let contigs_cluster_stream = ReceiverStream::new(cluster_rx);
 
     let assembly_dir = out_dir.join("assembly");
     tokio::fs::create_dir_all(&assembly_dir).await
@@ -9110,7 +9071,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         mapped_contigs_rx,
         unidentified_contigs_rx,
-        unique_unidentified_rx,
+        _unique_unidentified_rx,
         mut annot_tasks,
         mut annot_rxs,
     ) = generate_annotated_fasta_stream(
@@ -9360,11 +9321,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-    let clusters_opt = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
-        Some(duplicate_clusters.clone())
-    } else {
-        None
-    };
 
 
 

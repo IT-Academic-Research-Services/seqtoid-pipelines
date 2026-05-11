@@ -1,41 +1,27 @@
 // BLAST-related file functions and structures
-use std::collections::{HashMap, HashSet};
-use std::env::args;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::path::PathBuf;
 use std::hash::{BuildHasher, Hash, Hasher};
+
 use rayon::prelude::*;
 use memchr::memchr;
-
-use anyhow::{anyhow, Context, Result};
-use log::{self, LevelFilter, debug, info, error, warn};
+use anyhow::{anyhow, Result};
+use log::{self, debug, info, warn};
 use tokio_stream::StreamExt;
 use lexical::parse as lexical_parse;
 use fst::Map;
 use ahash::{AHashMap, RandomState as AHashState};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::fs::File as TokioFile;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{channel, Sender};
-use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 use dashmap::DashMap;
-use tokio::time::{sleep, Duration, Instant};
-use ahash::RandomState as AHashRandomState;
 use bytes::Bytes;
-
-
 use once_cell::sync::Lazy;
 
-use crate::config::defs::{Taxid, Lineage, NT_TAG, NR_TAG, RunConfig, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel};
+use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
-use crate::utils::file::write_byte_stream_to_file;
-use crate::utils::system::{compute_batch_size, compute_phase_concurrency};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
@@ -595,6 +581,7 @@ pub fn build_taxon_counts_list(agg: AHashMap<Vec<i32>, AggBucket>, count_type: &
 
 /// Build a negative taxid for “no-specific-call” at a given level.
 ///  -100 * level (level 1=species -100, 2=genus -200, 3=family -300)
+#[allow(dead_code)]
 fn negative_taxid(level: u8) -> i64 {
     -100 * (level as i64)
 }
@@ -857,6 +844,7 @@ pub fn parse_m8_acc_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
     let parts: Vec<&str> = line.split('\t').collect();
     if parts.len() >= 3 {
@@ -868,8 +856,8 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 
 
 pub async fn generate_taxon_count_json_from_m8(
-    mut m8_stream_rx:           ReceiverStream<ParseOutput>,
-    mut hit_summary_stream_rx:  ReceiverStream<ParseOutput>,
+    m8_stream_rx:           ReceiverStream<ParseOutput>,
+    hit_summary_stream_rx:  ReceiverStream<ParseOutput>,
     db_type:                    &str,
     lineage_map:                Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter:         Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
@@ -1056,6 +1044,7 @@ pub async fn generate_taxon_count_json_from_m8(
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn assert_m8_eq(a: &M8Record, b: &M8Record, ctx: &str) {
         assert_eq!(a.qname,    b.qname,    "{ctx}: qname");
         assert_eq!(a.tname,    b.tname,    "{ctx}: tname");
@@ -1074,7 +1063,7 @@ mod tests {
     }
 
     fn compare_nt(line: &str) {
-        let scalar = M8Record::parse_line_nt_scalar(line).expect("NT scalar failed");
+        let _scalar = M8Record::parse_line_nt_scalar(line).expect("NT scalar failed");
         #[cfg(target_arch = "x86_64")]
         {
             let avx = M8Record::parse_line_nt_avx512(line).expect("NT avx512 failed");
@@ -1083,7 +1072,7 @@ mod tests {
     }
 
     fn compare_nr(line: &str) {
-        let scalar = M8Record::parse_line_nr_scalar(line).expect("NR scalar failed");
+        let _scalar = M8Record::parse_line_nr_scalar(line).expect("NR scalar failed");
         #[cfg(target_arch = "x86_64")]
         {
             let avx = M8Record::parse_line_nr_avx512(line).expect("NR avx512 failed");

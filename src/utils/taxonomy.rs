@@ -1,5 +1,5 @@
 use tokio_stream::StreamExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self as StdFS};
 use std::fs::File as StdFile;
@@ -8,22 +8,20 @@ use std::io::{BufReader as StdBufReader};
 use std::sync::Arc;
 use std::io::{BufWriter as StdBufWriter, Write};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use log::{info, warn, debug};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use flate2::read::GzDecoder;
 use csv::ReaderBuilder;
-use sled::{Db, Tree, IVec};
 use fst::{MapBuilder};
-use needletail::{parse_fastx_file, FastxReader};
+use needletail::parse_fastx_file;
 use bincode::{encode_into_std_write, decode_from_std_read};
-use serde::{Serialize, Deserialize};
 use ahash::AHashMap;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::{mpsc, Semaphore, Mutex};
-use crate::config::defs::{Taxid, Lineage, PipelineError, INVALID_CALL_BASE_ID, TaxonSeqLocation};
-use crate::utils::blast::{M8Record, AggBucket, TaxonCount};
+use tokio::sync::{mpsc, Mutex};
+use crate::config::defs::{Taxid, Lineage, TaxonSeqLocation};
+use crate::utils::blast::M8Record;
 use crate::utils::streams::ParseOutput;
 use bytes::Bytes;
 
@@ -358,7 +356,6 @@ pub fn scan_fasta_bases(
     let mut reader = parse_fastx_file(path)
         .unwrap_or_else(|e| panic!("Failed to open {} FASTA {}: {}", name, path.display(), e));
 
-    let mut count = 0;
     while let Some(record) = reader.next() {
         let rec = record.expect("FASTA parse error");
         if let Some(acc_base) = std::str::from_utf8(rec.id())
@@ -366,7 +363,6 @@ pub fn scan_fasta_bases(
             .and_then(|id| id.split('.').next())
         {
             bases.insert(acc_base.to_string());
-            count += 1;
         }
     }
 
@@ -906,6 +902,7 @@ pub fn get_taxid(header: &str, field: &str) -> Result<i32> {
 }
 
 
+#[allow(dead_code)]
 fn get_taxid_field_num(sample_headers: &[String], taxid_field: &str) -> i32 {
     for header in sample_headers.iter().take(100) {  // look at first 100 headers
         let cleaned = header.trim_start_matches('>');

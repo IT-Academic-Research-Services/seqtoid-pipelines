@@ -12,7 +12,7 @@ use std::pin::Pin;
 
 
 use tokio::fs::File;
-use log::{self, LevelFilter, debug, info, error, warn};
+use log::{self, debug, info, error, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter, ReadBuf};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -20,27 +20,22 @@ use tokio::time::{Duration, sleep};
 use tokio::time::{interval, Interval};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::sync::Notify;
 use tokio::fs::File as TokioFile;
 use tokio::fs::{metadata, remove_file};
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use std::os::unix::fs::FileTypeExt;
-use futures::TryFutureExt;
 use uuid::Uuid;
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs::{self, set_permissions};
 use std::fs::Permissions;
-use futures::stream::BoxStream;
-use futures::pin_mut;
 use bytes::Bytes;
-use rayon::prelude::*;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG, SPADES_TAG};
 use crate::config::defs::{CoreAllocation, RunConfig, SimdLevel};
-use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
+use crate::utils::system::{detect_ram, generate_rng};
 
 
 pub trait ToBytes {
@@ -2060,16 +2055,15 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::io::Read;
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, LevelFilter, debug, error};
     use tokio::process::Command;
     use tokio::task;
-    use tokio::fs::File as TokioFile;
     use tokio::time::{self, Duration};
     use crate::utils::fastx::fastx_generator;
-    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend, GpuInfo};
+    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend};
     use std::sync::Arc;
     use rayon::ThreadPoolBuilder;
-    use tokio::sync::{Semaphore, Mutex};
+    use tokio::sync::Semaphore;
     use std::path::PathBuf;
     use crate::cli::Arguments;
     use tempfile::tempdir;
@@ -2081,14 +2075,13 @@ mod tests {
 
 
     // Helper function to create a RunConfig for tests
-    // Helper function to create a RunConfig for tests
     fn create_test_run_config() -> Arc<RunConfig> {
         let args = Arguments {
             threads: 8,
             ..Default::default()
         };
 
-        let (total_ram, available_ram) = detect_ram()
+        let (_, available_ram) = detect_ram()
             .unwrap_or((16u64 << 30, 8u64 << 30));
 
         let rng = generate_rng(Some(42));
@@ -2613,7 +2606,7 @@ mod tests {
             });
             handles.push(handle);
         }
-        let all_records = time::timeout(Duration::from_secs(120), async {
+        let _ = time::timeout(Duration::from_secs(120), async {
             let mut all_records = Vec::with_capacity(2);
             for (i, handle) in handles.into_iter().enumerate() {
                 let records = handle.await??;
@@ -3398,7 +3391,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_to_fifo_invalid_path() -> Result<()> {
         let invalid_path = PathBuf::from("/blah/blah/flibiddy/blah");
-        let (tx, rx) = mpsc::channel::<ParseOutput>(10);
+        let (_, rx) = mpsc::channel::<ParseOutput>(10);
         let write_handle = tokio::spawn(write_to_fifo(rx, invalid_path.clone()));
         let result = write_handle.await?;
         assert!(result.is_err(), "Should error on invalid FIFO path");

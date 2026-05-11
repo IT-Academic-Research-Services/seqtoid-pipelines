@@ -1,16 +1,12 @@
 // Functions and definitions for the minimap2-associated PAF file format
 use anyhow::{anyhow, Result};
-use log::{info, debug, warn};
-use std::cmp::Reverse;
+use log::{info, debug};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc::{self, Sender};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream, StreamMap};  
-use dashmap::DashMap;
+use tokio::sync::mpsc::Sender;
 use rayon::prelude::*;
 use memchr::memchr2_iter;
 use lexical::parse as lexical_parse;
@@ -18,7 +14,6 @@ use once_cell::sync::Lazy;
 use bytes::Bytes;
 
 use crate::utils::streams::ParseOutput;
-use crate::config::defs::{SIMD_LEVEL, SimdLevel};
 
 const LAMBDA: f64 = 1.58;
 const K: f64 = 0.1;
@@ -222,8 +217,7 @@ impl PafRecord {
         info!("Merging {} raw PAF files → streaming PAF output (no conversion)", paf_paths.len());
 
         let start = std::time::Instant::now();
-        let mut total_lines = 0u64;
-        let mut skipped = 0u64;
+        let total_lines = 0u64;
 
         let mut handles = Vec::new();
 
@@ -380,6 +374,7 @@ mod tests {
     // ── helpers ────────────────────────────────────────────────────────────
 
     /// Assert two PafRecords are field-for-field identical.
+    #[allow(dead_code)]
     fn assert_records_eq(a: &PafRecord, b: &PafRecord, context: &str) {
         assert_eq!(a.qname,  b.qname,  "{context}: qname");
         assert_eq!(a.qlen,   b.qlen,   "{context}: qlen");

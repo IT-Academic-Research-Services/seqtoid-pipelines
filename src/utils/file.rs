@@ -5,10 +5,8 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use crate::config::defs::GZIP_EXT;
-use log::{self, LevelFilter, debug, info, error, warn};
+use log::{self, debug, info, warn};
 use anyhow::{Result, anyhow};
-use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_stream::wrappers::ReceiverStream;
@@ -20,9 +18,9 @@ use tokio::io::AsyncSeekExt;
 use tokio_stream::StreamExt;
 use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
-use crate::utils::fastx::{SequenceRecord, r1r2_base};
+use crate::utils::fastx::SequenceRecord;
 use crate::config::defs::{RunConfig, PipelineError, StreamDataType};
-use sysinfo::{Disks, DiskUsage};
+use sysinfo::Disks;
 use nix::sys::statvfs;
 use regex::Regex;
 
@@ -306,7 +304,7 @@ pub async fn write_parse_output_to_fifo(
     let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024); // Default to 16MB for large files
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
-        let mut writer_file = TokioFile::create(&fifo_path)
+        let writer_file = TokioFile::create(&fifo_path)
             .await
             .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
         let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
@@ -831,7 +829,6 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::NamedTempFile;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_write_vecu8_to_file() -> std::io::Result<()> {

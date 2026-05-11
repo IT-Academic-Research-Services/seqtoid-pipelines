@@ -10,7 +10,6 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow, Context};
 use log::{self, debug, info, error, warn};
 
-use std::sync::Mutex;
 
 use std::collections::HashMap;
 use ahash::AHashMap;
@@ -38,9 +37,9 @@ use bytes::Bytes;
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{StreamDataType, FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
-use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
-use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
+use crate::config::defs::{StreamDataType, FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode};
+use crate::utils::taxonomy::{get_valid_lineage, combine_taxon_loc_json};
+use crate::utils::system::{compute_phase_concurrency};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -513,7 +512,6 @@ pub fn read_fastq(
     max_reads: u64,
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
-    chunk_size: usize,          // legacy param — kept for compatibility
     tag: &str,
     config: &RunConfig,         // ← added
 ) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<ReadStats, anyhow::Error>>)> {
@@ -783,7 +781,6 @@ pub fn read_fasta(
     max_records: u64,
     min_seq_len: Option<usize>,
     max_seq_len: Option<usize>,
-    chunk_size: usize,           // legacy
     config: &RunConfig,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
 
@@ -1995,7 +1992,6 @@ pub async fn write_combined_fastq(
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use std::collections::HashSet;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
@@ -2003,7 +1999,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn compare_header(head: &[u8], prefix: char) {
-        let scalar = parse_header_scalar(head, prefix);
+        let _scalar = parse_header_scalar(head, prefix);
         #[cfg(target_arch = "x86_64")]
         {
             let avx = parse_header_avx512(head, prefix);

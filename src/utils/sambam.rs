@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -14,12 +13,11 @@ use noodles::bam::record::{Record};
 use noodles::bam::record::Record as BamRecord;
 use noodles::bam;
 use tokio::fs::File;
-use tokio::sync::Semaphore;
 use dashmap::DashMap;
 
 
 use crate::utils::streams::ParseOutput;
-use crate::config::defs::{ClusterInfo, DuplicateClusters};
+use crate::config::defs::ClusterInfo;
 
 #[derive(Debug, Clone)]
 pub struct InsertSizeStats {
@@ -93,7 +91,7 @@ pub async fn generate_info_from_bam_stream(
     let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
 
     let mut worker_handles = Vec::with_capacity(concurrency);
-    for i in 0..concurrency {
+    for _ in 0..concurrency {
         let rx = shared_rx.clone();
         let duplicate_clusters_clone = duplicate_clusters.clone();
         let header_clone = header.clone();
@@ -241,7 +239,6 @@ pub async fn compute_insert_size_stats_from_bam(
         .map_err(|e| anyhow!("Failed to open BAM file {}: {}", bam_path.display(), e))?;
 
     let mut bam_reader = bam::r#async::io::Reader::new(file);
-    let header = bam_reader.read_header().await?;
 
     let histogram = Arc::new(Mutex::new(HashMap::<u32, u64>::new()));
     let mut total_proper_pairs = 0u64;
@@ -362,7 +359,6 @@ pub async fn compute_insert_size_stats_from_bam(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
 
     #[tokio::test]
     async fn test_stream_sam_alignment_counter() -> Result<()> {
