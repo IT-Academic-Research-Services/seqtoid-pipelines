@@ -1039,7 +1039,7 @@ pub async fn generate_taxon_count_json_from_m8(
 
 
 
-#[cfg(test)]
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,24 +1064,17 @@ mod tests {
 
     fn compare_nt(line: &str) {
         let scalar = M8Record::parse_line_nt_scalar(line).expect("NT scalar failed");
-        #[cfg(target_arch = "x86_64")]
-        {
-            let avx = M8Record::parse_line_nt_avx512(line).expect("NT avx512 failed");
-            assert_m8_eq(&scalar, &avx, line);
-        }
+        let dispatched = M8Record::parse_line_nt(line).expect("NT dispatch failed");
+        assert_m8_eq(&scalar, &dispatched, line);
     }
 
     fn compare_nr(line: &str) {
         let scalar = M8Record::parse_line_nr_scalar(line).expect("NR scalar failed");
-        #[cfg(target_arch = "x86_64")]
-        {
-            let avx = M8Record::parse_line_nr_avx512(line).expect("NR avx512 failed");
-            assert_m8_eq(&scalar, &avx, line);
-        }
+        let dispatched = M8Record::parse_line_nr(line).expect("NR dispatch failed");
+        assert_m8_eq(&scalar, &dispatched, line);
     }
 
     // ── NT test lines (14 columns) ─────────────────────────────────────────
-
     const NT_BASIC: &str =
         "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903";
 
@@ -1091,7 +1084,6 @@ mod tests {
     const NT_MISMATCHES: &str =
         "read3\tKJ660346.2\t95.238\t210\t10\t2\t5\t214\t500\t709\t4.56e-88\t330.000\t220\t18958";
 
-    // Long enough to span two 64-byte SIMD chunks
     const NT_LONG_QNAME: &str =
         "a_very_long_read_identifier_that_exceeds_sixty_four_bytes_total\tNC_045512.2\t98.667\t150\t2\t0\t1\t150\t1\t150\t2.34e-70\t275.000\t150\t29903";
 
@@ -1099,7 +1091,6 @@ mod tests {
         "read4\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903   ";
 
     // ── NR test lines (12 columns) ─────────────────────────────────────────
-
     const NR_BASIC: &str =
         "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000";
 
@@ -1110,7 +1101,6 @@ mod tests {
         "read3\tXYZ99999.2\t78.431\t153\t33\t3\t10\t162\t5\t155\t8.9e-20\t89.700";
 
     // ── NT tests ──────────────────────────────────────────────────────────
-
     #[test]
     fn test_nt_basic() { compare_nt(NT_BASIC); }
 
@@ -1135,7 +1125,7 @@ mod tests {
     fn test_nt_accession_version_stripped() {
         let r = M8Record::parse_line_nt_scalar(NT_BASIC).unwrap();
         assert_eq!(r.tname, "NC_045512", "version suffix must be stripped");
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         {
             let avx = M8Record::parse_line_nt_avx512(NT_BASIC).unwrap();
             assert_eq!(avx.tname, "NC_045512");
@@ -1145,7 +1135,7 @@ mod tests {
     #[test]
     fn test_nt_error_on_empty() {
         assert!(M8Record::parse_line_nt_scalar("").is_err());
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         assert!(M8Record::parse_line_nt_avx512("").is_err());
     }
 
@@ -1153,12 +1143,11 @@ mod tests {
     fn test_nt_error_on_too_few_fields() {
         let short = "read1\tNC_045512.2\t99.333\t150";
         assert!(M8Record::parse_line_nt_scalar(short).is_err());
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         assert!(M8Record::parse_line_nt_avx512(short).is_err());
     }
 
     // ── NR tests ──────────────────────────────────────────────────────────
-
     #[test]
     fn test_nr_basic() { compare_nr(NR_BASIC); }
 
@@ -1173,7 +1162,7 @@ mod tests {
         let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
         assert_eq!(r.qlen, 0, "NR qlen must default to 0");
         assert_eq!(r.slen, 0, "NR slen must default to 0");
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         {
             let avx = M8Record::parse_line_nr_avx512(NR_BASIC).unwrap();
             assert_eq!(avx.qlen, 0);
@@ -1185,7 +1174,7 @@ mod tests {
     fn test_nr_accession_version_stripped() {
         let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
         assert_eq!(r.tname, "QIK02963");
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         {
             let avx = M8Record::parse_line_nr_avx512(NR_BASIC).unwrap();
             assert_eq!(avx.tname, "QIK02963");
@@ -1195,7 +1184,7 @@ mod tests {
     #[test]
     fn test_nr_error_on_empty() {
         assert!(M8Record::parse_line_nr_scalar("").is_err());
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         assert!(M8Record::parse_line_nr_avx512("").is_err());
     }
 
@@ -1203,13 +1192,9 @@ mod tests {
     fn test_nr_error_on_too_few_fields() {
         let short = "read1\tQIK02963.1\t87.500";
         assert!(M8Record::parse_line_nr_scalar(short).is_err());
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         assert!(M8Record::parse_line_nr_avx512(short).is_err());
     }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // New tests added below
-    // ─────────────────────────────────────────────────────────────────────
 
     use fst::MapBuilder;
 
