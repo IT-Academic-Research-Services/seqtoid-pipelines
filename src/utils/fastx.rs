@@ -1,3 +1,4 @@
+use crate::utils::taxonomy::get_taxid;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use std::collections::HashSet;
 use anyhow::{Result, anyhow, Context};
 use log::{self, debug, info, error, warn};
+
 
 use std::collections::HashMap;
 use ahash::AHashMap;
@@ -26,14 +28,18 @@ use futures::future::try_join_all;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::sync::mpsc::Receiver;
-use memchr::memmem;
+use tokio::io::AsyncSeekExt;
+use memchr::{memmem, memchr3};
 use fst::{MapBuilder};
+use once_cell::sync::Lazy;
+use bytes::Bytes;
 
 use crate::utils::streams::{ParseOutput, ToBytes};
 use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError};
-use crate::utils::taxonomy::{get_valid_lineage, generate_locator_work, combine_taxon_loc_json};
+use crate::config::defs::{StreamDataType, FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
+use crate::utils::taxonomy::{get_valid_lineage, combine_taxon_loc_json};
+use crate::utils::system::{compute_phase_concurrency};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -52,6 +58,7 @@ lazy_static! {
         m
     };
 }
+
 
 lazy_static! {
     pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
@@ -87,6 +94,20 @@ impl SequenceRecord {
         match self {
             SequenceRecord::Fasta { seq, .. } => &**seq,
             SequenceRecord::Fastq { seq, .. } => &**seq,
+        }
+    }
+
+    pub fn seq_arc(&self) -> Arc<Vec<u8>> {
+        match self {
+            SequenceRecord::Fasta { seq, .. } => seq.clone(),
+            SequenceRecord::Fastq { seq, .. } => seq.clone(),
+        }
+    }
+
+    pub fn seq_owned(&self) -> Vec<u8> {
+        match self {
+            SequenceRecord::Fasta { seq, .. } => (**seq).clone(),
+            SequenceRecord::Fastq { seq, .. } => (**seq).clone(),
         }
     }
 
@@ -349,22 +370,124 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
 
 /// Parses a FASTX header.
 ///
-///
 /// # Arguments
-///
-/// * `head` - Header line of a FASTX record.
-/// * 'prefix' - Leading, defining character of the header. > for FASTA, @ for FASTQ.
+/// * `head`   - Header bytes (needletail has already stripped the leading `>`/`@`).
+/// * `prefix` - The leading character (`>` or `@`) to strip from the id field.
 ///
 /// # Returns
-/// Tuple: (id, desc) split of header on whitespace.
-///
+/// `(id, desc)` — desc is `None` when the header has no whitespace.
 pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
-    let head_str = String::from_utf8_lossy(head).into_owned();
-    let parts: Vec<&str> = head_str.splitn(2, |c: char| c.is_whitespace()).collect();
-    let id = parts[0].trim_start_matches(prefix).to_string();
-    let desc = parts.get(1).map(|s| s.to_string()).filter(|s| !s.is_empty());
-    (id, desc)
+    PARSE_HEADER_FN(head, prefix)
 }
+
+/// Scalar path — used on non-AVX-512 hardware.
+fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
+    match memchr3(b' ', b'\t', b'\n', head) {
+        Some(pos) => {
+            let id_bytes = &head[..pos];
+            let desc_bytes = &head[pos + 1..];
+            let id = String::from_utf8_lossy(id_bytes)
+                .trim_start_matches(prefix)
+                .to_string();
+            let desc = if desc_bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(desc_bytes).into_owned())
+            };
+            (id, desc)
+        }
+        None => {
+            // id-only header (e.g. ">NC_045512.2" with no description)
+            let id = String::from_utf8_lossy(head)
+                .trim_start_matches(prefix)
+                .to_string();
+            (id, None)
+        }
+    }
+}
+
+/// AVX-512 path — 64-byte sweep to find the first whitespace byte.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Option<String>) {
+    use std::arch::x86_64::*;
+    use std::arch::x86_64::__m512i;
+
+    let len = head.len();
+    let space_splat = _mm512_set1_epi8(b' ' as i8);
+    let tab_splat   = _mm512_set1_epi8(b'\t' as i8);
+    let nl_splat    = _mm512_set1_epi8(b'\n' as i8);
+
+    let mut i = 0usize;
+    while i + 64 <= len {
+        let chunk = _mm512_loadu_si512(head.as_ptr().add(i).cast::<__m512i>());
+        let mask: u64 =
+            _mm512_cmpeq_epi8_mask(chunk, space_splat) |
+            _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
+            _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+        if mask != 0 {
+            let pos = i + mask.trailing_zeros() as usize;
+            let id_bytes   = &head[..pos];
+            let desc_bytes = &head[pos + 1..];
+            let id = String::from_utf8_lossy(id_bytes)
+                .trim_start_matches(prefix)
+                .to_string();
+            let desc = if desc_bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(desc_bytes).into_owned())
+            };
+            return (id, desc);
+        }
+        i += 64;
+    }
+    // Scalar tail for remaining < 64 bytes (also handles id-only headers)
+    parse_header_scalar(&head[i..], prefix).map_id_offset(i, head, prefix)
+}
+
+// Helper to re-run scalar on tail bytes and merge the offset back.
+// Only called for headers whose whitespace (if any) falls in the tail.
+#[cfg(target_arch = "x86_64")]
+trait MergeOffset {
+    fn map_id_offset(self, offset: usize, full: &[u8], prefix: char) -> Self;
+}
+#[cfg(target_arch = "x86_64")]
+impl MergeOffset for (String, Option<String>) {
+    fn map_id_offset(self, offset: usize, full: &[u8], prefix: char) -> Self {
+        // If scalar found a split in the tail, the id must be re-extracted
+        // from the full slice (offset..split) to be complete.
+        let (tail_id, desc) = self;
+        if desc.is_some() {
+            // whitespace was in the tail — id spans from 0..offset + tail_id length
+            let full_id = String::from_utf8_lossy(&full[..offset + tail_id.len()])
+                .trim_start_matches(prefix)
+                .to_string();
+            (full_id, desc)
+        } else {
+            // no whitespace anywhere — id is the full header
+            let full_id = String::from_utf8_lossy(full)
+                .trim_start_matches(prefix)
+                .to_string();
+            (full_id, None)
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_header_avx512(head: &[u8], prefix: char) -> (String, Option<String>) {
+    // Safety: only reachable when SIMD_LEVEL == Avx512, confirmed at startup.
+    unsafe { parse_header_avx512_inner(head, prefix) }
+}
+
+static PARSE_HEADER_FN: Lazy<fn(&[u8], char) -> (String, Option<String>)> = Lazy::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(*SIMD_LEVEL, SimdLevel::Avx512) {
+        debug!("parse_header: using AVX-512 path");
+        return parse_header_avx512;
+    }
+    debug!("parse_header: using scalar path");
+    parse_header_scalar
+});
 
 
 /// Reads a FASTQ file.
@@ -384,17 +507,32 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
 pub fn read_fastq(
     path1: PathBuf,
     path2: Option<PathBuf>,
+    pairing_mode: PairingMode,
     technology: Option<Technology>,
     max_reads: u64,
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
-    chunk_size: usize,
+    tag: &str,
+    config: &RunConfig,         // ← added
 ) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<ReadStats, anyhow::Error>>)> {
-    let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
 
+    let effective_chunk = crate::utils::system::compute_buffer_size(
+        config,
+        "read_fastq",
+        match technology {
+            Some(Technology::ONT) => StreamDataType::OntFastq,
+            _ => StreamDataType::IlluminaFastq,
+        },
+        1.1,                        // light boost for reader
+    );
+
+    let (tx, rx) = mpsc::channel(effective_chunk / 1024); // ~1KB per item
+
+    let tag_owned = tag.to_string();
     let task = tokio::spawn(async move {
-        debug!("read_fastq: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, chunk_size={}",
-                  path1, path2, max_reads, min_read_len, max_read_len, chunk_size);
+        let tag = &tag_owned;
+        debug!("read_fastq: Starting with path1={:?}, path2={:?}, max_reads={}, min_read_len={:?}, max_read_len={:?}, effective_chunk={}",
+                  path1, path2, max_reads, min_read_len, max_read_len, effective_chunk);
 
         let mut undersized_reads: u64 = 0;
         let mut oversized_reads: u64 = 0;
@@ -404,11 +542,11 @@ pub fn read_fastq(
 
         match path2 {
             None => {
-                // Single-end: unchanged
+                // Single-end
                 debug!("read_fastq: Opening single-end FASTQ: {:?}", path1);
                 let mut reader = parse_fastx_file(&path1)
                     .map_err(|e| anyhow!("Failed to open FASTQ {}: {}", path1.display(), e))?;
-                let mut buffer = Vec::with_capacity(chunk_size);
+                let mut buffer = Vec::with_capacity(effective_chunk);
 
                 while let Some(result) = reader.next() {
                     if validated_reads + undersized_reads + oversized_reads >= max_reads {
@@ -452,22 +590,26 @@ pub fn read_fastq(
                     buffer.extend_from_slice(&record_bytes);
                     validated_reads += 1;
 
-                    if buffer.len() >= chunk_size {
-                        if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                    if buffer.len() >= effective_chunk {
+                        if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                             return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
                         }
                     }
                 }
+
                 if !buffer.is_empty() {
-                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                    if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
+
                 debug!("read_fastq: Processed {} single-end reads (undersized: {}, validated: {}, oversized: {})",
                           validated_reads + undersized_reads + oversized_reads, undersized_reads, validated_reads, oversized_reads);
+
                 if validated_reads == 0 {
-                    warn!("read_fastq: Warning: No reads processed from {:?}", path1);
+                    warn!("{}: No reads processed from {:?}", tag, path1);
                 }
+
                 Ok(ReadStats {
                     undersized: undersized_reads,
                     validated: validated_reads,
@@ -476,16 +618,20 @@ pub fn read_fastq(
                     unpaired_r2: 0,
                 })
             }
+
             Some(path2) => {
                 if let Some(Technology::ONT) = technology {
                     return Err(anyhow!("Paired-end not supported for ONT"));
                 }
+
                 debug!("read_fastq: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
+
                 let mut reader1 = parse_fastx_file(&path1)
                     .map_err(|e| anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e))?;
                 let mut reader2 = parse_fastx_file(&path2)
                     .map_err(|e| anyhow!("Failed to open R2 FASTQ {}: {}", path2.display(), e))?;
-                let mut buffer = Vec::with_capacity(chunk_size);
+
+                let mut buffer = Vec::with_capacity(effective_chunk);
 
                 loop {
                     if validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 >= max_reads {
@@ -493,7 +639,6 @@ pub fn read_fastq(
                         break;
                     }
 
-                    // Try to read R1
                     let r1_opt = reader1.next();
                     let r1_record = match r1_opt {
                         Some(Ok(rec)) => Some(rec),
@@ -506,7 +651,6 @@ pub fn read_fastq(
                         None => None,
                     };
 
-                    // Try to read R2
                     let r2_opt = reader2.next();
                     let r2_record = match r2_opt {
                         Some(Ok(rec)) => Some(rec),
@@ -521,15 +665,16 @@ pub fn read_fastq(
 
                     match (r1_record, r2_record) {
                         (Some(r1), Some(r2)) => {
-                            // Both valid → process pair
                             if r1.qual().is_none() || r2.qual().is_none() {
-                                return Err(anyhow!("Expected FASTQ for pair at read {}",
-                                                    validated_reads + undersized_reads + oversized_reads + 1));
+                                return Err(anyhow!("Expected FASTQ for pair at read {}", validated_reads + undersized_reads + oversized_reads + 1));
                             }
 
-                            if !compare_read_ids_bytes(r1.id(), r2.id()) {
-                                warn!("ID mismatch at pair {} — discarding unpaired",
-                                      validated_reads + undersized_reads + oversized_reads + 1);
+                            if matches!(pairing_mode, PairingMode::Strict) && !compare_read_ids_bytes(r1.id(), r2.id()) {
+                                warn!("{}: ID mismatch at pair {} — discarding unpaired: {} vs {}",
+                                      tag,
+                                      validated_reads + undersized_reads + oversized_reads + 1,
+                                      String::from_utf8_lossy(r1.id()),
+                                      String::from_utf8_lossy(r2.id()));
                                 unpaired_r1 += 1;
                                 unpaired_r2 += 1;
                                 continue;
@@ -551,7 +696,7 @@ pub fn read_fastq(
                                 }
                             }
 
-                            // Build R1 bytes
+                            // Build R1 + R2 interleaved
                             let mut r1_bytes = Vec::new();
                             r1_bytes.push(b'@');
                             r1_bytes.extend_from_slice(r1.id());
@@ -563,7 +708,6 @@ pub fn read_fastq(
                             r1_bytes.extend_from_slice(r1.qual().unwrap());
                             r1_bytes.push(b'\n');
 
-                            // Build R2 bytes
                             let mut r2_bytes = Vec::new();
                             r2_bytes.push(b'@');
                             r2_bytes.extend_from_slice(r2.id());
@@ -575,51 +719,35 @@ pub fn read_fastq(
                             r2_bytes.extend_from_slice(r2.qual().unwrap());
                             r2_bytes.push(b'\n');
 
-                            // Interleave: R1 then R2
                             buffer.extend_from_slice(&r1_bytes);
                             buffer.extend_from_slice(&r2_bytes);
                             validated_reads += 1;
 
-                            if buffer.len() >= chunk_size {
-                                if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+                            if buffer.len() >= effective_chunk {
+                                if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                                     return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
                                 }
                             }
                         }
-                        (Some(_), None) => {
-                            unpaired_r1 += 1;
-                            if unpaired_r1 <= 10 {
-                                warn!("Unpaired R1 read after R2 ended — discarding");
-                            }
-                        }
-                        (None, Some(_)) => {
-                            unpaired_r2 += 1;
-                            if unpaired_r2 <= 10 {
-                                warn!("Unpaired R2 read after R1 ended — discarding");
-                            }
-                        }
+                        (Some(_), None) => { unpaired_r1 += 1; }
+                        (None, Some(_)) => { unpaired_r2 += 1; }
                         (None, None) => break,
                     }
                 }
 
-                // Send remaining buffer
                 if !buffer.is_empty() {
-                    if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+                    if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
 
                 if unpaired_r1 > 0 || unpaired_r2 > 0 {
-                    warn!("Discarded {} unpaired R1 reads and {} unpaired R2 reads from raw input", unpaired_r1, unpaired_r2);
+                    warn!("{}: Discarded {} unpaired R1 and {} unpaired R2 reads", tag, unpaired_r1, unpaired_r2);
                 }
 
                 debug!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {}, unpaired R1: {}, unpaired R2: {})",
                           validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2,
                           undersized_reads, validated_reads, oversized_reads, unpaired_r1, unpaired_r2);
-
-                if validated_reads == 0 {
-                    warn!("read_fastq: Warning: No valid paired reads processed from R1={:?}, R2={:?}", path1, path2);
-                }
 
                 Ok(ReadStats {
                     undersized: undersized_reads,
@@ -653,20 +781,26 @@ pub fn read_fasta(
     max_records: u64,
     min_seq_len: Option<usize>,
     max_seq_len: Option<usize>,
-    chunk_size: usize,
+    config: &RunConfig,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-    let (tx, rx) = mpsc::channel(chunk_size / 1024); // ~1KB per item
+
+    let effective_chunk = crate::utils::system::compute_buffer_size(
+        config,
+        "read_fasta",
+        StreamDataType::JustBytes,
+        1.2,                         // moderate boost for FASTA reader
+    );
+
+    let (tx, rx) = mpsc::channel(effective_chunk / 1024);
 
     tokio::spawn(async move {
-        debug!("read_fasta: Starting with path={:?}, max_records={}, min_seq_len={:?}, max_seq_len={:?}, chunk_size={}",
-                  path, max_records, min_seq_len, max_seq_len, chunk_size);
+        debug!("read_fasta: Starting with path={:?}, max_records={}, min_seq_len={:?}, max_seq_len={:?}, effective_chunk={}",
+                  path, max_records, min_seq_len, max_seq_len, effective_chunk);
 
         let mut reader = parse_fastx_file(&path)
-            .map_err(|e| {
-                anyhow!("Failed to open FASTA {}: {}", path.display(), e)
-            })?;
+            .map_err(|e| anyhow!("Failed to open FASTA {}: {}", path.display(), e))?;
 
-        let mut buffer = Vec::with_capacity(chunk_size);
+        let mut buffer = Vec::with_capacity(effective_chunk);
         let mut record_count: u64 = 0;
 
         while let Some(result) = reader.next() {
@@ -678,16 +812,12 @@ pub fn read_fasta(
                 anyhow!("Parse error at record {}: {}", record_count + 1, e)
             })?;
 
-            // Ensure FASTA (not FASTQ)
             if record.qual().is_some() {
                 return Err(anyhow!("Expected FASTA, got FASTQ at record {}", record_count + 1));
             }
 
-            // Log record details
             let seq_len = record.seq().len();
-            let _id_str = std::str::from_utf8(record.id()).unwrap_or("<invalid utf8>");
 
-            // Optional length filters
             if let Some(min) = min_seq_len {
                 if seq_len < min {
                     debug!("read_fasta: Skipping record {}: seq_len={} < min={}", record_count + 1, seq_len, min);
@@ -701,7 +831,6 @@ pub fn read_fasta(
                 }
             }
 
-            // Construct FASTA record
             let mut record_bytes = Vec::new();
             record_bytes.push(b'>');
             record_bytes.extend_from_slice(record.id());
@@ -712,17 +841,15 @@ pub fn read_fasta(
             buffer.extend_from_slice(&record_bytes);
             record_count += 1;
 
-            // Send if chunk full
-            if buffer.len() >= chunk_size {
-                if tx.send(ParseOutput::Bytes(Arc::new(std::mem::take(&mut buffer)))).await.is_err() {
+            if buffer.len() >= effective_chunk {
+                if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
                     return Err(anyhow!("Failed to send byte chunk at record {}", record_count));
                 }
             }
         }
 
-        // Send remaining
         if !buffer.is_empty() {
-            if tx.send(ParseOutput::Bytes(Arc::new(buffer))).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
                 return Err(anyhow!("Failed to send final byte chunk"));
             }
         }
@@ -747,38 +874,63 @@ pub fn read_fasta(
 /// * 'dest_path' - location to write to
 /// * 'mbuffer_capacity'
 /// # Returns      Vec<JoinHandle<Result<()>>>,
+/// Writes any FASTA stream to file with aggressive batching + large buffer.
+/// Used in 9 places — keeps the exact same API so nothing else changes.
 pub fn write_fasta_stream_to_file(
     stream: ReceiverStream<ParseOutput>,
     dest_path: PathBuf,
-    buffer_capacity: usize,
+    config: Arc<RunConfig>,           // ← Arc for 'static spawn
+    data_type: StreamDataType,        // ← added
+    label: &str,                      // optional label for logging
 ) -> JoinHandle<Result<()>> {
+
     let dest_path_clone = dest_path.clone();
+    let label_owned = label.to_string();
 
     tokio::spawn(async move {
         let file = TokioFile::create(&dest_path_clone)
             .await
             .map_err(|e| anyhow!("Cannot create FASTA file {}: {}", dest_path_clone.display(), e))?;
 
-        let mut writer = tokio::io::BufWriter::with_capacity(buffer_capacity, file);
+        // Dynamic hot buffer
+        let effective_buffer = crate::utils::system::compute_buffer_size(
+            &config,
+            "write_fasta_stream_to_file",
+            data_type,
+            2.0,                          // very hot write path
+        );
+
+        let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
 
         let mut stream = stream;
+        let mut batch: Vec<u8> = Vec::with_capacity(effective_buffer / 4); // 4:1 batch ratio
+
         while let Some(item) = stream.next().await {
             let bytes = item
                 .to_bytes()
-                .map_err(|e| anyhow!("Failed to convert FASTA record to bytes: {}", e))?;
+                .map_err(|e| anyhow!("Failed to convert record to bytes: {}", e))?;
 
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+            batch.extend_from_slice(&bytes);
+
+            if batch.len() >= effective_buffer / 4 {
+                writer.write_all(&batch).await
+                    .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+                batch.clear();
+            }
         }
 
-        writer
-            .flush()
-            .await
+        if !batch.is_empty() {
+            writer.write_all(&batch).await
+                .map_err(|e| anyhow!("Final write error to {}: {}", dest_path_clone.display(), e))?;
+        }
+
+        writer.flush().await
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
-        info!("FASTA written to {}", dest_path_clone.display());
+        let final_size = writer.stream_position().await.unwrap_or(0);
+        info!("{} written to {} ({} bytes, buffer {} MiB)",
+              label_owned, dest_path_clone.display(), final_size, effective_buffer / (1024*1024));
+
         Ok(())
     })
 }
@@ -789,74 +941,73 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
         return true;
     }
 
-    // Convert to str with fallback (safe, no panic)
-    let s1 = std::str::from_utf8(id1).unwrap_or("");
-    let s2 = std::str::from_utf8(id2).unwrap_or("");
+    let mut base1 = id1;
+    let mut base2 = id2;
 
-    // Expanded suffix list — ordered roughly by frequency / importance
-    // Each group is labeled with the platforms / formats it covers
-    let suffixes: [&str; 24] = [
-        // Classic Illumina / most common overall
-        "/1", "/2",
-
-        // Older Illumina, some custom pipelines
-        ".1", ".2",
-
-        // Illumina with space + colon (HiSeq, NovaSeq, NextSeq)
-        " 1:", " 2:",
-
-        // Full Illumina flowcell/lane info suffix (very common on NovaSeq)
-        " 1:N:0:", " 2:N:0:",
-
-        // Variant with slash instead of space (some demux tools)
-        "/1:N:0:", "/2:N:0:",
-
-        // BGISEQ, DNBSEQ, MGISEQ, many Chinese platforms
-        "_1", "_2",
-
-        // Very old Illumina CASAVA format (pre-2011, rare but still seen)
-        " 1#0/1", " 2#0/2",
-
-        // Nanopore, Oxford Nanopore, some custom / long-read paired
-        "|1", "|2",
-
-        // Rare 10x Genomics / Parse / custom variants
-        " 1#", " 2#",
-
-        // 10x Genomics, Parse Biosciences, some single-cell demux
-        "/R1", "/R2",
-
-        // Sometimes appears in headers instead of file names
-        "_R1", "_R2",
-
-        // Rare variant without N (some older or custom)
-        " 1:0", " 2:0",
+    // Strip common suffixes (byte-level)
+    let suffixes: [&[u8]; 24] = [
+        b"/1", b"/2",
+        b".1", b".2",
+        b" 1:", b" 2:",
+        b" 1:N:0:", b" 2:N:0:",
+        b"/1:N:0:", b"/2:N:0:",
+        b"_1", b"_2",
+        b" 1#0/1", b" 2#0/2",
+        b"|1", b"|2",
+        b" 1#", b" 2#",
+        b"/R1", b"/R2",
+        b"_R1", b"_R2",
+        b" 1:0", b" 2:0",
     ];
 
-    let mut base1 = s1;
-    let mut base2 = s2;
-
-    // Strip the longest matching suffix from each ID
-    // We break after the first match to avoid over-trimming
+    let mut stripped1 = false;
     for &suffix in &suffixes {
         if base1.ends_with(suffix) {
             base1 = &base1[..base1.len() - suffix.len()];
+            stripped1 = true;
             break;
         }
     }
 
+    let mut stripped2 = false;
     for &suffix in &suffixes {
         if base2.ends_with(suffix) {
             base2 = &base2[..base2.len() - suffix.len()];
+            stripped2 = true;
             break;
         }
     }
 
-    // Clean up any trailing whitespace, colon, or hash that might remain
-    base1 = base1.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
-    base2 = base2.trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '#');
+    if (stripped1 || stripped2) && base1 == base2 {
+        return true;
+    }
 
-    // Final comparison
+    // Try a more aggressive approach: strip everything after the first space
+    if let Some(space_idx) = base1.iter().position(|&b| b == b' ') {
+        base1 = &base1[..space_idx];
+    }
+    if let Some(space_idx) = base2.iter().position(|&b| b == b' ') {
+        base2 = &base2[..space_idx];
+    }
+
+    // Clean up any trailing characters
+    while !base1.is_empty() {
+        let last = base1[base1.len() - 1];
+        if last == b' ' || last == b'\t' || last == b':' || last == b'#' || last == b'.' || last == b'/' || last == b'_' {
+            base1 = &base1[..base1.len() - 1];
+        } else {
+            break;
+        }
+    }
+    while !base2.is_empty() {
+        let last = base2[base2.len() - 1];
+        if last == b' ' || last == b'\t' || last == b':' || last == b'#' || last == b'.' || last == b'/' || last == b'_' {
+            base2 = &base2[..base2.len() - 1];
+        } else {
+            break;
+        }
+    }
+
     base1 == base2
 }
 
@@ -962,30 +1113,7 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
 /// bool: true if reads are a matched pair.
 ///
 pub fn compare_read_ids(id1: &str, id2: &str) -> bool {
-    // Extract ID parts without @
-    let id_part1 = id1.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
-    let id_part2 = id2.trim_start_matches('@').splitn(2, ' ').next().unwrap_or("");
-
-    // Check for identical IDs (SRA and some Casava 1.8+ cases)
-    if id_part1 == id_part2 {
-        return true;
-    }
-
-    // Check for /1 and /2 format (pre-Casava 1.8 Illumina and custom formats)
-    let full_id_part1 = id1.splitn(2, ' ').next().unwrap_or("");
-    let full_id_part2 = id2.splitn(2, ' ').next().unwrap_or("");
-
-
-    if (full_id_part1.ends_with("/1") && full_id_part2.ends_with("/2")) ||
-        (full_id_part1.ends_with("/2") && full_id_part2.ends_with("/1")) {
-        let base1 = &full_id_part1[..full_id_part1.len() - 2];
-        let base2 = &full_id_part2[..full_id_part2.len() - 2];
-        if base1 == base2 {
-            return true;
-        }
-    }
-
-    false
+    compare_read_ids_bytes(id1.as_bytes(), id2.as_bytes())
 }
 
 /// Writes out a FASTA file to a FIFO pipe.
@@ -1356,6 +1484,7 @@ pub fn build_fasta_index(
 
 
 pub async fn generate_taxid_fasta(
+    config: Arc<RunConfig>,
     mapped_contigs_stream: ReceiverStream<ParseOutput>,
     unidentified_contigs_stream: ReceiverStream<ParseOutput>,
     nt_hit_summary_stream: ReceiverStream<ParseOutput>,
@@ -1373,8 +1502,8 @@ pub async fn generate_taxid_fasta(
     let (combined_tx, combined_rx) = mpsc::channel(2048);
 
     // Channels for completed hit maps
-    let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<AHashMap<String, (Taxid, u8)>>(1);
-    let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<AHashMap<String, (Taxid, u8)>>(1);
+    let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
+    let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
 
     // Load NT hit summary → build map
     let load_nt_task = tokio::spawn({
@@ -1394,7 +1523,7 @@ pub async fn generate_taxid_fasta(
                     hits.insert(read_id, (taxid, level));
                 }
             }
-            nt_hits_tx.send(hits).await.map_err(|_| anyhow!("NT hits tx dropped"))?;
+            nt_hits_tx.send(Arc::new(hits)).await.map_err(|_| anyhow!("NT hits tx dropped"))?;
             Ok(())
         }
     });
@@ -1417,7 +1546,7 @@ pub async fn generate_taxid_fasta(
                     hits.insert(read_id, (taxid, level));
                 }
             }
-            nr_hits_tx.send(hits).await.map_err(|_| anyhow!("NR hits tx dropped"))?;
+            nr_hits_tx.send(Arc::new(hits)).await.map_err(|_| anyhow!("NR hits tx dropped"))?;
             Ok(())
         }
     });
@@ -1428,58 +1557,184 @@ pub async fn generate_taxid_fasta(
         let nt_hits = nt_hits_rx.recv().await.ok_or(anyhow!("NT hits map not received"))?;
         let nr_hits = nr_hits_rx.recv().await.ok_or(anyhow!("NR hits map not received"))?;
 
-        // Process annotated (mapped) contigs
-        let mut mapped_stream = mapped_contigs_stream;
-        while let Some(item) = mapped_stream.next().await {
-            if let ParseOutput::Fasta(rec) = item {
-                let annotated_id = rec.id();
-                let parts: Vec<&str> = annotated_id.split(':').collect();
-                let contig_id = parts.last().unwrap_or(&"").to_string();
+        let concurrency = compute_phase_concurrency(
+            &config,
+            "generate_taxid_fasta",
+            0.5,           // ~0.5 GB per thread max
+            4.0,           // 4 threads per core
+            64,            // cap
+            8,             // min for meaningful parallelism
+        );
 
-                let nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
-                let nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+        const BATCH_SIZE: usize = 1000;
 
-                let new_header = format!(
-                    ">family_nr:{}:family_nt:{}:genus_nr:{}:genus_nt:{}:species_nr:{}:species_nt:{}:{}\n",
-                    nr_lineage[2], nt_lineage[2],
-                    nr_lineage[1], nt_lineage[1],
-                    nr_lineage[0], nt_lineage[0],
-                    annotated_id
-                );
+        // Process annotated (mapped) contigs in parallel
+        {
+            let (batch_tx, batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
+            let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
+            
+            let mut worker_handles = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                let rx = batch_rx.clone();
+                let m_tx = mapped_tx.clone();
+                let c_tx = combined_tx.clone();
+                let nt_hits = nt_hits.clone();
+                let nr_hits = nr_hits.clone();
+                let lineage_map = lineage_map.clone();
 
-                let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
-                let seq_arc = match rec {
-                    SequenceRecord::Fasta { seq, .. } => seq,
-                    _ => unreachable!(),
-                };
-                let new_rec = SequenceRecord::Fasta {
-                    id: new_id,
-                    desc: new_desc,
-                    seq: seq_arc,
-                };
+                worker_handles.push(tokio::spawn(async move {
+                    loop {
+                        let batch = {
+                            let mut lock = rx.lock().await;
+                            lock.recv().await
+                        };
 
-                mapped_tx.send(ParseOutput::Fasta(new_rec.clone())).await?;
-                combined_tx.send(ParseOutput::Fasta(new_rec)).await?;
+                        let batch = match batch {
+                            Some(b) => b,
+                            None => break,
+                        };
+
+                        for rec in batch {
+                            let annotated_id = rec.id();
+                            let parts: Vec<&str> = annotated_id.split(':').collect();
+                            let contig_id = parts.last().unwrap_or(&"").to_string();
+
+                            let nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
+                            let nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+
+                            let new_header = format!(
+                                ">family_nr:{}:family_nt:{}:genus_nr:{}:genus_nt:{}:species_nr:{}:species_nt:{}:{}\n",
+                                nr_lineage[2], nt_lineage[2],
+                                nr_lineage[1], nt_lineage[1],
+                                nr_lineage[0], nt_lineage[0],
+                                annotated_id
+                            );
+
+                            let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
+                            let seq_arc = rec.seq_arc();
+                            let new_rec = SequenceRecord::Fasta {
+                                id: new_id,
+                                desc: new_desc,
+                                seq: seq_arc,
+                            };
+
+                            m_tx.send(ParseOutput::Fasta(new_rec.clone())).await.map_err(|_| anyhow!("mapped_tx dropped"))?;
+                            c_tx.send(ParseOutput::Fasta(new_rec)).await.map_err(|_| anyhow!("combined_tx dropped"))?;
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }));
+            }
+
+            let mut mapped_stream = mapped_contigs_stream;
+            let mut current_batch = Vec::with_capacity(BATCH_SIZE);
+            while let Some(item) = mapped_stream.next().await {
+                match item {
+                    ParseOutput::Fasta(rec) => {
+                        current_batch.push(rec);
+                        if current_batch.len() >= BATCH_SIZE {
+                            batch_tx.send(std::mem::take(&mut current_batch))
+                                .await
+                                .map_err(|_| anyhow!("batch_tx dropped unexpectedly during mapped_stream processing"))?;
+                        }
+                    }
+                    _ => return Err(anyhow!("Unexpected item type in mapped_contigs_stream: expected Fasta")),
+                }
+            }
+            if !current_batch.is_empty() {
+                batch_tx.send(current_batch).await.map_err(|_| anyhow!("batch_tx dropped"))?;
+            }
+            drop(batch_tx);
+
+            for handle in worker_handles {
+                handle.await??;
             }
         }
 
-        // Process unidentified contigs → conform headers
-        let mut unid_stream = unidentified_contigs_stream;
-        while let Some(item) = unid_stream.next().await {
-            if let ParseOutput::Fasta(rec) = item {
-                let conformed_header = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
-                let (new_id, new_desc) = parse_header(conformed_header.as_bytes(), '>');
-                let seq_arc = match rec {
-                    SequenceRecord::Fasta { seq, .. } => seq,
-                    _ => unreachable!(),
-                };
-                let new_rec = SequenceRecord::Fasta {
-                    id: new_id,
-                    desc: new_desc,
-                    seq: seq_arc,
-                };
-                combined_tx.send(ParseOutput::Fasta(new_rec)).await?;
+        // Process unidentified contigs → conform headers (parallel + buffered)
+        {
+            let unidentified_concurrency = compute_phase_concurrency(
+                &config,
+                "unidentified_taxid_conform",
+                0.5,
+                4.0,
+                128,
+                16,
+            );
+            let unid_batch_size = 32_000;
+
+
+            let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(unidentified_concurrency * 3);
+            let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
+
+            let mut unid_workers = Vec::with_capacity(unidentified_concurrency);
+            for _ in 0..unidentified_concurrency {
+                let rx = unid_batch_rx.clone();
+                let c_tx = combined_tx.clone();
+
+                unid_workers.push(tokio::spawn(async move {
+                    loop {
+                        let batch_opt = {
+                            let mut guard = rx.lock().await;
+                            guard.recv().await
+                        };
+
+                        let batch = match batch_opt {
+                            Some(b) => b,
+                            None => break,
+                        };
+
+                        for item in batch.iter() {
+                            let rec: &SequenceRecord = item;
+
+                            let conformed = format!("{}{}", CONFORMING_PREAMBLE, rec.id());
+                            let (new_id, new_desc) = parse_header(conformed.as_bytes(), '>');
+
+                            let new_rec = SequenceRecord::Fasta {
+                                id: new_id,
+                                desc: new_desc,
+                                seq: rec.seq_arc(),
+                            };
+
+
+                            let _ = c_tx.send(ParseOutput::Fasta(new_rec)).await;
+                        }
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                }));
             }
+
+            // Producer: batch incoming unidentified FASTA records
+            let mut unid_stream = unidentified_contigs_stream;
+            let mut current_batch: Vec<SequenceRecord> = Vec::with_capacity(unid_batch_size);
+
+            while let Some(item) = unid_stream.next().await {
+                match item {
+                    ParseOutput::Fasta(rec) => {
+                        current_batch.push(rec);
+                        if current_batch.len() >= unid_batch_size {
+                            let batch_to_send = std::mem::take(&mut current_batch);
+                            let _ = unid_batch_tx.send(batch_to_send).await;
+                        }
+                    }
+                    _ => {
+                        warn!("Unexpected non-Fasta item in unidentified_contigs_stream");
+                    }
+                }
+            }
+
+            if !current_batch.is_empty() {
+                let _ = unid_batch_tx.send(current_batch).await;
+            }
+
+            drop(unid_batch_tx);
+
+            // Wait for all workers
+            for worker in unid_workers {
+                worker.await??;
+            }
+            
         }
 
         drop(mapped_tx);
@@ -1499,6 +1754,7 @@ pub async fn generate_taxid_fasta(
 
 
 pub async fn generate_taxid_locator(
+    config: Arc<RunConfig>,
     fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
     assembly_dir: PathBuf,
 ) -> Result<
@@ -1509,121 +1765,167 @@ pub async fn generate_taxid_locator(
     ),
     PipelineError,
 > {
+    let concurrency = compute_phase_concurrency(
+        &config,
+        "generate_taxid_locator",
+        0.5,
+        4.0,
+        128,
+        16,
+    );
+    info!("generate_taxid_locator starting — {} output workers", concurrency);
 
-    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
-    let mut records: Vec<(String, String)> = Vec::with_capacity(1_000_000);
+    let levels = vec!["species", "genus", "family"];
+    let hit_types = vec!["NT", "NR"];
 
-    while let Some(item) = fasta_stream.next().await {
-        let bytes = item
-            .to_bytes()
-            .map_err(|e| PipelineError::Other(anyhow!("ParseOutput to_bytes failed: {}", e)))?;
+    let mut output_paths = Vec::new();
+    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+    let mut record_channels = Vec::new(); // (taxid_field, sender)
 
-        if bytes.is_empty() {
-            continue;
-        }
+    // Create one channel + one task per output type (8 total)
+    for level in levels.iter() {
+        for hit_type in hit_types.iter() {
+            let level_owned = level.to_string();
+            let hit_type_owned = hit_type.to_string();
+            let taxid_field = format!("{}_{}", level_owned, hit_type_owned.to_lowercase());
 
-        let record_str = String::from_utf8(bytes.to_vec())
-            .map_err(|e| PipelineError::Other(anyhow!("Invalid UTF-8 in FASTA record: {}", e)))?;
-
-        let mut lines = record_str.lines();
-        let header_line = match lines.next() {
-            Some(l) => l,
-            None => continue,
-        };
-        let seq_line = match lines.next() {
-            Some(l) => l,
-            None => {
-                warn!("FASTA record missing sequence line");
-                continue;
-            }
-        };
-
-        if !header_line.starts_with('>') {
-            warn!("Invalid FASTA header (missing '>'): {}", header_line);
-            continue;
-        }
-
-        let header = header_line[1..].trim().to_string(); // strip '>'
-        let seq = seq_line.trim().to_string();
-
-        records.push((header, seq));
-    }
-
-    info!("Collected {} mapped contigs for taxid locator generation", records.len());
-
-    if records.is_empty() {
-        // Write empty outputs
-        let empty_paths = vec![
-            assembly_dir.join("refined_taxid_annot_sorted_nt.fasta"),
-            assembly_dir.join("refined_taxid_annot_sorted_nr.fasta"),
-        ];
-        return Ok((empty_paths, vec![], vec![]));
-    }
-
-    let records_arc = Arc::new(records);
-
-    let levels = ["species", "genus", "family"];
-    let hit_types = ["NT", "NR"];
-
-    let mut output_paths: Vec<PathBuf> = Vec::new();
-    let mut locator_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-
-    for &level in &levels {
-        for &hit_type in &hit_types {
-            let taxid_field = format!("{}_{}", level, hit_type.to_lowercase());
-
-            let fa_name = if level == "species" {
-                format!("refined_taxid_annot_sorted_{}.fasta", hit_type.to_lowercase())
+            let fa_name = if level_owned == "species" {
+                format!("refined_taxid_annot_sorted_{}.fasta", hit_type_owned.to_lowercase())
             } else {
-                format!("refined_taxid_annot_sorted_{}_{}.fasta", level, hit_type.to_lowercase())
+                format!(
+                    "refined_taxid_annot_sorted_{}_{}.fasta",
+                    level_owned,
+                    hit_type_owned.to_lowercase()
+                )
             };
-            let output_fa = assembly_dir.join(&fa_name);
-            let output_json = assembly_dir.join(format!(
+            let fa_path = assembly_dir.join(&fa_name);
+            let json_path = assembly_dir.join(format!(
                 "refined_taxid_locations_{}_{}.json",
-                level,
-                hit_type.to_lowercase()
+                level_owned,
+                hit_type_owned.to_lowercase()
             ));
 
-            let records_clone = records_arc.clone();
-            let taxid_field_clone = taxid_field.clone();
-            let hit_type_clone = hit_type.to_string();
-            let output_fa_clone = output_fa.clone();
-            let output_json_clone = output_json.clone();
+            output_paths.push(fa_path.clone());
+            output_paths.push(json_path.clone());
 
-            let handle = tokio::task::spawn_blocking(move || {
-                generate_locator_work(
-                    records_clone,
-                    taxid_field_clone,
-                    hit_type_clone,
-                    output_fa_clone,
-                    output_json_clone,
-                )
+            let (tx, rx) = mpsc::channel::<(String, String)>(32768);
+
+            // Clone what the worker needs before moving into closure
+            let taxid_field_for_worker = taxid_field.clone();
+            let hit_type_for_worker = hit_type_owned.clone();
+            let fa_path_for_worker = fa_path.clone();
+            let json_path_for_worker = json_path.clone();
+
+            let task = tokio::spawn(async move {
+                let mut records_by_taxid: AHashMap<i32, Vec<(String, String)>> = AHashMap::new();
+
+                let mut rx = rx;
+                while let Some((header, seq)) = rx.recv().await {
+                    let taxid = get_taxid(&header, &taxid_field_for_worker).unwrap_or(-1);
+                    records_by_taxid.entry(taxid).or_default().push((header, seq));
+                }
+
+                if records_by_taxid.is_empty() {
+                    std::fs::write(&fa_path_for_worker, b"")?;
+                    std::fs::write(&json_path_for_worker, b"[]")?;
+                    debug!("Empty output written: {}", fa_path_for_worker.display());
+                    return Ok(());
+                }
+
+                let mut sorted_taxids: Vec<i32> = records_by_taxid.keys().copied().collect();
+                sorted_taxids.sort();
+
+                let file = std::fs::File::create(&fa_path_for_worker)
+                    .map_err(|e| anyhow!("create {}: {}", fa_path_for_worker.display(), e))?;
+                let mut writer = std::io::BufWriter::with_capacity(32 * 1024 * 1024, file);
+
+                let mut pos: u64 = 0;
+                let mut locations = Vec::with_capacity(records_by_taxid.len());
+
+                for taxid in sorted_taxids {
+                    let recs = records_by_taxid.get(&taxid).unwrap();
+                    let start = pos;
+
+                    for (header, seq) in recs {
+                        writer.write_all(b">")?;
+                        writer.write_all(header.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                        pos += 1 + header.len() as u64 + 1;
+
+                        writer.write_all(seq.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                        pos += seq.len() as u64 + 1;
+                    }
+
+                    locations.push(TaxonSeqLocation {
+                        taxid,
+                        first_byte: start,
+                        last_byte: pos.saturating_sub(1),
+                        hit_type: hit_type_for_worker.clone(),
+                    });
+                }
+
+                writer.flush()
+                    .map_err(|e| anyhow!("flush {}: {}", fa_path_for_worker.display(), e))?;
+
+                let json_bytes = serde_json::to_vec(&locations)?;
+                std::fs::write(&json_path_for_worker, json_bytes)?;
+
+                info!(
+                    "Wrote {} ({} taxids, {} records)",
+                    fa_path_for_worker.display(),
+                    locations.len(),
+                    records_by_taxid.values().map(|v| v.len()).sum::<usize>()
+                );
+                Ok(())
             });
 
-            locator_tasks.push(handle);
-
-            output_paths.push(output_fa);
-            output_paths.push(output_json);
+            tasks.push(task);
+            record_channels.push((taxid_field, tx));
         }
     }
 
+    // Stream parsing + selective broadcast
+    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
+    while let Some(item) = fasta_stream.next().await {
+        if let ParseOutput::Fasta(rec) = item {
+            let header = rec.id().to_string();
+            let seq = String::from_utf8(rec.seq().to_vec())
+                .map_err(|e| anyhow!("Invalid UTF-8 in sequence: {}", e))?;
+
+            // Send only to channels where this header has a valid taxid for that field
+            for (field, tx) in &record_channels {
+                if get_taxid(&header, field).unwrap_or(-1) != -1 {
+                    let _ = tx.send((header.clone(), seq.clone())).await;
+                }
+            }
+        }
+    }
+
+    // Close all channels
+    for (_, tx) in record_channels {
+        drop(tx);
+    }
+
+    // Wait for all workers
+    for task in tasks {
+        task.await??;
+    }
+
+    // Combine JSON locators
     let json_paths: Vec<PathBuf> = output_paths
         .iter()
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter(|p| p.extension().map_or(false, |e| e == "json"))
         .cloned()
         .collect();
 
     let combined_path = assembly_dir.join("refined_taxid_locations_combined.json");
-    let combined_path_for_worker = combined_path.clone(); // ← explicit clone
+    combine_taxon_loc_json(json_paths, combined_path.clone())?;
 
-    let combine_handle = tokio::task::spawn_blocking(move || {
-        combine_taxon_loc_json(json_paths, combined_path_for_worker)
-    });
-
-    locator_tasks.push(combine_handle);
     output_paths.push(combined_path);
 
-    Ok((output_paths, locator_tasks, vec![]))
+    info!("generate_taxid_locator complete");
+    Ok((output_paths, vec![], vec![]))
 }
 
 pub async fn filter_fastq_to_bytes_stream(
@@ -1638,8 +1940,7 @@ pub async fn filter_fastq_to_bytes_stream(
                 if headers.contains(&record.id()[..]) {
                     match record.to_bytes() {
                         Ok(vec) => {
-                            let arc_data = Arc::new(vec);
-                            let _ = tx.send(ParseOutput::Bytes(arc_data)).await;
+                            let _ = tx.send(ParseOutput::Bytes(vec)).await;
                         }
                         Err(e) => error!("Failed to serialize FASTQ record: {}", e),
                     }
@@ -1652,53 +1953,323 @@ pub async fn filter_fastq_to_bytes_stream(
     ReceiverStream::new(rx)
 }
 
+pub async fn write_combined_fastq(
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+    combined_path: &PathBuf,
+) -> Result<(), PipelineError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut out = TokioFile::create(combined_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let mut r1 = TokioFile::open(&r1_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    tokio::io::copy(&mut r1, &mut out)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    if let Some(r2_path) = r2_path_opt {
+        let mut r2 = TokioFile::open(&r2_path)
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        tokio::io::copy(&mut r2, &mut out)
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    }
+
+    out.flush()
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+    use futures::StreamExt;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn compare_header(head: &[u8], prefix: char) {
+        let scalar = parse_header_scalar(head, prefix);
+        let dispatched = parse_header(head, prefix);
+        assert_eq!(scalar.0, dispatched.0, "id mismatch for {:?}", std::str::from_utf8(head));
+        assert_eq!(scalar.1, dispatched.1, "desc mismatch for {:?}", std::str::from_utf8(head));
+    }
+
+    #[test]
+    fn test_header_id_only_fasta() {
+        let head = b"NC_045512.2";
+        let (id, desc) = parse_header_scalar(head, '>');
+        assert_eq!(id, "NC_045512.2");
+        assert!(desc.is_none());
+        compare_header(head, '>');
+    }
+
+    #[test]
+    fn test_header_with_space_desc() {
+        let head = b"NC_045512.2 Severe acute respiratory syndrome coronavirus 2";
+        let (id, desc) = parse_header_scalar(head, '>');
+        assert_eq!(id, "NC_045512.2");
+        assert_eq!(desc.as_deref(), Some("Severe acute respiratory syndrome coronavirus 2"));
+        compare_header(head, '>');
+    }
+
+    #[test]
+    fn test_header_with_tab_desc() {
+        let head = b"read1\tsome description";
+        let (id, desc) = parse_header_scalar(head, '@');
+        assert_eq!(id, "read1");
+        assert_eq!(desc.as_deref(), Some("some description"));
+        compare_header(head, '@');
+    }
+
+    #[test]
+    fn test_header_fastq_prefix_stripped() {
+        let head = b"@SRR12345.1 length=150";
+        let (id, desc) = parse_header_scalar(head, '@');
+        assert_eq!(id, "SRR12345.1");
+        assert_eq!(desc.as_deref(), Some("length=150"));
+        compare_header(head, '@');
+    }
+
+    #[test]
+    fn test_header_empty_desc_after_space() {
+        let head = b"contig_00001 ";
+        let (id, desc) = parse_header_scalar(head, '>');
+        assert_eq!(id, "contig_00001");
+        assert!(desc.is_none(), "trailing space with empty desc should give None");
+        compare_header(head, '>');
+    }
+
+    #[test]
+    fn test_header_long_id_spans_two_simd_chunks() {
+        let long_id = "a".repeat(70);
+        let head = format!("{} some description", long_id);
+        let (id, desc) = parse_header_scalar(head.as_bytes(), '>');
+        assert_eq!(id, long_id);
+        assert_eq!(desc.as_deref(), Some("some description"));
+        compare_header(head.as_bytes(), '>');
+    }
+
+    #[test]
+    fn test_header_long_id_only_no_whitespace() {
+        let long_id = "a".repeat(100);
+        let (id, desc) = parse_header_scalar(long_id.as_bytes(), '>');
+        assert_eq!(id, long_id);
+        assert!(desc.is_none());
+        compare_header(long_id.as_bytes(), '>');
+    }
+
+    #[test]
+    fn test_header_sra_style() {
+        let head = b"SRR12345.1.1 SRR12345.1 length=150";
+        let (id, desc) = parse_header_scalar(head, '@');
+        assert_eq!(id, "SRR12345.1.1");
+        assert_eq!(desc.as_deref(), Some("SRR12345.1 length=150"));
+        compare_header(head, '@');
+    }
+
+    #[test]
+    fn test_compare_read_ids_exact_and_suffix_variants() {
+        assert!(compare_read_ids("read1", "read1"));
+        assert!(compare_read_ids("read1/1", "read1/2"));
+        assert!(compare_read_ids("read1_R1", "read1_R2"));
+        assert!(compare_read_ids("read1.1", "read1.2"));
+        assert!(compare_read_ids("read1 1:N:0:", "read1 2:N:0:"));
+        assert!(!compare_read_ids("read1", "read2"));
+        assert!(!compare_read_ids("read1/1", "read2/2"));
+    }
+
+    #[test]
+    fn test_sequence_record_accessors() {
+        let fasta = SequenceRecord::Fasta {
+            id: "contig1".to_string(),
+            desc: Some("some desc".to_string()),
+            seq: Arc::new(b"ACGT".to_vec()),
+        };
+
+        assert_eq!(fasta.id(), "contig1");
+        assert_eq!(fasta.seq(), b"ACGT");
+        assert_eq!(fasta.seq_owned(), b"ACGT".to_vec());
+        assert_eq!(fasta.qual(), b"");
+        assert_eq!(fasta.desc(), Some("some desc"));
+        let fasta_arc = fasta.seq_arc();
+        assert!(Arc::ptr_eq(&fasta_arc, &fasta.seq_arc()));
+
+        let fastq = SequenceRecord::Fastq {
+            id: "read1".to_string(),
+            desc: None,
+            seq: Arc::new(b"TGCA".to_vec()),
+            qual: Arc::new(b"IIII".to_vec()),
+        };
+
+        assert_eq!(fastq.id(), "read1");
+        assert_eq!(fastq.seq(), b"TGCA");
+        assert_eq!(fastq.seq_owned(), b"TGCA".to_vec());
+        assert_eq!(fastq.qual(), b"IIII");
+        assert_eq!(fastq.desc(), None);
+        let fastq_arc = fastq.seq_arc();
+        assert!(Arc::ptr_eq(&fastq_arc, &fastq.seq_arc()));
+    }
+
+    #[test]
+    fn test_validate_sequence() {
+        let valid = Arc::new(b"ACGTACGT".to_vec());
+        assert!(validate_sequence(&valid, b"ACGT").is_ok());
+
+        let invalid = Arc::new(b"ACNT".to_vec());
+        let err = validate_sequence(&invalid, b"ACGT").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid nucleotide"));
+        assert!(msg.contains("N"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_sequence_parallel() -> Result<()> {
+        let valid = Arc::new(b"ACGTACGTACGT".to_vec());
+        validate_sequence_parallel(valid, b"ACGT", 3).await?;
+
+        let invalid = Arc::new(b"ACGTXCGT".to_vec());
+        let err = validate_sequence_parallel(invalid, b"ACGT", 3)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid nucleotide"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fastx_generator_yields_expected_records() -> Result<()> {
+        let mut stream = fastx_generator(4, 12, 30.0, 5.0);
+        let mut seen = 0usize;
+
+        while let Some(record) = stream.next().await {
+            seen += 1;
+            assert_eq!(record.id(), format!("read{}", seen));
+            assert_eq!(record.seq().len(), 12);
+            assert_eq!(record.qual().len(), 12);
+            assert!(matches!(record, SequenceRecord::Fastq { .. }));
+        }
+
+        assert_eq!(seen, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fastx_generator_zero_length_is_empty() -> Result<()> {
+        let mut stream = fastx_generator(10, 0, 30.0, 5.0);
+        assert!(stream.next().await.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_r1r2_base_detects_r1_and_builds_filename() {
+        let path = PathBuf::from("/tmp/sample_R1.fastq");
+        let result = r1r2_base(&path);
+
+        assert_eq!(result.delimiter, Some('_'));
+        assert_eq!(result.r1_tag.as_deref(), Some("R1"));
+        assert_eq!(result.prefix.as_deref(), Some("sample"));
+        assert_eq!(result.index, Some(1));
+        assert_eq!(result.file_name.as_deref(), Some("sample.fastq"));
+    }
+
+    #[test]
+    fn test_r1r2_base_non_matching_path_returns_empty_result() {
+        let path = PathBuf::from("/tmp/sample.fastq");
+        let result = r1r2_base(&path);
+
+        assert_eq!(
+            result,
+            R1R2Result {
+                delimiter: None,
+                r1_tag: None,
+                file_name: None,
+                index: None,
+                prefix: None,
+            }
+        );
+    }
 
     #[test]
     fn test_sequence_reader_fasta() -> io::Result<()> {
-        let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
-        let path = tmp.path().with_extension("fasta");
-        std::fs::rename(tmp.path(), &path)?;
-        writeln!(tmp, ">seq1 testFASTA\nATCG")?;
-        tmp.flush()?;
-        
-        let reader_result = sequence_reader(&path);
-        match reader_result {
-            Ok(reader) => {
-                match reader {
-                    SequenceReader::Fasta(_reader) => { Ok(()) },
-                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
-                }
-            }
-            Err(e) => Err(e),
+        let dir = tempdir()?;
+        let path = dir.path().join("sample.fasta");
+        fs::write(&path, b">seq1 testFASTA\nATCG\n")?;
+
+        match sequence_reader(&path)? {
+            SequenceReader::Fasta(_) => Ok(()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
         }
-        
     }
-    
+
     #[test]
     fn test_sequence_reader_fastq() -> io::Result<()> {
-        let mut tmp = NamedTempFile::new_in(std::env::temp_dir())?;
-        let path = tmp.path().with_extension("fastq");
-        std::fs::rename(tmp.path(), &path)?;
-        writeln!(tmp, "@seq1\nATCG\n+\nIIII")?;
-        tmp.flush()?;
+        let dir = tempdir()?;
+        let path = dir.path().join("sample.fastq");
+        fs::write(&path, b"@seq1\nATCG\n+\nIIII\n")?;
 
-        let reader_result = sequence_reader(&path);
-        match reader_result {
-            Ok(reader) => {
-                match reader {
-                    SequenceReader::Fastq(_reader) => { Ok(()) },
-                    _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
-                }
-            }
-            Err(e) => Err(e),
+        match sequence_reader(&path)? {
+            SequenceReader::Fastq(_) => Ok(()),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
         }
     }
+
+    #[test]
+    fn test_sequence_reader_invalid_extension() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sample.txt");
+        fs::write(&path, b"@seq1\nATCG\n+\nIIII\n").unwrap();
+
+        match sequence_reader(&path) {
+            Ok(_) => panic!("expected invalid extension error"),
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidData),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_raw_read_count_single_end() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("single.fastq");
+        fs::write(&path, b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nHHHH\n")?;
+
+        let handle = raw_read_count(path, None);
+        let count = handle.await??;
+        assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_read_count_paired_end() -> Result<()> {
+        let dir = tempdir()?;
+        let r1 = dir.path().join("r1.fastq");
+        let r2 = dir.path().join("r2.fastq");
+
+        fs::write(
+            &r1,
+            b"@read1/1\nACGT\n+\nIIII\n@read2/1\nTGCA\n+\nHHHH\n",
+        )?;
+        fs::write(
+            &r2,
+            b"@read1/2\nACGT\n+\nIIII\n@read2/2\nTGCA\n+\nHHHH\n",
+        )?;
+
+        let handle = raw_read_count(r1, Some(r2));
+        let count = handle.await??;
+        assert_eq!(count, 4);
+        Ok(())
+    }
+
+  
+
     #[tokio::test]
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
@@ -1719,7 +2290,7 @@ mod tests {
         });
 
         let count = stream_record_counter(rx, false).await?;
-        assert_eq!(count, 2, "Should count 2 FASTQ records");
+        assert_eq!(count, 2);
         Ok(())
     }
 
@@ -1742,16 +2313,86 @@ mod tests {
         });
 
         let count = stream_record_counter(rx, true).await?;
-        assert_eq!(count, 1, "Should stop at first FASTA record with early_exit");
+        assert_eq!(count, 1);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_stream_record_counter_empty() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        drop(tx); // Close immediately
+        drop(tx);
         let count = stream_record_counter(rx, false).await?;
-        assert_eq!(count, 0, "Should count 0 for empty stream");
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_and_filter_fastq_id() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "keep_me_01".to_string(),
+                desc: None,
+                seq: Arc::new(b"ATCG".to_vec()),
+                qual: Arc::new(b"IIII".to_vec()),
+            }))
+                .await
+                .unwrap();
+
+            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+                id: "ignore_me_02".to_string(),
+                desc: None,
+                seq: Arc::new(b"TGCA".to_vec()),
+                qual: Arc::new(b"HHHH".to_vec()),
+            }))
+                .await
+                .unwrap();
+        });
+
+        let (filtered_rx, task) = parse_and_filter_fastq_id(rx, 10, "keep_me".to_string());
+        let mut filtered_rx = filtered_rx;
+        let mut results = Vec::new();
+
+        while let Some(record) = filtered_rx.recv().await {
+            results.push(record);
+        }
+
+        task.await??;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id(), "keep_me_01");
+        assert_eq!(results[0].seq(), b"ATCG");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_byte_stream_to_fastq_round_trip() -> Result<()> {
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(ParseOutput::Bytes(
+            b"@read1\nACGT\n+\nIIII\n".to_vec().into(),
+        ))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let (out_rx, task) = parse_byte_stream_to_fastq(rx, 10, 1).await?;
+        let mut out_stream = ReceiverStream::new(out_rx);
+        let mut records = Vec::new();
+
+        while let Some(item) = out_stream.next().await {
+            match item {
+                ParseOutput::Fastq(record) => records.push(record),
+                other => panic!("unexpected output item: {:?}", other),
+            }
+        }
+
+        task.await??;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id(), "read1");
+        assert_eq!(records[0].seq(), b"ACGT");
+        assert_eq!(records[0].qual(), b"IIII");
         Ok(())
     }
 
@@ -1772,23 +2413,27 @@ mod tests {
                 qual: Arc::new(b"HHHH".to_vec()),
             }),
         ];
+
         tokio::spawn(async move {
             for record in records {
                 tx.send(record).await.unwrap();
             }
         });
+
         let (concat_rx, task) = concatenate_paired_reads(ReceiverStream::new(rx), 10, 10).await?;
         let mut concat_records = Vec::new();
-        let mut stream = concat_rx;  // Directly use concat_rx (already a ReceiverStream)
+        let mut stream = concat_rx;
+
         while let Some(ParseOutput::Fastq(record)) = stream.next().await {
             concat_records.push(record);
         }
+
         task.await??;
+
         assert_eq!(concat_records.len(), 1);
         assert_eq!(concat_records[0].id(), "read1/1");
         assert_eq!(concat_records[0].seq(), b"ATCGNGCTA");
         assert_eq!(concat_records[0].qual(), b"IIII!HHHH");
         Ok(())
     }
-
 }

@@ -11,19 +11,20 @@ use sysinfo::{System, Pid, ProcessesToUpdate};
 use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput, deinterleave_fastq_stream_to_fifos};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 use tokio::fs::File as TokioFile;
 use futures::future::join_all;
-use seqtoid_pipelines::config::defs::{RunConfig, StreamDataType};
+use seqtoid_pipelines::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, StreamDataType};
 use std::path::PathBuf;
 use rayon::ThreadPoolBuilder;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, Semaphore};
 use seqtoid_pipelines::cli::Arguments;
-use seqtoid_pipelines::utils::system::{detect_cores_and_load, detect_ram, generate_rng};
+use seqtoid_pipelines::utils::system::{detect_cores_and_load, detect_ram, generate_rng, compute_buffer_size};
+use seqtoid_pipelines::config::defs::SimdLevel;
 
 #[tokio::test]
 async fn test_fastx_generator_stress() -> Result<()> {
@@ -143,29 +144,51 @@ async fn test_fastx_generator_edge_cases() -> Result<()> {
 // Helper function to create a RunConfig for tests
 fn create_test_run_config() -> Arc<RunConfig> {
     let args = Arguments {
-        threads: 64,
+        threads: 8,
         ..Default::default()
     };
+
     let (total_ram, available_ram) = detect_ram()
         .unwrap_or((16u64 << 30, 8u64 << 30));
+
     let rng = generate_rng(Some(42));
-    Arc::new(RunConfig {
+
+    let mut run_config = RunConfig {
         cwd: PathBuf::from("."),
-        ram_temp_dir: PathBuf::from("/scratch"),
+        ram_temp_dir: std::env::temp_dir(),
         out_dir: PathBuf::from("test"),
         args,
-        thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(84).build().unwrap()),
-        maximal_semaphore: Arc::new(Semaphore::new(84)),
-        base_buffer_size: 5_000_000, // Reasonable for 1.5TB RAM
-        input_size: 100 * 1_048_576,
-        physical_cores: 64,
-        max_cores: 64,
-        available_ram: available_ram,
-        rng: rng,
+        thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
+        maximal_semaphore: Arc::new(Semaphore::new(8)),
+        base_buffer_size: 0,                    // temporary placeholder
+        input_size: 100 + 1_048_576,
+        physical_cores: 4,
+        max_cores: 32,
+        available_ram,
+        rng,
         log_level: LevelFilter::Debug,
         base_backpressure_pause: 1000,
-    })
+        simd: SimdLevel::Scalar,
+        gpu_info: GpuDetection { count: 0, gpus: vec![] },
+        has_gpu: false,
+        alignment_backend: NRAlignmentBackend::Diamond,
+    };
+
+    // Compute proper buffer size exactly like main.rs
+    let sdt = StreamDataType::IlluminaFastq; // default for tests
+
+    let base_buffer_size = compute_buffer_size(
+        &run_config,
+        "test_global_default",
+        sdt,
+        1.0,
+    );
+
+    run_config.base_buffer_size = base_buffer_size;
+
+    Arc::new(run_config)
 }
+
 
 #[tokio::test]
 async fn test_t_junction_stress() -> Result<()> {
@@ -383,6 +406,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         args,
         StreamDataType::IlluminaFastq,
         false,
+        None
     ).await?;
 
     match timeout(Duration::from_secs(30), inner_task).await {
@@ -513,6 +537,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         args,
                                         StreamDataType::IlluminaFastq,
                                         false,
+                                        None
                                     )
                                         .await {
                                         Ok(result) => result,
@@ -528,7 +553,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         &mut *child_guard,
                                         ChildStream::Stdout,
                                         ParseMode::Fastq,
-                                        *buffer_size,
+                                        &config,
                                     ).await?;
                                     drop(child_guard);
 
@@ -569,7 +594,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                         .stderr(std::process::Stdio::piped())
                                         .spawn()
                                         .map_err(|e| anyhow!("Failed to spawn {}: {}.", cmd, e))?;
-                                    let lines = read_child_output_to_vec(&mut wc_child, ChildStream::Stdout).await?;
+                                    let lines = read_child_output_to_vec(&mut wc_child, ChildStream::Stdout, &config).await?;
                                     let first_line = lines
                                         .first()
                                         .ok_or_else(|| anyhow!("No output from wc"))?;

@@ -35,11 +35,18 @@ jobs:
       - name: Increase pipe buffer size
         run: sudo sysctl -w fs.pipe-max-size=1048576
 
+      - name: Clean target directory (force rebuild)
+        run: rm -rf target
+
       - name: Build
         run: cargo build --verbose
+        env:
+          RUSTFLAGS: "-C target-cpu=haswell"
 
       - name: Run tests
         run: |
           RUST_BACKTRACE=full cargo test --verbose -- --test-threads=1
         env:
+          RUSTFLAGS: "-C target-cpu=haswell"
+          CARGO_INCREMENTAL: "0"
           RUST_LOG: debug

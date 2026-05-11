@@ -1,16 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use log::{self, debug, error, info, warn, LevelFilter};
+use std::sync::Arc;
+use log::{self, warn};
 
 use anyhow::{anyhow, Context, Result};
-use rayon::prelude::*;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt;
 
 use crate::utils::blast::M8Record;
 use crate::utils::streams::{ParseOutput, ToBytes};
@@ -133,7 +133,7 @@ pub async fn generate_coverage_viz(
     )
         .await?;
 
-    let coverage_viz_data = generate_coverage_viz_data(&accession_data, &contig_data, &read_data, max_bins)?;
+    let coverage_viz_data = generate_coverage_viz_data(&accession_data, &contig_data, &read_data, max_bins).await?;
 
     let summary_data = generate_coverage_viz_summary_data(
         &taxon_data,
@@ -148,12 +148,23 @@ pub async fn generate_coverage_viz(
 
     let viz_dir = output_dir.join("coverage_viz");
     create_dir_all(&viz_dir).await?;
-    coverage_viz_data.par_iter().try_for_each(|(acc_id, data)| {
-        let path = viz_dir.join(format!("{}_coverage_viz.json", acc_id));
-        let mut file = BufWriter::new(File::create(path)?);
-        serde_json::to_writer_pretty(&mut file, data)
-            .map_err(|e| anyhow!("Failed writing {}: {}", acc_id, e))
-    })?;
+
+    let mut tasks = FuturesUnordered::new();
+    for (acc_id, data) in coverage_viz_data {
+        let viz_dir = viz_dir.clone();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            let path = viz_dir.join(format!("{}_coverage_viz.json", acc_id));
+            let file = File::create(path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &data)
+                .map_err(|e| anyhow!("Failed writing {}: {}", acc_id, e))
+        }));
+    }
+
+    while let Some(result) = tasks.next().await {
+        let result: Result<Result<()>, tokio::task::JoinError> = result;
+        result.context("Task join error")??;
+    }
 
     Ok(())
 }
@@ -471,16 +482,24 @@ fn select_best_accessions_per_taxon(
     (taxon_data, accession_data)
 }
 
-fn generate_coverage_viz_data(
+async fn generate_coverage_viz_data(
     accession_data: &HashMap<String, AccessionData>,
     contig_data: &HashMap<String, Vec<ContigHit>>,
     read_data: &HashMap<String, Vec<ReadHit>>,
     max_num_bins: usize,
 ) -> Result<HashMap<String, CoverageVizData>> {
-    // Collect results in parallel into a Vec, then build HashMap sequentially
-    let viz_results: Result<Vec<(String, CoverageVizData)>> = accession_data
-        .par_iter()
-        .map(|(acc_id, acc_obj)| {
+    let contig_data = Arc::new(contig_data.clone());
+    let read_data = Arc::new(read_data.clone());
+
+    let mut tasks = FuturesUnordered::new();
+
+    for (acc_id, acc_obj) in accession_data {
+        let acc_id = acc_id.clone();
+        let acc_obj = acc_obj.clone();
+        let contig_data = Arc::clone(&contig_data);
+        let read_data = Arc::clone(&read_data);
+
+        tasks.push(tokio::task::spawn_blocking(move || {
             let total_len = acc_obj.total_length as f64;
             if total_len == 0.0 {
                 return Err(anyhow!("Zero length accession: {}", acc_id));
@@ -490,15 +509,15 @@ fn generate_coverage_viz_data(
             let bin_size = total_len / num_bins as f64;
 
             let (coverage, _) = calculate_accession_coverage(
-                acc_id,
-                acc_obj,
-                contig_data,
-                read_data,
+                &acc_id,
+                &acc_obj,
+                &contig_data,
+                &read_data,
                 num_bins,
                 bin_size,
             )?;
 
-            let stats = calculate_accession_stats(acc_obj, contig_data, read_data, total_len)?;
+            let stats = calculate_accession_stats(&acc_obj, &contig_data, &read_data, total_len)?;
 
             let viz = CoverageVizData {
                 total_length: acc_obj.total_length,
@@ -512,14 +531,14 @@ fn generate_coverage_viz_data(
                 avg_prop_mismatch: format_percent(stats.avg_prop_mismatch),
             };
 
-            Ok((acc_id.clone(), viz))
-        })
-        .collect();
+            Ok((acc_id, viz))
+        }));
+    }
 
-    let viz_results = viz_results?;
-
-    let mut result = HashMap::with_capacity(viz_results.len());
-    for (acc_id, viz) in viz_results {
+    let mut result = HashMap::with_capacity(accession_data.len());
+    while let Some(task_result) = tasks.next().await {
+        let task_result: Result<Result<(String, CoverageVizData)>, tokio::task::JoinError> = task_result;
+        let (acc_id, viz) = task_result.context("Task join error")??;
         result.insert(acc_id, viz);
     }
 

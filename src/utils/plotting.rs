@@ -14,18 +14,19 @@ pub fn plot_depths(depth_map: &HashMap<usize, u32>, sample_name: &str, output_pa
 
     let root = BitMapBackend::new(output_path, (800, 600)).into_drawing_area();
     root.fill(&WHITE)?;
-    // Find max
+
+    // Find max (never zero for log scale)
     let max_depth = depths.iter().max().copied().unwrap_or(1).max(1);
 
     let mut chart = ChartBuilder::on(&root)
         .caption(sample_name, ("sans-serif", 20))
         .x_label_area_size(40)
         .y_label_area_size(40)
-        .build_cartesian_2d(1..max_pos, LogRange(1u32..max_depth + 1))?;
+        .build_cartesian_2d(1..max_pos, (1u32..max_depth + 1).log_scale())?;
 
     chart.configure_mesh()
         .x_desc("position")
-        .y_desc("depth")
+        .y_desc("depth (log scale)")
         .draw()?;
 
     chart.draw_series(LineSeries::new(

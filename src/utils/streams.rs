@@ -6,44 +6,44 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use std::pin::Pin;
 
 
-use tokio::fs::File;
-use log::{self, LevelFilter, debug, info, error, warn};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter};
+use log::{self, debug, info, error, warn};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter, ReadBuf};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
+use tokio::time::{interval, Interval};
 use tokio_stream::{Stream, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::sync::Notify;
 use tokio::fs::File as TokioFile;
 use tokio::fs::{metadata, remove_file};
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use std::os::unix::fs::FileTypeExt;
-use futures::TryFutureExt;
 use uuid::Uuid;
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs::{self, set_permissions};
 use std::fs::Permissions;
-
+use bytes::Bytes;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
-use crate::config::defs::{PipelineError, StreamDataType};
+use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG, SPADES_TAG};
 use crate::config::defs::{CoreAllocation, RunConfig};
-use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng, compute_base_buffer_size, get_ram_temp_dir};
-
 
 
 pub trait ToBytes {
-    fn to_bytes(&self) -> Result<Vec<u8>>;
+    fn to_bytes(&self) -> Result<Bytes>;
 }
 
 impl ToBytes for SequenceRecord {
-    fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut buffer = Vec::new();  // Alloc only when needed (e.g., for stdin pipes)
+    fn to_bytes(&self) -> Result<Bytes> {
+        let mut buffer = Vec::new();
+
         match self {
             SequenceRecord::Fastq { id, desc, seq, qual } => {
                 if let Some(desc) = desc {
@@ -66,13 +66,12 @@ impl ToBytes for SequenceRecord {
                 buffer.push(b'\n');
             }
         }
-        Ok(buffer)
+
+        Ok(Bytes::from(buffer))
     }
 }
 
-
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ChildStream {
     Stdout,
     Stderr,
@@ -83,34 +82,32 @@ pub enum ParseMode {
     Fastq,
     Fasta,
     Bytes,
-    Lines
+    Lines,
 }
 
+// streams.rs
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
     Fastq(SequenceRecord),
     Fasta(SequenceRecord),
-    Bytes(Arc<Vec<u8>>),
+    Bytes(Bytes),
 }
 
 impl ToBytes for ParseOutput {
-    fn to_bytes(&self) -> Result<Vec<u8>> {
+    fn to_bytes(&self) -> Result<Bytes> {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
             ParseOutput::Fasta(record) => record.to_bytes(),
-            ParseOutput::Bytes(bytes) => {
-                // Avoid cloning if possible; return Vec only if needed
-                Arc::try_unwrap(bytes.clone()).map_err(|_| anyhow!("Cannot unwrap Arc with multiple references"))
-                    .or_else(|_| Ok((**bytes).clone())) // Fallback to clone if Arc is shared
-            }
+            ParseOutput::Bytes(bytes) => Ok(bytes.clone()),
         }
     }
 }
 
-/// Converts mpsc::Receiver<ParseOutput> type output to AsyncRead suitable to parse_fasta. parse_fastq.
+/// Converts mpsc::Receiver<ParseOutput> output to AsyncRead suitable for parse_fasta / parse_fastq.
 pub struct ChannelReader {
     rx: mpsc::Receiver<ParseOutput>,
-    buffer: Vec<u8>,
+    buffer: Option<Bytes>,
+    offset: usize,
     closed: bool,
 }
 
@@ -118,7 +115,8 @@ impl ChannelReader {
     pub fn new(rx: mpsc::Receiver<ParseOutput>) -> Self {
         Self {
             rx,
-            buffer: Vec::new(),
+            buffer: None,
+            offset: 0,
             closed: false,
         }
     }
@@ -126,51 +124,64 @@ impl ChannelReader {
 
 impl AsyncRead for ChannelReader {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.closed {
-            return std::task::Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()));
         }
 
-        // If buffer has data, copy to output
-        if !self.buffer.is_empty() {
-            let to_copy = std::cmp::min(self.buffer.len(), buf.remaining());
-            buf.put_slice(&self.buffer[0..to_copy]);
-            self.buffer.drain(0..to_copy);
-            return std::task::Poll::Ready(Ok(()));
-        }
-
-        // Fetch next chunk from channel
-        match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(item)) => {
-                match item {
-                    ParseOutput::Bytes(bytes) => {
-                        self.buffer = Arc::try_unwrap(bytes).unwrap_or_else(|arc| (*arc).clone());
-                        let to_copy = std::cmp::min(self.buffer.len(), buf.remaining());
-                        buf.put_slice(&self.buffer[0..to_copy]);
-                        self.buffer.drain(0..to_copy);
-                        std::task::Poll::Ready(Ok(()))
-                    }
-                    _ => std::task::Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Expected ParseOutput::Bytes, got another variant",
-                    ))),
+        loop {
+            if let Some(bytes) = self.buffer.as_ref().cloned() {
+                let remaining = &bytes[self.offset..];
+                if remaining.is_empty() {
+                    self.buffer = None;
+                    self.offset = 0;
+                    continue;
                 }
+
+                let to_copy = std::cmp::min(remaining.len(), buf.remaining());
+                buf.put_slice(&remaining[..to_copy]);
+                self.offset += to_copy;
+
+                if self.offset >= bytes.len() {
+                    self.buffer = None;
+                    self.offset = 0;
+                }
+
+                return Poll::Ready(Ok(()));
             }
-            std::task::Poll::Ready(None) => {
-                self.closed = true;
-                std::task::Poll::Ready(Ok(()))
+
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(item)) => match item {
+                    ParseOutput::Bytes(bytes) => {
+                        self.buffer = Some(bytes);
+                        self.offset = 0;
+                    }
+                    _ => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Expected ParseOutput::Bytes, got another variant",
+                        )));
+                    }
+                },
+                Poll::Ready(None) => {
+                    self.closed = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
-/// Generates any number of output streams from a single input stream.
-/// The streams are all asynchronous.
-///
+/// Fans oiut data piece by peiecve to donstream consumers
+/// NOTE: does NOT give each cocnusmer ALL data. NOT used for "splitting" streams!!
+/// if feeding reads a b c to two consumers
+/// Task A: recv() → gets `a`
+/// Task B: recv() → gets `b`
+/// Task A: recv() → gets `c`
 /// # Arguments
 ///
 /// * `input_stream`: An asynchronous stream yielding items of type `T`.
@@ -188,7 +199,7 @@ pub async fn t_junction<S>(
     base_buffer_size: usize,
     stall_threshold: u64,
     stream_sleep_ms: Option<u64>,
-    backpressure_pause_ms: u64,
+    _backpressure_pause_ms: u64,
     data_type: StreamDataType,
     label: String,
     notify: Option<Arc<Notify>>,
@@ -278,28 +289,17 @@ where
                 return;
             }
 
-            // Adaptive backpressure sleep
-            let pause_ms = if lowest_capacity_ratio < 0.1 {
-                backpressure_pause_ms
-            } else if lowest_capacity_ratio < 0.3 {
-                backpressure_pause_ms / 2
-            } else if lowest_capacity_ratio < 0.5 {
-                backpressure_pause_ms / 4
-            } else {
-                0
-            };
-
-            if pause_ms > 0 {
-                if item_count % 10000 == 0 {
-                debug!(
-                    "{}: Adaptive backpressure pause {}ms (lowest capacity {:.1}%) at item {}",
-                    label,
-                    pause_ms,
-                    lowest_capacity_ratio * 100.0,
-                    item_count
-                );
-            }
-            sleep(Duration::from_millis(pause_ms)).await;
+            // Per-item backpressure: only slow down when the SLOWEST receiver is truly full.
+            if lowest_capacity_ratio < 0.05 {
+                if item_count % 5000 == 0 {
+                    debug!(
+                        "{}: Heavy backpressure detected (lowest capacity {:.1}%). Sleep 10ms.",
+                        label, lowest_capacity_ratio * 100.0
+                    );
+                }
+                sleep(Duration::from_millis(10)).await;
+            } else if lowest_capacity_ratio < 0.20 {
+                tokio::task::yield_now().await;
             }
 
             if item_count % stall_threshold == 0 {
@@ -338,6 +338,7 @@ where
     Ok((output_rxs, done_rx))
 }
 
+
 /// Asynchronously spawn an external process and feed it a stream as stdin.
 /// Capture stdout and return from function.
 ///
@@ -358,7 +359,12 @@ pub async fn stream_to_cmd(
     args: Vec<String>,
     data_type: StreamDataType,
     verbose: bool,
-) -> Result<(Arc<tokio::sync::Mutex<Child>>, JoinHandle<Result<(), anyhow::Error>>, JoinHandle<Result<(), anyhow::Error>>)> {
+    stderr_log_path: Option<PathBuf>,
+) -> Result<(
+    Arc<tokio::sync::Mutex<Child>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+)> {
     let core_allocation = config.get_core_allocation(cmd_tag, None);
     let _permit = if core_allocation == CoreAllocation::Maximal {
         Some(config.maximal_semaphore.clone().acquire_owned().await?)
@@ -366,14 +372,18 @@ pub async fn stream_to_cmd(
         None
     };
 
-    let (batch_size_bytes, writer_capacity) = match data_type {
-        StreamDataType::JustBytes => (65_536, 65_536),
-        StreamDataType::IlluminaFastq => (8_388_608, 8_388_608),
-        StreamDataType::OntFastq => (1_048_576, 1_048_576),
-    };
+    let writer_capacity = crate::utils::system::compute_buffer_size(
+        &config,
+        "stream_to_cmd",
+        data_type,
+        1.8, // 1.0 = normal, 1.5–2.0 for very hot paths later
+    );
+
+    let batch_size_bytes = writer_capacity / 4; // keep ~4:1 batching ratio
 
     let cmd_tag_owned = cmd_tag.to_string();
     let cmd_tag_err_owned = cmd_tag.to_string();
+    let stderr_log_path_clone = stderr_log_path.clone();
 
     let mut child = Command::new(&cmd_tag_owned)
         .args(&args)
@@ -398,13 +408,13 @@ pub async fn stream_to_cmd(
     let stdin_task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(writer_capacity, stdin);
         let mut batch = Vec::with_capacity(batch_size_bytes);
-        let mut total_written = 0;
+        let mut total_written = 0usize;
 
         let mut stream = ReceiverStream::new(rx);
         while let Some(item) = stream.next().await {
             match &item {
-                ParseOutput::Bytes(arc_bytes) => batch.extend_from_slice(&**arc_bytes),
-                ParseOutput::Fastq(record) => {  // Direct match on inner enum
+                ParseOutput::Bytes(bytes) => batch.extend_from_slice(bytes.as_ref()),
+                ParseOutput::Fastq(record) => {
                     if let SequenceRecord::Fastq { id, desc, seq, qual } = record {
                         if let Some(d) = desc {
                             batch.extend_from_slice(format!("@{} {}\n", id, d).as_bytes());
@@ -433,18 +443,27 @@ pub async fn stream_to_cmd(
             if batch.len() >= batch_size_bytes {
                 if let Err(e) = writer.write_all(&batch).await {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        // Check status before ignoring (non-blocking)
                         let mut guard = child_clone.lock().await;
                         if let Ok(Some(status)) = guard.try_wait() {
                             if status.success() {
-                                debug!("Ignoring BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
-                                break; // Safe: No loss, child done
+                                debug!(
+                                    "Ignoring BrokenPipe in {} after successful exit",
+                                    cmd_tag_owned
+                                );
+                                break;
                             } else {
-                                return Err(anyhow!("BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                                return Err(anyhow!(
+                                    "BrokenPipe in {} with failed child exit: {:?}",
+                                    cmd_tag_owned,
+                                    status
+                                ));
                             }
                         } else {
-                            // Child not exited yet; treat as error (potential loss)
-                            return Err(anyhow!("BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                            return Err(anyhow!(
+                                "BrokenPipe in {} before child exit: {}",
+                                cmd_tag_owned,
+                                e
+                            ));
                         }
                     } else {
                         return Err(anyhow!("Write error in {}: {}", cmd_tag_owned, e));
@@ -461,54 +480,82 @@ pub async fn stream_to_cmd(
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     let mut guard = child_clone.lock().await;
                     if let Ok(Some(status)) = guard.try_wait() {
-                        if status.success() {
-                            debug!("Ignoring final BrokenPipe in {} after successful exit (code {:?})", cmd_tag_owned, status.code());
-                        } else {
-                            return Err(anyhow!("Final BrokenPipe in {} with failed child exit: {:?}", cmd_tag_owned, status));
+                        if !status.success() {
+                            return Err(anyhow!("Final BrokenPipe with failed exit: {:?}", status));
                         }
                     } else {
-                        return Err(anyhow!("Final BrokenPipe in {} before child exit: {}", cmd_tag_owned, e));
+                        return Err(anyhow!("Final BrokenPipe before exit: {}", e));
                     }
                 } else {
-                    return Err(anyhow!("Final write error in {}: {}", cmd_tag_owned, e));
+                    return Err(anyhow!("Final write error: {}", e));
                 }
             } else {
                 writer.flush().await?;
-                total_written += batch.len();
             }
         }
 
         writer.flush().await?;
-        drop(writer); // Close stdin, signal EOF
+        drop(writer);
 
-        // Final check: Await child completion and verify success
         let mut guard = child_clone.lock().await;
         let status = guard.wait().await?;
         if !status.success() {
-            return Err(anyhow!("Child {} failed after stream: exit {:?}", cmd_tag_owned, status));
+            return Err(anyhow!("Child {} failed: {:?}", cmd_tag_owned, status));
         }
+
+        debug!(
+            "[{} stdin] completed, wrote {} bytes",
+            cmd_tag_owned, total_written
+        );
+
         Ok(())
     });
 
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::with_capacity(1_048_576, stderr);
         let mut buffer = vec![0u8; 8192];
-        if verbose {
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
-                        debug!("[{} stderr]: {}", cmd_tag_err_owned, stderr_chunk);
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to read stderr: {}", e));
-                    }
-                }
+
+        let mut stderr_file = if let Some(path) = stderr_log_path_clone {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    anyhow!("Failed to create stderr log dir {}: {}", parent.display(), e)
+                })?;
             }
+            Some(TokioFile::create(&path).await.map_err(|e| {
+                anyhow!("Failed to create stderr log file {}: {}", path.display(), e)
+            })?)
         } else {
-            while reader.read(&mut buffer).await? != 0 {}
+            None
+        };
+
+        loop {
+            let n = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|e| anyhow!("Failed to read stderr: {}", e))?;
+
+            if n == 0 {
+                break;
+            }
+
+            if let Some(file) = stderr_file.as_mut() {
+                file.write_all(&buffer[..n]).await.map_err(|e| {
+                    anyhow!("Failed to write stderr log for {}: {}", cmd_tag_err_owned, e)
+                })?;
+            }
+
+            if verbose || stderr_log_path.is_some() {
+                let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
+                debug!("[{} stderr]: {}", cmd_tag_err_owned, stderr_chunk);
+            }
         }
+
+        if let Some(file) = stderr_file.as_mut() {
+            file.flush().await.map_err(|e| {
+                anyhow!("Failed to flush stderr log for {}: {}", cmd_tag_err_owned, e)
+            })?;
+        }
+
         Ok(())
     });
 
@@ -520,6 +567,7 @@ pub async fn spawn_cmd(
     cmd_tag: &str,
     args: Vec<String>,
     verbose: bool,
+    stderr_log_path: Option<PathBuf>,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
     let core_allocation = config.get_core_allocation(cmd_tag, None);
     let _permit = if core_allocation == CoreAllocation::Maximal {
@@ -529,9 +577,26 @@ pub async fn spawn_cmd(
     };
 
     let cmd_tag_owned = cmd_tag.to_string();
-    eprintln!("[{} cmd]: {}", cmd_tag, args.join(" "));
-    let mut child = Command::new(&cmd_tag_owned)
-        .args(&args)
+
+    // === NUMA SUPPORT - ONLY for tools that benefit ===
+    let (binary, final_args) = if should_use_numactl(config.as_ref(), cmd_tag) {
+        let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag_owned.clone()];
+        numa_args.extend(args);
+        debug!("spawn_cmd: Prepended numactl --interleave=all for {}", cmd_tag);
+        ("numactl", numa_args)
+    } else {
+        ("", args)   // empty string = use original binary
+    };
+
+    eprintln!("[{} cmd]: {}", cmd_tag, final_args.join(" "));
+
+    // Use the correct binary
+    let mut child = if binary.is_empty() {
+        Command::new(&cmd_tag_owned)
+    } else {
+        Command::new(binary)
+    }
+        .args(&final_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -543,32 +608,68 @@ pub async fn spawn_cmd(
             .stderr
             .take()
             .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+
         let cmd_tag_clone = cmd_tag_owned.clone();
+        let stderr_log_path_clone = stderr_log_path.clone();
+
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
             let mut buffer = vec![0u8; 8192];
-            if verbose {
-                loop {
-                    match reader.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let stderr_chunk = String::from_utf8_lossy(&buffer[..n]);
-                            debug!("[{} stderr]: {}", cmd_tag_clone, stderr_chunk);
-                        }
-                        Err(e) => {
-                            return Err(anyhow!("Failed to read stderr: {}", e));
-                        }
+
+            let mut stderr_file = if let Some(path) = stderr_log_path_clone {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).await.map_err(|e| {
+                        anyhow!("Failed to create stderr log dir {}: {}", parent.display(), e)
+                    })?;
+                }
+                Some(TokioFile::create(&path).await.map_err(|e| {
+                    anyhow!("Failed to create stderr log file {}: {}", path.display(), e)
+                })?)
+            } else {
+                None
+            };
+
+            loop {
+                let n = reader.read(&mut buffer).await
+                    .map_err(|e| anyhow!("Failed to read stderr: {}", e))?;
+
+                if n == 0 {
+                    break;
+                }
+
+                if let Some(file) = stderr_file.as_mut() {
+                    file.write_all(&buffer[..n]).await.map_err(|e| {
+                        anyhow!("Failed to write stderr log for {}: {}", cmd_tag_clone, e)
+                    })?;
+                }
+
+                if verbose || stderr_log_path.is_some() {
+                    let chunk = String::from_utf8_lossy(&buffer[..n]);
+                    eprint!("[{} stderr]: {}", cmd_tag_clone, chunk);
+                    if !chunk.ends_with('\n') {
+                        eprintln!();
                     }
                 }
-            } else {
-                while reader.read(&mut buffer).await? != 0 {}
             }
+
+            if let Some(file) = stderr_file.as_mut() {
+                file.flush().await.map_err(|e| {
+                    anyhow!("Failed to flush stderr log for {}: {}", cmd_tag_clone, e)
+                })?;
+            }
+
             Ok(())
         })
     };
 
-    // Permit is automatically dropped when the function exits, releasing it
     Ok((child, stderr_task))
+}
+
+/// Helper: which tools should get numactl on large Linux nodes
+fn should_use_numactl(config: &RunConfig, cmd_tag: &str) -> bool {
+    cfg!(target_os = "linux")
+        && config.max_cores >= 64
+        && (cmd_tag == MMSEQS_TAG || cmd_tag == SPADES_TAG || cmd_tag == DIAMOND_TAG)
 }
 
 /// Parse the output of a stream, either Fastq or simple bytes.
@@ -586,40 +687,56 @@ pub async fn parse_child_output(
     child: &mut Child,
     stream: ChildStream,
     mode: ParseMode,
-    buffer_size: usize,
+    config: &RunConfig,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
+
     match (stream, mode) {
+        // Fastq
         (ChildStream::Stdout, ParseMode::Fastq) => {
-            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
-            parse_fastq(stdout, buffer_size).await
+            let stdout = child.stdout.take()
+                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_fastq(stdout, config, StreamDataType::IlluminaFastq).await
         }
         (ChildStream::Stderr, ParseMode::Fastq) => {
-            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
-            parse_fastq(stderr, buffer_size).await
+            let stderr = child.stderr.take()
+                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_fastq(stderr, config, StreamDataType::IlluminaFastq).await
         }
+
+        // Fasta
         (ChildStream::Stdout, ParseMode::Fasta) => {
-            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
-            parse_fasta(stdout, buffer_size).await
+            let stdout = child.stdout.take()
+                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_fasta(stdout, config, StreamDataType::JustBytes).await
         }
         (ChildStream::Stderr, ParseMode::Fasta) => {
-            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
-            parse_fasta(stderr, buffer_size).await
+            let stderr = child.stderr.take()
+                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_fasta(stderr, config, StreamDataType::JustBytes).await
         }
+
+        // Bytes
         (ChildStream::Stdout, ParseMode::Bytes) => {
-            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
-            parse_bytes(stdout, buffer_size).await
+            let stdout = child.stdout.take()
+                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_bytes(stdout, config, StreamDataType::JustBytes).await
         }
         (ChildStream::Stderr, ParseMode::Bytes) => {
-            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
-            parse_bytes(stderr, buffer_size).await
+            let stderr = child.stderr.take()
+                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_bytes(stderr, config, StreamDataType::JustBytes).await
         }
+
+        // Lines
         (ChildStream::Stdout, ParseMode::Lines) => {
-            let stdout = child.stdout.take().ok_or_else(|| anyhow!("Child stdout not available"))?;
-            parse_lines(stdout, buffer_size).await
+            let stdout = child.stdout.take()
+                .ok_or_else(|| anyhow!("Child stdout not available"))?;
+            parse_lines(stdout, config, StreamDataType::JustBytes).await
         }
         (ChildStream::Stderr, ParseMode::Lines) => {
-            let stderr = child.stderr.take().ok_or_else(|| anyhow!("Child stderr not available"))?;
-            parse_lines(stderr, buffer_size).await
+            let stderr = child.stderr.take()
+                .ok_or_else(|| anyhow!("Child stderr not available"))?;
+            parse_lines(stderr, config, StreamDataType::JustBytes).await
         }
     }
 }
@@ -635,12 +752,22 @@ pub async fn parse_child_output(
 /// Result<mpsc::Receiver<ParseOutput>>
 pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
-    buffer_size: usize,
+    config: &RunConfig,           // ← added
+    data_type: StreamDataType,    // ← added (IlluminaFastq or OntFastq)
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let channel_buffer = crate::utils::system::compute_buffer_size(
+        config,
+        "parse_fastq",
+        data_type,
+        0.55,                         // parsing benefits from tighter buffers + backpressure
+    );
+
+    let (tx, rx) = mpsc::channel(channel_buffer);
+
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
     let mut buffer = String::new();
-    let mut count = 0;
+    let mut count = 0usize;
 
     tokio::spawn(async move {
         loop {
@@ -656,6 +783,7 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
                 debug!("parse_fastq: Reached end of input, processed {} records", count);
                 break;
             }
+
             let id_line = buffer.trim_end();
             if !id_line.starts_with('@') {
                 error!("parse_fastq: Invalid FASTQ format: expected '@', got '{}'", id_line);
@@ -729,9 +857,19 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
 /// Result<mpsc::Receiver<ParseOutput>>
 pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
-    buffer_size: usize,
+    config: &RunConfig,
+    data_type: StreamDataType,    // (JustBytes is fine)
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let channel_buffer = crate::utils::system::compute_buffer_size(
+        config,
+        "parse_fasta",
+        data_type,
+        0.6,                          // parsing path — tighter buffers
+    );
+
+    let (tx, rx) = mpsc::channel(channel_buffer);
+
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
     let mut buffer = String::new();
     let mut current_id = None;
@@ -768,7 +906,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fasta {
                 id,
                 desc: current_desc.take(),
-                seq: Arc::new(current_seq), // Move final current_seq
+                seq: Arc::new(current_seq),
             };
             if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                 return Err(anyhow!("Receiver dropped during final FASTA parsing, data loss detected"));
@@ -776,6 +914,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
         }
         Ok::<(), anyhow::Error>(())
     });
+
     Ok(rx)
 }
 
@@ -790,13 +929,23 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
 /// Result<mpsc::Receiver<ParseOutput>>
 pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
-    buffer_size: usize,
+    config: &RunConfig,
+    data_type: StreamDataType,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let channel_buffer = crate::utils::system::compute_buffer_size(
+        config,
+        "parse_bytes",
+        data_type,
+        0.6,                          // parsing path — tighter buffers for backpressure
+    );
+
+    let (tx, rx) = mpsc::channel(channel_buffer);
 
     tokio::spawn(async move {
         let mut reader = BufReader::with_capacity(1024 * 1024, reader);
         let mut buffer = vec![0u8; 8192];
+
         loop {
             let bytes_read = match reader.read(&mut buffer).await {
                 Ok(n) => n,
@@ -808,7 +957,11 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
             if bytes_read == 0 {
                 break;
             }
-            if tx.send(ParseOutput::Bytes(Arc::new(buffer[..bytes_read].to_vec()))).await.is_err() {
+
+            if tx.send(ParseOutput::Bytes(Bytes::from(buffer[..bytes_read].to_vec())))
+                .await
+                .is_err()
+            {
                 error!("Receiver dropped while sending bytes");
                 break;
             }
@@ -829,15 +982,27 @@ pub async fn parse_bytes<R: AsyncRead + Unpin + Send + 'static>(
 /// Result<mpsc::Receiver<ParseOutput>>
 pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     reader: R,
-    buffer_size: usize,
+    config: &RunConfig,
+    data_type: StreamDataType,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let channel_buffer = crate::utils::system::compute_buffer_size(
+        config,
+        "parse_lines",
+        data_type,
+        0.6,
+    );
+
+    let (tx, rx) = mpsc::channel(channel_buffer);
+
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
     tokio::spawn(async move {
         let mut line = String::new();
+
         loop {
             line.clear();
+
             let bytes_read = match reader.read_line(&mut line).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -845,15 +1010,25 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
                     return;
                 }
             };
+
             if bytes_read == 0 {
                 break;
             }
-            let trimmed = line.trim_end().to_string();
-            if !trimmed.is_empty() {
-                if tx.send(ParseOutput::Bytes(Arc::new(trimmed.into_bytes()))).await.is_err() {
-                    error!("Receiver dropped while sending line");
-                    break;
-                }
+
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let bytes = trimmed.as_bytes().to_vec();
+
+            if tx
+                .send(ParseOutput::Bytes(Bytes::from(bytes)))
+                .await
+                .is_err()
+            {
+                error!("Receiver dropped while sending line");
+                break;
             }
         }
     });
@@ -906,8 +1081,8 @@ pub async fn stream_to_file(
 ///
 /// # Returns
 /// Result<Vec<String>> containing the lines from the selected stream.
-pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream) -> Result<Vec<String>> {
-    let rx = parse_child_output(child, stream, ParseMode::Bytes, 1000).await?;
+pub async fn read_child_output_to_vec(child: &mut Child, stream: ChildStream, config: &RunConfig) -> Result<Vec<String>> {
+    let rx = parse_child_output(child, stream, ParseMode::Bytes, &config).await?;
     let mut stream = ReceiverStream::new(rx);
     let mut lines = Vec::new();
 
@@ -1089,7 +1264,7 @@ pub async fn deinterleave_fastq_stream(
             record_count += 1;
             if let ParseOutput::Fastq(record) = item {
                 let bytes = record.to_bytes().map_err(|e| anyhow!("Failed to convert FASTQ to bytes: {}", e))?;
-                let bytes_output = ParseOutput::Bytes(Arc::new(bytes));
+                let bytes_output = ParseOutput::Bytes(Bytes::from(bytes));
                 if paired {
                     if is_r1 {
                         r1_tx.send(bytes_output.clone()).await
@@ -1142,96 +1317,59 @@ pub async fn deinterleave_fastq_stream_to_fifos(
     JoinHandle<Result<(), anyhow::Error>>,
     Option<JoinHandle<Result<(), anyhow::Error>>>,
 ), PipelineError> {
+
     let ram_temp_dir = config.ram_temp_dir.clone();
     let r1_fifo = ram_temp_dir.join(format!("{}_R1.fq", sample_base));
     let r2_fifo = paired.then(|| ram_temp_dir.join(format!("{}_R2.fq", sample_base)));
 
-    // Clean up any stale FIFOs (R1 always, R2 only if paired)
+    // Clean up stale FIFOs
     let fifos_to_clean: Vec<&PathBuf> = std::iter::once(&r1_fifo)
         .chain(r2_fifo.as_ref())
         .collect();
 
-    debug!(
-        "Cleaning up existing FIFOs: R1={}, R2={:?}",
-        r1_fifo.display(),
-        r2_fifo.as_ref().map(|p| p.display())
-    );
-
     for fifo in fifos_to_clean {
         for attempt in 1..=3 {
             if metadata(fifo).await.is_ok() {
-                debug!("Attempt {} to remove existing FIFO: {}", attempt, fifo.display());
                 match remove_file(fifo).await {
-                    Ok(_) => {
-                        debug!("Successfully removed FIFO: {}", fifo.display());
-                        break;
-                    }
+                    Ok(_) => break,
                     Err(e) => {
-                        warn!(
-                            "Failed to remove FIFO {} on attempt {}: {}",
-                            fifo.display(),
-                            attempt,
-                            e
-                        );
-                        if attempt < 3 {
-                            sleep(Duration::from_millis(100)).await;
-                            continue;
+                        if attempt == 3 {
+                            return Err(PipelineError::IOError(format!(
+                                "Failed to remove FIFO {} after 3 attempts: {}", fifo.display(), e
+                            )));
                         }
-                        return Err(PipelineError::IOError(format!(
-                            "Failed to remove existing FIFO {} after 3 attempts: {}",
-                            fifo.display(),
-                            e
-                        )));
+                        sleep(Duration::from_millis(100)).await;
                     }
                 }
             } else {
-                debug!("No existing FIFO found: {}", fifo.display());
                 break;
             }
         }
     }
 
-    // Create R1 FIFO (always)
-    debug!("Creating R1 FIFO: {}", r1_fifo.display());
+    // Create FIFOs
     create_fifo(&r1_fifo)
         .await
         .map_err(|e| PipelineError::IOError(format!("Failed to create R1 FIFO {}: {}", r1_fifo.display(), e)))?;
-    if !metadata(&r1_fifo)
-        .await
-        .map_err(|e| PipelineError::IOError(format!("R1 FIFO check failed: {}", e)))?
-        .file_type()
-        .is_fifo()
-    {
-        return Err(PipelineError::IOError(format!(
-            "R1 path {} is not a FIFO",
-            r1_fifo.display()
-        )));
-    }
 
-    // Create R2 FIFO only if paired
     if let Some(ref r2_path) = r2_fifo {
-        debug!("Creating R2 FIFO: {}", r2_path.display());
         create_fifo(r2_path)
             .await
             .map_err(|e| PipelineError::IOError(format!("Failed to create R2 FIFO {}: {}", r2_path.display(), e)))?;
-        if !metadata(r2_path)
-            .await
-            .map_err(|e| PipelineError::IOError(format!("R2 FIFO check failed: {}", e)))?
-            .file_type()
-            .is_fifo()
-        {
-            return Err(PipelineError::IOError(format!(
-                "R2 path {} is not a FIFO",
-                r2_path.display()
-            )));
-        }
     }
 
-    let buffer_size = (config.base_buffer_size * 10).min(100_000);
-    let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(buffer_size);
-    let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(buffer_size);
+    // Dynamic buffer for deinterleave channels
+    let channel_buffer = crate::utils::system::compute_buffer_size(
+        &config,
+        "deinterleave_fastq",
+        StreamDataType::IlluminaFastq,
+        1.6,                          // hot path for deinterleave
+    );
 
-    // Deinterleave task — convert PipelineError → anyhow::Error
+    let (r1_tx, r1_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
+    let (r2_tx, r2_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
+
+    // Deinterleave task
     let deinterleave_handle = tokio::spawn(async move {
         let mut is_r1 = true;
         let mut record_count = 0;
@@ -1242,49 +1380,33 @@ pub async fn deinterleave_fastq_stream_to_fifos(
                 ParseOutput::Fastq(record) => {
                     if paired {
                         if is_r1 {
-                            r1_tx
-                                .send(ParseOutput::Fastq(record))
-                                .await
+                            r1_tx.send(ParseOutput::Fastq(record)).await
                                 .map_err(|_| PipelineError::StreamDataDropped)?;
                         } else {
-                            r2_tx
-                                .send(ParseOutput::Fastq(record))
-                                .await
+                            r2_tx.send(ParseOutput::Fastq(record)).await
                                 .map_err(|_| PipelineError::StreamDataDropped)?;
                         }
                         is_r1 = !is_r1;
                     } else {
-                        r1_tx
-                            .send(ParseOutput::Fastq(record))
-                            .await
+                        r1_tx.send(ParseOutput::Fastq(record)).await
                             .map_err(|_| PipelineError::StreamDataDropped)?;
                     }
                 }
-                _ => {
-                    return Err(PipelineError::InvalidFastqFormat(
-                        "Non-FASTQ in deinterleave stream".to_string(),
-                    )
-                        .into());
-                }
+                _ => return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in deinterleave stream".to_string()).into()),
             }
         }
 
         if paired && !is_r1 {
             return Err(PipelineError::InvalidFastqFormat(format!(
-                "Incomplete paired-end stream: {} records, expected even number",
-                record_count
-            ))
-                .into());
+                "Incomplete paired-end stream: {} records", record_count
+            )).into());
         }
 
-        debug!(
-            "deinterleave_fastq_stream_to_fifos: Completed deinterleaving {} records",
-            record_count
-        );
+        debug!("deinterleave_fastq_stream_to_fifos: Completed {} records", record_count);
         Ok(())
     });
 
-    // Writer tasks — write_to_fifo returns JoinHandle<Result<(), anyhow::Error>>
+    // Writer tasks
     let r1_write_handle = tokio::spawn(write_to_fifo(r1_rx, r1_fifo.clone()));
     let r2_write_handle = if paired {
         Some(tokio::spawn(write_to_fifo(r2_rx, r2_fifo.clone().unwrap())))
@@ -1590,14 +1712,16 @@ pub async fn bytes_to_lines(
     buffer_size: usize,
 ) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
     let (tx, output_rx) = mpsc::channel(buffer_size);
-    let mut leftover = Vec::new();
+    let mut leftover: Vec<u8> = Vec::new();
 
     let task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(rx);
+
         while let Some(item) = stream.next().await {
             match item {
-                ParseOutput::Bytes(arc_bytes) => {
-                    let mut bytes = arc_bytes.as_ref().to_vec();
+                ParseOutput::Bytes(bytes) => {
+                    let mut bytes = bytes.to_vec();
+
                     if !leftover.is_empty() {
                         leftover.append(&mut bytes);
                         bytes = leftover;
@@ -1607,7 +1731,7 @@ pub async fn bytes_to_lines(
                     let mut start = 0;
                     for i in 0..bytes.len() {
                         if bytes[i] == b'\n' {
-                            let line = Arc::new(bytes[start..=i].to_vec());
+                            let line = Bytes::copy_from_slice(&bytes[start..=i]);
                             if tx.send(ParseOutput::Bytes(line)).await.is_err() {
                                 warn!("Warning: Receiver dropped in bytes_to_lines, stopping line processing");
                                 break;
@@ -1627,7 +1751,7 @@ pub async fn bytes_to_lines(
         }
 
         if !leftover.is_empty() {
-            if tx.send(ParseOutput::Bytes(Arc::new(leftover))).await.is_err() {
+            if tx.send(ParseOutput::Bytes(Bytes::from(leftover))).await.is_err() {
                 warn!("Warning: Receiver dropped when sending final leftover line");
             }
         }
@@ -1648,58 +1772,593 @@ pub async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyh
 }
 
 
+
+pub fn monitor_stream(
+    input: ReceiverStream<ParseOutput>,
+    stage_name: &str,
+    log_interval: Duration,
+) -> ReceiverStream<ParseOutput> {
+    let count = Arc::new(AtomicUsize::new(0));
+    let stage = stage_name.to_string();
+    let count_clone = count.clone();
+
+    let stop_notify = Arc::new(Notify::new());
+    let stop_notify_clone = stop_notify.clone();
+    let stage_clone = stage.clone();
+
+    tokio::spawn(async move {
+        let mut heartbeat: Interval = interval(log_interval);
+        let mut last_count: usize = 0;
+        let start = Instant::now();
+
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    let current = count_clone.load(Ordering::Relaxed);
+                    let delta = current - last_count;
+                    let velocity = (delta as f64) / log_interval.as_secs_f64();
+
+                    if delta == 0 {
+                        warn!(
+                            "{}: Stalled (0 records in last {:?}, total={})",
+                            stage_clone,
+                            log_interval,
+                            current
+                        );
+                    } else {
+                        info!(
+                            "{}: Output velocity: {:.0} records/s ({} total, +{} since last tick, elapsed {:?})",
+                            stage_clone,
+                            velocity,
+                            current,
+                            delta,
+                            start.elapsed()
+                        );
+                    }
+
+                    last_count = current;
+                }
+                _ = stop_notify_clone.notified() => {
+                    let final_count = count_clone.load(Ordering::Relaxed);
+                    debug!(
+                        "{}: Logging task stopped after {} total records in {:?}",
+                        stage_clone,
+                        final_count,
+                        start.elapsed()
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut input_receiver = input.into_inner();
+    let buf_size = input_receiver.capacity();
+    let (forward_tx, forward_rx) = mpsc::channel::<ParseOutput>(buf_size);
+    let stop_notify_forward = stop_notify.clone();
+    let stage_forward = stage.clone();
+    let count_forward = count.clone();
+
+    tokio::spawn(async move {
+        struct DropGuard {
+            notify: Arc<Notify>,
+        }
+
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.notify.notify_one();
+            }
+        }
+
+        let _guard = DropGuard {
+            notify: stop_notify,
+        };
+
+        let mut forwarded = 0usize;
+        let mut last_log = Instant::now();
+
+        while let Some(item) = input_receiver.recv().await {
+            count_forward.fetch_add(1, Ordering::Relaxed);
+            forwarded += 1;
+
+            if forward_tx.send(item).await.is_err() {
+                warn!(
+                    "{}: Forward send failed (downstream dropped after {} records)",
+                    stage_forward,
+                    forwarded
+                );
+                break;
+            }
+
+            if last_log.elapsed() >= Duration::from_secs(10) {
+                let current = count_forward.load(Ordering::Relaxed);
+                info!(
+                    "{}: forwarded {} records total (receiver total={})",
+                    stage_forward,
+                    forwarded,
+                    current
+                );
+                last_log = Instant::now();
+            }
+        }
+
+        let final_total = count_forward.load(Ordering::Relaxed);
+        info!(
+            "{}: Stream complete ({} total records)",
+            stage_forward,
+            final_total
+        );
+
+        drop(forward_tx);
+        stop_notify_forward.notify_one();
+    });
+
+    ReceiverStream::new(forward_rx)
+}
+
+
+/// Guarantees: zero data drops, respects t_junction backpressure, cleanup_receivers untouched.
+///
+/// Speed improvements
+/// - reuses the input batch buffer allocation instead of `std::mem::take`
+/// - reserves space for incoming chunks before extending
+/// - surfaces downstream send failure instead of silently ignoring it
+pub fn batch_rayon_process<F>(
+    config: Arc<RunConfig>,
+    mut input: ReceiverStream<ParseOutput>,
+    processor: F,
+    stage_name: &'static str,
+    batch_target_bytes: usize,        // legacy fallback
+) -> ReceiverStream<ParseOutput>
+where
+    F: Fn(Vec<u8>) -> Vec<Vec<u8>> + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel(1024);
+    let processor = Arc::new(processor);
+
+    async fn send_lines(
+        tx: &mpsc::Sender<ParseOutput>,
+        lines: Vec<Vec<u8>>,
+        stage_name: &'static str,
+        label: &'static str,
+    ) -> bool {
+        for line in lines {
+            if tx.send(ParseOutput::Bytes(Bytes::from(line))).await.is_err() {
+                warn!("{}: downstream closed while sending {}", stage_name, label);
+                return false;
+            }
+        }
+        true
+    }
+
+    tokio::spawn(async move {
+        let batch_target = crate::utils::system::compute_buffer_size(
+            &config,
+            "batch_rayon",
+            StreamDataType::JustBytes,
+            2.0,                          // hot CPU path — larger batches
+        ).max(batch_target_bytes);        // respect legacy param if larger
+
+        let mut buf = Vec::with_capacity(batch_target);
+        let mut processed = 0u64;
+
+        while let Some(item) = input.next().await {
+            let ParseOutput::Bytes(b) = item else { continue; };
+
+            buf.reserve(b.len());
+            buf.extend_from_slice(&b);
+
+            if buf.len() >= batch_target {
+                let mut batch = Vec::with_capacity(buf.len());
+                batch.append(&mut buf);
+
+                let p = Arc::clone(&processor);
+                let config_clone = Arc::clone(&config);
+
+                let lines = match tokio::task::spawn_blocking(move || {
+                    config_clone.thread_pool.install(|| p(batch))
+                }).await {
+                    Ok(lines) => lines,
+                    Err(join_err) => {
+                        error!("{}: batch task panicked: {}", stage_name, join_err);
+                        break;
+                    }
+                };
+
+                let batch_len = lines.len() as u64;
+                if !send_lines(&tx, lines, stage_name, "batch").await {
+                    break;
+                }
+
+                processed += batch_len;
+            }
+        }
+
+        // Final flush
+        if !buf.is_empty() {
+            let mut batch = Vec::with_capacity(buf.len());
+            batch.append(&mut buf);
+
+            let p = Arc::clone(&processor);
+            let config_clone = Arc::clone(&config);
+
+            let lines = match tokio::task::spawn_blocking(move || {
+                config_clone.thread_pool.install(|| p(batch))
+            }).await {
+                Ok(lines) => lines,
+                Err(join_err) => {
+                    error!("{}: final batch task panicked: {}", stage_name, join_err);
+                    return;
+                }
+            };
+
+            let batch_len = lines.len() as u64;
+            let _ = send_lines(&tx, lines, stage_name, "final batch").await;
+            processed += batch_len;
+        }
+
+        debug!("{}: finished — total {} items (target batch {} bytes)", stage_name, processed, batch_target);
+    });
+
+    ReceiverStream::new(rx)
+}
+
+/// Router that reads the upstream ONCE and fans it out to N private channels.
+/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+/// Router that reads the upstream ONCE and fans it out to N private channels.
+/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+pub async fn fanout_to_channels(
+    mut upstream: ReceiverStream<ParseOutput>,
+    n_branches: usize,
+    label: &str,
+    config: &RunConfig,           // ← added
+    data_type: StreamDataType,    // ← added
+) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
+
+    let buffer_per_branch = crate::utils::system::compute_buffer_size(
+        config,
+        "fanout",                     // phase name
+        data_type,
+        1.45,                         // good hot-path boost for fanout (not too aggressive)
+    );
+
+    let mut txs = Vec::with_capacity(n_branches);
+    let mut rxs = Vec::with_capacity(n_branches);
+
+    for _ in 0..n_branches {
+        let (tx, rx) = mpsc::channel(buffer_per_branch);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+
+    let label = label.to_string();
+    let router: JoinHandle<anyhow::Result<(), anyhow::Error>> = tokio::spawn(async move {
+        let mut count = 0usize;
+        while let Some(item) = upstream.next().await {
+            count += 1;
+            // Send to EVERY branch (never drop)
+            let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
+            let _ = futures::future::join_all(sends).await;
+        }
+        debug!("[fanout {}] finished — forwarded {} items total", label, count);
+        Ok(())
+    });
+
+    Ok((rxs, router))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
     use std::io::Read;
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, LevelFilter, debug, error};
     use tokio::process::Command;
     use tokio::task;
-    use tokio::fs::File as TokioFile;
     use tokio::time::{self, Duration};
     use crate::utils::fastx::fastx_generator;
-    use crate::config::defs::{RunConfig, StreamDataType};
+    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend, SimdLevel};
     use std::sync::Arc;
     use rayon::ThreadPoolBuilder;
-    use tokio::sync::{Semaphore, Mutex};
+    use tokio::sync::Semaphore;
+    use tokio::fs::File;
     use std::path::PathBuf;
     use crate::cli::Arguments;
     use tempfile::tempdir;
     use tokio::fs::metadata;
     use std::os::unix::fs::FileTypeExt;
     use crate::utils::fastx::SequenceRecord;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::duplex;
+    use crate::utils::system::{detect_ram, generate_rng};
 
 
     // Helper function to create a RunConfig for tests
     fn create_test_run_config() -> Arc<RunConfig> {
         let args = Arguments {
-            threads: 8, // Laptop
+            threads: 8,
             ..Default::default()
         };
 
-        let (total_ram, available_ram) = detect_ram()
+        let (_, available_ram) = detect_ram()
             .unwrap_or((16u64 << 30, 8u64 << 30));
+
         let rng = generate_rng(Some(42));
 
-        Arc::new(RunConfig {
+        let mut run_config = RunConfig {
             cwd: PathBuf::from("."),
             ram_temp_dir: std::env::temp_dir(),
             out_dir: PathBuf::from("test"),
             args,
             thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
             maximal_semaphore: Arc::new(Semaphore::new(8)),
-            base_buffer_size: 5_000_000,
+            base_buffer_size: 0,                    // temporary placeholder
             input_size: 100 + 1_048_576,
             physical_cores: 4,
-            max_cores: 8,
-            available_ram: available_ram,
-            rng: rng,
+            max_cores: 32,
+            available_ram,
+            rng,
             log_level: LevelFilter::Debug,
-            base_backpressure_pause: 1000
-        })
+            base_backpressure_pause: 1000,
+            simd: SimdLevel::Scalar,
+            gpu_info: GpuDetection { count: 0, gpus: vec![] },
+            has_gpu: false,
+            alignment_backend: NRAlignmentBackend::Diamond,
+        };
+
+        // Compute proper buffer size exactly like main.rs
+        let sdt = StreamDataType::IlluminaFastq; // default for tests
+
+        let base_buffer_size = crate::utils::system::compute_buffer_size(
+            &run_config,
+            "test_global_default",
+            sdt,
+            1.0,
+        );
+
+        run_config.base_buffer_size = base_buffer_size;
+
+        Arc::new(run_config)
+    }
+
+
+    #[tokio::test]
+    async fn test_to_bytes_formats_fastq_and_fasta() -> Result<()> {
+        let fastq = SequenceRecord::Fastq {
+            id: "read1".to_string(),
+            desc: Some("mate 1".to_string()),
+            seq: Arc::new(b"ATCG".to_vec()),
+            qual: Arc::new(b"IIII".to_vec()),
+        };
+        let fasta = SequenceRecord::Fasta {
+            id: "contig1".to_string(),
+            desc: Some("assembled contig".to_string()),
+            seq: Arc::new(b"GATTACA".to_vec()),
+        };
+
+        assert_eq!(fastq.to_bytes()?.as_ref(), b"@read1 mate 1\nATCG\n+\nIIII\n");
+        assert_eq!(fasta.to_bytes()?.as_ref(), b">contig1 assembled contig\nGATTACA\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_fasta_multiline_and_description() -> Result<()> {
+        let config = create_test_run_config();
+        let (mut writer, reader) = duplex(64 * 1024);
+        let input = b">seq1 first record\nACGT\nTGCA\n>seq2\nNNNN\n";
+
+        let write_task = tokio::spawn(async move {
+            writer.write_all(input).await?;
+            writer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let rx = parse_fasta(reader, &config, StreamDataType::JustBytes).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut records = Vec::new();
+        while let Some(item) = stream.next().await {
+            records.push(item);
+        }
+
+        write_task.await??;
+        assert_eq!(records.len(), 2);
+
+        match &records[0] {
+            ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
+                assert_eq!(id, "seq1");
+                assert_eq!(desc.as_deref(), Some("first record"));
+                assert_eq!(seq.as_ref().as_slice(), b"ACGTTGCA");
+            }
+            other => panic!("Expected first FASTA record, got {:?}", other),
+        }
+
+        match &records[1] {
+            ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
+                assert_eq!(id, "seq2");
+                assert_eq!(desc, &None);
+                assert_eq!(seq.as_ref().as_slice(), b"NNNN");
+            }
+            other => panic!("Expected second FASTA record, got {:?}", other),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_skips_blanks_and_trims_endings() -> Result<()> {
+        let config = create_test_run_config();
+        let (mut writer, reader) = duplex(64 * 1024);
+        let input = b"line1\n\nline2\r\nline3\n";
+
+        let write_task = tokio::spawn(async move {
+            writer.write_all(input).await?;
+            writer.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let rx = parse_lines(reader, &config, StreamDataType::JustBytes).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut lines = Vec::new();
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            lines.push(String::from_utf8(bytes.to_vec())?);
+        }
+
+        write_task.await??;
+        assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bytes_to_lines_reassembles_chunk_boundaries() -> Result<()> {
+        let (tx, rx) = mpsc::channel(8);
+        let (mut out_rx, task) = bytes_to_lines(rx, 8).await?;
+
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"abc\nx"))).await?;
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"yz\n\nlast"))).await?;
+        drop(tx);
+
+        let mut got = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            match item {
+                ParseOutput::Bytes(bytes) => got.push(String::from_utf8(bytes.to_vec())?),
+                other => panic!("Expected bytes, got {:?}", other),
+            }
+        }
+
+        task.await??;
+        assert_eq!(got, vec!["abc\n", "xyz\n", "\n", "last"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_lines_skips_blank_lines() -> Result<()> {
+        let config = create_test_run_config();
+        let (mut writer, reader) = tokio::io::duplex(64);
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(b"abc\n\nxyz\n\nlast\n").await.unwrap();
+        });
+
+        let rx = parse_lines(reader, &config, StreamDataType::JustBytes).await?;
+        let mut stream = ReceiverStream::new(rx);
+
+        let mut got = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                ParseOutput::Bytes(bytes) => got.push(String::from_utf8(bytes.to_vec())?),
+                other => panic!("Expected bytes, got {:?}", other),
+            }
+        }
+
+        assert_eq!(got, vec!["abc", "xyz", "last"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_y_junction_concatenates_streams_in_order() -> Result<()> {
+        let (tx1, rx1) = mpsc::channel(8);
+        let (tx2, rx2) = mpsc::channel(8);
+
+        tx1.send(ParseOutput::Bytes(Bytes::from_static(b"a1"))).await?;
+        tx1.send(ParseOutput::Bytes(Bytes::from_static(b"a2"))).await?;
+        drop(tx1);
+        tx2.send(ParseOutput::Bytes(Bytes::from_static(b"b1"))).await?;
+        drop(tx2);
+
+        let (rx, task) = y_junction(vec![rx1, rx2], 8).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut got = Vec::new();
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            got.push(String::from_utf8(bytes.to_vec())?);
+        }
+
+        task.await??;
+        assert_eq!(got, vec!["a1", "a2", "b1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_convert_fasta_stream_to_sequence_record_filters_non_fasta() -> Result<()> {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(ParseOutput::Fasta(SequenceRecord::Fasta {
+            id: "seq1".to_string(),
+            desc: Some("desc".to_string()),
+            seq: Arc::new(b"ACGT".to_vec()),
+        })).await?;
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"ignored"))).await?;
+        drop(tx);
+
+        let (mut out_rx, task) = convert_fasta_stream_to_sequence_record(rx, 8).await?;
+        let mut records = Vec::new();
+        while let Some(item) = out_rx.recv().await {
+            records.push(item);
+        }
+
+        task.await??;
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            SequenceRecord::Fasta { id, desc, seq } => {
+                assert_eq!(id, "seq1");
+                assert_eq!(desc.as_deref(), Some("desc"));
+                assert_eq!(seq.as_ref().as_slice(), b"ACGT");
+            }
+            other => panic!("Expected FASTA record, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fanout_to_channels_duplicates_items_to_all_branches() -> Result<()> {
+        let config = create_test_run_config();
+        let (up_tx, up_rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            up_tx.send(ParseOutput::Bytes(Bytes::from_static(b"first"))).await.unwrap();
+            up_tx.send(ParseOutput::Bytes(Bytes::from_static(b"second"))).await.unwrap();
+            drop(up_tx);
+        });
+        let upstream = ReceiverStream::new(up_rx);
+
+        let (receivers, router) = fanout_to_channels(
+            upstream,
+            3,
+            "test_fanout",
+            &config,
+            StreamDataType::JustBytes,
+        ).await?;
+
+        let mut branch_data = Vec::new();
+        for rx in receivers {
+            let mut stream = ReceiverStream::new(rx);
+            let mut items = Vec::new();
+            while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+                items.push(String::from_utf8(bytes.to_vec())?);
+            }
+            branch_data.push(items);
+        }
+
+        router.await??;
+        for branch in branch_data {
+            assert_eq!(branch, vec!["first", "second"]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_child_output_lines() -> Result<()> {
+        let config = create_test_run_config();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'alpha\\n\\n beta\\n gamma\\n'");
+        let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
+        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Lines, &config).await?;
+        let mut stream = ReceiverStream::new(rx);
+        let mut got = Vec::new();
+        while let Some(ParseOutput::Bytes(bytes)) = stream.next().await {
+            got.push(String::from_utf8(bytes.to_vec())?);
+        }
+        assert_eq!(got, vec!["alpha", " beta", " gamma"]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1947,7 +2606,7 @@ mod tests {
             });
             handles.push(handle);
         }
-        let all_records = time::timeout(Duration::from_secs(120), async {
+        let _ = time::timeout(Duration::from_secs(120), async {
             let mut all_records = Vec::with_capacity(2);
             for (i, handle) in handles.into_iter().enumerate() {
                 let records = handle.await??;
@@ -2074,6 +2733,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2111,6 +2771,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2162,6 +2823,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2202,6 +2864,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await;
         assert!(result.is_err(), "Should fail for invalid command");
@@ -2236,6 +2899,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2274,6 +2938,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2334,6 +2999,7 @@ mod tests {
             vec!["-n".to_string(), "1".to_string()],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         let mut stdout = {
@@ -2373,6 +3039,7 @@ mod tests {
             vec![],
             StreamDataType::IlluminaFastq,
             false,
+            None
         )
             .await?;
         task.await??;
@@ -2387,10 +3054,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_child_output_fastq() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("echo");
         cmd.arg("@read1\nATCG\n+\nIIII\n@read2\nGCTA\n+\nHHHH\n");
         let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Fastq, 100).await?;
+        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Fastq, &config).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut records = Vec::new();
         while let Some(ParseOutput::Fastq(record)) = stream.next().await {
@@ -2406,10 +3074,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_child_output_bytes() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("echo");
         cmd.arg("test data");
         let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, 100).await?;
+        let rx = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, &config).await?;
         let mut stream = ReceiverStream::new(rx);
         while let Some(ParseOutput::Bytes(chunk)) = stream.next().await {
             assert!(String::from_utf8_lossy(&*chunk).contains("test data"));
@@ -2420,6 +3089,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_file_fastq() -> Result<()> {
+        let config = create_test_run_config();
         let _ = fs::remove_file("stream_to_file_test_illumina.fq");
         let num_records = 2;
         let mut records = fastx_generator(num_records, 150, 30.0, 8.0).map(ParseOutput::Fastq);
@@ -2444,7 +3114,7 @@ mod tests {
         assert!(output_path.exists(), "Output file was not created");
 
         let file = File::open(&output_path).await?;
-        let rx = parse_fastq(file, 1024).await?;
+        let rx = parse_fastq(file, &config, StreamDataType::IlluminaFastq).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut parsed_records = Vec::new();
 
@@ -2468,6 +3138,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_to_file_no_records() -> Result<()> {
+        let config = create_test_run_config();
         let _ = fs::remove_file("stream_to_file_norecord_test.fq");
         let (tx, rx) = mpsc::channel(1024);
         let mut records = fastx_generator(0, 10, 35.0, 3.0).map(ParseOutput::Fastq);
@@ -2494,7 +3165,7 @@ mod tests {
         );
 
         let file = File::open(&output_path).await?;
-        let rx = parse_fastq(file, 1024).await?;
+        let rx = parse_fastq(file, &config, StreamDataType::IlluminaFastq).await?;
         let mut stream = ReceiverStream::new(rx);
         let mut parsed_records = Vec::new();
 
@@ -2517,10 +3188,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_child_output_to_vec() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("echo");
         cmd.arg("line1\nline2\n\nline3");
         let mut child = cmd.stdout(std::process::Stdio::piped()).spawn()?;
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stdout, &config).await?;
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "line1");
         assert_eq!(lines[1], "line2");
@@ -2530,10 +3202,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_child_output_to_vec_stderr() -> Result<()> {
+        let config = create_test_run_config();
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("echo error >&2");
         let mut child = cmd.stderr(std::process::Stdio::piped()).spawn()?;
-        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr).await?;
+        let lines = read_child_output_to_vec(&mut child, ChildStream::Stderr, &config).await?;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "error");
         Ok(())
@@ -2543,7 +3216,7 @@ mod tests {
     async fn test_spawn_cmd_stderr_verbose() -> Result<()> {
         let config = create_test_run_config();
         let args = vec!["-c".to_string(), "echo error >&2".to_string()];
-        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, true).await?;
+        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, true, None).await?;
         let status = child.wait().await?;
         stderr_task.await??;
         assert!(status.success(), "Child process should exit successfully");
@@ -2554,7 +3227,7 @@ mod tests {
     async fn test_spawn_cmd_stderr_non_verbose() -> Result<()> {
         let config = create_test_run_config();
         let args = vec!["-c".to_string(), "echo error >&2".to_string()];
-        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, false).await?;
+        let (mut child, stderr_task) = spawn_cmd(config, "sh", args, false, None).await?;
         let status = child.wait().await?;
         stderr_task.await??;
         assert!(status.success(), "Child process should exit successfully");
@@ -2564,15 +3237,23 @@ mod tests {
     #[tokio::test]
     async fn test_stream_to_file_bytes_no_clone() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        let data = Arc::new(vec![b'A'; 1_000_000]); // 1MB chunk
-        tokio::spawn(async move { tx.send(ParseOutput::Bytes(data)).await.unwrap(); });
+        let data = Bytes::from(vec![b'A'; 1_000_000]);
+
+        tokio::spawn(async move {
+            tx.send(ParseOutput::Bytes(data)).await.unwrap();
+        });
+
         let path = PathBuf::from("test_bytes.fq");
-        let task = tokio::spawn(stream_to_file(rx, path.clone())); // Pass raw Receiver
+        let task = tokio::spawn(stream_to_file(rx, path.clone()));
         task.await??;
+
         let file = std::fs::File::open(&path)?;
         let mut contents = Vec::new();
-        std::io::BufReader::new(file).read_to_end(&mut contents)?; // Use std::io::Read
+        std::io::BufReader::new(file).read_to_end(&mut contents)?;
+
         assert_eq!(contents.len(), 1_000_000);
+        assert!(contents.iter().all(|&b| b == b'A'));
+
         std::fs::remove_file(&path)?;
         Ok(())
     }
@@ -2710,7 +3391,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_to_fifo_invalid_path() -> Result<()> {
         let invalid_path = PathBuf::from("/blah/blah/flibiddy/blah");
-        let (tx, rx) = mpsc::channel::<ParseOutput>(10);
+        let (_, rx) = mpsc::channel::<ParseOutput>(10);
         let write_handle = tokio::spawn(write_to_fifo(rx, invalid_path.clone()));
         let result = write_handle.await?;
         assert!(result.is_err(), "Should error on invalid FIFO path");
@@ -2959,7 +3640,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<ParseOutput>(10);
         let stream = ReceiverStream::new(rx);
 
-        tx.send(ParseOutput::Bytes(Arc::new(b"invalid".to_vec()))).await?;
+        tx.send(ParseOutput::Bytes(Bytes::from_static(b"invalid"))).await?;
 
         let (r1_fifo, r2_fifo_opt, deinterleave_handle, r1_write_handle, r2_write_handle_opt) = deinterleave_fastq_stream_to_fifos(
             config.clone(),

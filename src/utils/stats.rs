@@ -1,6 +1,6 @@
 /// Analysis of data that does not fit elsewhere (i.e. not FASTX-based)
 use anyhow::{Result, anyhow};
-use log::{self, LevelFilter, debug, info, error, warn};
+use log::{self, info, warn};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;

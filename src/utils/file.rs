@@ -5,10 +5,8 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
-use crate::config::defs::GZIP_EXT;
-use log::{self, LevelFilter, debug, info, error, warn};
+use log::{self, debug, info, warn};
 use anyhow::{Result, anyhow};
-use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio_stream::wrappers::ReceiverStream;
@@ -16,12 +14,15 @@ use crate::utils::streams::ParseOutput;
 use tokio::task::JoinHandle;
 use tokio::fs::File as TokioFile;
 use tokio::process::Command;
+use tokio::io::AsyncSeekExt;
 use tokio_stream::StreamExt;
 use tempfile::Builder as TempfileBuilder;
 use crate::utils::streams::ToBytes;
-use crate::utils::fastx::{SequenceRecord, r1r2_base};
-use crate::config::defs::{RunConfig, PipelineError};
-use sysinfo::{Disks, DiskUsage};
+use crate::utils::fastx::SequenceRecord;
+use crate::config::defs::{RunConfig, PipelineError, StreamDataType};
+use sysinfo::Disks;
+use nix::sys::statvfs;
+use regex::Regex;
 
 
 
@@ -303,7 +304,7 @@ pub async fn write_parse_output_to_fifo(
     let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024); // Default to 16MB for large files
     let fifo_path = fifo_path.clone();
     let task = tokio::spawn(async move {
-        let mut writer_file = TokioFile::create(&fifo_path)
+        let writer_file = TokioFile::create(&fifo_path)
             .await
             .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
         let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
@@ -503,59 +504,117 @@ pub async fn write_parse_output_to_file(
     Ok(task)
 }
 
+pub fn resolve_existing_input_path(input: &str, cwd: &Path) -> Result<PathBuf, PipelineError> {
+    let resolved = resolve_to_absolute(input, cwd);
+
+    if !resolved.exists() {
+        return Err(PipelineError::FileNotFound(resolved));
+    }
+    if !resolved.is_file() {
+        return Err(PipelineError::InvalidConfig(format!(
+            "Not a file: {}",
+            resolved.display()
+        )));
+    }
+
+    Ok(resolved)
+}
+
+fn basename_without_extensions(path: &Path) -> Result<String, PipelineError> {
+    let mut current = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            PipelineError::InvalidConfig(format!(
+                "Could not derive basename from {}",
+                path.display()
+            ))
+        })?
+        .to_string();
+
+    loop {
+        let p = Path::new(&current);
+        match p.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) if stem != current => current = stem.to_string(),
+            _ => break,
+        }
+    }
+
+    Ok(current)
+}
+
+fn strip_common_read_suffixes(base: &str) -> String {
+    // Ordered from most specific to least specific.
+    // This covers common Illumina / SRA-like layouts:
+    //   sample_S1_L001_R1_001
+    //   sample_L001_R1_001
+    //   sample_R1_001
+    //   sample_R1
+    //   sample_1
+    //   sample.1
+    //   sample-1
+    let patterns = [
+        r"(?i)^(?P<base>.+?)[._-]S\d+[._-]L\d{3}[._-]R[12][._-]\d{3}$",
+        r"(?i)^(?P<base>.+?)[._-]L\d{3}[._-]R[12][._-]\d{3}$",
+        r"(?i)^(?P<base>.+?)[._-]R[12][._-]\d{3}$",
+        r"(?i)^(?P<base>.+?)[._-]R?[12]$",
+    ];
+
+    for pat in patterns {
+        let re = Regex::new(pat).expect("valid mate-suffix regex");
+        if let Some(caps) = re.captures(base) {
+            return caps
+                .name("base")
+                .map(|m| m.as_str().trim_end_matches(&['_', '-', '.'][..]).to_string())
+                .unwrap_or_else(|| base.to_string());
+        }
+    }
+
+    base.to_string()
+}
+
+pub fn derive_sample_base_from_file1(file1_path: &Path) -> Result<PathBuf, PipelineError> {
+    let basename = basename_without_extensions(file1_path)?;
+    let stripped = strip_common_read_suffixes(&basename);
+    Ok(PathBuf::from(stripped))
+}
+
 pub async fn validate_file_inputs(
     config: &RunConfig,
     cwd: &PathBuf,
 ) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
-    // Resolve and validate file1 (required)
-    let file1_path: PathBuf = match &config.args.file1 {
-        Some(file) => {
-            let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
-            if file1_full_path.exists() {
-                file1_full_path
-            } else {
-                return Err(PipelineError::FileNotFound(file1_full_path));
-            }
-        }
-        None => return Err(PipelineError::InvalidConfig("File1 path required".to_string())),
-    };
-
-    // Compute sample_base (same as before)
-    let sample_base: String;
-    let file1_r1r2 = r1r2_base(&file1_path);
-    sample_base = match file1_r1r2.prefix {
-        Some(prefix) => prefix,
+    let file1_path = match &config.args.file1 {
+        Some(file) => resolve_existing_input_path(file, cwd)?,
         None => {
-            info!("No R1 tag found. Using bare file 1 stem as sample_base.");
-            file1_path.to_string_lossy().into_owned()
+            return Err(PipelineError::InvalidConfig(
+                "File1 path required".to_string(),
+            ))
         }
     };
 
-    let sample_base_buf: PathBuf = PathBuf::from(&sample_base);
-    let (no_ext_sample_base_buf, _) = extension_remover(&sample_base_buf);
-    let no_ext_sample_base = no_ext_sample_base_buf.to_string_lossy().into_owned();
-
-    // Validate file1 exists (redundant but kept for safety)
-    if !file1_path.exists() {
-        return Err(PipelineError::FileNotFound(file1_path));
-    }
-
-    // Resolve and validate file2 (optional)
-    let file2_path: Option<PathBuf> = match &config.args.file2 {
+    let file2_path = match &config.args.file2 {
         Some(file) => {
-            let file2_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
-            if file2_full_path.exists() {
-                Some(file2_full_path)
-            } else {
-                error!("File2 path does not exist: {}", file2_full_path.display());
-                None
-            }
+            let resolved = resolve_existing_input_path(file, cwd)?;
+            Some(resolved)
         }
         None => None,
     };
-    
 
-    Ok((file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base))
+    let sample_base_buf = derive_sample_base_from_file1(&file1_path)?;
+    let sample_base = sample_base_buf.to_string_lossy().into_owned();
+
+    if let Some(ref file2) = file2_path {
+        let file2_base = derive_sample_base_from_file1(file2)?;
+        if file2_base != sample_base_buf {
+            warn!(
+                "file1/file2 sample bases do not match: '{}' vs '{}'",
+                sample_base_buf.display(),
+                file2_base.display()
+            );
+        }
+    }
+
+    Ok((file1_path, file2_path, sample_base_buf, sample_base))
 }
 
 
@@ -569,59 +628,63 @@ pub async fn validate_file_inputs(
 /// # Returns
 /// A `JoinHandle` that resolves to `Result<(), anyhow::Error>` upon completion.
 pub async fn write_byte_stream_to_file(
-    output_path: &PathBuf,
-    mut input_stream: ReceiverStream<ParseOutput>,
-    buffer_size: Option<usize>,
-) -> Result<JoinHandle<Result<(), anyhow::Error>>> {
-    let buffer_capacity = buffer_size.unwrap_or(16 * 1024 * 1024);
-    let output_path_clone = output_path.clone();
+    dest_path: &PathBuf,
+    stream: ReceiverStream<ParseOutput>,
+    config: Arc<RunConfig>,
+    data_type: StreamDataType,
+    label: &str,                    // still &str here
+) -> Result<JoinHandle<Result<()>>> {
 
-    let task = tokio::spawn(async move {
-        let file = TokioFile::create(&output_path_clone)
+    let dest_path_clone = dest_path.clone();
+    let label = label.to_string();  // ← clone to owned String
+
+    let write_handle = tokio::spawn(async move {
+        let file = TokioFile::create(&dest_path_clone)
             .await
-            .map_err(|e| anyhow!("Failed to create output file at {}: {}",
-                               output_path_clone.display(), e))?;
-        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
-        let mut stream = input_stream;
-        let mut total_bytes = 0u64;
+            .map_err(|e| anyhow!("Cannot create file {}: {}", dest_path_clone.display(), e))?;
+
+        let effective_buffer = crate::utils::system::compute_buffer_size(
+            &config,
+            "write_byte_stream_to_file",
+            data_type,
+            1.8,
+        );
+
+        let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
+
+        let mut stream = stream;
+        let mut batch: Vec<u8> = Vec::with_capacity(effective_buffer / 4);
 
         while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(bytes) => {
-                    writer.write_all(&bytes)
-                        .await
-                        .map_err(|e| anyhow!("Failed to write to {}: {}",
-                                           output_path_clone.display(), e))?;
-                    total_bytes += bytes.len() as u64;
-                }
-                _ => {
-                    // Log unexpected non-Bytes items but continue
-                    warn!("write_byte_stream_to_file: Skipping non-Bytes item for {}",
-                              output_path_clone.display());
-                }
+            let bytes = item
+                .to_bytes()
+                .map_err(|e| anyhow!("Failed to convert to bytes: {}", e))?;
+
+            batch.extend_from_slice(&bytes);
+
+            if batch.len() >= effective_buffer / 4 {
+                writer.write_all(&batch).await
+                    .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
+                batch.clear();
             }
         }
 
-        writer.flush()
-            .await
-            .map_err(|e| anyhow!("Failed to flush {}: {}",
-                               output_path_clone.display(), e))?;
-        writer.shutdown()
-            .await
-            .map_err(|e| anyhow!("Failed to shutdown {}: {}",
-                               output_path_clone.display(), e))?;
-
-        if total_bytes == 0 {
-            warn!("No bytes written to file at {}", output_path_clone.display());
+        if !batch.is_empty() {
+            writer.write_all(&batch).await
+                .map_err(|e| anyhow!("Final write error to {}: {}", dest_path_clone.display(), e))?;
         }
 
-        debug!("write_byte_stream_to_file: Wrote {} bytes to {}",
-                  total_bytes, output_path_clone.display());
+        writer.flush().await
+            .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
+
+        let final_size = writer.stream_position().await.unwrap_or(0);
+        info!("{} written to {} ({} bytes, buffer {} MiB)",
+              label, dest_path_clone.display(), final_size, effective_buffer / (1024*1024));
 
         Ok(())
     });
 
-    Ok(task)
+    Ok(write_handle)
 }
 
 pub async fn file_size(path: &PathBuf) -> Result<u64> {
@@ -631,14 +694,33 @@ pub async fn file_size(path: &PathBuf) -> Result<u64> {
 }
 
 pub async fn available_space_for_path(path: &PathBuf) -> Result<u64> {
+    let target = path.canonicalize().unwrap_or_else(|_| path.clone());
+    info!("Querying space for canonical path: {}", target.display());
+
+    // Primary: nix statvfs (reliable for tmpfs/NVMe)
+    match statvfs::statvfs(&target) {
+        Ok(stat) => {
+            let block_size = stat.block_size() as u64;               // safe cast
+            let blocks_avail = stat.blocks_available() as u64;       // safe cast
+            let avail = block_size * blocks_avail;
+            info!("statvfs success: block_size={} blocks_avail={} → {} bytes available", block_size, blocks_avail, avail);
+            return Ok(avail);
+        }
+        Err(e) => warn!("statvfs failed: {}", e),
+    }
+
+    // Fallback: sysinfo
     let disks = Disks::new_with_refreshed_list();
-    let target = path.as_path();
     for disk in disks.list() {
-        if target.starts_with(disk.mount_point()) {
-            return Ok(disk.available_space());
+        let mp = disk.mount_point();
+        if target.starts_with(mp) {
+            let avail = disk.available_space();
+            info!("sysinfo match on {}: {} bytes", mp.display(), avail);
+            return Ok(avail);
         }
     }
-    Err(anyhow!("No disk found for path: {}", path.display()))
+
+    Err(anyhow!("No matching filesystem found for {}", target.display()))
 }
 
 
@@ -656,56 +738,90 @@ pub async fn choose_temp_dir(
     estimated_bytes: u64,
     ram_dir: &PathBuf,
     nvme_scratch: &Option<String>,
-    headroom_factor: u64, // e.g., 4 → use at most 1/4 of available RAM
+    headroom_factor: u64,
+    prefer_nvme: bool,
 ) -> Result<TempDir, PipelineError> {
     async fn check_space(path: &PathBuf, required: u64, factor: u64) -> Result<bool, PipelineError> {
         let avail = available_space_for_path(path).await?;
+        info!("choose temp dir avilable bytes {}", avail);
         Ok(required <= avail / factor)
     }
 
-    // 1. Try RAM dir
-    if check_space(ram_dir, estimated_bytes, headroom_factor).await? {
+    async fn try_create_temp(
+        dir_path: &PathBuf,
+        estimated: u64,
+        factor: u64,
+        label: &str,
+    ) -> Option<Result<TempDir, PipelineError>> {
+        if !check_space(dir_path, estimated, factor).await.ok()? {
+            return None;
+        }
+
         debug!(
-            "Using RAM temp dir {}: {} bytes fits in {} available (/{})",
-            ram_dir.display(),
-            estimated_bytes,
-            available_space_for_path(ram_dir).await?,
-            headroom_factor
+            "Trying {} dir {}: {} bytes fits in {} available (/{})",
+            label,
+            dir_path.display(),
+            estimated,
+            available_space_for_path(dir_path).await.ok()?,
+            factor
         );
-        return TempDir::new_in(ram_dir)
-            .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in RAM dir {}: {}", ram_dir.display(), e)));
+
+        let temp_dir = match TempDir::new_in(dir_path) {
+            Ok(td) => td,
+            Err(e) => return Some(Err(PipelineError::Other(anyhow!(
+                "Failed to create TempDir in {} dir {}: {}", label, dir_path.display(), e
+            )))),
+        };
+
+        // ────────────────────────────────────────────────────────────────
+        //  force directory visibility before returning
+        // This closes the race window where DIAMOND sees ENOENT
+        // ────────────────────────────────────────────────────────────────
+        if let Err(e) = tokio::fs::create_dir(temp_dir.path().join("probe")).await {
+            warn!("Filesystem probe failed in {}: {}. Continuing anyway.", dir_path.display(), e);
+            // Not fatal — we still return the dir, just log
+        } else {
+            let _ = tokio::fs::remove_dir(temp_dir.path().join("probe")).await;
+        }
+
+        // Optional ultra-paranoid version (usually overkill but zero risk):
+        // tokio::fs::sync_all().await.ok();   // fsync whole filesystem — slow!
+
+        debug!("Created and probed temp dir: {}", temp_dir.path().display());
+        Some(Ok(temp_dir))
     }
 
-    // 2. Try NVMe scratch if provided
-    if let Some(nvme) = nvme_scratch {
-        let nvme_path = PathBuf::from(nvme);
-        if check_space(&nvme_path, estimated_bytes, headroom_factor).await? {
-            debug!(
-                "Using NVMe scratch {}: {} bytes fits (/{})",
-                nvme_path.display(),
-                estimated_bytes,
-                headroom_factor
-            );
-            return TempDir::new_in(&nvme_path)
-                .map_err(|e| PipelineError::Other(anyhow!("Failed to create TempDir in NVMe dir {}: {}", nvme_path.display(), e)));
-        } else {
-            warn!(
-                "NVMe scratch {} insufficient: need {} bytes (/{})",
-                nvme_path.display(),
-                estimated_bytes,
-                headroom_factor
-            );
-        }
+
+    let ram_attempt = try_create_temp(ram_dir, estimated_bytes, headroom_factor, "RAM").await;
+    let nvme_path = nvme_scratch.as_ref().map(PathBuf::from);
+    let nvme_attempt = if let Some(ref nvme) = nvme_path {
+        try_create_temp(nvme, estimated_bytes, headroom_factor, "NVMe").await
     } else {
         debug!("No NVMe scratch configured — skipping");
+        None
+    };
+
+    let chosen = if prefer_nvme {
+        info!("choosing nvme");
+        nvme_attempt.or(ram_attempt)
+    } else {
+        info!("choosing ram");
+        ram_attempt.or(nvme_attempt)
+    };
+
+    if let Some(res) = chosen {
+        return res;
     }
 
-    // 3. Final fallback: system temp
-    debug!(
-        "Falling back to system temp dir (RAM/NVMe insufficient or unavailable)"
-    );
-    TempDir::new()
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))
+    debug!("Falling back to system temp dir");
+    let fallback = TempDir::new()
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to create system TempDir: {}", e)))?;
+
+    // Probe fallback too
+    let _ = tokio::fs::create_dir(fallback.path().join("probe")).await;
+    let _ = tokio::fs::remove_dir(fallback.path().join("probe")).await;
+
+    Ok(fallback)
 }
 
 #[cfg(test)]
@@ -713,7 +829,6 @@ mod tests {
     use super::*;
     use std::io::Read;
     use tempfile::NamedTempFile;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_write_vecu8_to_file() -> std::io::Result<()> {

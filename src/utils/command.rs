@@ -1,21 +1,14 @@
 /// Functions and structs for working with creating command-line arguments
 
 use anyhow::{anyhow, Result};
-use log::{self, LevelFilter, debug, info, error, warn};
-use num_cpus;
+use log::{self, debug, info, warn};
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, PipelineError, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, FASTA_EXTS, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG};
-use crate::cli::Arguments;
+use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG, MMSEQS_TAG};
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::fs;
-use tokio::task::JoinHandle;
-use tempfile::{NamedTempFile, TempDir};
-use fxhash::FxHashMap;
-use crate::utils::file::{write_vecu8_to_file, extension_remover};
-use crate::utils::streams::{spawn_cmd};
+use crate::utils::streams::spawn_cmd;
 
 
 pub trait ArgGenerator {
@@ -42,6 +35,7 @@ pub async fn version_check(
     version_column: usize,
     child_stream: ChildStream,
     version_file: Option<PathBuf>,
+    config: &RunConfig
 ) -> Result<f32> {
     let cmd_tag_owned = command_tag.to_string();
     debug!("Running command: {}", &cmd_tag_owned);
@@ -55,7 +49,7 @@ pub async fn version_check(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}. Is it installed? Error: {}.", cmd_tag_owned.clone(), e))?;
 
-    let lines = read_child_output_to_vec(&mut child, child_stream).await?;
+    let lines = read_child_output_to_vec(&mut child, child_stream, &config).await?;
 
     if let Some(file_path) = version_file {
         if let Some(parent) = file_path.parent() {
@@ -94,11 +88,42 @@ pub async fn version_check(
     Ok(version)
 }
 
+/// Prepends `numactl --interleave=all` for large multi-socket Linux machines (EPYC).
+/// Does nothing on MacBooks, small machines, or non-Linux.
+/// Prepends numactl for tools that benefit from memory interleaving on large EPYC nodes.
+/// Prepends numactl + explicit hugepage advice for memory-heavy tools
+pub fn prepend_numactl_if_beneficial(
+    config: &RunConfig,
+    args: Vec<String>,
+    cmd_tag: &str
+) -> Vec<String> {
+    if !cfg!(target_os = "linux") || config.max_cores < 64 {
+        return args;
+    }
+
+    if matches!(cmd_tag, DIAMOND_TAG | MMSEQS_TAG | SPADES_TAG) {
+        let mut numa_args = vec![
+            "--interleave=all".to_string(),
+            "--".to_string(),           // end of numactl options
+            "prctl".to_string(),                    // set per-process hugepage hint
+            "--set-current".to_string(),
+            "madvise_hugepage".to_string(),         // tells kernel to prefer 2MB pages
+            cmd_tag.to_string(),
+        ];
+        numa_args.extend(args);
+
+        debug!("Prepended numactl --interleave=all + prctl madvise_hugepage for {}", cmd_tag);
+        numa_args
+    } else {
+        args
+    }
+}
+
 pub mod fastp {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug};
     use crate::config::defs::{FASTP_TAG,  RunConfig};
     use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
@@ -107,11 +132,12 @@ pub mod fastp {
     #[derive(Debug)]
     pub struct FastpConfig {
         pub command_fields: HashMap<String, Option<String>>,
+        pub paired: bool,
     }
     pub struct FastpArgGenerator;
 
-    pub async fn fastp_presence_check() -> Result<f32> {
-        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn fastp_presence_check(config: &RunConfig) -> Result<f32> {
+        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -128,8 +154,8 @@ pub mod fastp {
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
             args_vec.push("--interleaved_in".to_string());
-            args_vec.push("-q".to_string());
-            args_vec.push(args.quality.to_string());
+            // args_vec.push("-q".to_string());
+            // args_vec.push(args.quality.to_string());
 
             let json_out = run_config.out_dir.join("fastp.json");
             args_vec.push("-j".to_string());
@@ -150,6 +176,10 @@ pub mod fastp {
                 args_vec.push(adapter_path.to_string_lossy().into_owned());
             }
 
+            if args.adapter_fasta.is_some() && config.paired {
+                args_vec.push("--detect_adapter_for_pe".to_string());
+            }
+
             for (key, value) in config.command_fields.iter() {
                 args_vec.push(key.clone());
                 if let Some(v) = value {
@@ -163,14 +193,15 @@ pub mod fastp {
 }
 
 mod pigz {
-    use crate::config::defs::{FASTP_TAG, PIGZ_TAG, RunConfig};
+    use crate::config::defs::{PIGZ_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct PigzArgGenerator;
 
-    pub async fn pigz_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None).await?;
+    #[allow(dead_code)]
+    pub async fn pigz_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -186,14 +217,12 @@ mod pigz {
 }
 
 mod h5dump {
-    use anyhow::anyhow;
-    use tokio::process::Command;
-    use crate::config::defs::{H5DUMP_TAG, PIGZ_TAG};
+    use crate::config::defs::{H5DUMP_TAG, RunConfig};
     use crate::utils::command::version_check;
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
-    pub async fn h5dump_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None).await?;
+    pub async fn h5dump_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 }
@@ -205,7 +234,7 @@ pub mod minimap2 {
     use tokio::fs;
     use tokio::task::JoinHandle;
     use tempfile::{NamedTempFile, TempDir};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug, info};
     use anyhow::{anyhow, Result};
     use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG, FASTA_EXTS};
     use crate::utils::file::available_space_for_path;
@@ -214,15 +243,16 @@ pub mod minimap2 {
 
     pub struct Minimap2Config {
         pub minimap2_index_path: PathBuf,
-        pub input_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
+        pub r1_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
+        pub r2_path: Option<PathBuf>,             // ← NEW: optional query file (None = stdin)
         pub option_fields: HashMap<String, Option<String>>,
         pub num_threads: Option<usize>,
     }
 
     pub struct Minimap2ArgGenerator;
 
-    pub async fn minimap2_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
-        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file).await?;
+    pub async fn minimap2_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
+        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
@@ -411,6 +441,7 @@ pub mod minimap2 {
                     MINIMAP2_TAG,
                     minimap2_args,
                     config.args.verbose,
+                    None
                 )
                     .await
                     .map_err(|e| PipelineError::ToolExecution {
@@ -460,7 +491,7 @@ pub mod minimap2 {
 
             let mut args_vec: Vec<String> = Vec::new();
 
-            let mut threads = if let Some(override_threads) = config.num_threads {
+            let threads = if let Some(override_threads) = config.num_threads {
                 override_threads
             } else {
                 run_config.thread_allocation(MINIMAP2_TAG, None)
@@ -481,8 +512,10 @@ pub mod minimap2 {
             args_vec.push(index_path.to_string_lossy().to_string());
 
             // Input: file if provided, otherwise stdin
-            if let Some(input_path) = &config.input_path {
-                args_vec.push(input_path.to_string_lossy().to_string());
+            if let Some(r1_path) = &config.r1_path {
+                args_vec.push(r1_path.to_string_lossy().to_string());
+                if let Some(r2_path) = &config.r2_path { args_vec.push(r2_path.to_string_lossy().to_string());}
+
             } else {
                 args_vec.push("-".to_string()); // stdin
             }
@@ -495,9 +528,8 @@ pub mod minimap2 {
 pub mod samtools {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
     use crate::utils::command::{version_check, ArgGenerator};
 
     #[derive(Debug)]
@@ -508,8 +540,8 @@ pub mod samtools {
 
     pub struct SamtoolsArgGenerator;
 
-    pub async fn samtools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn samtools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -597,10 +629,9 @@ pub mod samtools {
 pub mod bcftools {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
-    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig, SAMTOOLS_TAG};
+    use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
     pub struct BcftoolsConfig {
@@ -610,8 +641,8 @@ pub mod bcftools {
 
     pub struct BcftoolsArgGenerator;
 
-    pub async fn bcftools_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn bcftools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -666,9 +697,8 @@ pub mod bcftools {
 pub mod kraken2 {
     use anyhow::anyhow;
     use std::path::PathBuf;
-    use tokio::process::Command;
     use crate::config::defs::{KRAKEN2_TAG, RunConfig};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
@@ -681,8 +711,8 @@ pub mod kraken2 {
 
     pub struct Kraken2ArgGenerator;
 
-    pub async fn kraken2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None).await?;
+    pub async fn kraken2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -730,11 +760,10 @@ pub mod kraken2 {
 pub mod ivar {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::RunConfig;
     use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
     pub struct IvarConfig {
@@ -744,8 +773,8 @@ pub mod ivar {
 
     pub struct IvarArgGenerator;
 
-    pub async fn ivar_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None).await?;
+    pub async fn ivar_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -783,29 +812,25 @@ pub mod ivar {
 }
 
 pub mod muscle {
-    use anyhow::anyhow;
-    use tokio::process::Command;
-    use crate::config::defs::{IVAR_TAG, MUSCLE_TAG};
+    use crate::config::defs::{RunConfig,  MUSCLE_TAG};
     use crate::utils::command::version_check;
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct MuscleArgGenerator;
-    pub async fn muscle_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn muscle_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 }
 
 pub mod mafft {
-    use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{MAFFT_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct MafftArgGenerator;
-    pub async fn mafft_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None).await?;
+    pub async fn mafft_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None, &config).await?;
         Ok(version)
     }
 
@@ -826,10 +851,9 @@ pub mod mafft {
 
 pub mod quast {
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::{QUAST_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct QuastArgGenerator;
 
@@ -839,14 +863,13 @@ pub mod quast {
         pub assembly_fasta: String,
     }
 
-    pub async fn quast_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn quast_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
     impl ArgGenerator for QuastArgGenerator {
         fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<QuastConfig>())
                 .ok_or_else(|| anyhow!("Quast requires a QuastConfig as extra argument"))?;
@@ -876,10 +899,9 @@ pub mod quast {
 pub mod nucmer {
     use anyhow::anyhow;
     use std::path::PathBuf;
-    use tokio::process::Command;
-    use crate::config::defs::{NUCMER_DELTA, NUCMER_TAG, RunConfig};
+    use crate::config::defs::{NUCMER_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     pub struct NucmerArgGenerator;
 
@@ -888,8 +910,8 @@ pub mod nucmer {
         pub assembly_fasta: PathBuf,
     }
 
-    pub async fn nucmer_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None).await?;
+    pub async fn nucmer_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -914,15 +936,13 @@ pub mod nucmer {
 }
 
 pub mod show_coords {
-    use anyhow::anyhow;
-    use crate::config::defs::RunConfig;
-    use crate::config::defs::{SHOW_COORDS_TAG, NUCMER_DELTA};
+    use crate::config::defs::{RunConfig, NUCMER_DELTA};
     use crate::utils::command::ArgGenerator;
 
     pub struct ShowCoordsArgGenerator;
 
     impl ArgGenerator for ShowCoordsArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, _run_config: &RunConfig, _extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let mut args_vec: Vec<String> = Vec::new();
 
             args_vec.push("-r".to_string());
@@ -937,11 +957,10 @@ pub mod show_coords {
 pub mod seqkit {
     use std::collections::HashMap;
     use anyhow::anyhow;
-    use tokio::process::Command;
     use crate::config::defs::RunConfig;
     use crate::config::defs::{SeqkitSubcommand, SEQKIT_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream};
+    use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
     pub struct SeqkitConfig {
@@ -951,13 +970,13 @@ pub mod seqkit {
 
     pub struct SeqkitArgGenerator;
 
-    pub async fn seqkit_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None).await?;
+    pub async fn seqkit_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
     impl ArgGenerator for SeqkitArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, _run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<SeqkitConfig>())
                 .ok_or_else(|| anyhow!("Seqkit requires a SeqkitConfig as extra argument"))?;
@@ -998,7 +1017,7 @@ pub mod bowtie2 {
     use anyhow::{anyhow, Result};
     use std::fs::{self, DirEntry};
     use std::process::Command;
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self,debug};
     use crate::config::defs::{RunConfig, BOWTIE2_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
@@ -1006,13 +1025,15 @@ pub mod bowtie2 {
     pub struct Bowtie2Config {
         pub bt2_index_path: PathBuf,
         pub paired: bool,
+        pub r1_path: Option<PathBuf>,
+        pub r2_path: Option<PathBuf>,
         pub option_fields: HashMap<String, Option<String>>,
     }
 
     pub struct Bowtie2ArgGenerator;
 
-    pub async fn bowtie2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None).await?;
+    pub async fn bowtie2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1139,29 +1160,59 @@ pub mod bowtie2 {
                 .and_then(|e| e.downcast_ref::<Bowtie2Config>())
                 .ok_or_else(|| anyhow!("Bowtie2 requires a Bowtie2Config as extra argument"))?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args: Vec<String> = Vec::new();
 
-            for (key, value) in config.option_fields.iter() {
-                args_vec.push(format!("{}", key));
+            for (key, value) in &config.option_fields {
+                args.push(key.clone());
                 if let Some(v) = value {
-                    args_vec.push(format!("{}", v));
+                    args.push(v.clone());
                 }
             }
 
-            args_vec.push("-x".to_string());
-            args_vec.push(config.bt2_index_path.to_string_lossy().to_string());
-            args_vec.push("-p".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
-            args_vec.push(num_cores.to_string());
-            if config.paired{
-                args_vec.push("--interleaved".to_string()); // if paired, will be an interleaved stream
-            }
-            else {
-                args_vec.push("-U".to_string());
-            }
-            args_vec.push("-".to_string());
+            // Index
+            args.push("-x".to_string());
+            args.push(config.bt2_index_path.to_string_lossy().to_string());
 
-            Ok(args_vec)
+            // Threads
+            args.push("-p".to_string());
+            let num_cores = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
+            args.push(num_cores.to_string());
+
+            // Input handling
+            match (config.r1_path.as_ref(), config.r2_path.as_ref()) {
+                (Some(r1), Some(r2)) => {
+                    // Paired files
+                    args.push("-1".to_string());
+                    args.push(r1.to_string_lossy().to_string());
+                    args.push("-2".to_string());
+                    args.push(r2.to_string_lossy().to_string());
+                }
+                (Some(r1), None) => {
+                    // Single-end file
+                    args.push("-U".to_string());
+                    args.push(r1.to_string_lossy().to_string());
+                }
+                (None, _) => {
+                    // Stdin mode
+                    if config.paired {
+                        args.push("--interleaved".to_string());
+                    } else {
+                        args.push("-U".to_string());
+                    }
+                    args.push("-".to_string());  // stdin
+                }
+            }
+
+            // Safety check: paired flag should match input
+            if config.paired && config.r1_path.is_none() && config.r2_path.is_none() {
+                debug!("Bowtie2: using --interleaved for paired stdin input");
+            } else if config.paired && (config.r1_path.is_none() || config.r2_path.is_none()) {
+                return Err(anyhow!("Bowtie2 paired mode requires both R1 and R2 paths (or stdin)"));
+            }
+
+            debug!("Bowtie2 final args: {}", args.join(" "));
+
+            Ok(args)
         }
     }
 }
@@ -1170,7 +1221,7 @@ pub mod hisat2 {
     use std::path::{Path, PathBuf};
     use std::collections::HashMap;
     use anyhow::{anyhow, Result};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug};
     use std::fs::{self, DirEntry};
     use std::process::Command;
     use crate::config::defs::{RunConfig, HISAT2_TAG};
@@ -1187,8 +1238,8 @@ pub mod hisat2 {
 
     pub struct Hisat2ArgGenerator;
 
-    pub async fn hisat2_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout, None).await?;
+    pub async fn hisat2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1367,8 +1418,8 @@ pub mod kallisto {
 
     pub struct KallistoArgGenerator;
 
-    pub async fn kallisto_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout, None).await?;
+    pub async fn kallisto_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1431,7 +1482,7 @@ pub mod kallisto {
 pub mod star {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use log::{self, LevelFilter, debug, info, error, warn};
+    use log::{self, debug};
     use anyhow::{anyhow, Result};
     use std::fs::{self, DirEntry};
     use std::process::Command;
@@ -1448,8 +1499,8 @@ pub mod star {
 
     pub struct StarArgGenerator;
 
-    pub async fn star_presence_check() -> anyhow::Result<f32> {
-        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, None).await?;
+    pub async fn star_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
+        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1612,8 +1663,8 @@ pub mod czid_dedup {
 
     pub struct CzidDedupArgGenerator;
 
-    pub async fn czid_dedup_presence_check() -> Result<f32> {
-        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn czid_dedup_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -1662,36 +1713,33 @@ pub mod czid_dedup {
 
 pub mod diamond {
 
-    const DIAMOND_TEMP:u64 = 20 * 1024 * 1024 * 1024; // 20 GB
 
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::path::Path;
     use regex::Regex;
-    use log::{debug, info, error, warn};
-    use tokio::fs::{self, DirEntry};
+    use log::{debug, info, warn};
     use tokio::task::JoinHandle;
     use tokio::process::Command;
-    use tempfile::{NamedTempFile, TempDir};
     use anyhow::{anyhow, Result as AnyhowResult};
     use crate::config::defs::{DIAMOND_TAG, DiamondSubcommand, RunConfig, PipelineError};
-    use crate::utils::file::{available_space_for_path, choose_temp_dir};
+    use crate::utils::file::{available_space_for_path};
     use crate::utils::system::detect_ram;
-    use crate::utils::streams::{read_child_output_to_vec, ChildStream, spawn_cmd};
+    use crate::utils::streams::{ChildStream};
     use crate::utils::command::{version_check, ArgGenerator};
 
     #[derive(Debug)]
     pub struct DiamondConfig {
         pub subcommand: DiamondSubcommand,
         pub db: PathBuf,
+        pub r1_path: Option<PathBuf>,
+        pub r2_path: Option<PathBuf>,
         pub subcommand_fields: HashMap<String, Option<String>>,
     }
 
     pub struct DiamondArgGenerator;
 
-    pub async fn diamond_presence_check(version_file: Option<PathBuf>) -> anyhow::Result<f32> {
-        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file).await?;
+    pub async fn diamond_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> anyhow::Result<f32> {
+        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
@@ -1750,13 +1798,10 @@ pub mod diamond {
             args_vec.push("-d".to_string());
             args_vec.push(config.db.to_string_lossy().to_string());
 
+
             let threads = run_config.thread_allocation(DIAMOND_TAG, None);
             args_vec.push("--threads".to_string());
             args_vec.push(threads.to_string());
-
-            let index_chunks = if threads >= 96 { 12 } else if threads >= 64 { 8 } else { 4 };
-            args_vec.push("-c".to_string());
-            args_vec.push(index_chunks.to_string());
 
             for (key, value) in &config.subcommand_fields {
                 args_vec.push(key.clone());
@@ -1773,7 +1818,6 @@ pub mod diamond {
         let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
 
-        // Get real DB size if possible
         let db_path = run_config.args.diamond_db.as_deref()
             .ok_or_else(|| anyhow!("--diamond-db required"))?;
         let db_path = if db_path.ends_with(".dmnd") {
@@ -1787,33 +1831,44 @@ pub mod diamond {
 
         let total_letters_billions = db_stats.1 as f64 / 1e9;
 
-        // RAM scaling — blastx needs roughly 10–14 GB per billion letters
-        let ram_factor = if available_ram_gb >= 1000.0 {  // EPYC / r6id
+        let ram_factor = if available_ram_gb >= 1400.0 {
+            9.0
+        } else if available_ram_gb >= 900.0 {
             10.0
-        } else if available_ram_gb >= 128.0 {  // decent server
+        } else if available_ram_gb >= 128.0 {
             12.0
-        } else {  // laptop
+        } else {
             15.0
         };
 
         let mut block_size = available_ram_gb / ram_factor;
 
-        // Never exceed DB size
         block_size = block_size.min(total_letters_billions);
 
-        // Safety floors and caps
         block_size = block_size.max(6.0);
-        block_size = block_size.min(200.0);  // very large block sizes can cause issues
+        block_size = block_size.min(200.0);
 
-        // Scratch space check
         let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
         let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
-        let db_size_gb = std::fs::metadata(&db_path)
-            .map(|m| m.len() as f64 / 1e9 / 1_073_741_824.0)
-            .unwrap_or(50.0);  // fallback ~50 GB for NR
+        // let db_size_gb = std::fs::metadata(&db_path)
+        //     .map(|m| m.len() as f64 / 1_073_741_824.0)
+        //     .unwrap_or(50.0);
 
-        if scratch_avail < (db_size_gb * 2.0) as u64 {
-            warn!("Low scratch space — reducing block size by 30%");
+        let scratch_avail_gib = scratch_avail as f64 / 1_073_741_824.0;
+
+        let estimated_scratch_gib = block_size * 3.0 + 20.0;
+
+        if scratch_avail_gib < estimated_scratch_gib * 1.2 {
+            warn!(
+            "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 50%",
+            estimated_scratch_gib, scratch_avail_gib
+        );
+            block_size *= 0.5;
+        } else if scratch_avail_gib < estimated_scratch_gib * 1.5 {
+            warn!(
+            "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 30%",
+            estimated_scratch_gib, scratch_avail_gib
+        );
             block_size *= 0.7;
         }
 
@@ -1872,7 +1927,7 @@ pub mod spades {
     use crate::config::defs::{SPADES_TAG, RunConfig};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
-    use log::{debug, info, error, warn};
+    use log::{info};
 
     pub struct SpadesConfig {
         pub r1_path: PathBuf,                // Always required (R1 or single-end)
@@ -1883,8 +1938,8 @@ pub mod spades {
 
     pub struct SpadesArgGenerator;
 
-    pub async fn spades_presence_check(version_file: Option<PathBuf>) -> Result<f32> {
-        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file).await?;
+    pub async fn spades_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
+        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
@@ -1965,13 +2020,13 @@ pub mod makeblastdb {
 
     pub struct MakeblastdbArgGenerator;
 
-    pub async fn makeblastdb_presence_check() -> Result<f32> {
-        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn makeblastdb_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
     impl ArgGenerator for MakeblastdbArgGenerator {
-        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+        fn generate_args(&self, _run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<MakeblastdbConfig>())
                 .ok_or_else(|| anyhow!("makeblastdb requires MakeblastdbConfig as extra argument"))?;
@@ -2019,8 +2074,8 @@ pub mod blastn {
 
     pub struct BlastnArgGenerator;
 
-    pub async fn blastn_presence_check() -> Result<f32> {
-        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn blastn_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -2086,8 +2141,8 @@ pub mod blastx {
 
     pub struct BlastxArgGenerator;
 
-    pub async fn blastx_presence_check() -> Result<f32> {
-        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None).await?;
+    pub async fn blastx_presence_check(config: &RunConfig)-> Result<f32> {
+        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
     }
 
@@ -2131,6 +2186,796 @@ pub mod blastx {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// GNU sort
+// ────────────────────────────────────────────────────────────────
+pub mod sort {
+    use std::collections::HashMap;
+    use anyhow::{anyhow, Result};
+    use crate::config::defs::RunConfig;
+    use crate::utils::command::{ArgGenerator, version_check};
+    use crate::utils::streams::ChildStream;
+
+    #[derive(Debug)]
+    pub struct SortConfig {
+        pub key: String,                    // e.g. "-k1,1"
+        pub parallel: Option<usize>,
+        pub buffer_size: Option<String>,    // e.g. "50%"
+        pub temp_dir: Option<String>,       // -T /path
+        pub output: Option<String>,         // -o sorted.m8
+        pub extra_fields: HashMap<String, Option<String>>,
+        pub input: Option<String>,
+    }
+
+    pub struct SortArgGenerator;
+
+    pub async fn sort_presence_check(config: &RunConfig)-> Result<f32> {
+        // GNU sort doesn't have a clean --version that always works the same way,
+        // but "sort --version" is reliable on all modern coreutils.
+        let version = version_check("sort", vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
+        Ok(version)
+    }
+
+    impl ArgGenerator for SortArgGenerator {
+        fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<SortConfig>())
+                .ok_or_else(|| anyhow!("sort requires a SortConfig as extra argument"))?;
+
+            let mut args: Vec<String> = vec![];
+
+            // Core sorting key (required for m8: sort by read ID = column 1)
+            args.push(config.key.clone());
+
+            // Parallelism — default to full allocation unless overridden
+            let threads = config.parallel
+                .unwrap_or_else(|| run_config.thread_allocation("sort", None));
+            if threads > 1 {
+                args.push("--parallel".to_string());
+                args.push(threads.to_string());
+            }
+
+            // Memory buffer
+            if let Some(buf) = &config.buffer_size {
+                args.push("-S".to_string());
+                args.push(buf.clone());
+            } else {
+                args.push("-S".to_string());
+                args.push("50%".to_string());
+            }
+
+            // Temp directory (critical for large sorts on NVMe)
+            if let Some(td) = &config.temp_dir {
+                args.push("-T".to_string());
+                args.push(td.clone());
+            }
+
+            // Output file (-o)
+            if let Some(out) = &config.output {
+                args.push("-o".to_string());
+                args.push(out.clone());
+            }
+
+            // Any extra flags the caller wants
+            for (key, value) in &config.extra_fields {
+                args.push(key.clone());
+                if let Some(v) = value {
+                    args.push(v.clone());
+                }
+            }
+
+            // Input
+            if let Some(input_file) = &config.input{
+                args.push(input_file.clone());
+            }
+
+            Ok(args)
+        }
+    }
+}
+
+
+
+pub mod mmseqs {
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{anyhow, Result};
+    use log::{debug, info, warn};
+    use tokio::process::{Child, Command};
+
+    use crate::config::defs::{MMSEQS_TAG, RunConfig};
+    use crate::utils::command::ArgGenerator;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MmseqsBackend {
+        Cpu,
+        Gpu,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MmseqsSubcommand {
+        Version,
+        Createdb,
+        MakePaddedSeqDb,
+        CreateIndex,
+        EasySearch,
+        Search,
+        ConvertAlis,
+        GpuServer,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MmseqsConfig {
+        pub subcommand: MmseqsSubcommand,
+        pub backend: MmseqsBackend,
+
+        pub input: Option<PathBuf>,
+        pub target_db: Option<PathBuf>,
+        pub result_db: Option<PathBuf>,
+        pub output: Option<PathBuf>,
+        pub tmp_dir: Option<PathBuf>,
+
+        pub threads: Option<usize>,
+        pub sensitivity: Option<String>,
+
+        pub search_type: Option<String>,
+        pub max_seqs: Option<String>,
+        pub prefilter_mode: Option<String>,
+        pub db_load_mode: Option<String>,
+        pub alignment_mode: Option<String>,
+        pub index_subset: Option<String>,
+
+        pub format_output: Option<String>,
+        pub cuda_visible_devices: Option<String>,
+
+        /// Extra raw args appended verbatim. Use this for rare flags that do not
+        /// deserve a dedicated field yet.
+        pub option_fields: HashMap<String, Option<String>>,
+
+        /// If true, generate client-side flags for MMseqs GPU server mode.
+        /// This is only meaningful for Search / ConvertAlis workflows, not GpuServer itself.
+        pub gpu_server: bool,
+    }
+
+    impl Default for MmseqsConfig {
+        fn default() -> Self {
+            Self {
+                subcommand: MmseqsSubcommand::EasySearch,
+                backend: MmseqsBackend::Cpu,
+                input: None,
+                target_db: None,
+                result_db: None,
+                output: None,
+                tmp_dir: None,
+                threads: None,
+                sensitivity: None,
+                search_type: None,
+                max_seqs: None,
+                prefilter_mode: None,
+                db_load_mode: None,
+                alignment_mode: None,
+                index_subset: None,
+                format_output: None,
+                cuda_visible_devices: None,
+                option_fields: HashMap::new(),
+                gpu_server: false,
+            }
+        }
+    }
+
+    pub struct MmseqsArgGenerator;
+
+    fn required_path<'a>(value: &'a Option<PathBuf>, what: &str) -> Result<&'a PathBuf> {
+        value
+            .as_ref()
+            .ok_or_else(|| anyhow!("MMseqs requires {}", what))
+    }
+
+    fn resolve_mmseqs_db(run_config: &RunConfig, explicit: Option<&PathBuf>) -> Result<PathBuf> {
+        if let Some(p) = explicit {
+            return Ok(p.clone());
+        }
+
+        let db = run_config
+            .args
+            .mmseqs_db
+            .as_ref()
+            .ok_or_else(|| anyhow!("MMseqs requires --mmseqs-db"))?;
+
+        let path = PathBuf::from(db);
+        if !path.exists() {
+            return Err(anyhow!("MMseqs DB path does not exist: {}", path.display()));
+        }
+
+        Ok(path)
+    }
+
+    fn validate_cpu_index(db_prefix: &Path) -> Result<()> {
+        let candidates = [
+            db_prefix.with_extension("index"),
+            db_prefix.with_extension("idx"),
+            db_prefix.with_extension("lookup"),
+            db_prefix.with_extension("source"),
+        ];
+
+        if candidates.iter().any(|p| p.exists()) {
+            return Ok(());
+        }
+
+        warn!(
+            "MMseqs CPU backend: no obvious index sidecar found near {}. \
+             Proceeding anyway, but repeated searches will be slower.",
+            db_prefix.display()
+        );
+
+        Ok(())
+    }
+
+    fn push_threads(args: &mut Vec<String>, run_config: &RunConfig, threads: Option<usize>) {
+        let n = threads.unwrap_or_else(|| run_config.thread_allocation(MMSEQS_TAG, None));
+        args.push("--threads".to_string());
+        args.push(n.to_string());
+    }
+
+    fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: &Option<String>) {
+        if let Some(v) = value {
+            args.push(flag.to_string());
+            args.push(v.clone());
+        }
+    }
+
+    fn push_option_fields(args: &mut Vec<String>, fields: &HashMap<String, Option<String>>) {
+        for (key, value) in fields {
+            args.push(key.clone());
+            if let Some(v) = value {
+                args.push(v.clone());
+            }
+        }
+    }
+
+    fn push_gpu_client_flags(args: &mut Vec<String>, config: &MmseqsConfig) {
+        if config.backend != MmseqsBackend::Gpu {
+            return;
+        }
+
+        args.push("--gpu".to_string());
+        args.push("1".to_string());
+        debug!("MMseqs2: GPU client mode enabled (--gpu 1)");
+
+        if config.gpu_server {
+            args.push("--gpu-server".to_string());
+            args.push("1".to_string());
+
+            args.push("--db-load-mode".to_string());
+            args.push(config.db_load_mode.clone().unwrap_or_else(|| "2".to_string()));
+
+            if config.prefilter_mode.is_none() {
+                args.push("--prefilter-mode".to_string());
+                args.push("1".to_string());
+            }
+
+            debug!("MMseqs2: GPU server client mode enabled (--gpu-server 1 --db-load-mode 2)");
+        }
+    }
+    
+
+    pub async fn mmseqs_presence_check(_config: &RunConfig)-> Result<f32> {
+        let output = Command::new(MMSEQS_TAG)
+            .arg("version")
+            .output()
+            .await
+            .map_err(|e| anyhow!("Failed to spawn mmseqs. Is it installed? Error: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "mmseqs version check failed with exit code {:?}",
+                output.status.code()
+            ));
+        }
+
+        Ok(0.0)
+    }
+
+    pub async fn spawn_gpuserver(
+        target_db: &Path,
+        cuda_visible_devices: Option<&str>,
+    ) -> Result<Child> {
+        if !target_db.exists() {
+            return Err(anyhow!(
+                "MMseqs GPU server target DB does not exist: {}",
+                target_db.display()
+            ));
+        }
+
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("gpuserver");
+        cmd.arg(target_db);
+
+        if let Some(devices) = cuda_visible_devices {
+            cmd.env("CUDA_VISIBLE_DEVICES", devices);
+        }
+
+        // Important: current MMseqs2 release notes say gpuserver no longer accepts --gpu.
+        // The client gets the GPU flags; the server is started without --gpu.
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn mmseqs gpuserver: {}", e))?;
+
+        Ok(child)
+    }
+
+    pub async fn stop_gpuserver(child: &mut Child) -> Result<()> {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => return Err(anyhow!("Failed to query gpuserver state: {}", e)),
+        }
+
+        child
+            .kill()
+            .await
+            .map_err(|e| anyhow!("Failed to stop mmseqs gpuserver: {}", e))?;
+
+        let _ = child.wait().await;
+        Ok(())
+    }
+
+
+    impl ArgGenerator for MmseqsArgGenerator {
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<MmseqsConfig>())
+                .ok_or_else(|| anyhow!("MMseqs requires a MmseqsConfig as extra argument"))?;
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            match config.subcommand {
+                MmseqsSubcommand::Version => {
+                    args_vec.push("version".to_string());
+                }
+
+                MmseqsSubcommand::Createdb => {
+                    let input = required_path(&config.input, "input FASTA/FASTQ for createdb")?;
+                    let output = required_path(&config.output, "output DB for createdb")?;
+
+                    args_vec.push("createdb".to_string());
+                    args_vec.push(input.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    // If the caller wants to create a GPU DB directly, pass --gpu via option_fields.
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::MakePaddedSeqDb => {
+                    let input = required_path(&config.input, "input DB for makepaddedseqdb")?;
+                    let output = required_path(&config.output, "output GPU DB for makepaddedseqdb")?;
+
+                    args_vec.push("makepaddedseqdb".to_string());
+                    args_vec.push(input.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::CreateIndex => {
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                    let tmp_dir = required_path(&config.tmp_dir, "tmp dir for createindex")?;
+
+                    args_vec.push("createindex".to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(tmp_dir.to_string_lossy().to_string());
+
+                    if let Some(subset) = &config.index_subset {
+                        args_vec.push("--index-subset".to_string());
+                        args_vec.push(subset.clone());
+                    }
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::GpuServer => {
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+
+                    args_vec.push("gpuserver".to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+
+                    // Do NOT add --gpu here. Current MMseqs2 release notes say gpuserver
+                    // no longer accepts --gpu; the client side gets the GPU flags.
+                    if let Some(devs) = &config.cuda_visible_devices {
+                        args_vec.push("--cuda-visible-devices".to_string());
+                        args_vec.push(devs.clone());
+                    }
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::EasySearch => {
+                    let query = required_path(&config.input, "query FASTA/FASTQ for easy-search")?;
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                    let output = required_path(&config.output, "output m8 for easy-search")?;
+                    let tmp_dir = required_path(&config.tmp_dir, "tmp dir for easy-search")?;
+
+                    args_vec.push("easy-search".to_string());
+                    push_gpu_client_flags(&mut args_vec, config);
+                    push_threads(&mut args_vec, run_config, config.threads);
+
+                    if config.backend == MmseqsBackend::Cpu {
+                        push_optional_arg(&mut args_vec, "-s", &config.sensitivity);
+                    }
+
+                    if let Some(st) = &config.search_type {
+                        args_vec.push("--search-type".to_string());
+                        args_vec.push(st.clone());
+                    }
+
+                    if let Some(ms) = &config.max_seqs {
+                        args_vec.push("--max-seqs".to_string());
+                        args_vec.push(ms.clone());
+                    }
+
+                    if let Some(pm) = &config.prefilter_mode {
+                        args_vec.push("--prefilter-mode".to_string());
+                        args_vec.push(pm.clone());
+                    }
+
+                    args_vec.push(query.to_string_lossy().to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+                    args_vec.push(tmp_dir.to_string_lossy().to_string());
+
+                    args_vec.push("--format-output".to_string());
+                    args_vec.push(config.format_output.clone().unwrap_or_else(|| {
+                        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                            .to_string()
+                    }));
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::Search => {
+                    let query = required_path(&config.input, "query DB/FASTA for search")?;
+                    let target_db = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                    let result_db = required_path(&config.result_db, "result DB for search")?;
+                    let tmp_dir = required_path(&config.tmp_dir, "tmp dir for search")?;
+
+                    args_vec.push("search".to_string());
+                    push_gpu_client_flags(&mut args_vec, config);
+                    push_threads(&mut args_vec, run_config, config.threads);
+
+                    if let Some(s) = &config.sensitivity {
+                        args_vec.push("-s".to_string());
+                        args_vec.push(s.clone());
+                    }
+
+                    // Production-safe default: search does not match easy-search identity semantics
+                    // unless alignment-mode is set. We default to 3 so pident is real rather than
+                    // estimated, unless the caller overrides it.
+                    args_vec.push("--alignment-mode".to_string());
+                    args_vec.push(
+                        config
+                            .alignment_mode
+                            .clone()
+                            .unwrap_or_else(|| "3".to_string()),
+                    );
+
+                    if let Some(st) = &config.search_type {
+                        args_vec.push("--search-type".to_string());
+                        args_vec.push(st.clone());
+                    }
+
+                    if let Some(ms) = &config.max_seqs {
+                        args_vec.push("--max-seqs".to_string());
+                        args_vec.push(ms.clone());
+                    }
+
+                    if let Some(pm) = &config.prefilter_mode {
+                        args_vec.push("--prefilter-mode".to_string());
+                        args_vec.push(pm.clone());
+                    }
+
+                    if config.gpu_server && config.backend == MmseqsBackend::Gpu {
+                        if config.prefilter_mode.is_none() {
+                            args_vec.push("--prefilter-mode".to_string());
+                            args_vec.push("1".to_string());
+                        }
+                    }
+
+                    args_vec.push(query.to_string_lossy().to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(result_db.to_string_lossy().to_string());
+                    args_vec.push(tmp_dir.to_string_lossy().to_string());
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+
+                MmseqsSubcommand::ConvertAlis => {
+                    let query_db = required_path(&config.input, "query DB for convertalis")?;
+                    let target_db = required_path(&config.target_db, "target DB for convertalis")?;
+                    let result_db = required_path(&config.result_db, "result DB for convertalis")?;
+                    let output = required_path(&config.output, "output m8 for convertalis")?;
+
+                    args_vec.push("convertalis".to_string());
+                    args_vec.push(query_db.to_string_lossy().to_string());
+                    args_vec.push(target_db.to_string_lossy().to_string());
+                    args_vec.push(result_db.to_string_lossy().to_string());
+                    args_vec.push(output.to_string_lossy().to_string());
+
+                    // Keep the same text columns you are already using unless overridden.
+                    args_vec.push("--format-output".to_string());
+                    args_vec.push(config.format_output.clone().unwrap_or_else(|| {
+                        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+                            .to_string()
+                    }));
+
+                    push_option_fields(&mut args_vec, &config.option_fields);
+                }
+            }
+
+            if matches!(config.subcommand, MmseqsSubcommand::EasySearch | MmseqsSubcommand::Search)
+                && config.backend == MmseqsBackend::Cpu
+            {
+                let target = resolve_mmseqs_db(run_config, config.target_db.as_ref())?;
+                validate_cpu_index(&target)?;
+            }
+
+            if config.backend == MmseqsBackend::Gpu
+                && matches!(config.subcommand, MmseqsSubcommand::EasySearch | MmseqsSubcommand::Search)
+            {
+                debug!(
+                    "MMseqs GPU client selected; GPU-compatible DB should be padded/indexed already"
+                );
+            }
+
+            debug!("MMseqs argv: {:?}", args_vec);
+            Ok(args_vec)
+        }
+    }
+
+    /// Convenience helper for the new GPU server workflow.
+    ///
+    /// Typical usage:
+    /// 1) createdb / makepaddedseqdb / createindex --index-subset 2
+    /// 2) spawn_gpuserver(...)
+    /// 3) run Search with backend=Gpu and gpu_server=true
+    /// 4) run ConvertAlis if you want m8 output
+    pub async fn build_gpu_server_client_args(
+        run_config: &RunConfig,
+        config: &MmseqsConfig,
+    ) -> Result<Vec<String>> {
+        let generator = MmseqsArgGenerator;
+        generator.generate_args(run_config, Some(config as &dyn Any))
+    }
+
+    pub fn mmseqs_gpu_server_note() -> &'static str {
+        "Use gpuserver without --gpu, then use search with --gpu 1 --gpu-server 1 --db-load-mode 2."
+    }
+
+    pub fn mmseqs_cpu_production_note() -> &'static str {
+        "Use search for production control; add --alignment-mode 3 to preserve real pident, or keep easy-search for compatibility."
+    }
+
+    pub fn mmseqs_gpu_db_prep_note() -> &'static str {
+        "GPU DB prep: createdb -> makepaddedseqdb -> createindex --index-subset 2."
+    }
+
+    pub fn default_easy_search_format_output() -> &'static str {
+        "query,target,pident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits"
+    }
+
+    pub fn default_search_alignment_mode() -> &'static str {
+        "3"
+    }
+
+    pub fn default_gpu_server_db_load_mode() -> &'static str {
+        "2"
+    }
+
+    pub fn default_gpu_server_prefilter_mode() -> &'static str {
+        "1"
+    }
+
+    pub fn default_gpu_createindex_subset() -> &'static str {
+        "2"
+    }
+
+    pub fn recommended_cuda_visible_devices_for_server(all_visible: bool) -> Option<String> {
+        if all_visible {
+            None
+        } else {
+            Some("0".to_string())
+        }
+    }
+
+    pub fn example_gpu_server_workflow(
+        query_db: PathBuf,
+        target_db: PathBuf,
+        result_db: PathBuf,
+        out_m8: PathBuf,
+        tmp_dir: PathBuf,
+    ) -> (MmseqsConfig, MmseqsConfig, MmseqsConfig) {
+        let search_cfg = MmseqsConfig {
+            subcommand: MmseqsSubcommand::Search,
+            backend: MmseqsBackend::Gpu,
+            input: Some(query_db),
+            target_db: Some(target_db.clone()),
+            result_db: Some(result_db),
+            output: None,
+            tmp_dir: Some(tmp_dir),
+            threads: None,
+            sensitivity: None,
+            search_type: None,
+            max_seqs: None,
+            prefilter_mode: None,
+            db_load_mode: Some(default_gpu_server_db_load_mode().to_string()),
+            alignment_mode: Some(default_search_alignment_mode().to_string()),
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+            option_fields: HashMap::new(),
+            gpu_server: true,
+        };
+
+        let convert_cfg = MmseqsConfig {
+            subcommand: MmseqsSubcommand::ConvertAlis,
+            backend: MmseqsBackend::Cpu,
+            input: None,
+            target_db: Some(target_db),
+            result_db: search_cfg.result_db.clone(),
+            output: Some(out_m8),
+            tmp_dir: None,
+            threads: None,
+            sensitivity: None,
+            search_type: None,
+            max_seqs: None,
+            prefilter_mode: None,
+            db_load_mode: None,
+            alignment_mode: None,
+            index_subset: None,
+            format_output: Some(default_easy_search_format_output().to_string()),
+            cuda_visible_devices: None,
+            option_fields: HashMap::new(),
+            gpu_server: false,
+        };
+
+        let server_cfg = MmseqsConfig {
+            subcommand: MmseqsSubcommand::GpuServer,
+            backend: MmseqsBackend::Gpu,
+            input: None,
+            target_db: search_cfg.target_db.clone(),
+            result_db: None,
+            output: None,
+            tmp_dir: None,
+            threads: None,
+            sensitivity: None,
+            search_type: None,
+            max_seqs: None,
+            prefilter_mode: None,
+            db_load_mode: None,
+            alignment_mode: None,
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+            option_fields: HashMap::new(),
+            gpu_server: false,
+        };
+
+        (server_cfg, search_cfg, convert_cfg)
+    }
+
+    pub async fn mmseqs_createdb(
+        input: &Path,
+        output: &Path,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("createdb");
+        cmd.arg(input);
+        cmd.arg(output);
+        Ok(cmd)
+    }
+
+    pub async fn mmseqs_makepaddedseqdb(
+        input_db: &Path,
+        output_db: &Path,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("makepaddedseqdb");
+        cmd.arg(input_db);
+        cmd.arg(output_db);
+        Ok(cmd)
+    }
+
+    pub async fn mmseqs_createindex(
+        target_db: &Path,
+        tmp_dir: &Path,
+        index_subset: Option<&str>,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("createindex");
+        cmd.arg(target_db);
+        cmd.arg(tmp_dir);
+
+        if let Some(subset) = index_subset {
+            cmd.arg("--index-subset");
+            cmd.arg(subset);
+        }
+
+        Ok(cmd)
+    }
+
+    pub async fn mmseqs_convertalis(
+        query_db: &Path,
+        target_db: &Path,
+        result_db: &Path,
+        output_m8: &Path,
+        format_output: Option<&str>,
+    ) -> Result<Command> {
+        let mut cmd = Command::new(MMSEQS_TAG);
+        cmd.arg("convertalis");
+        cmd.arg(query_db);
+        cmd.arg(target_db);
+        cmd.arg(result_db);
+        cmd.arg(output_m8);
+
+        if let Some(fmt) = format_output {
+            cmd.arg("--format-output");
+            cmd.arg(fmt);
+        }
+
+        Ok(cmd)
+    }
+
+    pub fn is_gpu_server_client(config: &MmseqsConfig) -> bool {
+        config.backend == MmseqsBackend::Gpu && config.gpu_server
+    }
+
+    pub fn uses_search_command(config: &MmseqsConfig) -> bool {
+        matches!(
+            config.subcommand,
+            MmseqsSubcommand::EasySearch | MmseqsSubcommand::Search
+        )
+    }
+
+    pub fn uses_convertalis_command(config: &MmseqsConfig) -> bool {
+        matches!(config.subcommand, MmseqsSubcommand::ConvertAlis)
+    }
+
+    pub fn uses_server_command(config: &MmseqsConfig) -> bool {
+        matches!(config.subcommand, MmseqsSubcommand::GpuServer)
+    }
+
+    pub fn uses_db_prep_command(config: &MmseqsConfig) -> bool {
+        matches!(
+            config.subcommand,
+            MmseqsSubcommand::Createdb
+                | MmseqsSubcommand::MakePaddedSeqDb
+                | MmseqsSubcommand::CreateIndex
+        )
+    }
+
+    pub fn maybe_warn_on_easy_search_cpu(config: &MmseqsConfig) {
+        if matches!(config.subcommand, MmseqsSubcommand::EasySearch)
+            && config.backend == MmseqsBackend::Cpu
+        {
+            info!(
+                "MMseqs CPU easy-search selected. This preserves current behavior."
+            );
+        }
+    }
+}
+
+
+
+
+
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -2155,13 +3000,15 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
         BLASTN_TAG => Box::new(blastn::BlastnArgGenerator),
         BLASTX_TAG => Box::new(blastx::BlastxArgGenerator),
         MAKEBLASTDB_TAG => {Box::new(makeblastdb::MakeblastdbArgGenerator)},
+        SORT_TAG => Box::new(sort::SortArgGenerator),
+        MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
     generator.generate_args(run_config, extra)
 }
 
-pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
+pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunConfig) -> Result<()> {
     let assembly_dir = out_dir.join("assembly");
     fs::create_dir_all(&assembly_dir).await
         .map_err(|e| anyhow!("Failed to create assembly directory: {}", e))?;
@@ -2182,28 +3029,30 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf) -> Result<()> {
             };
 
             let version = match tool {
-                FASTP_TAG => fastp::fastp_presence_check().await,
-                H5DUMP_TAG => h5dump::h5dump_presence_check().await,
-                MINIMAP2_TAG => minimap2::minimap2_presence_check(version_file).await,
-                SAMTOOLS_TAG => samtools::samtools_presence_check().await,
-                KRAKEN2_TAG => kraken2::kraken2_presence_check().await,
-                BCFTOOLS_TAG => bcftools::bcftools_presence_check().await,
-                IVAR_TAG => ivar::ivar_presence_check().await,
-                MUSCLE_TAG => muscle::muscle_presence_check().await,
-                MAFFT_TAG => mafft::mafft_presence_check().await,
-                QUAST_TAG => quast::quast_presence_check().await,
-                NUCMER_TAG => nucmer::nucmer_presence_check().await,
-                SEQKIT_TAG => seqkit::seqkit_presence_check().await,
-                BOWTIE2_TAG => bowtie2::bowtie2_presence_check().await,
-                HISAT2_TAG => hisat2::hisat2_presence_check().await,
-                KALLISTO_TAG => kallisto::kallisto_presence_check().await,
-                STAR_TAG => star::star_presence_check().await,
-                CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check().await,
-                DIAMOND_TAG => diamond::diamond_presence_check(version_file).await,
-                SPADES_TAG => spades::spades_presence_check(version_file).await,
-                BLASTN_TAG => blastn::blastn_presence_check().await,
-                BLASTX_TAG => blastx::blastx_presence_check().await,
-                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check().await,
+                FASTP_TAG => fastp::fastp_presence_check(&config).await,
+                H5DUMP_TAG => h5dump::h5dump_presence_check(&config).await,
+                MINIMAP2_TAG => minimap2::minimap2_presence_check(&config, version_file).await,
+                SAMTOOLS_TAG => samtools::samtools_presence_check(&config).await,
+                KRAKEN2_TAG => kraken2::kraken2_presence_check(&config).await,
+                BCFTOOLS_TAG => bcftools::bcftools_presence_check(&config).await,
+                IVAR_TAG => ivar::ivar_presence_check(&config).await,
+                MUSCLE_TAG => muscle::muscle_presence_check(&config).await,
+                MAFFT_TAG => mafft::mafft_presence_check(&config).await,
+                QUAST_TAG => quast::quast_presence_check(&config).await,
+                NUCMER_TAG => nucmer::nucmer_presence_check(&config).await,
+                SEQKIT_TAG => seqkit::seqkit_presence_check(&config).await,
+                BOWTIE2_TAG => bowtie2::bowtie2_presence_check(&config).await,
+                HISAT2_TAG => hisat2::hisat2_presence_check(&config).await,
+                KALLISTO_TAG => kallisto::kallisto_presence_check(&config).await,
+                STAR_TAG => star::star_presence_check(&config).await,
+                CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check(&config).await,
+                DIAMOND_TAG => diamond::diamond_presence_check(&config, version_file).await,
+                SPADES_TAG => spades::spades_presence_check(&config, version_file).await,
+                BLASTN_TAG => blastn::blastn_presence_check(&config).await,
+                BLASTX_TAG => blastx::blastx_presence_check(&config).await,
+                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check(&config).await,
+                SORT_TAG => sort::sort_presence_check(&config).await,
+                MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

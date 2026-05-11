@@ -13,6 +13,7 @@ use tokio::task::JoinError;
 use serde_json::Error as SerdeJsonError;
 use serde::{Deserialize, Serialize};
 use log::LevelFilter;
+use once_cell::sync::Lazy;
 
 use crate::cli::Arguments;
 
@@ -42,6 +43,8 @@ pub const SPADES_TAG: &str = "spades.py";
 pub const BLASTN_TAG: &str = "blastn";
 pub const BLASTX_TAG: &str = "blastx";
 pub const MAKEBLASTDB_TAG: &str = "makeblastdb";
+pub const SORT_TAG: &str = "sort";
+pub const MMSEQS_TAG: &str = "mmseqs";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";
@@ -57,6 +60,10 @@ pub const MIN_NORMAL_POSITIVE_DOUBLE: f64 = f64::MIN_POSITIVE;
 pub const CONFORMING_PREAMBLE: &str = ">family_nr:-300:family_nt:-300:genus_nr:-200:genus_nt:-200:species_nr:-100:species_nt:-100:";
 
 pub const SMT_MODEST_MULTIPLIER: f32 = 1.3_f32;
+
+pub static SIMD_LEVEL: Lazy<SimdLevel> = Lazy::new(|| {
+    crate::utils::system::detect_simd_level()
+});
 
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
@@ -80,6 +87,7 @@ lazy_static! {
         m.insert(BLASTN_TAG, 2.12);
         m.insert(BLASTX_TAG, 2.12);
         m.insert(MAKEBLASTDB_TAG, 2.12);
+        m.insert(MMSEQS_TAG, 0.0);
         m
     };
 }
@@ -198,6 +206,36 @@ pub const FASTQ_TAG: &str = "fastq";
 pub const FASTA_EXTS: &[&'static str] = &["fasta", "fa", "fna", "faa", "ffn", "frn"];
 pub const FASTQ_EXTS: &[&'static str] = &["fastq", "fq"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdLevel {
+    Scalar,
+    Avx2,
+    Avx512,
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuInfo {
+    pub index: usize,              // 0-based
+    pub name: String,              // e.g. "NVIDIA H100 80GB HBM3" or "Apple M2"
+    pub memory_mib: Option<u64>,   // total VRAM in MiB (None if unknown)
+    pub is_discrete: bool,         // true for dedicated card, false for integrated
+    pub driver: Option<String>,    // e.g. "550.90.07" or None
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuDetection {
+    pub count: usize,
+    pub gpus: Vec<GpuInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NRAlignmentBackend {
+    Diamond,          // always CPU
+    MmseqsCpu,
+    MmseqsGpu,
+}
+
+
 #[derive(Clone, Debug)]
 pub struct RunConfig {
     pub cwd: PathBuf,
@@ -213,7 +251,11 @@ pub struct RunConfig {
     pub available_ram: u64,
     pub rng: StdRng,
     pub log_level: LevelFilter,
-    pub base_backpressure_pause: u64
+    pub base_backpressure_pause: u64,
+    pub simd: SimdLevel,
+    pub gpu_info: GpuDetection,
+    pub has_gpu: bool,
+    pub alignment_backend: NRAlignmentBackend,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -230,6 +272,12 @@ pub struct ClusterInfo {
     pub members: Vec<String>,       // All member IDs (rep at [0]) — used by non-host in CountAll
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingMode {
+    Strict,
+    Relaxed,
+}
+
 pub type DuplicateClusters = HashMap<String, ClusterInfo>;
 
 impl RunConfig {
@@ -238,7 +286,7 @@ impl RunConfig {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
             (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _) | (HISAT2_TAG, _)
-            | (MAKEBLASTDB_TAG, _) => CoreAllocation::Maximal,
+            | (MAKEBLASTDB_TAG, _) | (MMSEQS_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
@@ -246,6 +294,21 @@ impl RunConfig {
             (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
             _ => CoreAllocation::Minimal,
         }
+    }
+
+    pub fn mmseqs_threads(&self) -> usize {
+        let base = self.thread_allocation(MMSEQS_TAG, Some("search"));
+
+        // Scale based on physical scale of the machine
+        let threads = match self.max_cores {
+            0..=64   => base.min(56),                    // small machines / MacBook
+            65..=128 => base.min(112),                   // r6id.32xlarge
+            129..=192 => base.min(160),                  // r8id.48xlarge class
+            _        => base.min(224),                   // 256+ core EPYC permanent nodes
+        };
+
+        // Final safety cap (never use 100% of cores)
+        threads.min(self.max_cores * 9 / 10)
     }
 
     pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
@@ -259,7 +322,7 @@ impl RunConfig {
         };
 
         let prefer_physical = match tag {
-            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG => false, // allow modest SMT
+            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG | MMSEQS_TAG => false, // allow modest SMT
             BOWTIE2_TAG | HISAT2_TAG | SPADES_TAG | FASTP_TAG | PIGZ_TAG => true,      // physical only
             _ => false,  // default allow
         };
@@ -267,7 +330,7 @@ impl RunConfig {
         if prefer_physical && self.args.use_smt { // If a program does poorly with SMT, don't allow it even if use_smt true
             allocation = allocation.min(self.physical_cores);
         } else if !prefer_physical && self.args.use_smt {
-            // Modest SMT: allow up to ~1.3× physical cores 
+            // Modest SMT: allow up to ~1.3× physical cores
 
             let modest_max = (self.physical_cores as f32 * SMT_MODEST_MULTIPLIER).ceil() as usize;
             allocation = allocation.min(modest_max);

@@ -5,11 +5,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
-use std::collections::HashMap;
 use std::process::Command;
 
-use log::{self, LevelFilter, debug, info, error, warn};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use log::{self, debug, info, error, warn};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::time::sleep;
 use tokio::process::Command as TokioCommand;
 use anyhow::{anyhow, Result};
@@ -17,24 +16,8 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_core::{OsRng, RngCore};
 
-use crate::cli::args::{Arguments, Technology};
-use crate::config::defs::{RunConfig, StreamDataType};
+use crate::config::defs::{RunConfig, StreamDataType, SimdLevel, GpuDetection, GpuInfo};
 
-
-#[derive(Debug, Clone)]
-pub struct GpuInfo {
-    pub index: usize,              // 0-based
-    pub name: String,              // e.g. "NVIDIA H100 80GB HBM3" or "Apple M2"
-    pub memory_mib: Option<u64>,   // total VRAM in MiB (None if unknown)
-    pub is_discrete: bool,         // true for dedicated card, false for integrated
-    pub driver: Option<String>,    // e.g. "550.90.07" or None
-}
-
-#[derive(Debug, Clone)]
-pub struct GpuDetection {
-    pub count: usize,
-    pub gpus: Vec<GpuInfo>,
-}
 
 
 /// Detects physical cores (not logical) — fallback to lscpu if sysinfo doesn't distinguish
@@ -204,6 +187,68 @@ pub fn compute_base_buffer_size(total_input_size_bytes: u64) -> usize {
     records_per_channel
 }
 
+/// Single source of truth for buffer sizes — fully dynamic.
+pub fn compute_buffer_size(
+    config: &RunConfig,
+    phase: &str,
+    data_type: StreamDataType,
+    multiplier: f64,
+) -> usize {
+    let input_gb = config.input_size as f64 / 1_000_000_000.0;
+    let avail_gib = config.available_ram as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    let mut records_per_channel = (input_gb * 100_000.0) as usize;
+    records_per_channel = records_per_channel.clamp(10_000, 1_000_000);
+
+    let record_size = match data_type {
+        StreamDataType::IlluminaFastq => 1_000,
+        StreamDataType::OntFastq => 10_000,
+        StreamDataType::JustBytes => 512,
+    };
+
+    let mut bytes = (records_per_channel * record_size) as f64;
+
+    // Hardware scaling
+    if avail_gib >= 1000.0 {
+        bytes *= 2.5;
+        bytes = bytes.min(128.0 * 1024.0 * 1024.0);
+    } else if avail_gib >= 500.0 {
+        bytes *= 2.0;
+        bytes = bytes.min(96.0 * 1024.0 * 1024.0);
+    } else if avail_gib >= 128.0 {
+        bytes *= 1.5;
+        bytes = bytes.min(64.0 * 1024.0 * 1024.0);
+    } else {
+        bytes = bytes.min(16.0 * 1024.0 * 1024.0);
+    }
+
+    // Phase hot-path boost
+    match phase {
+        "stream_to_cmd" | "write_to_fifo" | "fanout" | "deinterleave" => {
+            bytes *= 1.8;
+            bytes = bytes.min(128.0 * 1024.0 * 1024.0);
+        }
+        "parse_fastq" | "parse_bytes" => {
+            bytes *= 0.5;
+            bytes = bytes.max(4.0 * 1024.0 * 1024.0);
+        }
+        "batch_rayon" => {
+            bytes *= 2.0;
+            bytes = bytes.min(64.0 * 1024.0 * 1024.0);
+        }
+        _ => {}
+    }
+
+    let final_bytes = (bytes * multiplier)
+        .clamp(4.0 * 1024.0 * 1024.0, 128.0 * 1024.0 * 1024.0) as usize;
+
+    debug!(
+        "compute_buffer_size({}/{:?}) = {} MiB (input {:.1}GB, avail {:.1}GiB, mult {:.1})",
+        phase, data_type, final_bytes / (1024*1024), input_gb, avail_gib, multiplier
+    );
+
+    final_bytes
+}
 
 /// Searches for a directory for RAM temp files.
 /// Prefers /dev/shm (RAM disk) for linux, otherwise returns the standard temp dir.
@@ -235,6 +280,7 @@ pub fn get_ram_temp_dir() -> PathBuf {
 
 
 /// The iostat functions below are currently unused and just here for future use.
+#[allow(dead_code)]
 async fn monitor_io_utilization(device: String) {
     loop {
         match run_iostat(&device).await {
@@ -256,6 +302,7 @@ async fn monitor_io_utilization(device: String) {
 }
 
 // Helper: Run iostat -x -d <device> 1 1 (once, extended disk stats)
+#[allow(dead_code)]
 async fn run_iostat(device: &str) -> Result<Output> {
     TokioCommand::new("iostat")
         .args(&["-x", "-d", device, "1", "1"])  // Extended, device-specific, 1s interval, count=1
@@ -265,6 +312,7 @@ async fn run_iostat(device: &str) -> Result<Output> {
 }
 
 // Helper: Parse %util from iostat output (e.g., look for line with device and extract last column)
+#[allow(dead_code)]
 fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
     for line in output.lines() {
         if line.contains(device) && !line.contains("Device") {  // Skip header
@@ -319,7 +367,7 @@ pub fn detect_gpus() -> Result<GpuDetection> {
     }
 }
 
-
+#[allow(dead_code)]
 fn detect_nvidia() -> Result<GpuDetection> {
     // Query name + memory + driver
     let output = Command::new("nvidia-smi")
@@ -419,6 +467,7 @@ fn detect_macos() -> Result<GpuDetection> {
     })
 }
 
+#[allow(dead_code)]
 fn detect_lspci_basic() -> Result<GpuDetection> {
     let output = Command::new("lspci")
         .arg("-mm")           // machine-readable format, easier to parse
@@ -499,4 +548,152 @@ fn detect_lspci_basic() -> Result<GpuDetection> {
         count: gpus.len(),
         gpus,
     })
+}
+
+/// Computes a safe concurrency level for a pipeline phase.
+///
+/// # Parameters
+/// - `config`: RunConfig with max_cores and RAM info
+/// - `phase_name`: For logging (e.g. "minimap2_nt", "call_hits_nr")
+/// - `ram_per_thread_gb`: Estimated GB per thread (mm2 ~65, call_hits ~0.5–1)
+/// - `cpu_divisor`: How many threads per core (mm2: 6, call_hits: 3–4)
+/// - `max_cap`: Hard upper limit (phase-specific)
+/// - `min_threads`: Minimum even if RAM/CPU say lower
+pub fn compute_phase_concurrency(
+    config: &RunConfig,
+    phase_name: &str,
+    ram_per_thread_gb: f64,
+    cpu_divisor: f64,
+    max_cap: usize,
+    min_threads: usize,
+) -> usize {
+    let total_threads = config.max_cores as f64;
+    let (total_bytes, avail_bytes) = detect_ram().unwrap_or((0, 0)); // fallback to 0 if fails
+
+    let total_gib = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let avail_gib = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    let target_ram_gib = avail_gib * 0.80; // 80% safe usage
+    let max_jobs_from_ram = (target_ram_gib / ram_per_thread_gb).floor() as usize;
+
+    let max_jobs_from_cpu = (total_threads / cpu_divisor).max(1.0) as usize;
+
+    let mut concurrency = max_jobs_from_ram
+        .min(max_jobs_from_cpu)
+        .min(max_cap)
+        .max(min_threads);
+
+    // Small machine overrides
+    if total_gib < 128.0 {
+        concurrency = concurrency.min(4);
+    }
+    if total_gib < 64.0 {
+        concurrency = concurrency.min(2);
+    }
+
+    info!(
+        "{} concurrency: {} jobs (RAM limit: {}, CPU limit: {}, cap: {}, min: {})",
+        phase_name, concurrency, max_jobs_from_ram, max_jobs_from_cpu, max_cap, min_threads
+    );
+
+    concurrency
+}
+
+pub fn compute_batch_size(
+    est_total_lines: Option<usize>,  // Optional: If known (e.g., from prior count); else None for defaults
+    avg_line_bytes: usize,           // ~200
+    target_batch_mb: usize,          // 100–500
+    concurrency: usize,
+) -> usize {
+    let target_bytes = target_batch_mb * 1024 * 1024;
+    let base_batch = target_bytes / avg_line_bytes;  // e.g., 100MB / 200B = 500k lines
+
+    if let Some(total_lines) = est_total_lines {
+        // Dynamic: ~10–20 batches per concurrent task for overlap
+        let total_batches = concurrency * 15;
+        let from_total = total_lines / total_batches;
+        base_batch.min(from_total)
+    } else {
+        base_batch  // Fixed if unknown
+    }
+        .clamp(10_000, 500_000)  // Min/max
+}
+
+pub fn detect_simd_level() -> SimdLevel {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        info!("Non-x86_64 platform → forcing Scalar SIMD (MacBook Pro is safe here)");
+        return SimdLevel::Scalar;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") &&
+            is_x86_feature_detected!("avx512bw") &&
+            is_x86_feature_detected!("avx512vl") &&
+            is_x86_feature_detected!("avx512dq") {
+            info!("AVX-512 (F+BW+VL+DQ) detected → enabling AVX512 path (r8id.48xlarge / EPYC)");
+            SimdLevel::Avx512
+        } else if is_x86_feature_detected!("avx2") {
+            debug!("AVX2 detected (no AVX-512) → falling back to AVX2");
+            SimdLevel::Avx2
+        } else {
+            info!("No vector extensions detected → Scalar fallback (safe on all hardware)");
+            SimdLevel::Scalar
+        }
+    }
+}
+
+/// Ensures Transparent Huge Pages are enabled in the best mode for MMseqs/Diamond.
+/// Should be called early in pipeline startup on big Linux nodes.
+pub async fn ensure_transparent_hugepages(config: &RunConfig) -> Result<()> {
+    if !cfg!(target_os = "linux") || config.max_cores < 64 {
+        debug!("THP optimization skipped (not a large Linux node)");
+        return Ok(());
+    }
+
+    info!("Ensuring Transparent Huge Pages (THP) are optimized for large EPYC nodes...");
+
+    let paths = [
+        "/sys/kernel/mm/transparent_hugepage/enabled",
+        "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+        "/sys/kernel/mm/transparent_hugepage/defrag",
+    ];
+
+    let target = "always";
+
+    for path in &paths {
+        let current = match tokio::fs::read_to_string(path).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                warn!("Could not read {}: {}", path, e);
+                continue;
+            }
+        };
+
+        if current.contains(target) {
+            debug!("{} already set to {}", path, target);
+            continue;
+        }
+
+        // Try to set it
+        if let Err(e) = tokio::fs::write(path, target).await {
+            warn!("Failed to write '{}' to {}: {}", target, path, e);
+            // Non-fatal — continue
+        } else {
+            info!("Set {} = {}", path, target);
+        }
+    }
+
+    // Also encourage defrag
+    let _ = tokio::fs::write("/sys/kernel/mm/transparent_hugepage/defrag", "always").await;
+
+    // Optional: drop caches to encourage promotion
+    if config.max_cores >= 128 {
+        let _ = tokio::fs::write("/proc/sys/vm/drop_caches", "3").await;
+        info!("Dropped page cache to encourage hugepage promotion");
+    }
+
+    info!("THP optimization complete (mode: always)");
+    Ok(())
 }

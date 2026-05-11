@@ -27,13 +27,13 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_core::{RngCore, OsRng};
 use crate::cli::parse;
-use crate::config::defs::{RunConfig, StreamDataType, PipelineError};
+use crate::config::defs::{RunConfig, StreamDataType, PipelineError, NRAlignmentBackend, GpuDetection, GpuInfo};
 use crate::cli::args::Technology;
-use crate::utils::file::file_path_manipulator;
+use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, derive_sample_base_from_file1};
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
-                           compute_base_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
-                           GpuDetection, GpuInfo};
+                           compute_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
+                           detect_simd_level, ensure_transparent_hugepages};
 use pipelines::consensus_genome;
 use pipelines::short_read_mngs;
 use pipelines::db;
@@ -86,9 +86,12 @@ async fn main() -> Result<()> {
 
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
+    let mut has_gpu = false;
+    let mut use_mmseqs_gpu = false;
     let gpu_info = detect_gpus().unwrap_or(GpuDetection { count: 0, gpus: vec![] });
 
     if gpu_info.count > 0 {
+        has_gpu = true;
         for gpu in &gpu_info.gpus {
             info!(
             "GPU {}: {} ({}{} MiB)",
@@ -99,11 +102,23 @@ async fn main() -> Result<()> {
         );
         }
 
-        // Example: decide whether to use MMseqs2-GPU
-        // if gpu_info.gpus.iter().any(|g| g.name.contains("H100") || g.name.contains("L40")) {
-        //     // enable GPU path
-        // }
+        use_mmseqs_gpu = gpu_info.gpus.iter().any(|g| {
+            g.name.contains("H100")
+                || g.name.contains("L40S")
+                || g.name.contains("L40")
+                || g.name.contains("A10G")
+                || g.name.contains("A10")
+                || g.name.contains("L4")
+        });
     }
+
+    let backend = if args.use_diamond {
+        NRAlignmentBackend::Diamond
+    } else if use_mmseqs_gpu {
+        NRAlignmentBackend::MmseqsGpu
+    } else {
+        NRAlignmentBackend::MmseqsCpu
+    };
 
     let (total_ram, available_ram) = detect_ram()?;
     debug!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
@@ -118,7 +133,9 @@ async fn main() -> Result<()> {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-    let base_buffer_size = compute_base_buffer_size(input_size);
+
+
+    let simd = detect_simd_level();
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
@@ -129,16 +146,37 @@ async fn main() -> Result<()> {
         args,
         thread_pool,
         maximal_semaphore,
-        base_buffer_size,
+        base_buffer_size: 0,
         input_size,
         physical_cores,
         max_cores,
         available_ram,
         rng,
         log_level,
-        base_backpressure_pause: 1000 // NB: hardcoded for testing
+        base_backpressure_pause: 1000, // NB: hardcoded for testing
+        simd: simd,
+        gpu_info: gpu_info,
+        has_gpu: has_gpu,
+        alignment_backend: backend,
 
     });
+
+    if let Err(e) = ensure_transparent_hugepages(&run_config).await {
+        warn!("THP setup failed (non-fatal): {}", e);
+    }
+
+    let base_buffer_size = compute_buffer_size(
+        &run_config,
+        "global_default",
+        sdt,
+        1.0,
+    );
+
+    let run_config = Arc::new(RunConfig {
+        base_buffer_size,   // now correct
+        ..(*run_config).clone()   // copy everything else
+    });
+
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config).await,
@@ -199,44 +237,20 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             }
         }
         None => {
-            let file1_path: PathBuf = match &args.file1 {
-                Some(file) => {
-                    let file1_full_path = file_path_manipulator(&PathBuf::from(file), Some(cwd), None, None, "");
-                    if file1_full_path.exists() {
-                        file1_full_path
-                    } else {
-                        return Err(anyhow::anyhow!("Cannot find file 1 (-i)"));
-                    }
-                }
+            let file1 = match &args.file1 {
+                Some(file) => resolve_existing_input_path(file, cwd)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                 None => return Err(anyhow::anyhow!("File1 path required")),
             };
-            let file1_r1r2 = r1r2_base(&file1_path);
 
-            let dir_base = match file1_r1r2.prefix {
-                Some(prefix) => prefix,
-                None => {
-                    info!("No R1 tag found. Using bare file 1 stem as sample_base.");
-                    file1_r1r2.file_name.unwrap_or_else(|| {
-                        file1_path
-                            .file_stem()
-                            .map(|stem| stem.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "default_sample".to_string())
-                    })
-                }
-            };
+            let sample_base = derive_sample_base_from_file1(&file1)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-            let timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .map(|secs| {
-                    let dt = DateTime::from_timestamp(secs as i64, 0)
-                        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-                    dt.format("%Y%m%d").to_string()
-                })
-                .unwrap_or_else(|_| "19700101".to_string());
-            cwd.join(format!("{}_{}", dir_base, timestamp))
+            let timestamp = chrono::Local::now().format("%Y%m%d").to_string();
+            cwd.join(format!("{}_{}", sample_base.display(), timestamp))
         }
     };
+
     fs::create_dir_all(&out_dir)?;
     Ok(out_dir)
 }

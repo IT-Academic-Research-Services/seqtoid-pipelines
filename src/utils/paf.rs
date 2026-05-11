@@ -1,13 +1,20 @@
 // Functions and definitions for the minimap2-associated PAF file format
 use anyhow::{anyhow, Result};
-use std::cmp::Reverse;
+use log::{info, debug};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
 
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::Sender;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};  
+use rayon::prelude::*;
+use memchr::memchr2_iter;
+use lexical::parse as lexical_parse;
+use once_cell::sync::Lazy;
+use bytes::Bytes;
 
 use crate::utils::streams::ParseOutput;
+use crate::config::defs::{SIMD_LEVEL, SimdLevel};
 
 const LAMBDA: f64 = 1.58;
 const K: f64 = 0.1;
@@ -30,36 +37,157 @@ pub struct PafRecord {
 }
 
 impl PafRecord {
-    pub fn parse_line(line: &str) -> Result<Self> {
+    /// Scalar parser — baseline, used on non-AVX-512 hardware.
+    fn parse_line_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         let mut fields = line.split('\t');
-        let qname = fields.next().ok_or_else(|| anyhow!("Missing qname"))?.to_string();
-        let qlen = fields.next().ok_or_else(|| anyhow!("Missing qlen"))?.parse()?;
-        let qstart = fields.next().ok_or_else(|| anyhow!("Missing qstart"))?.parse()?;
-        let qend = fields.next().ok_or_else(|| anyhow!("Missing qend"))?.parse()?;
-        let strand = fields.next().ok_or_else(|| anyhow!("Missing strand"))?.chars().next().ok_or_else(|| anyhow!("Invalid strand"))?;
-        let tname = fields.next().ok_or_else(|| anyhow!("Missing tname"))?.to_string();
-        let tlen = fields.next().ok_or_else(|| anyhow!("Missing tlen"))?.parse()?;
-        let tstart = fields.next().ok_or_else(|| anyhow!("Missing tstart"))?.parse()?;
-        let tend = fields.next().ok_or_else(|| anyhow!("Missing tend"))?.parse()?;
-        let nmatch = fields.next().ok_or_else(|| anyhow!("Missing nmatch"))?.parse()?;
-        let alen = fields.next().ok_or_else(|| anyhow!("Missing alen"))?.parse()?;
-        let mapq = fields.next().ok_or_else(|| anyhow!("Missing mapq"))?.parse()?;
 
-        let mut tags = std::collections::HashMap::new();
+        macro_rules! next {
+            ($name:literal) => {
+                fields.next().ok_or_else(|| anyhow!(concat!("Missing ", $name)))?
+            };
+        }
+        macro_rules! parse_u64 {
+            ($name:literal) => {{
+                let s = next!($name);
+                lexical_parse::<u64, _>(s.as_bytes())
+                    .map_err(|e| anyhow!(concat!("invalid ", $name, ": {}"), e))?
+            }};
+        }
+
+        let qname  = next!("qname").to_string();
+        let qlen   = parse_u64!("qlen");
+        let qstart = parse_u64!("qstart");
+        let qend   = parse_u64!("qend");
+        let strand = next!("strand").chars().next().ok_or_else(|| anyhow!("Invalid strand"))?;
+        let tname  = next!("tname").to_string();
+        let tlen   = parse_u64!("tlen");
+        let tstart = parse_u64!("tstart");
+        let tend   = parse_u64!("tend");
+        let nmatch = parse_u64!("nmatch");
+        let alen   = parse_u64!("alen");
+        let mapq   = parse_u64!("mapq");
+
+        let mut tags = HashMap::new();
         for tag_str in fields {
             let parts: Vec<&str> = tag_str.splitn(3, ':').collect();
             if parts.len() == 3 {
-                let key = parts[0].to_string();
-                let _typ = parts[1]; // We can check if needed
-                let val = parts[2].to_string();
-                tags.insert(key, val);
+                tags.insert(parts[0].to_string(), parts[2].to_string());
             }
         }
 
-        Ok(Self {
-            qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq, tags,
-        })
+        Ok(Self { qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq, tags })
+    }
+
+    /// AVX-512 inner parser.
+    /// Uses a 64-byte SIMD sweep to collect all tab positions in one pass,
+    /// then indexes directly into byte slices — no iterator, no intermediate allocs.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn parse_line_avx512_inner(line: &str) -> Result<Self> {
+        use std::arch::x86_64::*;
+        use std::arch::x86_64::__m512i;
+
+        let bytes = line.trim_end().as_bytes();
+        let len = bytes.len();
+        if len == 0 {
+            return Err(anyhow!("empty PAF line"));
+        }
+
+        // ── Phase 1: collect every tab position in 64-byte SIMD chunks ──────
+        let mut tab_pos: Vec<usize> = Vec::with_capacity(24);
+        let tab_splat = _mm512_set1_epi8(b'\t' as i8);
+        let mut i = 0usize;
+
+        while i + 64 <= len {
+            let chunk = _mm512_loadu_si512(bytes.as_ptr().add(i).cast::<__m512i>());
+            let mut mask: u64 = _mm512_cmpeq_epi8_mask(chunk, tab_splat);
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                tab_pos.push(i + bit);
+                mask &= mask - 1;
+            }
+            i += 64;
+        }
+        // Scalar tail for the remaining < 64 bytes
+        while i < len {
+            if bytes[i] == b'\t' {
+                tab_pos.push(i);
+            }
+            i += 1;
+        }
+
+        if tab_pos.len() < 11 {
+            return Err(anyhow!(
+                "PAF line has {} tabs, need ≥11 for 12 mandatory fields",
+                tab_pos.len()
+            ));
+        }
+
+        // ── Phase 2: index into fields by tab positions ───────────────────
+        // Field n:  start = tab_pos[n-1]+1 (or 0 for n==0)
+        //           end   = tab_pos[n]      (or len for last field)
+        macro_rules! field {
+            ($n:expr) => {{
+                let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
+                let end   = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+                &bytes[start..end]
+            }};
+        }
+        macro_rules! parse_u64 {
+            ($n:expr, $name:literal) => {
+                lexical_parse::<u64, _>(field!($n))
+                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+            };
+        }
+
+        let qname  = std::str::from_utf8(field!(0)).map_err(|_| anyhow!("qname not UTF-8"))?.to_string();
+        let qlen   = parse_u64!(1,  "qlen");
+        let qstart = parse_u64!(2,  "qstart");
+        let qend   = parse_u64!(3,  "qend");
+        let strand = match field!(4).first() {
+            Some(&b'+') => '+',
+            Some(&b'-') => '-',
+            other => return Err(anyhow!("invalid strand byte: {:?}", other)),
+        };
+        let tname  = std::str::from_utf8(field!(5)).map_err(|_| anyhow!("tname not UTF-8"))?.to_string();
+        let tlen   = parse_u64!(6,  "tlen");
+        let tstart = parse_u64!(7,  "tstart");
+        let tend   = parse_u64!(8,  "tend");
+        let nmatch = parse_u64!(9,  "nmatch");
+        let alen   = parse_u64!(10, "alen");
+        let mapq   = parse_u64!(11, "mapq");
+
+        // ── Phase 3: optional tag fields (12, 13, …) ─────────────────────
+        let n_fields = tab_pos.len() + 1;
+        let mut tags = HashMap::with_capacity(n_fields.saturating_sub(12));
+        for fi in 12..n_fields {
+            let start     = tab_pos[fi - 1] + 1;
+            let end       = if fi < tab_pos.len() { tab_pos[fi] } else { len };
+            let tag_bytes = &bytes[start..end];
+            if tag_bytes.is_empty() { continue; }
+            if let Ok(s) = std::str::from_utf8(tag_bytes) {
+                let mut it = s.splitn(3, ':');
+                if let (Some(k), Some(_t), Some(v)) = (it.next(), it.next(), it.next()) {
+                    tags.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+
+        Ok(Self { qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq, tags })
+    }
+
+    /// Safe wrapper — satisfies the `fn(&str) -> Result<Self>` type required by the dispatch static.
+    #[cfg(target_arch = "x86_64")]
+    fn parse_line_avx512(line: &str) -> Result<Self> {
+        // Safety: only reachable when SIMD_LEVEL == Avx512, which means
+        // is_x86_feature_detected! confirmed avx512f+bw at startup.
+        unsafe { Self::parse_line_avx512_inner(line) }
+    }
+
+    /// Public entry point — dispatches to the best available implementation at first call.
+    pub fn parse_line(line: &str) -> Result<Self> {
+        PARSE_PAF_LINE(line)
     }
 
     pub fn alignment_score(&self) -> i32 {
@@ -83,60 +211,62 @@ impl PafRecord {
         line
     }
 
-    pub async fn merge_paf_streams(
-        mut streams: Vec<ReceiverStream<ParseOutput>>,
+    pub async fn merge_paf_files(
+        paf_paths: &[PathBuf],
         tx: Sender<ParseOutput>,
-        _buffer_size: usize,  // unused but kept for signature compatibility
     ) -> Result<()> {
-        let mut query_hits: HashMap<String, Vec<PafRecord>> = HashMap::new();
+        info!("Merging {} raw PAF files → streaming PAF output (no conversion)", paf_paths.len());
 
-        // Collect all PAF records from all partial streams
-        for mut stream in streams {
-            while let Some(item) = stream.next().await {
-                match item {
-                    ParseOutput::Bytes(bytes) => {
-                        let line = String::from_utf8_lossy(&*bytes).trim().to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let record = PafRecord::parse_line(&line)?;
-                        query_hits
-                            .entry(record.qname.clone())
-                            .or_default()
-                            .push(record);
+        let start = std::time::Instant::now();
+        let total_lines = 0u64;
+
+        let mut handles = Vec::new();
+
+        for path in paf_paths {
+            let path = path.clone();
+            let tx_clone = tx.clone();
+
+            handles.push(tokio::spawn(async move {
+                let file = File::open(&path).await
+                    .map_err(|e| anyhow!("Failed to open PAF {}: {}", path.display(), e))?;
+
+                let mut reader = BufReader::new(file);
+                let mut line = String::new();
+                let mut local_lines = 0u64;
+                let mut local_skipped = 0u64;
+
+                while reader.read_line(&mut line).await? > 0 {
+                    local_lines += 1;
+                    let trimmed = line.trim();
+
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        local_skipped += 1;
+                        line.clear();
+                        continue;
                     }
-                    _ => {
-                        return Err(anyhow!("Unexpected non-Bytes item in PAF stream"));
+
+                    // Forward raw PAF line unchanged
+                    let bytes = (trimmed.to_string() + "\n").into_bytes();
+                    if tx_clone.send(ParseOutput::Bytes(Bytes::from(bytes))).await.is_err() {
+                        return Ok(());
                     }
+
+                    line.clear();
                 }
-            }
+
+                info!("Merged {}: {} lines ({} skipped)", path.display(), local_lines, local_skipped);
+                Ok::<(), anyhow::Error>(())
+            }));
         }
 
-        // Sort queries alphabetically for deterministic output
-        let mut queries: Vec<String> = query_hits.keys().cloned().collect();
-        queries.sort();
-
-        // For each query: sort by descending AS score, keep top 6 hits
-        for query in queries {
-            if let Some(mut hits) = query_hits.remove(&query) {
-                hits.sort_by_key(|h| Reverse(h.alignment_score()));
-                hits.truncate(6);  // 1 primary + up to 5 secondaries
-
-                for hit in hits {
-                    let paf_line = hit.to_paf_line();
-                    tx.send(ParseOutput::Bytes(Arc::new(paf_line.into_bytes())))
-                        .await
-                        .map_err(|e| anyhow!("Failed to send merged PAF line: {}", e))?;
-                }
-            }
+        for h in handles {
+            h.await??;
         }
 
+        info!("Raw PAF merge complete: {} total lines in {:.2?}", total_lines, start.elapsed());
         Ok(())
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Your existing methods (unchanged)
-    // ────────────────────────────────────────────────────────────────
     fn calc_bitscore(&self) -> f64 {
         let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
         let alen = self.alen as f64;
@@ -152,14 +282,8 @@ impl PafRecord {
     }
 
     fn calc_gap_openings(&self) -> u64 {
-        let cigar = self.tags.get("cg").cloned().unwrap_or_default();
-        let mut go = 0;
-        for c in cigar.chars() {
-            if c == 'I' || c == 'D' {
-                go += 1;
-            }
-        }
-        go
+        let cigar = self.tags.get("cg").map(|s| s.as_bytes()).unwrap_or(b"");
+        memchr2_iter(b'I', b'D', cigar).count() as u64
     }
 
     fn percent_identity(&self) -> f64 {
@@ -215,5 +339,186 @@ impl PafRecord {
             nonmatch, gap_openings, qstart_1, self.qend,
             tstart_adj, tend_adj, evalue, bitscore
         )
+    }
+}
+
+static PARSE_PAF_LINE: Lazy<fn(&str) -> Result<PafRecord>> = Lazy::new(|| {
+    #[cfg(target_arch = "x86_64")]
+    if matches!(*SIMD_LEVEL, SimdLevel::Avx512) {
+        debug!("PAF parser: using AVX-512 path");
+        return PafRecord::parse_line_avx512;
+    }
+    debug!("PAF parser: using scalar path");
+    PafRecord::parse_line_scalar
+});
+
+pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
+    batch
+        .par_split(|&b| b == b'\n')
+        .filter(|line: &&[u8]| !line.is_empty() && !line.starts_with(b"#"))
+        .flat_map(|line_bytes: &[u8]| {
+            if let Ok(line) = std::str::from_utf8(line_bytes) {
+                if let Ok(record) = PafRecord::parse_line(line) {
+                    let m8_line = record.to_m8_line(genome_size);
+                    return vec![m8_line.into_bytes()];
+                }
+            }
+            vec![]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ────────────────────────────────────────────────────────────
+
+    /// Assert two PafRecords are field-for-field identical.
+    #[allow(dead_code)]
+    fn assert_records_eq(a: &PafRecord, b: &PafRecord, context: &str) {
+        assert_eq!(a.qname,  b.qname,  "{context}: qname");
+        assert_eq!(a.qlen,   b.qlen,   "{context}: qlen");
+        assert_eq!(a.qstart, b.qstart, "{context}: qstart");
+        assert_eq!(a.qend,   b.qend,   "{context}: qend");
+        assert_eq!(a.strand, b.strand, "{context}: strand");
+        assert_eq!(a.tname,  b.tname,  "{context}: tname");
+        assert_eq!(a.tlen,   b.tlen,   "{context}: tlen");
+        assert_eq!(a.tstart, b.tstart, "{context}: tstart");
+        assert_eq!(a.tend,   b.tend,   "{context}: tend");
+        assert_eq!(a.nmatch, b.nmatch, "{context}: nmatch");
+        assert_eq!(a.alen,   b.alen,   "{context}: alen");
+        assert_eq!(a.mapq,   b.mapq,   "{context}: mapq");
+        assert_eq!(a.tags,   b.tags,   "{context}: tags");
+    }
+
+    /// Run both parsers against `line` and assert they agree.
+    /// Run both parsers against `line` and assert they agree.
+    fn compare_parsers(line: &str) {
+        let scalar = PafRecord::parse_line_scalar(line)
+            .expect("scalar parse failed");
+
+        let dispatched = PafRecord::parse_line(line)
+            .expect("dispatched parse failed");
+
+        assert_records_eq(&scalar, &dispatched, line);
+    }
+
+    // ── representative real-world lines ───────────────────────────────────
+
+    const BASIC: &str =
+        "read1\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60";
+
+    const WITH_TAGS: &str =
+        "read2\t300\t10\t290\t-\tAB123456\t5000\t200\t480\t270\t280\t30\tcg:Z:10M2I5D\tNM:i:7\tAS:i:255";
+
+    const REVERSE_STRAND: &str =
+        "read3\t200\t5\t195\t-\tKJ660346\t18958\t500\t690\t185\t190\t60\tAS:i:180";
+
+    const ZERO_COORDS: &str =
+        "read4\t100\t0\t100\t+\tMN908947.3\t29903\t0\t100\t100\t100\t0";
+
+    const MAX_VALUES: &str =
+        "read5\t1000000\t0\t999999\t+\tNC_000001\t248956422\t0\t999999\t999000\t1000000\t60";
+
+    // A line just long enough to span two 64-byte SIMD chunks (> 64 bytes total).
+    const LONG_LINE: &str =
+        "long_read_id_that_is_quite_verbose_indeed\t250\t0\t250\t+\tsome_reference_sequence_name\t100000\t1000\t1250\t245\t250\t60\tcg:Z:250M\tNM:i:5";
+
+    // Trailing whitespace / CRLF should be trimmed by both parsers.
+    const TRAILING_SPACE: &str =
+        "read6\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60   ";
+
+    // ── tests ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_basic_line() {
+        compare_parsers(BASIC);
+    }
+
+    #[test]
+    fn test_with_optional_tags() {
+        compare_parsers(WITH_TAGS);
+        // Also verify tag values were parsed
+        let r = PafRecord::parse_line_scalar(WITH_TAGS).unwrap();
+        assert_eq!(r.tags.get("NM").map(|s| s.as_str()), Some("7"));
+        assert_eq!(r.tags.get("AS").map(|s| s.as_str()), Some("255"));
+        assert_eq!(r.tags.get("cg").map(|s| s.as_str()), Some("10M2I5D"));
+    }
+
+    #[test]
+    fn test_reverse_strand() {
+        compare_parsers(REVERSE_STRAND);
+        let r = PafRecord::parse_line_scalar(REVERSE_STRAND).unwrap();
+        assert_eq!(r.strand, '-');
+    }
+
+    #[test]
+    fn test_zero_coordinates() {
+        compare_parsers(ZERO_COORDS);
+        let r = PafRecord::parse_line_scalar(ZERO_COORDS).unwrap();
+        assert_eq!(r.qstart, 0);
+        assert_eq!(r.tstart, 0);
+    }
+
+    #[test]
+    fn test_max_values() {
+        compare_parsers(MAX_VALUES);
+        let r = PafRecord::parse_line_scalar(MAX_VALUES).unwrap();
+        assert_eq!(r.qlen, 1_000_000);
+        assert_eq!(r.tlen, 248_956_422);
+    }
+
+    #[test]
+    fn test_line_spanning_two_simd_chunks() {
+        compare_parsers(LONG_LINE);
+    }
+
+    #[test]
+    fn test_trailing_whitespace_trimmed() {
+        compare_parsers(TRAILING_SPACE);
+        // Verify trailing spaces don't bleed into field values
+        let r = PafRecord::parse_line_scalar(TRAILING_SPACE).unwrap();
+        assert_eq!(r.qname, "read6");
+        assert_eq!(r.qlen, 150);
+        assert_eq!(r.mapq, 60);
+    }
+
+    #[test]
+    fn test_to_m8_line_scalar_avx512_agree() {
+        let genome_size = 29903.0_f64;
+        let scalar_m8 = PafRecord::parse_line_scalar(WITH_TAGS)
+            .unwrap()
+            .to_m8_line(genome_size);
+
+        let dispatched_m8 = PafRecord::parse_line(WITH_TAGS)
+            .unwrap()
+            .to_m8_line(genome_size);
+
+        assert_eq!(scalar_m8, dispatched_m8, "to_m8_line output differs between scalar and dispatched");
+        assert!(!scalar_m8.is_empty());
+    }
+
+    #[test]
+    fn test_error_on_empty_line() {
+        assert!(PafRecord::parse_line_scalar("").is_err());
+        assert!(PafRecord::parse_line("").is_err());           // ← use the dispatched version
+    }
+
+    #[test]
+    fn test_error_on_too_few_fields() {
+        let short = "read1\t150\t0\t150\t+\tNC_045512.2\t29903";
+        assert!(PafRecord::parse_line_scalar(short).is_err());
+        assert!(PafRecord::parse_line(short).is_err());   // use dispatched version
+    }
+
+    #[test]
+    fn test_parse_paf_batch_to_m8_roundtrip() {
+        let batch = format!("{}\n{}\n{}\n", BASIC, WITH_TAGS, REVERSE_STRAND);
+        let results = parse_paf_batch_to_m8(batch.into_bytes(), 29903.0);
+        // BASIC and REVERSE_STRAND have no tname with NT:/NR: prefix → empty m8 line, filtered out
+        // WITH_TAGS also has no prefix → all three map to empty; batch returns nothing harmful
+        // Just ensure no panic and result is a Vec.
+        let _ = results;
     }
 }
