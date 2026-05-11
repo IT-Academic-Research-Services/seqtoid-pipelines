@@ -10,9 +10,10 @@ env:
   CARGO_TERM_COLOR: always
   # ─────────────────────────────────────────────────────────────
   # Critical fix for GitHub CI SIGILL crash
-  # GitHub ubuntu-latest runners do NOT guarantee AVX-512.
-  # We force x86-64-v3 (AVX2 + BMI + FMA) so the binary works
-  # everywhere
+  # Forces x86-64-v3 (AVX2 + BMI + FMA) so the binary works
+  # on GitHub runners while still being fast.
+  # Your r8id.48xlarge / GPU nodes will still use full AVX-512
+  # locally (they ignore this flag when you use target-cpu=native).
   # ─────────────────────────────────────────────────────────────
   RUSTFLAGS: "-C target-cpu=x86-64-v3"
 
@@ -41,6 +42,9 @@ jobs:
 
       - name: Increase pipe buffer size
         run: sudo sysctl -w fs.pipe-max-size=1048576
+
+      - name: Clean target directory
+        run: cargo clean
 
       - name: Build
         run: cargo build --verbose
