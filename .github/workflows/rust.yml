@@ -36,8 +36,8 @@ jobs:
         run: sudo sysctl -w fs.pipe-max-size=1048576
 
       # ─────────────────────────────────────────────────────────────
-      # FORCE CLEAN + EXPLICIT RUSTFLAGS (this is what was missing)
-      # GitHub sometimes ignores top-level RUSTFLAGS when a step has its own env:
+      # FORCE CLEAN + EXPLICIT RUSTFLAGS THAT DISABLES AVX-512
+      # This is the bulletproof version for GitHub CI
       # ─────────────────────────────────────────────────────────────
       - name: Clean target directory (force rebuild)
         run: rm -rf target
@@ -45,12 +45,12 @@ jobs:
       - name: Build
         run: cargo build --verbose
         env:
-          RUSTFLAGS: "-C target-cpu=x86-64-v3"
+          RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=-avx512f,-avx512bw,-avx512cd,-avx512dq,-avx512vl,-avx512bf16,-avx512bitalg,-avx512vbmi,-avx512vbmi2,-avx512vnni,-avx512vp2intersect"
 
       - name: Run tests
         run: |
           RUST_BACKTRACE=full cargo test --verbose -- --test-threads=1
         env:
-          RUSTFLAGS: "-C target-cpu=x86-64-v3"
+          RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=-avx512f,-avx512bw,-avx512cd,-avx512dq,-avx512vl,-avx512bf16,-avx512bitalg,-avx512vbmi,-avx512vbmi2,-avx512vnni,-avx512vp2intersect"
           CARGO_INCREMENTAL: "0"
           RUST_LOG: debug
