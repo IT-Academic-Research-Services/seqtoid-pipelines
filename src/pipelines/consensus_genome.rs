@@ -1079,7 +1079,7 @@ async fn align_to_target(
             error: e.to_string(),
         })?;
 
-    let (minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
+    let (minimap2_child, _minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),  // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,

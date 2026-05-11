@@ -1596,12 +1596,12 @@ async fn minimap2_filter(
     cleanup_tasks.push(count_stream_task);
     cleanup_tasks.push(count_err_task);
 
-    let (count_tx, count_rx) = oneshot::channel::<u64>();
+    let (_count_tx, count_rx) = oneshot::channel::<u64>();
     let count_future = tokio::spawn({
         let config = config.clone();
         async move {
             let mut guard = count_child_arc.lock().await;
-            let count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout, &config).await?;
+            let _count_lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout, &config).await?;
             Ok(())
         }
     });
@@ -3065,7 +3065,7 @@ async fn run_diamond_single_file(
             error: e.to_string(),
         })?;
 
-    let (mut diamond_child, diamond_stderr_task) = spawn_cmd(
+    let (mut diamond_child, _diamond_stderr_task) = spawn_cmd(
         config.clone(),
         DIAMOND_TAG,
         diamond_args,
@@ -7606,7 +7606,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     debug!("file1 path: {:?}  sample base buf: {:?}  sample base: {:?}", file1_path.display(), sample_base_buf.display(), sample_base);
 
-    let seed = config.args.seed.unwrap_or_else(|| {
+    let _seed = config.args.seed.unwrap_or_else(|| {
         let mut bytes = [0u8; 8];
         OsRng.fill_bytes(&mut bytes);
         let random_seed = u64::from_le_bytes(bytes);

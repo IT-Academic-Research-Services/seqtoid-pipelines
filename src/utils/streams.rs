@@ -11,7 +11,6 @@ use std::task::{Context, Poll};
 use std::pin::Pin;
 
 
-use tokio::fs::File;
 use log::{self, debug, info, error, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter, ReadBuf};
 use tokio::process::{Child, Command};
@@ -34,8 +33,7 @@ use bytes::Bytes;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG, SPADES_TAG};
-use crate::config::defs::{CoreAllocation, RunConfig, SimdLevel};
-use crate::utils::system::{detect_ram, generate_rng};
+use crate::config::defs::{CoreAllocation, RunConfig};
 
 
 pub trait ToBytes {
@@ -201,7 +199,7 @@ pub async fn t_junction<S>(
     base_buffer_size: usize,
     stall_threshold: u64,
     stream_sleep_ms: Option<u64>,
-    backpressure_pause_ms: u64,
+    _backpressure_pause_ms: u64,
     data_type: StreamDataType,
     label: String,
     notify: Option<Arc<Notify>>,
@@ -2060,10 +2058,11 @@ mod tests {
     use tokio::task;
     use tokio::time::{self, Duration};
     use crate::utils::fastx::fastx_generator;
-    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend};
+    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend, SimdLevel};
     use std::sync::Arc;
     use rayon::ThreadPoolBuilder;
     use tokio::sync::Semaphore;
+    use tokio::fs::File;
     use std::path::PathBuf;
     use crate::cli::Arguments;
     use tempfile::tempdir;
@@ -2072,6 +2071,7 @@ mod tests {
     use crate::utils::fastx::SequenceRecord;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::io::duplex;
+    use crate::utils::system::{detect_ram, generate_rng};
 
 
     // Helper function to create a RunConfig for tests
