@@ -393,19 +393,15 @@ mod tests {
     }
 
     /// Run both parsers against `line` and assert they agree.
+    /// Run both parsers against `line` and assert they agree.
     fn compare_parsers(line: &str) {
         let scalar = PafRecord::parse_line_scalar(line)
             .expect("scalar parse failed");
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            let avx = PafRecord::parse_line_avx512(line)
-                .expect("avx512 parse failed");
-            assert_records_eq(&scalar, &avx, line);
-        }
+        let dispatched = PafRecord::parse_line(line)
+            .expect("dispatched parse failed");
 
-        // On non-x86_64 this test still validates the scalar parser compiles + runs.
-        let _ = scalar;
+        assert_records_eq(&scalar, &dispatched, line);
     }
 
     // ── representative real-world lines ───────────────────────────────────
