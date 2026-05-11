@@ -14,6 +14,7 @@ use once_cell::sync::Lazy;
 use bytes::Bytes;
 
 use crate::utils::streams::ParseOutput;
+use crate::config::defs::{SIMD_LEVEL, SimdLevel};
 
 const LAMBDA: f64 = 1.58;
 const K: f64 = 0.1;

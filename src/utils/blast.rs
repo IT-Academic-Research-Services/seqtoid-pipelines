@@ -18,7 +18,7 @@ use dashmap::DashMap;
 use bytes::Bytes;
 use once_cell::sync::Lazy;
 
-use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode};
+use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
