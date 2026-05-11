@@ -486,36 +486,30 @@ mod tests {
 
     #[test]
     fn test_to_m8_line_scalar_avx512_agree() {
-        // The m8 output of both parsers must be byte-identical.
         let genome_size = 29903.0_f64;
         let scalar_m8 = PafRecord::parse_line_scalar(WITH_TAGS)
             .unwrap()
             .to_m8_line(genome_size);
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            let avx_m8 = PafRecord::parse_line_avx512(WITH_TAGS)
-                .unwrap()
-                .to_m8_line(genome_size);
-            assert_eq!(scalar_m8, avx_m8, "to_m8_line output differs between scalar and AVX-512");
-        }
+        let dispatched_m8 = PafRecord::parse_line(WITH_TAGS)
+            .unwrap()
+            .to_m8_line(genome_size);
 
+        assert_eq!(scalar_m8, dispatched_m8, "to_m8_line output differs between scalar and dispatched");
         assert!(!scalar_m8.is_empty());
     }
 
     #[test]
     fn test_error_on_empty_line() {
         assert!(PafRecord::parse_line_scalar("").is_err());
-        #[cfg(target_arch = "x86_64")]
-        assert!(PafRecord::parse_line_avx512("").is_err());
+        assert!(PafRecord::parse_line("").is_err());           // ← use the dispatched version
     }
 
     #[test]
     fn test_error_on_too_few_fields() {
         let short = "read1\t150\t0\t150\t+\tNC_045512.2\t29903";
         assert!(PafRecord::parse_line_scalar(short).is_err());
-        #[cfg(target_arch = "x86_64")]
-        assert!(PafRecord::parse_line_avx512(short).is_err());
+        assert!(PafRecord::parse_line(short).is_err());   // use dispatched version
     }
 
     #[test]
