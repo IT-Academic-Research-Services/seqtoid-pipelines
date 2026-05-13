@@ -65,32 +65,6 @@ pub static SIMD_LEVEL: Lazy<SimdLevel> = Lazy::new(|| {
     crate::utils::system::detect_simd_level()
 });
 
-lazy_static! {
-    pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
-        let mut m = HashMap::new();
-        m.insert(SAMTOOLS_TAG, 1.19);
-        m.insert(BCFTOOLS_TAG, 1.19);
-        m.insert(MINIMAP2_TAG, 2.24);
-        m.insert(KRAKEN2_TAG, 2.1);
-        m.insert(PIGZ_TAG, 2.8);
-        m.insert(FASTP_TAG, 1.0);
-        m.insert(MAFFT_TAG, 7.5);
-        m.insert(QUAST_TAG, 5.20);
-        m.insert(SEQKIT_TAG, 2.10);
-        m.insert(BOWTIE2_TAG, 2.50);
-        m.insert(KALLISTO_TAG, 0.5);
-        m.insert(HISAT2_TAG, 2.20);
-        m.insert(STAR_TAG, 2.7);
-        m.insert(CZID_DEDUP_TAG, 0.1);
-        m.insert(DIAMOND_TAG, 2.1);
-        m.insert(SPADES_TAG, 4.2);
-        m.insert(BLASTN_TAG, 2.12);
-        m.insert(BLASTX_TAG, 2.12);
-        m.insert(MAKEBLASTDB_TAG, 2.12);
-        m.insert(MMSEQS_TAG, 0.0);
-        m
-    };
-}
 
 lazy_static! {
     static ref TOOL_THREAD_CAPS: HashMap<&'static str, usize> = {
