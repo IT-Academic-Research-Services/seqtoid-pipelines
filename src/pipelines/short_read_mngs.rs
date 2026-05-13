@@ -764,7 +764,7 @@ async fn hisat2_filter(
     let mut cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
 
-    // PAIRED-END
+    // PAIRED-END PATH
     if paired {
         let temp_dir = choose_temp_dir(
             config.input_size * headroom,
@@ -802,12 +802,14 @@ async fn hisat2_filter(
 
         // 2. sort -n → BAM
         let bam_path = temp_dir.path().join("hisat2_sorted.bam");
+        let threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
+
         let sort_config = SamtoolsConfig {
             subcommand: SamtoolsSubcommand::Sort,
             subcommand_fields: HashMap::from([
                 ("-n".to_string(), None),
                 ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
-                ("-@".to_string(), Some("8".to_string())),
+                ("-@".to_string(), Some(threads.to_string())),
                 ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
             ]),
         };
@@ -924,7 +926,8 @@ async fn hisat2_filter(
         parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config).await?
     };
 
-    // 2. samtools sort -n (streaming)
+    // 2. samtools sort -n
+    let sort_threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
     let sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
@@ -932,7 +935,7 @@ async fn hisat2_filter(
             ("-u".to_string(), None),
             ("-O".to_string(), Some("bam".to_string())),
             ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
-            ("-@".to_string(), Some("12".to_string())),
+            ("-@".to_string(), Some(sort_threads.to_string())),
             ("-".to_string(), None),
         ]),
     };
@@ -956,7 +959,7 @@ async fn hisat2_filter(
         parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config).await?
     };
 
-    // 3. Optional BAM write + fanout if needed
+    // 3. Optional BAM write + fanout
     let fastq_input_stream = if let Some(bam_path) = output_bam_path {
         let (streams, router) = fanout_to_channels(
             ReceiverStream::new(sorted_bam_stream),
