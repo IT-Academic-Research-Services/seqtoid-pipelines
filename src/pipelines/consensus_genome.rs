@@ -888,8 +888,7 @@ async fn filter_with_kraken(
 
 
     let filtered_stream = ReceiverStream::new(parse_output_rx);
-
-    // Before t_junction, split for check
+    
     let (check_tx, mut check_rx) = mpsc::channel(1);
     let (forward_tx, forward_rx) = mpsc::channel(config.base_buffer_size);
     let check_split_task = tokio::spawn(async move {

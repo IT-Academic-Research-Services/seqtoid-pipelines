@@ -8,7 +8,7 @@ use std::time::Instant;
 use log::{self, LevelFilter, debug, info, error, warn};
 use futures::StreamExt;
 use sysinfo::{System, Pid, ProcessesToUpdate};
-use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, t_junction, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput, deinterleave_fastq_stream_to_fifos};
+use seqtoid_pipelines::utils::streams::{read_child_output_to_vec, stream_to_cmd, fanout_to_channels, parse_child_output, stream_to_file, ChildStream, ParseMode, ParseOutput, deinterleave_fastq_stream_to_fifos};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::process::{Child, Command};
@@ -191,7 +191,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
 
 
 #[tokio::test]
-async fn test_t_junction_stress() -> Result<()> {
+async fn test_fanout_stress() -> Result<()> {
     let buffer_sizes = [1000, 10_000, 100_000];
     let stall_thresholds = [100, 1000];
     let sleep_ms_options = [Some(0), Some(10)];
@@ -199,7 +199,7 @@ async fn test_t_junction_stress() -> Result<()> {
     let num_reads = 100_000;
     let seq_len = 100;
     let n_outputs = 2;
-    let mut log = std::fs::File::create("t_junction_stress.log")?;
+    let mut log = std::fs::File::create("fanout_stress.log")?;
     writeln!(
         &mut log,
         "BufferSize\tStall\tSleep\tBackpressurePause\tStreams\tReads\tSeqLen\tTime\tMemory\tRecords\tSuccess"
@@ -222,16 +222,13 @@ async fn test_t_junction_stress() -> Result<()> {
 
                     let stream = fastx_generator(num_reads, seq_len, 30.0, 5.0).map(ParseOutput::Fastq);
                     let start = Instant::now();
-                    let (outputs, done_rx) = t_junction(
+
+                    let (outputs, router_handle) = fanout_to_channels(
                         stream,
                         n_outputs,
-                        buffer_size,
-                        stall_threshold,
-                        sleep_ms,
-                        backpressure_pause_ms,
+                        "fanout_stress",
+                        &create_test_run_config(),
                         StreamDataType::IlluminaFastq,
-                        "t_junction_stress".to_string(),
-                        None
                     )
                         .await?;
 
@@ -256,16 +253,14 @@ async fn test_t_junction_stress() -> Result<()> {
 
                     join_all(handles).await;
 
-                    match done_rx.await {
-                        Ok(result) => match result {
-                            Ok(()) => info!("t_junction completed successfully"),
-                            Err(e) => {
-                                error!("t_junction failed: {}", e);
-                                run_success = false;
-                            }
-                        },
+                    match router_handle.await {
+                        Ok(Ok(())) => info!("fanout_to_channels completed successfully"),
+                        Ok(Err(e)) => {
+                            error!("fanout_to_channels failed: {}", e);
+                            run_success = false;
+                        }
                         Err(e) => {
-                            error!("t_junction task failed to send: {}", e);
+                            error!("fanout_to_channels task panicked: {}", e);
                             run_success = false;
                         }
                     }
@@ -306,7 +301,7 @@ async fn test_t_junction_stress() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_t_junction_count() -> Result<()> {
+async fn test_fanout_count() -> Result<()> {
     let num_read = 10_000;
     let read_size = 50;
     let buffer_size = 100_000;
@@ -314,22 +309,21 @@ async fn test_t_junction_count() -> Result<()> {
     let sleep_ms = Some(1);
     let backpressure_pause_ms = 500;
     info!(
-        "Testing t_junction: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}",
+        "Testing fanout_to_channels: Reads: {}, Size: {}, Buffer: {}, Sleep: {:?}",
         num_read, read_size, buffer_size, sleep_ms
     );
     stderr().flush()?;
     let stream = fastx_generator(num_read, read_size, 35.0, 3.0).map(ParseOutput::Fastq);
-    let (outputs, done_rx) = t_junction(
+
+    let (outputs, router_handle) = fanout_to_channels(
         stream,
         2,
-        buffer_size,
-        stall_threshold,
-        sleep_ms,
-        backpressure_pause_ms,
+        "fanout_count",
+        &create_test_run_config(),
         StreamDataType::IlluminaFastq,
-        "t_junction_count".to_string(),
-        None
-    ).await?;
+    )
+        .await?;
+
     let mut counts = vec![0usize; 2];
     let mut handles = Vec::new();
 
@@ -340,11 +334,11 @@ async fn test_t_junction_count() -> Result<()> {
             while let Some(_) = stream.next().await {
                 count += 1;
                 if count % 1000 == 0 {
-                    info!("t_junction stream {} counted {} records", i, count);
+                    info!("fanout_to_channels stream {} counted {} records", i, count);
                     stderr().flush().ok();
                 }
             }
-            info!("t_junction stream {} finished: {} records", i, count);
+            info!("fanout_to_channels stream {} finished: {} records", i, count);
             Ok::<_, anyhow::Error>(count)
         });
         handles.push((i, handle));
@@ -354,17 +348,18 @@ async fn test_t_junction_count() -> Result<()> {
         counts[i] = handle.await??;
     }
 
-    match done_rx.await {
-        Ok(Ok(())) => info!("t_junction completed successfully"),
-        Ok(Err(e)) => error!("t_junction failed: {}", e),
-        Err(e) => error!("t_junction send error: {}", e),
+    // Wait for router (replaces done_rx)
+    match router_handle.await {
+        Ok(Ok(())) => info!("fanout_to_channels completed successfully"),
+        Ok(Err(e)) => error!("fanout_to_channels failed: {}", e),
+        Err(e) => error!("fanout_to_channels send error: {}", e),
     }
     stderr().flush()?;
-    info!("t_junction counts: {:?}", counts);
+    info!("fanout_to_channels counts: {:?}", counts);
     stderr().flush()?;
     if counts != vec![num_read, num_read] {
         return Err(anyhow!(
-            "t_junction produced [{:}], expected [{}, {}]",
+            "fanout_to_channels produced [{:}], expected [{}, {}]",
             counts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
             num_read, num_read
         ));
@@ -386,17 +381,15 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
     stderr().flush()?;
 
     let stream = fastx_generator(num_read, read_size, 35.0, 3.0).map(ParseOutput::Fastq);
-    let (mut outputs, done_rx) = t_junction(
+
+    let (mut outputs, router_handle) = fanout_to_channels(
         stream,
         1,
-        100_000,
-        100,
-        Some(1),
-        500,
+        "test_stream_to_cmd_direct",
+        &config,
         StreamDataType::IlluminaFastq,
-        "test_stream_to_cmd_direct".to_string(),
-        None
-    ).await?;
+    )
+        .await?;
 
     let rx = outputs.pop().ok_or_else(|| anyhow!("No output stream"))?;
     let (child, inner_task, _inner_err_task) = stream_to_cmd(
@@ -407,7 +400,8 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         StreamDataType::IlluminaFastq,
         false,
         None
-    ).await?;
+    )
+        .await?;
 
     match timeout(Duration::from_secs(30), inner_task).await {
         Ok(Ok(Ok(()))) => info!("stream_to_cmd completed successfully"),
@@ -425,7 +419,7 @@ async fn test_stream_to_cmd_direct() -> Result<()> {
         }
     }
 
-    done_rx.await??;
+    drop(router_handle); // new completion signal (replaces done_rx.await??)
 
     let child = Arc::try_unwrap(child)
         .map_err(|_| anyhow!("Multiple references to child remain"))?
@@ -487,34 +481,17 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                 );
                                 stderr().flush()?;
 
-                                // Generate stream and split with t_junction
+                                // Generate stream
                                 let stream = fastx_generator(*num_read, *read_size, 35.0, 3.0).map(ParseOutput::Fastq);
-                                let mut gen_count = 0;
-                                let stream = stream.inspect(move |_result| {
-                                    gen_count += 1;
-                                });
-                                let (outputs, done_rx) = match t_junction(
+
+                                let (outputs, router_handle) = fanout_to_channels(
                                     stream,
                                     *stream_num,
-                                    *buffer_size,
-                                    10000,
-                                    if *sleep == 0 { None } else { Some(*sleep) },
-                                    backpressure_pause_ms,
+                                    "test_stream_to_cmd_stress",
+                                    &config,
                                     StreamDataType::IlluminaFastq,
-                                    "test_stream_to_cmd_stress".to_string(),
-                                    None
-
                                 )
-                                    .await {
-                                    Ok(result) => result,
-                                    Err(e) => {
-                                        error!("t_junction failed to start: {}", e);
-                                        run_success = false;
-                                        return Err(anyhow!("t_junction failed: {}", e));
-                                    }
-                                };
-                                info!("t_junction started with {} streams", *stream_num);
-                                stderr().flush()?;
+                                    .await?;
 
                                 let mut tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
                                 let mut outfiles = Vec::new();
@@ -568,10 +545,11 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                                 let results = join_all(tasks).await;
                                 for result in results {
-                                    result??; // Unwrap JoinHandle and inner Result, propagating errors
+                                    result??;
                                 }
 
-                                done_rx.await??; // Propagates any t_junction errors
+                                // Wait for fanout router (replaces done_rx.await??)
+                                drop(router_handle);
 
                                 for outfile in &outfiles {
                                     let mut cmd = String::new();
@@ -636,7 +614,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
                                     run_success
                                 )?;
                                 log.flush()?;
-                                
+
                                 stderr().flush()?;
 
                                 for outfile in outfiles {
@@ -645,7 +623,7 @@ async fn test_stream_to_cmd_stress() -> Result<()> {
 
                                 if !run_success {
                                     return Err(anyhow!(
-                                        "Test failed due to errors in stream_to_cmd or t_junction"
+                                        "Test failed due to errors in stream_to_cmd or fanout_to_channels"
                                     ));
                                 }
                             }
