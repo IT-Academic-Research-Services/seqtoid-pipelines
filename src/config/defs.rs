@@ -261,7 +261,7 @@ impl RunConfig {
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
             (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _) | (HISAT2_TAG, _)
             | (MAKEBLASTDB_TAG, _) | (MMSEQS_TAG, _) => CoreAllocation::Maximal,
-            (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
+            (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) | (SAMTOOLS_TAG, Some("fastq")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
