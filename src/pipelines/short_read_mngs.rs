@@ -663,7 +663,7 @@ async fn bowtie2_filter_files(
     ).await?;
 
     let fastq_temp_dir = choose_temp_dir(
-        config.input_size, // FASTQ size ~ input size
+        config.input_size,
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         2,
@@ -677,41 +677,77 @@ async fn bowtie2_filter_files(
         None
     };
 
-    let mut fields = HashMap::new();
-    fields.insert("-f".to_string(), Some(if paired { "13".to_string() } else { "4".to_string() }));
-
     if paired {
+        let mut fields = HashMap::new();
+        fields.insert("-f".to_string(), Some("13".to_string()));
         fields.insert("-1".to_string(), Some(fq1.to_string_lossy().to_string()));
         fields.insert("-2".to_string(), Some(fq2.as_ref().unwrap().to_string_lossy().to_string()));
         fields.insert("-0".to_string(), Some("/dev/null".to_string()));
         fields.insert("-s".to_string(), Some("/dev/null".to_string()));
+
+        let config_fastq = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Fastq,
+            subcommand_fields: fields,
+        };
+
+        let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
+
+        let (child, stdin_task, err_task) = stream_to_cmd(
+            config.clone(),
+            fastq_input_stream.into_inner(),
+            SAMTOOLS_TAG,
+            args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+            None
+        ).await?;
+
+        cleanup_tasks.push(stdin_task);
+        cleanup_tasks.push(err_task);
+
+        {
+            let mut guard = child.lock().await;
+            guard.wait().await?;
+        }
+
     } else {
-        fields.insert("-o".to_string(), Some(fq1.to_string_lossy().to_string()));
-    }
+        // streaming fastq (no -o flag)
+        let fastq_config = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Fastq,
+            subcommand_fields: HashMap::from([
+                ("-f4".to_string(), None),
+                ("-".to_string(), None),
+                ("-N".to_string(), None),
+            ]),
+        };
 
-    let config_fastq = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: fields,
-    };
+        let fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&fastq_config))?;
 
-    let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
+        let (fastq_child, fastq_task, fastq_err_task) = stream_to_cmd(
+            config.clone(),
+            fastq_input_stream.into_inner(),
+            SAMTOOLS_TAG,
+            fastq_args,
+            StreamDataType::JustBytes,
+            config.args.verbose,
+            None
+        ).await?;
 
-    let (child, stdin_task, err_task) = stream_to_cmd(
-        config.clone(),
-        fastq_input_stream.into_inner(),
-        SAMTOOLS_TAG,
-        args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-        None
-    ).await?;
+        cleanup_tasks.extend([fastq_task, fastq_err_task]);
 
-    cleanup_tasks.push(stdin_task);
-    cleanup_tasks.push(err_task);
+        let fastq_stream = {
+            let mut guard = fastq_child.lock().await;
+            parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fastq, &config).await?
+        };
 
-    {
-        let mut guard = child.lock().await;
-        guard.wait().await?;
+        let write_task = write_byte_stream_to_file(
+            &fq1,
+            ReceiverStream::new(fastq_stream),
+            config.clone(),
+            StreamDataType::JustBytes,
+            "bt2_fastq_se",
+        ).await?;
+        cleanup_tasks.push(write_task);
     }
 
     Ok((
