@@ -21,7 +21,7 @@ use crate::utils::streams::ParseOutput;
 use crate::utils::command::{generate_cli, check_versions};
 use crate::utils::file::{file_path_manipulator, write_parse_output_to_temp_fifo, validate_file_inputs, choose_temp_dir};
 use crate::utils::fastx::{read_fastq, parse_and_filter_fastq_id, concatenate_paired_reads, parse_byte_stream_to_fastq};
-use crate::utils::streams::{t_junction, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
+use crate::utils::streams::{fanout_to_channels, stream_to_cmd, parse_child_output, ChildStream, ParseMode, stream_to_file, spawn_cmd, parse_fastq, parse_bytes, y_junction, join_with_error_handling};
 use crate::config::defs::{PipelineError, StreamDataType, PIGZ_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, SamtoolsSubcommand, KRAKEN2_TAG, BCFTOOLS_TAG, BcftoolsSubcommand, MAFFT_TAG, QUAST_TAG, SEQKIT_TAG, SeqkitSubcommand, PairingMode};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
@@ -104,19 +104,15 @@ async fn validate_input(
     let val_rx_stream = ReceiverStream::new(rx);
 
     // Split the byte stream for output and quast write
-    let (val_streams, _val_done_rx) = t_junction(
+    let (val_streams, val_router_handle) = fanout_to_channels(
         val_rx_stream,
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
-        StreamDataType::IlluminaFastq,  // Semantically FASTQ bytes
-        "validate_input".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+        "validate_input",
+        &config,
+        StreamDataType::IlluminaFastq,
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_tasks.push(val_router_handle);
 
     if val_streams.len() < 2 {
         return Err(PipelineError::EmptyStream);
@@ -337,21 +333,15 @@ async fn align_to_host(
     let samtools_out_stream_fastq = ReceiverStream::new(samtools_out_stream_fastq);
 
     // Split FASTQ byte stream for output, file write, count, and check
-    let (host_streams, host_done_rx) = t_junction(
+    let (host_streams, host_router_handle) = fanout_to_channels(
         samtools_out_stream_fastq,
         4,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "align_to_host",
+        &config,
         StreamDataType::JustBytes,
-        "align_to_host".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_receivers.push(host_done_rx);
+    cleanup_tasks.push(host_router_handle);
 
     // Consume Vec to get Receivers
     let mut streams_iter = host_streams.into_iter();
@@ -477,24 +467,18 @@ async fn process_ercc(
         "_",
     );
 
-    let (ercc_streams, ercc_done_rx) = t_junction(
+    let (ercc_streams, ercc_router_handle) = fanout_to_channels(
         input_stream,
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "process_ercc_bypass",
+        &config,
         StreamDataType::JustBytes,
-        "process_ercc_bypass".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(ercc_router_handle);
 
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    cleanup_receivers.push(ercc_done_rx);
 
     let mut minimap2_options = HashMap::new();
     match config.args.technology {
@@ -554,21 +538,15 @@ async fn process_ercc(
 
 
     // Split SAM stream for check and further processing
-    let (sam_streams, sam_done_rx) = t_junction(
+    let (sam_streams, sam_router_handle) = fanout_to_channels(
         ReceiverStream::new(minimap2_out_stream),
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "process_ercc_empty_check",
+        &config,
         StreamDataType::JustBytes,
-        "process_ercc_empty_check".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(sam_router_handle);
 
-    cleanup_receivers.push(sam_done_rx);
     let mut sam_streams_iter = sam_streams.into_iter();
     let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_view_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -726,21 +704,15 @@ async fn process_ercc(
     };
 
 
-    let (stats_streams, stats_done_rx) = t_junction(
+    let (stats_streams, stats_router_handle) = fanout_to_channels(
         ReceiverStream::new(stats_samtools_out_stream),
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "process_ercc_stats",
+        &config,
         StreamDataType::JustBytes,
-        "process_ercc_stats".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(stats_router_handle);
 
-    cleanup_receivers.push(stats_done_rx);
     let mut stats_streams_iter = stats_streams.into_iter();
     let stats_file_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let stats_parse_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -787,6 +759,7 @@ async fn filter_with_kraken(
     PipelineError,
 > {
     let mut cleanup_tasks = vec![];
+    let mut cleanup_receivers = vec![];
 
     // Parse the byte stream into Fastq records
     let (parse_rx, parse_task) = parse_byte_stream_to_fastq(
@@ -953,21 +926,15 @@ async fn filter_with_kraken(
     let filtered_stream = ReceiverStream::new(forward_rx);
 
     // Split stream for output and compression
-    let (kraken_streams, kraken_done_rx) = t_junction(
+    let (kraken_streams, kraken_router_handle) = fanout_to_channels(
         filtered_stream,
-        2, // Only two streams now
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        2,
+        "filter_reads_output",
+        &config,
         StreamDataType::IlluminaFastq,
-        "filter_reads_output".to_string(),
-        None,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(kraken_router_handle);
 
-    let cleanup_receivers = vec![kraken_done_rx];
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1167,21 +1134,15 @@ async fn align_to_target(
         "_",
     );
 
-    let (sam_streams, sam_done_rx) = t_junction(
+    let (sam_streams, sam_router_handle) = fanout_to_channels(
         samtools_sort_out_stream,
         3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "align_to_target",
+        &config,
         StreamDataType::JustBytes,
-        "align_to_target".to_string(),
-        None
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(sam_router_handle);
 
-    cleanup_receivers.push(sam_done_rx);
     let mut streams_iter = sam_streams.into_iter();
     let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1386,20 +1347,15 @@ async fn generate_consensus(
 
     let samtools_consensus_out_stream = ReceiverStream::new(samtools_consensus_out_stream);
 
-    let (consensus_streams, consensus_done_rx) = t_junction(
+    let (consensus_streams, consensus_router_handle) = fanout_to_channels(
         samtools_consensus_out_stream,
         3,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "generate_consensus",
+        &config,
         StreamDataType::JustBytes,
-        "generate_consensus".to_string(),
-        None,
-    ).await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(consensus_router_handle);
 
-    cleanup_receivers.push(consensus_done_rx);
     let mut streams_iter = consensus_streams.into_iter();
     let consensus_realign_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let consensus_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1535,21 +1491,14 @@ async fn call_variants(
     };
     let bcftools_call_out_stream = ReceiverStream::new(bcftools_call_out_stream);
 
-    let (vcf_streams, vcf_done_rx) = t_junction(
+    let (vcf_streams, vcf_router_handle) = fanout_to_channels(
         bcftools_call_out_stream,
         2,
-        config.base_buffer_size,
-        config.args.stall_threshold,
-        None,
-        config.base_backpressure_pause,
+        "call_variants",
+        &config,
         StreamDataType::JustBytes,
-        "call_variants".to_string(),
-        None
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-
-    cleanup_receivers.push(vcf_done_rx);
+    ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_tasks.push(vcf_router_handle);
 
     let mut streams_iter = vcf_streams.into_iter();
     let vcf_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -2121,20 +2070,15 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             align_bam_path = Some(align_bam_path_inner);
 
             // Split SAM streams for bypass, stats, etc
-            let (align_sam_streams, align_sam_done_rx) = t_junction(
+            let (align_sam_streams, align_sam_router_handle) = fanout_to_channels(
                 sam_output_stream,
                 4,
-                config.base_buffer_size,
-                config.args.stall_threshold,
-                None,
-                config.base_backpressure_pause,
+                "pipeline_aligned_sam_split",
+                &config,
                 StreamDataType::JustBytes,
-                "pipeline_aligned_sam_split".to_string(),
-                None,
-            )
-                .await
-                .map_err(|_| PipelineError::StreamDataDropped)?;
-            cleanup_receivers.push(align_sam_done_rx);
+            ).await.map_err(|_| PipelineError::StreamDataDropped)?;
+            cleanup_tasks.push(align_sam_router_handle);
+
             let mut align_streams_iter = align_sam_streams.into_iter();
             let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
