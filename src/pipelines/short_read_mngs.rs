@@ -802,14 +802,14 @@ async fn hisat2_filter(
 
         // 2. sort -n → BAM
         let bam_path = temp_dir.path().join("hisat2_sorted.bam");
-        let threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
+        let sort_threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
 
         let sort_config = SamtoolsConfig {
             subcommand: SamtoolsSubcommand::Sort,
             subcommand_fields: HashMap::from([
                 ("-n".to_string(), None),
                 ("-o".to_string(), Some(bam_path.to_string_lossy().to_string())),
-                ("-@".to_string(), Some(threads.to_string())),
+                ("-@".to_string(), Some(sort_threads.to_string())),
                 ("-T".to_string(), Some(temp_dir.path().to_string_lossy().to_string())),
             ]),
         };
@@ -928,6 +928,7 @@ async fn hisat2_filter(
 
     // 2. samtools sort -n
     let sort_threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
+
     let sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
@@ -970,12 +971,12 @@ async fn hisat2_filter(
         ).await.map_err(|_| PipelineError::StreamDataDropped)?;
 
         let mut splits = streams.into_iter();
-        let bam_stream = splits.next().ok_or(PipelineError::EmptyStream)?;
+        let bam_write_stream = splits.next().ok_or(PipelineError::EmptyStream)?;
         let fastq_stream = splits.next().ok_or(PipelineError::EmptyStream)?;
 
         let write_task = write_byte_stream_to_file(
             &bam_path,
-            ReceiverStream::new(bam_stream),
+            ReceiverStream::new(bam_write_stream),
             config.clone(),
             StreamDataType::JustBytes,
             "hisat2_bam_write"
@@ -989,12 +990,14 @@ async fn hisat2_filter(
     };
 
     // 4. samtools fastq -f 4 → stdout (streaming)
+    let fastq_threads = config.thread_allocation(SAMTOOLS_TAG, Some("fastq"));
+
     let fastq_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Fastq,
         subcommand_fields: HashMap::from([
             ("-f4".to_string(), None),
             ("-".to_string(), None),
-            ("-@".to_string(), Some("8".to_string())),
+            ("-@".to_string(), Some(fastq_threads.to_string())),
             ("-N".to_string(), None),
         ]),
     };
