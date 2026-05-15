@@ -1997,7 +1997,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_fasta_multiline_and_description() -> Result<()> {
         let config = create_test_run_config();
-        let (mut writer, reader) = duplex(64 * 1024);
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
         let input = b">seq1 first record\nACGT\nTGCA\n>seq2\nNNNN\n";
 
         let write_task = tokio::spawn(async move {
@@ -2008,17 +2008,14 @@ mod tests {
 
         let rx = parse_fasta(reader, &config, StreamDataType::JustBytes).await?;
         let mut stream = ReceiverStream::new(rx);
-        let mut records = Vec::new();
-        while let Some(item) = stream.next().await {
-            records.push(item);
-        }
+        let records: Vec<_> = stream.collect().await;
 
         write_task.await??;
         assert_eq!(records.len(), 2);
 
         match &records[0] {
             ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
-                assert_eq!(id, "seq1");
+                assert_eq!(id, "seq1");              
                 assert_eq!(desc.as_deref(), Some("first record"));
                 assert_eq!(seq.as_ref().as_slice(), b"ACGTTGCA");
             }
