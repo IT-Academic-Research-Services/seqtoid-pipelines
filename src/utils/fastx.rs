@@ -380,26 +380,29 @@ pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     PARSE_HEADER_FN(head, prefix)
 }
 
-/// Scalar path — used on non-AVX-512 hardware.
+/// Scalar path — used on non-AVX-512 hardware. always trims trailing whitespace from ID
 fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
     match memchr3(b' ', b'\t', b'\n', head) {
         Some(pos) => {
             let id_bytes = &head[..pos];
             let desc_bytes = &head[pos + 1..];
+
             let id = String::from_utf8_lossy(id_bytes)
                 .trim_start_matches(prefix)
+                .trim_end()                    // ← THIS WAS MISSING
                 .to_string();
-            let desc = if desc_bytes.is_empty() {
+
+            let desc = if desc_bytes.is_empty() || desc_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
                 None
             } else {
-                Some(String::from_utf8_lossy(desc_bytes).into_owned())
+                Some(String::from_utf8_lossy(desc_bytes).trim_end().to_string())
             };
             (id, desc)
         }
         None => {
-            // id-only header (e.g. ">NC_045512.2" with no description)
             let id = String::from_utf8_lossy(head)
                 .trim_start_matches(prefix)
+                .trim_end()
                 .to_string();
             (id, None)
         }
@@ -411,7 +414,6 @@ fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Option<String>) {
     use std::arch::x86_64::*;
-    use std::arch::x86_64::__m512i;
 
     let len = head.len();
     let space_splat = _mm512_set1_epi8(b' ' as i8);
@@ -423,26 +425,31 @@ unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Optio
         let chunk = _mm512_loadu_si512(head.as_ptr().add(i).cast::<__m512i>());
         let mask: u64 =
             _mm512_cmpeq_epi8_mask(chunk, space_splat) |
-            _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
-            _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+                _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
+                _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+
         if mask != 0 {
             let pos = i + mask.trailing_zeros() as usize;
-            let id_bytes   = &head[..pos];
+            let id_bytes = &head[..pos];
             let desc_bytes = &head[pos + 1..];
+
             let id = String::from_utf8_lossy(id_bytes)
                 .trim_start_matches(prefix)
+                .trim_end()
                 .to_string();
-            let desc = if desc_bytes.is_empty() {
+
+            let desc = if desc_bytes.is_empty() || desc_bytes.iter().all(|&b| b.is_ascii_whitespace()) {
                 None
             } else {
-                Some(String::from_utf8_lossy(desc_bytes).into_owned())
+                Some(String::from_utf8_lossy(desc_bytes).trim_end().to_string())
             };
             return (id, desc);
         }
         i += 64;
     }
-    // Scalar tail for remaining < 64 bytes (also handles id-only headers)
-    parse_header_scalar(&head[i..], prefix).map_id_offset(i, head, prefix)
+
+    // Tail
+    parse_header_scalar(&head[i..], prefix)
 }
 
 // Helper to re-run scalar on tail bytes and merge the offset back.
@@ -2044,9 +2051,9 @@ mod tests {
     #[test]
     fn test_header_empty_desc_after_space() {
         let head = b"contig_00001 ";
-        let (id, desc) = parse_header_scalar(head, '>');
+        let (id, desc) = parse_header_scalar(head, '>');   // use the public dispatcher
         assert_eq!(id, "contig_00001");
-        assert!(desc.is_none(), "trailing space with empty desc should give None");
+        assert!(desc.is_none());
         compare_header(head, '>');
     }
 
@@ -2076,6 +2083,24 @@ mod tests {
         assert_eq!(id, "SRR12345.1.1");
         assert_eq!(desc.as_deref(), Some("SRR12345.1 length=150"));
         compare_header(head, '@');
+    }
+
+    #[test]
+    fn test_fastx_header_edge_cases() {
+        let cases = vec![
+            (">contig_00001   ", "contig_00001", None),
+            ("@SRR12345.1 length=150", "SRR12345.1", Some("length=150")),
+            (">seq", "seq", None),
+            (">seq desc with spaces", "seq", Some("desc with spaces")),
+            ("@read/1 1:N:0:1", "read/1", Some("1:N:0:1")),
+            (">NC_045512.2", "NC_045512.2", None),
+        ];
+
+        for (header, expected_id, expected_desc) in cases {
+            let (id, desc) = parse_header(header.as_bytes(), header.chars().next().unwrap());
+            assert_eq!(id, expected_id, "Failed on: {}", header);
+            assert_eq!(desc.as_deref(), expected_desc, "Desc mismatch on: {}", header);
+        }
     }
 
     #[test]

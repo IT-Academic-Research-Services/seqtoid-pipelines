@@ -1,92 +1,145 @@
 /// Functions and structs for working with creating command-line arguments
+use std::path::PathBuf;
+use std::sync::LazyLock;
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use log::{self, debug, info, warn};
 use tokio::process::Command;
 use futures::future::try_join_all;
-use crate::config::defs::{RunConfig, TOOL_VERSIONS, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG, MMSEQS_TAG};
-use crate::utils::streams::{read_child_output_to_vec, ChildStream};
-use std::path::PathBuf;
 use tokio::fs;
+use regex::Regex;
+
 use crate::utils::streams::spawn_cmd;
+use crate::config::defs::{RunConfig, FASTP_TAG, PIGZ_TAG, H5DUMP_TAG, MINIMAP2_TAG, SAMTOOLS_TAG, KRAKEN2_TAG, BCFTOOLS_TAG, IVAR_TAG, MUSCLE_TAG, MAFFT_TAG, QUAST_TAG, NUCMER_TAG, SHOW_COORDS_TAG, SEQKIT_TAG, BOWTIE2_TAG, HISAT2_TAG, KALLISTO_TAG, STAR_TAG, CZID_DEDUP_TAG, DIAMOND_TAG, SPADES_TAG, BLASTN_TAG, BLASTX_TAG, MAKEBLASTDB_TAG, SORT_TAG, MMSEQS_TAG};
+use crate::utils::streams::{read_child_output_to_vec, ChildStream};
 
 
 pub trait ArgGenerator {
     fn generate_args(&self, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>>;
 }
 
-/// Checks the version of a CLI external tool.
-/// NB: ONLY keeps tracks of major plus minor, i.e. 2.1, 4.3, not a point release like 3.4.5
-/// Strips all non digit parts of the version.
-/// # Arguments
-///
-/// * `command_tag` - Executable name of tool.
-/// * `version_args` - CLI args necessary to get tool to output version.
-/// * `version_line` - Which output line contains the version.
-/// * `version_column` - Which output column contains the version.
-/// * `child_stream` - Is the verion on stdout or stderr.
-///
-/// # Returns
-/// Result<f32>major/minor version number
-pub async fn version_check(
-    command_tag: &str,
-    version_args: Vec<&str>,
-    version_line: usize,
-    version_column: usize,
-    child_stream: ChildStream,
-    version_file: Option<PathBuf>,
-    config: &RunConfig
-) -> Result<f32> {
-    let cmd_tag_owned = command_tag.to_string();
-    debug!("Running command: {}", &cmd_tag_owned);
-    let args: Vec<&str> = version_args;
+#[derive(Debug, Clone)]
+pub struct VersionSpec {
+    pub min: f32,
+    pub extractor: fn(&str) -> Result<f32>,
+}
 
-    let mut child = Command::new(&cmd_tag_owned)
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
+static TOOL_VERSION_SPECS: LazyLock<HashMap<&'static str, VersionSpec>> = LazyLock::new(|| {
+    let mut m = HashMap::new();
+
+    let default_parser: fn(&str) -> Result<f32> = parse_semver;
+
+    m.insert(SAMTOOLS_TAG,    VersionSpec { min: 1.19, extractor: default_parser });
+    m.insert(BCFTOOLS_TAG,    VersionSpec { min: 1.19, extractor: default_parser });
+    m.insert(MINIMAP2_TAG,    VersionSpec { min: 2.24, extractor: default_parser });
+    m.insert(KRAKEN2_TAG,     VersionSpec { min: 2.1,  extractor: default_parser });
+    m.insert(PIGZ_TAG,        VersionSpec { min: 2.8,  extractor: default_parser });
+    m.insert(FASTP_TAG,       VersionSpec { min: 1.0,  extractor: default_parser });
+    m.insert(MAFFT_TAG,       VersionSpec { min: 7.5,  extractor: default_parser });
+    m.insert(QUAST_TAG,       VersionSpec { min: 5.20, extractor: default_parser });
+    m.insert(SEQKIT_TAG,      VersionSpec { min: 2.10, extractor: default_parser });
+    m.insert(BOWTIE2_TAG,     VersionSpec { min: 2.50, extractor: default_parser });
+    m.insert(KALLISTO_TAG,    VersionSpec { min: 0.5,  extractor: default_parser });
+    m.insert(HISAT2_TAG,      VersionSpec { min: 2.20, extractor: parse_hisat2_version });
+    m.insert(STAR_TAG,        VersionSpec { min: 2.7,  extractor: default_parser });
+    m.insert(CZID_DEDUP_TAG,  VersionSpec { min: 0.1,  extractor: default_parser });
+    m.insert(DIAMOND_TAG,     VersionSpec { min: 2.1,  extractor: parse_diamond_version });
+    m.insert(SPADES_TAG,      VersionSpec { min: 4.2,  extractor: default_parser });
+    m.insert(BLASTN_TAG,      VersionSpec { min: 2.12, extractor: default_parser });
+    m.insert(BLASTX_TAG,      VersionSpec { min: 2.12, extractor: default_parser });
+    m.insert(MAKEBLASTDB_TAG, VersionSpec { min: 2.12, extractor: default_parser });
+    m.insert(MMSEQS_TAG,      VersionSpec { min: 0.0,  extractor: parse_mmseqs_version }); // 0.0 = no enforcement
+
+    // Tools not in your original map (add if you want checks)
+    m.insert(IVAR_TAG,        VersionSpec { min: 1.4,  extractor: default_parser });
+    m.insert(MUSCLE_TAG,      VersionSpec { min: 5.1,  extractor: default_parser });
+    m.insert(NUCMER_TAG,      VersionSpec { min: 4.0,  extractor: default_parser });
+    m.insert(SORT_TAG,        VersionSpec { min: 2.3,  extractor: default_parser });
+    m.insert(H5DUMP_TAG,      VersionSpec { min: 1.8,  extractor: default_parser });
+
+    m
+});
+
+pub async fn check_tool_version(
+    tool: &str,
+    version_args: Vec<&str>,
+    stream: ChildStream,
+    config: &RunConfig,
+) -> Result<f32> {
+    let spec = TOOL_VERSION_SPECS.get(tool)
+        .ok_or_else(|| anyhow!("No version spec for tool: {}", tool))?;
+
+    let mut child = Command::new(tool)
+        .args(&version_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow!("Failed to spawn {}. Is it installed? Error: {}.", cmd_tag_owned.clone(), e))?;
+        .spawn()?;
 
-    let lines = read_child_output_to_vec(&mut child, child_stream, &config).await?;
+    let mut lines = read_child_output_to_vec(&mut child, stream, config).await?;
 
-    if let Some(file_path) = version_file {
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).await
-                .map_err(|e| anyhow!("Failed to create directory for version file: {}", e))?;
-        }
-        let full_output = lines.join("\n");
-        fs::write(&file_path, full_output.as_bytes()).await
-            .map_err(|e| anyhow!("Failed to write version file {:?}: {}", file_path, e))?;
-        info!("Wrote version output to {:?}", file_path);
+    // Also try stderr if stdout gave nothing (common on macOS)
+    if lines.is_empty() || !lines.iter().any(|l| l.contains("version") || l.contains("Version")) {
+        let mut child2 = Command::new(tool).args(&version_args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()?;
+        let err_lines = read_child_output_to_vec(&mut child2, ChildStream::Stderr, config).await?;
+        lines.extend(err_lines);
     }
 
-    let line_w_version = lines
-        .get(version_line)
-        .ok_or_else(|| anyhow!("No line {} in {} version output", version_line, cmd_tag_owned.clone()))?;
+    let full_output = lines.join("\n");
+    debug!("{} version output:\n{}", tool, full_output);
 
-    let version_string = line_w_version
-        .split_whitespace()
-        .nth(version_column)
-        .ok_or_else(|| anyhow!("Invalid {} version output: {}", cmd_tag_owned.clone(), line_w_version))?;
+    let version = (spec.extractor)(&full_output)?;
 
-    if version_string.is_empty() {
-        return Err(anyhow!("Empty version number string in {} version output: {}", cmd_tag_owned.clone(), line_w_version));
+    if version < spec.min {
+        return Err(anyhow!(
+            "{} version {} < required >= {} (update your installation)",
+            tool, version, spec.min
+        ));
     }
 
-    let version_parts: Vec<_> = version_string.split(".").collect();
-    let major_version = version_parts[0];
-    let major_version_digits: String = major_version.chars().filter(|c| c.is_digit(10)).collect();
-    let mut minor_version = "0";
-    if version_parts.len() > 1 {
-        minor_version = version_parts[1];
-    }
-    let minor_version_digits: String = minor_version.chars().filter(|c| c.is_digit(10)).collect();
-    let version_string_formatted = format!("{}.{}", major_version_digits, minor_version_digits);
-    let version = version_string_formatted.parse::<f32>()?;
+    info!("{} version {} OK (>= {})", tool, version, spec.min);
     Ok(version)
 }
+
+
+fn parse_semver(output: &str) -> Result<f32> {
+    let re = Regex::new(r"(\d+\.\d+)(?:\.\d+)?").unwrap();
+
+    let caps = re.captures(output)
+        .ok_or_else(|| anyhow!("No version number found in:\n{}", output))?;
+
+    let version_str = caps.get(1).unwrap().as_str();   // only major.minor
+
+    version_str.parse::<f32>()
+        .map_err(|e| anyhow!("Failed to parse version '{}' as f32: {}", version_str, e))
+}
+
+fn parse_hisat2_version(output: &str) -> Result<f32> {
+    let re = Regex::new(r"(?i)version\s+(\d+\.\d+)(?:\.\d+)?").unwrap();
+    if let Some(c) = re.captures(output) {
+        let v = c.get(1).unwrap().as_str();
+        return v.parse::<f32>()
+            .map_err(|e| anyhow!("Failed to parse HISAT2 version '{}': {}", v, e));
+    }
+    parse_semver(output)  // fallback
+}
+
+fn parse_diamond_version(output: &str) -> Result<f32> {
+    let re = Regex::new(r"v?(\d+\.\d+)(?:\.\d+)?").unwrap();
+    let caps = re.captures(output)
+        .ok_or_else(|| anyhow!("No version in Diamond output"))?;
+    let v = caps.get(1).unwrap().as_str();
+    v.parse::<f32>().map_err(|e| anyhow!("Failed to parse Diamond version: {}", e))
+}
+
+fn parse_mmseqs_version(output: &str) -> Result<f32> {
+    let re = Regex::new(r"(\d+\.\d+)(?:\.\d+)?").unwrap();
+    let caps = re.captures(output)
+        .ok_or_else(|| anyhow!("No version in MMseqs output"))?;
+    let v = caps.get(1).unwrap().as_str();
+    v.parse::<f32>().map_err(|e| anyhow!("Failed to parse MMseqs version: {}", e))
+}
+
 
 /// Prepends `numactl --interleave=all` for large multi-socket Linux machines (EPYC).
 /// Does nothing on MacBooks, small machines, or non-Linux.
@@ -126,7 +179,7 @@ pub mod fastp {
     use log::{self, debug};
     use crate::config::defs::{FASTP_TAG,  RunConfig};
     use crate::utils::streams::{ChildStream};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
     #[derive(Debug)]
@@ -137,8 +190,7 @@ pub mod fastp {
     pub struct FastpArgGenerator;
 
     pub async fn fastp_presence_check(config: &RunConfig) -> Result<f32> {
-        let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(FASTP_TAG, vec!["-v"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for FastpArgGenerator {
@@ -194,15 +246,14 @@ pub mod fastp {
 
 mod pigz {
     use crate::config::defs::{PIGZ_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct PigzArgGenerator;
 
     #[allow(dead_code)]
     pub async fn pigz_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(PIGZ_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for PigzArgGenerator {
@@ -218,12 +269,11 @@ mod pigz {
 
 mod h5dump {
     use crate::config::defs::{H5DUMP_TAG, RunConfig};
-    use crate::utils::command::version_check;
+    use crate::utils::command::check_tool_version;
     use crate::utils::streams::ChildStream;
 
     pub async fn h5dump_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(H5DUMP_TAG, vec!["-V"], ChildStream::Stdout, config).await
     }
 }
 
@@ -238,7 +288,7 @@ pub mod minimap2 {
     use anyhow::{anyhow, Result};
     use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG, FASTA_EXTS};
     use crate::utils::file::available_space_for_path;
-    use crate::utils::command::{ArgGenerator, version_check, spawn_cmd};
+    use crate::utils::command::{ArgGenerator, check_tool_version, spawn_cmd};
     use crate::utils::streams::ChildStream;
 
     pub struct Minimap2Config {
@@ -252,8 +302,7 @@ pub mod minimap2 {
     pub struct Minimap2ArgGenerator;
 
     pub async fn minimap2_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
-        let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file, &config).await?;
-        Ok(version)
+        check_tool_version(MINIMAP2_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     pub async fn minimap2_index_prep(
@@ -530,7 +579,7 @@ pub mod samtools {
     use anyhow::anyhow;
     use crate::config::defs::{SAMTOOLS_TAG, SamtoolsSubcommand, RunConfig};
     use crate::utils::streams::ChildStream;
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
 
     #[derive(Debug)]
     pub struct SamtoolsConfig {
@@ -541,8 +590,7 @@ pub mod samtools {
     pub struct SamtoolsArgGenerator;
 
     pub async fn samtools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(SAMTOOLS_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for SamtoolsArgGenerator {
@@ -630,7 +678,7 @@ pub mod bcftools {
     use std::collections::HashMap;
     use anyhow::anyhow;
     use crate::config::defs::{BcftoolsSubcommand, BCFTOOLS_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -642,8 +690,7 @@ pub mod bcftools {
     pub struct BcftoolsArgGenerator;
 
     pub async fn bcftools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(BCFTOOLS_TAG, vec!["-v"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for BcftoolsArgGenerator {
@@ -699,7 +746,7 @@ pub mod kraken2 {
     use std::path::PathBuf;
     use crate::config::defs::{KRAKEN2_TAG, RunConfig};
     use crate::utils::streams::ChildStream;
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::file::file_path_manipulator;
 
     #[derive(Debug)]
@@ -712,8 +759,7 @@ pub mod kraken2 {
     pub struct Kraken2ArgGenerator;
 
     pub async fn kraken2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(KRAKEN2_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for Kraken2ArgGenerator {
@@ -762,7 +808,7 @@ pub mod ivar {
     use anyhow::anyhow;
     use crate::config::defs::RunConfig;
     use crate::config::defs::{IVAR_TAG, IvarSubcommand, IVAR_QUAL_THRESHOLD, IVAR_FREQ_THRESHOLD};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -774,8 +820,7 @@ pub mod ivar {
     pub struct IvarArgGenerator;
 
     pub async fn ivar_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(IVAR_TAG, vec!["version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for IvarArgGenerator {
@@ -813,25 +858,23 @@ pub mod ivar {
 
 pub mod muscle {
     use crate::config::defs::{RunConfig,  MUSCLE_TAG};
-    use crate::utils::command::version_check;
+    use crate::utils::command::check_tool_version;
     use crate::utils::streams::ChildStream;
 
     pub struct MuscleArgGenerator;
     pub async fn muscle_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(MUSCLE_TAG, vec!["-version"], ChildStream::Stdout, config).await
     }
 }
 
 pub mod mafft {
     use crate::config::defs::{MAFFT_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct MafftArgGenerator;
     pub async fn mafft_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None, &config).await?;
-        Ok(version)
+        check_tool_version(MAFFT_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for MafftArgGenerator {
@@ -852,7 +895,7 @@ pub mod mafft {
 pub mod quast {
     use anyhow::anyhow;
     use crate::config::defs::{QUAST_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct QuastArgGenerator;
@@ -864,8 +907,7 @@ pub mod quast {
     }
 
     pub async fn quast_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(QUAST_TAG, vec!["-v"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for QuastArgGenerator {
@@ -900,7 +942,7 @@ pub mod nucmer {
     use anyhow::anyhow;
     use std::path::PathBuf;
     use crate::config::defs::{NUCMER_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct NucmerArgGenerator;
@@ -911,8 +953,7 @@ pub mod nucmer {
     }
 
     pub async fn nucmer_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(NUCMER_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for NucmerArgGenerator {
@@ -959,7 +1000,7 @@ pub mod seqkit {
     use anyhow::anyhow;
     use crate::config::defs::RunConfig;
     use crate::config::defs::{SeqkitSubcommand, SEQKIT_TAG};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -971,8 +1012,7 @@ pub mod seqkit {
     pub struct SeqkitArgGenerator;
 
     pub async fn seqkit_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(SEQKIT_TAG, vec!["--help"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for SeqkitArgGenerator {
@@ -1019,7 +1059,7 @@ pub mod bowtie2 {
     use std::process::Command;
     use log::{self,debug};
     use crate::config::defs::{RunConfig, BOWTIE2_TAG};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct Bowtie2Config {
@@ -1033,8 +1073,7 @@ pub mod bowtie2 {
     pub struct Bowtie2ArgGenerator;
 
     pub async fn bowtie2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(BOWTIE2_TAG, vec!["-h"], ChildStream::Stdout, config).await
     }
 
     /// Prepares the Bowtie2 index by handling directory, tar, or tar.gz inputs.
@@ -1225,7 +1264,7 @@ pub mod hisat2 {
     use std::fs::{self, DirEntry};
     use std::process::Command;
     use crate::config::defs::{RunConfig, HISAT2_TAG};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -1239,8 +1278,7 @@ pub mod hisat2 {
     pub struct Hisat2ArgGenerator;
 
     pub async fn hisat2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(HISAT2_TAG, vec!["--version"], 0, 2, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(HISAT2_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     /// Prepares the HISAT2 index by handling directory, tar, or tar.gz inputs.
@@ -1406,7 +1444,7 @@ pub mod kallisto {
     use std::path::PathBuf;
     use anyhow::anyhow;
     use crate::config::defs::{RunConfig, KALLISTO_TAG, KallistoSubcommand};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct KallistoConfig {
@@ -1419,8 +1457,7 @@ pub mod kallisto {
     pub struct KallistoArgGenerator;
 
     pub async fn kallisto_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(KALLISTO_TAG, vec!["version"], 0, 2, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(KALLISTO_TAG, vec!["version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for KallistoArgGenerator {
@@ -1487,7 +1524,7 @@ pub mod star {
     use std::fs::{self, DirEntry};
     use std::process::Command;
     use crate::config::defs::{RunConfig, STAR_TAG};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     pub struct StarConfig {
@@ -1500,8 +1537,7 @@ pub mod star {
     pub struct StarArgGenerator;
 
     pub async fn star_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
-        let version = version_check(STAR_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(STAR_TAG, vec!["--version"], ChildStream::Stdout, config).await
     }
 
     /// Prepares the STAR index by handling directory, tar, or tar.gz inputs.
@@ -1649,7 +1685,7 @@ pub mod czid_dedup {
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use crate::config::defs::{RunConfig, CZID_DEDUP_TAG};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -1664,8 +1700,7 @@ pub mod czid_dedup {
     pub struct CzidDedupArgGenerator;
 
     pub async fn czid_dedup_presence_check(config: &RunConfig)-> Result<f32> {
-        let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(CZID_DEDUP_TAG, vec!["--help"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for CzidDedupArgGenerator {
@@ -1725,7 +1760,7 @@ pub mod diamond {
     use crate::utils::file::{available_space_for_path};
     use crate::utils::system::detect_ram;
     use crate::utils::streams::{ChildStream};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
 
     #[derive(Debug)]
     pub struct DiamondConfig {
@@ -1739,8 +1774,7 @@ pub mod diamond {
     pub struct DiamondArgGenerator;
 
     pub async fn diamond_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> anyhow::Result<f32> {
-        let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file, &config).await?;
-        Ok(version)
+        check_tool_version(DIAMOND_TAG, vec!["help"], ChildStream::Stdout, config).await
     }
 
     pub async fn diamond_index_prep(
@@ -1925,7 +1959,7 @@ pub mod spades {
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use crate::config::defs::{SPADES_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use log::{info};
 
@@ -1939,8 +1973,7 @@ pub mod spades {
     pub struct SpadesArgGenerator;
 
     pub async fn spades_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
-        let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file, &config).await?;
-        Ok(version)
+        check_tool_version(SPADES_TAG, vec!["-v"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for SpadesArgGenerator {
@@ -2007,7 +2040,7 @@ pub mod makeblastdb {
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use crate::config::defs::{MAKEBLASTDB_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -2021,8 +2054,7 @@ pub mod makeblastdb {
     pub struct MakeblastdbArgGenerator;
 
     pub async fn makeblastdb_presence_check(config: &RunConfig)-> Result<f32> {
-        let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(MAKEBLASTDB_TAG, vec!["-version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for MakeblastdbArgGenerator {
@@ -2059,7 +2091,7 @@ pub mod blastn {
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use crate::config::defs::{BLASTN_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -2075,8 +2107,7 @@ pub mod blastn {
     pub struct BlastnArgGenerator;
 
     pub async fn blastn_presence_check(config: &RunConfig)-> Result<f32> {
-        let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(BLASTN_TAG, vec!["-version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for BlastnArgGenerator {
@@ -2126,7 +2157,7 @@ pub mod blastx {
     use std::path::PathBuf;
     use anyhow::{anyhow, Result};
     use crate::config::defs::{BLASTX_TAG, RunConfig};
-    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::command::{check_tool_version, ArgGenerator};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -2142,8 +2173,7 @@ pub mod blastx {
     pub struct BlastxArgGenerator;
 
     pub async fn blastx_presence_check(config: &RunConfig)-> Result<f32> {
-        let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version(BLASTX_TAG, vec!["-version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for BlastxArgGenerator {
@@ -2193,7 +2223,7 @@ pub mod sort {
     use std::collections::HashMap;
     use anyhow::{anyhow, Result};
     use crate::config::defs::RunConfig;
-    use crate::utils::command::{ArgGenerator, version_check};
+    use crate::utils::command::{ArgGenerator, check_tool_version};
     use crate::utils::streams::ChildStream;
 
     #[derive(Debug)]
@@ -2212,8 +2242,7 @@ pub mod sort {
     pub async fn sort_presence_check(config: &RunConfig)-> Result<f32> {
         // GNU sort doesn't have a clean --version that always works the same way,
         // but "sort --version" is reliable on all modern coreutils.
-        let version = version_check("sort", vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
-        Ok(version)
+        check_tool_version("sort", vec!["--version"], ChildStream::Stdout, config).await
     }
 
     impl ArgGenerator for SortArgGenerator {
@@ -3008,79 +3037,44 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
     generator.generate_args(run_config, extra)
 }
 
-pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunConfig) -> Result<()> {
-    let assembly_dir = out_dir.join("assembly");
-    fs::create_dir_all(&assembly_dir).await
-        .map_err(|e| anyhow!("Failed to create assembly directory: {}", e))?;
-
-    let out_dir_cloned = out_dir.clone();
-    let assembly_dir_cloned = assembly_dir.clone();
-
-    let checks = tools.into_iter().map(move |tool| {
-        let out_dir = out_dir_cloned.clone();
-        let assembly_dir = assembly_dir_cloned.clone();
-
+/// Unified version checking using the new robust system
+pub async fn check_versions(tools: Vec<&str>, _out_dir: &PathBuf, config: &RunConfig) -> Result<()> {
+    let checks = tools.into_iter().map(|tool| {
         async move {
-            let version_file = match tool {
-                SPADES_TAG => Some(assembly_dir.join("assembly_version.txt")),
-                MINIMAP2_TAG => Some(out_dir.join("minimap2_version.txt")),
-                DIAMOND_TAG => Some(out_dir.join("diamond_version.txt")),
-                _ => None,
-            };
-
-            let version = match tool {
-                FASTP_TAG => fastp::fastp_presence_check(&config).await,
-                H5DUMP_TAG => h5dump::h5dump_presence_check(&config).await,
-                MINIMAP2_TAG => minimap2::minimap2_presence_check(&config, version_file).await,
-                SAMTOOLS_TAG => samtools::samtools_presence_check(&config).await,
-                KRAKEN2_TAG => kraken2::kraken2_presence_check(&config).await,
-                BCFTOOLS_TAG => bcftools::bcftools_presence_check(&config).await,
-                IVAR_TAG => ivar::ivar_presence_check(&config).await,
-                MUSCLE_TAG => muscle::muscle_presence_check(&config).await,
-                MAFFT_TAG => mafft::mafft_presence_check(&config).await,
-                QUAST_TAG => quast::quast_presence_check(&config).await,
-                NUCMER_TAG => nucmer::nucmer_presence_check(&config).await,
-                SEQKIT_TAG => seqkit::seqkit_presence_check(&config).await,
-                BOWTIE2_TAG => bowtie2::bowtie2_presence_check(&config).await,
-                HISAT2_TAG => hisat2::hisat2_presence_check(&config).await,
-                KALLISTO_TAG => kallisto::kallisto_presence_check(&config).await,
-                STAR_TAG => star::star_presence_check(&config).await,
-                CZID_DEDUP_TAG => czid_dedup::czid_dedup_presence_check(&config).await,
-                DIAMOND_TAG => diamond::diamond_presence_check(&config, version_file).await,
-                SPADES_TAG => spades::spades_presence_check(&config, version_file).await,
-                BLASTN_TAG => blastn::blastn_presence_check(&config).await,
-                BLASTX_TAG => blastx::blastx_presence_check(&config).await,
-                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check(&config).await,
-                SORT_TAG => sort::sort_presence_check(&config).await,
-                MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
-                _ => return Err(anyhow!("Unknown tool: {}", tool)),
-            }?;
-            Ok((tool.to_string(), version))
+            // Each module's presence_check already knows the right flags/stream
+            // and delegates to check_tool_version()
+            match tool {
+                FASTP_TAG       => fastp::fastp_presence_check(config).await,
+                PIGZ_TAG        => pigz::pigz_presence_check(config).await,
+                H5DUMP_TAG      => h5dump::h5dump_presence_check(config).await,
+                MINIMAP2_TAG    => minimap2::minimap2_presence_check(config, None).await,
+                SAMTOOLS_TAG    => samtools::samtools_presence_check(config).await,
+                KRAKEN2_TAG     => kraken2::kraken2_presence_check(config).await,
+                BCFTOOLS_TAG    => bcftools::bcftools_presence_check(config).await,
+                IVAR_TAG        => ivar::ivar_presence_check(config).await,
+                MUSCLE_TAG      => muscle::muscle_presence_check(config).await,
+                MAFFT_TAG       => mafft::mafft_presence_check(config).await,
+                QUAST_TAG       => quast::quast_presence_check(config).await,
+                NUCMER_TAG      => nucmer::nucmer_presence_check(config).await,
+                SEQKIT_TAG      => seqkit::seqkit_presence_check(config).await,
+                BOWTIE2_TAG     => bowtie2::bowtie2_presence_check(config).await,
+                HISAT2_TAG      => hisat2::hisat2_presence_check(config).await,
+                KALLISTO_TAG    => kallisto::kallisto_presence_check(config).await,
+                STAR_TAG        => star::star_presence_check(config).await,
+                CZID_DEDUP_TAG  => czid_dedup::czid_dedup_presence_check(config).await,
+                DIAMOND_TAG     => diamond::diamond_presence_check(config, None).await,
+                SPADES_TAG      => spades::spades_presence_check(config, None).await,
+                BLASTN_TAG      => blastn::blastn_presence_check(config).await,
+                BLASTX_TAG      => blastx::blastx_presence_check(config).await,
+                MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check(config).await,
+                SORT_TAG        => sort::sort_presence_check(config).await,
+                MMSEQS_TAG      => mmseqs::mmseqs_presence_check(config).await,
+                _ => return Err(anyhow!("Unknown tool in version check: {}", tool)),
+            }
         }
     });
 
-    let results = try_join_all(checks).await?;
-    let mut failed_tools = Vec::new();
-
-    for (tool, version) in &results {
-        if let Some(&min_version) = TOOL_VERSIONS.get(tool.as_str()) {
-            if *version < min_version {
-                failed_tools.push(format!(
-                    "{} (version found: {}, required: >= {})",
-                    tool, version, min_version
-                ));
-            }
-        } else {
-            warn!("Warning: No minimum version specified for tool: {}", tool);
-        }
-    }
-
-    if !failed_tools.is_empty() {
-        return Err(anyhow!(
-            "The following tools have versions below the minimum required: {}",
-            failed_tools.join(", ")
-        ));
-    }
-
+    try_join_all(checks).await?;
+    info!("✅ All external tool version checks passed.");
     Ok(())
 }
