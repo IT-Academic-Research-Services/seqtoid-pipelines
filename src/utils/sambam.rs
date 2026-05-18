@@ -5,6 +5,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
+use log::{self, debug, info, error, warn};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
@@ -234,9 +235,23 @@ pub async fn compute_insert_size_stats_from_bam(
     bam_path: PathBuf,
     max_records_to_check: Option<usize>,
 ) -> Result<InsertSizeStats> {
-    let file = File::open(&bam_path)
-        .await
-        .map_err(|e| anyhow!("Failed to open BAM file {}: {}", bam_path.display(), e))?;
+
+    // Early exit for tiny/empty BAMs
+    if let Ok(meta) = tokio::fs::metadata(&bam_path).await {
+        if meta.len() < 8192 {
+            info!("Host BAM {} is very small ({} bytes) — using dummy insert stats (no proper pairs expected).",
+                  bam_path.display(), meta.len());
+            return Ok(dummy_insert_stats());
+        }
+    }
+
+    let file = match File::open(&bam_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Could not open host BAM {}: {}", bam_path.display(), e);
+            return Ok(dummy_insert_stats());
+        }
+    };
 
     let mut bam_reader = bam::r#async::io::Reader::new(file);
 
@@ -250,76 +265,64 @@ pub async fn compute_insert_size_stats_from_bam(
     let mut record = Record::default();
 
     loop {
-        let bytes_read = bam_reader.read_record(&mut record).await?;
+        match bam_reader.read_record(&mut record).await {
+            Ok(0) => break,
+            Ok(_) => {
+                processed += 1;
+                if let Some(max) = max_records_to_check {
+                    if processed > max { break; }
+                }
 
-        if bytes_read == 0 {
-            // End of file
-            break;
-        }
+                let flags = record.flags();
+                if flags.is_unmapped()
+                    || flags.is_secondary()
+                    || flags.is_supplementary()
+                    || !flags.is_properly_segmented()
+                    || record.mate_reference_sequence_id().is_none()
+                    || record.template_length() == 0
+                {
+                    continue;
+                }
 
-        processed += 1;
-        if let Some(max) = max_records_to_check {
-            if processed > max {
+                if !flags.is_first_segment() || !flags.is_reverse_complemented() {
+                    continue;
+                }
+
+                let insert_size = record.template_length().abs() as u32;
+                if insert_size < MIN_REASONABLE_INSERT || insert_size > MAX_REASONABLE_INSERT {
+                    continue;
+                }
+
+                {
+                    let mut hist = histogram.lock().unwrap();
+                    *hist.entry(insert_size).or_insert(0) += 1;
+                }
+                total_proper_pairs += 1;
+            }
+            Err(e) => {
+                warn!("BAM read error during insert stats (continuing with partial data): {}", e);
                 break;
             }
         }
-
-        let flags = record.flags();
-
-        // Skip records that cannot contribute valid insert sizes
-        if flags.is_unmapped()
-            || flags.is_secondary()
-            || flags.is_supplementary()
-            || !flags.is_properly_segmented()
-            || record.mate_reference_sequence_id().is_none()
-            || record.template_length() == 0
-        {
-            continue;
-        }
-
-        // Only count first segment (R1) that is forward, with mate reverse
-        // This avoids double-counting and matches common Picard-style logic
-        if !flags.is_first_segment() || !flags.is_reverse_complemented() {
-            continue;
-        }
-
-        let insert_size = record.template_length().abs() as u32;
-
-        if insert_size < MIN_REASONABLE_INSERT || insert_size > MAX_REASONABLE_INSERT {
-            continue;
-        }
-
-        // Increment histogram (thread-safe)
-        {
-            let mut hist = histogram.lock().unwrap();
-            *hist.entry(insert_size).or_insert(0) += 1;
-        }
-
-        total_proper_pairs += 1;
     }
 
-    // Build sorted vec of (size, count)
+    if total_proper_pairs == 0 {
+        info!("No proper pairs found in host BAM (expected on small subsamples with heavy host filtering). Using dummy insert stats.");
+        return Ok(dummy_insert_stats());
+    }
+
     let mut insert_sizes: Vec<(u32, u64)> = {
         let hist = histogram.lock().unwrap();
         hist.iter().map(|(&size, &count)| (size, count)).collect()
     };
-
     insert_sizes.sort_by_key(|&(size, _)| size);
 
-    // Compute statistics
     let total_weight: u64 = insert_sizes.iter().map(|&(_, c)| c).sum();
 
     let mean = if total_weight > 0 {
-        insert_sizes
-            .iter()
-            .map(|&(s, c)| s as f64 * c as f64)
-            .sum::<f64>()
-            / total_weight as f64
-    } else {
-        0.0
-    };
+        insert_sizes.iter().map(|&(s, c)| s as f64 * c as f64).sum::<f64>() / total_weight as f64
+    } else { 0.0 };
 
-    // Median (middle value — handles both even and odd counts reasonably)
     let mut cumulative = 0u64;
     let mut median = 0.0;
     for &(size, count) in &insert_sizes {
@@ -331,17 +334,11 @@ pub async fn compute_insert_size_stats_from_bam(
     }
 
     let variance = if total_weight > 0 {
-        insert_sizes
-            .iter()
-            .map(|&(s, c)| {
-                let dev = s as f64 - mean;
-                dev * dev * c as f64
-            })
-            .sum::<f64>()
-            / total_weight as f64
-    } else {
-        0.0
-    };
+        insert_sizes.iter().map(|&(s, c)| {
+            let dev = s as f64 - mean;
+            dev * dev * c as f64
+        }).sum::<f64>() / total_weight as f64
+    } else { 0.0 };
 
     let stddev = variance.sqrt();
 
@@ -353,6 +350,17 @@ pub async fn compute_insert_size_stats_from_bam(
         stddev,
         mapped_proper_pairs: total_proper_pairs,
     })
+}
+
+fn dummy_insert_stats() -> InsertSizeStats {
+    InsertSizeStats {
+        insert_sizes: vec![],
+        total_proper_pairs: 0,
+        mean: 0.0,
+        median: 0.0,
+        stddev: 0.0,
+        mapped_proper_pairs: 0,
+    }
 }
 
 #[cfg(test)]
