@@ -8310,41 +8310,49 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
 
-    // Temporary: Skip Diamond by providing empty outputs
-    // let (dummy_tx, dummy_rx) = mpsc::channel::<ParseOutput>(1);
-    // drop(dummy_tx); // Immediately drop sender to create an empty stream
-    // let non_host_diamond_m8_stream = dummy_rx;
-    // let mut non_host_diamond_cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    // let mut non_host_diamond_cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    // === TEMPORARY DUMMY FOR DEBUGGING — comment back in when stable ===
+    let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_temp_dirs) = {
+        // Create an immediately closed empty stream so downstream code doesn't hang
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);   // close it immediately → downstream sees end-of-stream
+
+        (
+            ReceiverStream::new(rx),
+            vec![],
+            vec![],
+            vec![],
+        )
+    };
+    // =============================================================
 
 
     // Diamond or MMseqs2 non_host alignment
-    let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_temp_dirs) =
-        match config.alignment_backend {
-            NRAlignmentBackend::Diamond => {
-                diamond_non_host_align(
-                    config.clone(),
-                    non_host_r1_path.clone(),
-                    non_host_r2_path_opt.clone(),
-                ).await?
-            }
-            NRAlignmentBackend::MmseqsCpu => {
-                mmseqs_non_host_align(
-                    config.clone(),
-                    non_host_r1_path.clone(),
-                    non_host_r2_path_opt.clone(),
-                    MmseqsBackend::Cpu,
-                ).await?
-            }
-            NRAlignmentBackend::MmseqsGpu => {
-                mmseqs_non_host_align(
-                    config.clone(),
-                    non_host_r1_path.clone(),
-                    non_host_r2_path_opt.clone(),
-                    MmseqsBackend::Gpu,
-                ).await?
-            }
-        };
+    // let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_temp_dirs) =
+    //     match config.alignment_backend {
+    //         NRAlignmentBackend::Diamond => {
+    //             diamond_non_host_align(
+    //                 config.clone(),
+    //                 non_host_r1_path.clone(),
+    //                 non_host_r2_path_opt.clone(),
+    //             ).await?
+    //         }
+    //         NRAlignmentBackend::MmseqsCpu => {
+    //             mmseqs_non_host_align(
+    //                 config.clone(),
+    //                 non_host_r1_path.clone(),
+    //                 non_host_r2_path_opt.clone(),
+    //                 MmseqsBackend::Cpu,
+    //             ).await?
+    //         }
+    //         NRAlignmentBackend::MmseqsGpu => {
+    //             mmseqs_non_host_align(
+    //                 config.clone(),
+    //                 non_host_r1_path.clone(),
+    //                 non_host_r2_path_opt.clone(),
+    //                 MmseqsBackend::Gpu,
+    //             ).await?
+    //         }
+    //     };
 
     cleanup_tasks.append(&mut non_host_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_cleanup_receivers);
@@ -8368,7 +8376,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_sort_start = Instant::now();
     let nr_m8_sorted = sort_m8_by_read_id(
         config.clone(),
-        ReceiverStream::new(non_host_m8_stream),
+        non_host_m8_stream,
         "nr",
     ).await?;
     info!(
@@ -8879,6 +8887,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let nt_res = nt_handle
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs task panicked: {e}")))??;
+            info!("NT blast contigs should be done by this point");
 
             let (
                 nt_read_dict,
@@ -8949,6 +8958,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs task panicked: {e}")))??;
 
+            info!("NR blast contigs should be done by this point");
+
             let (
                 nr_read_dict,
                 nr_refined_counts,
@@ -9009,6 +9020,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
     let (nt_post_res, nr_post_res) = tokio::join!(nt_post_handle, nr_post_handle);
+
+    info!("blast contigs should be done by this point");
 
     let nt_post_res = nt_post_res
         .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs postprocess task panicked: {e}")))??;
