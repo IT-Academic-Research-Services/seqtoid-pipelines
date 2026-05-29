@@ -240,6 +240,10 @@ pub async fn compute_insert_size_stats_from_bam(
 
     let mut bam_reader = bam::r#async::io::Reader::new(file);
 
+    // noodles-bam requires the header to be read first
+    let _header = bam_reader.read_header().await
+        .map_err(|e| anyhow!("BAM header error: {}", e))?;
+
     let histogram = Arc::new(Mutex::new(HashMap::<u32, u64>::new()));
     let mut total_proper_pairs = 0u64;
     let mut processed = 0usize;
@@ -250,10 +254,12 @@ pub async fn compute_insert_size_stats_from_bam(
     let mut record = Record::default();
 
     loop {
-        let bytes_read = bam_reader.read_record(&mut record).await?;
+        let bytes_read = match bam_reader.read_record(&mut record).await {
+            Ok(n) => n,
+            Err(e) => return Err(anyhow!("BAM record read error: {}", e)),
+        };
 
         if bytes_read == 0 {
-            // End of file
             break;
         }
 
@@ -266,7 +272,7 @@ pub async fn compute_insert_size_stats_from_bam(
 
         let flags = record.flags();
 
-        // Skip records that cannot contribute valid insert sizes
+        // Standard proper-pair filter (matches Picard logic)
         if flags.is_unmapped()
             || flags.is_secondary()
             || flags.is_supplementary()
@@ -277,9 +283,8 @@ pub async fn compute_insert_size_stats_from_bam(
             continue;
         }
 
-        // Only count first segment (R1) that is forward, with mate reverse
-        // This avoids double-counting and matches common Picard-style logic
-        if !flags.is_first_segment() || !flags.is_reverse_complemented() {
+        // Count each proper pair exactly once (use first segment only)
+        if !flags.is_first_segment() {
             continue;
         }
 
@@ -289,7 +294,6 @@ pub async fn compute_insert_size_stats_from_bam(
             continue;
         }
 
-        // Increment histogram (thread-safe)
         {
             let mut hist = histogram.lock().unwrap();
             *hist.entry(insert_size).or_insert(0) += 1;
@@ -298,7 +302,9 @@ pub async fn compute_insert_size_stats_from_bam(
         total_proper_pairs += 1;
     }
 
-    // Build sorted vec of (size, count)
+    // ─────────────────────────────────────────────────────────────
+    // Build sorted histogram + stats (unchanged from your original)
+    // ─────────────────────────────────────────────────────────────
     let mut insert_sizes: Vec<(u32, u64)> = {
         let hist = histogram.lock().unwrap();
         hist.iter().map(|(&size, &count)| (size, count)).collect()
@@ -306,7 +312,6 @@ pub async fn compute_insert_size_stats_from_bam(
 
     insert_sizes.sort_by_key(|&(size, _)| size);
 
-    // Compute statistics
     let total_weight: u64 = insert_sizes.iter().map(|&(_, c)| c).sum();
 
     let mean = if total_weight > 0 {
@@ -319,7 +324,7 @@ pub async fn compute_insert_size_stats_from_bam(
         0.0
     };
 
-    // Median (middle value — handles both even and odd counts reasonably)
+    // Median
     let mut cumulative = 0u64;
     let mut median = 0.0;
     for &(size, count) in &insert_sizes {
