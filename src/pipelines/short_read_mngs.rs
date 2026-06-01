@@ -6083,27 +6083,6 @@ pub async fn blast_contigs(
         blastdb_path.display()
     );
 
-    let makeblastdb_config = MakeblastdbConfig {
-        input: reference_fasta.clone(),
-        dbtype: if db_type == NT_TAG {
-            "nucl".to_string()
-        } else {
-            "prot".to_string()
-        },
-        output: blastdb_path.clone(),
-        option_fields: HashMap::new(),
-    };
-
-    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    info!(
-        "[blast_contigs:{}] launching {}",
-        db_type, MAKEBLASTDB_TAG
-    );
 
     info!("blast_contigs right before making its db");
 
