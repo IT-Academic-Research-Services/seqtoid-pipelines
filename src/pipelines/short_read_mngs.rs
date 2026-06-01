@@ -4508,7 +4508,7 @@ pub async fn process_assembly(
         false,
     )
         .await?;
-    
+
 
     let index_dir = assembly_out_dir.join("bowtie_index");
     fs::create_dir_all(&index_dir).await?;
@@ -6105,17 +6105,78 @@ pub async fn blast_contigs(
         db_type, MAKEBLASTDB_TAG
     );
 
-    info!("blast_contigs right before making its stupid worthless db");
+    info!("blast_contigs right before making its db");
 
-    let (_, makeblastdb_err_task) = spawn_cmd(
+    // === 1. Build config ===
+    let makeblastdb_config = MakeblastdbConfig {
+        input: reference_fasta.clone(),
+        dbtype: if db_type == NT_TAG {
+            "nucl".to_string()
+        } else {
+            "prot".to_string()
+        },
+        output: blastdb_path.clone(),
+        option_fields: HashMap::new(),
+    };
+
+
+    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
+        .map_err(|e| anyhow::anyhow!("Failed to generate makeblastdb args: {}", e))?;
+
+    let log_path = out_dir.join(format!("{}_makeblastdb.log", db_type));
+
+    let (mut make_child, make_err_task) = spawn_cmd(
         config.clone(),
         MAKEBLASTDB_TAG,
         makeblastdb_args,
         config.args.verbose,
-        None
+        Some(log_path.clone()),
     )
-        .await?;
-    cleanup_tasks.push(makeblastdb_err_task);
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to spawn makeblastdb: {}", e))?;
+
+    cleanup_tasks.push(make_err_task);
+
+    info!("[makeblastdb:{}] waiting for database creation...", db_type);
+
+    let status = make_child.wait().await
+        .map_err(|e| anyhow::anyhow!("makeblastdb wait failed: {}", e))?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+        "makeblastdb failed with status: {:?}. Check log: {}",
+        status.code(),
+        log_path.display()
+    ));
+    }
+
+    info!("[makeblastdb:{}] completed successfully", db_type);
+
+    // verify db
+    let db_prefix = blastdb_path.clone();
+    let expected_extensions = if db_type == NT_TAG {
+        vec!["nin", "nhr", "nog", "nsq"]
+    } else {
+        vec!["pin", "phr", "pog", "psq"]
+    };
+
+    let mut db_ok = false;
+    for ext in expected_extensions {
+        let path = db_prefix.with_extension(ext);
+        if path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            db_ok = true;
+            debug!("Found valid db file: {}", path.display());
+            break;
+        }
+    }
+
+    if !db_ok {
+        return Err(anyhow::anyhow!(
+        "makeblastdb succeeded but produced no valid index files at prefix {} (check log: {})",
+        db_prefix.display(),
+        log_path.display()
+    ));
+    }
 
     let blast_command = if db_type == NT_TAG {
         BLASTN_TAG
