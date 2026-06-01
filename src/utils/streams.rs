@@ -2011,18 +2011,15 @@ pub async fn fanout_to_channels(
     mut upstream: ReceiverStream<ParseOutput>,
     n_branches: usize,
     label: &str,
-    config: &RunConfig,           // ← added
-    data_type: StreamDataType,    // ← added
+    config: &RunConfig,
+    data_type: StreamDataType,
 ) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
 
     let buffer_per_branch = crate::utils::system::compute_buffer_size(
-        config,
-        "fanout",                     // phase name
-        data_type,
-        1.45,                         // good hot-path boost for fanout (not too aggressive)
+        config, "fanout", data_type, 1.25,
     );
 
-    let mut txs = Vec::with_capacity(n_branches);
+    let mut txs: Vec<mpsc::Sender<ParseOutput>> = Vec::with_capacity(n_branches);
     let mut rxs = Vec::with_capacity(n_branches);
 
     for _ in 0..n_branches {
@@ -2032,14 +2029,35 @@ pub async fn fanout_to_channels(
     }
 
     let label = label.to_string();
-    let router: JoinHandle<anyhow::Result<(), anyhow::Error>> = tokio::spawn(async move {
+    let router = tokio::spawn(async move {
         let mut count = 0usize;
+        let mut last_log = Instant::now();
+
         while let Some(item) = upstream.next().await {
             count += 1;
-            // Send to EVERY branch (never drop)
-            let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
-            let _ = futures::future::join_all(sends).await;
+
+            let mut dropped_any = false;
+
+            for (i, tx) in txs.iter().enumerate() {
+                if tx.try_send(item.clone()).is_err() {
+                    // Backpressure → async send (rare)
+                    if tx.send(item.clone()).await.is_err() {
+                        warn!("[fanout {}] branch {} closed early at item {}", label, i, count);
+                        dropped_any = true;
+                    }
+                }
+            }
+
+            if dropped_any {
+                debug!("[fanout {}] some branches dropped item {}", label, count);
+            }
+
+            if count % 50_000 == 0 || last_log.elapsed() > Duration::from_secs(10) {
+                debug!("[fanout {}] forwarded {} items", label, count);
+                last_log = Instant::now();
+            }
         }
+
         debug!("[fanout {}] finished — forwarded {} items total", label, count);
         Ok(())
     });
