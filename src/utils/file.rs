@@ -834,6 +834,7 @@ pub async fn materialize_stream_to_file(
     label: &str,
     data_type: StreamDataType,
 ) -> Result<PathBuf> {
+
     let write_handle = write_byte_stream_to_file(
         &output_path,
         stream,
@@ -842,12 +843,60 @@ pub async fn materialize_stream_to_file(
         label,
     ).await?;
 
-    write_handle.await??; // Wait for completion + propagate errors
+    write_handle.await
+        .map_err(|e| anyhow!("Materialization task panicked for {}: {}", label, e))??;
 
-    debug!("Materialized {} → {} (size: {} bytes)",
-          label, output_path.display(), file_size(&output_path).await?);
+    let size = file_size(&output_path).await.unwrap_or(0);
+    debug!("Materialized {} → {} ({} bytes)", label, output_path.display(), size);
 
     Ok(output_path)
+}
+
+/// Materialize a stream to a temporary file with smart size estimation
+pub async fn materialize_to_temp(
+    config: Arc<RunConfig>,
+    stream: ReceiverStream<ParseOutput>,
+    label: &str,
+    data_type: StreamDataType,
+    headroom_factor: u64,
+    prefer_nvme: bool,
+    estimated_bytes: Option<u64>,           // ← NEW: optional override
+) -> Result<PathBuf> {
+
+    let size_estimate = estimated_bytes.unwrap_or_else(|| {
+        // Default heuristics
+        if label.contains("blast") || label.contains("m8") || label.contains("hit_summary") {
+            // BLAST outputs are almost always small
+            std::cmp::min(config.input_size / 50, 512 * 1024 * 1024)  // max 512 MiB estimate
+        } else if label.contains("taxon") || label.contains("count") {
+            64 * 1024 * 1024  // 64 MiB default for counts
+        } else {
+            config.input_size / 20
+        }
+    });
+
+    let temp_dir = choose_temp_dir(
+        size_estimate,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        headroom_factor,
+        prefer_nvme,
+    ).await?;
+
+    let output_path = temp_dir.path().join(format!("{}.materialized", label));
+
+    let final_path = materialize_stream_to_file(
+        config,
+        stream,
+        output_path.clone(),
+        label,
+        data_type,
+    ).await?;
+
+    debug!("Materialized {} → {} (est: {} bytes)",
+           label, final_path.display(), size_estimate);
+
+    Ok(final_path)
 }
 
 #[cfg(test)]
