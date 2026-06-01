@@ -70,7 +70,7 @@ use crate::utils::fastx::{raw_read_count, read_fasta,
 use crate::utils::file::{choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
-                         write_vecu8_to_file};
+                         write_vecu8_to_file, materialize_to_temp};
 use crate::utils::paf::{parse_paf_batch_to_m8};
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
@@ -6230,6 +6230,28 @@ pub async fn blast_contigs(
         config.base_buffer_size
     );
 
+    // materialize raw blast output BEFORE heavy fanout
+    // This breaks backpressure and guarantees clean EOF for the complex downstream graph
+    let blast_m8_path = materialize_to_temp(
+        config.clone(),
+        ReceiverStream::new(blast_out_stream),
+        &format!("blast_{}_raw", db_type),
+        StreamDataType::JustBytes,
+        4,                    // headroom
+        false,                // prefer RAM for BLAST output (usually small)
+        None,                 // let heuristic decide size
+    ).await?;
+
+    // Re-open as fresh stream (clean state, no backpressure from blastn)
+    let file = tokio::fs::File::open(&blast_m8_path).await
+        .context("Failed to reopen materialized blast m8")?;
+
+    let blast_m8_stream = parse_bytes(file, &config, StreamDataType::JustBytes).await?;
+
+    info!("[blast_contigs:{}] materialized blast output to {} (ready for fanout)",
+          db_type, blast_m8_path.display());
+
+
     // ────────────────────────────────────────────────
     // Top hits and results processing
     // ────────────────────────────────────────────────
@@ -6276,7 +6298,7 @@ pub async fn blast_contigs(
         tokio::spawn(async move {
             info!("[blast_contigs:{}] get_top_m8_nt started", db_type);
             let res = get_top_m8_nt(
-                ReceiverStream::new(blast_out_stream),
+                ReceiverStream::new(blast_m8_stream),
                 top_internal_tx,
                 top_nt_concurrency,
                 top_nt_batch_size,
@@ -6323,7 +6345,7 @@ pub async fn blast_contigs(
         tokio::spawn(async move {
             info!("[blast_contigs:{}] get_top_m8_nr started", db_type);
             let res = get_top_m8_nr(
-                ReceiverStream::new(blast_out_stream),
+                ReceiverStream::new(blast_m8_stream),
                 top_internal_tx,
                 top_nr_concurrency,
                 top_nr_batch_size,

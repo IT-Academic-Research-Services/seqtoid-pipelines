@@ -860,18 +860,16 @@ pub async fn materialize_to_temp(
     data_type: StreamDataType,
     headroom_factor: u64,
     prefer_nvme: bool,
-    estimated_bytes: Option<u64>,           // ← NEW: optional override
+    estimated_bytes: Option<u64>,
 ) -> Result<PathBuf> {
 
     let size_estimate = estimated_bytes.unwrap_or_else(|| {
-        // Default heuristics
-        if label.contains("blast") || label.contains("m8") || label.contains("hit_summary") {
-            // BLAST outputs are almost always small
-            std::cmp::min(config.input_size / 50, 512 * 1024 * 1024)  // max 512 MiB estimate
+        if label.contains("blast") || label.contains("m8") {
+            256 * 1024 * 1024usize as u64   // BLAST m8 files are rarely large
         } else if label.contains("taxon") || label.contains("count") {
-            64 * 1024 * 1024  // 64 MiB default for counts
+            64 * 1024 * 1024
         } else {
-            config.input_size / 20
+            (config.input_size / 20).max(32 * 1024 * 1024)
         }
     });
 
@@ -893,7 +891,7 @@ pub async fn materialize_to_temp(
         data_type,
     ).await?;
 
-    debug!("Materialized {} → {} (est: {} bytes)",
+    debug!("[materialize] {} → {} (est: {} bytes)",
            label, final_path.display(), size_estimate);
 
     Ok(final_path)
