@@ -824,6 +824,32 @@ pub async fn choose_temp_dir(
     Ok(fallback)
 }
 
+// Helper function for writing byte streams to files and force and EOF
+// Meant for small files writing to /dev/shm or nvme scratch
+//
+pub async fn materialize_stream_to_file(
+    config: Arc<RunConfig>,
+    stream: ReceiverStream<ParseOutput>,
+    output_path: PathBuf,
+    label: &str,
+    data_type: StreamDataType,
+) -> Result<PathBuf> {
+    let write_handle = write_byte_stream_to_file(
+        &output_path,
+        stream,
+        config.clone(),
+        data_type,
+        label,
+    ).await?;
+
+    write_handle.await??; // Wait for completion + propagate errors
+
+    debug!("Materialized {} → {} (size: {} bytes)",
+          label, output_path.display(), file_size(&output_path).await?);
+
+    Ok(output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
