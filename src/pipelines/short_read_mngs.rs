@@ -8532,6 +8532,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let cleanup_receivers = nt_cleanup_receivers;
             let temp_files = nt_temp_files;
 
+            // Fanout (keep for viz / taxid / coverage branches if still needed)
             let (nt_m8_rxs, nt_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_m8_stream_out),
                 3,
@@ -8542,7 +8543,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             cleanup_tasks.push(nt_m8_router);
 
             let mut nt_m8_iter = nt_m8_rxs.into_iter();
-            let nt_m8_merge = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_m8_merge_stream = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nt_m8_map = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nt_m8_viz = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
 
@@ -8556,18 +8557,42 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             cleanup_tasks.push(nt_hitsummary_router);
 
             let mut nt_hitsummary_iter = nt_hitsummary_rxs.into_iter();
-            let nt_hit_summary_merge = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nt_hit_summary_merge_stream = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nt_hit_summary_taxid = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nt_hit_summary_coverage = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            // === Materialize the merge outputs to temp files ===
+            let nt_refined_m8_path = out_dir.join("nt_refined.m8");           // or use choose_temp_dir + unique name
+            let nt_refined_hitsummary_path = out_dir.join("nt_refined.hitsummary.tab");
+
+            let nt_m8_write = write_byte_stream_to_file(
+                &nt_refined_m8_path,
+                ReceiverStream::new(nt_m8_merge_stream),
+                config.clone(),
+                StreamDataType::JustBytes,
+                "nt_refined_m8_merge",
+            ).await?;
+
+            let nt_hitsummary_write = write_byte_stream_to_file(
+                &nt_refined_hitsummary_path,
+                ReceiverStream::new(nt_hit_summary_merge_stream),
+
+                config.clone(),
+                StreamDataType::JustBytes,
+                "nt_refined_hitsummary_merge",
+            ).await?;
+
+            cleanup_tasks.push(nt_m8_write);
+            cleanup_tasks.push(nt_hitsummary_write);
 
             Ok::<_, PipelineError>((
                 nt_read_dict,
                 nt_refined_counts,
                 nt_contig_summary,
-                nt_m8_merge,
+                nt_refined_m8_path,           // now PathBuf
                 nt_m8_map,
                 nt_m8_viz,
-                nt_hit_summary_merge,
+                nt_refined_hitsummary_path,   // now PathBuf
                 nt_hit_summary_taxid,
                 nt_hit_summary_coverage,
                 nt_refined_m8_top_stream_out,
@@ -8583,7 +8608,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         async move {
             let nr_res = nr_handle
                 .await
-                .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs task panicked: {e}")))??;
+                .map_err(|e| PipelineError::Other(anyhow!("NT blast_contigs task panicked: {e}")))??;
 
             let (
                 nr_read_dict,
@@ -8591,7 +8616,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nr_contig_summary,
                 nr_refined_m8_stream_out,
                 nr_refined_hit_summary_stream_out,
-                _nr_refined_m8_top_stream_out,
+                nr_refined_m8_top_stream_out,
                 nr_cleanup_tasks,
                 nr_cleanup_receivers,
                 nr_temp_files,
@@ -8601,9 +8626,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let cleanup_receivers = nr_cleanup_receivers;
             let temp_files = nr_temp_files;
 
+            // Fanout (keep for viz / taxid / coverage branches if still needed)
             let (nr_m8_rxs, nr_m8_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_m8_stream_out),
-                2,
+                3,
                 "nr_m8",
                 &config,
                 StreamDataType::JustBytes
@@ -8611,8 +8637,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             cleanup_tasks.push(nr_m8_router);
 
             let mut nr_m8_iter = nr_m8_rxs.into_iter();
-            let nr_m8_merge = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_m8_merge_stream = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nr_m8_map = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_m8_viz = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
 
             let (nr_hitsummary_rxs, nr_hitsummary_router) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_hit_summary_stream_out),
@@ -8624,19 +8651,44 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             cleanup_tasks.push(nr_hitsummary_router);
 
             let mut nr_hitsummary_iter = nr_hitsummary_rxs.into_iter();
-            let nr_hit_summary_merge = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_preload = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_merge_stream = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nr_hit_summary_taxid = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+            let nr_hit_summary_coverage = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+            // === Materialize the merge outputs to temp files ===
+            let nr_refined_m8_path = out_dir.join("nr_refined.m8");           // or use choose_temp_dir + unique name
+            let nr_refined_hitsummary_path = out_dir.join("nr_refined.hitsummary.tab");
+
+            let nr_m8_write = write_byte_stream_to_file(
+                &nr_refined_m8_path,
+                ReceiverStream::new(nr_m8_merge_stream),
+                config.clone(),
+                StreamDataType::JustBytes,
+                "nr_refined_m8_merge",
+            ).await?;
+
+            let nr_hitsummary_write = write_byte_stream_to_file(
+                &nr_refined_hitsummary_path,
+                ReceiverStream::new(nr_hit_summary_merge_stream),
+                config.clone(),
+                StreamDataType::JustBytes,
+                "nr_refined_hitsummary_merge",
+            ).await?;
+
+            cleanup_tasks.push(nr_m8_write);
+            cleanup_tasks.push(nr_hitsummary_write);
 
             Ok::<_, PipelineError>((
                 nr_read_dict,
                 nr_refined_counts,
                 nr_contig_summary,
-                nr_m8_merge,
+                nr_refined_m8_path,           // now PathBuf
                 nr_m8_map,
-                nr_hit_summary_merge,
-                nr_hit_summary_preload,
+                nr_m8_viz,
+                nr_refined_hitsummary_path,   // now PathBuf
                 nr_hit_summary_taxid,
+                nr_hit_summary_coverage,
+                nr_refined_m8_top_stream_out,
                 cleanup_tasks,
                 cleanup_receivers,
                 temp_files,
@@ -8676,9 +8728,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_contig_summary,
         nr_m8_merge,
         _nr_m8_map,
+        _nr_m8_viz,
         nr_hit_summary_merge,
-        nr_hit_summary_preload,
         nr_hit_summary_taxid,
+        _nr_hit_summary_coverage,
+        _nr_refined_m8_top_stream_out,
         nr_cleanup_tasks,
         nr_cleanup_receivers,
         nr_temp_files,
@@ -8687,31 +8741,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(nr_cleanup_receivers);
     temp_files.extend(nr_temp_files);
 
-    // ────────────────────────────────────────────────────────────────
-    // PRELOAD NR alignments (parallel version)
-    // ────────────────────────────────────────────────────────────────
-    let nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>> =
-        Arc::new(DashMap::with_capacity_and_hasher(
-            80_000_000,
-            AHashRandomState::new()
-        ));
 
-    let preload_handle = tokio::spawn(preload_nr_alignments_parallel(
-        config.clone(),
-        nr_hit_summary_preload,
-        Arc::clone(&nr_alignment_per_read),
-    ));
-
-    // ────────────────────────────────────────────────────────────────
-    // Spawn merged taxon counts (unchanged except we await preload first)
-    // ────────────────────────────────────────────────────────────────
     let merged_cleanup_tasks = compute_merged_taxon_counts(
         config.clone(),
-        nt_temp_m8_path,
-        nt_temp_summary_path,
+        nt_m8_merge,                    // refined m8 from blast_contigs
+        nt_hit_summary_merge,           // refined hitsummary from blast_contigs
         nt_contig_summary,
-        nr_temp_m8_path,
-        nr_temp_summary_path,
+        nr_m8_merge,                    // refined m8 from blast_contigs
+        nr_hit_summary_merge,           // refined hitsummary from blast_contigs
         nr_contig_summary,
         should_keep_filter.clone(),
         duplicate_clusters.clone(),
@@ -8723,38 +8760,37 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(merged_cleanup_tasks);
 
-    // Wait for preload before proceeding (keeps exact ordering semantics from Python)
-    let _ = preload_handle.await
-        .map_err(|e| PipelineError::Other(anyhow!("NR preload task panicked: {}", e)))??;
 
-
-    let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
+    // Combine refined counts
+    let refined_combined_path = out_dir.join(rename_file_path(
+        &sample_base_buf,
+        None,
+        Some("refined_taxon_counts_with_dcr.json"),
+        "_",
+    ));
     let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
         &nr_refined_counts,
         refined_combined_path,
-    )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+    ).await?;
     cleanup_tasks.push(refined_write_json_task);
 
-
     // ────────────────────────────────────────────────────────────────
-    // NEW: Build tiny contig-level maps for the REFINED path
+    // Build accession maps from the REFINED hit summaries
+    // (these come from blast_contigs, not from call_hits_m8)
     // ────────────────────────────────────────────────────────────────
     let (nt_refined_map, nr_refined_map) = tokio::try_join!(
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            nt_hit_summary_for_refined
+            nt_hit_summary_merge,   // refined
         ),
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            nr_hit_summary_for_refined
-        )
+            nr_hit_summary_merge,   // refined
+        ),
     )?;
 
     // Contig FASTA stream (from assembly)
-    // ───────────────────────────────────────────────────────────────
     let contigs_fasta = assembly_outputs.contigs_fasta.clone();
     let contigs_file = tokio::fs::File::open(&contigs_fasta).await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
@@ -8764,18 +8800,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let contigs_stream = ReceiverStream::new(contigs_rx);
 
-    // Empty cluster stream (contigs have no duplicates)
-    let (_cluster_tx, _cluster_rx) = mpsc::channel::<ParseOutput>(1);
-    drop(_cluster_tx);
 
-    let assembly_dir = out_dir.join("assembly");
-    tokio::fs::create_dir_all(&assembly_dir).await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
-
-
-    let nr_annot_concurrency = compute_phase_concurrency(
+    let refined_annot_concurrency = compute_phase_concurrency(
         &config,
-        "nr_annot_concurrency",
+        "refined_annot_concurrency",
         0.4,
         4.0,
         128,
@@ -8792,11 +8820,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         contigs_stream,
         duplicate_clusters.clone(),
-        nt_refined_map,                     // tiny contig → NT accession
-        nr_refined_map,                     // tiny contig → NR accession
-        nr_annot_concurrency,
+        nt_refined_map,     // built from refined hitsummary
+        nr_refined_map,     // built from refined hitsummary
+        refined_annot_concurrency,
     ).await
         .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
 
