@@ -2662,25 +2662,29 @@ pub async fn sort_m8_by_read_id(
     Ok(ReceiverStream::new(rx))
 }
 
-/// Calls hits with the same logic as call_hits_m8 in the CZI pipeline
-/// NB:THIS NOW ASSUMES THE M8 IS READ ID SORTED
-/// # Arguments
+/// Calls hits with the same logic as call_hits_m8 in the CZI pipeline.
+/// NB: THIS NOW ASSUMES THE M8 IS READ ID SORTED.
 ///
-/// * `config` - RunConfig struct
-/// * `m8_inpout` - line-based m8 format input stream
-/// * `taxid_lineages_db_path` - path to sled-backed originally derived from tp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
-/// * `duplicate_cluster_sizes_path` - optinal duplicate cluster sizes for weighting
-/// * `taxon_blacklist_path` - optional list of excluded taxa
-/// * `deuterostome_path` - optional list of excluded taxa
-/// * `taxon_whitelist_path` -optional list of included taxa
-/// * `min_alignment_length` - will not attempt alignment under this threshold
+/// After the internal streaming worker/coordinator pipeline completes the
+/// per-read summarization + dedup, we:
+///   1. Fanout each output (dedup m8 + hit summary) to TWO branches.
+///   2. One branch is materialized to a file inside a `choose_temp_dir` TempDir
+///      (this is the primary output returned to the caller for downstream stages).
+///   3. The other branch writes an identical copy to the final `out_dir` (for
+///      inspection / debugging). These "not urgent" writes stay in cleanup_tasks.
 ///
+/// This eliminates the large fanout_to_channels usage on the hot path after
+/// call_hits_m8 while still preserving the final output files the user expects.
+///
+/// The returned TempDir must be kept alive (added to final_temp_dirs by caller)
+/// until the end of the pipeline run.
 ///
 /// # Returns
 /// Tuple:
-/// - m8 stream
-///  -hit-summary TSV stream
-/// - Vec of cleanup tasks
+/// - PathBuf to materialized dedup m8 (inside the temp dir)
+/// - PathBuf to materialized hit-summary TSV (inside the temp dir)
+/// - TempDir that owns the temp files (keep alive until end of run)
+/// - Vec of cleanup tasks (includes the out_dir copy writers + routers)
 /// - Vec of cleanup receivers
 pub async fn call_hits_m8(
     config: Arc<RunConfig>,
@@ -2693,14 +2697,15 @@ pub async fn call_hits_m8(
     concurrency: usize,
     tag: String,
 ) -> Result<(
-    ReceiverStream<ParseOutput>, // dedup m8 stream
-    ReceiverStream<ParseOutput>, // summary stream
-    Vec<JoinHandle<Result<()>>>,
-    Vec<oneshot::Receiver<Result<()>>>,
+    PathBuf, // temp dedup m8 (primary for downstream stages)
+    PathBuf, // temp hit summary (primary for downstream stages)
+    TempDir, // must be kept alive by caller — add to final_temp_dirs
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 ), PipelineError> {
     let worker_count = concurrency.max(1);
-    let mut cleanup_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-    let cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
     info!(
         "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
@@ -2745,14 +2750,6 @@ pub async fn call_hits_m8(
             while let Some(msg) = worker_rx.recv().await {
                 match msg {
                     WorkerMsg::ProcessRead { read_id, hits } => {
-                        // debug!(
-                        //     "[call_hits_m8:{}] worker {} processing read_id={} hits={}",
-                        //     worker_tag,
-                        //     worker_idx,
-                        //     read_id,
-                        //     hits.len()
-                        // );
-
                         let reduced = summarize_m8_hits(
                             0,
                             read_id,
@@ -2843,13 +2840,6 @@ pub async fn call_hits_m8(
                 );
             }
 
-            // if total_lines % 1_000_000 == 0 {
-            //     info!(
-            //         "[call_hits_m8:{}] coordinator saw {} lines so far (current read_id={})",
-            //         coordinator_tag, total_lines, read_id
-            //     );
-            // }
-
             #[cfg(debug_assertions)]
             {
                 if let Some(prev) = &last_seen_read_id {
@@ -2867,14 +2857,6 @@ pub async fn call_hits_m8(
             if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
                 let prev_read_id = current_read_id.take().unwrap();
                 let shard = shard_for_read_id(&prev_read_id, worker_count);
-
-                // debug!(
-                //     "[call_hits_m8:{}] dispatching read_id={} with {} hits to worker {}",
-                //     coordinator_tag,
-                //     prev_read_id,
-                //     current_hits.len(),
-                //     shard
-                // );
 
                 worker_txs[shard]
                     .send(WorkerMsg::ProcessRead {
@@ -2898,14 +2880,6 @@ pub async fn call_hits_m8(
         if let Some(read_id) = current_read_id {
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
-
-                // debug!(
-                //     "[call_hits_m8:{}] dispatching final read_id={} with {} hits to worker {}",
-                //     coordinator_tag,
-                //     read_id,
-                //     current_hits.len(),
-                //     shard
-                // );
 
                 worker_txs[shard]
                     .send(WorkerMsg::ProcessRead {
@@ -2946,6 +2920,21 @@ pub async fn call_hits_m8(
 
     cleanup_tasks.push(coordinator_handle);
 
+
+    let estimated_bytes = (config.input_size / 5).max(256 * 1024 * 1024);
+    let temp_dir = choose_temp_dir(
+        estimated_bytes,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    )
+        .await?;
+
+    let temp_dedup_path = temp_dir.path().join(format!("{}_dedup.m8", tag));
+    let temp_summary_path = temp_dir.path().join(format!("{}_hit_summary.txt", tag));
+
+    // DEDUP M8 fanout: branch 0 → materialize to temp (awaited), branch 1 → out_dir copy (background)
     let dedup_stream = ReceiverStream::new(dedup_rx);
     let (dedup_branches, dedup_router_handle) = fanout_to_channels(
         dedup_stream,
@@ -2957,19 +2946,13 @@ pub async fn call_hits_m8(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // track router task (replaces cleanup_receivers)
     cleanup_tasks.push(dedup_router_handle);
 
-    let mut dedup_branches = dedup_branches.into_iter();
+    let mut dedup_it = dedup_branches.into_iter();
+    let dedup_main_stream = ReceiverStream::new(dedup_it.next().ok_or(PipelineError::EmptyStream)?);
+    let dedup_file_stream = ReceiverStream::new(dedup_it.next().ok_or(PipelineError::EmptyStream)?);
 
-    let dedup_main = ReceiverStream::new(
-        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
-
-    let dedup_file_stream = ReceiverStream::new(
-        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
-
+    // out_dir copy (unchanged behavior, put in cleanup_tasks as "not urgent")
     let call_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
             &sample_base_buf,
@@ -2986,6 +2969,24 @@ pub async fn call_hits_m8(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(call_file_write_task);
 
+    // Primary output: materialize to temp and await so file is complete when we return the path
+    let materialize_dedup_handle = write_byte_stream_to_file(
+        &temp_dedup_path,
+        dedup_main_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        &format!("call_hits_m8_{}_dedup_temp", tag),
+    )
+        .await?;
+
+    let dedup_res = materialize_dedup_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("dedup temp materialize panicked: {}", e)))?;
+    dedup_res.map_err(|e| PipelineError::Other(anyhow!("dedup temp write failed: {}", e)))?;
+
+    info!("[call_hits_m8:{}] materialized primary dedup m8 → {}", tag, temp_dedup_path.display());
+
+    // HIT SUMMARY fanout: same pattern
     let summary_stream = ReceiverStream::new(summary_rx);
     let (summary_branches, summary_router_handle) = fanout_to_channels(
         summary_stream,
@@ -2997,19 +2998,13 @@ pub async fn call_hits_m8(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // track router task instead of oneshot receiver
     cleanup_tasks.push(summary_router_handle);
 
-    let mut summary_branches = summary_branches.into_iter();
+    let mut summary_it = summary_branches.into_iter();
+    let summary_main_stream = ReceiverStream::new(summary_it.next().ok_or(PipelineError::EmptyStream)?);
+    let summary_file_stream = ReceiverStream::new(summary_it.next().ok_or(PipelineError::EmptyStream)?);
 
-    let summary_main = ReceiverStream::new(
-        summary_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
-
-    let summary_file_stream = ReceiverStream::new(
-        summary_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
-
+    // out_dir copy (unchanged)
     let summary_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
             &sample_base_buf,
@@ -3026,11 +3021,32 @@ pub async fn call_hits_m8(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(summary_file_write_task);
 
-    info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
+    // Primary output: materialize to temp and await
+    let materialize_summary_handle = write_byte_stream_to_file(
+        &temp_summary_path,
+        summary_main_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        &format!("call_hits_m8_{}_summary_temp", tag),
+    )
+        .await?;
+
+    let summary_res = materialize_summary_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("summary temp materialize panicked: {}", e)))?;
+    summary_res.map_err(|e| PipelineError::Other(anyhow!("summary temp write failed: {}", e)))?;
+
+    info!("[call_hits_m8:{}] materialized primary hit summary → {}", tag, temp_summary_path.display());
+
+    info!(
+        "[call_hits_m8:{}] COMPLETE — temp files ready (downstream stages should now open these files instead of streams)",
+        tag
+    );
 
     Ok((
-        dedup_main,
-        summary_main,
+        temp_dedup_path,
+        temp_summary_path,
+        temp_dir,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -7955,10 +7971,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
     info!("call hits nt concurrency {}", nt_concurrency);
 
+
     let nt_call_hits_start = Instant::now();
-    let (nt_call_stream, nt_call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
+    let (
+        nt_temp_m8_path,
+        nt_temp_summary_path,
+        nt_temp_dir,
+        mut call_cleanup_tasks,
+        mut call_cleanup_receivers,
+    ) = call_hits_m8(
         config.clone(),
-        m8_sorted,                    // ←←← NOW SORTED
+        m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -7967,124 +7990,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nt_concurrency,
         "nt".to_string(),
     ).await?;
+
     info!(
-    "[run] call_hits_m8(nt) returned after {:?}",
-    nt_call_hits_start.elapsed()
-);
+        "[run] call_hits_m8(nt) returned after {:?} — outputs materialized to temp files",
+        nt_call_hits_start.elapsed()
+    );
 
     cleanup_tasks.append(&mut call_cleanup_tasks);
     cleanup_receivers.append(&mut call_cleanup_receivers);
 
-    info!("[run] wrapping NT outputs with monitor_stream");
-
-    let nt_call_stream = monitor_stream(
-        nt_call_stream,
-        "nt_call_stream_from_call_hits_m8",
-        Duration::from_secs(10),
-    );
-
-    let nt_call_summary_stream = monitor_stream(
-        nt_call_summary_stream,
-        "nt_call_summary_stream_from_call_hits_m8",
-        Duration::from_secs(10),
-    );
-
-    let nt_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
-
-    let (nt_call_rxs, nt_call_router) = fanout_to_channels(
-        nt_call_stream,                    // already the monitored stream from call_hits_m8
-        2, // generous buffer for m8 lines
-        "nt_call",
-        &config,
-        StreamDataType::JustBytes
-    ).await?;
-
-    cleanup_tasks.push(nt_call_router);    // router returns the correct JoinHandle type
-
-    info!(
-        "[run] fanout_to_channels(nt_call) ready after {:?} with 2 private channels",
-        nt_split_start.elapsed()
-    );
-
-    let mut nt_call_rxs_iter = nt_call_rxs.into_iter();
-    let nt_call_stream = ReceiverStream::new(nt_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_blast_stream = ReceiverStream::new(nt_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    // Keep the temp directory alive until the very end of the pipeline
+    final_temp_dirs.push(nt_temp_dir);
 
 
-    let nt_call_stream = monitor_stream(
-        nt_call_stream,
-        "nt_call_stream_to_generate_taxon_counts",
-        Duration::from_secs(15),
-    );
+    // right here we now have an m8 and hit summary file materilzed to fast temp
+    // everytuing that needed nt_call_stream can use nt_temp_m8_path
+    // everything that needed nt_call_summary_stream can use nt_temp_summary_path
 
-    let nt_blast_stream = monitor_stream(
-        nt_blast_stream,
-        "nt_blast_stream_to_blast_contigs",
-        Duration::from_secs(15),
-    );
-
-    let nt_summary_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NT summary (6 private channels)");
-
-    let (nt_summary_rxs, nt_summary_router) = fanout_to_channels(
-        nt_call_summary_stream,
-        6,
-        "nt_call_summary",
-        &config,
-        StreamDataType::JustBytes
-    ).await?;
-
-    cleanup_tasks.push(nt_summary_router);     // now the correct type
-
-    info!(
-        "[run] fanout_to_channels(nt_call_summary) ready after {:?} with 6 private channels",
-        nt_summary_split_start.elapsed()
-    );
-
-    let mut nt_summary_rxs_iter = nt_summary_rxs.into_iter();
-    let nt_summary_taxon_stream       = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_summary_hit_stream         = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_initial_stream             = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_blast_hit_stream           = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_hit_summary_for_refined    = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_hit_summary_for_taxid      = ReceiverStream::new(nt_summary_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-
-    info!("[run] NT split wiring complete");
-    info!("[run] nt_summary_taxon_stream -> generate_taxon_counts");
-    info!("[run] nt_summary_hit_stream -> summarize_hits");
-    info!("[run] nt_initial_stream -> initial_taxid_fasta");
-    info!("[run] nt_blast_hit_stream -> blast_contigs");
-
-    let nt_summary_taxon_stream = monitor_stream(
-        nt_summary_taxon_stream,
-        "nt_summary_taxon_stream_to_generate_taxon_counts",
-        Duration::from_secs(10),
-    );
-
-    let nt_summary_hit_stream = monitor_stream(
-        nt_summary_hit_stream,
-        "nt_summary_hit_stream_to_summarize_hits",
-        Duration::from_secs(10),
-    );
-
-    let nt_initial_stream = monitor_stream(
-        nt_initial_stream,
-        "nt_initial_stream_to_initial_taxid_fasta",
-        Duration::from_secs(15),
-    );
-
-    let nt_blast_hit_stream = monitor_stream(
-        nt_blast_hit_stream,
-        "nt_blast_hit_stream_to_blast_contigs",
-        Duration::from_secs(15),
-    );
-
-    info!("Launching downstream consumers for NT results:");
-    info!("  -> nt_call_stream (to generate_taxon_counts + nt_map_task)");
-    info!("  -> nt_blast_stream (to blast_contigs later)");
-    info!("  -> nt_summary_hit_stream (to summarize_hits)");
-    info!("  -> nt_summary_taxon_stream (to generate_taxon_counts)");
+    
 
     let nt_hit_summary_handle = tokio::spawn({
         let config = config.clone();
@@ -8194,20 +8117,43 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     nr_sort_start.elapsed()
 );
 
-    let (nr_call_stream, nr_call_summary_stream, mut nr_call_cleanup_tasks, mut nr_call_cleanup_receivers) =
-        call_hits_m8(
-            config.clone(),
-            nr_m8_sorted,
-            sample_base_buf.clone(),
-            lineage_map.clone(),
-            acc2taxid_map.clone(),
-            should_keep_filter.clone(),
-            0,
-            nr_concurrency,
-            "nr".to_string(),
-        ).await?;
-    cleanup_tasks.append(&mut nr_call_cleanup_tasks);
-    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
+    let nr_call_hits_start = Instant::now();
+    let (
+        nr_temp_m8_path,
+        nr_temp_summary_path,
+        nr_temp_dir,
+        mut call_cleanup_tasks,
+        mut call_cleanup_receivers,
+    ) = call_hits_m8(
+        config.clone(),
+        m8_sorted,
+        sample_base_buf.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
+        should_keep_filter.clone(),
+        36,
+        nr_concurrency,
+        "nr".to_string(),
+    ).await?;
+
+    info!(
+      "[run] call_hits_m8(nt) returned after {:?} — outputs materialized to temp files",
+      nr_call_hits_start.elapsed()
+  );
+
+    cleanup_tasks.append(&mut call_cleanup_tasks);
+    cleanup_receivers.append(&mut call_cleanup_receivers);
+
+    // Keep the temp directory alive until the very end of the pipeline
+    final_temp_dirs.push(nr_temp_dir);
+
+
+
+
+
+
+
+
 
     let nr_split_start = Instant::now();
     info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
