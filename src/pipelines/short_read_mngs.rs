@@ -3787,19 +3787,28 @@ pub async fn combine_taxon_counts(
 /// Final map merge is offloaded to spawn_blocking (exactly as you requested).
 pub async fn collect_hit_summary_to_accession_map_concurrent(
     config: Arc<RunConfig>,
-    mut summary_stream: ReceiverStream<ParseOutput>,
+    summary_path: PathBuf,
 ) -> Result<AHashMap<String, String>> {
-    let concurrency = compute_phase_concurrency(&config, "accession_map_final_merge", 0.2, 4.0, 32, 4);
+    let concurrency = compute_phase_concurrency(
+        &config,
+        "accession_map_final_merge",
+        0.2,
+        4.0,
+        32,
+        4,
+    );
     let batch_size = compute_batch_size(None, 1024, 512, concurrency);
 
     let (job_tx, job_rx) = mpsc::channel::<Vec<Vec<u8>>>(concurrency);
     let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
 
+    // === Workers  ===
     let mut worker_handles = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let rx = shared_rx.clone();
         let handle = tokio::spawn(async move {
             let mut partial = AHashMap::with_capacity(batch_size);
+
             while let Some(batch) = {
                 let mut g = rx.lock().await;
                 g.recv().await
@@ -3808,12 +3817,17 @@ pub async fn collect_hit_summary_to_accession_map_concurrent(
                     .par_iter()
                     .filter_map(|bytes| {
                         let line = String::from_utf8_lossy(bytes).trim_end().to_string();
-                        if line.is_empty() { return None; }
+                        if line.is_empty() {
+                            return None;
+                        }
                         let fields: Vec<&str> = line.split('\t').collect();
-                        if fields.len() < 2 { return None; }
+                        if fields.len() < 2 {
+                            return None;
+                        }
                         Some((fields[0].to_string(), fields[1].to_string()))
                     })
                     .collect();
+
                 for (k, v) in lines {
                     partial.insert(k, v);
                 }
@@ -3823,45 +3837,67 @@ pub async fn collect_hit_summary_to_accession_map_concurrent(
         worker_handles.push(handle);
     }
 
-    // Producer
-    let producer = tokio::spawn(async move {
-        let mut batch = Vec::with_capacity(batch_size);
-        while let Some(item) = summary_stream.next().await {
-            if let ParseOutput::Bytes(b) = item {
-                batch.push(b.to_vec());
-                if batch.len() >= batch_size {
-                    if job_tx.send(std::mem::take(&mut batch)).await.is_err() { break; }
+    // === Producer ===
+    let (batch_rx, file_reader_handle) =
+        read_file_lines_batched(summary_path.clone(), batch_size).await?;
+
+    let forwarder = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(batch_rx);
+
+        while let Some(batch) = stream.next().await {
+            // Convert Vec<ParseOutput> → Vec<Vec<u8>> for the existing worker channel
+            let raw_batch: Vec<Vec<u8>> = batch
+                .into_iter()
+                .filter_map(|item| {
+                    if let ParseOutput::Bytes(b) = item {
+                        Some(b.to_vec())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !raw_batch.is_empty() {
+                if job_tx.send(raw_batch).await.is_err() {
+                    break;
                 }
             }
         }
-        if !batch.is_empty() {
-            let _ = job_tx.send(batch).await;
-        }
+
         drop(job_tx);
         Ok::<(), anyhow::Error>(())
     });
 
-    // Await all workers FIRST (in async context)
+    // === Await workers ===
     let mut partial_maps = Vec::with_capacity(worker_handles.len());
     for handle in worker_handles {
-        let partial = handle.await
+        let partial = handle
+            .await
             .map_err(|e| anyhow!("Worker task panicked: {}", e))??;
         partial_maps.push(partial);
     }
 
-    // FINAL MERGE OFFLOADED TO spawn_blocking
+    // === Final merge in spawn_blocking (unchanged) ===
     let map = tokio::task::spawn_blocking(move || {
         let mut final_map = AHashMap::with_capacity(2_500_000);
         for partial in partial_maps {
             final_map.extend(partial);
         }
         final_map
-    }).await
+    })
+        .await
         .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
 
-    producer.await??;
+    // Await the two background tasks
+    forwarder.await??;
+    file_reader_handle.await??;
 
-    info!("collect_hit_summary_to_accession_map_concurrent → {} entries (tiny contig map, final merge in spawn_blocking)", map.len());
+    info!(
+        "collect_hit_summary_to_accession_map_concurrent → {} entries from {}",
+        map.len(),
+        summary_path.display()
+    );
+
     Ok(map)
 }
 
@@ -8105,11 +8141,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nt_map, nr_map) = tokio::try_join!(
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            nt_initial_stream
+            nt_temp_summary_path
         ),
         collect_hit_summary_to_accession_map_concurrent(
             config.clone(),
-            nr_initial_stream
+            nr_temp_summary_path
         )
     )?;
 
