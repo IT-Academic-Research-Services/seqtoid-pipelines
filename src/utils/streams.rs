@@ -1072,6 +1072,59 @@ pub async fn stream_to_file(
     Ok(())
 }
 
+
+/// Reads a line-based text file (hit summaries, dedup.m8, raw m8, etc.) and produces
+/// batches of `ParseOutput::Bytes`. This is the "reverse" of `stream_to_file`.
+///
+/// It preserves the batched producer + worker pool pattern so the pipeline stays
+/// highly concurrent instead of becoming single-threaded when reading materialized files.
+///
+/// Use this for any post-`call_hits_m8` text files that need to feed the existing
+/// concurrent worker infrastructure.
+pub async fn read_file_lines_batched(
+    path: PathBuf,
+    batch_size: usize,
+) -> Result<(
+    mpsc::Receiver<Vec<ParseOutput>>,
+    JoinHandle<Result<(), anyhow::Error>>,
+)> {
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(8);
+
+    let handle = tokio::spawn(async move {
+        let file = TokioFile::open(&path)
+            .await
+            .map_err(|e| anyhow!("Failed to open {}: {}", path.display(), e))?;
+
+        // Large buffer is important for throughput on NVMe and /dev/shm
+        let reader = tokio::io::BufReader::with_capacity(16 * 1024 * 1024, file);
+        let mut lines = reader.lines();
+
+        let mut batch = Vec::with_capacity(batch_size);
+
+        while let Some(line) = lines.next_line().await? {
+            if line.is_empty() {
+                continue;
+            }
+
+            batch.push(ParseOutput::Bytes(Bytes::from(line.into_bytes())));
+
+            if batch.len() >= batch_size {
+                if batch_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                    break; // downstream consumer dropped
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch).await;
+        }
+
+        Ok(())
+    });
+
+    Ok((batch_rx, handle))
+}
+
 /// Reads a child process's stdout or stderr into a Vec<String>.
 ///
 /// # Arguments
