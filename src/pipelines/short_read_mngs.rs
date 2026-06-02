@@ -7873,7 +7873,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // This guarantees consecutive lines per read → streaming group-by
     // ────────────────────────────────────────────────────────────────
     let m8_sorted_start = Instant::now();
-    let m8_sorted = sort_m8_by_read_id(
+    let nt_m8_sorted = sort_m8_by_read_id(
         config.clone(),
         m8_stream,
         "nt",                    // label for logging + temp files
@@ -7905,7 +7905,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut call_cleanup_receivers,
     ) = call_hits_m8(
         config.clone(),
-        m8_sorted,
+        nt_m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -8049,7 +8049,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut call_cleanup_receivers,
     ) = call_hits_m8(
         config.clone(),
-        m8_sorted,
+        nr_m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
