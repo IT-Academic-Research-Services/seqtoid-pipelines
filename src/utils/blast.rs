@@ -2,6 +2,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::path::PathBuf;
 
 use rayon::prelude::*;
 use memchr::memchr;
@@ -21,7 +22,7 @@ use once_cell::sync::Lazy;
 use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel};
 use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
-use crate::utils::streams::ToBytes;
+use crate::utils::streams::{ToBytes, read_file_lines_batched};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
@@ -856,15 +857,15 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 
 
 pub async fn generate_taxon_count_json_from_m8(
-    m8_stream_rx:           ReceiverStream<ParseOutput>,
-    hit_summary_stream_rx:  ReceiverStream<ParseOutput>,
-    db_type:                    &str,
-    lineage_map:                Arc<AHashMap<Taxid, Lineage>>,
-    should_keep_filter:         Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_clusters:         Arc<DashMap<String, ClusterInfo>>,
-    output_tx:                  mpsc::Sender<ParseOutput>,
-    concurrency:                usize,
-    batch_size_lines:           usize,
+    refined_m8_path: PathBuf,
+    refined_hit_summary_path: PathBuf,
+    db_type: &str,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+    output_tx: mpsc::Sender<ParseOutput>,
+    concurrency: usize,
+    batch_size_lines: usize,
 ) -> Result<()> {
     if concurrency == 0 {
         return Err(anyhow::anyhow!("concurrency must be > 0"));
@@ -872,36 +873,42 @@ pub async fn generate_taxon_count_json_from_m8(
 
     let db_type = db_type.to_string();
 
-    // Bounded mpsc channel — hard concurrency cap + backpressure
+    // Read from the materialized refined files (batched for speed)
+    let (m8_rx, _) = read_file_lines_batched(refined_m8_path, batch_size_lines).await?;
+    let (hit_rx, _) = read_file_lines_batched(refined_hit_summary_path, batch_size_lines).await?;
+
     let (job_tx, job_rx) = mpsc::channel::<(Vec<String>, Vec<String>)>(concurrency);
     let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
 
-    // Producer: build batches and send to bounded channel (exact same loop as before)
+    // Producer: process batches from both files in lockstep
     let producer_handle = tokio::spawn({
-        let mut m8_stream = m8_stream_rx;
-        let mut hit_stream = hit_summary_stream_rx;
+        let mut m8_batch_stream = ReceiverStream::new(m8_rx);
+        let mut hit_batch_stream = ReceiverStream::new(hit_rx);
+
         async move {
             let mut batch_m8 = Vec::with_capacity(batch_size_lines);
             let mut batch_hit = Vec::with_capacity(batch_size_lines);
 
             loop {
-                let m8_item = m8_stream.next().await;
-                let hit_item = hit_stream.next().await;
+                let m8_batch = m8_batch_stream.next().await;
+                let hit_batch = hit_batch_stream.next().await;
 
-                match (m8_item, hit_item) {
-                    (Some(m8), Some(hit)) => {
-                        if let Ok(bytes) = m8.to_bytes() {
-                            let line = String::from_utf8_lossy(&bytes);
-                            let trimmed = line.trim_end().to_string();
-                            if !trimmed.is_empty() {
-                                batch_m8.push(trimmed);
+                match (m8_batch, hit_batch) {
+                    (Some(m8_items), Some(hit_items)) => {
+                        for item in m8_items {
+                            if let Ok(bytes) = item.to_bytes() {
+                                let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                                if !line.is_empty() {
+                                    batch_m8.push(line);
+                                }
                             }
                         }
-                        if let Ok(bytes) = hit.to_bytes() {
-                            let line = String::from_utf8_lossy(&bytes);
-                            let trimmed = line.trim_end().to_string();
-                            if !trimmed.is_empty() {
-                                batch_hit.push(trimmed);
+                        for item in hit_items {
+                            if let Ok(bytes) = item.to_bytes() {
+                                let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                                if !line.is_empty() {
+                                    batch_hit.push(line);
+                                }
                             }
                         }
 
@@ -912,7 +919,6 @@ pub async fn generate_taxon_count_json_from_m8(
                         }
                     }
                     _ => {
-                        // final partial batch
                         if !batch_m8.is_empty() || !batch_hit.is_empty() {
                             let _ = job_tx.send((batch_m8, batch_hit)).await;
                         }
@@ -925,7 +931,7 @@ pub async fn generate_taxon_count_json_from_m8(
         }
     });
 
-    // Fixed worker pool — exactly `concurrency` workers (hard cap)
+    // Worker pool (logic unchanged, just receives batches)
     let mut workers = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let rx = shared_rx.clone();
@@ -974,7 +980,6 @@ pub async fn generate_taxon_count_json_from_m8(
                         }
                     }
 
-                    // Emit results
                     for (taxid, bucket) in buckets {
                         if let Some(lineage) = lineage_map.get(&taxid) {
                             if !should_keep_filter(lineage) { continue; }
@@ -1013,9 +1018,7 @@ pub async fn generate_taxon_count_json_from_m8(
                             };
 
                             let json = serde_json::to_string(&count)? + "\n";
-                            let _ = output_tx
-                                .send(ParseOutput::Bytes(Bytes::from(json)))
-                                .await;
+                            let _ = output_tx.send(ParseOutput::Bytes(Bytes::from(json))).await;
                         }
                     }
                 } else {
@@ -1027,13 +1030,12 @@ pub async fn generate_taxon_count_json_from_m8(
         workers.push(worker);
     }
 
-    // Wait for producer + all workers
     producer_handle.await??;
     for w in workers {
         w.await??;
     }
 
-    info!("Finished taxon count JSON generation for {} (bounded channel, {} workers)", db_type, concurrency);
+    info!("Finished taxon count JSON generation for {} ({} workers)", db_type, concurrency);
     Ok(())
 }
 
