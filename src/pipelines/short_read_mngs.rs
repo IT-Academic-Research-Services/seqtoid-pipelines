@@ -66,7 +66,7 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{raw_read_count, read_fasta,
                           read_fastq, stream_record_counter, write_fasta_stream_to_file,
                           SequenceRecord, generate_taxid_fasta, generate_taxid_locator,
-                          filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq, write_combined_fastq};
+                          filter_fastq_to_bytes_stream, parse_byte_stream_to_fastq, write_combined_fastq, file_record_counter};
 use crate::utils::file::{choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
@@ -8546,8 +8546,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let (
-        taxid_mapped_rx,
-        taxid_combined_rx,
+        taxid_mapped_path,
+        taxid_combined_path,
+        taxid_temp_dir,
         load_nt_task,
         load_nr_task,
         taxid_main_task,
@@ -8566,50 +8567,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(load_nt_task);
     cleanup_tasks.push(load_nr_task);
     cleanup_tasks.push(taxid_main_task);
+    final_temp_dirs.push(taxid_temp_dir);
 
+    let refined_mapped_final_path = assembly_out_dir.join("refined_taxid_annot_mapped_only.fasta");
+    let refined_combined_final_path = assembly_out_dir.join("refined_taxid_annot.fasta");
 
-    let (taxid_mapped_rxs, taxid_mapped_router) = fanout_to_channels(
-        ReceiverStream::new(taxid_mapped_rx),
-        2,
-        "taxid_mapped",
-        &config,
-        StreamDataType::JustBytes
-    ).await?;
-    cleanup_tasks.push(taxid_mapped_router);
-
-    let mut taxid_mapped_iter = taxid_mapped_rxs.into_iter();
-    let taxid_mapped_file   = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let taxid_mapped_locator = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-
-    let mapped_path = assembly_out_dir.join("refined_taxid_annot_mapped_only_fasta");
-    let combined_path = assembly_out_dir.join("refined_taxid_annot_fasta");
-
-
-    let write_mapped_handle = write_fasta_stream_to_file(
-        ReceiverStream::new(taxid_mapped_file),
-        mapped_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "taxid_mapped_file_stream_to_write",
-    );
-    cleanup_tasks.push(write_mapped_handle);
-
-    let write_combined_handle = write_fasta_stream_to_file(
-        ReceiverStream::new(taxid_combined_rx),
-        combined_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "taxid_combined_file_stream_to_write",
-    );
-    cleanup_tasks.push(write_combined_handle);
+    tokio::fs::copy(&taxid_mapped_path, &refined_mapped_final_path).await?;
+    tokio::fs::copy(&taxid_combined_path, &refined_combined_final_path).await?;
 
 
     let assembly_dir = out_dir.join("assembly");
     info!("Starting generate_taxid_locator on combined FASTA stream");
     let (locator_outputs, mut locator_tasks, _locator_receivers) = generate_taxid_locator(
         config.clone(),
-        taxid_mapped_locator, // directly pass the receiver
+        taxid_mapped_path.clone(),
         assembly_dir,
     )
         .await
@@ -8624,8 +8595,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     let (
-        initial_taxid_mapped_rx,
-        initial_taxid_combined_rx,
+        initial_taxid_mapped_path,
+        initial_taxid_combined_path,
+        initial_taxid_temp_dir,
         initial_load_nt_task,
         initial_load_nr_task,
         initial_taxid_main_task,
@@ -8643,81 +8615,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(initial_load_nt_task);
     cleanup_tasks.push(initial_load_nr_task);
     cleanup_tasks.push(initial_taxid_main_task);
+    final_temp_dirs.push(initial_taxid_temp_dir);
 
-    let initial_mapped_path = out_dir.join("taxid_annot_mapped_only.fasta");
-    let initial_combined_path = out_dir.join("taxid_annot.fasta");
+    let initial_taxid_mapped_final_path = out_dir.join("taxid_annot_mapped_only.fasta");
+    let initial_taxid_combined_final_path = out_dir.join("taxid_annot.fasta");
 
+    tokio::fs::copy(&initial_taxid_mapped_path, &initial_taxid_mapped_final_path).await?;
+    tokio::fs::copy(&initial_taxid_combined_path, &initial_taxid_combined_final_path).await?;
 
-    info!("[run] starting fanout_to_channels for initial taxid FASTA (mapped + combined)");
-
-    let (initial_mapped_rxs, initial_mapped_router) = fanout_to_channels(
-        ReceiverStream::new(initial_taxid_mapped_rx),
-        3,
-        "initial_taxid_mapped",
-        &config,
-        StreamDataType::JustBytes
-    ).await?;
-    cleanup_tasks.push(initial_mapped_router);
-
-    let mut initial_mapped_iter = initial_mapped_rxs.into_iter();
-    let initial_taxid_mapped_file = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_taxid_mapped_locator = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_taxid_mapped_count = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    let (initial_combined_rxs, initial_combined_router) = fanout_to_channels(
-        ReceiverStream::new(initial_taxid_combined_rx),
-        2,
-        "initial_taxid_combined",
-        &config,
-        StreamDataType::JustBytes
-    ).await?;
-    cleanup_tasks.push(initial_combined_router);
-
-    let mut initial_combined_iter = initial_combined_rxs.into_iter();
-    let initial_taxid_combined_file = initial_combined_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_taxid_combined_count = initial_combined_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    // Add monitors so we finally see progress logs again
-    let initial_taxid_mapped_file = monitor_stream(
-        ReceiverStream::new(initial_taxid_mapped_file),
-        "initial_taxid_mapped_file_to_write",
-        Duration::from_secs(15),
-    );
-    let initial_taxid_combined_file = monitor_stream(
-        ReceiverStream::new(initial_taxid_combined_file),
-        "initial_taxid_combined_file_to_write",
-        Duration::from_secs(15),
-    );
-
-
-
-    let initial_write_mapped_handle = write_fasta_stream_to_file(
-        initial_taxid_mapped_file, // Clone rx if needed for logging
-        initial_mapped_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "initial_taxid_mapped_file_stream_to_write",
-    );
-    cleanup_tasks.push(initial_write_mapped_handle);
-
-    let initial_write_combined_handle = write_fasta_stream_to_file(
-        initial_taxid_combined_file,
-        initial_combined_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "initial_taxid_combined_file_stream_to_write",
-    );
-    cleanup_tasks.push(initial_write_combined_handle);
-
-
-    let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false).await?;
-    let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false).await?;
+    let initial_mapped_count = file_record_counter( initial_taxid_mapped_path.clone(), false).await?;
+    let initial_combined_count = file_record_counter(initial_taxid_combined_path.clone(), false).await?;
     info!("Experimental: {} mapped, {} combined records", initial_mapped_count, initial_combined_count);
 
     info!("Starting generate_taxid_locator on second");
     let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) = generate_taxid_locator(
         config.clone(),
-        initial_taxid_mapped_locator,
+        initial_taxid_mapped_path,
         out_dir.clone(),
     )
         .await

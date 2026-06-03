@@ -20,6 +20,7 @@ use tokio_stream::{self as stream};
 
 use needletail::{parse_fastx_file, FastxReader, parser::{FastqReader}};
 use futures::stream::StreamExt;
+use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::time::{Duration};
@@ -35,7 +36,7 @@ use once_cell::sync::Lazy;
 use bytes::Bytes;
 
 use crate::utils::streams::{ParseOutput, ToBytes, read_file_lines_batched};
-use crate::utils::file::{extension_remover};
+use crate::utils::file::{extension_remover, choose_temp_dir};
 use crate::cli::Technology;
 use crate::config::defs::{StreamDataType, FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
 use crate::utils::taxonomy::{get_valid_lineage, combine_taxon_loc_json};
@@ -1143,6 +1144,42 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
+
+pub async fn file_record_counter(
+    path: PathBuf,
+    early_exit: bool,
+) -> Result<u64, anyhow::Error> {
+    let (rx, _) = read_file_lines_batched(path, 8192).await?;
+    let mut stream = ReceiverStream::new(rx);
+    let mut counter: u64 = 0;
+
+    while let Some(batch) = stream.next().await {
+        for item in batch {
+            match item {
+                ParseOutput::Bytes(chunk) => {
+                    let chunk_str = String::from_utf8_lossy(&chunk);
+                    for line in chunk_str.lines() {
+                        if line.starts_with('@') || line.starts_with('>') {
+                            counter += 1;
+                            if early_exit {
+                                return Ok(1); // Early exit: file is not empty
+                            }
+                        }
+                    }
+                }
+                ParseOutput::Fastq(_) | ParseOutput::Fasta(_) => {
+                    counter += 1;
+                    if early_exit {
+                        return Ok(1);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(counter)
+}
+
 #[allow(dead_code)]
 pub async fn stream_record_counter(
     rx: mpsc::Receiver<ParseOutput>,
@@ -1491,23 +1528,37 @@ pub async fn generate_taxid_fasta(
     nr_hit_summary_path: PathBuf,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
 ) -> Result<(
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
+    PathBuf,
+    PathBuf,
+    TempDir,
     JoinHandle<Result<()>>,
     JoinHandle<Result<()>>,
     JoinHandle<Result<()>>,
 )> {
-    // Output channels
-    let (mapped_tx, mapped_rx) = mpsc::channel(1024);
-    let (combined_tx, combined_rx) = mpsc::channel(2048);
+    // Create temp directory for outputs
+    let temp_dir = choose_temp_dir(
+        4 * 1024 * 1024 * 1024, // generous headroom
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        2,
+        true,
+    ).await?;
+
+    let taxid_mapped_path = temp_dir.path().join("taxid_mapped_contigs.fasta");
+    let taxid_combined_path = temp_dir.path().join("taxid_combined.fasta");
+
+    // Open writers (protected by mutex for concurrent writes from workers)
+    let mapped_file = tokio::fs::File::create(&taxid_mapped_path).await?;
+    let combined_file = tokio::fs::File::create(&taxid_combined_path).await?;
+
+    let mapped_writer = Arc::new(tokio::sync::Mutex::new(mapped_file));
+    let combined_writer = Arc::new(tokio::sync::Mutex::new(combined_file));
 
     // Channels for completed hit maps
     let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
     let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
 
-    // ────────────────────────────────────────────────────────────────
-    // Load NT hit summary file → build map
-    // ────────────────────────────────────────────────────────────────
+    // ── Load NT hit summary ─────────────────────────────────────────
     let load_nt_task = tokio::spawn({
         let path = nt_hit_summary_path.clone();
         async move {
@@ -1534,9 +1585,7 @@ pub async fn generate_taxid_fasta(
         }
     });
 
-    // ────────────────────────────────────────────────────────────────
-    // Load NR hit summary file → build map
-    // ────────────────────────────────────────────────────────────────
+    // ── Load NR hit summary ─────────────────────────────────────────
     let load_nr_task = tokio::spawn({
         let path = nr_hit_summary_path.clone();
         async move {
@@ -1563,9 +1612,7 @@ pub async fn generate_taxid_fasta(
         }
     });
 
-    // ────────────────────────────────────────────────────────────────
-    // Main processing task
-    // ────────────────────────────────────────────────────────────────
+    // ── Main processing task ────────────────────────────────────────
     let main_task = tokio::spawn(async move {
         let nt_hits = nt_hits_rx.recv().await.ok_or(anyhow!("NT hits map not received"))?;
         let nr_hits = nr_hits_rx.recv().await.ok_or(anyhow!("NR hits map not received"))?;
@@ -1581,7 +1628,7 @@ pub async fn generate_taxid_fasta(
 
         const BATCH_SIZE: usize = 1000;
 
-        // ── Process mapped (annotated) contigs ───────────────────────
+        // ── Mapped (annotated) contigs with taxid headers ───────────
         {
             let (batch_tx, batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
             let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
@@ -1589,8 +1636,8 @@ pub async fn generate_taxid_fasta(
             let mut worker_handles = Vec::with_capacity(concurrency);
             for _ in 0..concurrency {
                 let rx = batch_rx.clone();
-                let m_tx = mapped_tx.clone();
-                let c_tx = combined_tx.clone();
+                let mapped_writer = mapped_writer.clone();
+                let combined_writer = combined_writer.clone();
                 let nt_hits = nt_hits.clone();
                 let nr_hits = nr_hits.clone();
                 let lineage_map = lineage_map.clone();
@@ -1629,15 +1676,24 @@ pub async fn generate_taxid_fasta(
                                 seq: rec.seq_arc(),
                             };
 
-                            m_tx.send(ParseOutput::Fasta(new_rec.clone())).await.map_err(|_| anyhow!("mapped_tx dropped"))?;
-                            c_tx.send(ParseOutput::Fasta(new_rec)).await.map_err(|_| anyhow!("combined_tx dropped"))?;
+                            let fasta_bytes = new_rec.to_bytes()?;
+
+                            // Write to both files
+                            {
+                                let mut w = mapped_writer.lock().await;
+                                w.write_all(&fasta_bytes).await?;
+                            }
+                            {
+                                let mut w = combined_writer.lock().await;
+                                w.write_all(&fasta_bytes).await?;
+                            }
                         }
                     }
                     Ok::<(), anyhow::Error>(())
                 }));
             }
 
-            // Producer: read mapped contigs file
+            // Producer from mapped contigs file
             let (rx, _) = read_file_lines_batched(mapped_contigs_path, 8192).await?;
             let mut stream = ReceiverStream::new(rx);
             let mut current_batch = Vec::with_capacity(BATCH_SIZE);
@@ -1645,7 +1701,6 @@ pub async fn generate_taxid_fasta(
             while let Some(batch) = stream.next().await {
                 for item in batch {
                     if let ParseOutput::Bytes(bytes) = item {
-                        // Each Bytes item is one complete FASTA record (from previous step)
                         let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(&bytes))
                             .map_err(|e| anyhow!("Failed to parse mapped contig: {}", e))?;
 
@@ -1671,7 +1726,7 @@ pub async fn generate_taxid_fasta(
             }
         }
 
-        // ── Process unidentified contigs (conform headers) ───────────
+        // ── Unidentified contigs (conform headers) ───────────────────
         {
             let unidentified_concurrency = compute_phase_concurrency(
                 &config,
@@ -1689,7 +1744,7 @@ pub async fn generate_taxid_fasta(
             let mut unid_workers = Vec::with_capacity(unidentified_concurrency);
             for _ in 0..unidentified_concurrency {
                 let rx = unid_batch_rx.clone();
-                let c_tx = combined_tx.clone();
+                let combined_writer = combined_writer.clone();
 
                 unid_workers.push(tokio::spawn(async move {
                     loop {
@@ -1711,14 +1766,17 @@ pub async fn generate_taxid_fasta(
                                 desc: new_desc,
                                 seq: rec.seq_arc(),
                             };
-                            let _ = c_tx.send(ParseOutput::Fasta(new_rec)).await;
+
+                            let fasta_bytes = new_rec.to_bytes()?;
+                            let mut w = combined_writer.lock().await;
+                            w.write_all(&fasta_bytes).await?;
                         }
                     }
                     Ok::<(), anyhow::Error>(())
                 }));
             }
 
-            // Producer: read unidentified contigs file
+            // Producer from unidentified contigs file
             let (rx, _) = read_file_lines_batched(unidentified_contigs_path, 8192).await?;
             let mut stream = ReceiverStream::new(rx);
             let mut current_batch = Vec::with_capacity(unid_batch_size);
@@ -1750,14 +1808,23 @@ pub async fn generate_taxid_fasta(
             }
         }
 
-        drop(mapped_tx);
-        drop(combined_tx);
+        // Flush writers
+        {
+            let mut w = mapped_writer.lock().await;
+            w.flush().await?;
+        }
+        {
+            let mut w = combined_writer.lock().await;
+            w.flush().await?;
+        }
+
         Ok(())
     });
 
     Ok((
-        mapped_rx,
-        combined_rx,
+        taxid_mapped_path,
+        taxid_combined_path,
+        temp_dir,
         load_nt_task,
         load_nr_task,
         main_task,
@@ -1768,7 +1835,7 @@ pub async fn generate_taxid_fasta(
 
 pub async fn generate_taxid_locator(
     config: Arc<RunConfig>,
-    fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
+    fasta_path: PathBuf,
     assembly_dir: PathBuf,
 ) -> Result<
     (
@@ -1823,7 +1890,6 @@ pub async fn generate_taxid_locator(
 
             let (tx, rx) = mpsc::channel::<(String, String)>(32768);
 
-            // Clone what the worker needs before moving into closure
             let taxid_field_for_worker = taxid_field.clone();
             let hit_type_for_worker = hit_type_owned.clone();
             let fa_path_for_worker = fa_path.clone();
@@ -1898,18 +1964,33 @@ pub async fn generate_taxid_locator(
         }
     }
 
-    // Stream parsing + selective broadcast
-    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
-    while let Some(item) = fasta_stream.next().await {
-        if let ParseOutput::Fasta(rec) = item {
-            let header = rec.id().to_string();
-            let seq = String::from_utf8(rec.seq().to_vec())
-                .map_err(|e| anyhow!("Invalid UTF-8 in sequence: {}", e))?;
+    // ────────────────────────────────────────────────────────────────
+    // Read from file instead of stream
+    // ────────────────────────────────────────────────────────────────
+    let (rx, _) = read_file_lines_batched(fasta_path, 8192).await?;
+    let mut fasta_stream = ReceiverStream::new(rx);
 
-            // Send only to channels where this header has a valid taxid for that field
-            for (field, tx) in &record_channels {
-                if get_taxid(&header, field).unwrap_or(-1) != -1 {
-                    let _ = tx.send((header.clone(), seq.clone())).await;
+    while let Some(batch) = fasta_stream.next().await {
+        for item in batch {
+            if let ParseOutput::Bytes(bytes) = item {
+                // Each Bytes item should be one complete FASTA record
+                let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(&bytes))
+                    .map_err(|e| anyhow!("Failed to parse FASTA record: {}", e))?;
+
+                if let Some(record) = reader.next() {
+                    let rec = record.map_err(|e| anyhow!("Needletail error: {}", e))?;
+                    let seq_rec: SequenceRecord = rec.into();
+
+                    let header = seq_rec.id().to_string();
+                    let seq = String::from_utf8(seq_rec.seq().to_vec())
+                        .map_err(|e| anyhow!("Invalid UTF-8 in sequence: {}", e))?;
+
+                    // Send only to channels where this header has a valid taxid for that field
+                    for (field, tx) in &record_channels {
+                        if get_taxid(&header, field).unwrap_or(-1) != -1 {
+                            let _ = tx.send((header.clone(), seq.clone())).await;
+                        }
+                    }
                 }
             }
         }
