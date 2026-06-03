@@ -644,56 +644,54 @@ pub fn detect_simd_level() -> SimdLevel {
     }
 }
 
-/// Ensures Transparent Huge Pages are enabled in the best mode for MMseqs/Diamond.
-/// Should be called early in pipeline startup on big Linux nodes.
+/// Configures Transparent Huge Pages (THP) safely for large EPYC nodes.
+///
+/// We deliberately use `madvise` instead of `always`. Forcing `always` globally
+/// interacts very badly with GNU sort (when using large `-S` buffers) and some
+/// other tools, causing severe memory fragmentation and massive slowdowns on
+/// machines with ≥ 512 GiB RAM.
+///
+/// `madvise` is the safe default: it lets the application (and libraries) opt
+/// into huge pages where it actually helps (large allocations, mmseqs, etc.)
+/// without punishing tools like `sort`, `samtools sort`, etc.
 pub async fn ensure_transparent_hugepages(config: &RunConfig) -> Result<()> {
     if !cfg!(target_os = "linux") || config.max_cores < 64 {
-        debug!("THP optimization skipped (not a large Linux node)");
+        debug!("THP configuration skipped (not a large Linux node)");
         return Ok(());
     }
 
-    info!("Ensuring Transparent Huge Pages (THP) are optimized for large EPYC nodes...");
+    info!("Configuring Transparent Huge Pages (madvise mode) for large EPYC node...");
 
+    // We only touch these two. defrag is left at the system default.
     let paths = [
         "/sys/kernel/mm/transparent_hugepage/enabled",
         "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
-        "/sys/kernel/mm/transparent_hugepage/defrag",
     ];
 
-    let target = "always";
+    let target = "madvise";
 
     for path in &paths {
         let current = match tokio::fs::read_to_string(path).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {
-                warn!("Could not read {}: {}", path, e);
+                debug!("Could not read {}: {}", path, e);
                 continue;
             }
         };
 
-        if current.contains(target) {
-            debug!("{} already set to {}", path, target);
+        // Already correct?
+        if current.contains("[madvise]") || current == target {
+            debug!("{} already set to madvise", path);
             continue;
         }
 
-        // Try to set it
         if let Err(e) = tokio::fs::write(path, target).await {
-            warn!("Failed to write '{}' to {}: {}", target, path, e);
-            // Non-fatal — continue
+            warn!("Failed to set {} to '{}': {}", path, target, e);
         } else {
-            info!("Set {} = {}", path, target);
+            info!("Set {} → {}", path, target);
         }
     }
 
-    // Also encourage defrag
-    let _ = tokio::fs::write("/sys/kernel/mm/transparent_hugepage/defrag", "always").await;
-
-    // Optional: drop caches to encourage promotion
-    if config.max_cores >= 128 {
-        let _ = tokio::fs::write("/proc/sys/vm/drop_caches", "3").await;
-        info!("Dropped page cache to encourage hugepage promotion");
-    }
-
-    info!("THP optimization complete (mode: always)");
+    info!("THP configuration complete (mode: madvise)");
     Ok(())
 }
