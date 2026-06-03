@@ -2582,11 +2582,17 @@ pub async fn sort_m8_by_read_id(
         .map_err(|e| PipelineError::Other(anyhow!("{} writer task panicked: {}", tag, e)))?
         .map_err(|e| PipelineError::IOError(format!("{} writer task failed: {}", tag, e)))?;
 
+    let sort_buffer = if config.available_ram > 256 * 1024 * 1024 * 1024 {
+        "32G"
+    } else {
+        "8G"
+    };
+
     // 2) Only now spawn GNU sort, so it reads a complete file.
     let sort_config = crate::utils::command::sort::SortConfig {
         key: "-k1,1".to_string(),
         parallel: None,
-        buffer_size: Some("50%".to_string()),
+        buffer_size: Some(sort_buffer.to_string()),
         temp_dir: Some(temp_dir.path().to_string_lossy().into_owned()),
         output: Some(sorted_path.to_string_lossy().into_owned()),
         extra_fields: HashMap::new(),
