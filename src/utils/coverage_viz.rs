@@ -13,7 +13,7 @@ use tokio::fs::create_dir_all;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::utils::blast::M8Record;
-use crate::utils::streams::{ParseOutput, ToBytes};
+use crate::utils::streams::{ParseOutput, ToBytes, read_file_lines_batched};
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
@@ -102,11 +102,11 @@ struct CoverageBin {
 
 
 pub async fn generate_coverage_viz(
-    refined_gsnap_hitsummary2_tab: ReceiverStream<ParseOutput>,
-    refined_gsnap_blast_top_m8: ReceiverStream<ParseOutput>,
+    refined_gsnap_hitsummary2_tab: PathBuf,           // ← now PathBuf
+    refined_gsnap_blast_top_m8: ReceiverStream<ParseOutput>, // ← keep as stream
     contig_coverage_json: PathBuf,
     contig_stats_json: PathBuf,
-    gsnap_deduped_m8: ReceiverStream<ParseOutput>,
+    gsnap_deduped_m8: PathBuf,                        // ← now PathBuf
     nt_info_db: PathBuf,
     output_dir: PathBuf,
     max_num_bins_coverage: Option<usize>,
@@ -170,11 +170,11 @@ pub async fn generate_coverage_viz(
 }
 
 async fn prepare_data(
-    hit_summary: ReceiverStream<ParseOutput>,
-    blast_top_m8: ReceiverStream<ParseOutput>,
+    hit_summary_path: PathBuf,                    // ← now PathBuf
+    blast_top_m8_stream: ReceiverStream<ParseOutput>, // keep stream
     contig_coverage_json: &Path,
     contig_stats_json: &Path,
-    gsnap_deduped_m8: ReceiverStream<ParseOutput>,
+    gsnap_deduped_m8_path: PathBuf,               // ← now PathBuf
     info_dict: HashMap<String, (String, u64)>,
     min_contig_size: u64,
     num_accessions_per_taxon: usize,
@@ -188,7 +188,7 @@ async fn prepare_data(
     let valid_contigs = get_valid_contigs_with_read_counts(contig_stats_json, min_contig_size)?;
 
     let (mut accession_data, mut taxon_data) =
-        generate_accession_data(hit_summary, &valid_contigs).await?;
+        generate_accession_data(hit_summary_path, &valid_contigs).await?;
 
     if !keep_taxons_with_no_contigs {
         remove_taxons_with_no_contigs(&mut accession_data, &mut taxon_data);
@@ -196,11 +196,11 @@ async fn prepare_data(
 
     augment_accession_data_with_info(&info_dict, &mut accession_data);
 
-    let assigned_reads = get_unassigned_reads_set(&accession_data);  // actually assigned, per Python
+    let assigned_reads = get_unassigned_reads_set(&accession_data);
 
-    let mut contig_data = generate_contig_data(blast_top_m8, &valid_contigs).await?;
+    let mut contig_data = generate_contig_data(blast_top_m8_stream, &valid_contigs).await?;
 
-    let read_data = generate_read_data(gsnap_deduped_m8, &assigned_reads).await?;
+    let read_data = generate_read_data(gsnap_deduped_m8_path, &assigned_reads).await?;
 
     augment_contig_data_with_coverage(contig_coverage_json, &mut contig_data)?;
 
@@ -245,38 +245,43 @@ fn get_valid_contigs_with_read_counts(
 }
 
 async fn generate_accession_data(
-    mut hit_summary: ReceiverStream<ParseOutput>,
+    hit_summary_path: PathBuf,
     valid_contigs: &HashMap<String, u64>,
 ) -> Result<(HashMap<String, AccessionData>, HashMap<String, TaxonData>)> {
+    let (rx, _) = read_file_lines_batched(hit_summary_path, 8192).await?;
+    let mut stream = ReceiverStream::new(rx);
+
     let mut accession_data: HashMap<String, AccessionData> = HashMap::new();
     let mut taxon_data: HashMap<String, TaxonData> = HashMap::new();
 
     let mut line_count = 0;
 
-    while let Some(item) = hit_summary.next().await {
-        line_count += 1;
-        if line_count % 100_000 == 0 {
-            log::info!("Processed {} hit_summary lines", line_count);
-        }
+    while let Some(batch) = stream.next().await {
+        for item in batch {
+            line_count += 1;
+            if line_count % 100_000 == 0 {
+                log::info!("Processed {} hit_summary lines", line_count);
+            }
 
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
-        let fields: Vec<&str> = line.trim().split('\t').collect();
+            let bytes = item.to_bytes()?;
+            let line = String::from_utf8_lossy(&bytes);
+            let fields: Vec<&str> = line.trim().split('\t').collect();
 
-        if fields.len() >= 12 && valid_contigs.contains_key(fields[7]) {
-            let taxon = fields[9].to_string();
-            let acc = fields[8].to_string();
-            let contig = fields[7].to_string();
+            if fields.len() >= 12 && valid_contigs.contains_key(fields[7]) {
+                let taxon = fields[9].to_string();
+                let acc = fields[8].to_string();
+                let contig = fields[7].to_string();
 
-            taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
-            accession_data.entry(acc).or_default().contigs.push(contig);
-        } else if fields.len() >= 5 {
-            let taxon = fields[4].to_string();
-            let acc = fields[3].to_string();
-            let read = fields[0].to_string();
+                taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
+                accession_data.entry(acc).or_default().contigs.push(contig);
+            } else if fields.len() >= 5 {
+                let taxon = fields[4].to_string();
+                let acc = fields[3].to_string();
+                let read = fields[0].to_string();
 
-            taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
-            accession_data.entry(acc).or_default().reads.push(read);
+                taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
+                accession_data.entry(acc).or_default().reads.push(read);
+            }
         }
     }
 
@@ -389,50 +394,54 @@ async fn generate_contig_data(
 }
 
 async fn generate_read_data(
-    mut gsnap_deduped_m8: ReceiverStream<ParseOutput>,
+    gsnap_deduped_m8_path: PathBuf,
     assigned_reads: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<ReadHit>>> {
-    let mut read_data: HashMap<String, Vec<ReadHit>> = HashMap::new();
+    let (rx, _) = read_file_lines_batched(gsnap_deduped_m8_path, 8192).await?;
+    let mut stream = ReceiverStream::new(rx);
 
+    let mut read_data: HashMap<String, Vec<ReadHit>> = HashMap::new();
     let mut line_count = 0;
 
-    while let Some(item) = gsnap_deduped_m8.next().await {
-        line_count += 1;
-        if line_count % 100_000 == 0 {
-            log::info!("Processed {} gsnap_deduped_m8 lines", line_count);
-        }
+    while let Some(batch) = stream.next().await {
+        for item in batch {
+            line_count += 1;
+            if line_count % 100_000 == 0 {
+                log::info!("Processed {} gsnap_deduped_m8 lines", line_count);
+            }
 
-        let bytes = item.to_bytes()?;
-        let line = String::from_utf8_lossy(&bytes);
-        let line_trim = line.trim_end();
-        if line_trim.is_empty() {
-            continue;
-        }
-
-        let m8 = match M8Record::parse_line_nt(line_trim) {
-            Ok(record) => record,
-            Err(e) => {
-                warn!("Failed to parse m8 line: {} - {}", line_trim, e);
+            let bytes = item.to_bytes()?;
+            let line = String::from_utf8_lossy(&bytes);
+            let line_trim = line.trim_end();
+            if line_trim.is_empty() {
                 continue;
             }
-        };
 
-        let read_name = m8.qname.clone();
-        if assigned_reads.contains(&read_name) {
-            continue;
+            let m8 = match M8Record::parse_line_nt(line_trim) {
+                Ok(record) => record,
+                Err(e) => {
+                    warn!("Failed to parse m8 line: {} - {}", line_trim, e);
+                    continue;
+                }
+            };
+
+            let read_name = m8.qname.clone();
+            if assigned_reads.contains(&read_name) {
+                continue;
+            }
+
+            let accession_id = m8.tname.clone();
+            let prop_mismatch = m8.mismatch as f64 / m8.alen as f64;
+
+            let hit = ReadHit {
+                subject_start: m8.tstart,
+                subject_end: m8.tend,
+                prop_mismatch,
+                accession: accession_id,
+            };
+
+            read_data.entry(read_name).or_default().push(hit);
         }
-
-        let accession_id = m8.tname.clone();
-        let prop_mismatch = m8.mismatch as f64 / m8.alen as f64;
-
-        let hit = ReadHit {
-            subject_start: m8.tstart,
-            subject_end: m8.tend,
-            prop_mismatch,
-            accession: accession_id,
-        };
-
-        read_data.entry(read_name).or_default().push(hit);
     }
 
     Ok(read_data)

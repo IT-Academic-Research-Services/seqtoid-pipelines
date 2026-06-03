@@ -6252,7 +6252,7 @@ pub async fn blast_contigs(
         blast_command,
         blast_spawn_start.elapsed()
     );
-    info!("blast_contigs right before output aAAAAAAAAAA");
+
     let blast_out_stream = parse_child_output(
         &mut blast_child,
         ChildStream::Stdout,
@@ -7898,8 +7898,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
-        let nt_temp_m8_path = nt_temp_m8_path.clone();           // from call_hits_m8
-        let nt_temp_summary_path = nt_temp_summary_path.clone(); // from call_hits_m8
+        let nt_temp_m8_path = nt_temp_m8_path.clone();
+        let nt_temp_summary_path = nt_temp_summary_path.clone();
+
         async move {
             let start = Instant::now();
             info!("[run] generate_taxon_counts(NT) started");
@@ -8345,10 +8346,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
+        let nt_temp_m8_path = nt_temp_m8_path.clone();
+        let nt_temp_summary_path = nt_temp_summary_path.clone();
 
         async move {
-            // Just run blast_contigs and return its result directly.
-            // No extra fanout or re-materialization needed here anymore.
             blast_contigs(
                 config,
                 NT_TAG,
@@ -8388,6 +8389,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
+        let nr_temp_m8_path = nr_temp_m8_path.clone();
+        let nr_temp_summary_path = nr_temp_summary_path.clone();
 
         async move {
             blast_contigs(
@@ -8556,8 +8559,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         refined_mapped_contigs_path,
         refined_unidentified_contigs_path,
-        nt_temp_summary_path,
-        nr_temp_summary_path,
+        nt_temp_summary_path.clone(),
+        nr_temp_summary_path.clone(),
         lineage_map.clone(),
     )
         .await
@@ -8670,13 +8673,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir_for_viz = out_dir.clone();
     let coverage_task = if !skip_coverage_viz {
         info!("All coverage viz inputs present — spawning visualization task");
+
+        let nt_temp_m8_path = nt_temp_m8_path.clone();
+        let nt_temp_summary_path = nt_temp_summary_path.clone();
+        let nt_refined_top_stream = nt_refined_top_stream; // move the receiver
+
         Some(tokio::spawn(async move {
             generate_coverage_viz(
-                ReceiverStream::new(nt_hit_summary_coverage),
-                ReceiverStream::new(nt_refined_m8_top_stream_out),
+                nt_temp_summary_path,                           // PathBuf (hit summary)
+                ReceiverStream::new(nt_refined_top_stream),     // stream (top hits)
                 assembly_outputs.coverage_json,
                 assembly_outputs.contig_stats_json,
-                ReceiverStream::new(nt_m8_viz),
+                nt_temp_m8_path,                                // PathBuf (m8)
                 nt_info_db_path,
                 out_dir_for_viz,
                 Some(MAX_NUM_BINS_COVERAGE),
@@ -8690,7 +8698,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
         None
     };
-
 
 
 
