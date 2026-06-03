@@ -339,6 +339,33 @@ where
 }
 
 
+/// Returns the binary + arguments to use, optionally wrapped with numactl.
+///
+/// This is the single source of truth for numactl policy.
+/// Falls back gracefully if numactl is not installed.
+fn build_command_with_numa(
+    config: &RunConfig,
+    cmd_tag: &str,
+    args: Vec<String>,
+) -> (String, Vec<String>) {
+    let should_use = cfg!(target_os = "linux")
+        && config.max_cores >= 64
+        && matches!(cmd_tag, MMSEQS_TAG | DIAMOND_TAG | SPADES_TAG);
+
+    if should_use {
+        if which::which("numactl").is_ok() {
+            let mut final_args = vec!["--interleave=all".to_string(), cmd_tag.to_string()];
+            final_args.extend(args);
+            debug!("Using numactl --interleave=all for {}", cmd_tag);
+            return ("numactl".to_string(), final_args);
+        } else {
+            warn!("numactl not found — running {} without NUMA interleave", cmd_tag);
+        }
+    }
+
+    (cmd_tag.to_string(), args)
+}
+
 /// Asynchronously spawn an external process and feed it a stream as stdin.
 /// Capture stdout and return from function.
 ///
@@ -376,34 +403,35 @@ pub async fn stream_to_cmd(
         &config,
         "stream_to_cmd",
         data_type,
-        1.8, // 1.0 = normal, 1.5–2.0 for very hot paths later
+        1.8,
     );
+    let batch_size_bytes = writer_capacity / 4;
 
-    let batch_size_bytes = writer_capacity / 4; // keep ~4:1 batching ratio
+    let (binary, final_args) = build_command_with_numa(config.as_ref(), cmd_tag, args);
 
-    let cmd_tag_owned = cmd_tag.to_string();
-    let cmd_tag_err_owned = cmd_tag.to_string();
-    let stderr_log_path_clone = stderr_log_path.clone();
-
-    let mut child = Command::new(&cmd_tag_owned)
-        .args(&args)
+    let mut child = Command::new(&binary)
+        .args(&final_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag, e))?;
 
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
+        .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag))?;
 
     let child = Arc::new(tokio::sync::Mutex::new(child));
     let child_clone = child.clone();
+
+    let cmd_tag_owned = cmd_tag.to_string();
+    let cmd_tag_err_owned = cmd_tag.to_string();
+    let stderr_log_path_clone = stderr_log_path.clone();
 
     let stdin_task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(writer_capacity, stdin);
@@ -578,24 +606,10 @@ pub async fn spawn_cmd(
 
     let cmd_tag_owned = cmd_tag.to_string();
 
-    // === NUMA SUPPORT - ONLY for tools that benefit ===
-    let (binary, final_args) = if should_use_numactl(config.as_ref(), cmd_tag) {
-        let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag_owned.clone()];
-        numa_args.extend(args);
-        debug!("spawn_cmd: Prepended numactl --interleave=all for {}", cmd_tag);
-        ("numactl", numa_args)
-    } else {
-        ("", args)   // empty string = use original binary
-    };
+    // === ONLY CHANGE: numactl support ===
+    let (binary, final_args) = build_command_with_numa(config.as_ref(), cmd_tag, args);
 
-    eprintln!("[{} cmd]: {}", cmd_tag, final_args.join(" "));
-
-    // Use the correct binary
-    let mut child = if binary.is_empty() {
-        Command::new(&cmd_tag_owned)
-    } else {
-        Command::new(binary)
-    }
+    let mut child = Command::new(&binary)
         .args(&final_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -603,14 +617,14 @@ pub async fn spawn_cmd(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
 
-    let stderr_task = {
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
 
-        let cmd_tag_clone = cmd_tag_owned.clone();
+    let stderr_task = {
         let stderr_log_path_clone = stderr_log_path.clone();
+        let cmd_tag_clone = cmd_tag_owned.clone();
 
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
