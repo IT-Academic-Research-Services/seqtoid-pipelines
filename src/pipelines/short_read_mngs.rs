@@ -4070,27 +4070,43 @@ pub fn parse_fasta_batch_to_annotated_streaming(
 
 pub async fn generate_annotated_fasta_stream(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,           // contig FASTA
+    input_stream: ReceiverStream<ParseOutput>, // contigs.fasta stream
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    nt_map: AHashMap<String, String>,                    // tiny contig → NT accession
-    nr_map: AHashMap<String, String>,                    // tiny contig → NR accession
+    nt_map: AHashMap<String, String>,
+    nr_map: AHashMap<String, String>,
     _concurrency: usize,
 ) -> Result<(
-    mpsc::Receiver<ParseOutput>,               // annotated mapped contigs
-    mpsc::Receiver<ParseOutput>,               // unidentified (expanded)
-    mpsc::Receiver<ParseOutput>,               // unique unidentified (reps only)
+    PathBuf,                    // mapped_contigs_path
+    PathBuf,                    // unidentified_contigs_path
+    PathBuf,                    // unique_unidentified_path
+    TempDir,                    // keep alive until end of pipeline
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 )> {
     let channel_cap = (config.base_buffer_size / 4).max(10_000);
-    let (mapped_tx, mapped_rx) = mpsc::channel(channel_cap);
-    let (unid_tx, unid_rx) = mpsc::channel(channel_cap);
-    let (uniq_tx, uniq_rx) = mpsc::channel(channel_cap);
+
+    // Create temp directory for the three output FASTA files
+    let temp_dir = choose_temp_dir(
+        2 * 1024 * 1024 * 1024, // generous headroom for annotated contigs
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        2,
+        true,
+    )
+        .await?;
+
+    let mapped_path = temp_dir.path().join("mapped_contigs.fasta");
+    let unidentified_path = temp_dir.path().join("unidentified_contigs.fasta");
+    let unique_unidentified_path = temp_dir.path().join("unique_unidentified_contigs.fasta");
+
+    // Open writers
+    let mut mapped_writer = tokio::fs::File::create(&mapped_path).await?;
+    let mut unidentified_writer = tokio::fs::File::create(&unidentified_path).await?;
+    let mut unique_writer = tokio::fs::File::create(&unique_unidentified_path).await?;
 
     let (done_tx, done_rx) = oneshot::channel();
     let cleanup_receivers = vec![done_rx];
 
-    // Wrap the tiny maps for the rayon closure
     let nt_map_arc = Arc::new(nt_map);
     let nr_map_arc = Arc::new(nr_map);
 
@@ -4098,11 +4114,11 @@ pub async fn generate_annotated_fasta_stream(
         config.clone(),
         input_stream,
         move |batch: Vec<u8>| {
-            parse_fasta_batch_to_annotated_streaming(   // ← new streaming parser
-                                                        batch,
-                                                        &duplicate_clusters,
-                                                        &nt_map_arc,
-                                                        &nr_map_arc,
+            parse_fasta_batch_to_annotated_streaming(
+                batch,
+                &duplicate_clusters,
+                &nt_map_arc,
+                &nr_map_arc,
             )
         },
         "generate_annotated_fasta_streaming",
@@ -4111,38 +4127,48 @@ pub async fn generate_annotated_fasta_stream(
 
     let demux_handle = tokio::spawn(async move {
         let mut stream = batched_stream;
+
         while let Some(item) = stream.next().await {
             if let ParseOutput::Bytes(b) = item {
-                if b.is_empty() { continue; }
+                if b.is_empty() {
+                    continue;
+                }
                 let tag = b[0];
                 let data = &b[1..];
 
-                let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(data))
-                    .map_err(|e| anyhow!("Failed to parse demuxed record: {}", e))?;
-
-                if let Some(record) = reader.next() {
-                    let rec = record.map_err(|e| anyhow!("Needletail error: {}", e))?;
-                    let seq_rec: SequenceRecord = rec.into();
-                    let out_item = ParseOutput::Fasta(seq_rec);
-
-                    match tag {
-                        0 => { let _ = mapped_tx.send(out_item).await; },
-                        1 => { let _ = unid_tx.send(out_item).await; },
-                        2 => { let _ = uniq_tx.send(out_item).await; },
-                        _ => warn!("Unknown tag in generate_annotated_fasta_stream: {}", tag),
+                // Write the FASTA data to the correct file based on tag
+                let writer = match tag {
+                    0 => &mut mapped_writer,
+                    1 => &mut unidentified_writer,
+                    2 => &mut unique_writer,
+                    _ => {
+                        warn!("Unknown tag in generate_annotated_fasta_stream: {}", tag);
+                        continue;
                     }
+                };
+
+                // data already contains the full FASTA record(s)
+                if let Err(e) = writer.write_all(data).await {
+                    warn!("Failed to write annotated FASTA record: {}", e);
                 }
             }
         }
+
+        // Flush all writers
+        let _ = mapped_writer.flush().await;
+        let _ = unidentified_writer.flush().await;
+        let _ = unique_writer.flush().await;
+
         let _ = done_tx.send(Ok(()));
-        info!("generate_annotated_fasta_stream completed");
+        info!("generate_annotated_fasta_stream completed (wrote to temp files)");
         Ok::<(), anyhow::Error>(())
     });
 
     Ok((
-        mapped_rx,
-        unid_rx,
-        uniq_rx,
+        mapped_path,
+        unidentified_path,
+        unique_unidentified_path,
+        temp_dir,
         vec![demux_handle],
         cleanup_receivers,
     ))
@@ -7333,6 +7359,7 @@ pub async fn mmseqs_non_host_align(
 pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let out_dir = config.out_dir.clone();
+    let assembly_out_dir = out_dir.join("assembly");
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
@@ -8082,103 +8109,40 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )?;
 
     // Generate the annotated FASTA stream
-    let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) =
-        generate_annotated_fasta_stream(
-            config.clone(),
-            interleaved_stream,
-            duplicate_clusters.clone(),
-            nt_map,                     // small contig → NT accession map
-            nr_map,                     // small contig → NR accession map
-            annot_concurrency,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
-
-    cleanup_tasks.append(&mut annot_tasks);
-    cleanup_receivers.append(&mut annot_rxs);
-
-    let assembly_dir = out_dir.join("assembly");
-
-    let annotated_path = assembly_dir.join("annotated_merged.fa");
-    let unidentified_path = assembly_dir.join("unidentified.fa");
-    let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
-
-    info!("[run] starting fanout_to_channels for annotated FASTA (2 private channels)");
-
-    let (annotated_rxs, annotated_router) = fanout_to_channels(
-        ReceiverStream::new(annotated_rx),
-        2,
-        "initial_annotated",
-        &config,
-        StreamDataType::JustBytes
+    let (
+        initial_mapped_path,
+        initial_unidentified_path,
+        _initial_unique_unidentified_path,
+        initial_annot_temp_dir,
+        mut initial_annot_tasks,
+        mut initial_annot_rxs,
+    ) = generate_annotated_fasta_stream(
+        config.clone(),
+        interleaved_stream,
+        duplicate_clusters.clone(),
+        nt_map,                     // small contig → NT accession map
+        nr_map,                     // small contig → NR accession map
+        annot_concurrency,
     ).await?;
 
-    cleanup_tasks.push(annotated_router);
+    final_temp_dirs.push(initial_annot_temp_dir);
+    cleanup_tasks.append(&mut initial_annot_tasks);
+    cleanup_receivers.append(&mut initial_annot_rxs);
 
-    let mut annotated_rxs_iter = annotated_rxs.into_iter();
-    let initial_annotated_file_stream = annotated_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_annotated_taxon_stream = annotated_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let annotated_final_path = assembly_out_dir.join("annotated_merged.fa");
+    let unidentified_final_path = assembly_out_dir.join("unidentified.fa");
+    let unique_unidentified_final_path = assembly_out_dir.join("unique_unidentified.fa");
 
-    let (unidentified_rxs, unidentified_router) = fanout_to_channels(
-        ReceiverStream::new(unidentified_rx),
-        2,
-        "initial_unidentified",
-        &config,
-        StreamDataType::JustBytes
-    ).await?;
+    tokio::fs::copy(&initial_mapped_path, &annotated_final_path).await?;
+    tokio::fs::copy(&initial_unidentified_path, &unidentified_final_path).await?;
+    tokio::fs::copy(&_initial_unique_unidentified_path, &unique_unidentified_final_path).await?;
 
-    cleanup_tasks.push(unidentified_router);
 
-    let mut unidentified_rxs_iter = unidentified_rxs.into_iter();
-    let initial_unidentified_file_stream = unidentified_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let initial_unidentified_taxon_stream = unidentified_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    // Add monitors so you can actually see progress (no more 30-minute silences)
-    let initial_annotated_file_stream = monitor_stream(
-        ReceiverStream::new(initial_annotated_file_stream),
-        "initial_annotated_file_stream_to_write",
-        Duration::from_secs(15),
-    );
-
-    let initial_unidentified_file_stream = monitor_stream(
-        ReceiverStream::new(initial_unidentified_file_stream),
-        "initial_unidentified_file_stream_to_write",
-        Duration::from_secs(15),
-    );
-
-    // Write tasks are now eager consumers → EOF propagates instantly
-    cleanup_tasks.push(write_fasta_stream_to_file(
-        initial_annotated_file_stream,
-        annotated_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "initial_annotated_file_stream_to_write",
-    ));
-
-    cleanup_tasks.push(write_fasta_stream_to_file(
-        initial_unidentified_file_stream,
-        unidentified_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "initial_unidentified_file_stream_to_write",
-    ));
-
-    cleanup_tasks.push(write_fasta_stream_to_file(
-        ReceiverStream::new(unique_unidentified_rx),
-        unique_unidentified_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "unique_unidentified_file_stream_to_write",
-    ));
-
-    info!("[run] annotated FASTA wiring complete (fanout_to_channels used everywhere)");
     // *******************
     // Post-processing
     // *******************
 
     // Assembly stats
-    let assembly_out_dir = out_dir.join("assembly");
-
 
     let (assembly_outputs, assembly_bam_out_stream,
         post_assembly_cleanup_tasks,
@@ -8561,23 +8525,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
 
     let (
-        mapped_contigs_rx,
-        unidentified_contigs_rx,
-        _unique_unidentified_rx,
-        mut annot_tasks,
-        mut annot_rxs,
+        refined_mapped_contigs_path,
+        refined_unidentified_contigs_path,
+        _refined_unique_unidentified_path,
+        refined_annot_temp_dir,
+        mut refined_annot_tasks,
+        mut refined_annot_rxs,
     ) = generate_annotated_fasta_stream(
         config.clone(),
         contigs_stream,
         duplicate_clusters.clone(),
-        nt_refined_map,     // built from refined hitsummary
-        nr_refined_map,     // built from refined hitsummary
+        nt_refined_map,
+        nr_refined_map,
         refined_annot_concurrency,
-    ).await
-        .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+    ).await?;
 
-    cleanup_tasks.append(&mut annot_tasks);
-    cleanup_receivers.append(&mut annot_rxs);
+    final_temp_dirs.push(refined_annot_temp_dir);
+    cleanup_tasks.append(&mut refined_annot_tasks);
+    cleanup_receivers.append(&mut refined_annot_rxs);
 
 
     let (
@@ -8588,10 +8553,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         taxid_main_task,
     ) = generate_taxid_fasta(
         config.clone(),
-        ReceiverStream::new(mapped_contigs_rx),
-        ReceiverStream::new(unidentified_contigs_rx),
-        ReceiverStream::new(nt_hit_summary_taxid),
-        ReceiverStream::new(nr_hit_summary_taxid),
+        refined_mapped_contigs_path,
+        refined_unidentified_contigs_path,
+        nt_temp_summary_path,
+        nr_temp_summary_path,
         lineage_map.clone(),
     )
         .await
@@ -8617,8 +8582,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let taxid_mapped_locator = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
 
 
-    let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
-    let combined_path = assembly_dir.join("refined_taxid_annot_fasta");
+    let mapped_path = assembly_out_dir.join("refined_taxid_annot_mapped_only_fasta");
+    let combined_path = assembly_out_dir.join("refined_taxid_annot_fasta");
 
 
     let write_mapped_handle = write_fasta_stream_to_file(
@@ -8666,10 +8631,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         initial_taxid_main_task,
     ) = generate_taxid_fasta(
         config.clone(),
-        ReceiverStream::new(initial_annotated_taxon_stream),
-        ReceiverStream::new(initial_unidentified_taxon_stream),
-        nt_hit_summary_for_taxid,
-        nr_hit_summary_for_taxid,
+        initial_mapped_path,
+        initial_unidentified_path,
+        nt_temp_summary_path.clone(),
+        nr_temp_summary_path.clone(),
         lineage_map.clone(),
     )
         .await
