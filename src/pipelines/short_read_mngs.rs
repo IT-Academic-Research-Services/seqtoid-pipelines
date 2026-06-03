@@ -2703,9 +2703,9 @@ pub async fn call_hits_m8(
     concurrency: usize,
     tag: String,
 ) -> Result<(
-    PathBuf, // temp dedup m8 (primary for downstream stages)
-    PathBuf, // temp hit summary (primary for downstream stages)
-    TempDir, // must be kept alive by caller — add to final_temp_dirs
+    PathBuf, // temp dedup m8
+    PathBuf, // temp hit summary
+    TempDir,
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 ), PipelineError> {
@@ -2713,24 +2713,15 @@ pub async fn call_hits_m8(
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
     let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
 
-    info!(
-        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
-        tag, worker_count, min_aln_len
-    );
-
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
 
     #[derive(Debug)]
     enum WorkerMsg {
-        ProcessRead {
-            read_id: String,
-            hits: Vec<M8Record>,
-        },
+        ProcessRead { read_id: String, hits: Vec<M8Record> },
         Flush,
     }
 
-    // One sender per worker; reads are sharded by read_id.
     let mut worker_txs: Vec<mpsc::Sender<WorkerMsg>> = Vec::with_capacity(worker_count);
 
     for worker_idx in 0..worker_count {
@@ -2748,54 +2739,29 @@ pub async fn call_hits_m8(
             let mut total_emitted = 0usize;
             let start = Instant::now();
 
-            debug!(
-                "[call_hits_m8:{}] worker {} started (streaming mode)",
-                worker_tag, worker_idx
-            );
-
             while let Some(msg) = worker_rx.recv().await {
-                match msg {
-                    WorkerMsg::ProcessRead { read_id, hits } => {
-                        let reduced = summarize_m8_hits(
-                            0,
-                            read_id,
-                            &hits,
-                            &lineage_map,
-                            &acc2taxid_map,
-                            &*should_keep_filter,
-                            min_aln_len,
-                        );
-
-                        if let Some(reduced) = reduced {
-                            total_emitted += 1;
-
-                            dedup_tx
-                                .send(ParseOutput::Bytes(Bytes::from(reduced.dedup)))
-                                .await
-                                .context("dedup output channel closed")?;
-
-                            summary_tx
-                                .send(ParseOutput::Bytes(Bytes::from(reduced.summary)))
-                                .await
-                                .context("summary output channel closed")?;
-                        }
+                if let WorkerMsg::ProcessRead { read_id, hits } = msg {
+                    if let Some(reduced) = summarize_m8_hits(
+                        0, read_id, &hits, &lineage_map, &acc2taxid_map,
+                        &*should_keep_filter, min_aln_len,
+                    ) {
+                        total_emitted += 1;
+                        let _ = dedup_tx.send(ParseOutput::Bytes(Bytes::from(reduced.dedup))).await;
+                        let _ = summary_tx.send(ParseOutput::Bytes(Bytes::from(reduced.summary))).await;
                     }
-                    WorkerMsg::Flush => break,
+                } else {
+                    break;
                 }
             }
 
-            info!(
-                "[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}",
-                worker_tag, worker_idx, total_emitted, start.elapsed()
-            );
+            info!("[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}", worker_tag, worker_idx, total_emitted, start.elapsed());
             Ok::<(), anyhow::Error>(())
         });
 
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator: consume the sorted stream, accumulate one read at a time,
-    // and dispatch finished read blocks to a shard.
+    // Coordinator
     let coordinator_tag = tag.clone();
     let coordinator_handle = tokio::spawn(async move {
         let mut current_read_id: Option<String> = None;
@@ -2804,250 +2770,95 @@ pub async fn call_hits_m8(
         let mut total_reads = 0usize;
         let start = Instant::now();
 
-        #[cfg(debug_assertions)]
-        let mut last_seen_read_id: Option<String> = None;
-
-        debug!(
-            "[call_hits_m8:{}] coordinator started (streaming group-by)",
-            coordinator_tag
-        );
-
         while let Some(item) = m8_input.next().await {
-            let bytes = match item.to_bytes() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-
-            let line_str = match std::str::from_utf8(&bytes) {
-                Ok(s) => s.trim_end(),
-                Err(_) => continue,
-            };
-
-            if line_str.is_empty() || line_str.starts_with('#') {
-                continue;
-            }
+            let bytes = match item.to_bytes() { Ok(b) => b, Err(_) => continue };
+            let line_str = match std::str::from_utf8(&bytes) { Ok(s) => s.trim_end(), Err(_) => continue };
+            if line_str.is_empty() || line_str.starts_with('#') { continue; }
 
             total_lines += 1;
+            let read_id = match read_id_from_m8_line(line_str) { Some(r) => r.to_string(), None => continue };
+            let rec = match M8Record::parse_line_nr(line_str) { Ok(r) => r, Err(_) => continue };
 
-            let read_id = match read_id_from_m8_line(line_str) {
-                Some(r) => r.to_string(),
-                None => continue,
-            };
-
-            let rec = match M8Record::parse_line_nr(line_str) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            if total_lines == 1 {
-                info!(
-                    "[call_hits_m8:{}] first input line: read_id={} line={}",
-                    coordinator_tag, read_id, line_str
-                );
-            }
-
-            #[cfg(debug_assertions)]
-            {
-                if let Some(prev) = &last_seen_read_id {
-                    if prev > &read_id {
-                        warn!(
-                            "[call_hits_m8:{}] read IDs appear to go backwards: prev={} current={}",
-                            coordinator_tag, prev, read_id
-                        );
-                    }
-                }
-                last_seen_read_id = Some(read_id.clone());
-            }
-
-            // If the read ID changes, the previous read is complete.
             if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
-                let prev_read_id = current_read_id.take().unwrap();
-                let shard = shard_for_read_id(&prev_read_id, worker_count);
-
-                worker_txs[shard]
-                    .send(WorkerMsg::ProcessRead {
-                        read_id: prev_read_id,
-                        hits: std::mem::take(&mut current_hits),
-                    })
-                    .await
-                    .context("failed to dispatch completed read to worker")?;
-
+                let prev = current_read_id.take().unwrap();
+                let shard = shard_for_read_id(&prev, worker_count);
+                let _ = worker_txs[shard].send(WorkerMsg::ProcessRead { read_id: prev, hits: std::mem::take(&mut current_hits) }).await;
                 total_reads += 1;
             }
-
-            if current_read_id.is_none() {
-                current_read_id = Some(read_id.clone());
-            }
-
+            if current_read_id.is_none() { current_read_id = Some(read_id.clone()); }
             current_hits.push(rec);
         }
 
-        // Final read.
         if let Some(read_id) = current_read_id {
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
-
-                worker_txs[shard]
-                    .send(WorkerMsg::ProcessRead {
-                        read_id,
-                        hits: current_hits,
-                    })
-                    .await
-                    .context("failed to dispatch final read to worker")?;
-
+                let _ = worker_txs[shard].send(WorkerMsg::ProcessRead { read_id, hits: current_hits }).await;
                 total_reads += 1;
             }
         }
 
-        // Flush all workers after all reads have been dispatched.
-        for (_, tx) in worker_txs.iter().enumerate() {
-            tx.send(WorkerMsg::Flush)
-                .await
-                .context("failed to flush worker")?;
+        for tx in &worker_txs {
+            let _ = tx.send(WorkerMsg::Flush).await;
         }
 
-        info!(
-            "[call_hits_m8:{}] coordinator done — processed {} lines, {} reads in {:?}",
-            coordinator_tag,
-            total_lines,
-            total_reads,
-            start.elapsed()
-        );
-
-        if total_lines == 0 {
-            warn!(
-                "[call_hits_m8:{}] coordinator saw zero input lines; upstream sort/stream wiring is wrong",
-                coordinator_tag
-            );
-        }
-
+        info!("[call_hits_m8:{}] coordinator done — {} lines, {} reads in {:?}", coordinator_tag, total_lines, total_reads, start.elapsed());
         Ok::<(), anyhow::Error>(())
     });
-
     cleanup_tasks.push(coordinator_handle);
 
 
     let estimated_bytes = (config.input_size / 5).max(256 * 1024 * 1024);
-    let temp_dir = choose_temp_dir(
-        estimated_bytes,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        4,
-        false,
-    )
-        .await?;
+    let temp_dir = choose_temp_dir(estimated_bytes, &config.ram_temp_dir, &config.args.nvme_scratch, 4, false).await?;
 
     let temp_dedup_path = temp_dir.path().join(format!("{}_dedup.m8", tag));
     let temp_summary_path = temp_dir.path().join(format!("{}_hit_summary.txt", tag));
 
-    // DEDUP M8 fanout: branch 0 → materialize to temp (awaited), branch 1 → out_dir copy (background)
-    let dedup_stream = ReceiverStream::new(dedup_rx);
-    let (dedup_branches, dedup_router_handle) = fanout_to_channels(
-        dedup_stream,
-        2,
-        "call_hits_m8_dedup",
-        &config,
-        StreamDataType::JustBytes
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    cleanup_tasks.push(dedup_router_handle);
-
-    let mut dedup_it = dedup_branches.into_iter();
-    let dedup_main_stream = ReceiverStream::new(dedup_it.next().ok_or(PipelineError::EmptyStream)?);
-    let dedup_file_stream = ReceiverStream::new(dedup_it.next().ok_or(PipelineError::EmptyStream)?);
-
-    // out_dir copy (unchanged behavior, put in cleanup_tasks as "not urgent")
-    let call_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
-            None,
-            Some(&format!("{}.dedup.m8", tag)),
-            "_",
-        )),
-        dedup_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "call_hits_m8_dedup",
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(call_file_write_task);
-
-    // Primary output: materialize to temp and await so file is complete when we return the path
-    let materialize_dedup_handle = write_byte_stream_to_file(
+    let dedup_write = write_byte_stream_to_file(
         &temp_dedup_path,
-        dedup_main_stream,
+        ReceiverStream::new(dedup_rx),
         config.clone(),
         StreamDataType::JustBytes,
         &format!("call_hits_m8_{}_dedup_temp", tag),
-    )
-        .await?;
+    ).await?;
+    let _dedup_result = dedup_write.await
+        .map_err(|e| PipelineError::Other(anyhow!("dedup temp write panicked: {}", e)))??;
 
-    let dedup_res = materialize_dedup_handle
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("dedup temp materialize panicked: {}", e)))?;
-    dedup_res.map_err(|e| PipelineError::Other(anyhow!("dedup temp write failed: {}", e)))?;
-
-    info!("[call_hits_m8:{}] materialized primary dedup m8 → {}", tag, temp_dedup_path.display());
-
-    // HIT SUMMARY fanout: same pattern
-    let summary_stream = ReceiverStream::new(summary_rx);
-    let (summary_branches, summary_router_handle) = fanout_to_channels(
-        summary_stream,
-        2,
-        "call_hits_m8_summary",
-        &config,
-        StreamDataType::JustBytes
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    cleanup_tasks.push(summary_router_handle);
-
-    let mut summary_it = summary_branches.into_iter();
-    let summary_main_stream = ReceiverStream::new(summary_it.next().ok_or(PipelineError::EmptyStream)?);
-    let summary_file_stream = ReceiverStream::new(summary_it.next().ok_or(PipelineError::EmptyStream)?);
-
-    // out_dir copy (unchanged)
-    let summary_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
-            None,
-            Some(&format!("{}.summary.txt", tag)),
-            "_",
-        )),
-        summary_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "call_hits_m8_summary",
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(summary_file_write_task);
-
-    // Primary output: materialize to temp and await
-    let materialize_summary_handle = write_byte_stream_to_file(
+    let summary_write = write_byte_stream_to_file(
         &temp_summary_path,
-        summary_main_stream,
+        ReceiverStream::new(summary_rx),
         config.clone(),
         StreamDataType::JustBytes,
         &format!("call_hits_m8_{}_summary_temp", tag),
-    )
-        .await?;
+    ).await?;
+    let _summary_result = summary_write.await
+        .map_err(|e| PipelineError::Other(anyhow!("summary temp write panicked: {}", e)))??;
 
-    let summary_res = materialize_summary_handle
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("summary temp materialize panicked: {}", e)))?;
-    summary_res.map_err(|e| PipelineError::Other(anyhow!("summary temp write failed: {}", e)))?;
+    // Non-urgent copy to final output directory
+    let out_dedup_path = config.out_dir.join(rename_file_path(
+        &sample_base_buf, None, Some(&format!("{}.dedup.m8", tag)), "_"
+    ));
+    let temp_dedup_for_copy = temp_dedup_path.clone();
+    let out_dedup_copy = tokio::spawn(async move {
+        tokio::fs::copy(&temp_dedup_for_copy, &out_dedup_path)
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    });
+    cleanup_tasks.push(out_dedup_copy);
 
-    info!("[call_hits_m8:{}] materialized primary hit summary → {}", tag, temp_summary_path.display());
+    let out_summary_path = config.out_dir.join(rename_file_path(
+        &sample_base_buf, None, Some(&format!("{}.summary.txt", tag)), "_"
+    ));
+    let temp_summary_for_copy = temp_summary_path.clone();
+    let out_summary_copy = tokio::spawn(async move {
+        tokio::fs::copy(&temp_summary_for_copy, &out_summary_path)
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    });
+    cleanup_tasks.push(out_summary_copy);
 
-    info!(
-        "[call_hits_m8:{}] COMPLETE — temp files ready (downstream stages should now open these files instead of streams)",
-        tag
-    );
+    info!("[call_hits_m8:{}] COMPLETE — temp files materialized and ready", tag);
 
     Ok((
         temp_dedup_path,
