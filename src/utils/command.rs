@@ -567,7 +567,6 @@ pub mod samtools {
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fastq")).to_string());
                     args_vec.push("-c".to_string());
                     args_vec.push("6".to_string());
-                    args_vec.push("-n".to_string());
                 }
                 SamtoolsSubcommand::Stats => {
                     args_vec.push("stats".to_string());
