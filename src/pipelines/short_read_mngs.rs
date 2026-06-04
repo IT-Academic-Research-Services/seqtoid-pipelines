@@ -160,13 +160,10 @@ pub struct AssemblyHandle {
 #[derive(Debug)]
 pub struct CoverageOutputs {
     pub contigs_fasta: PathBuf,
-    pub contigs_ram_fasta: PathBuf,
     pub contigs_all_fasta: PathBuf,
     pub scaffolds_fasta: PathBuf,
-    pub sam_path: PathBuf,
+    pub bam_path: PathBuf,
     pub contig_stats_json: PathBuf,
-    pub coverage_json: PathBuf,
-    pub coverage_summary_csv: PathBuf,
     pub contig_stats: Arc<HashMap<String, u64>>,
     pub read2contig: Arc<HashMap<String, String>>,
 }
@@ -4236,189 +4233,12 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
 /// * `input_stream` - Raw byte FASTQ stream
 ///
 /// # Returns
-
-async fn spades_assembly(
-    config: Arc<RunConfig>,
-    r1_path: PathBuf,
-    r2_path_opt: Option<PathBuf>,
-    out_dir: &PathBuf,
-) -> Result<JoinHandle<Result<()>>> {
-    let assembly_dir = out_dir.join("assembly");
-    fs::create_dir_all(&assembly_dir)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
-
-    let spades_task = tokio::spawn(async move {
-        let mut cleanup_tasks = Vec::new();
-
-        // 1. Temp dir
-        let est_temp_bytes = config.input_size + MAX_SPADES_WORK_DIR;
-        let temp_dir = choose_temp_dir(
-            est_temp_bytes,
-            &config.ram_temp_dir,
-            &config.args.nvme_scratch,
-            4,
-            true,
-        )
-            .await?;
-
-        // 2. Run SPAdes inside a dedicated work dir under the temp dir
-        let spades_work_dir = TempDir::new_in(&temp_dir)?;
-        let spades_work_path = spades_work_dir.path().to_path_buf();
-        let stdout_log_path = assembly_dir.join("spades_stdout.log");
-
-        info!(
-            "[spades] starting: r1={}, r2={:?}, assembly_dir={}, temp_dir={}, spades_work_path={}, input_size={}, est_temp_bytes={}",
-            r1_path.display(),
-            r2_path_opt.as_ref().map(|p| p.display().to_string()),
-            assembly_dir.display(),
-            temp_dir.path().display(),
-            spades_work_path.display(),
-            config.input_size,
-            est_temp_bytes
-        );
-
-        info!(
-            "[spades] temp/work dir exists before spawn: temp_dir_exists={}, spades_work_exists={}",
-            temp_dir.path().exists(),
-            spades_work_path.exists()
-        );
-
-        let mut options = HashMap::new();
-        options.insert("--only-assembler".to_string(), None);
-
-        let spades_config = SpadesConfig {
-            r1_path: r1_path.clone(),
-            r2_path_opt: r2_path_opt.clone(),
-            outdir_path: spades_work_path.clone(),
-            option_fields: options,
-        };
-
-        let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))?;
-
-        info!("[spades] command args: {:?}", spades_args);
-
-        let (mut spades_child, spades_stderr_task) = spawn_cmd(
-            config.clone(),
-            SPADES_TAG,
-            spades_args,
-            config.args.verbose,
-            None
-        )
-            .await?;
-
-        info!(
-            "[spades] child spawned: stdout_present={}, stderr_present={}",
-            spades_child.stdout.is_some(),
-            spades_child.stderr.is_some()
-        );
-
-        let spades_out_stream = parse_child_output(
-            &mut spades_child,
-            ChildStream::Stdout,
-            ParseMode::Lines,
-            &config,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SPADES_TAG.to_string(),
-                error: e.to_string(),
-            })?;
-
-        let spades_write_task = tokio::spawn(stream_to_file(
-            spades_out_stream,
-            stdout_log_path.clone(),
-        ));
-        cleanup_tasks.push(spades_write_task);
-
-        // stderr is drained and logged by spawn_cmd's internal stderr task
-        spades_stderr_task.await??;
-
-        // Check SPAdes exit
-        let spades_exit = spades_child.wait().await?;
-
-        info!(
-            "[spades] exit status={:?} success={} work_dir_exists_after_wait={} stdout_log={}",
-            spades_exit.code(),
-            spades_exit.success(),
-            spades_work_path.exists(),
-            stdout_log_path.display()
-        );
-
-        match fs::metadata(&stdout_log_path).await {
-            Ok(meta) => info!(
-                "[spades] stdout log written: {} bytes at {}",
-                meta.len(),
-                stdout_log_path.display()
-            ),
-            Err(e) => warn!(
-                "[spades] stdout log missing or unreadable at {}: {}",
-                stdout_log_path.display(),
-                e
-            ),
-        }
-
-        if !spades_exit.success() {
-            error!("SPAdes failed with exit: {:?}", spades_exit);
-
-            // Write dummies so downstream code can detect the failure cleanly.
-            let contigs_path = assembly_dir.join("contigs.fasta");
-            let contigs_all_path = assembly_dir.join("contigs_all.fasta");
-            let scaffolds_path = assembly_dir.join("scaffolds.fasta");
-            let sam_path = assembly_dir.join("read-contig.sam");
-            let failed_marker = b";ASSEMBLY FAILED\n";
-
-            tokio::fs::write(&contigs_path, failed_marker).await?;
-            tokio::fs::write(&contigs_all_path, failed_marker).await?;
-            tokio::fs::write(&scaffolds_path, failed_marker).await?;
-            tokio::fs::write(&sam_path, b"@NO INFO\n").await?;
-
-            info!(
-                "[spades] wrote dummy outputs after failure: contigs={}, contigs_all={}, scaffolds={}, sam={}",
-                contigs_path.display(),
-                contigs_all_path.display(),
-                scaffolds_path.display(),
-                sam_path.display()
-            );
-
-            return Err(anyhow!("SPAdes assembly failed"));
-        }
-
-        // Probe the expected SPAdes outputs before leaving this stage.
-        let contigs_path = spades_work_path.join("contigs.fasta");
-        let scaffolds_path = spades_work_path.join("scaffolds.fasta");
-        let sam_path = spades_work_path.join("read-contig.sam");
-
-        for p in [&contigs_path, &scaffolds_path, &sam_path] {
-            match fs::metadata(p).await {
-                Ok(meta) => info!(
-                    "[spades] output exists: {} ({} bytes)",
-                    p.display(),
-                    meta.len()
-                ),
-                Err(e) => warn!(
-                    "[spades] expected output missing: {} ({})",
-                    p.display(),
-                    e
-                ),
-            }
-        }
-
-        info!("SPAdes completed successfully");
-
-        Ok(())
-    });
-
-    Ok(spades_task)
-}
-
 pub async fn process_assembly(
     config: Arc<RunConfig>,
-    out_dir: &PathBuf,
-    work_dir: &PathBuf,
+    assembly_out_dir: &PathBuf,   // to make clear this is <out_dir>/assembly
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
-    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,   // ← changed to DashMap
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     paired: bool,
     assembly_headroom: u64,
 ) -> Result<(
@@ -4427,203 +4247,208 @@ pub async fn process_assembly(
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
+    TempDir,
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
-    let raw_contigs_path = work_dir.join("contigs.fasta");
-    let raw_scaffolds_path = work_dir.join("scaffolds.fasta");
-    let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
-    drop(empty_tx);
 
-    info!(
-        "[assembly] process_assembly starting: out_dir={}, work_dir={}, raw_contigs={}, raw_scaffolds={}, paired={}",
-        out_dir.display(),
-        work_dir.display(),
-        raw_contigs_path.display(),
-        raw_scaffolds_path.display(),
-        paired
-    );
-
-    match fs::metadata(&raw_contigs_path).await {
-        Ok(meta) => info!(
-            "[assembly] raw contigs metadata before decision: exists=true size={} bytes is_file={}",
-            meta.len(),
-            meta.is_file()
-        ),
-        Err(e) => warn!(
-            "[assembly] raw contigs metadata before decision: exists=false path={} err={}",
-            raw_contigs_path.display(),
-            e
-        ),
-    }
-
-    match fs::metadata(&raw_scaffolds_path).await {
-        Ok(meta) => info!(
-            "[assembly] raw scaffolds metadata before decision: exists=true size={} bytes is_file={}",
-            meta.len(),
-            meta.is_file()
-        ),
-        Err(e) => warn!(
-            "[assembly] raw scaffolds metadata before decision: exists=false path={} err={}",
-            raw_scaffolds_path.display(),
-            e
-        ),
-    }
-
-    let spades_success = async {
-        match fs::metadata(&raw_contigs_path).await {
-            Ok(meta) => meta.len() > 0 && meta.is_file(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => {
-                warn!("Failed to read contigs.fasta metadata: {}", e);
-                false
-            }
-        }
-    }
-        .await;
-
-    if !spades_success {
-        let reason = match fs::metadata(&raw_contigs_path).await {
-            Ok(meta) if meta.len() == 0 => "contigs.fasta is empty",
-            Ok(_) => "contigs.fasta exists but is not a usable file",
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "contigs.fasta does not exist",
-            Err(e) => {
-                warn!(
-                    "[assembly] contigs.fasta metadata error at failure check: {}",
-                    e
-                );
-                "contigs.fasta metadata could not be read"
-            }
-        };
-
-        warn!(
-            "SPAdes assembly failed: {} — writing dummy outputs and skipping contig-based refinement",
-            reason
-        );
-
-        let dummy = ";ASSEMBLY FAILED";
-        let empty_sam = "@NO INFO\n";
-        let empty_json = "{}";
-
-        fs::write(out_dir.join("contigs.fasta"), dummy).await?;
-        fs::write(out_dir.join("contigs.ram.fasta"), dummy).await?;
-        fs::write(out_dir.join("contigs_all.fasta"), dummy).await?;
-        fs::write(out_dir.join("scaffolds.fasta"), dummy).await?;
-        fs::write(out_dir.join("read-contig.sam"), empty_sam).await?;
-        fs::write(out_dir.join("contig_stats.json"), empty_json).await?;
-
-        info!(
-            "[assembly] dummy outputs written to {}; no contig-based refinement will run",
-            out_dir.display()
-        );
-
-        return Ok((
-            CoverageOutputs {
-                contigs_fasta: out_dir.join("contigs.fasta"),
-                contigs_ram_fasta: out_dir.join("contigs.ram.fasta"),
-                contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-                scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-                sam_path: out_dir.join("read-contig.sam"),
-                contig_stats_json: out_dir.join("contig_stats.json"),
-                coverage_json: out_dir.join("assembly_contig_coverage.json"),
-                coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
-                contig_stats: Arc::new(HashMap::new()),
-                read2contig: Arc::new(HashMap::new()),
-            },
-            ReceiverStream::new(empty_rx),
-            cleanup_tasks,
-            cleanup_receivers,
-            temp_files,
-        ));
-    }
-
-    let contigs_all_out = out_dir.join("contigs_all.fasta");
-    fs::copy(&raw_contigs_path, &contigs_all_out).await?;
-    info!(
-        "[assembly] copied raw contigs to contigs_all: {} -> {}",
-        raw_contigs_path.display(),
-        contigs_all_out.display()
-    );
-
-    let contigs_out = out_dir.join("contigs.fasta");
-    let contigs_size = file_size(&raw_contigs_path).await?;
-    info!(
-        "[assembly] raw contigs size: {} bytes ({} GiB)",
-        contigs_size,
-        contigs_size as f64 / 1_073_741_824.0
-    );
-
+    let est_temp_bytes = config.input_size + MAX_SPADES_WORK_DIR;
     let temp_dir = choose_temp_dir(
-        contigs_size,
+        est_temp_bytes,
         &config.ram_temp_dir,
         &config.args.nvme_scratch,
         assembly_headroom,
-        false,
+        true,
+    )
+        .await?;
+
+
+    let stdout_log_path = assembly_out_dir.join("spades_stdout.log");
+
+    info!(
+        "[spades] starting: r1={}, r2={:?}, final_assembly_dir={},  temp_dir={}",
+        r1_path.display(),
+        r2_path_opt.as_ref().map(|p| p.display().to_string()),
+        assembly_out_dir.display(),
+        temp_dir.path().to_path_buf().display(),
+    );
+
+    let mut options = HashMap::new();
+    options.insert("--only-assembler".to_string(), None);
+
+    let spades_config = SpadesConfig {
+        r1_path: r1_path.clone(),
+        r2_path_opt: r2_path_opt.clone(),
+        outdir_path: temp_dir.path().to_path_buf(),
+        tempdir_path: Some(temp_dir.path().to_path_buf()),
+        option_fields: options,
+    };
+
+    let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))?;
+
+    info!("[spades] command args: {:?}", spades_args);
+
+    let (mut spades_child, spades_stderr_task) = spawn_cmd(
+        config.clone(),
+        SPADES_TAG,
+        spades_args,
+        config.args.verbose,
+        None
     )
         .await?;
 
     info!(
-        "[assembly] chosen temp dir for contig filtering/indexing: {}",
-        temp_dir.path().display()
+        "[spades] child spawned: stdout_present={}, stderr_present={}",
+        spades_child.stdout.is_some(),
+        spades_child.stderr.is_some()
     );
 
-    let ram_fasta_path = NamedTempFile::with_suffix_in(".fa", &temp_dir)
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let ram_path = ram_fasta_path.path().to_owned();
-
-    // Contig length filtering
-    let rx = read_fasta(
-        raw_contigs_path.clone(),
-        u64::MAX,
-        Some(config.args.min_contig_length),
-        None,
-        &config
+    let spades_out_stream = parse_child_output(
+        &mut spades_child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        &config,
     )
-        .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
-
-    let write_handle = write_fasta_stream_to_file(
-        ReceiverStream::new(rx),
-        ram_path.clone(),
-        config.clone(),
-        StreamDataType::JustBytes,
-        "process_assembly_contigs_filtering",
-    );
-
-    write_handle
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("Writer task panicked: {}", e)))?
-        .map_err(|e| PipelineError::Other(anyhow!("Writer task failed: {}", e)))?;
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SPADES_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-    fs::copy(&ram_path, &contigs_out).await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to copy contigs to output: {}", e)))?;
+    let spades_write_task = tokio::spawn(stream_to_file(
+        spades_out_stream,
+        stdout_log_path.clone(),
+    ));
+    cleanup_tasks.push(spades_write_task);
+
+    // stderr is drained and logged by spawn_cmd's internal stderr task
+    spades_stderr_task.await??;
+
+    // Check SPAdes exit
+    let spades_exit = spades_child.wait().await?;
 
     info!(
-        "[assembly] filtered contigs written: ram_path={} -> contigs_out={}",
-        ram_path.display(),
-        contigs_out.display()
+        "[spades] exit status={:?} success={}  stdout_log={}",
+        spades_exit.code(),
+        spades_exit.success(),
+        stdout_log_path.display()
     );
 
-    temp_files.push(ram_fasta_path);
-
-    let scaffolds_out = out_dir.join("scaffolds.fasta");
-    if raw_scaffolds_path.exists() {
-        fs::copy(&raw_scaffolds_path, &scaffolds_out).await?;
-        info!(
-            "[assembly] copied scaffolds: {} -> {}",
-            raw_scaffolds_path.display(),
-            scaffolds_out.display()
-        );
-    } else {
-        fs::write(&scaffolds_out, ";NO SCAFFOLDS").await?;
-        warn!(
-            "[assembly] raw scaffolds missing; wrote placeholder scaffolds at {}",
-            scaffolds_out.display()
-        );
+    match fs::metadata(&stdout_log_path).await {
+        Ok(meta) => info!(
+            "[spades] stdout log written: {} bytes at {}",
+            meta.len(),
+            stdout_log_path.display()
+        ),
+        Err(e) => warn!(
+            "[spades] stdout log missing or unreadable at {}: {}",
+            stdout_log_path.display(),
+            e
+        ),
     }
 
-    let index_dir = out_dir.join("bowtie_index");
+    let contigs_path = temp_dir.path().to_path_buf().join("contigs.fasta");
+    let contigs_all_path = temp_dir.path().to_path_buf().join("contigs_all.fasta");
+    let scaffolds_path = temp_dir.path().to_path_buf().join("scaffolds.fasta");
+    let bam_path = temp_dir.path().to_path_buf().join("read-contig.bam");
+    let stats_json_path = temp_dir.path().to_path_buf().join("contig_stats.json");
+
+
+    let final_contigs_path = assembly_out_dir.join("contigs.fasta");
+    let final_contigs_all_path = assembly_out_dir.join("contigs_all.fasta");
+    let final_scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
+    let final_bam_path = assembly_out_dir.join("read-contig.bam");
+    let final_stats_json_path = assembly_out_dir.join("contig_stats.json");
+
+
+    if spades_exit.success() {
+        // on success path, just start the copy of the real spades output files async
+        info!("[spades] completed successfully");
+
+        // Copy the contigs file to contigs_all to reserve the original
+        fs::copy(&contigs_path, &contigs_all_path).await?;
+
+
+        // Contig length filtering and copy the result back over contigs.fasta
+        let rx = read_fasta(
+            contigs_all_path.clone(),
+            u64::MAX,
+            Some(config.args.min_contig_length),
+            None,
+            &config
+        )
+            .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
+
+        let write_handle = write_fasta_stream_to_file(
+            ReceiverStream::new(rx),
+            contigs_path.clone(),
+            config.clone(),
+            StreamDataType::JustBytes,
+            "process_assembly_contigs_filtering",
+        );
+
+        write_handle
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("contigs -> contigs_all writer task panicked: {}", e)))?
+            .map_err(|e| PipelineError::Other(anyhow!("contigs -> contigs_all writer task failed: {}", e)))?;
+
+        tokio::fs::copy(&contigs_path, &final_contigs_path).await?;
+        tokio::fs::copy(&contigs_all_path, &final_contigs_all_path).await?;
+        tokio::fs::copy(&scaffolds_path, &final_scaffolds_path).await?;
+
+    }
+    else {
+        error!("SPAdes failed with exit: {:?}", spades_exit);
+
+        let failed_marker = b";ASSEMBLY FAILED\n";
+        let empty_scaffolds = b";NO SCAFFOLDS\n";
+        let empty_bam = b"@NO INFO\n";
+        let empty_json = b"{}";
+
+        // Here we sync write the final output files to disk (fast)
+        // and pass those back as the "temp" files for the pipeline to use
+
+        tokio::fs::write(&final_contigs_path, failed_marker).await?;
+        tokio::fs::write(&final_scaffolds_path, empty_scaffolds).await?;
+        tokio::fs::write(&final_contigs_all_path, failed_marker).await?;
+        tokio::fs::write(&final_bam_path, empty_bam).await?;
+        tokio::fs::write(&final_stats_json_path, empty_json).await?;
+
+        info!(
+            "[spades] wrote dummy outputs after failure: contigs={}, scaffolds={}",
+            final_contigs_path.display(),
+            final_scaffolds_path.display(),
+        );
+
+        return Ok((
+            CoverageOutputs {
+                contigs_fasta: final_contigs_path,
+                contigs_all_fasta: final_contigs_all_path,
+                scaffolds_fasta: final_scaffolds_path,
+                bam_path: final_bam_path,
+                contig_stats_json: final_stats_json_path,
+                contig_stats: Arc::new(HashMap::new()),
+                read2contig: Arc::new(HashMap::new()),
+            },
+            ReceiverStream::new({
+                let (tx, rx) = mpsc::channel(1);
+                drop(tx);
+                rx
+            }),
+            cleanup_tasks,
+            cleanup_receivers,
+            temp_files,
+            temp_dir,
+        ));
+
+    }
+
+    info!("SPAdes completed successfully");
+
+
+    let index_dir = temp_dir.path().to_path_buf().join("bowtie_index");
     fs::create_dir_all(&index_dir).await?;
     let index_prefix = index_dir.join("contigs"); // will create contigs.1.bt2, etc.
 
@@ -4640,7 +4465,7 @@ pub async fn process_assembly(
             "--threads",
             &num_index_cores.to_string(),
             "--quiet",
-            ram_path.clone().to_str().unwrap(),
+            contigs_path.clone().to_str().unwrap(),
             index_prefix.to_str().unwrap(),
         ])
         .status()
@@ -4778,17 +4603,16 @@ pub async fn process_assembly(
         non_host_streams_iter.next().ok_or(PipelineError::EmptyStream)?
     );
 
-    let sam_path = out_dir.join("read-contig.bam");
 
-    let write_sam_task = write_byte_stream_to_file(
-        &sam_path,
+    let write_bam_task = write_byte_stream_to_file(
+        &bam_path,
         bam_for_file,
         config.clone(),
         StreamDataType::JustBytes,
         "process_assembly",
     )
         .await?;
-    cleanup_tasks.push(write_sam_task);
+    cleanup_tasks.push(write_bam_task);
 
     let bam_concurrency = compute_phase_concurrency(
         &config,
@@ -4814,16 +4638,22 @@ pub async fn process_assembly(
         read2contig.len()
     );
 
+    let stats_json = serde_json::to_string_pretty(&contig_stats)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to serialize contig_stats: {}", e)))?;
+
+    std::fs::write(&stats_json_path, &stats_json)
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to write contig_stats.json: {}", e)))?;
+
+    tokio::fs::write(&final_stats_json_path, &stats_json).await
+        .map_err(|e| PipelineError::Other(anyhow!("Failed to write final contig_stats.json: {}", e)))?;
+
     Ok((
         CoverageOutputs {
-            contigs_fasta: out_dir.join("contigs.fasta"),
-            contigs_ram_fasta: ram_path.clone(),
-            contigs_all_fasta: out_dir.join("contigs_all.fasta"),
-            scaffolds_fasta: out_dir.join("scaffolds.fasta"),
-            sam_path: out_dir.join("read-contig.sam"),
-            contig_stats_json: out_dir.join("contig_stats.json"),
-            coverage_json: out_dir.join("assembly_contig_coverage.json"),
-            coverage_summary_csv: out_dir.join("assembly_contig_coverage_summary.csv"),
+            contigs_fasta: contigs_path,
+            contigs_all_fasta: contigs_all_path,
+            scaffolds_fasta: scaffolds_path,
+            bam_path: bam_path,
+            contig_stats_json: stats_json_path,
             contig_stats: Arc::new(contig_stats),
             read2contig: Arc::new(read2contig),
         },
@@ -4831,6 +4661,7 @@ pub async fn process_assembly(
         cleanup_tasks,
         cleanup_receivers,
         temp_files,
+        temp_dir
     ))
 }
 
@@ -6074,7 +5905,6 @@ pub async fn blast_contigs(
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
 )> {
-    info!("blast_contigs start you piece of shit");
     use std::time::{Duration, Instant};
 
     let fn_start = Instant::now();
@@ -6219,7 +6049,6 @@ pub async fn blast_contigs(
         db_type, MAKEBLASTDB_TAG
     );
 
-    info!("blast_contigs right before making its stupid worthless db");
 
     let (_, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
@@ -6272,7 +6101,7 @@ pub async fn blast_contigs(
         db_type,
         blast_command
     );
-    info!("blast_contigs right before spawing FUCK");
+    info!("blast_contigs right before spawning");
     let blast_spawn_start = Instant::now();
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
@@ -8490,18 +8319,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     // Assembly stats
-    let assembly_out_dir = out_dir.join("assembly");  // Assuming assembly_handle.out_dir was this
-    let assembly_work_dir = assembly_out_dir.join("spades");  // Match Python's subdir
-
+    let assembly_out_dir = out_dir.join("assembly");
 
 
     let (assembly_outputs, assembly_bam_out_stream,
         post_assembly_cleanup_tasks,
         post_assembly_cleanup_receivers,
-        post_assembly_temp_files) = process_assembly(
+        post_assembly_temp_files, post_assembly_temp_dir) = process_assembly(
         config.clone(),
         &assembly_out_dir,
-        &assembly_work_dir,
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
         duplicate_clusters.clone(),
@@ -8512,15 +8338,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
     cleanup_receivers.extend(post_assembly_cleanup_receivers);
     temp_files.extend(post_assembly_temp_files);
+    final_temp_dirs.push(post_assembly_temp_dir);
 
-    let _ = fs::remove_dir_all(assembly_work_dir).await;
+    let coverage_json_path = assembly_out_dir.join("assembly_contig_coverage.json");
+    let coverage_summary_csv_path = assembly_out_dir.join("assembly_contig_coverage_summary.csv");
 
     let generate_assembly_coverage_result = generate_assembly_coverage(
         config.clone(),
         assembly_bam_out_stream,
         &assembly_outputs.contigs_fasta,
-        &assembly_outputs.coverage_json,
-        &assembly_outputs.coverage_summary_csv,
+        &coverage_json_path,
+        &coverage_summary_csv_path,
     )
         .await
         .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
@@ -8691,7 +8519,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
 
     let nt_handle = tokio::spawn({
-        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let contigs_fasta_path = assembly_outputs.contigs_fasta.clone();
         let config = config.clone();
         let lineage_map = lineage_map.clone();
         let should_keep_filter = should_keep_filter.clone();
@@ -8730,7 +8558,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
 
     let nr_handle = tokio::spawn({
-        let contigs_fasta_path = assembly_outputs.contigs_ram_fasta.clone();
+        let contigs_fasta_path = assembly_outputs.contigs_fasta.clone();
         let config = config.clone();
         let lineage_map = lineage_map.clone();
         let should_keep_filter = should_keep_filter.clone();
@@ -8935,27 +8763,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(nr_cleanup_tasks);
     cleanup_receivers.extend(nr_cleanup_receivers);
     temp_files.extend(nr_temp_files);
-
-    let spades_task = spades_assembly(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-        &out_dir,
-    ).await?;
-
-    let spades_completion = spades_task.await;
-
-    match spades_completion {
-        Ok(Ok(())) => {
-            info!("SPAdes assembly task completed successfully");
-        }
-        Ok(Err(e)) => {
-            warn!("SPAdes assembly failed: {}", e);
-        }
-        Err(join_err) => {
-            error!("SPAdes task panicked or was cancelled: {}", join_err);
-        }
-    }
 
     // ────────────────────────────────────────────────────────────────
     // PRELOAD NR alignments (parallel version)
@@ -9262,10 +9069,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let skip_coverage_viz = {
         let mut skip = false;
 
-        if !assembly_outputs.coverage_json.exists() {
+        if !coverage_json_path.exists() {
             warn!("Skipping coverage viz: contig_coverage_json missing (likely due to SPAdes assembly failure)");
             skip = true;
-        } else if assembly_outputs.coverage_json.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+        } else if coverage_json_path.metadata().map(|m| m.len() == 0).unwrap_or(true) {
             warn!("Skipping coverage viz: contig_coverage_json is empty");
             skip = true;
         }
@@ -9288,7 +9095,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             generate_coverage_viz(
                 ReceiverStream::new(nt_hit_summary_coverage),
                 ReceiverStream::new(nt_refined_m8_top_stream_out),
-                assembly_outputs.coverage_json,
+                coverage_json_path,
                 assembly_outputs.contig_stats_json,
                 ReceiverStream::new(nt_m8_viz),
                 nt_info_db_path,
