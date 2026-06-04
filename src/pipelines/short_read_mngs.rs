@@ -7699,25 +7699,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
+
     // Compute paths after temp_dir but before moving rx (only borrows with as_ref())
     let non_host_r1_path = non_host_temp_dir.path().join("nonhost_R1.fastq");
     let non_host_r2_path_opt = r2_rx_opt.as_ref().map(|_| non_host_temp_dir.path().join("nonhost_R2.fastq"));
 
-    // Now create monitored streams (this moves r1_rx and r2_rx_opt)
-    // let r1_monitored = monitor_stream(
-    //     ReceiverStream::new(r1_rx),
-    //     "Deinterleave_R1",
-    //     Duration::from_secs(5),
-    // );
-    // let r2_monitored_opt = r2_rx_opt.map(|rx| {
-    //     monitor_stream(
-    //         ReceiverStream::new(rx),
-    //         "Deinterleave_R2",
-    //         Duration::from_secs(5),
-    //     )
-    // });
 
     info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion). Writing to: {:?}", non_host_temp_dir);
+    final_temp_dirs.push(non_host_temp_dir);
 
     let r1_write_task_fut = write_parse_output_to_file(
         &non_host_r1_path,
@@ -8039,7 +8028,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Diamond or MMseqs2 non_host alignment
-    let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_temp_dirs) =
+    let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_align_temp_dirs) =
         match config.alignment_backend {
             NRAlignmentBackend::Diamond => {
                 diamond_non_host_align(
@@ -8068,7 +8057,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.append(&mut non_host_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_cleanup_receivers);
-    final_temp_dirs.extend(non_host_temp_dirs);
+    final_temp_dirs.extend(non_host_align_temp_dirs);
 
     let nr_concurrency = compute_phase_concurrency(
         &config,
