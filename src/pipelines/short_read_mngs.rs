@@ -6193,7 +6193,7 @@ pub async fn blast_contigs(
     );
 
 
-    let (_, makeblastdb_err_task) = spawn_cmd(
+    let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
         MAKEBLASTDB_TAG,
         makeblastdb_args,
@@ -6201,7 +6201,23 @@ pub async fn blast_contigs(
         None
     )
         .await?;
-    cleanup_tasks.push(makeblastdb_err_task);
+
+    // Wait for makeblastdb to fully finish creating the index files
+    makeblastdb_child.wait().await.map_err(|e| PipelineError::ToolExecution {
+        tool: MAKEBLASTDB_TAG.to_string(),
+        error: format!("makeblastdb failed: {}", e),
+    })?;
+    makeblastdb_err_task.await??;
+
+    // Verify the index was actually created (BLAST looks for the .nal/.pal alias file)
+    let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
+    let expected_index = blastdb_path.with_extension(index_ext);
+    if !expected_index.exists() {
+        return Err(anyhow!(
+        "makeblastdb did not produce index file at {}",
+        expected_index.display()
+    ));
+    }
 
     let blast_command = if db_type == NT_TAG {
         BLASTN_TAG
