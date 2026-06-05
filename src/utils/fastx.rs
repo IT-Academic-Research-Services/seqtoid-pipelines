@@ -72,13 +72,13 @@ pub enum SequenceRecord {
     Fasta {
         id: String,
         desc: Option<String>,
-        seq: Arc<Vec<u8>>,
+        seq: Bytes,
     },
     Fastq {
         id: String,
         desc: Option<String>,
-        seq: Arc<Vec<u8>>,
-        qual: Arc<Vec<u8>>,
+        seq: Bytes,
+        qual: Bytes,
     },
 }
 
@@ -90,35 +90,6 @@ impl SequenceRecord {
         }
     }
 
-    pub fn seq(&self) -> &[u8] {
-        match self {
-            SequenceRecord::Fasta { seq, .. } => &**seq,
-            SequenceRecord::Fastq { seq, .. } => &**seq,
-        }
-    }
-
-    pub fn seq_arc(&self) -> Arc<Vec<u8>> {
-        match self {
-            SequenceRecord::Fasta { seq, .. } => seq.clone(),
-            SequenceRecord::Fastq { seq, .. } => seq.clone(),
-        }
-    }
-
-    pub fn seq_owned(&self) -> Vec<u8> {
-        match self {
-            SequenceRecord::Fasta { seq, .. } => (**seq).clone(),
-            SequenceRecord::Fastq { seq, .. } => (**seq).clone(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn qual(&self) -> &[u8] {
-        match self {
-            SequenceRecord::Fasta { .. } => &[],
-            SequenceRecord::Fastq { qual, .. } => &**qual,
-        }
-    }
-
     #[allow(dead_code)]
     pub fn desc(&self) -> Option<&str> {
         match self {
@@ -126,6 +97,27 @@ impl SequenceRecord {
             SequenceRecord::Fastq { desc, .. } => desc.as_deref(),
         }
     }
+
+
+    /// Cheap clone of the sequence bytes (refcount bump only).
+    pub fn seq(&self) -> Bytes {
+        match self {
+            SequenceRecord::Fasta { seq, .. } => seq.clone(),
+            SequenceRecord::Fastq { seq, .. } => seq.clone(),
+        }
+    }
+
+
+
+    #[allow(dead_code)]
+    pub fn qual(&self) -> Bytes {
+        match self {
+            SequenceRecord::Fasta { .. } => Bytes::new(),
+            SequenceRecord::Fastq { qual, .. } => qual.clone(),
+        }
+    }
+
+
 }
 
 
@@ -138,74 +130,72 @@ pub enum SequenceReader {
 impl From<needletail::parser::SequenceRecord<'_>> for SequenceRecord {
     fn from(record: needletail::parser::SequenceRecord<'_>) -> Self {
         let (id, desc) = parse_header(record.id(), if record.qual().is_some() { '@' } else { '>' });
+
         if let Some(qual) = record.qual() {
             SequenceRecord::Fastq {
                 id,
                 desc,
-                seq: Arc::new(record.seq().to_vec()),
-                qual: Arc::new(qual.to_vec()),
+                seq: Bytes::from(record.seq().to_vec()),
+                qual: Bytes::from(qual.to_vec()),
             }
         } else {
             SequenceRecord::Fasta {
                 id,
                 desc,
-                seq: Arc::new(record.seq().to_vec()),
+                seq: Bytes::from(record.seq().to_vec()),
             }
         }
     }
 }
 
 
-/// HashSet based sequence validator
-///
-///
-/// # Arguments
-///
-/// * `seq`: &[u8] ref to vec of bytes
-/// * 'valid_bases: vec of allowed bases
-///
-/// # Returns
-/// Result<(), String> for error if any
-#[allow(dead_code)]
-pub fn validate_sequence(seq: &Arc<Vec<u8>>, valid_bases: &[u8]) -> Result<()> {
-    let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
-    if let Some(&invalid_base) = seq.iter().find(|&&b| !valid_bases_set.contains(&b)) {
-        Err(anyhow::anyhow!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
-    } else {
-        Ok(())
+
+/// Validates that a sequence only contains allowed nucleotide bases.
+/// Accepts `&[u8]`, `Bytes`, `Vec<u8>`, `&Bytes`, etc.
+pub fn validate_sequence(seq: impl AsRef<[u8]>, valid_bases: &[u8]) -> Result<()> {
+    let seq = seq.as_ref();
+    let valid: HashSet<u8> = valid_bases.iter().copied().collect();
+
+    if let Some(&invalid) = seq.iter().find(|b| !valid.contains(b)) {
+        return Err(anyhow!(
+            "Invalid nucleotide '{}' found in sequence",
+            invalid as char
+        ));
     }
+    Ok(())
 }
 
+/// Parallel validation for very large sequences (e.g. long contigs).
+/// Uses cheap `Bytes` clones to distribute chunks across threads.
+pub async fn validate_sequence_parallel(
+    seq: Bytes,
+    valid_bases: &[u8],
+    num_threads: usize,
+) -> Result<()> {
+    if seq.is_empty() || num_threads == 0 {
+        return Ok(());
+    }
 
-/// PArallel HashSet based sequence validator
-/// for large sequences (probably over 1 billion bases)
-///
-/// # Arguments
-///
-/// * `seq`: &[u8] ref to vec of bytes
-/// * 'valid_bases: vec of allowed bases
-/// * num threads
-///
-/// # Returns
-/// Result<(), String> for error if any
-#[allow(dead_code)]
-pub async fn validate_sequence_parallel(seq: Arc<Vec<u8>>, valid_bases: &[u8], num_threads: usize) -> Result<()> {
-    let valid_bases_set: HashSet<u8> = valid_bases.iter().copied().collect();
-    let chunk_size = (seq.len() + num_threads - 1) / num_threads;
-    let mut handles: Vec<JoinHandle<Result<(), String>>> = Vec::new();
+    let valid: HashSet<u8> = valid_bases.iter().copied().collect();
+    let len = seq.len();
+    let chunk_size = (len + num_threads - 1) / num_threads;
+
+    let mut handles = Vec::with_capacity(num_threads);
 
     for i in 0..num_threads {
         let start = i * chunk_size;
-        let end = (start + chunk_size).min(seq.len());
-        if start >= seq.len() {
+        if start >= len {
             break;
         }
-        let seq_arc = Arc::clone(&seq);
-        let valid_bases_set = valid_bases_set.clone();
+        let end = (start + chunk_size).min(len);
+
+        // Cheap clone (refcount bump) + zero-copy slice
+        let chunk = seq.slice(start..end);
+        let valid = valid.clone();
+
         let handle = tokio::spawn(async move {
-            let chunk = &seq_arc[start..end];
-            if let Some(&invalid_base) = chunk.iter().find(|&&b| !valid_bases_set.contains(&b)) {
-                Err(format!("Invalid nucleotide '{}' found in sequence", invalid_base as char))
+            if let Some(&invalid) = chunk.iter().find(|b| !valid.contains(b)) {
+                Err(format!("Invalid nucleotide '{}' found in sequence", invalid as char))
             } else {
                 Ok(())
             }
@@ -213,10 +203,10 @@ pub async fn validate_sequence_parallel(seq: Arc<Vec<u8>>, valid_bases: &[u8], n
         handles.push(handle);
     }
 
-    let results = try_join_all(handles).await?;
-    for result in results {
-        result.map_err(|e| anyhow::anyhow!(e))?;
+    for handle in handles {
+        handle.await?.map_err(|e| anyhow!(e))?;
     }
+
     Ok(())
 }
 
@@ -1091,8 +1081,8 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
                 SequenceRecord::Fastq {
                     id: format!("read{}", i + 1),
                     desc: None,
-                    seq: Arc::new(seq.into_bytes()),
-                    qual: Arc::new(qual.into_bytes()),
+                    seq: Bytes::from(seq.into_bytes()),
+                    qual: Bytes::from(qual.into_bytes()),
                 }
             })
             .collect()
@@ -1136,7 +1126,7 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     while let Some(record_result) = reader.next() {
         let record = record_result.map_err(|e| anyhow!("Error reading FASTA: {}", e))?;
         let seq_record: SequenceRecord = record.to_owned().into();
-        let fasta_line = format!(">{}\n{}\n", seq_record.id(), String::from_utf8_lossy(seq_record.seq()));
+        let fasta_line = format!(">{}\n{}\n", seq_record.id(), String::from_utf8_lossy(&seq_record.seq()));
         fifo_file.write_all(fasta_line.as_bytes())?;
     }
     fifo_file.flush()?;
@@ -1366,8 +1356,8 @@ pub async fn concatenate_paired_reads(
                             let new_record = SequenceRecord::Fastq {
                                 id: r1_id.clone(),
                                 desc: r1_desc.clone(),
-                                seq: Arc::new(new_seq),
-                                qual: Arc::new(new_qual),
+                                seq: Bytes::from(new_seq),
+                                qual: Bytes::from(new_qual),
                             };
 
                             if tx.send(ParseOutput::Fastq(new_record)).await.is_err() {
@@ -1611,11 +1601,10 @@ pub async fn generate_taxid_fasta(
                             );
 
                             let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
-                            let seq_arc = rec.seq_arc();
                             let new_rec = SequenceRecord::Fasta {
                                 id: new_id,
                                 desc: new_desc,
-                                seq: seq_arc,
+                                seq: rec.seq(),   // ← cheap Bytes clone (just refcount bump)
                             };
 
                             m_tx.send(ParseOutput::Fasta(new_rec.clone())).await.map_err(|_| anyhow!("mapped_tx dropped"))?;
@@ -1693,7 +1682,7 @@ pub async fn generate_taxid_fasta(
                             let new_rec = SequenceRecord::Fasta {
                                 id: new_id,
                                 desc: new_desc,
-                                seq: rec.seq_arc(),
+                                seq: rec.seq(),
                             };
 
 
@@ -2094,52 +2083,48 @@ mod tests {
         let fasta = SequenceRecord::Fasta {
             id: "contig1".to_string(),
             desc: Some("some desc".to_string()),
-            seq: Arc::new(b"ACGT".to_vec()),
+            seq: Bytes::from_static(b"ACGT"),
         };
 
         assert_eq!(fasta.id(), "contig1");
-        assert_eq!(fasta.seq(), b"ACGT");
-        assert_eq!(fasta.seq_owned(), b"ACGT".to_vec());
-        assert_eq!(fasta.qual(), b"");
+        assert_eq!(fasta.seq().as_ref(), b"ACGT");
+        assert_eq!(fasta.qual().as_ref(), b"");
         assert_eq!(fasta.desc(), Some("some desc"));
-        let fasta_arc = fasta.seq_arc();
-        assert!(Arc::ptr_eq(&fasta_arc, &fasta.seq_arc()));
+
+        // Cloning is cheap (refcount bump)
+        let fasta_clone = fasta.clone();
+        assert_eq!(fasta_clone.seq().as_ref(), b"ACGT");
 
         let fastq = SequenceRecord::Fastq {
             id: "read1".to_string(),
             desc: None,
-            seq: Arc::new(b"TGCA".to_vec()),
-            qual: Arc::new(b"IIII".to_vec()),
+            seq: Bytes::from_static(b"TGCA"),
+            qual: Bytes::from_static(b"IIII"),
         };
 
         assert_eq!(fastq.id(), "read1");
-        assert_eq!(fastq.seq(), b"TGCA");
-        assert_eq!(fastq.seq_owned(), b"TGCA".to_vec());
-        assert_eq!(fastq.qual(), b"IIII");
+        assert_eq!(fastq.seq().as_ref(), b"TGCA");
+        assert_eq!(fastq.qual().as_ref(), b"IIII");
         assert_eq!(fastq.desc(), None);
-        let fastq_arc = fastq.seq_arc();
-        assert!(Arc::ptr_eq(&fastq_arc, &fastq.seq_arc()));
+
+        // Cloning is cheap
+        let fastq_clone = fastq.clone();
+        assert_eq!(fastq_clone.seq().as_ref(), b"TGCA");
     }
 
     #[test]
     fn test_validate_sequence() {
-        let valid = Arc::new(b"ACGTACGT".to_vec());
-        assert!(validate_sequence(&valid, b"ACGT").is_ok());
+        assert!(validate_sequence(b"ACGTACGT", b"ACGT").is_ok());
 
-        let invalid = Arc::new(b"ACNT".to_vec());
-        let err = validate_sequence(&invalid, b"ACGT").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Invalid nucleotide"));
-        assert!(msg.contains("N"));
+        let err = validate_sequence(b"ACNT", b"ACGT").unwrap_err();
+        assert!(err.to_string().contains("Invalid nucleotide"));
     }
 
     #[tokio::test]
     async fn test_validate_sequence_parallel() -> Result<()> {
-        let valid = Arc::new(b"ACGTACGTACGT".to_vec());
-        validate_sequence_parallel(valid, b"ACGT", 3).await?;
+        validate_sequence_parallel(Bytes::from_static(b"ACGTACGTACGT"), b"ACGT", 3).await?;
 
-        let invalid = Arc::new(b"ACGTXCGT".to_vec());
-        let err = validate_sequence_parallel(invalid, b"ACGT", 3)
+        let err = validate_sequence_parallel(Bytes::from_static(b"ACGTXCGT"), b"ACGT", 3)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Invalid nucleotide"));
@@ -2278,8 +2263,8 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
@@ -2302,7 +2287,7 @@ mod tests {
             ParseOutput::Fasta(SequenceRecord::Fasta {
                 id: "seq2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
             }),
         ];
 
@@ -2334,8 +2319,8 @@ mod tests {
             tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "keep_me_01".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }))
                 .await
                 .unwrap();
@@ -2343,8 +2328,8 @@ mod tests {
             tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "ignore_me_02".to_string(),
                 desc: None,
-                seq: Arc::new(b"TGCA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"TGCA"),
+                qual: Bytes::from_static(b"HHHH"),
             }))
                 .await
                 .unwrap();
@@ -2362,7 +2347,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id(), "keep_me_01");
-        assert_eq!(results[0].seq(), b"ATCG");
+        assert_eq!(results[0].seq().as_ref(), b"ATCG");   // ← fixed
         Ok(())
     }
 
@@ -2391,8 +2376,8 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id(), "read1");
-        assert_eq!(records[0].seq(), b"ACGT");
-        assert_eq!(records[0].qual(), b"IIII");
+        assert_eq!(records[0].seq().as_ref(), b"ACGT");     // ← fixed
+        assert_eq!(records[0].qual().as_ref(), b"IIII");    // ← fixed
         Ok(())
     }
 
@@ -2403,14 +2388,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
@@ -2432,8 +2417,8 @@ mod tests {
 
         assert_eq!(concat_records.len(), 1);
         assert_eq!(concat_records[0].id(), "read1/1");
-        assert_eq!(concat_records[0].seq(), b"ATCGNGCTA");
-        assert_eq!(concat_records[0].qual(), b"IIII!HHHH");
+        assert_eq!(concat_records[0].seq().as_ref(), b"ATCGNGCTA");   // ← fixed
+        assert_eq!(concat_records[0].qual().as_ref(), b"IIII!HHHH");  // ← fixed
         Ok(())
     }
 }

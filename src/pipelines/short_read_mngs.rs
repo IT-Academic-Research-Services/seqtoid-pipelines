@@ -4134,14 +4134,14 @@ pub fn parse_fasta_batch_to_annotated(
                 .map(|r| r.size)
                 .unwrap_or(1u64);
 
-            let seq_arc = record.seq_arc();
+
 
             if !is_unidentified {
                 let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
                 let mapped_rec = SequenceRecord::Fasta {
                     id,
                     desc: None,
-                    seq: seq_arc,
+                    seq: record.seq(),
                 };
                 if let Ok(bytes) = mapped_rec.to_bytes() {
                     let mut tagged = vec![0u8];
@@ -4152,7 +4152,7 @@ pub fn parse_fasta_batch_to_annotated(
                 let fasta_rep = SequenceRecord::Fasta {
                     id: rep_id.clone(),
                     desc: None,
-                    seq: seq_arc.clone(),
+                    seq: record.seq(),
                 };
                 if let Ok(bytes) = fasta_rep.to_bytes() {
                     // Unidentified (expanded)
@@ -4225,14 +4225,13 @@ pub fn parse_fasta_batch_to_annotated_streaming(
             .map(|r| r.size)
             .unwrap_or(1u64);
 
-        let seq_arc = record.seq_arc();
-
+        
         if !is_unidentified {
             let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
             let mapped_rec = SequenceRecord::Fasta {
                 id,
                 desc: None,
-                seq: seq_arc,
+                seq: record.seq(),
             };
             if let Ok(bytes) = mapped_rec.to_bytes() {
                 let mut tagged = vec![0u8];
@@ -4243,7 +4242,7 @@ pub fn parse_fasta_batch_to_annotated_streaming(
             let fasta_rep = SequenceRecord::Fasta {
                 id: rep_id.clone(),
                 desc: None,
-                seq: seq_arc.clone(),
+                seq: record.seq(),
             };
             if let Ok(bytes) = fasta_rep.to_bytes() {
                 let mut tagged_unid = vec![1u8];

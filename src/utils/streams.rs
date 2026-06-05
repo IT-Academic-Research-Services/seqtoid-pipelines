@@ -843,8 +843,8 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fastq {
                 id,
                 desc,
-                seq: Arc::new(seq),
-                qual: Arc::new(qual),
+                seq: Bytes::from(seq),
+                qual: Bytes::from(qual),
             };
 
             if tx.send(ParseOutput::Fastq(record)).await.is_err() {
@@ -901,7 +901,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                     let record = SequenceRecord::Fasta {
                         id,
                         desc: current_desc.take(),
-                        seq: Arc::new(current_seq),
+                        seq: Bytes::from(current_seq),
                     };
                     if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                         return Err(anyhow!("Receiver dropped during FASTA parsing, data loss detected"));
@@ -920,7 +920,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fasta {
                 id,
                 desc: current_desc.take(),
-                seq: Arc::new(current_seq),
+                seq: Bytes::from(current_seq),
             };
             if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                 return Err(anyhow!("Receiver dropped during final FASTA parsing, data loss detected"));
@@ -2142,13 +2142,13 @@ mod tests {
         let fastq = SequenceRecord::Fastq {
             id: "read1".to_string(),
             desc: Some("mate 1".to_string()),
-            seq: Arc::new(b"ATCG".to_vec()),
-            qual: Arc::new(b"IIII".to_vec()),
+            seq: Bytes::from_static(b"ATCG"),
+            qual:Bytes::from_static(b"IIII"),
         };
         let fasta = SequenceRecord::Fasta {
             id: "contig1".to_string(),
             desc: Some("assembled contig".to_string()),
-            seq: Arc::new(b"GATTACA".to_vec()),
+            seq: Bytes::from_static(b"GATTACA"),
         };
 
         assert_eq!(fastq.to_bytes()?.as_ref(), b"@read1 mate 1\nATCG\n+\nIIII\n");
@@ -2182,7 +2182,7 @@ mod tests {
             ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
                 assert_eq!(id, "seq1");
                 assert_eq!(desc.as_deref(), Some("first record"));
-                assert_eq!(seq.as_ref().as_slice(), b"ACGTTGCA");
+                assert_eq!(seq.as_ref(), b"ACGTTGCA");
             }
             other => panic!("Expected first FASTA record, got {:?}", other),
         }
@@ -2191,7 +2191,7 @@ mod tests {
             ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
                 assert_eq!(id, "seq2");
                 assert_eq!(desc, &None);
-                assert_eq!(seq.as_ref().as_slice(), b"NNNN");
+                assert_eq!(seq.as_ref(), b"NNNN");
             }
             other => panic!("Expected second FASTA record, got {:?}", other),
         }
@@ -2299,7 +2299,7 @@ mod tests {
         tx.send(ParseOutput::Fasta(SequenceRecord::Fasta {
             id: "seq1".to_string(),
             desc: Some("desc".to_string()),
-            seq: Arc::new(b"ACGT".to_vec()),
+            seq: Bytes::from_static(b"ACGT"),
         })).await?;
         tx.send(ParseOutput::Bytes(Bytes::from_static(b"ignored"))).await?;
         drop(tx);
@@ -2316,7 +2316,7 @@ mod tests {
             SequenceRecord::Fasta { id, desc, seq } => {
                 assert_eq!(id, "seq1");
                 assert_eq!(desc.as_deref(), Some("desc"));
-                assert_eq!(seq.as_ref().as_slice(), b"ACGT");
+                assert_eq!(seq.as_ref(), b"ACGT");
             }
             other => panic!("Expected FASTA record, got {:?}", other),
         }
@@ -2405,14 +2405,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
         let stream = tokio_stream::iter(records);
@@ -3080,9 +3080,9 @@ mod tests {
         }
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].id(), "read1");
-        assert_eq!(records[0].seq(), b"ATCG");
+        assert_eq!(records[0].seq(), Bytes::from_static(b"ATCG"));
         assert_eq!(records[1].id(), "read2");
-        assert_eq!(records[1].seq(), b"GCTA");
+        assert_eq!(records[1].seq(), Bytes::from_static(b"GCTA"));
         Ok(())
     }
 
@@ -3337,14 +3337,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
@@ -3428,8 +3428,8 @@ mod tests {
         let test_record = ParseOutput::Fastq(SequenceRecord::Fastq {
             id: "read1".to_string(),
             desc: None,
-            seq: Arc::new(b"ATCG".to_vec()),
-            qual: Arc::new(b"IIII".to_vec()),
+            seq: Bytes::from_static(b"ATCG"),
+            qual: Bytes::from_static(b"IIII"),
         });
 
         tokio::spawn(async move {
@@ -3467,26 +3467,26 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"CCCC".to_vec()),
-                qual: Arc::new(b"JJJJ".to_vec()),
+                seq: Bytes::from_static(b"CCCC"),
+                qual: Bytes::from_static(b"JJJJ"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GGGG".to_vec()),
-                qual: Arc::new(b"KKKK".to_vec()),
+                seq: Bytes::from_static(b"GGGG"),
+                qual: Bytes::from_static(b"KKKK"),
             }),
         ];
 
@@ -3553,14 +3553,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
@@ -3697,14 +3697,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
