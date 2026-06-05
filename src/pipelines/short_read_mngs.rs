@@ -5434,6 +5434,7 @@ pub async fn summarize_hits(
 /// # Arguments
 /// # Returns
 /// Result
+
 async fn write_empty_blast_outputs(
     blast_m8: &PathBuf,
     blast_top_m8: &PathBuf,
@@ -5442,13 +5443,21 @@ async fn write_empty_blast_outputs(
     refined_counts_with_dcr: &PathBuf,
     contig_summary_json: &PathBuf,
 
+    // These are the files we copy forward (same as Python)
+    deduped_m8: &PathBuf,
+    hit_summary: &PathBuf,
+    orig_counts_with_dcr: &PathBuf,
 ) -> Result<()> {
     tokio::fs::write(blast_m8, b" ").await?;
     tokio::fs::write(blast_top_m8, b" ").await?;
-    tokio::fs::write(refined_m8, b" ").await?;
-    tokio::fs::write(refined_hit_summary, b" ").await?;
-    tokio::fs::write(refined_counts_with_dcr, b" ").await?;
+
+    // Preserve previous read-level results (critical)
+    tokio::fs::copy(deduped_m8, refined_m8).await?;
+    tokio::fs::copy(hit_summary, refined_hit_summary).await?;
+    tokio::fs::copy(orig_counts_with_dcr, refined_counts_with_dcr).await?;
+
     tokio::fs::write(contig_summary_json, b"[]").await?;
+
     Ok(())
 }
 
@@ -6021,6 +6030,77 @@ pub async fn generate_m8_and_hit_summary(
 }
 
 
+
+async fn early_blast_exit(
+    db_type: &str,
+    blast_m8: &PathBuf,
+    blast_top_m8: &PathBuf,
+    refined_m8: &PathBuf,
+    refined_hit_summary: &PathBuf,
+    refined_counts: &PathBuf,
+    contig_summary: &PathBuf,
+    deduped_m8: Option<&PathBuf>,
+    hit_summary: Option<&PathBuf>,
+    orig_counts: Option<&PathBuf>,
+    read_dict: &Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
+    taxon_counts: Vec<TaxonCount>,
+    fn_start: tokio::time::Instant,
+) -> Result<(
+    AHashMap<String, Arc<ReadHit>>,
+    Vec<TaxonCount>,
+    Vec<ContigSummaryEntry>,
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+    Vec<NamedTempFile>,
+)> {
+    warn!("[blast_contigs:{}] graceful early exit (no usable BLAST results)", db_type);
+
+    if let (Some(d), Some(h), Some(c)) = (deduped_m8, hit_summary, orig_counts) {
+        // Preserve previous read-level results (preferred path)
+        tokio::fs::write(blast_m8, b" ").await?;
+        tokio::fs::write(blast_top_m8, b" ").await?;
+        tokio::fs::copy(d, refined_m8).await?;
+        tokio::fs::copy(h, refined_hit_summary).await?;
+        tokio::fs::copy(c, refined_counts).await?;
+        tokio::fs::write(contig_summary, b"[]").await?;
+    } else {
+        // Fallback when we don't have the source files (current streaming situation)
+        tokio::fs::write(blast_m8, b" ").await?;
+        tokio::fs::write(blast_top_m8, b" ").await?;
+        tokio::fs::write(refined_m8, b" ").await?;
+        tokio::fs::write(refined_hit_summary, b" ").await?;
+        tokio::fs::write(refined_counts, b" ").await?;
+        tokio::fs::write(contig_summary, b"[]").await?;
+    }
+
+    let final_read_dict = read_dict.lock().unwrap().clone();
+    let (_m8_tx, m8_rx) = mpsc::channel(1);
+    let (_hit_tx, hit_rx) = mpsc::channel(1);
+    let (_top_tx, top_rx) = mpsc::channel(1);
+
+    info!(
+        "[blast_contigs:{}] empty-output fast path complete after {:?}",
+        db_type,
+        fn_start.elapsed()
+    );
+
+    Ok((
+        final_read_dict,
+        taxon_counts,
+        vec![],
+        m8_rx,
+        hit_rx,
+        top_rx,
+        vec![],
+        vec![],
+        vec![],
+    ))
+}
+
+// ====================== blast_contigs ======================
 pub async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
@@ -6048,7 +6128,7 @@ pub async fn blast_contigs(
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
 )> {
-    use std::time::{Duration, Instant};
+    use tokio::time::Instant;           // ← use tokio's Instant
 
     let fn_start = Instant::now();
     info!(
@@ -6099,50 +6179,121 @@ pub async fn blast_contigs(
         ref_size
     );
 
-    if contig_size < MIN_REF_FASTA_SIZE || ref_size < MIN_ASSEMBLED_CONTIG_SIZE {
-        warn!(
-            "[blast_contigs:{}] skipping BLAST: contig_size={} ref_size={} (thresholds contig>= {}, ref>= {})",
+    // ─────────────────────────────────────────────────────────────
+    // Graceful early exit if there is nothing useful to BLAST
+    // ─────────────────────────────────────────────────────────────
+    if contig_size < MIN_ASSEMBLED_CONTIG_SIZE || ref_size < MIN_REF_FASTA_SIZE {
+        return early_blast_exit(
             db_type,
-            contig_size,
-            ref_size,
-            MIN_REF_FASTA_SIZE,
-            MIN_ASSEMBLED_CONTIG_SIZE
-        );
-
-        write_empty_blast_outputs(
             &blast_m8_path,
             &blast_top_m8_path,
             &refined_m8_path,
             &refined_hit_summary_path,
             &refined_counts_path,
             &contig_summary_path,
+            None,
+            None,
+            None,
+            &read_dict,
+            taxon_counts,
+            fn_start,
         )
-            .await?;
+            .await;
+    }
 
-        let final_read_dict = read_dict.lock().unwrap().clone();
+    // ─────────────────────────────────────────────────────────────
+    // Normal path
+    // ─────────────────────────────────────────────────────────────
+    let temp_dir = choose_temp_dir(
+        ref_size + contig_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        blast_headroom,
+        true,
+    )
+        .await?;
+    info!(
+        "[blast_contigs:{}] temp dir chosen: {}",
+        db_type,
+        temp_dir.path().display()
+    );
 
-        let (_m8_tx, m8_rx) = mpsc::channel(1);
-        let (_hit_tx, hit_rx) = mpsc::channel(1);
-        let (_top_tx, top_rx) = mpsc::channel(1);
+    let blastdb_suffix = format!("{}_blastindex", db_type);
+    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
+        .map_err(|e| PipelineError::Other(e.into()))?;
+    let blastdb_path = blastdb_ram_path.path().to_owned();
+    temp_files.push(blastdb_ram_path);
 
-        info!(
-            "[blast_contigs:{}] empty-output fast path complete after {:?}",
-            db_type,
-            fn_start.elapsed()
+    info!(
+        "[blast_contigs:{}] blastdb path: {}",
+        db_type,
+        blastdb_path.display()
+    );
+
+    let makeblastdb_config = MakeblastdbConfig {
+        input: reference_fasta.clone(),
+        dbtype: if db_type == NT_TAG {
+            "nucl".to_string()
+        } else {
+            "prot".to_string()
+        },
+        output: blastdb_path.clone(),
+        option_fields: HashMap::new(),
+    };
+
+    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MAKEBLASTDB_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    info!("[blast_contigs:{}] launching makeblastdb", db_type);
+
+    let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
+        config.clone(),
+        MAKEBLASTDB_TAG,
+        makeblastdb_args,
+        config.args.verbose,
+        None
+    )
+        .await?;
+
+    makeblastdb_child.wait().await.map_err(|e| PipelineError::ToolExecution {
+        tool: MAKEBLASTDB_TAG.to_string(),
+        error: format!("makeblastdb failed: {}", e),
+    })?;
+    makeblastdb_err_task.await??;
+
+    let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
+    let expected_index = blastdb_path.with_extension(index_ext);
+
+    if !expected_index.exists() {
+        warn!(
+            "[blast_contigs:{}] makeblastdb did not produce expected index at {}. Falling back gracefully.",
+            db_type, expected_index.display()
         );
 
-        return Ok((
-            final_read_dict,
+        return early_blast_exit(
+            db_type,
+            &blast_m8_path,
+            &blast_top_m8_path,
+            &refined_m8_path,
+            &refined_hit_summary_path,
+            &refined_counts_path,
+            &contig_summary_path,
+            None,
+            None,
+            None,
+            &read_dict,
             taxon_counts,
-            vec![],
-            m8_rx,
-            hit_rx,
-            top_rx,
-            cleanup_tasks,
-            cleanup_receivers,
-            temp_files,
-        ));
+            fn_start,
+        )
+            .await;
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Index exists → continue with blastn/x
+    // ─────────────────────────────────────────────────────────────
 
     let temp_dir = choose_temp_dir(
         ref_size + contig_size,
@@ -6187,11 +6338,7 @@ pub async fn blast_contigs(
             error: e.to_string(),
         })?;
 
-    info!(
-        "[blast_contigs:{}] launching {}",
-        db_type, MAKEBLASTDB_TAG
-    );
-
+    info!("[blast_contigs:{}] launching makeblastdb", db_type);
 
     let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
@@ -6202,22 +6349,45 @@ pub async fn blast_contigs(
     )
         .await?;
 
-    // Wait for makeblastdb to fully finish creating the index files
+    // Wait for makeblastdb to finish
     makeblastdb_child.wait().await.map_err(|e| PipelineError::ToolExecution {
         tool: MAKEBLASTDB_TAG.to_string(),
         error: format!("makeblastdb failed: {}", e),
     })?;
     makeblastdb_err_task.await??;
 
-    // Verify the index was actually created (BLAST looks for the .nal/.pal alias file)
+    // Verify the index was created
     let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
     let expected_index = blastdb_path.with_extension(index_ext);
+
     if !expected_index.exists() {
-        return Err(anyhow!(
-        "makeblastdb did not produce index file at {}",
-        expected_index.display()
-    ));
+        warn!(
+        "[blast_contigs:{}] makeblastdb did not produce expected index at {}. Falling back gracefully.",
+        db_type, expected_index.display()
+    );
+
+        return early_blast_exit(
+            db_type,
+            &blast_m8_path,
+            &blast_top_m8_path,
+            &refined_m8_path,
+            &refined_hit_summary_path,
+            &refined_counts_path,
+            &contig_summary_path,
+            None,
+            None,
+            None,
+            &read_dict,
+            taxon_counts,
+            fn_start,
+        )
+            .await;           // ← add this
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // If we reach here, the index exists — continue with blastn/x
+    // (rest of the function stays the same)
+    // ─────────────────────────────────────────────────────────────
 
     let blast_command = if db_type == NT_TAG {
         BLASTN_TAG
