@@ -660,15 +660,13 @@ pub async fn ensure_transparent_hugepages(config: &RunConfig) -> Result<()> {
         return Ok(());
     }
 
-    info!("Configuring Transparent Huge Pages (madvise mode) for large EPYC node...");
+    info!("Configuring Transparent Huge Pages for large linux node...");
 
-    // We only touch these two. defrag is left at the system default.
     let paths = [
         "/sys/kernel/mm/transparent_hugepage/enabled",
         "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
+        "/sys/kernel/mm/transparent_hugepage/defrag",
     ];
-
-    let target = "madvise";
 
     for path in &paths {
         let current = match tokio::fs::read_to_string(path).await {
@@ -679,19 +677,38 @@ pub async fn ensure_transparent_hugepages(config: &RunConfig) -> Result<()> {
             }
         };
 
-        // Already correct?
-        if current.contains("[madvise]") || current == target {
-            debug!("{} already set to madvise", path);
-            continue;
-        }
-
-        if let Err(e) = tokio::fs::write(path, target).await {
-            warn!("Failed to set {} to '{}': {}", path, target, e);
+        // Choose best supported value
+        let target = if path.ends_with("/defrag") {
+            // Prefer defer+madvise on modern kernels, fall back to madvise
+            if current.contains("[defer+madvise]") {
+                continue; // already optimal
+            }
+            "defer+madvise"
         } else {
-            info!("Set {} → {}", path, target);
+            if current.contains("[madvise]") {
+                continue;
+            }
+            "madvise"
+        };
+
+        match tokio::fs::write(path, target).await {
+            Ok(_) => info!("Set {} → {}", path, target),
+            Err(e) => {
+                if path.ends_with("/defrag") && target == "defer+madvise" {
+                    // Fallback for older kernels
+                    warn!("defer+madvise not supported on this kernel, falling back to madvise");
+                    if let Err(e2) = tokio::fs::write(path, "madvise").await {
+                        warn!("Failed to set {} to madvise: {}", path, e2);
+                    } else {
+                        info!("Set {} → madvise (fallback)", path);
+                    }
+                } else {
+                    warn!("Failed to set {} to '{}': {}", path, target, e);
+                }
+            }
         }
     }
 
-    info!("THP configuration complete (mode: madvise)");
+    info!("THP configuration complete (mode: madvise + safe defrag)");
     Ok(())
 }
