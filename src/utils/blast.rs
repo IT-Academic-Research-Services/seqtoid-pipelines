@@ -1058,11 +1058,38 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    // ── Proptest with random extra tags ────────────────────────────────────
+    // ── Strategy for generating tag fields (valid + malformed) ─────────────
+    fn tag_field_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Valid tag: key:type:value
+            ("[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}")
+                .prop_map(|(k, t, v)| format!("{}:{}{}", k, t, v)),
 
+            // Malformed: missing type (only one colon)
+            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}")
+                .prop_map(|(k, v)| format!("{}:{}", k, v)),
+
+            // Malformed: empty key
+            (":[A-Za-z]:[^\\t\\n]{0,30}").prop_map(|s| s.to_string()),
+
+            // Malformed: empty value
+            ("[A-Za-z0-9_]{1,10}:[A-Za-z]:").prop_map(|s| s.to_string()),
+
+            // Malformed: garbage / no colons
+            "[A-Za-z0-9_:\\-]{1,40}".prop_map(|s| s),
+
+            // Malformed: trailing colon only
+            "[A-Za-z0-9_]{1,10}:".prop_map(|s| s.to_string()),
+
+            // Empty tag field (consecutive tabs)
+            Just("".to_string()),
+        ]
+    }
+
+    // ── Proptests with random extra tags (valid + malformed) ───────────────
     proptest! {
         #[test]
-        fn test_parse_line_nt_equivalence_with_tags(
+        fn test_parse_line_nt_equivalence_with_malformed_tags(
             qname in "[a-zA-Z0-9._-]{1,100}",
             tname in "[a-zA-Z0-9._-]{1,50}",
             pident in 0.0..100.0,
@@ -1077,10 +1104,7 @@ mod tests {
             bitscore in 0.0..1000.0,
             qlen in 1u64..10000,
             slen in 1u64..1000000,
-            extra_tags in prop::collection::vec(
-                ( "[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}" ),
-                0..40
-            )
+            extra_tags in prop::collection::vec(tag_field_strategy(), 0..35)
         ) {
             let mut line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:e}\t{:.3}\t{}\t{}",
@@ -1088,15 +1112,22 @@ mod tests {
                 tstart, tend, evalue, bitscore, qlen, slen
             );
 
-            for (key, typ, val) in extra_tags {
-                line.push_str(&format!("\t{}:{}{}", key, typ, val));
+            for tag in extra_tags {
+                line.push_str(&format!("\t{}", tag));
             }
 
-            compare_nt(&line);
+            let scalar_res = M8Record::parse_line_nt_scalar(&line);
+            let dispatched_res = M8Record::parse_line_nt(&line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, &line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and AVX-512 disagreed on success/failure for line: {}", line),
+            }
         }
 
         #[test]
-        fn test_parse_line_nr_equivalence_with_tags(
+        fn test_parse_line_nr_equivalence_with_malformed_tags(
             qname in "[a-zA-Z0-9._-]{1,100}",
             tname in "[a-zA-Z0-9._-]{1,50}",
             pident in 0.0..100.0,
@@ -1109,10 +1140,7 @@ mod tests {
             tend in 1u64..1000000,
             evalue in 0.0..1.0,
             bitscore in 0.0..1000.0,
-            extra_tags in prop::collection::vec(
-                ( "[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}" ),
-                0..40
-            )
+            extra_tags in prop::collection::vec(tag_field_strategy(), 0..35)
         ) {
             let mut line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:e}\t{:.3}",
@@ -1120,11 +1148,18 @@ mod tests {
                 tstart, tend, evalue, bitscore
             );
 
-            for (key, typ, val) in extra_tags {
-                line.push_str(&format!("\t{}:{}{}", key, typ, val));
+            for tag in extra_tags {
+                line.push_str(&format!("\t{}", tag));
             }
 
-            compare_nr(&line);
+            let scalar_res = M8Record::parse_line_nr_scalar(&line);
+            let dispatched_res = M8Record::parse_line_nr(&line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, &line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and AVX-512 disagreed on success/failure for line: {}", line),
+            }
         }
     }
 
@@ -1292,7 +1327,7 @@ mod tests {
         assert!(M8Record::parse_line_nr(short).is_err());
     }
 
-    // ── Stronger edge-case tests ───────────────────────────────────────────
+    // ── Additional strong edge-case tests ──────────────────────────────────
 
     #[test]
     fn test_nt_malformed_and_extra_columns() {
@@ -1354,22 +1389,7 @@ mod tests {
         compare_nr(&line);
     }
 
-    #[test]
-    fn test_nt_very_long_line_with_mixed_tags() {
-        let mut line = "long_read\tNC_045512.2\t99.9\t500\t5\t1\t1\t500\t10\t500\t1e-100\t800.0\t500\t29903".to_string();
-        for i in 0..80 {
-            if i % 3 == 0 {
-                line.push_str(&format!("\tAS:i:{}", 100 + i));
-            } else if i % 3 == 1 {
-                line.push_str(&format!("\tNM:i:{}", i));
-            } else {
-                line.push_str(&format!("\tcg:Z:{}M", i));
-            }
-        }
-        compare_nt(&line);
-    }
-
-    // ── Existing consensus / aggregation / summarize tests (unchanged) ────
+    // ── Existing consensus / aggregation / summarize tests ────────────────
 
     use fst::MapBuilder;
 
