@@ -2065,7 +2065,6 @@ mod tests {
         assert_eq!(fasta.qual().as_ref(), b"");
         assert_eq!(fasta.desc(), Some("some desc"));
 
-        // Cloning is cheap (refcount bump)
         let fasta_clone = fasta.clone();
         assert_eq!(fasta_clone.seq().as_ref(), b"ACGT");
 
@@ -2081,7 +2080,6 @@ mod tests {
         assert_eq!(fastq.qual().as_ref(), b"IIII");
         assert_eq!(fastq.desc(), None);
 
-        // Cloning is cheap
         let fastq_clone = fastq.clone();
         assert_eq!(fastq_clone.seq().as_ref(), b"TGCA");
     }
@@ -2227,8 +2225,6 @@ mod tests {
         Ok(())
     }
 
-  
-
     #[tokio::test]
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
@@ -2321,7 +2317,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id(), "keep_me_01");
-        assert_eq!(results[0].seq().as_ref(), b"ATCG");   // ← fixed
+        assert_eq!(results[0].seq().as_ref(), b"ATCG");
         Ok(())
     }
 
@@ -2350,8 +2346,8 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id(), "read1");
-        assert_eq!(records[0].seq().as_ref(), b"ACGT");     // ← fixed
-        assert_eq!(records[0].qual().as_ref(), b"IIII");    // ← fixed
+        assert_eq!(records[0].seq().as_ref(), b"ACGT");
+        assert_eq!(records[0].qual().as_ref(), b"IIII");
         Ok(())
     }
 
@@ -2391,8 +2387,8 @@ mod tests {
 
         assert_eq!(concat_records.len(), 1);
         assert_eq!(concat_records[0].id(), "read1/1");
-        assert_eq!(concat_records[0].seq().as_ref(), b"ATCGNGCTA");   // ← fixed
-        assert_eq!(concat_records[0].qual().as_ref(), b"IIII!HHHH");  // ← fixed
+        assert_eq!(concat_records[0].seq().as_ref(), b"ATCGNGCTA");
+        assert_eq!(concat_records[0].qual().as_ref(), b"IIII!HHHH");
         Ok(())
     }
 
@@ -2412,18 +2408,17 @@ mod tests {
 
     #[test]
     fn test_parse_header_equivalence() {
-        // Long header that can span multiple 64-byte AVX-512 chunks
         let long_header = b"very_long_id_that_spans_multiple_chunks_".repeat(4);
 
         let cases: Vec<&[u8]> = vec![
             b"seq1 first record",
             b"seq1\tfirst record",
-            b"seq1\nfirst record",           // edge case with newline
+            b"seq1\nfirst record",
             b"seq1 first record with spaces",
-            b"seq1 ",                        // trailing space
-            b"seq1",                         // no description
+            b"seq1 ",
+            b"seq1",
             b"very_long_id_that_spans_multiple_chunks_",
-            &long_header[..],                // long header for AVX-512 testing
+            &long_header[..],
         ];
 
         for &header in &cases {
@@ -2442,7 +2437,7 @@ mod tests {
 
     #[test]
     fn test_parse_header_long_and_edge_cases() {
-        let long_id = "a".repeat(250); // deliberately > 64*3 bytes
+        let long_id = "a".repeat(250);
 
         let test_cases: Vec<(&[u8], char)> = vec![
             (long_id.as_bytes(), '>'),
@@ -2464,6 +2459,4 @@ mod tests {
             );
         }
     }
-
-
 }
