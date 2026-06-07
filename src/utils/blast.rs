@@ -1058,9 +1058,11 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    // ── Proptest with random extra tags ────────────────────────────────────
+
     proptest! {
         #[test]
-        fn test_parse_line_nt_equivalence(
+        fn test_parse_line_nt_equivalence_with_tags(
             qname in "[a-zA-Z0-9._-]{1,100}",
             tname in "[a-zA-Z0-9._-]{1,50}",
             pident in 0.0..100.0,
@@ -1074,18 +1076,27 @@ mod tests {
             evalue in 0.0..1.0,
             bitscore in 0.0..1000.0,
             qlen in 1u64..10000,
-            slen in 1u64..1000000
+            slen in 1u64..1000000,
+            extra_tags in prop::collection::vec(
+                ( "[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}" ),
+                0..40
+            )
         ) {
-            let line = format!(
+            let mut line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:e}\t{:.3}\t{}\t{}",
                 qname, tname, pident, alen, mismatch, gapopen, qstart, qend,
                 tstart, tend, evalue, bitscore, qlen, slen
             );
+
+            for (key, typ, val) in extra_tags {
+                line.push_str(&format!("\t{}:{}{}", key, typ, val));
+            }
+
             compare_nt(&line);
         }
 
         #[test]
-        fn test_parse_line_nr_equivalence(
+        fn test_parse_line_nr_equivalence_with_tags(
             qname in "[a-zA-Z0-9._-]{1,100}",
             tname in "[a-zA-Z0-9._-]{1,50}",
             pident in 0.0..100.0,
@@ -1097,13 +1108,22 @@ mod tests {
             tstart in 1u64..1000000,
             tend in 1u64..1000000,
             evalue in 0.0..1.0,
-            bitscore in 0.0..1000.0
+            bitscore in 0.0..1000.0,
+            extra_tags in prop::collection::vec(
+                ( "[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}" ),
+                0..40
+            )
         ) {
-            let line = format!(
+            let mut line = format!(
                 "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:e}\t{:.3}",
                 qname, tname, pident, alen, mismatch, gapopen, qstart, qend,
                 tstart, tend, evalue, bitscore
             );
+
+            for (key, typ, val) in extra_tags {
+                line.push_str(&format!("\t{}:{}{}", key, typ, val));
+            }
+
             compare_nr(&line);
         }
     }
@@ -1272,30 +1292,25 @@ mod tests {
         assert!(M8Record::parse_line_nr(short).is_err());
     }
 
-    // ── Stronger edge-case tests for malformed / extra columns ────────────
+    // ── Stronger edge-case tests ───────────────────────────────────────────
 
     #[test]
     fn test_nt_malformed_and_extra_columns() {
         let cases = vec![
-            // Too few columns
             "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000",
-            // Extra columns
             "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\textra1\textra2\textra3",
-            // Trailing tab (empty last field)
             "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\t",
-            // Empty field in the middle
             "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t\t150\t29903",
         ];
 
         for line in cases {
-            // Should either both succeed with same result or both fail
             let scalar_res = M8Record::parse_line_nt_scalar(line);
             let dispatched_res = M8Record::parse_line_nt(line);
 
             match (scalar_res, dispatched_res) {
                 (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, line),
-                (Err(_), Err(_)) => {} // both failed → acceptable
-                _ => panic!("Scalar and dispatched disagreed on error/success for: {}", line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar vs dispatched disagreement on: {}", line),
             }
         }
     }
@@ -1316,12 +1331,10 @@ mod tests {
             match (scalar_res, dispatched_res) {
                 (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, line),
                 (Err(_), Err(_)) => {}
-                _ => panic!("Scalar and dispatched disagreed on: {}", line),
+                _ => panic!("Scalar vs dispatched disagreement on: {}", line),
             }
         }
     }
-
-    // ── Very long lines with many tags (stresses AVX-512 tab collection) ──
 
     #[test]
     fn test_nt_long_line_many_tags() {
