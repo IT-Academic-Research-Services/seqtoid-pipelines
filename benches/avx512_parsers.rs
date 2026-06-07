@@ -1,16 +1,28 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord, parse_header};
+
 use std::io::Cursor;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use needletail::parser::FastqReader;
 use needletail::FastxReader;
 use ahash::AHashMap;
 use dashmap::DashMap;
+use bytes::Bytes;
 
 
+use tokio::sync::{mpsc, Semaphore};
+use tokio_stream::wrappers::ReceiverStream;
+
+use seqtoid_pipelines::config::defs::{Taxid, Lineage, StreamDataType, RunConfig, SimdLevel, GpuDetection, NRAlignmentBackend};
+use seqtoid_pipelines::utils::fastx::{write_fasta_stream_to_file};
+use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord, parse_header};
+use seqtoid_pipelines::utils::streams::{ParseOutput};
 use seqtoid_pipelines::utils::paf::PafRecord;
 use seqtoid_pipelines::utils::blast::{
-    process_record_pair, M8Record, AggBucket, merge_aggregations,
+    process_record_pair, M8Record, AggBucket, merge_aggregations, summarize_m8_hits, consensus_level
 };
+use seqtoid_pipelines::utils::taxonomy::{get_valid_lineage};
 
 
 
@@ -289,6 +301,315 @@ fn bench_blast_hit_processing(c: &mut Criterion) {
 
     group.finish();
 }
+
+// ── summarize_m8_hits (with inline helpers) ──────────────────────────────
+
+use fst::{Map, MapBuilder};
+use log::LevelFilter;
+use rayon::ThreadPoolBuilder;
+use seqtoid_pipelines::Arguments;
+use seqtoid_pipelines::utils::system::{detect_ram, generate_rng};
+
+fn lineage(species: i32, genus: i32, family: i32) -> Lineage {
+    [species, genus, family]
+}
+
+fn build_lineage_map() -> AHashMap<Taxid, Lineage> {
+    let mut map = AHashMap::default();
+    map.insert(1, lineage(1, 10, 100));
+    map.insert(2, lineage(2, 20, 200));
+    map.insert(3, lineage(3, 30, 300));
+    map.insert(4, lineage(1, 10, 999));
+    map
+}
+
+fn build_acc_map(entries: &[(&str, u64)]) -> Map<Vec<u8>> {
+    let mut builder = MapBuilder::memory();
+    for (k, v) in entries {
+        builder.insert(k.as_bytes(), *v).unwrap();
+    }
+    builder.into_map()
+}
+
+fn generate_hits_for_read(read_id: &str, num_hits: usize) -> Vec<M8Record> {
+    let mut hits = Vec::with_capacity(num_hits);
+    for i in 0..num_hits {
+        let bitscore = 300.0 - (i as f64 * 3.0);
+        hits.push(M8Record {
+            qname: read_id.to_string(),
+            tname: "QIK02963".to_string(),
+            pident: 87.5,
+            alen: 150 + i as u64,
+            mismatch: 12,
+            gapopen: 0,
+            qstart: 1,
+            qend: 150 + i as u64,
+            tstart: 1,
+            tend: 150 + i as u64,
+            evalue: 1.45e-38,
+            bitscore,
+            qlen: 0,
+            slen: 0,
+        });
+    }
+    hits
+}
+
+fn bench_summarize_m8_hits(c: &mut Criterion) {
+    let lineage_map = build_lineage_map();
+    let acc2taxid_map = build_acc_map(&[("QIK02963", 1)]);
+
+    let num_reads = 5_000; // Start smaller while testing
+    let mut all_reads = Vec::with_capacity(num_reads);
+
+    for i in 0..num_reads {
+        let read_id = format!("read{}", i);
+        let hits = generate_hits_for_read(&read_id, 8);
+        all_reads.push((i as u64, read_id, hits));
+    }
+
+    let mut group = c.benchmark_group("summarize_m8_hits");
+    group.throughput(Throughput::Elements(num_reads as u64));
+    group.sample_size(10);
+
+    group.bench_function("best_hit + consensus", |b| {
+        b.iter(|| {
+            for (seq, read_id, hits) in &all_reads {
+                let _ = black_box(summarize_m8_hits(
+                    black_box(*seq),
+                    black_box(read_id.clone()),
+                    black_box(hits),
+                    &lineage_map,
+                    &acc2taxid_map,
+                    &|_: &[i32]| true,
+                    black_box(50),
+                ));
+            }
+        })
+    });
+
+    group.finish();
+}
+
+// ── parse_paf_batch_to_m8 ────────────────────────────────────────────────
+
+fn bench_parse_paf_batch_to_m8(c: &mut Criterion) {
+    // Start with 50k lines for faster iteration while developing.
+    // Increase to 200k–500k later for final measurements.
+    let batch = generate_paf_batch(50_000);
+    let bytes = batch.into_bytes();
+    let genome_size = 29903.0;
+
+    let mut group = c.benchmark_group("parse_paf_batch_to_m8");
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.sample_size(10);
+
+    group.bench_function("full_batch_conversion", |b| {
+        b.iter(|| {
+            let _ = black_box(seqtoid_pipelines::utils::paf::parse_paf_batch_to_m8(
+                black_box(bytes.clone()),
+                genome_size,
+            ));
+        })
+    });
+
+    group.finish();
+}
+
+// ── generate_taxid_fasta Core Logic ──────────────────────────────────────
+
+fn bench_generate_taxid_fasta_core(c: &mut Criterion) {
+    let num_records = 10_000;
+    let mut records = Vec::with_capacity(num_records);
+
+    for i in 0..num_records {
+        records.push(SequenceRecord::Fasta {
+            id: format!(
+                "contig:family_nr:1:family_nt:2:genus_nr:10:genus_nt:20:species_nr:100:species_nt:200:read{}",
+                i
+            ),
+            desc: None,
+            seq: Bytes::from_static(b"ACGTACGTACGT"),
+        });
+    }
+
+    // Wrap maps in Arc to match the real function signature
+    let lineage_map: Arc<AHashMap<Taxid, Lineage>> = Arc::new(build_lineage_map());
+    let nt_hits: Arc<AHashMap<String, (Taxid, u8)>> = Arc::new(AHashMap::default());
+    let nr_hits: Arc<AHashMap<String, (Taxid, u8)>> = Arc::new(AHashMap::default());
+
+    let mut group = c.benchmark_group("generate_taxid_fasta_core");
+    group.throughput(Throughput::Elements(num_records as u64));
+    group.sample_size(10);
+
+    group.bench_function("parallel_annotation", |b| {
+        b.iter(|| {
+            for rec in &records {
+                let annotated_id = rec.id();
+                let parts: Vec<&str> = annotated_id.split(':').collect();
+                let contig_id = parts.last().unwrap_or(&"").to_string();
+
+                // Now passing &Arc<...> as expected by get_valid_lineage
+                let _nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
+                let _nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+
+                let new_header = format!(
+                    "family_nr:1:family_nt:2:genus_nr:10:genus_nt:20:species_nr:100:species_nt:200:{}",
+                    annotated_id
+                );
+                let _ = black_box(parse_header(new_header.as_bytes(), '>'));
+            }
+        })
+    });
+
+    group.finish();
+}
+
+// ── generate_taxid_locator Core ──────────────────────────────────────────
+
+fn bench_generate_taxid_locator_core(c: &mut Criterion) {
+    let num_records = 20_000;
+    let mut records = Vec::with_capacity(num_records);
+
+    for i in 0..num_records {
+        records.push(SequenceRecord::Fasta {
+            id: format!("family_nr:1:family_nt:2:read{}", i),
+            desc: None,
+            seq: Bytes::from_static(b"ACGT"),
+        });
+    }
+
+    let mut group = c.benchmark_group("generate_taxid_locator_core");
+    group.throughput(Throughput::Elements(num_records as u64));
+    group.sample_size(10);
+
+    group.bench_function("record_distribution", |b| {
+        b.iter(|| {
+            // Simulate the broadcast logic to multiple taxid channels
+            for rec in &records {
+                let header = rec.id().to_string();
+                // In real code this goes to multiple channels based on taxid_field
+                black_box(header);
+            }
+        })
+    });
+
+    group.finish();
+}
+
+// ── consensus_level under high load ──────────────────────────────────────
+
+// ── consensus_level under high hit counts ─────────────────────────────────
+
+fn bench_consensus_level_high_load(c: &mut Criterion) {
+    let num_hits = 200;
+    let mut hits = Vec::with_capacity(num_hits);
+
+    for i in 0..num_hits {
+        hits.push(M8Record {
+            qname: "read1".to_string(),
+            tname: format!("QIK02963.{}", i), // realistic accession style
+            pident: 85.0 + (i as f64 % 10.0),
+            alen: 120,
+            mismatch: 10,
+            gapopen: 1,
+            qstart: 1,
+            qend: 120,
+            tstart: 1,
+            tend: 120,
+            evalue: 1e-30,
+            bitscore: 250.0,
+            qlen: 150,
+            slen: 300,
+        });
+    }
+
+    let lineage_map = build_lineage_map();
+    let acc2taxid_map = build_acc_map(&[("QIK02963", 1)]);
+
+    // Required 4th argument
+    let should_keep = Arc::new(|_: &[i32]| true);
+
+    let mut group = c.benchmark_group("consensus_level_high_load");
+    group.throughput(Throughput::Elements(num_hits as u64));
+    group.sample_size(10);
+
+    group.bench_function("200_hits", |b| {
+        b.iter(|| {
+            let _ = black_box(consensus_level(
+                black_box(&hits),
+                black_box(&lineage_map),
+                black_box(&acc2taxid_map),
+                black_box(&should_keep),
+            ));
+        })
+    });
+
+    group.finish();
+}
+
+
+// ── Buffer & Concurrency Tuning Functions ────────────────────────────────
+
+fn bench_compute_buffer_and_concurrency(c: &mut Criterion) {
+    let args = Arguments {
+        threads: 8,
+        ..Default::default()
+    };
+    let (total_ram, available_ram) = detect_ram()
+        .unwrap_or((16u64 << 30, 8u64 << 30));
+
+    let rng = generate_rng(Some(42));
+
+    let mut config = RunConfig {
+        cwd: PathBuf::from("."),
+        ram_temp_dir: std::env::temp_dir(),
+        out_dir: PathBuf::from("test"),
+        args,
+        thread_pool: Arc::new(ThreadPoolBuilder::new().num_threads(8).build().unwrap()),
+        maximal_semaphore: Arc::new(Semaphore::new(8)),
+        base_buffer_size: 0,                    // temporary placeholder
+        input_size: 100 + 1_048_576,
+        physical_cores: 4,
+        max_cores: 32,
+        available_ram,
+        rng,
+        log_level: LevelFilter::Debug,
+        base_backpressure_pause: 1000,
+        simd: SimdLevel::Scalar,
+        gpu_info: GpuDetection { count: 0, gpus: vec![] },
+        has_gpu: false,
+        alignment_backend: NRAlignmentBackend::Diamond,
+    };
+
+    let mut group = c.benchmark_group("compute_buffer_concurrency");
+
+    group.bench_function("compute_buffer_size", |b| {
+        b.iter(|| {
+            black_box(seqtoid_pipelines::utils::system::compute_buffer_size(
+                black_box(&config),
+                "benchmark_phase",
+                StreamDataType::IlluminaFastq,
+                1.5,
+            ))
+        })
+    });
+
+    group.bench_function("compute_phase_concurrency", |b| {
+        b.iter(|| {
+            black_box(seqtoid_pipelines::utils::system::compute_phase_concurrency(
+                black_box(&config),
+                "benchmark_phase",
+                0.5,  // GB per thread
+                4.0,  // threads per core
+                128,  // max
+                8,    // min
+            ))
+        })
+    });
+
+    group.finish();
+}
 // ── Register all benchmarks ──────────────────────────────────────────────
 
 criterion_group!(
@@ -302,6 +623,12 @@ criterion_group!(
     bench_read_ingestion_single_end,
     bench_read_ingestion_paired_end_compare_ids,
     bench_blast_hit_processing,
+    bench_summarize_m8_hits,
+    bench_parse_paf_batch_to_m8,
+    bench_generate_taxid_fasta_core,
+    bench_generate_taxid_locator_core,
+    bench_consensus_level_high_load,
+    bench_compute_buffer_and_concurrency
 );
 
 criterion_main!(benches);
