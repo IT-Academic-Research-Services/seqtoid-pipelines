@@ -2400,13 +2400,69 @@ mod tests {
     fn test_parse_header_avx_vs_scalar_equivalence() {
         use proptest::prelude::*;
 
-        proptest!(|(s in "\\PC*")| {  // printable chars
-        let bytes = s.as_bytes();
-        let scalar = parse_header_scalar(bytes, '>');
-        let dispatched = parse_header(bytes, '>');
+        proptest!(|(s in "\\PC*", prefix in "[>@]")| {
+            let bytes = s.as_bytes();
+            let p = prefix.chars().next().unwrap();
+            let scalar = parse_header_scalar(bytes, p);
+            let dispatched = parse_header(bytes, p);
 
-        assert_eq!(scalar, dispatched, "Mismatch on: {:?}", s);
-    });
+            assert_eq!(scalar, dispatched, "Mismatch on: {:?} with prefix {}", s, p);
+        });
+    }
+
+    #[test]
+    fn test_parse_header_equivalence() {
+        // Long header that can span multiple 64-byte AVX-512 chunks
+        let long_header = b"very_long_id_that_spans_multiple_chunks_".repeat(4);
+
+        let cases: Vec<&[u8]> = vec![
+            b"seq1 first record",
+            b"seq1\tfirst record",
+            b"seq1\nfirst record",           // edge case with newline
+            b"seq1 first record with spaces",
+            b"seq1 ",                        // trailing space
+            b"seq1",                         // no description
+            b"very_long_id_that_spans_multiple_chunks_",
+            &long_header[..],                // long header for AVX-512 testing
+        ];
+
+        for &header in &cases {
+            let scalar = parse_header_scalar(header, '>');
+            let actual = parse_header(header, '>');
+
+            assert_eq!(
+                scalar, actual,
+                "Header mismatch on: {:?}\n  scalar: {:?}\n  actual: {:?}",
+                std::str::from_utf8(header),
+                scalar,
+                actual
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_header_long_and_edge_cases() {
+        let long_id = "a".repeat(250); // deliberately > 64*3 bytes
+
+        let test_cases: Vec<(&[u8], char)> = vec![
+            (long_id.as_bytes(), '>'),
+            (b"contig_00001 ", '>'),
+            (b"SRR12345.1 length=150", '@'),
+            (b"read1\tsome description with\ttabs", '@'),
+            (b"header_with_trailing_space ", '>'),
+        ];
+
+        for (header, prefix) in test_cases {
+            let scalar = parse_header_scalar(header, prefix);
+            let actual = parse_header(header, prefix);
+
+            assert_eq!(
+                scalar, actual,
+                "Failed on header: {:?} (prefix '{}')",
+                std::str::from_utf8(header),
+                prefix
+            );
+        }
     }
 
 
