@@ -3,9 +3,15 @@ use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord, parse_hea
 use std::io::Cursor;
 use needletail::parser::FastqReader;
 use needletail::FastxReader;
+use ahash::AHashMap;
+use dashmap::DashMap;
 
-use seqtoid_pipelines::utils::blast::M8Record;
+
 use seqtoid_pipelines::utils::paf::PafRecord;
+use seqtoid_pipelines::utils::blast::{
+    process_record_pair, M8Record, AggBucket, merge_aggregations,
+};
+
 
 
 // ── Existing micro benchmarks (kept for reference) ───────────────────────
@@ -224,6 +230,65 @@ fn bench_read_ingestion_paired_end_compare_ids(c: &mut Criterion) {
 
     group.finish();
 }
+
+// ── BLAST Hit Processing Stage Benchmark ─────────────────────────────────
+
+fn generate_m8_and_hit_lines(count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut pairs = Vec::with_capacity(count);
+
+    for i in 0..count {
+        // Realistic M8 line (NR-style)
+        let m8 = format!(
+            "read{}\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000\n",
+            i
+        );
+
+        // Realistic hit summary line (from kraken-style or your hit summary)
+        let hit = format!("read{}\t1\t12345\t1\t10\t100\t100\n", i);
+
+        pairs.push((m8.into_bytes(), hit.into_bytes()));
+    }
+    pairs
+}
+
+fn bench_blast_hit_processing(c: &mut Criterion) {
+    // 100k record pairs is a realistic batch size for benchmarking
+    let pairs = generate_m8_and_hit_lines(100_000);
+    let data_size: u64 = pairs.iter().map(|(m, h)| (m.len() + h.len()) as u64).sum();
+
+    let mut group = c.benchmark_group("blast_hit_processing_stage");
+    group.throughput(Throughput::Bytes(data_size));
+    group.sample_size(10);
+
+    group.bench_function("process_record_pair + aggregation", |b| {
+        b.iter(|| {
+            let mut agg: AHashMap<Vec<i32>, AggBucket> = AHashMap::default();
+            let mut lineage_cache: AHashMap<i32, Vec<i32>> = AHashMap::default();
+            let duplicate_clusters: DashMap<String, seqtoid_pipelines::config::defs::ClusterInfo> =
+                DashMap::new();
+
+            let should_keep = |_: &[i32]| true;
+
+            for (m8_bytes, hit_bytes) in &pairs {
+                let _ = process_record_pair(
+                    black_box(m8_bytes),
+                    black_box(hit_bytes),
+                    &mut agg,
+                    &mut lineage_cache,
+                    &duplicate_clusters,
+                    &should_keep,
+                    "NT",
+                    None,
+                );
+            }
+
+            // Also exercise merge_aggregations (common in real pipelines)
+            let _merged = merge_aggregations(vec![agg]);
+        })
+    });
+
+    group.finish();
+}
 // ── Register all benchmarks ──────────────────────────────────────────────
 
 criterion_group!(
@@ -236,6 +301,7 @@ criterion_group!(
     bench_paf_large_batch_streaming,
     bench_read_ingestion_single_end,
     bench_read_ingestion_paired_end_compare_ids,
+    bench_blast_hit_processing,
 );
 
 criterion_main!(benches);
