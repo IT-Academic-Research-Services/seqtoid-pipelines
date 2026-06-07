@@ -380,6 +380,35 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    // ── Strategy for generating tag fields (valid + malformed) ─────────────
+    fn tag_field_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Valid tag: key:type:value
+            ("[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}")
+                .prop_map(|(k, t, v)| format!("{}:{}{}", k, t, v)),
+
+            // Malformed: missing type (only one colon)
+            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}")
+                .prop_map(|(k, v)| format!("{}:{}", k, v)),
+
+            // Malformed: empty key
+            (":[A-Za-z]:[^\\t\\n]{0,30}").prop_map(|s| s.to_string()),
+
+            // Malformed: empty value
+            ("[A-Za-z0-9_]{1,10}:[A-Za-z]:").prop_map(|s| s.to_string()),
+
+            // Malformed: garbage / no colons
+            "[A-Za-z0-9_:\\-]{1,40}".prop_map(|s| s),
+
+            // Malformed: trailing colon only
+            "[A-Za-z0-9_]{1,10}:".prop_map(|s| s.to_string()),
+
+            // Empty tag field (consecutive tabs)
+            Just("".to_string()),
+        ]
+    }
+
+    // ── Basic field proptest ───────────────────────────────────────────────
     proptest! {
         #[test]
         fn test_parse_line_paf_equivalence(
@@ -401,6 +430,44 @@ mod tests {
                 qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq
             );
             compare_parsers(&line);
+        }
+    }
+
+    // ── Proptests with random extra tags (valid + malformed) ───────────────
+    proptest! {
+        #[test]
+        fn test_parse_line_paf_equivalence_with_malformed_tags(
+            qname in "[a-zA-Z0-9._-]{1,100}",
+            qlen in 1u64..1000000,
+            qstart in 0u64..1000000,
+            qend in 0u64..1000000,
+            strand in "[+-]",
+            tname in "[a-zA-Z0-9._-]{1,100}",
+            tlen in 1u64..1000000000,
+            tstart in 0u64..1000000000,
+            tend in 0u64..1000000000,
+            nmatch in 0u64..1000000,
+            alen in 0u64..1000000,
+            mapq in 0u8..60,
+            extra_tags in prop::collection::vec(tag_field_strategy(), 0..40)
+        ) {
+            let mut line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq
+            );
+
+            for tag in extra_tags {
+                line.push_str(&format!("\t{}", tag));
+            }
+
+            let scalar_res = PafRecord::parse_line_scalar(&line);
+            let dispatched_res = PafRecord::parse_line(&line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_records_eq(&s, &d, &line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and AVX-512 disagreed on success/failure for line: {}", line),
+            }
         }
     }
 
@@ -543,18 +610,18 @@ mod tests {
     fn test_parse_paf_batch_to_m8_roundtrip() {
         let batch = format!("{}\n{}\n{}\n", BASIC, WITH_TAGS, REVERSE_STRAND);
         let results = parse_paf_batch_to_m8(batch.into_bytes(), 29903.0);
-        let _ = results; // Just ensure no panic
+        let _ = results;
     }
 
-    // ── Additional strong equivalence tests (recommended) ─────────────────
+    // ── Strong edge-case tests (malformed tags, long lines, etc.) ─────────
 
     #[test]
     fn test_trailing_whitespace_and_empty_tags() {
         let cases = vec![
             "read6\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60   ",
-            "read7\t100\t0\t100\t+\tref\t1000\t0\t100\t100\t100\t60\t\tNM:i:0",     // empty field
-            "read8\t200\t0\t200\t-\tref\t2000\t0\t200\t200\t200\t60\tcg:Z:200M  ", // trailing space in last tag
-            "read9\t150\t0\t150\t+\tref\t1000\t0\t150\t150\t150\t60\t   ",         // only whitespace after last tab
+            "read7\t100\t0\t100\t+\tref\t1000\t0\t100\t100\t100\t60\t\tNM:i:0",
+            "read8\t200\t0\t200\t-\tref\t2000\t0\t200\t200\t200\t60\tcg:Z:200M  ",
+            "read9\t150\t0\t150\t+\tref\t1000\t0\t150\t150\t150\t60\t   ",
         ];
 
         for line in cases {
@@ -577,7 +644,7 @@ mod tests {
     #[test]
     fn test_long_line_many_tabs() {
         let mut line = "longid\t100\t0\t100\t+\tlongref\t10000\t0\t100\t100\t100\t60".to_string();
-        for i in 0..40 {
+        for i in 0..50 {
             line.push_str(&format!("\ttag{i}:Z:value{i}"));
         }
         compare_parsers(&line);
