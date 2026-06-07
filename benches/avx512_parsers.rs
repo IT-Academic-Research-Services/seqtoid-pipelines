@@ -1,9 +1,12 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use std::fs;
+use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord, parse_header};
+use std::io::Cursor;
+use needletail::parser::FastqReader;
+use needletail::FastxReader;
 
 use seqtoid_pipelines::utils::blast::M8Record;
 use seqtoid_pipelines::utils::paf::PafRecord;
-use seqtoid_pipelines::utils::fastx::parse_header;
+
 
 // ── Existing micro benchmarks (kept for reference) ───────────────────────
 
@@ -156,6 +159,71 @@ fn bench_paf_large_batch_streaming(c: &mut Criterion) {
     group.finish();
 }
 
+
+fn generate_fastq_bytes(num_reads: usize, read_len: usize) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(num_reads * (read_len * 2 + 100));
+    for i in 0..num_reads {
+        let id = format!("read{}", i);
+        let seq = "ACGT".repeat(read_len / 4);
+        let qual = "IIII".repeat(read_len / 4);
+
+        buffer.extend_from_slice(b"@");
+        buffer.extend_from_slice(id.as_bytes());
+        buffer.extend_from_slice(b"\n");
+        buffer.extend_from_slice(seq.as_bytes());
+        buffer.extend_from_slice(b"\n+\n");
+        buffer.extend_from_slice(qual.as_bytes());
+        buffer.extend_from_slice(b"\n");
+    }
+    buffer
+}
+
+fn bench_read_ingestion_single_end(c: &mut Criterion) {
+    let fastq_data = generate_fastq_bytes(200_000, 150);
+    let data_len = fastq_data.len() as u64;
+
+    let mut group = c.benchmark_group("read_ingestion_single_end");
+    group.throughput(Throughput::Bytes(data_len));
+    group.sample_size(10);
+
+    group.bench_function("parse_fastq_to_sequence_record", |b| {
+        b.iter(|| {
+            let cursor = Cursor::new(black_box(&fastq_data));
+            let mut reader = FastqReader::new(cursor);
+            let mut count = 0u64;
+
+            while let Some(result) = reader.next() {
+                if let Ok(record) = result {
+                    let _seq_record: SequenceRecord = record.into(); // includes parse_header
+                    count += 1;
+                }
+            }
+            black_box(count)
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_read_ingestion_paired_end_compare_ids(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_ingestion_paired_compare_ids");
+    group.sample_size(100);
+
+    let id1 = b"SRR12345678.1 1:N:0:ATCGATCG";
+    let id2 = b"SRR12345678.2 2:N:0:ATCGATCG";
+
+    group.bench_function("compare_read_ids_bytes", |b| {
+        b.iter(|| {
+            // Using the public wrapper for now
+            black_box(seqtoid_pipelines::utils::fastx::compare_read_ids(
+                black_box(std::str::from_utf8(id1).unwrap()),
+                black_box(std::str::from_utf8(id2).unwrap()),
+            ))
+        })
+    });
+
+    group.finish();
+}
 // ── Register all benchmarks ──────────────────────────────────────────────
 
 criterion_group!(
@@ -166,6 +234,8 @@ criterion_group!(
     bench_m8_nr_line,
     bench_m8_nt_large_batch_streaming,
     bench_paf_large_batch_streaming,
+    bench_read_ingestion_single_end,
+    bench_read_ingestion_paired_end_compare_ids,
 );
 
 criterion_main!(benches);
