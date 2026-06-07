@@ -1140,7 +1140,7 @@ mod tests {
         assert_m8_eq(&scalar, &dispatched, line);
     }
 
-    // ── NT test constants (14 columns) ─────────────────────────────────────
+    // ── NT test constants ──────────────────────────────────────────────────
     const NT_BASIC: &str =
         "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903";
 
@@ -1159,7 +1159,7 @@ mod tests {
     const NT_EXTRA_COLUMNS: &str =
         "read5\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\textra1\textra2";
 
-    // ── NR test constants (12 columns) ─────────────────────────────────────
+    // ── NR test constants ──────────────────────────────────────────────────
     const NR_BASIC: &str =
         "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000";
 
@@ -1249,8 +1249,8 @@ mod tests {
     #[test]
     fn test_nr_qlen_slen_zero() {
         let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
-        assert_eq!(r.qlen, 0, "NR qlen must default to 0");
-        assert_eq!(r.slen, 0, "NR slen must default to 0");
+        assert_eq!(r.qlen, 0);
+        assert_eq!(r.slen, 0);
     }
 
     #[test]
@@ -1272,7 +1272,91 @@ mod tests {
         assert!(M8Record::parse_line_nr(short).is_err());
     }
 
-    // ── Existing helper + consensus / aggregation / summarize tests ───────
+    // ── Stronger edge-case tests for malformed / extra columns ────────────
+
+    #[test]
+    fn test_nt_malformed_and_extra_columns() {
+        let cases = vec![
+            // Too few columns
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000",
+            // Extra columns
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\textra1\textra2\textra3",
+            // Trailing tab (empty last field)
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\t",
+            // Empty field in the middle
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t\t150\t29903",
+        ];
+
+        for line in cases {
+            // Should either both succeed with same result or both fail
+            let scalar_res = M8Record::parse_line_nt_scalar(line);
+            let dispatched_res = M8Record::parse_line_nt(line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, line),
+                (Err(_), Err(_)) => {} // both failed → acceptable
+                _ => panic!("Scalar and dispatched disagreed on error/success for: {}", line),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nr_malformed_and_extra_columns() {
+        let cases = vec![
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38",
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000\textra1\textra2",
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000\t",
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t\t96\t1.45e-38\t152.000",
+        ];
+
+        for line in cases {
+            let scalar_res = M8Record::parse_line_nr_scalar(line);
+            let dispatched_res = M8Record::parse_line_nr(line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and dispatched disagreed on: {}", line),
+            }
+        }
+    }
+
+    // ── Very long lines with many tags (stresses AVX-512 tab collection) ──
+
+    #[test]
+    fn test_nt_long_line_many_tags() {
+        let mut line = NT_BASIC.to_string();
+        for i in 0..60 {
+            line.push_str(&format!("\ttag{}:Z:value{}", i, i));
+        }
+        compare_nt(&line);
+    }
+
+    #[test]
+    fn test_nr_long_line_many_tags() {
+        let mut line = NR_BASIC.to_string();
+        for i in 0..60 {
+            line.push_str(&format!("\ttag{}:Z:value{}", i, i));
+        }
+        compare_nr(&line);
+    }
+
+    #[test]
+    fn test_nt_very_long_line_with_mixed_tags() {
+        let mut line = "long_read\tNC_045512.2\t99.9\t500\t5\t1\t1\t500\t10\t500\t1e-100\t800.0\t500\t29903".to_string();
+        for i in 0..80 {
+            if i % 3 == 0 {
+                line.push_str(&format!("\tAS:i:{}", 100 + i));
+            } else if i % 3 == 1 {
+                line.push_str(&format!("\tNM:i:{}", i));
+            } else {
+                line.push_str(&format!("\tcg:Z:{}M", i));
+            }
+        }
+        compare_nt(&line);
+    }
+
+    // ── Existing consensus / aggregation / summarize tests (unchanged) ────
 
     use fst::MapBuilder;
 
