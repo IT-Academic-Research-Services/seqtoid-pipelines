@@ -363,31 +363,19 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
 /// # Arguments
 /// * `head`   - Header bytes (needletail has already stripped the leading `>`/`@`).
 /// * `prefix` - The leading character (`>` or `@`) to strip from the id field.
-///
+/// Note: needletail already stripped the leading > or @.
 /// # Returns
 /// `(id, desc)` — desc is `None` when the header has no whitespace.
 pub fn parse_header(head: &[u8], prefix: char) -> (String, Option<String>) {
     PARSE_HEADER_FN(head, prefix)
 }
 
-/// Scalar path — used on non-AVX-512 hardware.
+/// Scalar path — reference implementation.
 fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
-    match memchr3(b' ', b'\t', b'\n', head) {
-        Some(pos) => {
-            let id_bytes = &head[..pos];
-            let desc_bytes = &head[pos + 1..];
-            let id = String::from_utf8_lossy(id_bytes)
-                .trim_start_matches(prefix)
-                .to_string();
-            let desc = if desc_bytes.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(desc_bytes).into_owned())
-            };
-            (id, desc)
-        }
+    match memchr::memchr3(b' ', b'\t', b'\n', head) {
+        Some(pos) => parse_from_pos(head, pos, prefix),
         None => {
-            // id-only header (e.g. ">NC_045512.2" with no description)
+            // id-only header
             let id = String::from_utf8_lossy(head)
                 .trim_start_matches(prefix)
                 .to_string();
@@ -396,14 +384,16 @@ fn parse_header_scalar(head: &[u8], prefix: char) -> (String, Option<String>) {
     }
 }
 
-/// AVX-512 path — 64-byte sweep to find the first whitespace byte.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Option<String>) {
     use std::arch::x86_64::*;
-    use std::arch::x86_64::__m512i;
 
     let len = head.len();
+    if len == 0 {
+        return (String::new(), None);
+    }
+
     let space_splat = _mm512_set1_epi8(b' ' as i8);
     let tab_splat   = _mm512_set1_epi8(b'\t' as i8);
     let nl_splat    = _mm512_set1_epi8(b'\n' as i8);
@@ -413,59 +403,41 @@ unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Optio
         let chunk = _mm512_loadu_si512(head.as_ptr().add(i).cast::<__m512i>());
         let mask: u64 =
             _mm512_cmpeq_epi8_mask(chunk, space_splat) |
-            _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
-            _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+                _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
+                _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+
         if mask != 0 {
             let pos = i + mask.trailing_zeros() as usize;
-            let id_bytes   = &head[..pos];
-            let desc_bytes = &head[pos + 1..];
-            let id = String::from_utf8_lossy(id_bytes)
-                .trim_start_matches(prefix)
-                .to_string();
-            let desc = if desc_bytes.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(desc_bytes).into_owned())
-            };
-            return (id, desc);
+            return parse_from_pos(head, pos, prefix);
         }
         i += 64;
     }
-    // Scalar tail for remaining < 64 bytes (also handles id-only headers)
-    parse_header_scalar(&head[i..], prefix).map_id_offset(i, head, prefix)
+
+    // Tail (< 64 bytes) → use scalar
+    parse_header_scalar(&head[i..], prefix)
 }
 
-// Helper to re-run scalar on tail bytes and merge the offset back.
-// Only called for headers whose whitespace (if any) falls in the tail.
-#[cfg(target_arch = "x86_64")]
-trait MergeOffset {
-    fn map_id_offset(self, offset: usize, full: &[u8], prefix: char) -> Self;
-}
-#[cfg(target_arch = "x86_64")]
-impl MergeOffset for (String, Option<String>) {
-    fn map_id_offset(self, offset: usize, full: &[u8], prefix: char) -> Self {
-        // If scalar found a split in the tail, the id must be re-extracted
-        // from the full slice (offset..split) to be complete.
-        let (tail_id, desc) = self;
-        if desc.is_some() {
-            // whitespace was in the tail — id spans from 0..offset + tail_id length
-            let full_id = String::from_utf8_lossy(&full[..offset + tail_id.len()])
-                .trim_start_matches(prefix)
-                .to_string();
-            (full_id, desc)
-        } else {
-            // no whitespace anywhere — id is the full header
-            let full_id = String::from_utf8_lossy(full)
-                .trim_start_matches(prefix)
-                .to_string();
-            (full_id, None)
-        }
-    }
+/// Core logic: given a known position of the first whitespace, extract id + desc.
+/// This is shared between scalar and AVX-512 paths.
+fn parse_from_pos(head: &[u8], pos: usize, prefix: char) -> (String, Option<String>) {
+    let id_bytes = &head[..pos];
+    let desc_bytes = &head[pos + 1..];
+
+    let id = String::from_utf8_lossy(id_bytes)
+        .trim_start_matches(prefix)
+        .to_string();
+
+    let desc = if desc_bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(desc_bytes).into_owned())
+    };
+
+    (id, desc)
 }
 
 #[cfg(target_arch = "x86_64")]
 fn parse_header_avx512(head: &[u8], prefix: char) -> (String, Option<String>) {
-    // Safety: only reachable when SIMD_LEVEL == Avx512, confirmed at startup.
     unsafe { parse_header_avx512_inner(head, prefix) }
 }
 
@@ -478,6 +450,8 @@ static PARSE_HEADER_FN: Lazy<fn(&[u8], char) -> (String, Option<String>)> = Lazy
     debug!("parse_header: using scalar path");
     parse_header_scalar
 });
+
+
 
 
 /// Reads a FASTQ file.
@@ -2421,4 +2395,19 @@ mod tests {
         assert_eq!(concat_records[0].qual().as_ref(), b"IIII!HHHH");  // ← fixed
         Ok(())
     }
+
+    #[test]
+    fn test_parse_header_avx_vs_scalar_equivalence() {
+        use proptest::prelude::*;
+
+        proptest!(|(s in "\\PC*")| {  // printable chars
+        let bytes = s.as_bytes();
+        let scalar = parse_header_scalar(bytes, '>');
+        let dispatched = parse_header(bytes, '>');
+
+        assert_eq!(scalar, dispatched, "Mismatch on: {:?}", s);
+    });
+    }
+
+
 }
