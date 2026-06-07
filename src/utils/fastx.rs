@@ -413,8 +413,9 @@ unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Optio
         i += 64;
     }
 
-    // Tail (< 64 bytes) → use scalar
-    parse_header_scalar(&head[i..], prefix)
+    // Fallback: use scalar on the full header for correctness
+    // (handles long headers and headers with no whitespace)
+    parse_header_scalar(head, prefix)
 }
 
 /// Core logic: given a known position of the first whitespace, extract id + desc.
