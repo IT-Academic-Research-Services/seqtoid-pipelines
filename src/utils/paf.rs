@@ -38,7 +38,7 @@ pub struct PafRecord {
 
 impl PafRecord {
     /// Scalar parser — baseline, used on non-AVX-512 hardware.
-    fn parse_line_scalar(line: &str) -> Result<Self> {
+    pub fn parse_line_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         let mut fields = line.split('\t');
 

@@ -87,7 +87,7 @@ impl M8Record {
     // ── NT scalar ──────────────────────────────────────────────────────────
 
     /// Parse 14-column NT (blastn) output — scalar baseline.
-    fn parse_line_nt_scalar(line: &str) -> Result<Self> {
+    pub fn parse_line_nt_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
             return Err(anyhow!("empty line"));
@@ -139,7 +139,7 @@ impl M8Record {
     // ── NR scalar ──────────────────────────────────────────────────────────
 
     /// Parse 12-column NR (blastx) output — scalar baseline.
-    fn parse_line_nr_scalar(line: &str) -> Result<Self> {
+    pub fn parse_line_nr_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
             return Err(anyhow!("empty line"));
