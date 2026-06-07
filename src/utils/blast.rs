@@ -87,7 +87,7 @@ impl M8Record {
     // ── NT scalar ──────────────────────────────────────────────────────────
 
     /// Parse 14-column NT (blastn) output — scalar baseline.
-    fn parse_line_nt_scalar(line: &str) -> Result<Self> {
+    pub fn parse_line_nt_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
             return Err(anyhow!("empty line"));
@@ -139,7 +139,7 @@ impl M8Record {
     // ── NR scalar ──────────────────────────────────────────────────────────
 
     /// Parse 12-column NR (blastx) output — scalar baseline.
-    fn parse_line_nr_scalar(line: &str) -> Result<Self> {
+    pub fn parse_line_nr_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
             return Err(anyhow!("empty line"));
@@ -221,14 +221,20 @@ impl M8Record {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn parse_line_nt_avx512_inner(line: &str) -> Result<Self> {
-        let bytes = line.trim_end().as_bytes();
-        if bytes.is_empty() { return Err(anyhow!("empty line")); }
+        let trimmed = line.trim_end();
+        let bytes = trimmed.as_bytes();
+        if bytes.is_empty() {
+            return Err(anyhow!("empty line"));
+        }
 
         let tab_pos = Self::collect_tab_positions(bytes);
         let len = bytes.len();
 
         if tab_pos.len() < 13 {
-            return Err(anyhow!("NT m8 line has {} tabs, need ≥13 for 14 fields", tab_pos.len()));
+            return Err(anyhow!(
+            "NT m8 line has {} tabs, need ≥13 for 14 fields",
+            tab_pos.len()
+        ));
         }
 
         macro_rules! field {
@@ -269,7 +275,7 @@ impl M8Record {
         let slen     = parse_u64!(13, "slen");
 
         if tab_pos.len() > 13 {
-            warn!("Extra columns in NT m8 line (expected 14)");
+            warn!("Extra columns in NT m8 line (expected 14): {}", trimmed);
         }
         Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen, slen })
     }
@@ -285,14 +291,20 @@ impl M8Record {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn parse_line_nr_avx512_inner(line: &str) -> Result<Self> {
-        let bytes = line.trim_end().as_bytes();
-        if bytes.is_empty() { return Err(anyhow!("empty line")); }
+        let trimmed = line.trim_end();
+        let bytes = trimmed.as_bytes();
+        if bytes.is_empty() {
+            return Err(anyhow!("empty line"));
+        }
 
         let tab_pos = Self::collect_tab_positions(bytes);
         let len = bytes.len();
 
         if tab_pos.len() < 11 {
-            return Err(anyhow!("NR m8 line has {} tabs, need ≥11 for 12 fields", tab_pos.len()));
+            return Err(anyhow!(
+            "NR m8 line has {} tabs, need ≥11 for 12 fields",
+            tab_pos.len()
+        ));
         }
 
         macro_rules! field {
@@ -331,8 +343,9 @@ impl M8Record {
         let bitscore = parse_f64!(11, "bitscore");
 
         if tab_pos.len() > 11 {
-            warn!("Extra columns in NR m8 line (expected 12)");
+            warn!("Extra columns in NT m8 line (expected 12): {}", trimmed);
         }
+
         Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen: 0, slen: 0 })
     }
 
@@ -1043,6 +1056,114 @@ pub async fn generate_taxon_count_json_from_m8(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // ── Strategy for generating tag fields (valid + malformed) ─────────────
+    fn tag_field_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Valid tag: key:type:value
+            ("[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}")
+                .prop_map(|(k, t, v)| format!("{}:{}{}", k, t, v)),
+
+            // Malformed: missing type (only one colon)
+            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}")
+                .prop_map(|(k, v)| format!("{}:{}", k, v)),
+
+            // Malformed: empty key
+            (":[A-Za-z]:[^\\t\\n]{0,30}").prop_map(|s| s.to_string()),
+
+            // Malformed: empty value
+            ("[A-Za-z0-9_]{1,10}:[A-Za-z]:").prop_map(|s| s.to_string()),
+
+            // Malformed: garbage / no colons
+            "[A-Za-z0-9_:\\-]{1,40}".prop_map(|s| s),
+
+            // Malformed: trailing colon only
+            "[A-Za-z0-9_]{1,10}:".prop_map(|s| s.to_string()),
+
+            // Empty tag field (consecutive tabs)
+            Just("".to_string()),
+        ]
+    }
+
+    // ── Proptests with random extra tags (valid + malformed) ───────────────
+    proptest! {
+        #[test]
+        fn test_parse_line_nt_equivalence_with_malformed_tags(
+            qname in "[a-zA-Z0-9._-]{1,100}",
+            tname in "[a-zA-Z0-9._-]{1,50}",
+            pident in 0.0..100.0,
+            alen in 0u64..10000,
+            mismatch in 0u64..1000,
+            gapopen in 0u64..100,
+            qstart in 1u64..10000,
+            qend in 1u64..10000,
+            tstart in 1u64..1000000,
+            tend in 1u64..1000000,
+            evalue in 0.0..1.0,
+            bitscore in 0.0..1000.0,
+            qlen in 1u64..10000,
+            slen in 1u64..1000000,
+            extra_tags in prop::collection::vec(tag_field_strategy(), 0..35)
+        ) {
+            let mut line = format!(
+                "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:e}\t{:.3}\t{}\t{}",
+                qname, tname, pident, alen, mismatch, gapopen, qstart, qend,
+                tstart, tend, evalue, bitscore, qlen, slen
+            );
+
+            for tag in extra_tags {
+                line.push_str(&format!("\t{}", tag));
+            }
+
+            let scalar_res = M8Record::parse_line_nt_scalar(&line);
+            let dispatched_res = M8Record::parse_line_nt(&line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, &line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and AVX-512 disagreed on success/failure for line: {}", line),
+            }
+        }
+
+        #[test]
+        fn test_parse_line_nr_equivalence_with_malformed_tags(
+            qname in "[a-zA-Z0-9._-]{1,100}",
+            tname in "[a-zA-Z0-9._-]{1,50}",
+            pident in 0.0..100.0,
+            alen in 0u64..10000,
+            mismatch in 0u64..1000,
+            gapopen in 0u64..100,
+            qstart in 1u64..10000,
+            qend in 1u64..10000,
+            tstart in 1u64..1000000,
+            tend in 1u64..1000000,
+            evalue in 0.0..1.0,
+            bitscore in 0.0..1000.0,
+            extra_tags in prop::collection::vec(tag_field_strategy(), 0..35)
+        ) {
+            let mut line = format!(
+                "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:e}\t{:.3}",
+                qname, tname, pident, alen, mismatch, gapopen, qstart, qend,
+                tstart, tend, evalue, bitscore
+            );
+
+            for tag in extra_tags {
+                line.push_str(&format!("\t{}", tag));
+            }
+
+            let scalar_res = M8Record::parse_line_nr_scalar(&line);
+            let dispatched_res = M8Record::parse_line_nr(&line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, &line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and AVX-512 disagreed on success/failure for line: {}", line),
+            }
+        }
+    }
+
+    // ── helpers ────────────────────────────────────────────────────────────
 
     #[allow(dead_code)]
     fn assert_m8_eq(a: &M8Record, b: &M8Record, ctx: &str) {
@@ -1074,7 +1195,7 @@ mod tests {
         assert_m8_eq(&scalar, &dispatched, line);
     }
 
-    // ── NT test lines (14 columns) ─────────────────────────────────────────
+    // ── NT test constants ──────────────────────────────────────────────────
     const NT_BASIC: &str =
         "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903";
 
@@ -1090,7 +1211,10 @@ mod tests {
     const NT_TRAILING_WHITESPACE: &str =
         "read4\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903   ";
 
-    // ── NR test lines (12 columns) ─────────────────────────────────────────
+    const NT_EXTRA_COLUMNS: &str =
+        "read5\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\textra1\textra2";
+
+    // ── NR test constants ──────────────────────────────────────────────────
     const NR_BASIC: &str =
         "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000";
 
@@ -1099,6 +1223,12 @@ mod tests {
 
     const NR_GAPS: &str =
         "read3\tXYZ99999.2\t78.431\t153\t33\t3\t10\t162\t5\t155\t8.9e-20\t89.700";
+
+    const NR_TRAILING_WHITESPACE: &str =
+        "read4\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000   ";
+
+    const NR_EXTRA_COLUMNS: &str =
+        "read5\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000\textra1\textra2";
 
     // ── NT tests ──────────────────────────────────────────────────────────
     #[test]
@@ -1122,29 +1252,29 @@ mod tests {
     }
 
     #[test]
+    fn test_nt_extra_columns() {
+        compare_nt(NT_EXTRA_COLUMNS);
+        let r = M8Record::parse_line_nt(NT_EXTRA_COLUMNS).unwrap();
+        assert_eq!(r.tname, "NC_045512");
+    }
+
+    #[test]
     fn test_nt_accession_version_stripped() {
         let r = M8Record::parse_line_nt_scalar(NT_BASIC).unwrap();
         assert_eq!(r.tname, "NC_045512", "version suffix must be stripped");
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        {
-            let avx = M8Record::parse_line_nt_avx512(NT_BASIC).unwrap();
-            assert_eq!(avx.tname, "NC_045512");
-        }
     }
 
     #[test]
     fn test_nt_error_on_empty() {
         assert!(M8Record::parse_line_nt_scalar("").is_err());
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        assert!(M8Record::parse_line_nt_avx512("").is_err());
+        assert!(M8Record::parse_line_nt("").is_err());
     }
 
     #[test]
     fn test_nt_error_on_too_few_fields() {
         let short = "read1\tNC_045512.2\t99.333\t150";
         assert!(M8Record::parse_line_nt_scalar(short).is_err());
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        assert!(M8Record::parse_line_nt_avx512(short).is_err());
+        assert!(M8Record::parse_line_nt(short).is_err());
     }
 
     // ── NR tests ──────────────────────────────────────────────────────────
@@ -1158,43 +1288,108 @@ mod tests {
     fn test_nr_gaps() { compare_nr(NR_GAPS); }
 
     #[test]
+    fn test_nr_trailing_whitespace() {
+        compare_nr(NR_TRAILING_WHITESPACE);
+        let r = M8Record::parse_line_nr_scalar(NR_TRAILING_WHITESPACE).unwrap();
+        assert_eq!(r.qname, "read4");
+    }
+
+    #[test]
+    fn test_nr_extra_columns() {
+        compare_nr(NR_EXTRA_COLUMNS);
+        let r = M8Record::parse_line_nr(NR_EXTRA_COLUMNS).unwrap();
+        assert_eq!(r.tname, "QIK02963");
+    }
+
+    #[test]
     fn test_nr_qlen_slen_zero() {
         let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
-        assert_eq!(r.qlen, 0, "NR qlen must default to 0");
-        assert_eq!(r.slen, 0, "NR slen must default to 0");
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        {
-            let avx = M8Record::parse_line_nr_avx512(NR_BASIC).unwrap();
-            assert_eq!(avx.qlen, 0);
-            assert_eq!(avx.slen, 0);
-        }
+        assert_eq!(r.qlen, 0);
+        assert_eq!(r.slen, 0);
     }
 
     #[test]
     fn test_nr_accession_version_stripped() {
         let r = M8Record::parse_line_nr_scalar(NR_BASIC).unwrap();
         assert_eq!(r.tname, "QIK02963");
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        {
-            let avx = M8Record::parse_line_nr_avx512(NR_BASIC).unwrap();
-            assert_eq!(avx.tname, "QIK02963");
-        }
     }
 
     #[test]
     fn test_nr_error_on_empty() {
         assert!(M8Record::parse_line_nr_scalar("").is_err());
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        assert!(M8Record::parse_line_nr_avx512("").is_err());
+        assert!(M8Record::parse_line_nr("").is_err());
     }
 
     #[test]
     fn test_nr_error_on_too_few_fields() {
         let short = "read1\tQIK02963.1\t87.500";
         assert!(M8Record::parse_line_nr_scalar(short).is_err());
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        assert!(M8Record::parse_line_nr_avx512(short).is_err());
+        assert!(M8Record::parse_line_nr(short).is_err());
     }
+
+    // ── Additional strong edge-case tests ──────────────────────────────────
+
+    #[test]
+    fn test_nt_malformed_and_extra_columns() {
+        let cases = vec![
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000",
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\textra1\textra2\textra3",
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\t",
+            "read1\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t\t150\t29903",
+        ];
+
+        for line in cases {
+            let scalar_res = M8Record::parse_line_nt_scalar(line);
+            let dispatched_res = M8Record::parse_line_nt(line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar vs dispatched disagreement on: {}", line),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nr_malformed_and_extra_columns() {
+        let cases = vec![
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38",
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000\textra1\textra2",
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000\t",
+            "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t\t96\t1.45e-38\t152.000",
+        ];
+
+        for line in cases {
+            let scalar_res = M8Record::parse_line_nr_scalar(line);
+            let dispatched_res = M8Record::parse_line_nr(line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_m8_eq(&s, &d, line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar vs dispatched disagreement on: {}", line),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nt_long_line_many_tags() {
+        let mut line = NT_BASIC.to_string();
+        for i in 0..60 {
+            line.push_str(&format!("\ttag{}:Z:value{}", i, i));
+        }
+        compare_nt(&line);
+    }
+
+    #[test]
+    fn test_nr_long_line_many_tags() {
+        let mut line = NR_BASIC.to_string();
+        for i in 0..60 {
+            line.push_str(&format!("\ttag{}:Z:value{}", i, i));
+        }
+        compare_nr(&line);
+    }
+
+    // ── Existing consensus / aggregation / summarize tests ────────────────
 
     use fst::MapBuilder;
 

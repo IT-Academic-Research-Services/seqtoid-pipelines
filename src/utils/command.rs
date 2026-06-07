@@ -567,7 +567,6 @@ pub mod samtools {
                     args_vec.push(RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fastq")).to_string());
                     args_vec.push("-c".to_string());
                     args_vec.push("6".to_string());
-                    args_vec.push("-n".to_string());
                 }
                 SamtoolsSubcommand::Stats => {
                     args_vec.push("stats".to_string());
@@ -1933,6 +1932,7 @@ pub mod spades {
         pub r1_path: PathBuf,                // Always required (R1 or single-end)
         pub r2_path_opt: Option<PathBuf>,    // Some(R2) for paired, None for single-end
         pub outdir_path: PathBuf,
+        pub tempdir_path: Option<PathBuf>,
         pub option_fields: HashMap<String, Option<String>>,  // e.g., {"--only-assembler": None}
     }
 
@@ -1984,6 +1984,11 @@ pub mod spades {
         );
             args_vec.push("-m".to_string());
             args_vec.push(spades_gb.to_string());
+
+            if let Some(tmp) = &config.tempdir_path {
+                args_vec.push("--tmp-dir".to_string());
+                args_vec.push(tmp.to_string_lossy().to_string());
+            }
 
             // Custom flags from config (e.g., --only-assembler)
             for (key, value) in config.option_fields.iter() {

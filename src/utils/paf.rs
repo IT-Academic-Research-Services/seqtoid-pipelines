@@ -38,7 +38,7 @@ pub struct PafRecord {
 
 impl PafRecord {
     /// Scalar parser — baseline, used on non-AVX-512 hardware.
-    fn parse_line_scalar(line: &str) -> Result<Self> {
+    pub fn parse_line_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         let mut fields = line.split('\t');
 
@@ -82,19 +82,20 @@ impl PafRecord {
     /// AVX-512 inner parser.
     /// Uses a 64-byte SIMD sweep to collect all tab positions in one pass,
     /// then indexes directly into byte slices — no iterator, no intermediate allocs.
+    /// AVX-512 inner parser — now guaranteed to match scalar exactly.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn parse_line_avx512_inner(line: &str) -> Result<Self> {
         use std::arch::x86_64::*;
-        use std::arch::x86_64::__m512i;
 
-        let bytes = line.trim_end().as_bytes();
+        let trimmed = line.trim_end();
+        let bytes = trimmed.as_bytes();
         let len = bytes.len();
         if len == 0 {
             return Err(anyhow!("empty PAF line"));
         }
 
-        // ── Phase 1: collect every tab position in 64-byte SIMD chunks ──────
+        // Phase 1: Collect all tab positions
         let mut tab_pos: Vec<usize> = Vec::with_capacity(24);
         let tab_splat = _mm512_set1_epi8(b'\t' as i8);
         let mut i = 0usize;
@@ -109,7 +110,6 @@ impl PafRecord {
             }
             i += 64;
         }
-        // Scalar tail for the remaining < 64 bytes
         while i < len {
             if bytes[i] == b'\t' {
                 tab_pos.push(i);
@@ -124,16 +124,15 @@ impl PafRecord {
             ));
         }
 
-        // ── Phase 2: index into fields by tab positions ───────────────────
-        // Field n:  start = tab_pos[n-1]+1 (or 0 for n==0)
-        //           end   = tab_pos[n]      (or len for last field)
+        // Phase 2: Field extraction (exact same logic as scalar)
         macro_rules! field {
             ($n:expr) => {{
                 let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
-                let end   = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+                let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
                 &bytes[start..end]
             }};
         }
+
         macro_rules! parse_u64 {
             ($n:expr, $name:literal) => {
                 lexical_parse::<u64, _>(field!($n))
@@ -141,16 +140,24 @@ impl PafRecord {
             };
         }
 
-        let qname  = std::str::from_utf8(field!(0)).map_err(|_| anyhow!("qname not UTF-8"))?.to_string();
+        let qname = std::str::from_utf8(field!(0))
+            .map_err(|_| anyhow!("qname not UTF-8"))?
+            .to_string();
+
         let qlen   = parse_u64!(1,  "qlen");
         let qstart = parse_u64!(2,  "qstart");
         let qend   = parse_u64!(3,  "qend");
+
         let strand = match field!(4).first() {
             Some(&b'+') => '+',
             Some(&b'-') => '-',
-            other => return Err(anyhow!("invalid strand byte: {:?}", other)),
+            _ => return Err(anyhow!("invalid strand")),
         };
-        let tname  = std::str::from_utf8(field!(5)).map_err(|_| anyhow!("tname not UTF-8"))?.to_string();
+
+        let tname = std::str::from_utf8(field!(5))
+            .map_err(|_| anyhow!("tname not UTF-8"))?
+            .to_string();
+
         let tlen   = parse_u64!(6,  "tlen");
         let tstart = parse_u64!(7,  "tstart");
         let tend   = parse_u64!(8,  "tend");
@@ -158,18 +165,18 @@ impl PafRecord {
         let alen   = parse_u64!(10, "alen");
         let mapq   = parse_u64!(11, "mapq");
 
-        // ── Phase 3: optional tag fields (12, 13, …) ─────────────────────
-        let n_fields = tab_pos.len() + 1;
-        let mut tags = HashMap::with_capacity(n_fields.saturating_sub(12));
-        for fi in 12..n_fields {
-            let start     = tab_pos[fi - 1] + 1;
-            let end       = if fi < tab_pos.len() { tab_pos[fi] } else { len };
+        // Phase 3: Tags — match scalar exactly
+        let mut tags = HashMap::new();
+        for fi in 12..=tab_pos.len() {  // note: <= to include last field
+            let start = tab_pos[fi - 1] + 1;  // safe because we checked tab_pos.len()
+            let end = if fi < tab_pos.len() { tab_pos[fi] } else { len };
             let tag_bytes = &bytes[start..end];
+
             if tag_bytes.is_empty() { continue; }
             if let Ok(s) = std::str::from_utf8(tag_bytes) {
-                let mut it = s.splitn(3, ':');
-                if let (Some(k), Some(_t), Some(v)) = (it.next(), it.next(), it.next()) {
-                    tags.insert(k.to_string(), v.to_string());
+                let parts: Vec<&str> = s.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    tags.insert(parts[0].to_string(), parts[2].to_string());
                 }
             }
         }
@@ -371,6 +378,98 @@ pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // ── Strategy for generating tag fields (valid + malformed) ─────────────
+    fn tag_field_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Valid tag: key:type:value
+            ("[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}")
+                .prop_map(|(k, t, v)| format!("{}:{}{}", k, t, v)),
+
+            // Malformed: missing type (only one colon)
+            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}")
+                .prop_map(|(k, v)| format!("{}:{}", k, v)),
+
+            // Malformed: empty key
+            (":[A-Za-z]:[^\\t\\n]{0,30}").prop_map(|s| s.to_string()),
+
+            // Malformed: empty value
+            ("[A-Za-z0-9_]{1,10}:[A-Za-z]:").prop_map(|s| s.to_string()),
+
+            // Malformed: garbage / no colons
+            "[A-Za-z0-9_:\\-]{1,40}".prop_map(|s| s),
+
+            // Malformed: trailing colon only
+            "[A-Za-z0-9_]{1,10}:".prop_map(|s| s.to_string()),
+
+            // Empty tag field (consecutive tabs)
+            Just("".to_string()),
+        ]
+    }
+
+    // ── Basic field proptest ───────────────────────────────────────────────
+    proptest! {
+        #[test]
+        fn test_parse_line_paf_equivalence(
+            qname in "[a-zA-Z0-9._-]{1,100}",
+            qlen in 1u64..1000000,
+            qstart in 0u64..1000000,
+            qend in 0u64..1000000,
+            strand in "[+-]",
+            tname in "[a-zA-Z0-9._-]{1,100}",
+            tlen in 1u64..1000000000,
+            tstart in 0u64..1000000000,
+            tend in 0u64..1000000000,
+            nmatch in 0u64..1000000,
+            alen in 0u64..1000000,
+            mapq in 0u8..60
+        ) {
+            let line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq
+            );
+            compare_parsers(&line);
+        }
+    }
+
+    // ── Proptests with random extra tags (valid + malformed) ───────────────
+    proptest! {
+        #[test]
+        fn test_parse_line_paf_equivalence_with_malformed_tags(
+            qname in "[a-zA-Z0-9._-]{1,100}",
+            qlen in 1u64..1000000,
+            qstart in 0u64..1000000,
+            qend in 0u64..1000000,
+            strand in "[+-]",
+            tname in "[a-zA-Z0-9._-]{1,100}",
+            tlen in 1u64..1000000000,
+            tstart in 0u64..1000000000,
+            tend in 0u64..1000000000,
+            nmatch in 0u64..1000000,
+            alen in 0u64..1000000,
+            mapq in 0u8..60,
+            extra_tags in prop::collection::vec(tag_field_strategy(), 0..40)
+        ) {
+            let mut line = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq
+            );
+
+            for tag in extra_tags {
+                line.push_str(&format!("\t{}", tag));
+            }
+
+            let scalar_res = PafRecord::parse_line_scalar(&line);
+            let dispatched_res = PafRecord::parse_line(&line);
+
+            match (scalar_res, dispatched_res) {
+                (Ok(s), Ok(d)) => assert_records_eq(&s, &d, &line),
+                (Err(_), Err(_)) => {}
+                _ => panic!("Scalar and AVX-512 disagreed on success/failure for line: {}", line),
+            }
+        }
+    }
 
     // ── helpers ────────────────────────────────────────────────────────────
 
@@ -393,13 +492,12 @@ mod tests {
     }
 
     /// Run both parsers against `line` and assert they agree.
-    /// Run both parsers against `line` and assert they agree.
     fn compare_parsers(line: &str) {
         let scalar = PafRecord::parse_line_scalar(line)
             .expect("scalar parse failed");
 
         let dispatched = PafRecord::parse_line(line)
-            .expect("dispatched parse failed");
+            .expect("dispatched (AVX-512 or scalar) parse failed");
 
         assert_records_eq(&scalar, &dispatched, line);
     }
@@ -421,11 +519,9 @@ mod tests {
     const MAX_VALUES: &str =
         "read5\t1000000\t0\t999999\t+\tNC_000001\t248956422\t0\t999999\t999000\t1000000\t60";
 
-    // A line just long enough to span two 64-byte SIMD chunks (> 64 bytes total).
     const LONG_LINE: &str =
         "long_read_id_that_is_quite_verbose_indeed\t250\t0\t250\t+\tsome_reference_sequence_name\t100000\t1000\t1250\t245\t250\t60\tcg:Z:250M\tNM:i:5";
 
-    // Trailing whitespace / CRLF should be trimmed by both parsers.
     const TRAILING_SPACE: &str =
         "read6\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60   ";
 
@@ -439,7 +535,6 @@ mod tests {
     #[test]
     fn test_with_optional_tags() {
         compare_parsers(WITH_TAGS);
-        // Also verify tag values were parsed
         let r = PafRecord::parse_line_scalar(WITH_TAGS).unwrap();
         assert_eq!(r.tags.get("NM").map(|s| s.as_str()), Some("7"));
         assert_eq!(r.tags.get("AS").map(|s| s.as_str()), Some("255"));
@@ -477,7 +572,6 @@ mod tests {
     #[test]
     fn test_trailing_whitespace_trimmed() {
         compare_parsers(TRAILING_SPACE);
-        // Verify trailing spaces don't bleed into field values
         let r = PafRecord::parse_line_scalar(TRAILING_SPACE).unwrap();
         assert_eq!(r.qname, "read6");
         assert_eq!(r.qlen, 150);
@@ -502,23 +596,70 @@ mod tests {
     #[test]
     fn test_error_on_empty_line() {
         assert!(PafRecord::parse_line_scalar("").is_err());
-        assert!(PafRecord::parse_line("").is_err());           // ← use the dispatched version
+        assert!(PafRecord::parse_line("").is_err());
     }
 
     #[test]
     fn test_error_on_too_few_fields() {
         let short = "read1\t150\t0\t150\t+\tNC_045512.2\t29903";
         assert!(PafRecord::parse_line_scalar(short).is_err());
-        assert!(PafRecord::parse_line(short).is_err());   // use dispatched version
+        assert!(PafRecord::parse_line(short).is_err());
     }
 
     #[test]
     fn test_parse_paf_batch_to_m8_roundtrip() {
         let batch = format!("{}\n{}\n{}\n", BASIC, WITH_TAGS, REVERSE_STRAND);
         let results = parse_paf_batch_to_m8(batch.into_bytes(), 29903.0);
-        // BASIC and REVERSE_STRAND have no tname with NT:/NR: prefix → empty m8 line, filtered out
-        // WITH_TAGS also has no prefix → all three map to empty; batch returns nothing harmful
-        // Just ensure no panic and result is a Vec.
         let _ = results;
+    }
+
+    // ── Strong edge-case tests (malformed tags, long lines, etc.) ─────────
+
+    #[test]
+    fn test_trailing_whitespace_and_empty_tags() {
+        let cases = vec![
+            "read6\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60   ",
+            "read7\t100\t0\t100\t+\tref\t1000\t0\t100\t100\t100\t60\t\tNM:i:0",
+            "read8\t200\t0\t200\t-\tref\t2000\t0\t200\t200\t200\t60\tcg:Z:200M  ",
+            "read9\t150\t0\t150\t+\tref\t1000\t0\t150\t150\t150\t60\t   ",
+        ];
+
+        for line in cases {
+            compare_parsers(line);
+        }
+    }
+
+    #[test]
+    fn test_malformed_tags() {
+        let line = "read\t100\t0\t100\t+\tref\t1000\t0\t100\t100\t100\t60\tbadtag\tgood:Z:value\tNM:i:5\tincomplete:";
+        compare_parsers(line);
+
+        let r = PafRecord::parse_line(line).unwrap();
+        assert_eq!(r.tags.get("good"), Some(&"value".to_string()));
+        assert_eq!(r.tags.get("NM"), Some(&"5".to_string()));
+        assert!(!r.tags.contains_key("badtag"));
+        assert!(!r.tags.contains_key("incomplete"));
+    }
+
+    #[test]
+    fn test_long_line_many_tabs() {
+        let mut line = "longid\t100\t0\t100\t+\tlongref\t10000\t0\t100\t100\t100\t60".to_string();
+        for i in 0..50 {
+            line.push_str(&format!("\ttag{i}:Z:value{i}"));
+        }
+        compare_parsers(&line);
+    }
+
+    #[test]
+    fn test_header_like_ids_and_special_chars() {
+        let cases = vec![
+            "read:1|with:colon\t150\t0\t150\t+\tref:seq|version.1\t1000\t0\t150\t150\t150\t60",
+            "read with space in qname\t100\t0\t100\t+\tref\t1000\t0\t100\t100\t100\t60",
+            "read\t100\t0\t100\t+\tref\t1000\t0\t100\t100\t100\t60\tcg:Z:10M2D\tAS:i:200\tNM:i:2",
+        ];
+
+        for line in cases {
+            compare_parsers(line);
+        }
     }
 }

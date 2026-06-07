@@ -30,6 +30,7 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::fs::{self, set_permissions};
 use std::fs::Permissions;
 use bytes::Bytes;
+use which;
 
 use crate::utils::fastx::{SequenceRecord, parse_header};
 use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG, SPADES_TAG};
@@ -339,6 +340,33 @@ where
 }
 
 
+/// Returns the binary + arguments to use, optionally wrapped with numactl.
+///
+/// This is the single source of truth for numactl policy.
+/// Falls back gracefully if numactl is not installed.
+fn build_command_with_numa(
+    config: &RunConfig,
+    cmd_tag: &str,
+    args: Vec<String>,
+) -> (String, Vec<String>) {
+    let should_use = cfg!(target_os = "linux")
+        && config.max_cores >= 64
+        && matches!(cmd_tag, MMSEQS_TAG | DIAMOND_TAG | SPADES_TAG);
+
+    if should_use {
+        if which::which("numactl").is_ok() {
+            let mut final_args = vec!["--interleave=all".to_string(), cmd_tag.to_string()];
+            final_args.extend(args);
+            debug!("Using numactl --interleave=all for {}", cmd_tag);
+            return ("numactl".to_string(), final_args);
+        } else {
+            warn!("numactl not found — running {} without NUMA interleave", cmd_tag);
+        }
+    }
+
+    (cmd_tag.to_string(), args)
+}
+
 /// Asynchronously spawn an external process and feed it a stream as stdin.
 /// Capture stdout and return from function.
 ///
@@ -378,32 +406,33 @@ pub async fn stream_to_cmd(
         data_type,
         1.8, // 1.0 = normal, 1.5–2.0 for very hot paths later
     );
+    let batch_size_bytes = writer_capacity / 4;
 
-    let batch_size_bytes = writer_capacity / 4; // keep ~4:1 batching ratio
+    let (binary, final_args) = build_command_with_numa(config.as_ref(), cmd_tag, args);
 
-    let cmd_tag_owned = cmd_tag.to_string();
-    let cmd_tag_err_owned = cmd_tag.to_string();
-    let stderr_log_path_clone = stderr_log_path.clone();
-
-    let mut child = Command::new(&cmd_tag_owned)
-        .args(&args)
+    let mut child = Command::new(&binary)
+        .args(&final_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
+        .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag, e))?;
 
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag_owned))?;
+        .ok_or_else(|| anyhow!("Failed to open stdin for {}", cmd_tag))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag))?;
 
     let child = Arc::new(tokio::sync::Mutex::new(child));
     let child_clone = child.clone();
+
+    let cmd_tag_owned = cmd_tag.to_string();
+    let cmd_tag_err_owned = cmd_tag.to_string();
+    let stderr_log_path_clone = stderr_log_path.clone();
 
     let stdin_task = tokio::spawn(async move {
         let mut writer = BufWriter::with_capacity(writer_capacity, stdin);
@@ -578,24 +607,9 @@ pub async fn spawn_cmd(
 
     let cmd_tag_owned = cmd_tag.to_string();
 
-    // === NUMA SUPPORT - ONLY for tools that benefit ===
-    let (binary, final_args) = if should_use_numactl(config.as_ref(), cmd_tag) {
-        let mut numa_args = vec!["--interleave=all".to_string(), cmd_tag_owned.clone()];
-        numa_args.extend(args);
-        debug!("spawn_cmd: Prepended numactl --interleave=all for {}", cmd_tag);
-        ("numactl", numa_args)
-    } else {
-        ("", args)   // empty string = use original binary
-    };
+    let (binary, final_args) = build_command_with_numa(config.as_ref(), cmd_tag, args);
 
-    eprintln!("[{} cmd]: {}", cmd_tag, final_args.join(" "));
-
-    // Use the correct binary
-    let mut child = if binary.is_empty() {
-        Command::new(&cmd_tag_owned)
-    } else {
-        Command::new(binary)
-    }
+    let mut child = Command::new(&binary)
         .args(&final_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -603,14 +617,14 @@ pub async fn spawn_cmd(
         .spawn()
         .map_err(|e| anyhow!("Failed to spawn {}: {}", cmd_tag_owned, e))?;
 
-    let stderr_task = {
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture stderr for {}", cmd_tag_owned))?;
 
-        let cmd_tag_clone = cmd_tag_owned.clone();
+    let stderr_task = {
         let stderr_log_path_clone = stderr_log_path.clone();
+        let cmd_tag_clone = cmd_tag_owned.clone();
 
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
@@ -829,8 +843,8 @@ pub async fn parse_fastq<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fastq {
                 id,
                 desc,
-                seq: Arc::new(seq),
-                qual: Arc::new(qual),
+                seq: Bytes::from(seq),
+                qual: Bytes::from(qual),
             };
 
             if tx.send(ParseOutput::Fastq(record)).await.is_err() {
@@ -887,7 +901,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
                     let record = SequenceRecord::Fasta {
                         id,
                         desc: current_desc.take(),
-                        seq: Arc::new(current_seq),
+                        seq: Bytes::from(current_seq),
                     };
                     if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                         return Err(anyhow!("Receiver dropped during FASTA parsing, data loss detected"));
@@ -906,7 +920,7 @@ pub async fn parse_fasta<R: AsyncRead + Unpin + Send + 'static>(
             let record = SequenceRecord::Fasta {
                 id,
                 desc: current_desc.take(),
-                seq: Arc::new(current_seq),
+                seq: Bytes::from(current_seq),
             };
             if tx.send(ParseOutput::Fasta(record)).await.is_err() {
                 return Err(anyhow!("Receiver dropped during final FASTA parsing, data loss detected"));
@@ -2011,18 +2025,18 @@ pub async fn fanout_to_channels(
     mut upstream: ReceiverStream<ParseOutput>,
     n_branches: usize,
     label: &str,
-    config: &RunConfig,           // ← added
-    data_type: StreamDataType,    // ← added
+    config: &RunConfig,
+    data_type: StreamDataType,
 ) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
 
     let buffer_per_branch = crate::utils::system::compute_buffer_size(
         config,
-        "fanout",                     // phase name
+        "fanout",
         data_type,
-        1.45,                         // good hot-path boost for fanout (not too aggressive)
+        1.45,
     );
 
-    let mut txs = Vec::with_capacity(n_branches);
+    let mut txs: Vec<mpsc::Sender<ParseOutput>> = Vec::with_capacity(n_branches);
     let mut rxs = Vec::with_capacity(n_branches);
 
     for _ in 0..n_branches {
@@ -2032,15 +2046,24 @@ pub async fn fanout_to_channels(
     }
 
     let label = label.to_string();
-    let router: JoinHandle<anyhow::Result<(), anyhow::Error>> = tokio::spawn(async move {
+
+    let router = tokio::spawn(async move {
         let mut count = 0usize;
+
         while let Some(item) = upstream.next().await {
             count += 1;
-            // Send to EVERY branch (never drop)
-            let sends: Vec<_> = txs.iter().map(|tx| tx.send(item.clone())).collect();
-            let _ = futures::future::join_all(sends).await;
+
+            for (branch_idx, tx) in txs.iter().enumerate() {
+                if tx.send(item.clone()).await.is_err() {
+                    return Err(anyhow!(
+                        "[fanout {}] branch {} closed unexpectedly while upstream was still producing (after {} items)",
+                        label, branch_idx, count
+                    ));
+                }
+            }
         }
-        debug!("[fanout {}] finished — forwarded {} items total", label, count);
+
+        debug!("[fanout {}] finished cleanly — forwarded {} items total", label, count);
         Ok(())
     });
 
@@ -2128,13 +2151,13 @@ mod tests {
         let fastq = SequenceRecord::Fastq {
             id: "read1".to_string(),
             desc: Some("mate 1".to_string()),
-            seq: Arc::new(b"ATCG".to_vec()),
-            qual: Arc::new(b"IIII".to_vec()),
+            seq: Bytes::from_static(b"ATCG"),
+            qual:Bytes::from_static(b"IIII"),
         };
         let fasta = SequenceRecord::Fasta {
             id: "contig1".to_string(),
             desc: Some("assembled contig".to_string()),
-            seq: Arc::new(b"GATTACA".to_vec()),
+            seq: Bytes::from_static(b"GATTACA"),
         };
 
         assert_eq!(fastq.to_bytes()?.as_ref(), b"@read1 mate 1\nATCG\n+\nIIII\n");
@@ -2168,7 +2191,7 @@ mod tests {
             ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
                 assert_eq!(id, "seq1");
                 assert_eq!(desc.as_deref(), Some("first record"));
-                assert_eq!(seq.as_ref().as_slice(), b"ACGTTGCA");
+                assert_eq!(seq.as_ref(), b"ACGTTGCA");
             }
             other => panic!("Expected first FASTA record, got {:?}", other),
         }
@@ -2177,7 +2200,7 @@ mod tests {
             ParseOutput::Fasta(SequenceRecord::Fasta { id, desc, seq }) => {
                 assert_eq!(id, "seq2");
                 assert_eq!(desc, &None);
-                assert_eq!(seq.as_ref().as_slice(), b"NNNN");
+                assert_eq!(seq.as_ref(), b"NNNN");
             }
             other => panic!("Expected second FASTA record, got {:?}", other),
         }
@@ -2285,7 +2308,7 @@ mod tests {
         tx.send(ParseOutput::Fasta(SequenceRecord::Fasta {
             id: "seq1".to_string(),
             desc: Some("desc".to_string()),
-            seq: Arc::new(b"ACGT".to_vec()),
+            seq: Bytes::from_static(b"ACGT"),
         })).await?;
         tx.send(ParseOutput::Bytes(Bytes::from_static(b"ignored"))).await?;
         drop(tx);
@@ -2302,7 +2325,7 @@ mod tests {
             SequenceRecord::Fasta { id, desc, seq } => {
                 assert_eq!(id, "seq1");
                 assert_eq!(desc.as_deref(), Some("desc"));
-                assert_eq!(seq.as_ref().as_slice(), b"ACGT");
+                assert_eq!(seq.as_ref(), b"ACGT");
             }
             other => panic!("Expected FASTA record, got {:?}", other),
         }
@@ -2391,14 +2414,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
         let stream = tokio_stream::iter(records);
@@ -3066,9 +3089,9 @@ mod tests {
         }
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].id(), "read1");
-        assert_eq!(records[0].seq(), b"ATCG");
+        assert_eq!(records[0].seq(), Bytes::from_static(b"ATCG"));
         assert_eq!(records[1].id(), "read2");
-        assert_eq!(records[1].seq(), b"GCTA");
+        assert_eq!(records[1].seq(), Bytes::from_static(b"GCTA"));
         Ok(())
     }
 
@@ -3323,14 +3346,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
@@ -3414,8 +3437,8 @@ mod tests {
         let test_record = ParseOutput::Fastq(SequenceRecord::Fastq {
             id: "read1".to_string(),
             desc: None,
-            seq: Arc::new(b"ATCG".to_vec()),
-            qual: Arc::new(b"IIII".to_vec()),
+            seq: Bytes::from_static(b"ATCG"),
+            qual: Bytes::from_static(b"IIII"),
         });
 
         tokio::spawn(async move {
@@ -3453,26 +3476,26 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"CCCC".to_vec()),
-                qual: Arc::new(b"JJJJ".to_vec()),
+                seq: Bytes::from_static(b"CCCC"),
+                qual: Bytes::from_static(b"JJJJ"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GGGG".to_vec()),
-                qual: Arc::new(b"KKKK".to_vec()),
+                seq: Bytes::from_static(b"GGGG"),
+                qual: Bytes::from_static(b"KKKK"),
             }),
         ];
 
@@ -3539,14 +3562,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
@@ -3683,14 +3706,14 @@ mod tests {
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/1".to_string(),
                 desc: None,
-                seq: Arc::new(b"ATCG".to_vec()),
-                qual: Arc::new(b"IIII".to_vec()),
+                seq: Bytes::from_static(b"ATCG"),
+                qual: Bytes::from_static(b"IIII"),
             }),
             ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "read1/2".to_string(),
                 desc: None,
-                seq: Arc::new(b"GCTA".to_vec()),
-                qual: Arc::new(b"HHHH".to_vec()),
+                seq: Bytes::from_static(b"GCTA"),
+                qual: Bytes::from_static(b"HHHH"),
             }),
         ];
 
