@@ -1664,57 +1664,100 @@ where
     ReceiverStream::new(rx)
 }
 
-/// Router that reads the upstream ONCE and fans it out to N private channels.
-/// Guarantees immediate draining + instant EOF propagation. No silent drops.
-/// Router that reads the upstream ONCE and fans it out to N private channels.
-/// Guarantees immediate draining + instant EOF propagation. No silent drops.
+/// Broadcasts every item from `upstream` to **all** `n_branches` downstream channels.
+///
+/// Never silently drops data.
+/// Every branch receives every item (or we error loudly).
+/// Every branch sees clean EOF when upstream ends (including the 0-item case).
 pub async fn fanout_to_channels(
     mut upstream: ReceiverStream<ParseOutput>,
     n_branches: usize,
     label: &str,
     config: &RunConfig,
     data_type: StreamDataType,
-) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, JoinHandle<anyhow::Result<(), anyhow::Error>>), PipelineError> {
+) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, oneshot::Receiver<Result<(), anyhow::Error>>), PipelineError> {
+    if n_branches == 0 {
+        return Err(PipelineError::Other(anyhow!("fanout_to_channels called with 0 branches in {}", label)));
+    }
 
-    let buffer_per_branch = crate::utils::system::compute_buffer_size(
+    let buffer_size = crate::utils::system::compute_buffer_size(
         config,
-        "fanout",
+        "fanout_to_channels",
         data_type,
-        1.45,
+        1.5, // slightly higher multiplier than normal paths because we duplicate
     );
 
     let mut txs: Vec<mpsc::Sender<ParseOutput>> = Vec::with_capacity(n_branches);
     let mut rxs = Vec::with_capacity(n_branches);
 
     for _ in 0..n_branches {
-        let (tx, rx) = mpsc::channel(buffer_per_branch);
+        let (tx, rx) = mpsc::channel(buffer_size);
         txs.push(tx);
         rxs.push(rx);
     }
 
     let label = label.to_string();
+    let (done_tx, done_rx) = oneshot::channel::<Result<(), anyhow::Error>>();
 
-    let router = tokio::spawn(async move {
-        let mut count = 0usize;
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+
+        let mut item_count: usize = 0;
+        let mut last_progress = Instant::now();
 
         while let Some(item) = upstream.next().await {
-            count += 1;
+            item_count += 1;
 
-            for (branch_idx, tx) in txs.iter().enumerate() {
-                if tx.send(item.clone()).await.is_err() {
-                    return Err(anyhow!(
-                        "[fanout {}] branch {} closed unexpectedly while upstream was still producing (after {} items)",
-                        label, branch_idx, count
-                    ));
+            // Track slowest branch for backpressure (prevents router from buffering forever)
+            let mut lowest_capacity = 1.0f64;
+
+            for (i, tx) in txs.iter().enumerate() {
+                let cap_ratio = tx.capacity() as f64 / buffer_size as f64;
+                lowest_capacity = lowest_capacity.min(cap_ratio);
+
+                match tx.try_send(item.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        if tx.send(item.clone()).await.is_err() {
+                            let _ = done_tx.send(Err(anyhow!(
+                                "[fanout {}] branch {} dropped while upstream still producing (after {} items)",
+                                label, i, item_count
+                            )));
+                            return;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        let _ = done_tx.send(Err(anyhow!(
+                            "[fanout {}] branch {} closed unexpectedly while upstream still producing (after {} items)",
+                            label, i, item_count
+                        )));
+                        return;
+                    }
                 }
+            }
+
+            // Smart backpressure — only slow down when the slowest branch is getting full
+            if lowest_capacity < 0.10 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else if lowest_capacity < 0.25 {
+                tokio::task::yield_now().await;
+            }
+
+            // Occasional progress for very long streams (cheap)
+            if item_count % 50_000 == 0 && last_progress.elapsed() > Duration::from_secs(30) {
+                debug!("[fanout {}] forwarded {} items so far", label, item_count);
+                last_progress = Instant::now();
             }
         }
 
-        debug!("[fanout {}] finished cleanly — forwarded {} items total", label, count);
-        Ok(())
+        // Upstream ended (including the 0-item case). Drop all senders so branches see EOF.
+        drop(txs);
+
+        debug!("[fanout {}] finished cleanly — forwarded {} items to {} branches", label, item_count, n_branches);
+        let _ = done_tx.send(Ok(()));
     });
 
-    Ok((rxs, router))
+    Ok((rxs, done_rx))
 }
 
 #[cfg(test)]

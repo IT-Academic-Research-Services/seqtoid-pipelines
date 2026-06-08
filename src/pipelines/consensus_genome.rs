@@ -79,7 +79,7 @@ async fn validate_input(
     out_dir: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let validated_interleaved_file_path = file_path_manipulator(
         &PathBuf::from(&sample_base_buf),
         Some(out_dir),
@@ -113,7 +113,7 @@ async fn validate_input(
     )
         .await?;
 
-    cleanup_tasks.push(val_router_handle);
+    cleanup_receivers.push(val_router_handle);
 
     if val_streams.len() < 2 {
         return Err(PipelineError::EmptyStream);
@@ -343,7 +343,7 @@ async fn align_to_host(
     )
         .await?;
 
-    cleanup_tasks.push(host_router_handle);
+    cleanup_receivers.push(host_router_handle);
 
     // Consume Vec to get Receivers
     let mut streams_iter = host_streams.into_iter();
@@ -481,7 +481,7 @@ async fn process_ercc(
     let mut streams_iter = ercc_streams.into_iter();
     let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    cleanup_tasks.push(ercc_router_handle);
+    cleanup_receivers.push(ercc_router_handle);
 
     let mut minimap2_options = HashMap::new();
     match config.args.technology {
@@ -550,7 +550,7 @@ async fn process_ercc(
     )
         .await?;
 
-    cleanup_tasks.push(sam_router_handle);
+    cleanup_receivers.push(sam_router_handle);
     let mut sam_streams_iter = sam_streams.into_iter();
     let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_view_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -717,7 +717,7 @@ async fn process_ercc(
     )
         .await?;
 
-    cleanup_tasks.push(stats_router_handle);
+    cleanup_receivers.push(stats_router_handle);
     let mut stats_streams_iter = stats_streams.into_iter();
     let stats_file_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let stats_parse_stream = stats_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -764,6 +764,7 @@ async fn filter_with_kraken(
     PipelineError,
 > {
     let mut cleanup_tasks = vec![];
+    let mut cleanup_receivers = Vec::new();
 
     // Parse the byte stream into Fastq records
     let (parse_rx, parse_task) = parse_byte_stream_to_fastq(
@@ -939,7 +940,7 @@ async fn filter_with_kraken(
     )
         .await?;
 
-    cleanup_tasks.push(kraken_router_handle);
+    cleanup_receivers.push(kraken_router_handle);
     let mut streams_iter = kraken_streams.into_iter();
     let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -990,7 +991,6 @@ async fn filter_with_kraken(
     });
     cleanup_tasks.push(cleanup_pipe_task);
 
-    let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = vec![];
     Ok((ReceiverStream::new(kraken_output_stream), cleanup_tasks, cleanup_receivers))
 }
 
@@ -1149,7 +1149,7 @@ async fn align_to_target(
     )
         .await?;
 
-    cleanup_tasks.push(sam_router_handle);
+    cleanup_receivers.push(sam_router_handle);
     let mut streams_iter = sam_streams.into_iter();
     let sam_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let sam_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1362,7 +1362,7 @@ async fn generate_consensus(
         StreamDataType::JustBytes,
     ).await?;
 
-    cleanup_tasks.push(consensus_router_handle);
+    cleanup_receivers.push(consensus_router_handle);
     let mut streams_iter = consensus_streams.into_iter();
     let consensus_realign_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let consensus_stats_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -1507,7 +1507,7 @@ async fn call_variants(
     )
         .await?;
 
-    cleanup_tasks.push(vcf_router_handle);
+    cleanup_receivers.push(vcf_router_handle);
 
     let mut streams_iter = vcf_streams.into_iter();
     let vcf_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -2087,7 +2087,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 StreamDataType::JustBytes,
             )
                 .await?;
-            cleanup_tasks.push(align_sam_router_handle);
+            cleanup_receivers.push(align_sam_router_handle);
             let mut align_streams_iter = align_sam_streams.into_iter();
             let align_sam_output_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
             let align_sam_call_stream = align_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
