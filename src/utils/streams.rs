@@ -2061,18 +2061,31 @@ mod tests {
     #[tokio::test]
     async fn test_fanout_to_channels_zero_branches() -> Result<()> {
         let config = create_test_run_config();
-        let (up_tx, up_rx) = mpsc::channel(8);
-        let upstream = ReceiverStream::new(up_rx);
-        drop(up_tx);
 
-        let (receivers, _router) = fanout_to_channels(
+        // Explicitly create and drop the sender so the upstream is closed
+        let (up_tx, up_rx) = mpsc::channel::<ParseOutput>(8);
+        drop(up_tx);
+        let upstream = ReceiverStream::new(up_rx);
+
+        let result = fanout_to_channels(
             upstream,
             0,
             "test_fanout_zero",
             &config,
             StreamDataType::IlluminaFastq,
-        ).await?;
-        assert_eq!(receivers.len(), 0);
+        )
+            .await;
+
+        // We expect an error for 0 branches — this is the correct/safe behavior
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("0 branches"),
+                "Expected error message about 0 branches, got: {}",
+                msg
+            );
+        }
         Ok(())
     }
 
@@ -2226,22 +2239,33 @@ mod tests {
     #[tokio::test]
     async fn test_fanout_to_channels_empty_stream() -> Result<()> {
         let config = create_test_run_config();
-        let (_up_tx, up_rx) = mpsc::channel::<ParseOutput>(8);
+
+        // Create channel and immediately drop the sender so upstream is empty/closed
+        let (up_tx, up_rx) = mpsc::channel::<ParseOutput>(8);
+        drop(up_tx);
         let upstream = ReceiverStream::new(up_rx);
 
-        let (outputs, router) = fanout_to_channels(
+        let (outputs, fanout_done) = fanout_to_channels(
             upstream,
             2,
             "test_fanout_empty",
             &config,
             StreamDataType::IlluminaFastq,
-        ).await?;
+        )
+            .await?;
 
+        // All branches should immediately see EOF
         for rx in outputs {
             let mut stream = ReceiverStream::new(rx);
-            assert!(stream.next().await.is_none());
+            assert!(
+                stream.next().await.is_none(),
+                "Expected None (EOF) from branch receiver on empty upstream"
+            );
         }
-        router.await??;
+
+        // The fanout task should complete cleanly
+        fanout_done.await??;
+
         Ok(())
     }
 
