@@ -13,7 +13,7 @@ use std::sync::Arc;
 use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::{self, LevelFilter, debug, info, error, warn};
 use env_logger::Builder;
 use clap::Parser;
@@ -72,6 +72,22 @@ async fn main() -> Result<()> {
     let dir = env::current_dir()?;
     info!("The current directory is {:?}\n", dir);
 
+    let file1_path = match &args.file1 {
+        Some(file) => resolve_existing_input_path(file, &dir)?,
+        None => return Err(anyhow!("File1 path required")),
+    };
+
+    let sample_base = derive_sample_base_from_file1(&file1_path)?;
+    info!("The sample base is {:?}\n", sample_base);
+    let sample_base_str = sample_base.to_string_lossy().into_owned();
+
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let run_id = format!("{}_{}", sample_base_str, timestamp);
+    let out_dir = setup_output_dir(&args, &dir, &sample_base_str, &timestamp)?;
+    info!("The output directory is {:?}\n", out_dir);
+
+    let efs_base_dir = PathBuf::from(&args.efs_runs_dir).join(&run_id);
+
     let ram_temp_dir = get_ram_temp_dir();
     info!("The RAM temp directory is {:?}\n", ram_temp_dir);
 
@@ -112,7 +128,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    let backend = if args.use_diamond {
+    let alignment_backend = if args.use_diamond {
         NRAlignmentBackend::Diamond
     } else if use_mmseqs_gpu {
         NRAlignmentBackend::MmseqsGpu
@@ -137,7 +153,6 @@ async fn main() -> Result<()> {
 
     let simd = detect_simd_level();
 
-    let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
     let run_config = Arc::new(RunConfig {
         cwd: dir,
@@ -154,10 +169,12 @@ async fn main() -> Result<()> {
         rng,
         log_level,
         base_backpressure_pause: 1000, // NB: hardcoded for testing
-        simd: simd,
-        gpu_info: gpu_info,
-        has_gpu: has_gpu,
-        alignment_backend: backend,
+        simd,
+        gpu_info,
+        has_gpu,
+        alignment_backend,
+        run_id,
+        efs_base_dir,
 
     });
 
@@ -226,7 +243,12 @@ async fn build_fasta_offset_db_run(run_config: Arc<RunConfig>) -> Result<(), Pip
 /// * `cwd` - The current working directory.
 /// # Returns
 /// path to the output directory.
-fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBuf> {
+fn setup_output_dir(
+    args: &cli::args::Arguments,
+    cwd: &PathBuf,
+    sample_base: &str,           // ← pass it in
+    timestamp: &str,             // ← pass the full timestamp
+) -> Result<PathBuf> {
     let out_dir = match &args.out_dir {
         Some(out) => {
             let path = PathBuf::from(out);
@@ -237,17 +259,7 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             }
         }
         None => {
-            let file1 = match &args.file1 {
-                Some(file) => resolve_existing_input_path(file, cwd)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-                None => return Err(anyhow::anyhow!("File1 path required")),
-            };
-
-            let sample_base = derive_sample_base_from_file1(&file1)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-            let timestamp = chrono::Local::now().format("%Y%m%d").to_string();
-            cwd.join(format!("{}_{}", sample_base.display(), timestamp))
+            cwd.join(format!("{}_{}", sample_base, timestamp))
         }
     };
 

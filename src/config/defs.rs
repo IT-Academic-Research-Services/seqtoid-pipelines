@@ -256,6 +256,8 @@ pub struct RunConfig {
     pub gpu_info: GpuDetection,
     pub has_gpu: bool,
     pub alignment_backend: NRAlignmentBackend,
+    pub run_id: String,
+    pub efs_base_dir: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

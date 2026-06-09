@@ -580,6 +580,8 @@ fn bench_compute_buffer_and_concurrency(c: &mut Criterion) {
         gpu_info: GpuDetection { count: 0, gpus: vec![] },
         has_gpu: false,
         alignment_backend: NRAlignmentBackend::Diamond,
+        run_id: "NULL".to_string(),
+        efs_base_dir: PathBuf::from("/dev/null"),
     };
 
     let mut group = c.benchmark_group("compute_buffer_concurrency");
