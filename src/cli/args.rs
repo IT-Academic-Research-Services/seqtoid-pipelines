@@ -225,4 +225,7 @@ pub struct Arguments {
     #[arg(long, default_value = "nrDB")]
     pub mmseqs_db: Option<String>,
 
+    #[arg(long, default_value = "/efs/runs")]
+    pub efs_runs_dir: String,
+
 }
