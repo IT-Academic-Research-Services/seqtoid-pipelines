@@ -582,6 +582,7 @@ fn bench_compute_buffer_and_concurrency(c: &mut Criterion) {
         alignment_backend: NRAlignmentBackend::Diamond,
         run_id: "NULL".to_string(),
         efs_base_dir: PathBuf::from("/dev/null"),
+        sample_base: PathBuf::from("avx512-bench"),
     };
 
     let mut group = c.benchmark_group("compute_buffer_concurrency");

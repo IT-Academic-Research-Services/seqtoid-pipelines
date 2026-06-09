@@ -258,6 +258,7 @@ pub struct RunConfig {
     pub alignment_backend: NRAlignmentBackend,
     pub run_id: String,
     pub efs_base_dir: PathBuf,
+    pub sample_base: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

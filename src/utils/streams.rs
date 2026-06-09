@@ -1820,6 +1820,7 @@ mod tests {
             alignment_backend: NRAlignmentBackend::Diamond,
             run_id: "NULL".to_string(),
             efs_base_dir: PathBuf::from("/dev/null"),
+            sample_base: PathBuf::from("stream_test"),
         };
 
         // Compute proper buffer size exactly like main.rs

@@ -585,7 +585,7 @@ pub fn derive_sample_base_from_file1(file1_path: &Path) -> Result<PathBuf, Pipel
 pub async fn validate_file_inputs(
     config: &RunConfig,
     cwd: &PathBuf,
-) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
+) -> Result<(PathBuf, Option<PathBuf>), PipelineError> {
     let file1_path = match &config.args.file1 {
         Some(file) => resolve_existing_input_path(file, cwd)?,
         None => {
@@ -603,21 +603,18 @@ pub async fn validate_file_inputs(
         None => None,
     };
 
-    let sample_base_buf = derive_sample_base_from_file1(&file1_path)?;
-    let sample_base = sample_base_buf.to_string_lossy().into_owned();
-
     if let Some(ref file2) = file2_path {
         let file2_base = derive_sample_base_from_file1(file2)?;
-        if file2_base != sample_base_buf {
+        if file2_base != config.sample_base {
             warn!(
                 "file1/file2 sample bases do not match: '{}' vs '{}'",
-                sample_base_buf.display(),
+                config.sample_base.display(),
                 file2_base.display()
             );
         }
     }
 
-    Ok((file1_path, file2_path, sample_base_buf, sample_base))
+    Ok((file1_path, file2_path))
 }
 
 

@@ -29,7 +29,7 @@ use rand_core::{RngCore, OsRng};
 use crate::cli::parse;
 use crate::config::defs::{RunConfig, StreamDataType, PipelineError, NRAlignmentBackend, GpuDetection, GpuInfo};
 use crate::cli::args::Technology;
-use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, derive_sample_base_from_file1};
+use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, derive_sample_base_from_file1, validate_file_inputs};
 use crate::utils::fastx::r1r2_base;
 use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
                            compute_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
         alignment_backend,
         run_id,
         efs_base_dir,
-
+        sample_base
     });
 
     if let Err(e) = ensure_transparent_hugepages(&run_config).await {

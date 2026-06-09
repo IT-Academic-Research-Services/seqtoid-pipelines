@@ -174,6 +174,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
         alignment_backend: NRAlignmentBackend::Diamond,
         run_id: "NULL".to_string(),
         efs_base_dir: PathBuf::from("/dev/null"),
+        sample_base: PathBuf::from("stress"),
     };
 
     // Compute proper buffer size exactly like main.rs

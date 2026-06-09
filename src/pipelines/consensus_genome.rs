@@ -448,7 +448,7 @@ async fn process_ercc(
     input_stream: ReceiverStream<ParseOutput>, // FASTQ byte stream
     ercc_index_path: PathBuf,
     out_dir: &PathBuf,
-    no_ext_sample_base: &str,
+    sample_base_str: &str,
 ) -> Result<
     (
         ReceiverStream<ParseOutput>,
@@ -462,7 +462,7 @@ async fn process_ercc(
     let mut cleanup_receivers = Vec::new();
 
     let ercc_stats_file_path = file_path_manipulator(
-        &PathBuf::from(no_ext_sample_base),
+        &PathBuf::from(sample_base_str),
         Some(out_dir),
         None,
         Some("ercc_stats.txt"),
@@ -753,7 +753,7 @@ async fn filter_with_kraken(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf,
+    sample_base: &PathBuf,
     target_taxid: &str,
 ) -> Result<
     (
@@ -788,7 +788,7 @@ async fn filter_with_kraken(
 
 
     let final_compressed_path = file_path_manipulator(
-        no_ext_sample_base_buf,
+        sample_base,
         Some(out_dir),
         None,
         Some("classified_filtered.fq.gz"),
@@ -827,7 +827,7 @@ async fn filter_with_kraken(
     // Run Kraken2 in single-end mode
     let kraken2_config = Kraken2Config {
         report_path: file_path_manipulator(
-            no_ext_sample_base_buf,
+            sample_base,
             Some(out_dir),
             None,
             Some("kraken2_report.txt"),
@@ -1013,7 +1013,7 @@ async fn align_to_target(
     input_stream: ReceiverStream<ParseOutput>,  // FASTQ SequenceRecord stream
     target_index_path: PathBuf,  // Minimap2 .mmi index
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf,
+    sample_base: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>, PathBuf), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
@@ -1133,7 +1133,7 @@ async fn align_to_target(
     let samtools_sort_out_stream = ReceiverStream::new(samtools_sort_out_stream);
 
     let align_bam_path = file_path_manipulator(
-        no_ext_sample_base_buf,
+        sample_base,
         Some(out_dir),
         None,
         Some("target_aligned.bam"),
@@ -1266,7 +1266,7 @@ async fn generate_consensus(
     config: Arc<RunConfig>,
     bam_stream: ReceiverStream<ParseOutput>, // Uncompressed BAM byte stream
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf,
+    sample_base: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
@@ -1369,7 +1369,7 @@ async fn generate_consensus(
     let consensus_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let consensus_file_path = file_path_manipulator(
-        no_ext_sample_base_buf,
+        sample_base,
         Some(out_dir),
         None,
         Some("consensus.fa"),
@@ -1397,7 +1397,7 @@ async fn call_variants(
     bam_stream: ReceiverStream<ParseOutput>,  //Uncompressed BAM byte stream
     target_ref_path: PathBuf,
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf,
+    sample_base: &PathBuf,
 ) -> Result<(ReceiverStream<ParseOutput>, PathBuf, Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
@@ -1514,7 +1514,7 @@ async fn call_variants(
     let vcf_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
     let vcf_file_path = file_path_manipulator(
-        no_ext_sample_base_buf,
+        sample_base,
         Some(out_dir),
         None,
         Some("variants.bcf"),
@@ -1536,7 +1536,7 @@ async fn realign_consensus_to_ref(
     consensus_realign_stream: Receiver<ParseOutput>,  // FASTA
     target_ref_fasta_path: PathBuf,
     out_dir: &PathBuf,
-    no_ext_sample_base_buf: &PathBuf,
+    sample_base: &PathBuf,
 ) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let reference_file = TokioFile::open(&target_ref_fasta_path).await
         .map_err(|e| PipelineError::Other(e.into()))?;
@@ -1548,7 +1548,7 @@ async fn realign_consensus_to_ref(
         .map_err(|e| PipelineError::Other(e.into()))?;
 
     let realign_consensus_path = file_path_manipulator(
-        no_ext_sample_base_buf,
+        sample_base,
         Some(out_dir),
         None,
         Some("consensus_realigned.fa"),
@@ -1607,7 +1607,7 @@ async fn realign_consensus_to_ref(
 
 async fn calculate_statistics(
     config: Arc<RunConfig>,
-    no_ext_sample_base: &str,
+    sample_base_str: &str,
     consensus_bam_stats_stream: Option<ReceiverStream<ParseOutput>>,  //Uncompressed BAM byte stream
     consensus_bam_depth_stream: Option<ReceiverStream<ParseOutput>>,  //Uncompressed BAM byte stream
     no_host_seqkit_out_stream_stats: Receiver<ParseOutput>,
@@ -1703,14 +1703,14 @@ async fn calculate_statistics(
     let samtools_depth_stats = compute_depth_stats(&depths)?;
 
     let depth_plot_path = file_path_manipulator(
-        &PathBuf::from(no_ext_sample_base),
+        &PathBuf::from(sample_base_str),
         Some(out_dir),
         None,
         Some("depth.png"),
         "_"
     );
 
-    plot_depths(&first_chr_depth_map, no_ext_sample_base, &depth_plot_path)?;
+    plot_depths(&first_chr_depth_map, sample_base_str, &depth_plot_path)?;
 
     let seqkit_stats = parse_seqkit_stats(no_host_seqkit_out_stream_stats).await?;
 
@@ -1777,7 +1777,7 @@ async fn calculate_statistics(
     let (coverage_bin_size, coverage) = if !depths.is_empty() { compute_coverage_bins(&depths, 500) } else { (0.0, Vec::new()) };
 
     let stats = Stats {
-        sample_name: no_ext_sample_base.to_string(),
+        sample_name: sample_base_str.to_string(),
         depth_avg: samtools_depth_stats.get("depth_avg").copied().unwrap_or(0.0),
         depth_q25: samtools_depth_stats.get("depth_q.25").copied().unwrap_or(0.0),
         depth_q50: samtools_depth_stats.get("depth_q.5").copied().unwrap_or(0.0),
@@ -1809,7 +1809,7 @@ async fn calculate_statistics(
         coverage,
     };
 
-    let stats_file_path = out_dir.join(format!("{}_stats.json", no_ext_sample_base));
+    let stats_file_path = out_dir.join(format!("{}_stats.json", sample_base_str));
     let mut stats_file = File::create(&stats_file_path)?;
     serde_json::to_writer_pretty(&mut stats_file, &stats)?;
 
@@ -1906,7 +1906,10 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) = validate_file_inputs(&config, &cwd).await?;
+    let sample_base = config.sample_base.clone();
+    let sample_base_str = sample_base.to_string_lossy().into_owned();
+
+    let (file1_path, file2_path) = validate_file_inputs(&config, &cwd).await?;
 
     let technology = config.args.technology.clone();
     
@@ -1959,7 +1962,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         config.clone(),
         file1_path,
         file2_path,
-        no_ext_sample_base_buf.clone(),
+        sample_base.clone(),
         &out_dir,
     )
         .await?;
@@ -1969,7 +1972,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
     // Host Removal
     let no_host_file_path = file_path_manipulator(
-        &no_ext_sample_base_buf,
+        &sample_base,
         Some(&out_dir),
         None,
         Some("no_host.fq.gz"),
@@ -2045,7 +2048,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 no_host_output_stream,
                 ercc_index_path,
                 &out_dir,
-                &no_ext_sample_base,
+                &sample_base_str,
             )
                 .await?;
             ercc_stats_task = ercc_stats_out_task;
@@ -2057,7 +2060,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 config.clone(),
                 no_host_ercc_stream,
                 &out_dir,
-                &no_ext_sample_base_buf,
+                &sample_base,
                 config.args.target_taxid.as_ref().expect("target_taxid must be set"),
             )
                 .await?;
@@ -2070,7 +2073,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 filter_reads_out_stream,
                 target_ref_index_path,
                 &out_dir,
-                &no_ext_sample_base_buf,
+                &sample_base,
             )
                 .await?;
             cleanup_tasks.extend(align_cleanup_tasks);
@@ -2099,7 +2102,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             // Make Consensus
             let (consensus_realign_stream, consensus_stats_stream_rx, consensus_file_path_x, consensus_cleanup_tasks, consensus_cleanup_receivers, consensus_quast_tasks) =
-                generate_consensus(config.clone(), align_sam_output_stream, &out_dir, &no_ext_sample_base_buf).await?;
+                generate_consensus(config.clone(), align_sam_output_stream, &out_dir, &sample_base).await?;
             consensus_file_path = Some(consensus_file_path_x);
             cleanup_tasks.extend(consensus_cleanup_tasks);
             cleanup_receivers.extend(consensus_cleanup_receivers);
@@ -2108,7 +2111,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
 
             // Call Variants
             let (call_bcftools_stats_stream_out, _, call_cleanup_tasks, call_cleanup_receivers) =
-                call_variants(config.clone(), align_sam_call_stream, target_fasta.clone(), &out_dir, &no_ext_sample_base_buf).await?;
+                call_variants(config.clone(), align_sam_call_stream, target_fasta.clone(), &out_dir, &sample_base).await?;
             cleanup_tasks.extend(call_cleanup_tasks);
             cleanup_receivers.extend(call_cleanup_receivers);
             call_bcftools_stats_stream = Some(call_bcftools_stats_stream_out);
@@ -2119,7 +2122,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 consensus_realign_stream.into_inner(),
                 target_fasta.clone(),
                 &out_dir,
-                &no_ext_sample_base_buf,
+                &sample_base,
             )
                 .await?;
             cleanup_tasks.extend(realign_cleanup_tasks);
@@ -2140,7 +2143,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     // Calculate Statistics
     calculate_statistics(
         config.clone(),
-        &no_ext_sample_base,
+        &sample_base_str,
         align_sam_stats_stream,
         align_sam_depth_stream,
         no_host_seqkit_out_stream_stats,

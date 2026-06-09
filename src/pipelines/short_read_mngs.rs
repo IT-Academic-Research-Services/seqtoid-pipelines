@@ -284,7 +284,7 @@ struct WeightedSampleItem {
 /// * `config` - RunConfig struct from main.
 /// * `file1_path` - Path to R1 or single ended FASTQ.
 /// * `file2_path` - Optional path to R2.
-///  * `sample_base_buf` - PathBuf of sample basename.
+///  * `sample_base` - PathBuf of sample basename.
 /// * `out_dir` - Base dir for output files.
 ///
 /// # Returns
@@ -293,7 +293,7 @@ async fn validate_input(
     config: Arc<RunConfig>,
     file1_path: PathBuf,
     file2_path: Option<PathBuf>,
-    sample_base_buf: PathBuf,
+    sample_base: PathBuf,
     out_dir: &PathBuf,
 ) -> anyhow::Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<u64, anyhow::Error>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
@@ -301,7 +301,7 @@ async fn validate_input(
 
 
     let validated_interleaved_file_path = file_path_manipulator(
-        &PathBuf::from(&sample_base_buf),
+        &PathBuf::from(&sample_base),
         Some(out_dir),
         None,
         Some("validated.fq.gz"),
@@ -1243,7 +1243,7 @@ async fn kallisto_quant(
     input_stream: ReceiverStream<ParseOutput>,
     out_dir: PathBuf,
     paired: bool,
-    sample_base_buf: PathBuf,
+    sample_base: PathBuf,
 ) -> Result<(
     oneshot::Sender<KallistoResults>,
     oneshot::Receiver<KallistoResults>,
@@ -1254,11 +1254,11 @@ async fn kallisto_quant(
     let mut cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
 
-    // Convert sample_base_buf to &str
-    let sample_base = sample_base_buf
+    // Convert sample_base to &str
+    let sample_base = sample_base
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| PipelineError::IOError(format!("Invalid sample base path: {}", sample_base_buf.display())))?
+        .ok_or_else(|| PipelineError::IOError(format!("Invalid sample base path: {}", sample_base.display())))?
         .to_string();
 
     // Create Kallisto output dir (idempotent, fast on NVMe)
@@ -2832,7 +2832,7 @@ pub async fn sort_m8_by_read_id(
 pub async fn call_hits_m8(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>, // MUST be sorted by read ID
-    sample_base_buf: PathBuf,
+    sample_base: PathBuf,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     acc2taxid_map: Arc<Map<Vec<u8>>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
@@ -3119,7 +3119,7 @@ pub async fn call_hits_m8(
 
     let call_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
+            &sample_base,
             None,
             Some(&format!("{}.dedup.m8", tag)),
             "_",
@@ -3159,7 +3159,7 @@ pub async fn call_hits_m8(
 
     let summary_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
+            &sample_base,
             None,
             Some(&format!("{}.summary.txt", tag)),
             "_",
@@ -7763,11 +7763,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let host_hisat2_index: String = config.args.host_hisat2_index.clone()
         .ok_or_else(|| PipelineError::MissingArgument("host_hisat2_index is required".to_string()))?;
+    
+    let sample_base = config.sample_base.clone();
+    let sample_base_str = sample_base.to_string_lossy().into_owned();
 
-    let (file1_path, file2_path, sample_base_buf, sample_base) = validate_file_inputs(&config, &cwd).await?;
+    let (file1_path, file2_path) = validate_file_inputs(&config, &cwd).await?;
     let paired = file2_path.is_some();
+    
 
-    debug!("file1 path: {:?}  sample base buf: {:?}  sample base: {:?}", file1_path.display(), sample_base_buf.display(), sample_base);
+
 
     let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
 
@@ -7776,7 +7780,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         file1_path.clone(),
         file2_path.clone(),
-        sample_base_buf.clone(),
+        sample_base.clone(),
         &out_dir,
     ).await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
@@ -7836,7 +7840,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         kallisto_stream,
         out_dir.clone(),
         paired,
-        sample_base_buf.clone(),
+        sample_base.clone(),
     ).await?;
     cleanup_tasks.extend(kallisto_cleanup_tasks);
     cleanup_receivers.extend(kallisto_cleanup_receivers);
@@ -8165,7 +8169,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
 
 
-    let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
+    let m8_file_path = out_dir.join(rename_file_path(&sample_base, None, Some("m8"), "."));
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) = paf_to_m8(
         config.clone(),
@@ -8211,7 +8215,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (nt_call_stream, nt_call_summary_stream, mut nt_call_cleanup_tasks, mut nt_call_cleanup_receivers) = call_hits_m8(
         config.clone(),
         m8_sorted,                    // ←←← NOW SORTED
-        sample_base_buf.clone(),
+        sample_base.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
         should_keep_filter.clone(),
@@ -8439,7 +8443,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         call_hits_m8(
             config.clone(),
             nr_m8_sorted,
-            sample_base_buf.clone(),
+            sample_base.clone(),
             lineage_map.clone(),
             acc2taxid_map.clone(),
             should_keep_filter.clone(),
@@ -8827,7 +8831,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     let combined_path = out_dir.join(rename_file_path(
-        &sample_base_buf,
+        &sample_base,
         None,
         Some("taxon_counts_with_dcr.json"),
         "_",
@@ -9170,7 +9174,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(anyhow!("NR preload task panicked: {}", e)))??;
 
 
-    let refined_combined_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
+    let refined_combined_path = out_dir.join(rename_file_path(&sample_base, None, Some("refined_taxon_counts_with_dcr.json"), "_"));
     let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
         &nr_refined_counts,
@@ -9571,7 +9575,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             }
 
             let plot_path = out_dir_host.join("host_insert_size_histogram.png");
-            if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base.as_str(), &plot_path) {
+            if let Err(e) = plot_insert_sizes(&stats.insert_sizes, sample_base_str.as_str(), &plot_path) {
                 warn!("Failed to plot insert size histogram: {}", e);
             }
 
