@@ -297,7 +297,7 @@ async fn validate_input(
     out_dir: &PathBuf,
 ) -> anyhow::Result<(ReceiverStream<ParseOutput>, Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>, JoinHandle<anyhow::Result<u64, anyhow::Error>>, JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
 
     let validated_interleaved_file_path = file_path_manipulator(
@@ -327,7 +327,7 @@ async fn validate_input(
     let val_rx_stream = ReceiverStream::new(rx);
 
     // Split the byte stream for fastp and write
-    let (val_streams, val_router_handle) = fanout_to_channels(
+    let (val_streams, val_router_done_rx) = fanout_to_channels(
         val_rx_stream,
         2,
         "validate_input",
@@ -337,7 +337,7 @@ async fn validate_input(
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_tasks.push(val_router_handle);
+    cleanup_receivers.push(val_router_done_rx);
 
     let mut val_streams_iter = val_streams.into_iter();
 
@@ -400,7 +400,7 @@ async fn bowtie2_align_and_sort_stream(
 ), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
     let temp_dir = choose_temp_dir(
         config.input_size,
@@ -481,7 +481,7 @@ async fn bowtie2_align_and_sort_stream(
     // split stream
     // ─────────────────────────────
 
-    let (streams, router_handle) = fanout_to_channels(
+    let (streams, router_done_rx) = fanout_to_channels(
         ReceiverStream::new(sorted_bam_stream),
         3,
         "bt2_split",
@@ -492,7 +492,7 @@ async fn bowtie2_align_and_sort_stream(
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
     // track the task instead of a oneshot receiver
-    cleanup_tasks.push(router_handle);
+    cleanup_receivers.push(router_done_rx);
 
     let mut it = streams.into_iter();
 
@@ -798,7 +798,7 @@ async fn hisat2_filter(
 ), PipelineError> {
 
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
     // PAIRED-END PATH
     if paired {
@@ -999,7 +999,7 @@ async fn hisat2_filter(
     // 3. Always fanout for count + fastq (reuse existing fanout + splits pattern).
     //    Write tee only if output_bam_path requested. Keeps streaming when None.
     let num_tees = if output_bam_path.is_some() { 3 } else { 2 };
-    let (streams, router) = fanout_to_channels(
+    let (streams, hisat2_bam_split_done_rx) = fanout_to_channels(
         ReceiverStream::new(sorted_bam_stream),
         num_tees,
         "hisat2_bam_split",
@@ -1022,7 +1022,7 @@ async fn hisat2_filter(
         ).await?;
         cleanup_tasks.push(write_task);
     }
-    cleanup_tasks.push(router);
+    cleanup_receivers.push(hisat2_bam_split_done_rx);
 
     let fastq_input_stream = ReceiverStream::new(fastq_stream);
 
@@ -1124,7 +1124,7 @@ async fn fastp_qc(
     input_stream: ReceiverStream<ParseOutput>,
 ) -> Result<(ReceiverStream<ParseOutput>,  Vec<JoinHandle<Result<(), anyhow::Error>>>, Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, oneshot::Receiver<Result<u64, anyhow::Error>>), PipelineError>{
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
     let qc_fastp_config_view = FastpConfig {
 
@@ -1184,7 +1184,7 @@ async fn fastp_qc(
     // Tee the byte stream for counting
     let tee_count_input = ReceiverStream::new(qc_fastp_out_stream);
 
-    let (tee_count_streams, tee_count_router_handle) = fanout_to_channels(
+    let (tee_count_streams, tee_count_router_done_rx) = fanout_to_channels(
         tee_count_input,
         2,
         "fastp_count",
@@ -1198,7 +1198,7 @@ async fn fastp_qc(
         })?;
 
     // track the task instead of oneshot receiver
-    cleanup_tasks.push(tee_count_router_handle);
+    cleanup_receivers.push(tee_count_router_done_rx);
 
     let mut tee_count_streams_iter = tee_count_streams.into_iter();
 
@@ -1515,7 +1515,7 @@ async fn minimap2_filter(
     PipelineError,
 > {
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let mut temp_dirs: Vec<TempDir> = Vec::new();
     let mut named_temp_files: Vec<NamedTempFile> = Vec::new();
 
@@ -1660,7 +1660,7 @@ async fn minimap2_filter(
 
     let bam_rx_stream = ReceiverStream::new(samtools_sort_out_stream);
 
-    let (bam_streams, bam_router_handle) = fanout_to_channels(
+    let (bam_streams, bam_router_done_rx) = fanout_to_channels(
         bam_rx_stream,
         num_tees,
         "minimap2_bam_split",
@@ -1671,7 +1671,7 @@ async fn minimap2_filter(
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
     // track task instead of oneshot receiver
-    cleanup_tasks.push(bam_router_handle);
+    cleanup_receivers.push(bam_router_done_rx);
 
     let mut bam_streams_iter = bam_streams.into_iter();
 
@@ -2542,6 +2542,10 @@ pub async fn paf_to_m8(
     Vec<JoinHandle<Result<(), anyhow::Error>>>,
     Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
 )> {
+
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+
     let genome_size = config.args.nt_db_size as f64;
 
     let paf_record_count = Arc::new(AtomicUsize::new(0));
@@ -2580,7 +2584,7 @@ pub async fn paf_to_m8(
     // Split the converted stream immediately; no extra intermediate mpsc queue.
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (streams, router_handle) = fanout_to_channels(
+    let (streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
         batched_stream,
         2,
         "paf_to_m8_stream",
@@ -2589,6 +2593,7 @@ pub async fn paf_to_m8(
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(paf_to_m8_stream_done_rx);
 
 
     let mut streams = streams;
@@ -2610,6 +2615,7 @@ pub async fn paf_to_m8(
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(write_task);
 
     let paf_total = paf_record_count.load(std::sync::atomic::Ordering::Relaxed);
     let m8_total = m8_line_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -2621,8 +2627,8 @@ pub async fn paf_to_m8(
 
     Ok((
         main_stream,
-        vec![write_task, router_handle],
-        vec![],
+        cleanup_tasks,
+        cleanup_receivers,
     ))
 }
 
@@ -2841,7 +2847,7 @@ pub async fn call_hits_m8(
 ), PipelineError> {
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-    let cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
 
     info!(
         "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
@@ -3088,7 +3094,7 @@ pub async fn call_hits_m8(
     cleanup_tasks.push(coordinator_handle);
 
     let dedup_stream = ReceiverStream::new(dedup_rx);
-    let (dedup_branches, dedup_router_handle) = fanout_to_channels(
+    let (dedup_branches, dedup_router_done_rx) = fanout_to_channels(
         dedup_stream,
         2,
         "call_hits_m8_dedup",
@@ -3099,7 +3105,7 @@ pub async fn call_hits_m8(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     // track router task (replaces cleanup_receivers)
-    cleanup_tasks.push(dedup_router_handle);
+    cleanup_receivers.push(dedup_router_done_rx);
 
     let mut dedup_branches = dedup_branches.into_iter();
 
@@ -3128,7 +3134,7 @@ pub async fn call_hits_m8(
     cleanup_tasks.push(call_file_write_task);
 
     let summary_stream = ReceiverStream::new(summary_rx);
-    let (summary_branches, summary_router_handle) = fanout_to_channels(
+    let (summary_branches, summary_router_done_rx) = fanout_to_channels(
         summary_stream,
         2,
         "call_hits_m8_summary",
@@ -3139,7 +3145,7 @@ pub async fn call_hits_m8(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     // track router task instead of oneshot receiver
-    cleanup_tasks.push(summary_router_handle);
+    cleanup_receivers.push(summary_router_done_rx);
 
     let mut summary_branches = summary_branches.into_iter();
 
@@ -4392,7 +4398,7 @@ pub async fn process_assembly(
     TempDir,
 ), PipelineError> {
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
 
@@ -4718,7 +4724,7 @@ pub async fn process_assembly(
 
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (non_host_streams, non_host_router_handle) = fanout_to_channels(
+    let (non_host_streams, non_host_done_rx) = fanout_to_channels(
         ReceiverStream::new(samtools_sort_out_stream),
         3,
         "process_assembly_sam",
@@ -4729,7 +4735,7 @@ pub async fn process_assembly(
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
     // track task
-    cleanup_tasks.push(non_host_router_handle);
+    cleanup_receivers.push(non_host_done_rx);
 
     let mut non_host_streams_iter = non_host_streams.into_iter();
 
@@ -7792,7 +7798,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("ercc_bt2_aligned_sorted.bam"),
     ).await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
-    cleanup_receivers.extend(ercc_bt2_cleanup_receivers);
     final_temp_dirs.extend(ercc_bt2_temp_dirs);
 
     // QC with fastp
@@ -7802,10 +7807,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ercc_bt2_out_stream,
     ).await?;
     cleanup_tasks.extend(qc_cleanup_tasks);
-    cleanup_receivers.extend(qc_cleanup_receivers);
 
     // Split for Kallisto and Bowtie2
-    let (kallisto_streams, kallisto_router_handle) = fanout_to_channels(
+    let (kallisto_streams, kallisto_done) = fanout_to_channels(
         qc_fastp_out_stream,
         2,
         "kallisto_split",
@@ -7815,8 +7819,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    // track router task
-    cleanup_tasks.push(kallisto_router_handle);
 
     let mut kallisto_streams_iter = kallisto_streams.into_iter();
 
@@ -7851,8 +7853,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("host_bt2_aligned_sorted.bam"),
     ).await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
-    cleanup_receivers.extend(host_bt2_cleanup_receivers);
     host_filter_temp_dirs.extend(host_bt2_temp_dirs);
+
+    // HISAT2 forced checkpoint cleanup block
+    // ERCC bt2 fanout is also done by this point in the pipeline
+    for rx in ercc_bt2_cleanup_receivers {
+        rx.await??;
+    }
+
+    for rx in qc_cleanup_receivers {
+        rx.await??;
+    }
+
+    // because the stream is forced to checkpoint by hisat2, we can await the kallisto receiver from the fanout here
+    kallisto_done.await?;
+
+    // Host bt2 fanout is done (its fastq branch fed into hisat2)
+    for rx in host_bt2_cleanup_receivers {
+        rx.await??;
+    }
 
 
     //host filtering hisat2
@@ -7870,13 +7889,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await?;
     cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
-    cleanup_receivers.append(&mut host_hisat2_cleanup_receivers);
     host_filter_temp_dirs.extend(hisat_temp_dirs);
 
 
     // If host is no huma, run an additional filter stage using a human reference
     let mut optional_human_bam_write_handle: Option<JoinHandle<Result<()>>> = None;
     let mut optional_human_bam_path: Option<PathBuf> = None;
+
+    let mut hisat2_cleanup_receivers = host_hisat2_cleanup_receivers;
+
 
     let post_filter_stream = if config.args.human_host {
         host_hisat2_out_stream
@@ -7907,8 +7928,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await?;
 
         cleanup_tasks.extend(human_bt2_cleanup_tasks);
-        cleanup_receivers.extend(human_bt2_cleanup_receivers);
         host_filter_temp_dirs.extend(human_bt2_temp_dirs);
+
+        for rx in human_bt2_cleanup_receivers {
+            rx.await??;
+        }
 
         // Save the BAM write handle and path for later awaiting / insert stats
         optional_human_bam_write_handle = Some(human_bt2_bam_write_handle);
@@ -7936,7 +7960,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await?;
 
         cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
-        cleanup_receivers.append(&mut human_hisat2_cleanup_receivers);
+        hisat2_cleanup_receivers.extend(human_hisat2_cleanup_receivers);
         host_filter_temp_dirs.extend(human_hisat_temp_dirs);
 
         human_hisat2_out_stream
@@ -8074,6 +8098,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     },
 )?;
 
+    for rx in hisat2_cleanup_receivers {
+        rx.await??;
+    }
+
     info!("Checkpoint complete. Files: r1:{:?}   r2:{:?}", non_host_r1_path, non_host_r2_path_opt);
 
 
@@ -8146,7 +8174,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await?;
     cleanup_tasks.append(&mut m8_cleanup_tasks);
-    cleanup_receivers.append(&mut m8_cleanup_receivers);
+
 
     // ────────────────────────────────────────────────────────────────
     // Sort m8 by read ID before call_hits_m8
@@ -8163,6 +8191,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     m8_sorted_start.elapsed()
 );
 
+    for rx in m8_cleanup_receivers {
+        rx.await??;
+    }
+
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
     let nt_concurrency = compute_phase_concurrency(
@@ -8176,7 +8208,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("call hits nt concurrency {}", nt_concurrency);
 
     let nt_call_hits_start = Instant::now();
-    let (nt_call_stream, nt_call_summary_stream, mut call_cleanup_tasks, mut call_cleanup_receivers) = call_hits_m8(
+    let (nt_call_stream, nt_call_summary_stream, mut nt_call_cleanup_tasks, mut nt_call_cleanup_receivers) = call_hits_m8(
         config.clone(),
         m8_sorted,                    // ←←← NOW SORTED
         sample_base_buf.clone(),
@@ -8192,8 +8224,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     nt_call_hits_start.elapsed()
 );
 
-    cleanup_tasks.append(&mut call_cleanup_tasks);
-    cleanup_receivers.append(&mut call_cleanup_receivers);
+    cleanup_tasks.append(&mut nt_call_cleanup_tasks);
 
     info!("[run] wrapping NT outputs with monitor_stream");
 
@@ -8212,7 +8243,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_split_start = Instant::now();
     info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
 
-    let (nt_call_rxs, nt_call_router) = fanout_to_channels(
+    let (nt_call_rxs, nt_call_done) = fanout_to_channels(
         nt_call_stream,                    // already the monitored stream from call_hits_m8
         2, // generous buffer for m8 lines
         "nt_call",
@@ -8220,7 +8251,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes
     ).await?;
 
-    cleanup_tasks.push(nt_call_router);    // router returns the correct JoinHandle type
 
     info!(
         "[run] fanout_to_channels(nt_call) ready after {:?} with 2 private channels",
@@ -8247,15 +8277,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nt_summary_split_start = Instant::now();
     info!("[run] starting fanout_to_channels for NT summary (6 private channels)");
 
-    let (nt_summary_rxs, nt_summary_router) = fanout_to_channels(
+    let (nt_summary_rxs, nt_summary_done_rx) = fanout_to_channels(
         nt_call_summary_stream,
         6,
         "nt_call_summary",
         &config,
         StreamDataType::JustBytes
     ).await?;
-
-    cleanup_tasks.push(nt_summary_router);     // now the correct type
 
     info!(
         "[run] fanout_to_channels(nt_call_summary) ready after {:?} with 6 private channels",
@@ -8420,12 +8448,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             "nr".to_string(),
         ).await?;
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
-    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
     let nr_split_start = Instant::now();
     info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
 
-    let (nr_call_rxs, nr_call_router) = fanout_to_channels(
+    let (nr_call_rxs, nr_call_done) = fanout_to_channels(
         nr_call_stream,                    // already the monitored stream from call_hits_m8
         2,
         "nr_call",
@@ -8433,7 +8460,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes
     ).await?;
 
-    cleanup_tasks.push(nr_call_router);    // router returns the correct JoinHandle type
 
     info!(
     "[run] fanout_to_channels(nr_call) ready after {:?} with 2 private channels",
@@ -8446,7 +8472,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let nr_summary_split_start = Instant::now();
     info!("[run] starting fanout_to_channels for NR summary (6 private channels)");
-    let (nr_summary_rxs, nr_summary_router) = fanout_to_channels(
+    let (nr_summary_rxs, nr_summary_done_rx) = fanout_to_channels(
         nr_call_summary_stream,
         6,
         "nr_call_summary",
@@ -8454,7 +8480,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes
     ).await?;
 
-    cleanup_tasks.push(nr_summary_router);     // now the correct type
 
     info!(
      "[run] fanout_to_channels(nr_call_summary) ready after {:?} with 6 private channels",
@@ -8564,7 +8589,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("[run] starting fanout_to_channels for annotated FASTA (2 private channels)");
 
-    let (annotated_rxs, annotated_router) = fanout_to_channels(
+    let (annotated_rxs, annotated_done_rx) = fanout_to_channels(
         ReceiverStream::new(annotated_rx),
         2,
         "initial_annotated",
@@ -8572,13 +8597,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes
     ).await?;
 
-    cleanup_tasks.push(annotated_router);
 
     let mut annotated_rxs_iter = annotated_rxs.into_iter();
     let initial_annotated_file_stream = annotated_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
     let initial_annotated_taxon_stream = annotated_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let (unidentified_rxs, unidentified_router) = fanout_to_channels(
+    let (unidentified_rxs, unidentified_done_rx) = fanout_to_channels(
         ReceiverStream::new(unidentified_rx),
         2,
         "initial_unidentified",
@@ -8586,7 +8610,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes
     ).await?;
 
-    cleanup_tasks.push(unidentified_router);
 
     let mut unidentified_rxs_iter = unidentified_rxs.into_iter();
     let initial_unidentified_file_stream = unidentified_rxs_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -8653,7 +8676,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ).await?;
 
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
-    cleanup_receivers.extend(post_assembly_cleanup_receivers);
+    // cleanup_receivers.extend(post_assembly_cleanup_receivers);
     temp_files.extend(post_assembly_temp_files);
     final_temp_dirs.push(post_assembly_temp_dir);
 
@@ -8671,6 +8694,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
     eprintln!("coverage result {:?}", generate_assembly_coverage_result);
 
+
+    for rx in post_assembly_cleanup_receivers {
+        rx.await??;
+    }
 
     let nt_file = config
         .args
@@ -8798,6 +8825,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_counts = nr_counts?;
 
 
+
     let combined_path = out_dir.join(rename_file_path(
         &sample_base_buf,
         None,
@@ -8923,31 +8951,31 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ) = nt_res;
 
             let mut cleanup_tasks = nt_cleanup_tasks;
-            let cleanup_receivers = nt_cleanup_receivers;
+            let mut cleanup_receivers = nt_cleanup_receivers;
             let temp_files = nt_temp_files;
 
-            let (nt_m8_rxs, nt_m8_router) = fanout_to_channels(
+            let (nt_m8_rxs, nt_m8_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_m8_stream_out),
                 3,
                 "nt_m8",
                 &config,
                 StreamDataType::JustBytes
             ).await?;
-            cleanup_tasks.push(nt_m8_router);
+            cleanup_receivers.push(nt_m8_done_rx);
 
             let mut nt_m8_iter = nt_m8_rxs.into_iter();
             let nt_m8_merge = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nt_m8_map = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nt_m8_viz = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-            let (nt_hitsummary_rxs, nt_hitsummary_router) = fanout_to_channels(
+            let (nt_hitsummary_rxs, nt_hitsummary_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_hit_summary_stream_out),
                 3,
                 "nt_hitsummary",
                 &config,
                 StreamDataType::JustBytes
             ).await?;
-            cleanup_tasks.push(nt_hitsummary_router);
+            cleanup_receivers.push(nt_hitsummary_done_rx);
 
             let mut nt_hitsummary_iter = nt_hitsummary_rxs.into_iter();
             let nt_hit_summary_merge = nt_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -8972,6 +9000,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
+    // Both branches of nt_call fanout and nr_call fanout are done
+    nt_call_done.await??;
+    nr_call_done.await??;
+
     let nr_post_handle = tokio::spawn({
         let config = config.clone();
         async move {
@@ -8992,30 +9024,30 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ) = nr_res;
 
             let mut cleanup_tasks = nr_cleanup_tasks;
-            let cleanup_receivers = nr_cleanup_receivers;
+            let mut cleanup_receivers = nr_cleanup_receivers;
             let temp_files = nr_temp_files;
 
-            let (nr_m8_rxs, nr_m8_router) = fanout_to_channels(
+            let (nr_m8_rxs, nr_m8_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_m8_stream_out),
                 2,
                 "nr_m8",
                 &config,
                 StreamDataType::JustBytes
             ).await?;
-            cleanup_tasks.push(nr_m8_router);
+            cleanup_receivers.push(nr_m8_done_rx);
 
             let mut nr_m8_iter = nr_m8_rxs.into_iter();
             let nr_m8_merge = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
             let nr_m8_map = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-            let (nr_hitsummary_rxs, nr_hitsummary_router) = fanout_to_channels(
+            let (nr_hitsummary_rxs, nr_hitsummary_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_hit_summary_stream_out),
                 3,
                 "nr_hitsummary",
                 &config,
                 StreamDataType::JustBytes
             ).await?;
-            cleanup_tasks.push(nr_hitsummary_router);
+            cleanup_receivers.push(nr_hitsummary_done_rx);
 
             let mut nr_hitsummary_iter = nr_hitsummary_rxs.into_iter();
             let nr_hit_summary_merge = nr_hitsummary_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -9045,6 +9077,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_post_res = nr_post_res
         .map_err(|e| PipelineError::Other(anyhow!("NR blast_contigs postprocess task panicked: {e}")))??;
 
+
     let (
         _nt_read_dict,
         nt_refined_counts,
@@ -9061,7 +9094,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nt_temp_files,
     ) = nt_post_res;
     cleanup_tasks.extend(nt_cleanup_tasks);
-    cleanup_receivers.extend(nt_cleanup_receivers);
     temp_files.extend(nt_temp_files);
 
     let (
@@ -9078,8 +9110,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_temp_files,
     ) = nr_post_res;
     cleanup_tasks.extend(nr_cleanup_tasks);
-    cleanup_receivers.extend(nr_cleanup_receivers);
     temp_files.extend(nr_temp_files);
+
+    // or is nt_blast_stream done here?
+
+    for rx in nt_cleanup_receivers { rx.await??; }
+    for rx in nr_cleanup_receivers { rx.await??; }
+
+    // 2. Now safe to await the big summary fanout
+    //    (because blast_hit branch has finished)
+    nt_summary_done_rx.await??;
+    nr_summary_done_rx.await??;
+
+    // 3. Now safe to await call_hits_m8 internal fanouts
+    //    (their outputs were consumed by nt_call + nt_call_summary fanouts)
+    for rx in nt_call_cleanup_receivers { rx.await??; }
+    for rx in nr_call_cleanup_receivers { rx.await??; }
+
 
     // ────────────────────────────────────────────────────────────────
     // PRELOAD NR alignments (parallel version)
@@ -9219,14 +9266,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(taxid_main_task);
 
 
-    let (taxid_mapped_rxs, taxid_mapped_router) = fanout_to_channels(
+    let (taxid_mapped_rxs, taxid_mapped_done_rx) = fanout_to_channels(
         ReceiverStream::new(taxid_mapped_rx),
         2,
         "taxid_mapped",
         &config,
         StreamDataType::JustBytes
     ).await?;
-    cleanup_tasks.push(taxid_mapped_router);
+    cleanup_receivers.push(taxid_mapped_done_rx);
 
     let mut taxid_mapped_iter = taxid_mapped_rxs.into_iter();
     let taxid_mapped_file   = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -9301,28 +9348,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("[run] starting fanout_to_channels for initial taxid FASTA (mapped + combined)");
 
-    let (initial_mapped_rxs, initial_mapped_router) = fanout_to_channels(
+    let (initial_mapped_rxs, initial_mapped_done_rx) = fanout_to_channels(
         ReceiverStream::new(initial_taxid_mapped_rx),
         3,
         "initial_taxid_mapped",
         &config,
         StreamDataType::JustBytes
     ).await?;
-    cleanup_tasks.push(initial_mapped_router);
+    cleanup_receivers.push(initial_mapped_done_rx);
 
     let mut initial_mapped_iter = initial_mapped_rxs.into_iter();
     let initial_taxid_mapped_file = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
     let initial_taxid_mapped_locator = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
     let initial_taxid_mapped_count = initial_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let (initial_combined_rxs, initial_combined_router) = fanout_to_channels(
+    let (initial_combined_rxs, initial_combined_done_rx) = fanout_to_channels(
         ReceiverStream::new(initial_taxid_combined_rx),
         2,
         "initial_taxid_combined",
         &config,
         StreamDataType::JustBytes
     ).await?;
-    cleanup_tasks.push(initial_combined_router);
+    cleanup_receivers.push(initial_combined_done_rx);
 
     let mut initial_combined_iter = initial_combined_rxs.into_iter();
     let initial_taxid_combined_file = initial_combined_iter.next().ok_or(PipelineError::EmptyStream)?;
@@ -9374,6 +9421,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e)))?;
     info!("second generate_taxid_locator odone ");
+
+    // Now safe to await the annotated and unidentified fanout tasks
+    annotated_done_rx.await??;
+    unidentified_done_rx.await??;
+
     cleanup_tasks.append(&mut initial_locator_tasks);
     info!("Experimental taxid locator files generated: {:?}", initial_locator_outputs);
 
