@@ -70,7 +70,7 @@ use crate::utils::fastx::{raw_read_count, read_fasta,
 use crate::utils::file::{choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
-                         write_vecu8_to_file};
+                         write_vecu8_to_file, copy_file_streaming};
 use crate::utils::paf::{parse_paf_batch_to_m8};
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
@@ -8109,6 +8109,52 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("Checkpoint complete. Files: r1:{:?}   r2:{:?}", non_host_r1_path, non_host_r2_path_opt);
 
 
+    // Write the checkpoint files to EFS
+
+   // NB: but this needs to be optional, since we will sometimes run on one machine
+
+    info!("Local non-host checkpoint written. Starting background copy to EFS...");
+
+    let efs_base = config.efs_base_dir.join(&config.run_id);
+    tokio::fs::create_dir_all(&efs_base).await?;
+
+    let non_host_r1_efs = efs_base.join("nonhost_R1.fastq");
+    let non_host_r2_efs = non_host_r2_path_opt.as_ref().map(|_| {
+        efs_base.join("nonhost_R2.fastq")
+    });
+
+    // One handle that covers both R1 and R2 (if present)
+    let copy_handle = tokio::spawn({
+        let non_host_r1_path     = non_host_r1_path.clone();
+        let non_host_r2_path_opt = non_host_r2_path_opt.clone();
+        let config               = config.clone();
+        let non_host_r1_efs      = non_host_r1_efs.clone();
+        let non_host_r2_efs      = non_host_r2_efs.clone();
+
+        async move {
+            // R1
+            copy_file_streaming(
+                &non_host_r1_path,
+                &non_host_r1_efs,
+                Some(config.clone()),
+                None,
+            )
+                .await?
+                .await??;
+
+            // R2 (only if this is a paired run)
+            if let (Some(local_r2), Some(efs_r2)) = (&non_host_r2_path_opt, &non_host_r2_efs) {
+                copy_file_streaming(local_r2, efs_r2, Some(config.clone()), None)
+                    .await?
+                    .await??;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+
+
+
     // Early cleanup upstream temp dirs (host filter, etc.)
     for td in &host_filter_temp_dirs {
         if let Err(e) = std::fs::remove_dir_all(td.path()) {
@@ -8380,6 +8426,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
+
+    // EFS files must be finishedc copyign here
+    copy_handle.await??;
+    info!("EFS copy complete — non-host files are ready");
 
     // Diamond or MMseqs2 non_host alignment
     let (non_host_m8_stream, mut non_host_cleanup_tasks, mut non_host_cleanup_receivers, non_host_align_temp_dirs) =
@@ -9735,6 +9785,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             } else {
                 warn!("Temp dir removal failed (non-fatal): {}", e);
             }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Clean up EFS non-host checkpoint directory
+    // (these are intermediate files and no longer needed)
+    if tokio::fs::try_exists(&efs_base).await.unwrap_or(false) {
+        if let Err(e) = tokio::fs::remove_dir_all(&efs_base).await {
+            warn!(
+            "Failed to remove EFS non-host directory {}: {}",
+            efs_base.display(),
+            e
+        );
+        } else {
+            debug!("Removed EFS non-host directory: {}", efs_base.display());
         }
     }
 
