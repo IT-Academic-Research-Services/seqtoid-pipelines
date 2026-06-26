@@ -1,7 +1,9 @@
+//! Sequence utilities.
+
+use rand::rng;
 use rand::rngs::ThreadRng;
 use rand::seq::IndexedRandom;
-use rand::rng;
-use rand_distr::{Normal, Distribution};
+use rand_distr::{Distribution, Normal};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DNA {
@@ -31,7 +33,7 @@ impl DNA {
     #[allow(dead_code)]
     pub fn random() -> DNA {
         let mut rng = rng();
-        
+
         *DNA::all()
             .choose(&mut rng)
             .expect("Nucleotide::all is never empty")
@@ -47,12 +49,9 @@ impl DNA {
 
     /// Helper method to generate a random nucleotide with a provided RNG.
     fn random_with_rng(rng: &mut ThreadRng) -> DNA {
-        *DNA::all()
-            .choose(rng)
-            .expect("DNA::all is never empty")
+        *DNA::all().choose(rng).expect("DNA::all is never empty")
     }
 }
-
 
 pub mod valid_bases {
     /// Valid DNA nucleotide bases in ASCII: A, C, G, T, a, c, g, t
@@ -70,22 +69,21 @@ fn normal_phred_qual(mean: f32, stdev: f32) -> u8 {
     let mut raw_phred = -1.0;
 
     let normal = Normal::new(mean, stdev).unwrap();
-    
+
     while raw_phred < 0.0 || raw_phred > 40.0 {
         raw_phred = normal.sample(&mut rand::rng());
     }
-    
+
     phred33(raw_phred as u8)
 }
 
 pub fn normal_phred_qual_string(length: usize, mean: f32, stdev: f32) -> String {
-
     let mut quals = String::new();
-    
+
     for _i in 0..length {
         quals.push(normal_phred_qual(mean, stdev) as char);
     }
-    
+
     quals
 }
 
@@ -96,10 +94,7 @@ mod tests {
     #[test]
     fn test_random_nucleotide() {
         let dna = DNA::random();
-        assert!(matches!(
-            dna,
-            DNA::A | DNA::C | DNA::G | DNA::T
-        ));
+        assert!(matches!(dna, DNA::A | DNA::C | DNA::G | DNA::T));
     }
 
     #[test]

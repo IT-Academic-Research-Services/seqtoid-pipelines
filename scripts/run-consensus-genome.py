@@ -1,8 +1,9 @@
-import os
-import subprocess
-import re
 import argparse
+import os
+import re
+import subprocess
 from datetime import datetime
+
 
 def find_fastq_pairs(directory, sample_order):
     """

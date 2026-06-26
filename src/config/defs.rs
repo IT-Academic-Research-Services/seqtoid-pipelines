@@ -1,19 +1,20 @@
-// src/config/defs.rs
-use std::path::PathBuf;
-use std::collections::HashMap;
+//! src/config/defs.rs
+
 use std::cmp::min;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
-use rayon::ThreadPool;
-use tokio::sync::Semaphore;
-use rand::rngs::StdRng;
-use tokio::task::JoinError;
-use serde_json::Error as SerdeJsonError;
-use serde::{Deserialize, Serialize};
 use log::LevelFilter;
 use once_cell::sync::Lazy;
+use rand::rngs::StdRng;
+use rayon::ThreadPool;
+use serde::{Deserialize, Serialize};
+use serde_json::Error as SerdeJsonError;
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 
 use crate::cli::Arguments;
 

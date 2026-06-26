@@ -1,29 +1,32 @@
-use tokio_stream::StreamExt;
-use std::path::PathBuf;
+//! Taxonomy-related utilities and data structures.
+
 use std::collections::{HashMap, HashSet};
-use std::fs::{self as StdFS};
 use std::fs::File as StdFile;
-use std::io::{BufReader as StdBufReader};
-
-use std::sync::Arc;
+use std::fs::{self as StdFS};
+use std::io::BufReader as StdBufReader;
 use std::io::{BufWriter as StdBufWriter, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use ahash::AHashMap;
 use anyhow::{anyhow, Result};
-use log::{info, warn, debug};
+use bincode::{decode_from_std_read, encode_into_std_write};
+use bytes::Bytes;
+use csv::ReaderBuilder;
+use flate2::read::GzDecoder;
+use fst::{Map, MapBuilder};
+use log::{debug, info, warn};
+use needletail::parse_fastx_file;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use flate2::read::GzDecoder;
-use csv::ReaderBuilder;
-use fst::{MapBuilder};
-use needletail::parse_fastx_file;
-use bincode::{encode_into_std_write, decode_from_std_read};
-use ahash::AHashMap;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::{mpsc, Mutex};
-use crate::config::defs::{Taxid, Lineage, TaxonSeqLocation};
+use tokio::try_join;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+
+use crate::config::defs::{Lineage, RunConfig, Taxid, TaxonSeqLocation};
 use crate::utils::blast::M8Record;
 use crate::utils::streams::ParseOutput;
-use bytes::Bytes;
 
 const SPECIES_NON_SPECIFIC: Taxid = -100;
 const GENUS_NON_SPECIFIC: Taxid = -200;
@@ -31,6 +34,16 @@ const FAMILY_NON_SPECIFIC: Taxid = -300;
 
 const NULL_TAXID: Taxid = -1;
 const NULL_LINEAGE: Lineage = [NULL_TAXID; 3];
+
+#[derive(Default)]
+struct MergedHsp {
+    total_alen: u64,
+    sum_pident: f64,
+    evalue: f64,
+    bitscore: f64,
+    hsp_count: u64,
+    representative: M8Record,
+}
 
 // *******************
 // DB creation functions
@@ -62,9 +75,15 @@ pub async fn build_taxid_lineages_db(
     let mut nodes_reader = BufReader::new(nodes_file).lines();
     while let Some(line) = nodes_reader.next_line().await? {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        if parts.len() < 3 { continue; }
-        let Ok(taxid) = parts[0].parse::<Taxid>() else { continue; };
-        let Ok(parent) = parts[1].parse::<Taxid>() else { continue; };
+        if parts.len() < 3 {
+            continue;
+        }
+        let Ok(taxid) = parts[0].parse::<Taxid>() else {
+            continue;
+        };
+        let Ok(parent) = parts[1].parse::<Taxid>() else {
+            continue;
+        };
         let rank = parts[2].to_string();
         if taxid != 1 {
             parent_map.insert(taxid, parent);
@@ -78,9 +97,15 @@ pub async fn build_taxid_lineages_db(
     let mut merged_reader = BufReader::new(merged_file).lines();
     while let Some(line) = merged_reader.next_line().await? {
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-        if parts.len() < 2 { continue; }
-        let Ok(old) = parts[0].parse::<Taxid>() else { continue; };
-        let Ok(new) = parts[1].parse::<Taxid>() else { continue; };
+        if parts.len() < 2 {
+            continue;
+        }
+        let Ok(old) = parts[0].parse::<Taxid>() else {
+            continue;
+        };
+        let Ok(new) = parts[1].parse::<Taxid>() else {
+            continue;
+        };
         merged_map.insert(old, new);
     }
     info!("Loaded {} merges", merged_map.len());
@@ -152,15 +177,25 @@ pub async fn build_taxid_lineages_db(
     Ok(())
 }
 
-pub async fn load_taxid_lineages_db(bincode_path: &PathBuf) -> Result<Arc<AHashMap<Taxid, Lineage>>> {
+/// Loads taxid-lineages map from bincode.
+///
+/// # Arguments
+///
+/// * `bincode_path` - path to the bincode file
+///
+/// # Returns
+///
+/// Result containing the Arc-wrapped AHashMap of lineages
+pub async fn load_taxid_lineages_db(
+    bincode_path: &PathBuf,
+) -> Result<Arc<AHashMap<Taxid, Lineage>>> {
     let mut file = StdFile::open(bincode_path)?;
-    let std_map: HashMap<Taxid, Lineage> = decode_from_std_read(&mut file, bincode::config::standard())
-        .map_err(|e| anyhow!("Bincode decode failed: {}", e))?;
+    let std_map: HashMap<Taxid, Lineage> =
+        decode_from_std_read(&mut file, bincode::config::standard())
+            .map_err(|e| anyhow!("Bincode decode failed: {}", e))?;
     let map = AHashMap::from_iter(std_map);
     Ok(Arc::new(map))
 }
-
-
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccTaxEntry {
@@ -237,7 +272,11 @@ pub async fn build_accession2taxid_db(
                     None => break,
                 };
 
-                let filename = mapping_file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+                let filename = mapping_file
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 info!("Worker {} reading mapping file: {}", i, filename);
 
                 let tx = tx.clone();
@@ -252,7 +291,8 @@ pub async fn build_accession2taxid_db(
 
                     let mut batch = Vec::with_capacity(1000);
                     for result in rdr.records() {
-                        let record = result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
+                        let record =
+                            result.map_err(|e| anyhow!("Parse error in {}: {}", filename, e))?;
 
                         let full_acc = record[0].to_string();
                         let acc_base = full_acc.split('.').next().unwrap_or(&full_acc).to_string();
@@ -262,22 +302,37 @@ pub async fn build_accession2taxid_db(
                         }
 
                         let taxid_idx = if record.len() == 2 { 1 } else { 2 };
-                        let taxid: Taxid = record.get(taxid_idx)
+                        let taxid: Taxid = record
+                            .get(taxid_idx)
                             .ok_or_else(|| anyhow!("Missing taxid column in {}", filename))?
                             .parse()
-                            .map_err(|_| anyhow!("Invalid taxid in {}: {}", filename, record.get(taxid_idx).unwrap_or("<missing>")))?;
+                            .map_err(|_| {
+                                anyhow!(
+                                    "Invalid taxid in {}: {}",
+                                    filename,
+                                    record.get(taxid_idx).unwrap_or("<missing>")
+                                )
+                            })?;
 
-                        batch.push(AccTaxEntry { acc: acc_base, taxid });  // ← key = base only
+                        batch.push(AccTaxEntry {
+                            acc: acc_base,
+                            taxid,
+                        }); // ← key = base only
                         if batch.len() >= 1000 {
-                            tx.blocking_send(std::mem::replace(&mut batch, Vec::with_capacity(1000)))
-                                .map_err(|_| anyhow!("Channel closed"))?;
+                            tx.blocking_send(std::mem::replace(
+                                &mut batch,
+                                Vec::with_capacity(1000),
+                            ))
+                            .map_err(|_| anyhow!("Channel closed"))?;
                         }
                     }
                     if !batch.is_empty() {
-                        tx.blocking_send(batch).map_err(|_| anyhow!("Channel closed"))?;
+                        tx.blocking_send(batch)
+                            .map_err(|_| anyhow!("Channel closed"))?;
                     }
                     Ok(())
-                }).await?;
+                })
+                .await?;
 
                 if let Err(e) = res {
                     return Err(e);
@@ -317,7 +372,10 @@ pub async fn build_accession2taxid_db(
         // Dedup: keep first seen (or warn on conflict)
         if let Some(existing) = acc_to_taxid.insert(entry.acc.clone(), entry.taxid) {
             if existing != entry.taxid {
-                warn!("Taxid conflict for base {}: {} vs {}", entry.acc, existing, entry.taxid);
+                warn!(
+                    "Taxid conflict for base {}: {} vs {}",
+                    entry.acc, existing, entry.taxid
+                );
             }
         } else {
             total_mapped += 1;
@@ -331,7 +389,7 @@ pub async fn build_accession2taxid_db(
     // Build FST with base accessions as keys
     let mut builder = MapBuilder::memory();
     let mut sorted_keys: Vec<String> = acc_to_taxid.keys().cloned().collect();
-    sorted_keys.sort_unstable();  // deterministic order
+    sorted_keys.sort_unstable(); // deterministic order
 
     for acc_base in sorted_keys {
         if let Some(&taxid) = acc_to_taxid.get(&acc_base) {
@@ -342,17 +400,23 @@ pub async fn build_accession2taxid_db(
     let map_bytes = builder.into_inner()?;
     let mut out_file = StdFile::create(db_path)?;
     out_file.write_all(&map_bytes)?;
-    info!("Built FST acc2taxid DB with {} entries at {}", total_mapped, db_path.display());
+    info!(
+        "Built FST acc2taxid DB with {} entries at {}",
+        total_mapped,
+        db_path.display()
+    );
 
     Ok(())
 }
 
-/// scans a FASTA file for base accessions (i.e. no version at end) and inserts
-pub fn scan_fasta_bases(
-    path: &PathBuf,
-    bases: &mut HashSet<String>,
-    name: &str,
-) {
+/// Scans a FASTA file for base accessions (no version) and inserts into a set.
+///
+/// # Arguments
+///
+/// * `path` - path to the FASTA file
+/// * `bases` - mutable set to store extracted accessions
+/// * `name` - name of the database (for logging)
+pub fn scan_fasta_bases(path: &PathBuf, bases: &mut HashSet<String>, name: &str) {
     let mut reader = parse_fastx_file(path)
         .unwrap_or_else(|e| panic!("Failed to open {} FASTA {}: {}", name, path.display(), e));
 
@@ -417,7 +481,6 @@ pub async fn build_should_keep_filter(
     })
 }
 
-
 ///Reading helper function for above filter list files
 ///
 /// # Arguments
@@ -439,21 +502,28 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
     Ok(set)
 }
 
-
-/// Retrieves the top hit from an m8 stream
-/// Ranking
+/// Retrieves the top hit from an m8 stream (NT version).
+///
+/// Ranking:
 /// 1. Higher AAI = pident * alen / qlen
 /// 2. Lower evalue
 /// 3. Higher bitscore
+///
 /// # Arguments
-/// * `path` - path to hit sumamry file.
+///
+/// * `input` - Stream of ParseOutput (lines)
+/// * `output_tx` - Channel to send best hits
+/// * `concurrency` - Number of worker tasks
+/// * `batch_size` - Number of lines per batch
+///
 /// # Returns
-/// hash map of HitSummaries
+///
+/// Result
 pub async fn get_top_m8_nt(
     mut input: ReceiverStream<ParseOutput>,
     output_tx: mpsc::Sender<ParseOutput>,
     concurrency: usize,
-    batch_size: usize,   // Lines per batch; aim for 10-50MB/batch
+    batch_size: usize, // Lines per batch; aim for 10-50MB/batch
 ) -> Result<()> {
     if concurrency == 0 {
         return Err(anyhow!("concurrency must be > 0"));
@@ -497,15 +567,28 @@ pub async fn get_top_m8_nt(
                     }
                     // Sort: Descending alen, ascending mismatch+gapopen, ascending evalue, descending bitscore
                     hits.sort_by(|a, b| {
-                        b.alen.cmp(&a.alen)
+                        b.alen
+                            .cmp(&a.alen)
                             .then_with(|| a.mismatch.cmp(&b.mismatch))
                             .then_with(|| a.gapopen.cmp(&b.gapopen))
-                            .then_with(|| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal))
-                            .then_with(|| b.bitscore.partial_cmp(&a.bitscore).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| {
+                                a.evalue
+                                    .partial_cmp(&b.evalue)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .then_with(|| {
+                                b.bitscore
+                                    .partial_cmp(&a.bitscore)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
                     });
                     let best = hits.into_iter().next().expect("Non-empty vec after check");
                     let line = best.to_tab_string() + "\n";
-                    if out_tx.send(ParseOutput::Bytes(Bytes::from(line.into_bytes()))).await.is_err() {
+                    if out_tx
+                        .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
+                        .await
+                        .is_err()
+                    {
                         return Err(anyhow!("Output send failed in worker {}", i));
                     }
                 }
@@ -539,28 +622,32 @@ pub async fn get_top_m8_nt(
     drop(job_tx);
 
     for handle in worker_handles {
-        handle.await.map_err(|e| anyhow!("Worker join failed: {}", e))??;
+        handle
+            .await
+            .map_err(|e| anyhow!("Worker join failed: {}", e))??;
     }
 
     Ok(())
 }
 
-#[derive(Default)]
-struct MergedHsp {
-    total_alen: u64,
-    sum_pident: f64,
-    evalue: f64,
-    bitscore: f64,
-    hsp_count: u64,
-    representative: M8Record,
-}
-
-
+/// Retrieves the top hit from an m8 stream (NR version).
+/// Merges HSPs per (query, subject) pair.
+///
+/// # Arguments
+///
+/// * `input` - Stream of ParseOutput (lines)
+/// * `output_tx` - Channel to send best hits
+/// * `concurrency` - Number of worker tasks
+/// * `batch_size` - Number of lines per batch
+///
+/// # Returns
+///
+/// Result
 pub async fn get_top_m8_nr(
     mut input: ReceiverStream<ParseOutput>,
     output_tx: mpsc::Sender<ParseOutput>,
     concurrency: usize,
-    batch_size: usize,   // Lines per batch; aim for 10-50MB/batch
+    batch_size: usize, // Lines per batch; aim for 10-50MB/batch
 ) -> Result<()> {
     if concurrency == 0 {
         return Err(anyhow!("concurrency must be > 0"));
@@ -613,8 +700,10 @@ pub async fn get_top_m8_nr(
                 let mut best_per_contig: AHashMap<String, MergedHsp> = AHashMap::new();
                 for ((contig, _subject), merged_hsp) in merged {
                     let current = best_per_contig.entry(contig).or_default();
-                    if merged_hsp.bitscore > current.bitscore ||
-                        (merged_hsp.bitscore == current.bitscore && merged_hsp.evalue < current.evalue) {
+                    if merged_hsp.bitscore > current.bitscore
+                        || (merged_hsp.bitscore == current.bitscore
+                            && merged_hsp.evalue < current.evalue)
+                    {
                         *current = merged_hsp;
                     }
                 }
@@ -630,11 +719,24 @@ pub async fn get_top_m8_nr(
                     // Reconstruct line (12-column NR format: no qlen/slen)
                     let line = format!(
                         "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
-                        rep.qname, rep.tname, avg_pident, best.total_alen,
-                        rep.mismatch, rep.gapopen, rep.qstart, rep.qend,
-                        rep.tstart, rep.tend, best.evalue, best.bitscore
+                        rep.qname,
+                        rep.tname,
+                        avg_pident,
+                        best.total_alen,
+                        rep.mismatch,
+                        rep.gapopen,
+                        rep.qstart,
+                        rep.qend,
+                        rep.tstart,
+                        rep.tend,
+                        best.evalue,
+                        best.bitscore
                     );
-                    if out_tx.send(ParseOutput::Bytes(Bytes::from(line.into_bytes()))).await.is_err() {
+                    if out_tx
+                        .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
+                        .await
+                        .is_err()
+                    {
                         return Err(anyhow!("Output send failed in worker {}", i));
                     }
                 }
@@ -668,17 +770,13 @@ pub async fn get_top_m8_nr(
     drop(job_tx);
 
     for handle in worker_handles {
-        handle.await.map_err(|e| anyhow!("Worker join failed: {}", e))??;
+        handle
+            .await
+            .map_err(|e| anyhow!("Worker join failed: {}", e))??;
     }
 
     Ok(())
 }
-
-
-
-// *******************
-// DB access functions
-// *******************
 
 /// Validates and cleans a taxonomic lineage
 /// Matches the CZI lineage.validate_taxid_lineage  for 3-rank case
@@ -695,17 +793,17 @@ pub async fn get_top_m8_nr(
 /// # Returns
 /// Validayte lineage vector with negtive taxids by converntion for no hit at that level
 pub fn validate_taxid_lineage(
-    lineage: &[i32],        // full lineage from DB for the hit_taxid
-    hit_taxid: Taxid,       // the taxid at which consensus was reached
-    hit_level: u8,          // 1=species, 2=genus, 3=family, 0=no consensus
+    lineage: &[i32],  // full lineage from DB for the hit_taxid
+    hit_taxid: Taxid, // the taxid at which consensus was reached
+    hit_level: u8,    // 1=species, 2=genus, 3=family, 0=no consensus
 ) -> Vec<i32> {
-    let mut cleaned = lineage.to_vec();   // always length 3 in our usage
+    let mut cleaned = lineage.to_vec(); // always length 3 in our usage
 
     if hit_level == 0 {
         // No consensus at any level → invalidate everything
-        cleaned[0] = SPECIES_NON_SPECIFIC;   // -100
-        cleaned[1] = GENUS_NON_SPECIFIC;     // -200
-        cleaned[2] = FAMILY_NON_SPECIFIC;    // -300
+        cleaned[0] = SPECIES_NON_SPECIFIC; // -100
+        cleaned[1] = GENUS_NON_SPECIFIC; // -200
+        cleaned[2] = FAMILY_NON_SPECIFIC; // -300
         return cleaned;
     }
 
@@ -738,33 +836,52 @@ pub fn validate_taxid_lineage(
     cleaned
 }
 
-
+/// Returns the lineage for a given read ID based on consensus hits.
+///
+/// # Arguments
+///
+/// * `hits_by_read_id` - Map of read ID to (taxid, level)
+/// * `lineage_map` - Map of taxid to full lineage
+/// * `read_id` - The read ID to look up
+///
+/// # Returns
+///
+/// The validated Lineage
 pub fn get_valid_lineage(
-    hits_by_read_id: &AHashMap<String, (Taxid, u8)>,     // contig_id → (taxid, level)
+    hits_by_read_id: &AHashMap<String, (Taxid, u8)>, // contig_id → (taxid, level)
     lineage_map: &Arc<AHashMap<Taxid, Lineage>>,
     read_id: &str,
 ) -> Lineage {
-    let (hit_taxid, hit_level) = hits_by_read_id
-        .get(read_id)
-        .copied()
-        .unwrap_or((-1, 255)); // 255 = invalid level
+    let (hit_taxid, hit_level) = hits_by_read_id.get(read_id).copied().unwrap_or((-1, 255)); // 255 = invalid level
 
     if hit_taxid <= 0 {
         return NULL_LINEAGE;
     }
 
     if hit_level == 1 {
-
-        lineage_map
-            .get(&hit_taxid)
-            .copied()
-            .unwrap_or(NULL_LINEAGE)
+        lineage_map.get(&hit_taxid).copied().unwrap_or(NULL_LINEAGE)
     } else {
-
-        [SPECIES_NON_SPECIFIC, GENUS_NON_SPECIFIC, FAMILY_NON_SPECIFIC]
+        [
+            SPECIES_NON_SPECIFIC,
+            GENUS_NON_SPECIFIC,
+            FAMILY_NON_SPECIFIC,
+        ]
     }
 }
 
+/// Generates sorted FASTA and JSON locator files for taxon-specific sequences.
+///
+/// # Arguments
+///
+/// * `records` - Vector of (header, sequence) pairs
+/// * `taxid_field` - Name of the taxid field in the header
+/// * `hit_type` - Type of hit (e.g., "NT", "NR")
+/// * `output_fa` - Path to output FASTA
+/// * `output_json` - Path to output JSON locator
+///
+/// # Returns
+///
+/// Result
 pub fn generate_locator_work(
     records: Arc<Vec<(String, String)>>, // (header_without_>, sequence)
     taxid_field: String,
@@ -784,9 +901,7 @@ pub fn generate_locator_work(
     // -----------------------------------------------------------------------
     let mut indices: Vec<usize> = (0..records.len()).collect();
 
-    indices.sort_unstable_by_key(|&i| {
-        get_taxid(&records[i].0, &taxid_field).unwrap_or(-1)
-    });
+    indices.sort_unstable_by_key(|&i| get_taxid(&records[i].0, &taxid_field).unwrap_or(-1));
 
     // -----------------------------------------------------------------------
     // 2. Prepare FASTA writer (large buffer, same as before)
@@ -842,14 +957,24 @@ pub fn generate_locator_work(
         });
     }
 
-    writer.flush()
-        .map_err(|e| anyhow!("Failed to flush FASTA writer for {}: {}", output_fa.display(), e))?;
+    writer.flush().map_err(|e| {
+        anyhow!(
+            "Failed to flush FASTA writer for {}: {}",
+            output_fa.display(),
+            e
+        )
+    })?;
 
     // -----------------------------------------------------------------------
     // 4. Write JSON locator (same format as Python)
     // -----------------------------------------------------------------------
-    let json_bytes = serde_json::to_vec(&locations)
-        .map_err(|e| anyhow!("Failed to serialize JSON for {}: {}", output_json.display(), e))?;
+    let json_bytes = serde_json::to_vec(&locations).map_err(|e| {
+        anyhow!(
+            "Failed to serialize JSON for {}: {}",
+            output_json.display(),
+            e
+        )
+    })?;
 
     std::fs::write(&output_json, json_bytes)
         .map_err(|e| anyhow!("Failed to write JSON {}: {}", output_json.display(), e))?;
@@ -864,8 +989,17 @@ pub fn generate_locator_work(
     Ok(())
 }
 
-/// Matches the original Python splitting logic as closely as possible
-/// Returns -1 on failure (same fallback as your current version)
+/// Parses a taxid from a FASTA header string based on a field name.
+/// Matches the original Python splitting logic as closely as possible.
+///
+/// # Arguments
+///
+/// * `header` - FASTA header string
+/// * `field` - Field name to search for (e.g., "species_nt")
+///
+/// # Returns
+///
+/// Result containing the parsed Taxid, or -1 if not found
 pub fn get_taxid(header: &str, field: &str) -> Result<i32> {
     // Remove leading '>' if present
     let cleaned = header.trim_start_matches('>');
@@ -891,32 +1025,109 @@ pub fn get_taxid(header: &str, field: &str) -> Result<i32> {
     };
 
     // Parse (same as Python — fail silently to -1)
-    let taxid = taxid_str
-        .parse::<i32>()
-        .unwrap_or_else(|e| {
-            debug!("Failed to parse taxid '{}': {}", taxid_str, e);
-            -1
-        });
+    let taxid = taxid_str.parse::<i32>().unwrap_or_else(|e| {
+        debug!("Failed to parse taxid '{}': {}", taxid_str, e);
+        -1
+    });
 
     Ok(taxid)
 }
 
+/// Loads taxonomic lineage and accession-to-taxid databases into memory.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result containing:
+/// - map of taxids to their full lineages
+/// - FST map for accession to taxid lookups
+pub async fn load_lineage_and_acc2tax_maps(
+    config: Arc<RunConfig>,
+) -> Result<(Arc<AHashMap<Taxid, Lineage>>, Arc<Map<Vec<u8>>>)> {
+    let lineage_path = PathBuf::from(&config.args.taxid_lineages_db);
+    let acc2taxid_path = PathBuf::from(&config.args.acc2taxid_db);
 
+    let lineage_future = async move {
+        load_taxid_lineages_db(&lineage_path).await.map_err(|e| {
+            anyhow!(
+                "Failed to load lineage DB from {}: {}",
+                lineage_path.display(),
+                e
+            )
+        })
+    };
+
+    let acc2taxid_future = async move {
+        let bytes = tokio::fs::read(&acc2taxid_path).await.map_err(|e| {
+            anyhow!(
+                "Failed to read acc2taxid DB {}: {}",
+                acc2taxid_path.display(),
+                e
+            )
+        })?;
+
+        let map =
+            Map::new(bytes).map_err(|e| anyhow!("Failed to parse acc2taxid fst map: {}", e))?;
+
+        Ok::<Arc<Map<Vec<u8>>>, anyhow::Error>(Arc::new(map))
+    };
+
+    let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
+
+    info!(
+        "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
+        lineage_map.len(),
+        acc2taxid_map.len()
+    );
+
+    Ok((lineage_map, acc2taxid_map))
+}
+
+/// Finds the position of the taxid field in FASTA headers.
+///
+/// # Arguments
+///
+/// * `sample_headers` - Sample of headers to inspect
+/// * `taxid_field` - Field name to find
+///
+/// # Returns
+///
+/// 1-based index of the field, or -1 if not found
 #[allow(dead_code)]
 fn get_taxid_field_num(sample_headers: &[String], taxid_field: &str) -> i32 {
-    for header in sample_headers.iter().take(100) {  // look at first 100 headers
+    for header in sample_headers.iter().take(100) {
+        // look at first 100 headers
         let cleaned = header.trim_start_matches('>');
         let parts: Vec<&str> = cleaned.split(':').collect();
         if let Some(idx) = parts.iter().position(|&p| p == taxid_field) {
-            info!("Found taxid field '{}' at position {}", taxid_field, idx + 1);
+            info!(
+                "Found taxid field '{}' at position {}",
+                taxid_field,
+                idx + 1
+            );
             return (idx + 1) as i32;
         }
     }
-    warn!("Taxid field '{}' not found in first 100 headers", taxid_field);
+    warn!(
+        "Taxid field '{}' not found in first 100 headers",
+        taxid_field
+    );
     -1
 }
 
-
+/// Combines multiple taxon location JSON files into a single one.
+///
+/// # Arguments
+///
+/// * `input_jsons` - List of JSON files to combine
+/// * `output_json` - Path to the combined output JSON
+///
+/// # Returns
+///
+/// Result
 pub fn combine_taxon_loc_json(input_jsons: Vec<PathBuf>, output_json: PathBuf) -> Result<()> {
     let mut combined: Vec<TaxonSeqLocation> = Vec::new();
     for path in input_jsons {
@@ -1052,7 +1263,7 @@ mod tests {
             Some(whitelist.clone()),
             Some(blacklist.clone()),
         )
-            .await?;
+        .await?;
 
         assert!(keep(&[333]));
         assert!(keep(&[444, 999]));
@@ -1071,10 +1282,7 @@ mod tests {
         let in2 = dir.path().join("two.json");
         let out = dir.path().join("combined.json");
 
-        let a = vec![
-            taxon_loc(10, 0, 9, "NT"),
-            taxon_loc(20, 10, 19, "NT"),
-        ];
+        let a = vec![taxon_loc(10, 0, 9, "NT"), taxon_loc(20, 10, 19, "NT")];
         let b = vec![taxon_loc(30, 0, 7, "NR")];
 
         fs::write(&in1, serde_json::to_vec(&a)?)?;
@@ -1098,7 +1306,10 @@ mod tests {
 
         let records = Arc::new(vec![
             ("contig_b:species_nt:20:extra".to_string(), "TT".to_string()),
-            ("contig_a:species_nt:10:extra".to_string(), "AAAA".to_string()),
+            (
+                "contig_a:species_nt:10:extra".to_string(),
+                "AAAA".to_string(),
+            ),
         ]);
 
         generate_locator_work(
@@ -1122,4 +1333,3 @@ mod tests {
         Ok(())
     }
 }
-
