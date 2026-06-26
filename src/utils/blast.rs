@@ -1,39 +1,45 @@
-// BLAST-related file functions and structures
+//! BLAST-related file functions and structures
+//! including m8 file-based
+
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::Arc;
 
-use rayon::prelude::*;
-use memchr::memchr;
-use anyhow::{anyhow, Result};
-use log::{self, debug, info, warn};
-use tokio_stream::StreamExt;
-use lexical::parse as lexical_parse;
-use fst::Map;
-use ahash::{AHashMap, RandomState as AHashState};
-use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::ReceiverStream;
-use tokio::sync::mpsc;
-use tokio::io::AsyncWriteExt;
-use dashmap::DashMap;
-use bytes::Bytes;
-use once_cell::sync::Lazy;
 use ahash::RandomState as AHashRandomState;
+use ahash::{AHashMap, RandomState as AHashState};
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use dashmap::DashMap;
+use fst::Map;
+use lexical::parse as lexical_parse;
+use log::{self, debug, info, warn};
+use memchr::memchr;
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
-use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel, PipelineError, RunConfig, StreamDataType, SORT_TAG, NT_TAG, NR_TAG};
-use crate::utils::streams::{ParseOutput, parse_lines, fanout_to_channels, ToBytes, spawn_cmd};
-use crate::utils::taxonomy::{validate_taxid_lineage};
-use crate::utils::file::{choose_temp_dir, write_byte_stream_to_file, rename_file_path};
-use crate::utils::command::generate_cli;
-use tokio::fs::File as TokioFile;
-use tokio::time::Instant;
-use tokio::sync::oneshot;
-use std::path::PathBuf;
-use std::collections::HashMap;
 use futures::future::try_join_all;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::fs::File as TokioFile;
 use tokio::io::BufWriter;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+use crate::config::defs::{
+    ClusterInfo, Lineage, PipelineError, ReadCountingMode, RunConfig, SimdLevel, StreamDataType,
+    Taxid, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, READ_COUNTING_MODE, SIMD_LEVEL, SORT_TAG,
+};
+use crate::utils::command::generate_cli;
+use crate::utils::file::{choose_temp_dir, rename_file_path, write_byte_stream_to_file};
+use crate::utils::streams::{fanout_to_channels, parse_lines, spawn_cmd, ParseOutput, ToBytes};
 use crate::utils::system::compute_phase_concurrency;
+use crate::utils::taxonomy::validate_taxid_lineage;
 
 /// Represents an entry in the contig summary, grouping metadata and hit stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,20 +66,20 @@ pub struct SpeciesAlignmentResults {
 /// Represents a single record in a BLAST m8 (tabular) output file.
 #[derive(Debug, Clone, Default)]
 pub struct M8Record {
-    pub qname: String,       // Read ID
-    pub tname: String,       // Base Accession ID (no version suffix)
-    pub pident: f64,         // Percent identity
-    pub alen: u64,           // Alignment length
-    pub mismatch: u64,       // Mismatches
-    pub gapopen: u64,        // Gap openings
-    pub qstart: u64,         // Query start
-    pub qend: u64,           // Query end
-    pub tstart: u64,         // Target start
-    pub tend: u64,           // Target end
-    pub evalue: f64,         // E-value
-    pub bitscore: f64,       // Bitscore
-    pub qlen: u64,   // Query length: From column in NT; 0 or contig len in NR (unused in NR logic)
-    pub slen: u64,   // Subject length: From column in NT; 0 in NR (unused entirely)
+    pub qname: String, // Read ID
+    pub tname: String, // Base Accession ID (no version suffix)
+    pub pident: f64,   // Percent identity
+    pub alen: u64,     // Alignment length
+    pub mismatch: u64, // Mismatches
+    pub gapopen: u64,  // Gap openings
+    pub qstart: u64,   // Query start
+    pub qend: u64,     // Query end
+    pub tstart: u64,   // Target start
+    pub tend: u64,     // Target end
+    pub evalue: f64,   // E-value
+    pub bitscore: f64, // Bitscore
+    pub qlen: u64, // Query length: From column in NT; 0 or contig len in NR (unused in NR logic)
+    pub slen: u64, // Subject length: From column in NT; 0 in NR (unused entirely)
 }
 
 /// Internal structure for grouped batch processing of read hits.
@@ -122,7 +128,9 @@ impl M8Record {
 
         macro_rules! next {
             ($name:literal) => {
-                fields.next().ok_or_else(|| anyhow!(concat!("missing ", $name, " in NT m8 line")))?
+                fields
+                    .next()
+                    .ok_or_else(|| anyhow!(concat!("missing ", $name, " in NT m8 line")))?
             };
         }
         macro_rules! parse_float {
@@ -140,26 +148,45 @@ impl M8Record {
             }};
         }
 
-        let qname           = next!("qname").to_string();
-        let raw_accession   = next!("tname");
-        let tname           = raw_accession.split('.').next().unwrap_or(raw_accession).to_string();
-        let pident          = parse_float!("pident");
-        let alen            = parse_u64!("alen");
-        let mismatch        = parse_u64!("mismatch");
-        let gapopen         = parse_u64!("gapopen");
-        let qstart          = parse_u64!("qstart");
-        let qend            = parse_u64!("qend");
-        let tstart          = parse_u64!("tstart");
-        let tend            = parse_u64!("tend");
-        let evalue          = parse_float!("evalue");
-        let bitscore        = parse_float!("bitscore");
-        let qlen            = parse_u64!("qlen");
-        let slen            = parse_u64!("slen");
+        let qname = next!("qname").to_string();
+        let raw_accession = next!("tname");
+        let tname = raw_accession
+            .split('.')
+            .next()
+            .unwrap_or(raw_accession)
+            .to_string();
+        let pident = parse_float!("pident");
+        let alen = parse_u64!("alen");
+        let mismatch = parse_u64!("mismatch");
+        let gapopen = parse_u64!("gapopen");
+        let qstart = parse_u64!("qstart");
+        let qend = parse_u64!("qend");
+        let tstart = parse_u64!("tstart");
+        let tend = parse_u64!("tend");
+        let evalue = parse_float!("evalue");
+        let bitscore = parse_float!("bitscore");
+        let qlen = parse_u64!("qlen");
+        let slen = parse_u64!("slen");
 
         if fields.next().is_some() {
             warn!("Extra columns in NT m8 line (expected 14): {}", line);
         }
-        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen, slen })
+        Ok(Self {
+            qname,
+            tname,
+            pident,
+            alen,
+            mismatch,
+            gapopen,
+            qstart,
+            qend,
+            tstart,
+            tend,
+            evalue,
+            bitscore,
+            qlen,
+            slen,
+        })
     }
 
     // ── NR scalar ──────────────────────────────────────────────────────────
@@ -182,7 +209,9 @@ impl M8Record {
 
         macro_rules! next {
             ($name:literal) => {
-                fields.next().ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
+                fields
+                    .next()
+                    .ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
             };
         }
         macro_rules! parse_float {
@@ -200,24 +229,43 @@ impl M8Record {
             }};
         }
 
-        let qname           = next!("qname").to_string();
-        let raw_accession   = next!("tname");
-        let tname           = raw_accession.split('.').next().unwrap_or(raw_accession).to_string();
-        let pident          = parse_float!("pident");
-        let alen            = parse_u64!("alen");
-        let mismatch        = parse_u64!("mismatch");
-        let gapopen         = parse_u64!("gapopen");
-        let qstart          = parse_u64!("qstart");
-        let qend            = parse_u64!("qend");
-        let tstart          = parse_u64!("tstart");
-        let tend            = parse_u64!("tend");
-        let evalue          = parse_float!("evalue");
-        let bitscore        = parse_float!("bitscore");
+        let qname = next!("qname").to_string();
+        let raw_accession = next!("tname");
+        let tname = raw_accession
+            .split('.')
+            .next()
+            .unwrap_or(raw_accession)
+            .to_string();
+        let pident = parse_float!("pident");
+        let alen = parse_u64!("alen");
+        let mismatch = parse_u64!("mismatch");
+        let gapopen = parse_u64!("gapopen");
+        let qstart = parse_u64!("qstart");
+        let qend = parse_u64!("qend");
+        let tstart = parse_u64!("tstart");
+        let tend = parse_u64!("tend");
+        let evalue = parse_float!("evalue");
+        let bitscore = parse_float!("bitscore");
 
         if fields.next().is_some() {
             warn!("Extra columns in NR m8 line (expected 12): {}", line);
         }
-        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen: 0, slen: 0 })
+        Ok(Self {
+            qname,
+            tname,
+            pident,
+            alen,
+            mismatch,
+            gapopen,
+            qstart,
+            qend,
+            tstart,
+            tend,
+            evalue,
+            bitscore,
+            qlen: 0,
+            slen: 0,
+        })
     }
 
     // ── shared AVX-512 tab scanner ─────────────────────────────────────────
@@ -227,8 +275,8 @@ impl M8Record {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn collect_tab_positions(bytes: &[u8]) -> Vec<usize> {
-        use std::arch::x86_64::*;
         use std::arch::x86_64::__m512i;
+        use std::arch::x86_64::*;
         let len = bytes.len();
         let mut tab_pos: Vec<usize> = Vec::with_capacity(16);
         let tab_splat = _mm512_set1_epi8(b'\t' as i8);
@@ -244,7 +292,9 @@ impl M8Record {
             i += 64;
         }
         while i < len {
-            if bytes[i] == b'\t' { tab_pos.push(i); }
+            if bytes[i] == b'\t' {
+                tab_pos.push(i);
+            }
             i += 1;
         }
         tab_pos
@@ -266,15 +316,15 @@ impl M8Record {
 
         if tab_pos.len() < 13 {
             return Err(anyhow!(
-            "NT m8 line has {} tabs, need ≥13 for 14 fields",
-            tab_pos.len()
-        ));
+                "NT m8 line has {} tabs, need ≥13 for 14 fields",
+                tab_pos.len()
+            ));
         }
 
         macro_rules! field {
             ($n:expr) => {{
                 let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
-                let end   = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+                let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
                 &bytes[start..end]
             }};
         }
@@ -291,27 +341,44 @@ impl M8Record {
             };
         }
 
-        let qname = std::str::from_utf8(field!(0)).map_err(|_| anyhow!("qname not UTF-8"))?.to_string();
-        let raw   = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
+        let qname = std::str::from_utf8(field!(0))
+            .map_err(|_| anyhow!("qname not UTF-8"))?
+            .to_string();
+        let raw = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
         let tname = raw.split('.').next().unwrap_or(raw).to_string();
 
-        let pident   = parse_f64!(2,  "pident");
-        let alen     = parse_u64!(3,  "alen");
-        let mismatch = parse_u64!(4,  "mismatch");
-        let gapopen  = parse_u64!(5,  "gapopen");
-        let qstart   = parse_u64!(6,  "qstart");
-        let qend     = parse_u64!(7,  "qend");
-        let tstart   = parse_u64!(8,  "tstart");
-        let tend     = parse_u64!(9,  "tend");
-        let evalue   = parse_f64!(10, "evalue");
+        let pident = parse_f64!(2, "pident");
+        let alen = parse_u64!(3, "alen");
+        let mismatch = parse_u64!(4, "mismatch");
+        let gapopen = parse_u64!(5, "gapopen");
+        let qstart = parse_u64!(6, "qstart");
+        let qend = parse_u64!(7, "qend");
+        let tstart = parse_u64!(8, "tstart");
+        let tend = parse_u64!(9, "tend");
+        let evalue = parse_f64!(10, "evalue");
         let bitscore = parse_f64!(11, "bitscore");
-        let qlen     = parse_u64!(12, "qlen");
-        let slen     = parse_u64!(13, "slen");
+        let qlen = parse_u64!(12, "qlen");
+        let slen = parse_u64!(13, "slen");
 
         if tab_pos.len() > 13 {
             warn!("Extra columns in NT m8 line (expected 14): {}", trimmed);
         }
-        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen, slen })
+        Ok(Self {
+            qname,
+            tname,
+            pident,
+            alen,
+            mismatch,
+            gapopen,
+            qstart,
+            qend,
+            tstart,
+            tend,
+            evalue,
+            bitscore,
+            qlen,
+            slen,
+        })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -336,15 +403,15 @@ impl M8Record {
 
         if tab_pos.len() < 11 {
             return Err(anyhow!(
-            "NR m8 line has {} tabs, need ≥11 for 12 fields",
-            tab_pos.len()
-        ));
+                "NR m8 line has {} tabs, need ≥11 for 12 fields",
+                tab_pos.len()
+            ));
         }
 
         macro_rules! field {
             ($n:expr) => {{
                 let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
-                let end   = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+                let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
                 &bytes[start..end]
             }};
         }
@@ -361,26 +428,43 @@ impl M8Record {
             };
         }
 
-        let qname = std::str::from_utf8(field!(0)).map_err(|_| anyhow!("qname not UTF-8"))?.to_string();
-        let raw   = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
+        let qname = std::str::from_utf8(field!(0))
+            .map_err(|_| anyhow!("qname not UTF-8"))?
+            .to_string();
+        let raw = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
         let tname = raw.split('.').next().unwrap_or(raw).to_string();
 
-        let pident   = parse_f64!(2,  "pident");
-        let alen     = parse_u64!(3,  "alen");
-        let mismatch = parse_u64!(4,  "mismatch");
-        let gapopen  = parse_u64!(5,  "gapopen");
-        let qstart   = parse_u64!(6,  "qstart");
-        let qend     = parse_u64!(7,  "qend");
-        let tstart   = parse_u64!(8,  "tstart");
-        let tend     = parse_u64!(9,  "tend");
-        let evalue   = parse_f64!(10, "evalue");
+        let pident = parse_f64!(2, "pident");
+        let alen = parse_u64!(3, "alen");
+        let mismatch = parse_u64!(4, "mismatch");
+        let gapopen = parse_u64!(5, "gapopen");
+        let qstart = parse_u64!(6, "qstart");
+        let qend = parse_u64!(7, "qend");
+        let tstart = parse_u64!(8, "tstart");
+        let tend = parse_u64!(9, "tend");
+        let evalue = parse_f64!(10, "evalue");
         let bitscore = parse_f64!(11, "bitscore");
 
         if tab_pos.len() > 11 {
             warn!("Extra columns in NT m8 line (expected 12): {}", trimmed);
         }
 
-        Ok(Self { qname, tname, pident, alen, mismatch, gapopen, qstart, qend, tstart, tend, evalue, bitscore, qlen: 0, slen: 0 })
+        Ok(Self {
+            qname,
+            tname,
+            pident,
+            alen,
+            mismatch,
+            gapopen,
+            qstart,
+            qend,
+            tstart,
+            tend,
+            evalue,
+            bitscore,
+            qlen: 0,
+            slen: 0,
+        })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -401,18 +485,26 @@ impl M8Record {
         PARSE_M8_NR(line)
     }
 
-
     pub fn to_tab_string(&self) -> String {
         format!(
             "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\t{}\t{}",
-            self.qname, self.tname, self.pident, self.alen,
-            self.mismatch, self.gapopen, self.qstart, self.qend,
-            self.tstart, self.tend, self.evalue, self.bitscore,
-            self.qlen, self.slen
+            self.qname,
+            self.tname,
+            self.pident,
+            self.alen,
+            self.mismatch,
+            self.gapopen,
+            self.qstart,
+            self.qend,
+            self.tstart,
+            self.tend,
+            self.evalue,
+            self.bitscore,
+            self.qlen,
+            self.slen
         )
     }
 }
-
 
 static PARSE_M8_NT: Lazy<fn(&str) -> Result<M8Record>> = Lazy::new(|| {
     #[cfg(target_arch = "x86_64")]
@@ -462,8 +554,6 @@ pub struct TaxonCount {
     pub base_count: u64,
     pub source_count_type: Option<Vec<String>>,
 }
-
-
 
 /// Processes a pair of m8 hit and hit summary records and updates the aggregation map.
 ///
@@ -523,8 +613,8 @@ pub fn process_record_pair(
 
     // Build raw lineage from hit summary columns (indices 4,5,6)
     let species = hit_fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let genus   = hit_fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let family  = hit_fields.get(6).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let genus = hit_fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let family = hit_fields.get(6).and_then(|s| s.parse().ok()).unwrap_or(-1);
     let raw = vec![species, genus, family];
 
     // Lineage cache (exactly like summarize_hits)
@@ -575,7 +665,9 @@ pub fn process_record_pair(
 /// # Returns
 ///
 /// AHashMap<Vec<i32>, AggBucket>: the merged aggregation map
-pub fn merge_aggregations(parts: Vec<AHashMap<Vec<i32>, AggBucket>>) -> AHashMap<Vec<i32>, AggBucket> {
+pub fn merge_aggregations(
+    parts: Vec<AHashMap<Vec<i32>, AggBucket>>,
+) -> AHashMap<Vec<i32>, AggBucket> {
     let mut merged = AHashMap::new();
     for part in parts {
         for (k, b) in part {
@@ -606,16 +698,29 @@ pub fn merge_aggregations(parts: Vec<AHashMap<Vec<i32>, AggBucket>>) -> AHashMap
 /// # Returns
 ///
 /// Vec<TaxonCount>: the list of generated taxon count records
-pub fn build_taxon_counts_list(agg: AHashMap<Vec<i32>, AggBucket>, count_type: &str) -> Vec<TaxonCount> {
+pub fn build_taxon_counts_list(
+    agg: AHashMap<Vec<i32>, AggBucket>,
+    count_type: &str,
+) -> Vec<TaxonCount> {
     let mut rows = Vec::with_capacity(agg.len());
     for (agg_key, bucket) in agg {
-        if bucket.unique_count == 0 { continue; }
+        if bucket.unique_count == 0 {
+            continue;
+        }
 
         let len_key = agg_key.len();
-        let tax_level = (3 - len_key + 1) as u8;   // exact Python: species=1, genus=2, family=3
+        let tax_level = (3 - len_key + 1) as u8; // exact Python: species=1, genus=2, family=3
 
-        let genus_taxid = if tax_level <= 2 { agg_key[2 - tax_level as usize] } else { -200 };
-        let family_taxid = if tax_level <= 3 { agg_key[3 - tax_level as usize] } else { -300 };
+        let genus_taxid = if tax_level <= 2 {
+            agg_key[2 - tax_level as usize]
+        } else {
+            -200
+        };
+        let family_taxid = if tax_level <= 3 {
+            agg_key[3 - tax_level as usize]
+        } else {
+            -300
+        };
 
         let count = if READ_COUNTING_MODE == ReadCountingMode::CountAll {
             bucket.nonunique_count
@@ -661,7 +766,6 @@ fn negative_taxid(level: u8) -> i64 {
     -100 * (level as i64)
 }
 
-
 /// Computes the common lineage for a set of hits,
 /// Assumes lineages are [species, genus, family] leaf-to-root with possible negatives.
 ///
@@ -679,7 +783,7 @@ pub fn consensus_level(
     lineage_map: &AHashMap<Taxid, Lineage>,
     acc2taxid_map: &Map<Vec<u8>>,
     should_keep: &Arc<impl Fn(&[i32]) -> bool + Send + Sync>,
-) -> Result<(u8, i64, Vec<M8Record>)>   {
+) -> Result<(u8, i64, Vec<M8Record>)> {
     let lineages: Vec<Lineage> = hits
         .iter()
         .filter_map(|r| {
@@ -689,14 +793,15 @@ pub fn consensus_level(
             let taxid_opt = acc2taxid_map.get(accession.as_bytes());
 
             // 2. Fallback: strip version → base accession (e.g., "ACC")
-            let taxid_u64 = taxid_opt.or_else(|| {
-                let base_acc = accession.split('.').next().unwrap_or(accession);
-                if base_acc != accession {
-                    acc2taxid_map.get(base_acc.as_bytes())
-                } else {
-                    None
-                }
-            })
+            let taxid_u64 = taxid_opt
+                .or_else(|| {
+                    let base_acc = accession.split('.').next().unwrap_or(accession);
+                    if base_acc != accession {
+                        acc2taxid_map.get(base_acc.as_bytes())
+                    } else {
+                        None
+                    }
+                })
                 .ok_or_else(|| anyhow!("Accession not found in acc2taxid map: {}", accession))
                 .ok()?;
 
@@ -743,8 +848,6 @@ pub fn consensus_level(
     Ok((max_level, consensus_taxid, hits.to_vec()))
 }
 
-
-
 /// Extract the read ID from a BLAST m8 line.
 ///
 /// # Arguments
@@ -756,7 +859,11 @@ pub fn consensus_level(
 /// Option<&str>: the extracted read ID if found
 pub fn read_id_from_m8_line(line: &str) -> Option<&str> {
     let read_id = line.split('\t').next()?;
-    if read_id.is_empty() { None } else { Some(read_id) }
+    if read_id.is_empty() {
+        None
+    } else {
+        Some(read_id)
+    }
 }
 
 /// Assigns a read ID to a specific shard for concurrent processing.
@@ -805,10 +912,12 @@ pub async fn sort_m8_by_read_id(
         4,
         false,
     )
-        .await?;
+    .await?;
 
     let unsorted_path = temp_dir.path().join(format!("{}_unsorted.m8", db_type));
-    let sorted_path = temp_dir.path().join(format!("{}_sorted_by_read.m8", db_type));
+    let sorted_path = temp_dir
+        .path()
+        .join(format!("{}_sorted_by_read.m8", db_type));
 
     info!(
         "[{}] Starting m8 sort (est {} bytes) using RAM/NVMe scratch",
@@ -823,8 +932,8 @@ pub async fn sort_m8_by_read_id(
         StreamDataType::JustBytes,
         &tag,
     )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     write_task
         .await
@@ -848,11 +957,7 @@ pub async fn sort_m8_by_read_id(
         input: Some(unsorted_path.to_string_lossy().into_owned()),
     };
 
-    let sort_args = generate_cli(
-        crate::config::defs::SORT_TAG,
-        &config,
-        Some(&sort_config),
-    )
+    let sort_args = generate_cli(crate::config::defs::SORT_TAG, &config, Some(&sort_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: crate::config::defs::SORT_TAG.to_string(),
             error: e.to_string(),
@@ -863,13 +968,13 @@ pub async fn sort_m8_by_read_id(
         crate::config::defs::SORT_TAG,
         sort_args,
         config.args.verbose,
-        None
+        None,
     )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: crate::config::defs::SORT_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    .await
+    .map_err(|e| PipelineError::ToolExecution {
+        tool: crate::config::defs::SORT_TAG.to_string(),
+        error: e.to_string(),
+    })?;
 
     let status = sort_child
         .wait()
@@ -903,12 +1008,11 @@ pub async fn sort_m8_by_read_id(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
     info!(
-    "[{}] sorted output exists: {} bytes at {}",
-    tag,
-    meta.len(),
-    sorted_path.display()
-);
-
+        "[{}] sorted output exists: {} bytes at {}",
+        tag,
+        meta.len(),
+        sorted_path.display()
+    );
 
     let rx = parse_lines(sorted_file, &config, StreamDataType::JustBytes)
         .await
@@ -948,12 +1052,15 @@ pub async fn call_hits_m8(
     min_aln_len: u64,
     concurrency: usize,
     tag: String,
-) -> Result<(
-    ReceiverStream<ParseOutput>, // dedup m8 stream
-    ReceiverStream<ParseOutput>, // summary stream
-    Vec<tokio::task::JoinHandle<Result<()>>>,
-    Vec<oneshot::Receiver<Result<()>>>,
-), PipelineError> {
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>, // dedup m8 stream
+        ReceiverStream<ParseOutput>, // summary stream
+        Vec<tokio::task::JoinHandle<Result<()>>>,
+        Vec<oneshot::Receiver<Result<()>>>,
+    ),
+    PipelineError,
+> {
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
@@ -979,7 +1086,8 @@ pub async fn call_hits_m8(
     let mut worker_txs: Vec<mpsc::Sender<WorkerMsgLocal>> = Vec::with_capacity(worker_count);
 
     for worker_idx in 0..worker_count {
-        let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerMsgLocal>(config.base_buffer_size * 16);
+        let (worker_tx, mut worker_rx) =
+            mpsc::channel::<WorkerMsgLocal>(config.base_buffer_size * 16);
         worker_txs.push(worker_tx);
 
         let lineage_map = lineage_map.clone();
@@ -1031,7 +1139,10 @@ pub async fn call_hits_m8(
 
             info!(
                 "[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}",
-                worker_tag, worker_idx, total_emitted, start.elapsed()
+                worker_tag,
+                worker_idx,
+                total_emitted,
+                start.elapsed()
             );
             Ok::<(), anyhow::Error>(())
         });
@@ -1177,23 +1288,20 @@ pub async fn call_hits_m8(
         2,
         "call_hits_m8_dedup",
         &config,
-        StreamDataType::JustBytes
+        StreamDataType::JustBytes,
     )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     // track router task (replaces cleanup_receivers)
     cleanup_receivers.push(dedup_router_done_rx);
 
     let mut dedup_branches = dedup_branches.into_iter();
 
-    let dedup_main = ReceiverStream::new(
-        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
+    let dedup_main = ReceiverStream::new(dedup_branches.next().ok_or(PipelineError::EmptyStream)?);
 
-    let dedup_file_stream = ReceiverStream::new(
-        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
+    let dedup_file_stream =
+        ReceiverStream::new(dedup_branches.next().ok_or(PipelineError::EmptyStream)?);
 
     let call_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
@@ -1207,8 +1315,8 @@ pub async fn call_hits_m8(
         StreamDataType::JustBytes,
         "call_hits_m8_dedup",
     )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(call_file_write_task);
 
     let summary_stream = ReceiverStream::new(summary_rx);
@@ -1217,23 +1325,21 @@ pub async fn call_hits_m8(
         2,
         "call_hits_m8_summary",
         &config,
-        StreamDataType::JustBytes
+        StreamDataType::JustBytes,
     )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     // track router task instead of oneshot receiver
     cleanup_receivers.push(summary_router_done_rx);
 
     let mut summary_branches = summary_branches.into_iter();
 
-    let summary_main = ReceiverStream::new(
-        summary_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
+    let summary_main =
+        ReceiverStream::new(summary_branches.next().ok_or(PipelineError::EmptyStream)?);
 
-    let summary_file_stream = ReceiverStream::new(
-        summary_branches.next().ok_or(PipelineError::EmptyStream)?
-    );
+    let summary_file_stream =
+        ReceiverStream::new(summary_branches.next().ok_or(PipelineError::EmptyStream)?);
 
     let summary_file_write_task = write_byte_stream_to_file(
         &config.out_dir.join(rename_file_path(
@@ -1247,18 +1353,13 @@ pub async fn call_hits_m8(
         StreamDataType::JustBytes,
         "call_hits_m8_summary",
     )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(summary_file_write_task);
 
     info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
 
-    Ok((
-        dedup_main,
-        summary_main,
-        cleanup_tasks,
-        cleanup_receivers,
-    ))
+    Ok((dedup_main, summary_main, cleanup_tasks, cleanup_receivers))
 }
 
 /// Summarizes BLAST m8 hits for a single read into a ReducedRead structure.
@@ -1344,15 +1445,18 @@ where
         best.evalue,
         best.bitscore
     )
-        .into_bytes();
+    .into_bytes();
 
     // Keep the same consensus logic as the current code.
     let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
     let wrapped_filter = Arc::new(|l: &[i32]| should_keep_filter(l));
 
     let (tax_level, _cons_taxid, consensus_hits) =
-        consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter)
-            .unwrap_or((0, 0, Vec::new()));
+        consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter).unwrap_or((
+            0,
+            0,
+            Vec::new(),
+        ));
 
     let first_lineage = consensus_hits
         .first()
@@ -1363,24 +1467,17 @@ where
 
     let summary_line = format!(
         "{}\t{}\t{}\t{}\t{}\t{}\n",
-        read_id,
-        best.tname,
-        first_lineage[0],
-        first_lineage[1],
-        first_lineage[2],
-        tax_level
+        read_id, best.tname, first_lineage[0], first_lineage[1], first_lineage[2], tax_level
     )
-        .into_bytes();
+    .into_bytes();
 
     Some(ReducedRead {
         seq,
         dedup: dedup_line,
         summary: summary_line,
-        accession: best.tname.clone(),   
+        accession: best.tname.clone(),
     })
 }
-
-
 
 /// Parses a batch of summary records from raw bytes.
 ///
@@ -1483,7 +1580,6 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
     }
 }
 
-
 /// Generates taxonomic count JSON records from an m8 and hit summary stream.
 ///
 /// # Arguments
@@ -1502,15 +1598,15 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 ///
 /// Result<()>: success or error
 pub async fn generate_taxon_count_json_from_m8(
-    m8_stream_rx:           ReceiverStream<ParseOutput>,
-    hit_summary_stream_rx:  ReceiverStream<ParseOutput>,
-    db_type:                    &str,
-    lineage_map:                Arc<AHashMap<Taxid, Lineage>>,
-    should_keep_filter:         Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
-    duplicate_clusters:         Arc<DashMap<String, ClusterInfo>>,
-    output_tx:                  mpsc::Sender<ParseOutput>,
-    concurrency:                usize,
-    batch_size_lines:           usize,
+    m8_stream_rx: ReceiverStream<ParseOutput>,
+    hit_summary_stream_rx: ReceiverStream<ParseOutput>,
+    db_type: &str,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+    output_tx: mpsc::Sender<ParseOutput>,
+    concurrency: usize,
+    batch_size_lines: usize,
 ) -> Result<()> {
     if concurrency == 0 {
         return Err(anyhow::anyhow!("concurrency must be > 0"));
@@ -1551,8 +1647,16 @@ pub async fn generate_taxon_count_json_from_m8(
                             }
                         }
 
-                        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines {
-                            if job_tx.send((std::mem::take(&mut batch_m8), std::mem::take(&mut batch_hit))).await.is_err() {
+                        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines
+                        {
+                            if job_tx
+                                .send((
+                                    std::mem::take(&mut batch_m8),
+                                    std::mem::take(&mut batch_hit),
+                                ))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -1593,13 +1697,23 @@ pub async fn generate_taxon_count_json_from_m8(
 
                     for (m8_line, hit_line) in batch_m8.into_iter().zip(batch_hit) {
                         let hit_fields: Vec<&str> = hit_line.split('\t').collect();
-                        if hit_fields.len() < 10 { continue; }
+                        if hit_fields.len() < 10 {
+                            continue;
+                        }
 
                         let read_id = hit_fields[0].to_string();
-                        let level   = hit_fields.get(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
-                        let taxid   = hit_fields.get(2).and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                        let level = hit_fields
+                            .get(1)
+                            .and_then(|s| s.parse::<u8>().ok())
+                            .unwrap_or(0);
+                        let taxid = hit_fields
+                            .get(2)
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(0);
 
-                        if taxid <= 0 || level == 0 { continue; }
+                        if taxid <= 0 || level == 0 {
+                            continue;
+                        }
 
                         if let Ok(m8) = M8Record::parse_line_nt(&m8_line)
                             .or_else(|_| M8Record::parse_line_nr(&m8_line))
@@ -1623,23 +1737,33 @@ pub async fn generate_taxon_count_json_from_m8(
                     // Emit results
                     for (taxid, bucket) in buckets {
                         if let Some(lineage) = lineage_map.get(&taxid) {
-                            if !should_keep_filter(lineage) { continue; }
+                            if !should_keep_filter(lineage) {
+                                continue;
+                            }
 
                             let dcr = if bucket.nonunique_count > 0 {
                                 bucket.unique_count as f64 / bucket.nonunique_count as f64
-                            } else { 0.0 };
+                            } else {
+                                0.0
+                            };
 
                             let percent_identity = if bucket.base_count > 0 {
                                 bucket.sum_percent_identity / bucket.base_count as f64
-                            } else { 0.0 };
+                            } else {
+                                0.0
+                            };
 
                             let alignment_length = if bucket.base_count > 0 {
                                 bucket.sum_alignment_length / bucket.base_count as f64
-                            } else { 0.0 };
+                            } else {
+                                0.0
+                            };
 
                             let e_value = if bucket.base_count > 0 {
                                 bucket.sum_e_value / bucket.base_count as f64
-                            } else { 0.0 };
+                            } else {
+                                0.0
+                            };
 
                             let count = TaxonCount {
                                 tax_id: taxid,
@@ -1655,13 +1779,13 @@ pub async fn generate_taxon_count_json_from_m8(
                                 e_value,
                                 count_type: db_type.clone(),
                                 base_count: bucket.base_count,
-                                source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+                                source_count_type: Some(
+                                    bucket.source_count_type.into_iter().collect(),
+                                ),
                             };
 
                             let json = serde_json::to_string(&count)? + "\n";
-                            let _ = output_tx
-                                .send(ParseOutput::Bytes(Bytes::from(json)))
-                                .await;
+                            let _ = output_tx.send(ParseOutput::Bytes(Bytes::from(json))).await;
                         }
                     }
                 } else {
@@ -1679,11 +1803,12 @@ pub async fn generate_taxon_count_json_from_m8(
         w.await??;
     }
 
-    info!("Finished taxon count JSON generation for {} (bounded channel, {} workers)", db_type, concurrency);
+    info!(
+        "Finished taxon count JSON generation for {} (bounded channel, {} workers)",
+        db_type, concurrency
+    );
     Ok(())
 }
-
-
 
 /// Generates taxonomic counts from a called m8 stream.
 ///
@@ -1714,10 +1839,10 @@ pub async fn generate_taxon_counts(
     let num_workers = compute_phase_concurrency(
         &config,
         "generate_taxon_counts",
-        0.6,   // ~600 MB transient per worker (lineage cache + agg map)
+        0.6, // ~600 MB transient per worker (lineage cache + agg map)
         2.5,
-        128,   // EPYC 84c sweet spot
-        8,     // still useful on MacBook Air
+        128, // EPYC 84c sweet spot
+        8,   // still useful on MacBook Air
     );
 
     info!(
@@ -1955,7 +2080,10 @@ pub async fn generate_taxon_counts(
 
             let send_start = Instant::now();
             worker_txs[worker_idx]
-                .send((std::mem::take(&mut m8_batch), std::mem::take(&mut hit_batch)))
+                .send((
+                    std::mem::take(&mut m8_batch),
+                    std::mem::take(&mut hit_batch),
+                ))
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
@@ -2055,7 +2183,6 @@ pub async fn generate_taxon_counts(
     Ok(result)
 }
 
-
 /// Computes merged taxonomic counts from both NT and NR databases.
 ///
 /// # Arguments
@@ -2115,23 +2242,32 @@ pub async fn compute_merged_taxon_counts(
             };
             let line = String::from_utf8_lossy(&bytes);
             let trimmed = line.trim_end();
-            if trimmed.is_empty() { continue; }
+            if trimmed.is_empty() {
+                continue;
+            }
 
             let fields: Vec<&str> = trimmed.split('\t').collect();
-            if fields.len() < 10 { continue; }
+            if fields.len() < 10 {
+                continue;
+            }
 
             let read_id = fields[0].to_string();
             let contig_species = fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-            let read_species   = fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+            let read_species = fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
 
-            alignment_map.insert(read_id.clone(), SpeciesAlignmentResults {
-                contig: contig_species,
-                read: read_species,
-            });
+            alignment_map.insert(
+                read_id.clone(),
+                SpeciesAlignmentResults {
+                    contig: contig_species,
+                    read: read_species,
+                },
+            );
             hit_lines.insert(read_id, bytes);
         }
         (alignment_map, hit_lines)
-    }).await.map_err(|e| PipelineError::Other(e.into()))?;
+    })
+    .await
+    .map_err(|e| PipelineError::Other(e.into()))?;
 
     // 2. Parallel file writers (background cleanup)
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
@@ -2175,24 +2311,31 @@ pub async fn compute_merged_taxon_counts(
             let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
 
             while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
-                let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
+                let m8_bytes = match m8_item {
+                    ParseOutput::Bytes(b) => b,
+                    _ => continue,
+                };
                 let hit_bytes = hit_item.to_bytes()?;
 
                 let hit_line = String::from_utf8_lossy(&hit_bytes);
                 let trimmed = hit_line.trim_end();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
 
                 let hit_fields: Vec<&str> = trimmed.split('\t').collect();
-                if hit_fields.len() < 10 { continue; }
+                if hit_fields.len() < 10 {
+                    continue;
+                }
 
                 let read_id = hit_fields[0];
 
                 let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-                let nt_read   = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+                let nt_read = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
 
                 let nr_align = nr_alignment_map.get(read_id);
                 let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
-                let _has_nr_read   = nr_align.map_or(false, |a| a.read.is_some());
+                let _has_nr_read = nr_align.map_or(false, |a| a.read.is_some());
 
                 if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
                     let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
@@ -2202,7 +2345,9 @@ pub async fn compute_merged_taxon_counts(
                     let _ = nt_hit_write_tx.send(hit_bytes_out.clone()).await;
 
                     let _ = merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await;
-                    let _ = merged_hit_tx_nt.send(ParseOutput::Bytes(hit_bytes_out)).await;
+                    let _ = merged_hit_tx_nt
+                        .send(ParseOutput::Bytes(hit_bytes_out))
+                        .await;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -2222,11 +2367,16 @@ pub async fn compute_merged_taxon_counts(
             let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
 
             while let Some(m8_item) = nr_m8.next().await {
-                let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
+                let m8_bytes = match m8_item {
+                    ParseOutput::Bytes(b) => b,
+                    _ => continue,
+                };
 
                 let m8_str = String::from_utf8_lossy(&m8_bytes);
                 let trimmed_m8 = m8_str.trim_end();
-                if trimmed_m8.is_empty() { continue; }
+                if trimmed_m8.is_empty() {
+                    continue;
+                }
 
                 let m8_fields: Vec<&str> = trimmed_m8.split('\t').collect();
                 let read_id = m8_fields[0];
@@ -2245,7 +2395,9 @@ pub async fn compute_merged_taxon_counts(
                     let _ = nr_hit_write_tx.send(hit_bytes_out.clone()).await;
 
                     let _ = merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await;
-                    let _ = merged_hit_tx_nr.send(ParseOutput::Bytes(hit_bytes_out)).await;
+                    let _ = merged_hit_tx_nr
+                        .send(ParseOutput::Bytes(hit_bytes_out))
+                        .await;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -2262,7 +2414,8 @@ pub async fn compute_merged_taxon_counts(
         should_keep_filter.clone(),
         "merged_NT_NR".to_string(),
         None,
-    ).await?;
+    )
+    .await?;
 
     let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
     tokio::fs::write(&merged_taxon_counts_path, json).await?;
@@ -2276,28 +2429,37 @@ pub async fn compute_merged_taxon_counts(
         for mut entry in nt_contig_summary {
             entry.db_type = "merged_NT_NR".to_string();
             nt_contig_names.insert(entry.contig_name.clone());
-            merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+            merged_contigs
+                .entry(entry.species_taxid)
+                .or_default()
+                .push(entry);
         }
 
         for mut entry in nr_contig_summary {
             if !nt_contig_names.contains(&entry.contig_name) {
                 entry.db_type = "merged_NT_NR".to_string();
-                merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+                merged_contigs
+                    .entry(entry.species_taxid)
+                    .or_default()
+                    .push(entry);
             }
         }
 
         merged_contigs.into_values().flatten().collect::<Vec<_>>()
-    }).await.map_err(|e| PipelineError::Other(e.into()))?;
+    })
+    .await
+    .map_err(|e| PipelineError::Other(e.into()))?;
 
     let json = serde_json::to_string_pretty(&final_contigs)?;
     tokio::fs::write(&merged_contig_summary_path, json).await?;
-    info!("Merged contig summary written ({} entries)", final_contigs.len());
+    info!(
+        "Merged contig summary written ({} entries)",
+        final_contigs.len()
+    );
 
     info!("compute_merged_taxon_counts complete — exact Python logic, fully streaming");
     Ok(cleanup_tasks)
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -2310,23 +2472,16 @@ mod tests {
             // Valid tag: key:type:value
             ("[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}")
                 .prop_map(|(k, t, v)| format!("{}:{}{}", k, t, v)),
-
             // Malformed: missing type (only one colon)
-            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}")
-                .prop_map(|(k, v)| format!("{}:{}", k, v)),
-
+            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}").prop_map(|(k, v)| format!("{}:{}", k, v)),
             // Malformed: empty key
             (":[A-Za-z]:[^\\t\\n]{0,30}").prop_map(|s| s.to_string()),
-
             // Malformed: empty value
             ("[A-Za-z0-9_]{1,10}:[A-Za-z]:").prop_map(|s| s.to_string()),
-
             // Malformed: garbage / no colons
             "[A-Za-z0-9_:\\-]{1,40}".prop_map(|s| s),
-
             // Malformed: trailing colon only
             "[A-Za-z0-9_]{1,10}:".prop_map(|s| s.to_string()),
-
             // Empty tag field (consecutive tabs)
             Just("".to_string()),
         ]
@@ -2413,20 +2568,20 @@ mod tests {
 
     #[allow(dead_code)]
     fn assert_m8_eq(a: &M8Record, b: &M8Record, ctx: &str) {
-        assert_eq!(a.qname,    b.qname,    "{ctx}: qname");
-        assert_eq!(a.tname,    b.tname,    "{ctx}: tname");
+        assert_eq!(a.qname, b.qname, "{ctx}: qname");
+        assert_eq!(a.tname, b.tname, "{ctx}: tname");
         assert!((a.pident - b.pident).abs() < 1e-9, "{ctx}: pident");
-        assert_eq!(a.alen,     b.alen,     "{ctx}: alen");
+        assert_eq!(a.alen, b.alen, "{ctx}: alen");
         assert_eq!(a.mismatch, b.mismatch, "{ctx}: mismatch");
-        assert_eq!(a.gapopen,  b.gapopen,  "{ctx}: gapopen");
-        assert_eq!(a.qstart,   b.qstart,   "{ctx}: qstart");
-        assert_eq!(a.qend,     b.qend,     "{ctx}: qend");
-        assert_eq!(a.tstart,   b.tstart,   "{ctx}: tstart");
-        assert_eq!(a.tend,     b.tend,     "{ctx}: tend");
-        assert!((a.evalue   - b.evalue  ).abs() < 1e-30, "{ctx}: evalue");
-        assert!((a.bitscore - b.bitscore).abs() < 1e-9,  "{ctx}: bitscore");
-        assert_eq!(a.qlen,     b.qlen,     "{ctx}: qlen");
-        assert_eq!(a.slen,     b.slen,     "{ctx}: slen");
+        assert_eq!(a.gapopen, b.gapopen, "{ctx}: gapopen");
+        assert_eq!(a.qstart, b.qstart, "{ctx}: qstart");
+        assert_eq!(a.qend, b.qend, "{ctx}: qend");
+        assert_eq!(a.tstart, b.tstart, "{ctx}: tstart");
+        assert_eq!(a.tend, b.tend, "{ctx}: tend");
+        assert!((a.evalue - b.evalue).abs() < 1e-30, "{ctx}: evalue");
+        assert!((a.bitscore - b.bitscore).abs() < 1e-9, "{ctx}: bitscore");
+        assert_eq!(a.qlen, b.qlen, "{ctx}: qlen");
+        assert_eq!(a.slen, b.slen, "{ctx}: slen");
     }
 
     fn compare_nt(line: &str) {
@@ -2461,14 +2616,12 @@ mod tests {
         "read5\tNC_045512.2\t99.333\t150\t1\t0\t1\t150\t100\t249\t1.23e-75\t285.000\t150\t29903\textra1\textra2";
 
     // ── NR test constants ──────────────────────────────────────────────────
-    const NR_BASIC: &str =
-        "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000";
+    const NR_BASIC: &str = "read1\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000";
 
     const NR_ZERO_EVALUE: &str =
         "read2\tAAA12345.1\t100.000\t300\t0\t0\t1\t300\t1\t300\t0.0\t600.000";
 
-    const NR_GAPS: &str =
-        "read3\tXYZ99999.2\t78.431\t153\t33\t3\t10\t162\t5\t155\t8.9e-20\t89.700";
+    const NR_GAPS: &str = "read3\tXYZ99999.2\t78.431\t153\t33\t3\t10\t162\t5\t155\t8.9e-20\t89.700";
 
     const NR_TRAILING_WHITESPACE: &str =
         "read4\tQIK02963.1\t87.500\t96\t12\t0\t1\t96\t1\t96\t1.45e-38\t152.000   ";
@@ -2478,16 +2631,24 @@ mod tests {
 
     // ── NT tests ──────────────────────────────────────────────────────────
     #[test]
-    fn test_nt_basic() { compare_nt(NT_BASIC); }
+    fn test_nt_basic() {
+        compare_nt(NT_BASIC);
+    }
 
     #[test]
-    fn test_nt_zero_evalue() { compare_nt(NT_ZERO_EVALUE); }
+    fn test_nt_zero_evalue() {
+        compare_nt(NT_ZERO_EVALUE);
+    }
 
     #[test]
-    fn test_nt_mismatches_gaps() { compare_nt(NT_MISMATCHES); }
+    fn test_nt_mismatches_gaps() {
+        compare_nt(NT_MISMATCHES);
+    }
 
     #[test]
-    fn test_nt_long_qname_spans_two_chunks() { compare_nt(NT_LONG_QNAME); }
+    fn test_nt_long_qname_spans_two_chunks() {
+        compare_nt(NT_LONG_QNAME);
+    }
 
     #[test]
     fn test_nt_trailing_whitespace() {
@@ -2525,13 +2686,19 @@ mod tests {
 
     // ── NR tests ──────────────────────────────────────────────────────────
     #[test]
-    fn test_nr_basic() { compare_nr(NR_BASIC); }
+    fn test_nr_basic() {
+        compare_nr(NR_BASIC);
+    }
 
     #[test]
-    fn test_nr_zero_evalue() { compare_nr(NR_ZERO_EVALUE); }
+    fn test_nr_zero_evalue() {
+        compare_nr(NR_ZERO_EVALUE);
+    }
 
     #[test]
-    fn test_nr_gaps() { compare_nr(NR_GAPS); }
+    fn test_nr_gaps() {
+        compare_nr(NR_GAPS);
+    }
 
     #[test]
     fn test_nr_trailing_whitespace() {
@@ -2686,8 +2853,9 @@ mod tests {
         let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
         let should_keep = Arc::new(|_: &[i32]| true);
 
-        let (level, taxid, kept) = consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-            .expect("consensus_level should succeed");
+        let (level, taxid, kept) =
+            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
+                .expect("consensus_level should succeed");
 
         assert_eq!(level, 3);
         assert_eq!(taxid, 100);
@@ -2707,8 +2875,9 @@ mod tests {
         let acc2taxid_map = build_acc_map(&[("ACC1", 1), ("ACC2", 2)]);
         let should_keep = Arc::new(|_: &[i32]| true);
 
-        let (level, taxid, kept) = consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-            .expect("consensus_level should succeed");
+        let (level, taxid, kept) =
+            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
+                .expect("consensus_level should succeed");
 
         assert_eq!(level, 2);
         assert_eq!(taxid, 10);
@@ -2722,8 +2891,9 @@ mod tests {
         let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
         let should_keep = Arc::new(|_: &[i32]| false);
 
-        let (level, taxid, kept) = consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-            .expect("consensus_level should return ok");
+        let (level, taxid, kept) =
+            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
+                .expect("consensus_level should return ok");
 
         assert_eq!((level, taxid), (0, 0));
         assert!(kept.is_empty());
@@ -2823,7 +2993,7 @@ mod tests {
             "NT",
             None,
         )
-            .expect("process_record_pair should not fail");
+        .expect("process_record_pair should not fail");
 
         assert!(agg.is_empty());
     }
@@ -2848,7 +3018,7 @@ mod tests {
             "NT",
             None,
         )
-            .expect("process_record_pair should succeed");
+        .expect("process_record_pair should succeed");
 
         assert!(!agg.is_empty());
         let bucket = agg.values().next().unwrap();
@@ -2878,7 +3048,7 @@ mod tests {
             "merged_NT_NR",
             Some("NR"),
         )
-            .expect("process_record_pair should succeed");
+        .expect("process_record_pair should succeed");
 
         let bucket = agg.values().next().unwrap();
         assert_eq!(bucket.base_count, 100);
@@ -2906,12 +3076,16 @@ mod tests {
             &should_keep,
             50,
         )
-            .expect("expected a reduced read");
+        .expect("expected a reduced read");
 
         assert_eq!(reduced.seq, 7);
         assert_eq!(reduced.accession, "ACC2");
-        assert!(std::str::from_utf8(&reduced.dedup).unwrap().starts_with("read1\tACC2\t"));
-        assert!(std::str::from_utf8(&reduced.summary).unwrap().starts_with("read1\tACC2\t"));
+        assert!(std::str::from_utf8(&reduced.dedup)
+            .unwrap()
+            .starts_with("read1\tACC2\t"));
+        assert!(std::str::from_utf8(&reduced.summary)
+            .unwrap()
+            .starts_with("read1\tACC2\t"));
     }
 
     #[test]

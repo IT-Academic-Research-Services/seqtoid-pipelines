@@ -1,4 +1,5 @@
-// src/config/defs.rs
+//! src/config/defs.rs
+
 use std::path::PathBuf;
 use std::collections::HashMap;
 use std::cmp::min;

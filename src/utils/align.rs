@@ -1,9 +1,10 @@
-use anyhow::anyhow;
-use bio::alignment::AlignmentOperation;
-use bio::alignment::pairwise::Aligner;
-use tokio::sync::mpsc::Receiver;
-use crate::utils::fastx::SequenceRecord;
+//! Aligning functions
 
+use crate::utils::fastx::SequenceRecord;
+use anyhow::anyhow;
+use bio::alignment::pairwise::Aligner;
+use bio::alignment::AlignmentOperation;
+use tokio::sync::mpsc::Receiver;
 
 /// Align contigs using rust-bio
 ///

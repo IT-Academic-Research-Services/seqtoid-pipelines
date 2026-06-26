@@ -1,32 +1,33 @@
-use anyhow::{anyhow, Result};
-use futures::StreamExt;
+//! SAM/BAM alignment counter and insert size statistics.
+
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use anyhow::{anyhow, Result};
+use dashmap::DashMap;
+use futures::StreamExt;
+use noodles::bam;
+use noodles::bam::r#async::io::Reader as BamAsyncReader;
+use noodles::bam::record::Record;
+use noodles::bam::record::Record as BamRecord;
+use tokio::fs::File;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
-use noodles::bam::r#async::io::Reader as BamAsyncReader;
-use noodles::bam::record::{Record};
-use noodles::bam::record::Record as BamRecord;
-use noodles::bam;
-use tokio::fs::File;
-use dashmap::DashMap;
 
-
-use crate::utils::streams::ParseOutput;
 use crate::config::defs::ClusterInfo;
+use crate::utils::streams::ParseOutput;
 
 #[derive(Debug, Clone)]
 pub struct InsertSizeStats {
-    pub insert_sizes: Vec<(u32, u64)>,      // (size, count) sorted by size
+    pub insert_sizes: Vec<(u32, u64)>, // (size, count) sorted by size
     pub total_proper_pairs: u64,
     pub mean: f64,
     pub median: f64,
     pub stddev: f64,
-    pub mapped_proper_pairs: u64,           // should == total_proper_pairs here
+    pub mapped_proper_pairs: u64, // should == total_proper_pairs here
 }
 
 pub async fn stream_sam_alignment_counter(
@@ -49,13 +50,16 @@ pub async fn stream_sam_alignment_counter(
                     }
                 }
             }
-            _ => return Err(anyhow!("Unexpected ParseOutput in SAM stream; expected Bytes")),
+            _ => {
+                return Err(anyhow!(
+                    "Unexpected ParseOutput in SAM stream; expected Bytes"
+                ))
+            }
         }
     }
 
     Ok(counter)
 }
-
 
 fn anyhow_to_io(e: anyhow::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
@@ -67,19 +71,24 @@ pub async fn generate_info_from_bam_stream(
     min_contig_size: usize,
     concurrency: usize,
 ) -> Result<(
-    HashMap<String, String>,           // read2contig
-    HashMap<String, u64>,              // contig_stats (cluster-adjusted)
-    HashMap<String, usize>,            // contig_unique_counts
+    HashMap<String, String>, // read2contig
+    HashMap<String, u64>,    // contig_stats (cluster-adjusted)
+    HashMap<String, usize>,  // contig_unique_counts
 )> {
     let byte_stream = ReceiverStream::new(rx).map(|item| match item {
         ParseOutput::Bytes(bytes) => Ok(bytes),
-        _ => Err(anyhow_to_io(anyhow!("BAM stream received non-Bytes variant"))),
+        _ => Err(anyhow_to_io(anyhow!(
+            "BAM stream received non-Bytes variant"
+        ))),
     });
 
     let stream_reader = StreamReader::new(byte_stream);
     let mut bam_reader = BamAsyncReader::new(stream_reader);
 
-    let header = bam_reader.read_header().await.map_err(|e| anyhow!("BAM header error: {}", e))?;
+    let header = bam_reader
+        .read_header()
+        .await
+        .map_err(|e| anyhow!("BAM header error: {}", e))?;
 
     // Shared structures
     let read2contig = Arc::new(DashMap::new());
@@ -198,14 +207,25 @@ pub async fn generate_info_from_bam_stream(
     drop(job_tx);
 
     for handle in worker_handles {
-        handle.await.map_err(|e| anyhow!("Worker join error: {}", e))??;
+        handle
+            .await
+            .map_err(|e| anyhow!("Worker join error: {}", e))??;
     }
 
-    let read2contig: HashMap<String, String> = read2contig.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+    let read2contig: HashMap<String, String> = read2contig
+        .iter()
+        .map(|r| (r.key().clone(), r.value().clone()))
+        .collect();
 
-    let mut contig_stats: HashMap<String, u64> = contig_stats.iter().map(|r| (r.key().clone(), *r.value())).collect();
+    let mut contig_stats: HashMap<String, u64> = contig_stats
+        .iter()
+        .map(|r| (r.key().clone(), *r.value()))
+        .collect();
 
-    let mut contig_unique_counts: HashMap<String, usize> = contig_unique_counts.iter().map(|r| (r.key().clone(), *r.value())).collect();
+    let mut contig_unique_counts: HashMap<String, usize> = contig_unique_counts
+        .iter()
+        .map(|r| (r.key().clone(), *r.value()))
+        .collect();
 
     // Apply min unique read filter
     contig_stats.retain(|contig_name, _| {
@@ -216,7 +236,6 @@ pub async fn generate_info_from_bam_stream(
 
     Ok((read2contig, contig_stats, contig_unique_counts))
 }
-
 
 /// Insert stats from an exisiting bam file
 ///
@@ -241,7 +260,9 @@ pub async fn compute_insert_size_stats_from_bam(
     let mut bam_reader = bam::r#async::io::Reader::new(file);
 
     // noodles-bam requires the header to be read first
-    let _header = bam_reader.read_header().await
+    let _header = bam_reader
+        .read_header()
+        .await
         .map_err(|e| anyhow!("BAM header error: {}", e))?;
 
     let histogram = Arc::new(Mutex::new(HashMap::<u32, u64>::new()));
@@ -386,7 +407,11 @@ mod tests {
     #[tokio::test]
     async fn test_stream_sam_alignment_counter_empty() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        let sam_data = vec![ParseOutput::Bytes(b"@HD\tVN:1.6\n@SQ\tSN:ERCC-00002\tLN:1061\n".to_vec().into())];
+        let sam_data = vec![ParseOutput::Bytes(
+            b"@HD\tVN:1.6\n@SQ\tSN:ERCC-00002\tLN:1061\n"
+                .to_vec()
+                .into(),
+        )];
 
         tokio::spawn(async move {
             for item in sam_data {

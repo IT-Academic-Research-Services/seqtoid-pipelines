@@ -1,16 +1,15 @@
-use sysinfo::System;
-use anyhow::anyhow;
-use anyhow::Result;
+//! Stream functions
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::pin::Pin;
 
-
+use anyhow::anyhow;
+use anyhow::Result;
 use log::{self, debug, info, error, warn};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter, ReadBuf};
 use tokio::process::{Child, Command};
@@ -25,7 +24,6 @@ use tokio::fs::File as TokioFile;
 use tokio::fs::{metadata, remove_file};
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use std::os::unix::fs::FileTypeExt;
-use uuid::Uuid;
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs::{self, set_permissions};
 use std::fs::Permissions;
@@ -37,11 +35,13 @@ use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG
 use crate::config::defs::{CoreAllocation, RunConfig};
 
 
+/// Trait for converting types into a `Bytes` representation.
 pub trait ToBytes {
     fn to_bytes(&self) -> Result<Bytes>;
 }
 
 impl ToBytes for SequenceRecord {
+    /// Converts a `SequenceRecord` into its corresponding FASTQ or FASTA byte representation.
     fn to_bytes(&self) -> Result<Bytes> {
         let mut buffer = Vec::new();
 
@@ -95,6 +95,7 @@ pub enum ParseOutput {
 }
 
 impl ToBytes for ParseOutput {
+    /// Converts `ParseOutput` variants into their byte representation.
     fn to_bytes(&self) -> Result<Bytes> {
         match self {
             ParseOutput::Fastq(record) => record.to_bytes(),
@@ -113,6 +114,7 @@ pub struct ChannelReader {
 }
 
 impl ChannelReader {
+    /// Creates a new `ChannelReader` from an `mpsc::Receiver`.
     pub fn new(rx: mpsc::Receiver<ParseOutput>) -> Self {
         Self {
             rx,
@@ -428,6 +430,18 @@ pub async fn stream_to_cmd(
     Ok((child, stdin_task, stderr_task))
 }
 
+/// Spawns an external command with specified arguments and captures its output.
+///
+/// # Arguments
+///
+/// * `config` - Shared run configuration
+/// * `cmd_tag` - Identifier for the command
+/// * `args` - Command line arguments
+/// * `verbose` - Whether to enable verbose output
+/// * `stderr_log_path` - Optional path to log stderr output
+///
+/// # Returns
+/// A result containing the child process and its stderr handling task.
 pub async fn spawn_cmd(
     config: Arc<RunConfig>,
     cmd_tag: &str,
@@ -1087,6 +1101,16 @@ pub async fn write_to_fifo(mut rx: mpsc::Receiver<ParseOutput>, fifo_path: PathB
     Ok(())
 }
 
+/// Deinterleaves a FASTQ stream into R1 and optionally R2 streams.
+///
+/// # Arguments
+///
+/// * `input_stream` - Stream of `ParseOutput` items.
+/// * `paired` - Whether the input is paired-end.
+/// * `buffer_size` - Buffer size for the output channels.
+///
+/// # Returns
+/// A tuple containing the R1 receiver, an optional R2 receiver, and the deinterleaving task handle.
 pub async fn deinterleave_fastq_stream(
     input_stream: ReceiverStream<ParseOutput>,
     paired: bool,
@@ -1270,6 +1294,16 @@ pub async fn deinterleave_fastq_stream_to_fifos(
 
 
 
+/// Interleaves two FASTQ streams into a single stream.
+///
+/// # Arguments
+///
+/// * `r1_rx` - Receiver for the first read stream.
+/// * `r2_rx` - Receiver for the second read stream.
+/// * `buffer_size` - Buffer size for the output channel.
+///
+/// # Returns
+/// A result containing the interleaved receiver and the interleaving task handle.
 pub async fn interleave_fastq_streams(
     r1_rx: mpsc::Receiver<ParseOutput>,
     r2_rx: mpsc::Receiver<ParseOutput>,
@@ -1339,6 +1373,15 @@ pub async fn y_junction(
 }
 
 
+/// Converts a FASTA stream into a stream of `SequenceRecord` objects.
+///
+/// # Arguments
+///
+/// * `rx` - Receiver for the `ParseOutput` stream.
+/// * `buffer_size` - Buffer size for the output channel.
+///
+/// # Returns
+/// A result containing the `SequenceRecord` receiver and the conversion task handle.
 pub async fn convert_fasta_stream_to_sequence_record(
     rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
@@ -1368,6 +1411,15 @@ pub async fn convert_fasta_stream_to_sequence_record(
 }
 
 
+/// Splits a byte stream into a stream of lines (as `ParseOutput::Bytes`).
+///
+/// # Arguments
+///
+/// * `rx` - Receiver for the input byte stream.
+/// * `buffer_size` - Buffer size for the output channel.
+///
+/// # Returns
+/// A result containing the line receiver and the processing task handle.
 pub async fn bytes_to_lines(
     rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
@@ -1434,6 +1486,16 @@ pub async fn join_with_error_handling<T>(task: JoinHandle<anyhow::Result<T, anyh
 
 
 
+/// Monitors a stream and logs its progress and velocity at regular intervals.
+///
+/// # Arguments
+///
+/// * `input` - Input stream to monitor.
+/// * `stage_name` - Name of the pipeline stage for logging.
+/// * `log_interval` - Time between log messages.
+///
+/// # Returns
+/// A new stream that forwards all items from the input stream.
 pub fn monitor_stream(
     input: ReceiverStream<ParseOutput>,
     stage_name: &str,
@@ -1558,12 +1620,18 @@ pub fn monitor_stream(
 }
 
 
-/// Guarantees: zero data drops,  cleanup_receivers untouched.
+/// Processes a stream in batches using Rayon for parallel processing.
 ///
-/// Speed improvements
-/// - reuses the input batch buffer allocation instead of `std::mem::take`
-/// - reserves space for incoming chunks before extending
-/// - surfaces downstream send failure instead of silently ignoring it
+/// # Arguments
+///
+/// * `config` - Shared run configuration.
+/// * `input` - Input stream of `ParseOutput`.
+/// * `processor` - Function that processes a batch of bytes and returns a vector of byte vectors.
+/// * `stage_name` - Name of the stage for logging.
+/// * `batch_target_bytes` - Target size for each batch in bytes.
+///
+/// # Returns
+/// A new stream containing the processed items.
 pub fn batch_rayon_process<F>(
     config: Arc<RunConfig>,
     mut input: ReceiverStream<ParseOutput>,
@@ -1669,6 +1737,17 @@ where
 /// Never silently drops data.
 /// Every branch receives every item (or we error loudly).
 /// Every branch sees clean EOF when upstream ends (including the 0-item case).
+///
+/// # Arguments
+///
+/// * `upstream` - Input stream.
+/// * `n_branches` - Number of downstream branches to create.
+/// * `label` - Label for logging.
+/// * `config` - Shared run configuration.
+/// * `data_type` - Type of data being streamed.
+///
+/// # Returns
+/// A result containing a vector of receivers for each branch and a oneshot receiver for completion status.
 pub async fn fanout_to_channels(
     mut upstream: ReceiverStream<ParseOutput>,
     n_branches: usize,
@@ -1787,7 +1866,7 @@ mod tests {
     use crate::utils::system::{detect_ram, generate_rng};
 
 
-    // Helper function to create a RunConfig for tests
+    /// Helper function to create a `RunConfig` for tests.
     fn create_test_run_config() -> Arc<RunConfig> {
         let args = Arguments {
             threads: 8,

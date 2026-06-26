@@ -1,17 +1,16 @@
-/// Analysis of data that does not fit elsewhere (i.e. not FASTX-based)
-use anyhow::{Result, anyhow};
+//! Analysis of data that does not fit elsewhere (i.e. not FASTX-based)
+
+use std::collections::HashMap;
+
+use anyhow::{anyhow, Result};
 use log::{self, info, warn};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use std::collections::HashMap;
-use crate::utils::streams::ParseOutput;
-use crate::utils::fastx::SequenceRecord;
+
 use crate::config::defs::SamtoolsStats;
-
-
-
-
+use crate::utils::fastx::SequenceRecord;
+use crate::utils::streams::ParseOutput;
 
 /// Helper function to compute Nx (e.g., N50, N75)
 ///
@@ -59,8 +58,6 @@ pub fn compute_lx(lengths: &[u64], fraction: f64) -> u32 {
     0
 }
 
-
-
 /// Parses `samtools stats` output lines.
 ///
 /// # Arguments
@@ -104,7 +101,10 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                                 if let Ok(count) = parts[2].parse::<u64>() {
                                     total_pairs = count;
                                 } else {
-                                    warn!("Failed to parse 'reads mapped and paired' count: {}", parts[2]);
+                                    warn!(
+                                        "Failed to parse 'reads mapped and paired' count: {}",
+                                        parts[2]
+                                    );
                                 }
                             }
                         } else {
@@ -129,7 +129,11 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
                                 insert_sizes.push((size, count));
                             }
                         } else {
-                            warn!("Malformed IS line (expected 5 fields, got {}): {}", parts.len(), line);
+                            warn!(
+                                "Malformed IS line (expected 5 fields, got {}): {}",
+                                parts.len(),
+                                line
+                            );
                         }
                     }
                     _ => {}
@@ -145,7 +149,11 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
     if insert_sizes.is_empty() {
         warn!("No valid IS lines parsed — likely single-end or no mapped pairs");
     } else {
-        info!("Parsed {} insert size bins, total_pairs = {}", insert_sizes.len(), total_pairs);
+        info!(
+            "Parsed {} insert size bins, total_pairs = {}",
+            insert_sizes.len(),
+            total_pairs
+        );
     }
 
     Ok(SamtoolsStats {
@@ -154,7 +162,6 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
         total_pairs,
     })
 }
-
 
 /// Parses `samtools depth` output lines.
 ///
@@ -165,7 +172,9 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
 /// # Returns
 ///
 /// Result<HashMap<String, HashMap<usize, u32>>>: map of chromosome to (position to depth)
-pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, HashMap<usize, u32>>> {
+pub async fn parse_samtools_depth(
+    rx: mpsc::Receiver<ParseOutput>,
+) -> Result<HashMap<String, HashMap<usize, u32>>> {
     let mut depth_map: HashMap<String, HashMap<usize, u32>> = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
     let mut line_count = 0;
@@ -189,9 +198,9 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
                 }
 
                 let chr = parts[0].to_string();
-                let pos: usize = parts[1]
-                    .parse()
-                    .map_err(|e| anyhow!("Failed to parse position at line {}: {}", line_count, e))?;
+                let pos: usize = parts[1].parse().map_err(|e| {
+                    anyhow!("Failed to parse position at line {}: {}", line_count, e)
+                })?;
                 let depth: u32 = parts[2]
                     .parse()
                     .map_err(|e| anyhow!("Failed to parse depth at line {}: {}", line_count, e))?;
@@ -202,7 +211,10 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
                     .insert(pos, depth);
             }
             _ => {
-                return Err(anyhow!("Unexpected non-byte data in samtools depth stream at line {}", line_count));
+                return Err(anyhow!(
+                    "Unexpected non-byte data in samtools depth stream at line {}",
+                    line_count
+                ));
             }
         }
     }
@@ -213,7 +225,6 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
 
     Ok(depth_map)
 }
-
 
 /// Computes depth statistics from a slice of depth values.
 ///
@@ -277,7 +288,6 @@ pub fn compute_depth_stats(depths: &[u32]) -> Result<HashMap<String, f64>> {
     Ok(stats)
 }
 
-
 /// Parses `seqkit stats` output.
 ///
 /// # Arguments
@@ -287,7 +297,9 @@ pub fn compute_depth_stats(depths: &[u32]) -> Result<HashMap<String, f64>> {
 /// # Returns
 ///
 /// Result<HashMap<String, String>>: map of statistic names to their values
-pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
+pub async fn parse_seqkit_stats(
+    rx: mpsc::Receiver<ParseOutput>,
+) -> Result<HashMap<String, String>> {
     let mut stats = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
     let mut header_processed = false;
@@ -309,14 +321,20 @@ pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashM
                 }
 
                 if parts.len() < 8 {
-                    return Err(anyhow!("Invalid seqkit stats format: expected at least 8 fields, found {}", parts.len()));
+                    return Err(anyhow!(
+                        "Invalid seqkit stats format: expected at least 8 fields, found {}",
+                        parts.len()
+                    ));
                 }
 
                 // Extract fields
                 stats.insert("file".to_string(), parts[0].to_string());
                 stats.insert("format".to_string(), parts[1].to_string());
                 stats.insert("type".to_string(), parts[2].to_string());
-                stats.insert("num_seqs".to_string(), parts[3].replace(",", "").to_string());
+                stats.insert(
+                    "num_seqs".to_string(),
+                    parts[3].replace(",", "").to_string(),
+                );
                 stats.insert("sum_len".to_string(), parts[4].replace(",", "").to_string());
                 stats.insert("min_len".to_string(), parts[5].replace(",", "").to_string());
                 stats.insert("avg_len".to_string(), parts[6].to_string());
@@ -334,7 +352,6 @@ pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashM
 
     Ok(stats)
 }
-
 
 /// Parses ERCC statistics from `samtools stats` output.
 ///
@@ -404,7 +421,6 @@ pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap
     Ok(stats)
 }
 
-
 /// Computes allele counts from a FASTA sequence stream.
 ///
 /// # Arguments
@@ -438,7 +454,6 @@ pub async fn compute_allele_counts(rx: mpsc::Receiver<ParseOutput>) -> Result<Ha
     Ok(counts)
 }
 
-
 /// Computes coverage bins for visualization.
 ///
 /// # Arguments
@@ -449,9 +464,16 @@ pub async fn compute_allele_counts(rx: mpsc::Receiver<ParseOutput>) -> Result<Ha
 /// # Returns
 ///
 /// (f64, Vec<(usize, f64, f64, u8, u8)>): tuple of (bin size, vector of (bin index, avg depth, avg breadth, 1, 0))
-pub fn compute_coverage_bins(depths: &[u32], max_num_bins: usize) -> (f64, Vec<(usize, f64, f64, u8, u8)>) {
+pub fn compute_coverage_bins(
+    depths: &[u32],
+    max_num_bins: usize,
+) -> (f64, Vec<(usize, f64, f64, u8, u8)>) {
     let len = depths.len();
-    let num_bins = if len <= max_num_bins { len } else { max_num_bins };
+    let num_bins = if len <= max_num_bins {
+        len
+    } else {
+        max_num_bins
+    };
     let bin_size = len as f64 / num_bins as f64;
     let mut coverage = Vec::with_capacity(num_bins);
     for index in 0..num_bins {
