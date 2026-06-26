@@ -14,11 +14,13 @@ use ahash::{AHashMap, RandomState as AHashState};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::mpsc;
+use tokio::io::AsyncWriteExt;
 use dashmap::DashMap;
 use bytes::Bytes;
 use once_cell::sync::Lazy;
+use ahash::RandomState as AHashRandomState;
 
-use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel, PipelineError, RunConfig, StreamDataType, SORT_TAG};
+use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel, PipelineError, RunConfig, StreamDataType, SORT_TAG, NT_TAG, NR_TAG};
 use crate::utils::streams::{ParseOutput, parse_lines, fanout_to_channels, ToBytes, spawn_cmd};
 use crate::utils::taxonomy::{validate_taxid_lineage};
 use crate::utils::file::{choose_temp_dir, write_byte_stream_to_file, rename_file_path};
@@ -28,6 +30,10 @@ use tokio::time::Instant;
 use tokio::sync::oneshot;
 use std::path::PathBuf;
 use std::collections::HashMap;
+use futures::future::try_join_all;
+use tokio::io::BufWriter;
+use tokio::task::JoinHandle;
+use crate::utils::system::compute_phase_concurrency;
 
 /// Represents an entry in the contig summary, grouping metadata and hit stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1677,6 +1683,619 @@ pub async fn generate_taxon_count_json_from_m8(
     Ok(())
 }
 
+
+
+/// Generates taxonomic counts from a called m8 stream.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `m8_stream`: line-based m8 format input stream
+/// * `summary_stream`: stream of summary information from m8
+/// * `duplicate_clusters`: map of cluster information
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `count_type`: type of database being referenced (e.g., "NT")
+/// * `source_count_type`: optional second source type (e.g., "NR")
+///
+/// # Returns
+///
+/// Result containing a vector of taxon counts
+pub async fn generate_taxon_counts(
+    config: Arc<RunConfig>,
+    m8_stream: ReceiverStream<ParseOutput>,
+    summary_stream: ReceiverStream<ParseOutput>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    count_type: String,
+    source_count_type: Option<String>, // kept for exact call-site compatibility
+) -> Result<Vec<TaxonCount>, PipelineError> {
+    use std::time::Duration;
+
+    let num_workers = compute_phase_concurrency(
+        &config,
+        "generate_taxon_counts",
+        0.6,   // ~600 MB transient per worker (lineage cache + agg map)
+        2.5,
+        128,   // EPYC 84c sweet spot
+        8,     // still useful on MacBook Air
+    );
+
+    info!(
+        "generate_taxon_counts({}) — {} workers, per-worker local AHashMap + lineage cache (exact Python semantics)",
+        count_type, num_workers
+    );
+
+    let (worker_txs, worker_rxs): (Vec<_>, Vec<_>) = (0..num_workers)
+        .map(|_| mpsc::channel::<(Vec<Bytes>, Vec<Bytes>)>(64))
+        .unzip();
+
+    // Spawn workers — each owns a completely private aggregation map + cache.
+    // We also time each recv() so we can see whether workers are starved or blocked.
+    let worker_handles: Vec<_> = worker_rxs
+        .into_iter()
+        .enumerate()
+        .map(|(worker_idx, mut rx)| {
+            let dup = duplicate_clusters.clone();
+            let keep = should_keep_filter.clone();
+            let src = source_count_type.clone();
+            let ct = count_type.clone();
+
+            tokio::spawn(async move {
+                let mut agg: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
+                let mut lineage_cache: AHashMap<i32, Vec<i32>> = AHashMap::new();
+
+                let mut batches = 0usize;
+                let mut total_pairs = 0usize;
+                let mut max_recv_wait = Duration::from_secs(0);
+                let mut max_batch_process = Duration::from_secs(0);
+                let start = Instant::now();
+
+                loop {
+                    let recv_start = Instant::now();
+                    let maybe_batch = rx.recv().await;
+                    let recv_wait = recv_start.elapsed();
+                    if recv_wait > max_recv_wait {
+                        max_recv_wait = recv_wait;
+                    }
+
+                    let Some((m8_batch, hit_batch)) = maybe_batch else {
+                        break;
+                    };
+
+                    batches += 1;
+                    let batch_start = Instant::now();
+
+                    for (m8_bytes, hit_bytes) in m8_batch.into_iter().zip(hit_batch) {
+                        total_pairs += 1;
+                        process_record_pair(
+                            m8_bytes.as_ref(),
+                            hit_bytes.as_ref(),
+                            &mut agg,
+                            &mut lineage_cache,
+                            &dup,
+                            &*keep,
+                            &ct,
+                            src.as_deref(),
+                        )?;
+                    }
+
+                    let batch_elapsed = batch_start.elapsed();
+                    if batch_elapsed > max_batch_process {
+                        max_batch_process = batch_elapsed;
+                    }
+
+                    // if recv_wait >= Duration::from_millis(100)
+                    //     || batch_elapsed >= Duration::from_millis(100)
+                    // {
+                    //     debug!(
+                    //         "[generate_taxon_counts:{}] worker {} recv_wait={:?} batch_time={:?} batches={} pairs={} agg={} cache={}",
+                    //         ct,
+                    //         worker_idx,
+                    //         recv_wait,
+                    //         batch_elapsed,
+                    //         batches,
+                    //         total_pairs,
+                    //         agg.len(),
+                    //         lineage_cache.len(),
+                    //     );
+                    // }
+
+                    // if last_log.elapsed() >= Duration::from_secs(10) {
+                    //     info!(
+                    //         "[generate_taxon_counts:{}] worker {} progress: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} agg={} cache={} elapsed={:?}",
+                    //         ct,
+                    //         worker_idx,
+                    //         batches,
+                    //         total_pairs,
+                    //         max_recv_wait,
+                    //         max_batch_process,
+                    //         agg.len(),
+                    //         lineage_cache.len(),
+                    //         start.elapsed(),
+                    //     );
+                    //     last_log = Instant::now();
+                    // }
+                }
+
+                info!(
+                    "[generate_taxon_counts:{}] worker {} done: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} elapsed={:?}",
+                    ct,
+                    worker_idx,
+                    batches,
+                    total_pairs,
+                    max_recv_wait,
+                    max_batch_process,
+                    start.elapsed(),
+                );
+
+                Ok::<AHashMap<Vec<i32>, AggBucket>, anyhow::Error>(agg)
+            })
+        })
+        .collect();
+
+    // Producer: pair the two streams and round-robin to workers.
+    // Keep the original lockstep semantics, but add visibility at each await boundary.
+    let mut m8_batch: Vec<Bytes> = Vec::with_capacity(8192);
+    let mut hit_batch: Vec<Bytes> = Vec::with_capacity(8192);
+    let mut batch_idx = 0usize;
+    let mut total_pairs = 0usize;
+    let mut m8_items_seen = 0usize;
+    let mut hit_items_seen = 0usize;
+
+    let mut m8_iter = m8_stream;
+    let mut hit_iter = summary_stream;
+
+    let mut max_m8_wait = Duration::from_secs(0);
+    let mut max_hit_wait = Duration::from_secs(0);
+    let mut max_send_wait = Duration::from_secs(0);
+    let mut last_log = Instant::now();
+    let producer_start = Instant::now();
+
+    let mut m8_closed = false;
+    let mut hit_closed = false;
+
+    loop {
+        let (m8_res, hit_res) = tokio::join!(
+            async {
+                let start = Instant::now();
+                let item = m8_iter.next().await;
+                (item, start.elapsed())
+            },
+            async {
+                let start = Instant::now();
+                let item = hit_iter.next().await;
+                (item, start.elapsed())
+            }
+        );
+
+        let (m8_item, m8_wait) = m8_res;
+        let (hit_item, hit_wait) = hit_res;
+
+        if m8_wait > max_m8_wait {
+            max_m8_wait = m8_wait;
+        }
+        if hit_wait > max_hit_wait {
+            max_hit_wait = hit_wait;
+        }
+
+        if m8_wait >= Duration::from_millis(50) || hit_wait >= Duration::from_millis(50) {
+            let ratio = if hit_wait.as_nanos() > 0 {
+                m8_wait.as_secs_f64() / hit_wait.as_secs_f64()
+            } else {
+                0.0
+            };
+
+            let classification = if m8_wait > hit_wait * 5 {
+                "STARVING_ON_M8"
+            } else if hit_wait > m8_wait * 5 {
+                "STARVING_ON_SUMMARY"
+            } else {
+                "BOTH_SLOW"
+            };
+
+            warn!(
+                "[generate_taxon_counts:{}] WAIT: m8={:?} hit={:?} ratio={:.2} class={} total_pairs={} batches={}",
+                count_type,
+                m8_wait,
+                hit_wait,
+                ratio,
+                classification,
+                total_pairs,
+                batch_idx,
+            );
+        }
+
+        let m8_present = m8_item.is_some();
+        let hit_present = hit_item.is_some();
+
+        let (Some(m8_item), Some(hit_item)) = (m8_item, hit_item) else {
+            if !m8_present && !m8_closed {
+                m8_closed = true;
+                warn!(
+                    "[generate_taxon_counts:{}] m8 stream closed at pairs={} batches={}",
+                    count_type, total_pairs, batch_idx
+                );
+            }
+            if !hit_present && !hit_closed {
+                hit_closed = true;
+                warn!(
+                    "[generate_taxon_counts:{}] summary stream closed at pairs={} batches={}",
+                    count_type, total_pairs, batch_idx
+                );
+            }
+
+            warn!(
+                "[generate_taxon_counts:{}] STREAM CLOSED: m8_present={} hit_present={} total_pairs={} batches={}",
+                count_type,
+                m8_present,
+                hit_present,
+                total_pairs,
+                batch_idx
+            );
+            break;
+        };
+
+        if let ParseOutput::Bytes(b) = m8_item {
+            if !b.is_empty() {
+                m8_items_seen += 1;
+                m8_batch.push(b);
+                total_pairs += 1;
+            }
+        }
+
+        if let ParseOutput::Bytes(b) = hit_item {
+            if !b.is_empty() {
+                hit_items_seen += 1;
+                hit_batch.push(b);
+            }
+        }
+
+        if m8_batch.len() >= 8192 && hit_batch.len() >= 8192 {
+            let worker_idx = batch_idx % num_workers;
+
+            let send_start = Instant::now();
+            worker_txs[worker_idx]
+                .send((std::mem::take(&mut m8_batch), std::mem::take(&mut hit_batch)))
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "generate_taxon_counts({}) worker send failed: {}",
+                        count_type,
+                        e
+                    ))
+                })?;
+            let send_wait = send_start.elapsed();
+
+            if send_wait > max_send_wait {
+                max_send_wait = send_wait;
+            }
+
+            if m8_wait >= Duration::from_millis(100)
+                || hit_wait >= Duration::from_millis(100)
+                || send_wait >= Duration::from_millis(100)
+            {
+                info!(
+                    "[generate_taxon_counts:{}] batch {} waits: m8={:?} hit={:?} send={:?} total_pairs={} worker={}",
+                    count_type,
+                    batch_idx,
+                    m8_wait,
+                    hit_wait,
+                    send_wait,
+                    total_pairs,
+                    worker_idx,
+                );
+            }
+
+            batch_idx += 1;
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            info!(
+                "[generate_taxon_counts:{}] producer progress: pairs={} batches={} max_waits(m8={:?}, hit={:?}, send={:?}) elapsed={:?}",
+                count_type,
+                total_pairs,
+                batch_idx,
+                max_m8_wait,
+                max_hit_wait,
+                max_send_wait,
+                producer_start.elapsed(),
+            );
+            last_log = Instant::now();
+        }
+    }
+
+    // Final partial batch
+    if !m8_batch.is_empty() || !hit_batch.is_empty() {
+        let worker_idx = batch_idx % num_workers;
+        let send_start = Instant::now();
+        worker_txs[worker_idx]
+            .send((m8_batch, hit_batch))
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "generate_taxon_counts({}) final worker send failed: {}",
+                    count_type,
+                    e
+                ))
+            })?;
+        let send_wait = send_start.elapsed();
+        if send_wait > max_send_wait {
+            max_send_wait = send_wait;
+        }
+
+        info!(
+            "[generate_taxon_counts:{}] final batch sent to worker {} in {:?}",
+            count_type, worker_idx, send_wait
+        );
+    }
+
+    drop(worker_txs); // close all workers
+
+    // Merge the tiny partial maps from each worker.
+    let partials: Vec<AHashMap<Vec<i32>, AggBucket>> = try_join_all(worker_handles)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let global_agg = merge_aggregations(partials);
+
+    // Final Python Loop 2 — identical output shape
+    let result = build_taxon_counts_list(global_agg, &count_type);
+
+    info!(
+        "generate_taxon_counts({}) complete — {} taxa (max waits: m8={:?}, hit={:?}, send={:?})",
+        count_type,
+        result.len(),
+        max_m8_wait,
+        max_hit_wait,
+        max_send_wait,
+    );
+
+    Ok(result)
+}
+
+
+/// Computes merged taxonomic counts from both NT and NR databases.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `nt_m8_stream`: receiver for NT m8 records
+/// * `nt_hit_summary_stream`: receiver for NT hit summary records
+/// * `nt_contig_summary`: summary entries for NT contigs
+/// * `nr_m8_stream`: receiver for NR m8 records
+/// * `nr_hit_summary_stream`: receiver for NR hit summary records
+/// * `nr_contig_summary`: summary entries for NR contigs
+/// * `_lineage_map`: map of taxids to lineages (unused)
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `duplicate_clusters`: map of cluster information
+/// * `merged_m8_path`: output path for merged m8 file
+/// * `merged_hitsummary_path`: output path for merged hit summary file
+/// * `merged_taxon_counts_path`: output path for merged taxon counts file
+/// * `merged_contig_summary_path`: output path for merged contig summary file
+/// * `_nr_alignment_per_read`: map of NR alignments per read (unused)
+///
+/// # Returns
+///
+/// Result containing a vector of cleanup tasks
+pub async fn compute_merged_taxon_counts(
+    config: Arc<RunConfig>,
+    nt_m8_stream: mpsc::Receiver<ParseOutput>,
+    nt_hit_summary_stream: mpsc::Receiver<ParseOutput>,
+    nt_contig_summary: Vec<ContigSummaryEntry>,
+
+    nr_m8_stream: mpsc::Receiver<ParseOutput>,
+    nr_hit_summary_stream: mpsc::Receiver<ParseOutput>,
+    nr_contig_summary: Vec<ContigSummaryEntry>,
+
+    _lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+
+    merged_m8_path: PathBuf,
+    merged_hitsummary_path: PathBuf,
+    merged_taxon_counts_path: PathBuf,
+    merged_contig_summary_path: PathBuf,
+    _nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
+) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+
+    // 1. Parallel NR preload
+    let (nr_alignment_map, nr_hit_lines) = tokio::task::spawn_blocking(move || {
+        let mut alignment_map: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
+        let mut hit_lines: AHashMap<String, Bytes> = AHashMap::new();
+
+        let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
+
+        while let Some(item) = futures::executor::block_on(nr_hit_stream.next()) {
+            let bytes = match item.to_bytes() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let line = String::from_utf8_lossy(&bytes);
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() { continue; }
+
+            let fields: Vec<&str> = trimmed.split('\t').collect();
+            if fields.len() < 10 { continue; }
+
+            let read_id = fields[0].to_string();
+            let contig_species = fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
+            let read_species   = fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+
+            alignment_map.insert(read_id.clone(), SpeciesAlignmentResults {
+                contig: contig_species,
+                read: read_species,
+            });
+            hit_lines.insert(read_id, bytes);
+        }
+        (alignment_map, hit_lines)
+    }).await.map_err(|e| PipelineError::Other(e.into()))?;
+
+    // 2. Parallel file writers (background cleanup)
+    let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
+    let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
+
+    let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Bytes>(4096);
+    let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Bytes>(4096);
+
+    cleanup_tasks.push(tokio::spawn(async move {
+        while let Some(bytes) = m8_write_rx.recv().await {
+            let _ = merged_m8_file.write_all(&bytes).await;
+            let _ = merged_m8_file.write_all(b"\n").await;
+        }
+        let _ = merged_m8_file.flush().await;
+        Ok::<(), anyhow::Error>(())
+    }));
+
+    cleanup_tasks.push(tokio::spawn(async move {
+        while let Some(bytes) = hit_write_rx.recv().await {
+            let _ = merged_hit_file.write_all(&bytes).await;
+            let _ = merged_hit_file.write_all(b"\n").await;
+        }
+        let _ = merged_hit_file.flush().await;
+        Ok::<(), anyhow::Error>(())
+    }));
+
+    // 3. Parallel selection passes (NT first, then NR)
+    let (merged_m8_tx, merged_m8_rx) = mpsc::channel::<ParseOutput>(4096);
+    let (merged_hit_tx, merged_hit_rx) = mpsc::channel::<ParseOutput>(4096);
+
+    // NT pass
+    let nt_m8_write_tx = m8_write_tx.clone();
+    let nt_hit_write_tx = hit_write_tx.clone();
+    let merged_m8_tx_nt = merged_m8_tx.clone();
+    let merged_hit_tx_nt = merged_hit_tx.clone();
+
+    let nt_task = tokio::spawn({
+        let nr_alignment_map = nr_alignment_map.clone();
+        async move {
+            let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
+            let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
+
+            while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
+                let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
+                let hit_bytes = hit_item.to_bytes()?;
+
+                let hit_line = String::from_utf8_lossy(&hit_bytes);
+                let trimmed = hit_line.trim_end();
+                if trimmed.is_empty() { continue; }
+
+                let hit_fields: Vec<&str> = trimmed.split('\t').collect();
+                if hit_fields.len() < 10 { continue; }
+
+                let read_id = hit_fields[0];
+
+                let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
+                let nt_read   = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
+
+                let nr_align = nr_alignment_map.get(read_id);
+                let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
+                let _has_nr_read   = nr_align.map_or(false, |a| a.read.is_some());
+
+                if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
+                    let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
+                    let mut hit_with_source = hit_fields.to_vec();
+                    hit_with_source.push(NT_TAG);
+                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
+                    let _ = nt_hit_write_tx.send(hit_bytes_out.clone()).await;
+
+                    let _ = merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await;
+                    let _ = merged_hit_tx_nt.send(ParseOutput::Bytes(hit_bytes_out)).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    cleanup_tasks.push(nt_task);
+
+    // NR pass (remaining reads)
+    let nr_m8_write_tx = m8_write_tx;
+    let nr_hit_write_tx = hit_write_tx;
+    let merged_m8_tx_nr = merged_m8_tx;
+    let merged_hit_tx_nr = merged_hit_tx;
+
+    let nr_task = tokio::spawn({
+        let nr_hit_lines = nr_hit_lines.clone();
+        async move {
+            let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
+
+            while let Some(m8_item) = nr_m8.next().await {
+                let m8_bytes = match m8_item { ParseOutput::Bytes(b) => b, _ => continue };
+
+                let m8_str = String::from_utf8_lossy(&m8_bytes);
+                let trimmed_m8 = m8_str.trim_end();
+                if trimmed_m8.is_empty() { continue; }
+
+                let m8_fields: Vec<&str> = trimmed_m8.split('\t').collect();
+                let read_id = m8_fields[0];
+
+                if let Some(hit_bytes) = nr_hit_lines.get(read_id) {
+                    let _ = nr_m8_write_tx.send(m8_bytes.clone()).await;
+
+                    let mut hit_with_source = String::from_utf8_lossy(hit_bytes)
+                        .trim_end()
+                        .split('\t')
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>();
+                    hit_with_source.push(NR_TAG.to_string());
+
+                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
+                    let _ = nr_hit_write_tx.send(hit_bytes_out.clone()).await;
+
+                    let _ = merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await;
+                    let _ = merged_hit_tx_nr.send(ParseOutput::Bytes(hit_bytes_out)).await;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    cleanup_tasks.push(nr_task);
+
+    // 4. Taxon counting (already highly parallel from earlier work)
+    let merged_taxon_counts = generate_taxon_counts(
+        config.clone(),
+        ReceiverStream::new(merged_m8_rx),
+        ReceiverStream::new(merged_hit_rx),
+        duplicate_clusters.clone(),
+        should_keep_filter.clone(),
+        "merged_NT_NR".to_string(),
+        None,
+    ).await?;
+
+    let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
+    tokio::fs::write(&merged_taxon_counts_path, json).await?;
+    info!("Merged taxon counts generated (fully streaming)");
+
+    // 5. Parallel contig merge (exact Python _merge_contigs)
+    let final_contigs = tokio::task::spawn_blocking(move || {
+        let mut merged_contigs: HashMap<Taxid, Vec<ContigSummaryEntry>> = HashMap::new();
+        let mut nt_contig_names: HashSet<String> = HashSet::new();
+
+        for mut entry in nt_contig_summary {
+            entry.db_type = "merged_NT_NR".to_string();
+            nt_contig_names.insert(entry.contig_name.clone());
+            merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+        }
+
+        for mut entry in nr_contig_summary {
+            if !nt_contig_names.contains(&entry.contig_name) {
+                entry.db_type = "merged_NT_NR".to_string();
+                merged_contigs.entry(entry.species_taxid).or_default().push(entry);
+            }
+        }
+
+        merged_contigs.into_values().flatten().collect::<Vec<_>>()
+    }).await.map_err(|e| PipelineError::Other(e.into()))?;
+
+    let json = serde_json::to_string_pretty(&final_contigs)?;
+    tokio::fs::write(&merged_contig_summary_path, json).await?;
+    info!("Merged contig summary written ({} entries)", final_contigs.len());
+
+    info!("compute_merged_taxon_counts complete — exact Python logic, fully streaming");
+    Ok(cleanup_tasks)
+}
 
 
 
