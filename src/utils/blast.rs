@@ -23,6 +23,7 @@ use crate::utils::streams::ParseOutput;
 use crate::utils::taxonomy::validate_taxid_lineage;
 use crate::utils::streams::ToBytes;
 
+/// Represents an entry in the contig summary, grouping metadata and hit stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
     pub contig_name: String,
@@ -37,13 +38,14 @@ pub struct ContigSummaryEntry {
     pub family_taxid: i32,
 }
 
+/// Stores the best taxonomic alignment results for both a contig and its constituent read.
 #[derive(Debug, Clone, Default)]
 pub struct SpeciesAlignmentResults {
     pub contig: Option<Taxid>,
     pub read: Option<Taxid>,
 }
 
-/// Single BLAST m8 line
+/// Represents a single record in a BLAST m8 (tabular) output file.
 #[derive(Debug, Clone, Default)]
 pub struct M8Record {
     pub qname: String,       // Read ID
@@ -62,7 +64,7 @@ pub struct M8Record {
     pub slen: u64,   // Subject length: From column in NT; 0 in NR (unused entirely)
 }
 
-//for read-grouped bastching
+/// Internal structure for grouped batch processing of read hits.
 #[derive(Debug, Clone)]
 pub struct ReducedRead {
     pub seq: u64,
@@ -71,22 +73,34 @@ pub struct ReducedRead {
     pub accession: String,
 }
 
+/// Holds hits for a read that are waiting to be processed as a group.
 #[derive(Debug)]
 pub struct PendingRead {
     pub read_id: String,
     pub hits: Vec<M8Record>,
 }
 
+/// Message type for passing data to background workers.
 #[derive(Debug)]
 pub enum WorkerMsg {
+    /// A single line of data with an associated sequence number.
     Line { seq: u64, line: Vec<u8> },
+    /// Signals the worker to flush its current buffers.
     Flush,
 }
 
 impl M8Record {
     // ── NT scalar ──────────────────────────────────────────────────────────
 
-    /// Parse 14-column NT (blastn) output — scalar baseline.
+    /// Parses a 14-column NT (blastn) output line using a scalar implementation.
+    ///
+    /// # Arguments
+    ///
+    /// * `line`: the m8 line string to parse
+    ///
+    /// # Returns
+    ///
+    /// Result<Self>: the parsed M8Record or an error
     pub fn parse_line_nt_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
@@ -138,7 +152,15 @@ impl M8Record {
 
     // ── NR scalar ──────────────────────────────────────────────────────────
 
-    /// Parse 12-column NR (blastx) output — scalar baseline.
+    /// Parses a 12-column NR (blastx) output line using a scalar implementation.
+    ///
+    /// # Arguments
+    ///
+    /// * `line`: the m8 line string to parse
+    ///
+    /// # Returns
+    ///
+    /// Result<Self>: the parsed M8Record or an error
     pub fn parse_line_nr_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
@@ -438,6 +460,22 @@ pub struct TaxonCount {
 
 
 
+/// Processes a pair of m8 hit and hit summary records and updates the aggregation map.
+///
+/// # Arguments
+///
+/// * `m8_bytes`: raw bytes of the m8 alignment record
+/// * `hit_bytes`: raw bytes of the corresponding hit summary record
+/// * `agg`: shared map of lineage keys to aggregation buckets
+/// * `lineage_cache`: cache for validated taxonomic lineages
+/// * `duplicate_clusters`: map of cluster information for weighting
+/// * `should_keep`: filter for taxonomic lineages to keep
+/// * `count_type`: type of database being referenced (e.g., "NT")
+/// * `source_count_type`: optional second source type (e.g., "NR")
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub fn process_record_pair(
     m8_bytes: &[u8],
     hit_bytes: &[u8],
@@ -523,6 +561,15 @@ pub fn process_record_pair(
     Ok(())
 }
 
+/// Merges multiple aggregation maps into a single one.
+///
+/// # Arguments
+///
+/// * `parts`: a vector of aggregation maps to merge
+///
+/// # Returns
+///
+/// AHashMap<Vec<i32>, AggBucket>: the merged aggregation map
 pub fn merge_aggregations(parts: Vec<AHashMap<Vec<i32>, AggBucket>>) -> AHashMap<Vec<i32>, AggBucket> {
     let mut merged = AHashMap::new();
     for part in parts {
@@ -544,6 +591,16 @@ pub fn merge_aggregations(parts: Vec<AHashMap<Vec<i32>, AggBucket>>) -> AHashMap
     merged
 }
 
+/// Converts an aggregation map into a list of TaxonCount structures.
+///
+/// # Arguments
+///
+/// * `agg`: the aggregation map to convert
+/// * `count_type`: the database type for the counts
+///
+/// # Returns
+///
+/// Vec<TaxonCount>: the list of generated taxon count records
 pub fn build_taxon_counts_list(agg: AHashMap<Vec<i32>, AggBucket>, count_type: &str) -> Vec<TaxonCount> {
     let mut rows = Vec::with_capacity(agg.len());
     for (agg_key, bucket) in agg {
@@ -683,11 +740,30 @@ pub fn consensus_level(
 
 
 
+/// Extract the read ID from a BLAST m8 line.
+///
+/// # Arguments
+///
+/// * `line`: the m8 line string
+///
+/// # Returns
+///
+/// Option<&str>: the extracted read ID if found
 pub fn read_id_from_m8_line(line: &str) -> Option<&str> {
     let read_id = line.split('\t').next()?;
     if read_id.is_empty() { None } else { Some(read_id) }
 }
 
+/// Assigns a read ID to a specific shard for concurrent processing.
+///
+/// # Arguments
+///
+/// * `read_id`: the read ID string
+/// * `workers`: total number of workers/shards
+///
+/// # Returns
+///
+/// usize: the assigned shard index
 pub fn shard_for_read_id(read_id: &str, workers: usize) -> usize {
     let workers = workers.max(1);
     let state = AHashState::with_seeds(0, 1, 2, 3);
@@ -696,6 +772,21 @@ pub fn shard_for_read_id(read_id: &str, workers: usize) -> usize {
     (hasher.finish() as usize) % workers
 }
 
+/// Summarizes BLAST m8 hits for a single read into a ReducedRead structure.
+///
+/// # Arguments
+///
+/// * `seq`: sequence number of the read
+/// * `read_id`: the read ID string
+/// * `hits`: a slice of m8 records for the read
+/// * `lineage_map`: map of taxids to taxonomic lineages
+/// * `acc2taxid_map`: map of accessions to taxids
+/// * `should_keep_filter`: filter for taxonomic lineages to keep
+/// * `min_aln_len`: minimum alignment length to consider a hit
+///
+/// # Returns
+///
+/// Option<ReducedRead>: the summarized read info, or None if no hits pass filters
 pub fn summarize_m8_hits<F>(
     seq: u64,
     read_id: String,
@@ -802,6 +893,15 @@ where
 
 
 
+/// Parses a batch of summary records from raw bytes.
+///
+/// # Arguments
+///
+/// * `batch`: raw bytes containing summary lines
+///
+/// # Returns
+///
+/// Vec<Vec<u8>>: a vector of parsed summary line bytes
 pub fn parse_summary_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
     batch
         .par_split(|&b| b == b'\n')
@@ -810,6 +910,15 @@ pub fn parse_summary_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Parses a batch of m8 metrics from raw bytes.
+///
+/// # Arguments
+///
+/// * `batch`: raw bytes containing m8 metric lines
+///
+/// # Returns
+///
+/// Vec<Vec<u8>>: a vector of parsed metric line bytes
 pub fn parse_m8_metrics_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
     batch
         .par_split(|&b| b == b'\n')
@@ -818,6 +927,15 @@ pub fn parse_m8_metrics_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Parses a batch of m8 accession mappings from raw bytes.
+///
+/// # Arguments
+///
+/// * `batch`: raw bytes containing m8 records
+///
+/// # Returns
+///
+/// Vec<Vec<u8>>: a vector of (read_id, accession) line bytes
 pub fn parse_m8_acc_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
     batch
         .par_split(|&b| b == b'\n')
@@ -858,6 +976,15 @@ pub fn parse_m8_acc_batch(batch: Vec<u8>) -> Vec<Vec<u8>> {
 }
 
 #[allow(dead_code)]
+/// Extracts the read ID and taxid from a hit summary line.
+///
+/// # Arguments
+///
+/// * `line`: the hit summary line string
+///
+/// # Returns
+///
+/// Option<(String, i32)>: the extracted read ID and taxid if found
 fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
     let parts: Vec<&str> = line.split('\t').collect();
     if parts.len() >= 3 {
@@ -868,6 +995,23 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 }
 
 
+/// Generates taxonomic count JSON records from an m8 and hit summary stream.
+///
+/// # Arguments
+///
+/// * `m8_stream_rx`: receiver for m8 record stream
+/// * `hit_summary_stream_rx`: receiver for hit summary record stream
+/// * `db_type`: database type (e.g., "NT")
+/// * `lineage_map`: map of taxids to taxonomic lineages
+/// * `should_keep_filter`: filter for lineages to keep
+/// * `duplicate_clusters`: map of cluster information for duplicate weighting
+/// * `output_tx`: sender for the generated JSON count records
+/// * `concurrency`: number of concurrent workers
+/// * `batch_size_lines`: number of lines per processing batch
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn generate_taxon_count_json_from_m8(
     m8_stream_rx:           ReceiverStream<ParseOutput>,
     hit_summary_stream_rx:  ReceiverStream<ParseOutput>,

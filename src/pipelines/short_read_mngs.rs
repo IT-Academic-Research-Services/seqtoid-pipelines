@@ -94,20 +94,27 @@ const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
 
 
+/// Holds the results from a Kallisto quantification run.
 #[derive(Debug)]
 pub struct KallistoResults {
-    pub ercc_counts: Vec<(String, f64)>, // (target_id, est_counts)
-    pub transcript_to_gene: Vec<(String, String)>, // (transcript_id, gene_id)
+    /// ERCC counts as a vector of (target_id, est_counts).
+    pub ercc_counts: Vec<(String, f64)>,
+    /// Mapping from transcript_id to gene_id.
+    pub transcript_to_gene: Vec<(String, String)>,
 }
 
-// SampleItem for reservoir sampling
+/// Represents an item in a reservoir sample.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SampleItem {
-    key: f64, // For A-Res sampling
-    records: Vec<SequenceRecord>, // 1 for SE, 2 for PE
-    weight: u64, // Duplicate count
-    hash_key: Option<u64>, // For disk mode
+    /// Key used for A-Res sampling.
+    key: f64,
+    /// Sequence records (1 for single-end, 2 for paired-end).
+    records: Vec<SequenceRecord>,
+    /// Number of duplicate reads this item represents.
+    weight: u64,
+    /// Optional hash key for disk-backed sampling.
+    hash_key: Option<u64>,
 }
 
 impl PartialEq for SampleItem {
@@ -127,6 +134,7 @@ impl PartialOrd for SampleItem {
     }
 }
 
+/// Combined taxonomic counts from both NT and NR databases.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CombinedTaxonCount {
     pub tax_id: i32,
@@ -137,12 +145,15 @@ pub struct CombinedTaxonCount {
     pub nr: Option<TaxonMetrics>,
 }
 
+/// Detailed metrics for a taxon hit in a specific database.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TaxonMetrics {
-    pub count: u64,           // Adjusted reads assigned (with DCR)
+    /// Adjusted read count (with duplicate compression).
+    pub count: u64,
     pub nonunique_count: u64,
     pub unique_count: u64,
-    pub dcr: f64,             // Duplicate compression ratio
+    /// Duplicate compression ratio.
+    pub dcr: f64,
     pub percent_identity: f64,
     pub alignment_length: f64,
     pub e_value: f64,
@@ -150,6 +161,7 @@ pub struct TaxonMetrics {
     pub source_count_type: Option<Vec<String>>,
 }
 
+/// Handle for managing an ongoing Spades assembly task.
 #[derive(Debug)]
 pub struct AssemblyHandle {
     pub spades_task: JoinHandle<Result<(), anyhow::Error>>,
@@ -157,6 +169,7 @@ pub struct AssemblyHandle {
     pub out_dir: PathBuf,
 }
 
+/// Paths and metadata for assembly coverage analysis outputs.
 #[derive(Debug)]
 pub struct CoverageOutputs {
     pub contigs_fasta: PathBuf,
@@ -168,6 +181,7 @@ pub struct CoverageOutputs {
     pub read2contig: Arc<HashMap<String, String>>,
 }
 
+/// Information about a single read's taxonomic hit.
 #[derive(Debug, Clone)]
 pub struct ReadHit {
     pub level: u8,
@@ -186,6 +200,11 @@ pub struct ReadHit {
 }
 
 impl ReadHit {
+    /// Serializes the read hit to a tab-separated string.
+    ///
+    /// # Returns
+    ///
+    /// String: tab-separated representation of the hit
     pub fn to_tab_string(&self) -> String {
         format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -220,10 +239,28 @@ impl ReadHit {
     }
 
 
+    /// Serializes the read hit to a tab-separated string with an explicit read ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `read_id`: the ID of the read
+    ///
+    /// # Returns
+    ///
+    /// String: tab-separated representation of the hit
     pub fn to_full_tab_line(&self, read_id: &str) -> String {
         format!("{}\t{}", read_id, self.to_tab_string())
     }
 
+    /// Parses a read hit from a tab-separated line.
+    ///
+    /// # Arguments
+    ///
+    /// * `line`: the tab-separated line to parse
+    ///
+    /// # Returns
+    ///
+    /// Result<(String, Self)>: the read ID and the parsed ReadHit
     pub fn from_tab_line(line: &str) -> Result<(String, Self)> {
         let fields: Vec<&str> = line.trim().split('\t').collect();
         if fields.len() != 28 {
@@ -260,35 +297,48 @@ pub struct AccessionHit {
 }
 
 
+/// Represents a sequence cluster from a deduplication step.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct Cluster {
+    /// ID of the representative read for this cluster.
     rep_id: String,
+    /// Number of reads in the cluster.
     size: u64,
+    /// IDs of all reads belonging to this cluster.
     members: Vec<String>,
 }
 
-
+/// Represents a sequence record with an associated weight for sampling.
 #[allow(dead_code)]
 #[derive(Clone)]
 struct WeightedSampleItem {
+    /// Random key for sampling.
     key: f64,
+    /// The sequence record.
     record: SequenceRecord,
+    /// The weight (e.g., duplicate count) of this record.
     weight: u64,
 }
 
-/// Called read_fastq in single or paired FASTQ's and streams interleaved output
+/// Validates the input FASTQ files and returns an interleaved stream of sequence records.
 ///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct from main.
-/// * `file1_path` - Path to R1 or single ended FASTQ.
-/// * `file2_path` - Optional path to R2.
-///  * `sample_base_buf` - PathBuf of sample basename.
-/// * `out_dir` - Base dir for output files.
+/// * `config`: the run configuration
+/// * `file1_path`: path to the R1 (or single-end) FASTQ file
+/// * `file2_path`: optional path to the R2 FASTQ file
+/// * `sample_base_buf`: base path for the sample
+/// * `out_dir`: directory where output files should be saved
 ///
 /// # Returns
-/// ParseOutput validated interleaved FASTQ stream, vecs of cleaup takss and recoevers, handle for raw and validated read counts.
+///
+/// Result containing:
+/// - interleaved FASTQ stream
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - handle for the raw read count task
+/// - handle for the validated read count task
 async fn validate_input(
     config: Arc<RunConfig>,
     file1_path: PathBuf,
@@ -365,24 +415,26 @@ async fn validate_input(
     Ok((val_ercc_bowtie2_filter_out_stream,  cleanup_tasks, cleanup_receivers, raw_count_task, val_count_task))
 }
 
-/// bowtie2 filter function where the passing stream contains the unmapped reads
+/// Aligns reads using Bowtie2 and sorts the output BAM stream.
 ///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream
-/// * `bt2_index_path` - Path to Bowtie2 index.
-/// * `paired` - Whether the input is paired-end.
-/// * `bowtie2_options` - Additional Bowtie2 options as a HashMap (e.g., HashMap::from([("--very-sensitive-local".to_string(), None)])).
-/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `bt2_index_path`: path to the Bowtie2 index
+/// * `paired`: whether the input is paired-end
+/// * `bowtie2_options`: additional command-line options for Bowtie2
+/// * `output_bam_path`: path where the sorted BAM file will be written
 ///
 /// # Returns
-/// Tuple:
-/// - unmapped FASTQ stream.
-/// - Optional receiver for the total mapped count (u64) if `count_mapped` is true.
-/// - Vector of cleanup tasks.
-/// - Vector of cleanup receivers.
-
+///
+/// Result containing:
+/// - stream of BAM records
+/// - BAM write task handle
+/// - receiver for the count of mapped reads
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - temporary directory used for sorting
 async fn bowtie2_align_and_sort_stream(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -549,6 +601,27 @@ async fn bowtie2_align_and_sort_stream(
     ))
 }
 
+/// Filters reads using Bowtie2 and returns a stream of unmapped FASTQ records.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `bt2_index_path`: path to the Bowtie2 index
+/// * `paired`: whether the input is paired-end
+/// * `bowtie2_options`: additional command-line options for Bowtie2
+/// * `output_bam_path`: path where the sorted BAM file will be written
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of unmapped FASTQ records
+/// - receiver for the count of mapped reads
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - BAM write task handle
+/// - path to the generated BAM file
+/// - vector of temporary directories used
 async fn bowtie2_filter_stream(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -626,6 +699,28 @@ async fn bowtie2_filter_stream(
 }
 
 
+/// Filters reads from disk using Bowtie2 and returns paths to the unmapped FASTQ files.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `bt2_index_path`: path to the Bowtie2 index
+/// * `paired`: whether the input is paired-end
+/// * `bowtie2_options`: additional command-line options for Bowtie2
+/// * `output_bam_path`: path where the sorted BAM file will be written
+///
+/// # Returns
+///
+/// Result containing:
+/// - path to the R1 (or single-end) unmapped FASTQ file
+/// - optional path to the R2 unmapped FASTQ file
+/// - receiver for the count of mapped reads
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - BAM write task handle
+/// - path to the generated BAM file
+/// - vector of temporary directories used
 async fn bowtie2_filter_files(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -780,6 +875,27 @@ async fn bowtie2_filter_files(
 /// - Vector of cleanup tasks.
 /// - Vector of cleanup receivers.
 
+/// Filters reads using HISAT2 and returns a stream of unmapped FASTQ records.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `r1_path`: path to the R1 (or single-end) FASTQ file
+/// * `r2_path_opt`: optional path to the R2 FASTQ file
+/// * `hisat2_index_path`: path to the HISAT2 index
+/// * `paired`: whether the input is paired-end
+/// * `hisat2_options`: additional command-line options for HISAT2
+/// * `output_bam_path`: optional path to save the aligned BAM file
+/// * `headroom`: estimated memory headroom available for sorting
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of unmapped FASTQ records
+/// - receiver for the count of mapped reads
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - vector of temporary directories used
 async fn hisat2_filter(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -1108,16 +1224,21 @@ async fn hisat2_filter(
 }
 
 
-/// QC's input stream using FASTP
+/// Performs quality control on the input FASTQ stream using fastp.
 ///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream
-///
+/// * `config`: the run configuration
+/// * `paired`: whether the input is paired-end
+/// * `input_stream`: stream of raw FASTQ records
 ///
 /// # Returns
 ///
+/// Result containing:
+/// - stream of quality-controlled FASTQ records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - receiver for the count of records that passed QC
 async fn fastp_qc(
     config: Arc<RunConfig>,
     paired: bool,
@@ -1230,14 +1351,24 @@ async fn fastp_qc(
     Ok((qc_out_stream, cleanup_tasks, cleanup_receivers, count_result_rx))
 }
 
-/// Runs Kallisto quant
+/// Runs Kallisto quantification on the input FASTQ stream.
 ///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `out_dir`: directory where Kallisto outputs will be written
+/// * `paired`: whether the input is paired-end
+/// * `sample_base_buf`: base path for the sample
 ///
 /// # Returns
+///
+/// Result containing:
+/// - sender for ERCC results
+/// - receiver for ERCC results
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - handle for the Kallisto task
 async fn kallisto_quant(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -1367,14 +1498,16 @@ async fn kallisto_quant(
     Ok((ercc_tx, ercc_rx, cleanup_tasks, cleanup_receivers, kallisto_exit_task))
 }
 
-/// Parses results of kallisto
+/// Processes Kallisto output files to extract ERCC quantification results.
 ///
 /// # Arguments
 ///
-/// * 'kallisto_out_dir': PathBuf to output dir of kallisto
-/// *  'ercc_tx': oneshot::Sender<KallistoResults>,
+/// * `kallisto_out_dir`: directory containing Kallisto results
+/// * `ercc_tx`: sender to transmit the extracted results
 ///
 /// # Returns
+///
+/// Result containing a handle to the processing task.
 async fn kallisto_results(
     kallisto_out_dir: PathBuf,
     ercc_tx: oneshot::Sender<KallistoResults>,
@@ -1480,23 +1613,24 @@ async fn kallisto_results(
     Ok(parse_task)
 }
 
-/// Minimap2 filter
+/// Filters reads using minimap2 and returns a stream of unmapped FASTQ records.
 ///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct
-/// * `input_stream` - Interleaved FASTQ stream (paired or single-end).
-/// * `paired` - Whether the input is paired-end.
-/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `paired`: whether the input is paired-end
+/// * `output_bam_path`: optional path to save the aligned BAM file
 ///
 /// # Returns
-/// Tuple:
-/// - Interleaved FASTQ stream : unmapped reads.
-/// - Receiver for the total mapped read count
-/// - Vec of cleanup tasks
-/// - Vec of cleanup receivers
-/// - Optional temporary FASTA file for host reference.
-/// - Optional temporary minimap2 index file.
+///
+/// Result containing:
+/// - stream of unmapped FASTQ records
+/// - receiver for the count of mapped reads
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - vector of temporary files created
+/// - vector of temporary directories used
 #[allow(dead_code)]
 async fn minimap2_filter(
     config: Arc<RunConfig>,
@@ -1803,6 +1937,24 @@ async fn minimap2_filter(
 }
 
 
+/// Deduplicates the input FASTQ stream.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `paired`: whether the input is paired-end
+/// * `prefix_len`: length of the prefix to use for deduplication (if any)
+/// * `out_dir`: directory where deduplication stats will be written
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of unique FASTQ records
+/// - receiver for the count of unique reads
+/// - map of cluster information (representative to members)
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 async fn dedup(
     config: Arc<RunConfig>,
     input_stream: mpsc::Receiver<ParseOutput>,
@@ -1985,6 +2137,22 @@ async fn dedup(
     ))
 }
 
+/// Internal worker for deduplication, processing a shard of reads.
+///
+/// # Arguments
+///
+/// * `rx`: receiver for FASTQ records to process
+/// * `shards`: shared maps of read hashes to cluster information
+/// * `uniques_tx`: sender for unique sequence records
+/// * `csv_tx`: sender for cluster membership information (representative, member)
+/// * `paired`: whether the input is paired-end
+/// * `prefix_len`: optional prefix length for deduplication
+/// * `total_count`: atomic counter for total reads processed
+/// * `unique_count`: atomic counter for unique reads found
+///
+/// # Returns
+///
+/// Result<()>: success or error
 async fn dedup_worker(
     mut rx: mpsc::Receiver<ParseOutput>,
     shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>>,
@@ -2110,6 +2278,22 @@ async fn dedup_worker(
 }
 
 #[allow(dead_code)]
+/// Subsamples the input FASTQ stream using weights from deduplication clusters.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `uniques_stream`: receiver for unique FASTQ records
+/// * `duplicate_clusters`: map of cluster information
+/// * `seed`: random seed for reproducibility
+/// * `max_subsample`: maximum number of reads to keep
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of subsampled FASTQ records
+/// - receiver for the count of subsampled reads
+/// - handle for the subsampling task
 async fn subsample_weighted(
     config: Arc<RunConfig>,
     uniques_stream: mpsc::Receiver<ParseOutput>,
@@ -2181,6 +2365,21 @@ async fn subsample_weighted(
 
 
 
+/// Subsamples the input FASTQ stream uniformly.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `uniques_rx`: receiver for unique FASTQ records
+/// * `max_subsample`: maximum number of reads to keep
+/// * `paired`: whether the input is paired-end
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of subsampled FASTQ records
+/// - receiver for the count of subsampled reads
+/// - handle for the subsampling task
 async fn subsample_uniform(
     config: Arc<RunConfig>,
     uniques_rx: mpsc::Receiver<ParseOutput>,
@@ -2288,6 +2487,20 @@ async fn subsample_uniform(
 /// - Vec of cleanup receivers
 /// - Optional temporary FASTA file for non-host reference.
 /// - Optional temporary minimap2 index file.
+/// Aligns unmapped reads against NT index chunks using minimap2.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `r1_path`: path to the R1 unmapped FASTQ file
+/// * `r2_path_opt`: optional path to the R2 unmapped FASTQ file
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of alignment results (PAF format)
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 pub async fn minimap2_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -2521,18 +2734,20 @@ pub async fn minimap2_non_host_align(
 
 
 
-/// Converts a PAF stream to an m8 stream, splits it for file writing,
-/// and returns the main m8 stream along with cleanup handles.
+/// Converts a PAF stream to an BLAST m8 format stream and writes it to a file.
+///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct
-/// * `input_stream` - Interleaved FASTQ stream (paired or single-end).
+/// * `config`: the run configuration
+/// * `input_stream`: stream of PAF records
+/// * `m8_path`: path where the converted m8 file will be written
 ///
 /// # Returns
-/// Tuple:
-/// - m8 stream
-/// - Vec of cleanup tasks
-/// - Vec of cleanup receivers
+///
+/// Result containing:
+/// - stream of m8 records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 pub async fn paf_to_m8(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -2633,17 +2848,17 @@ pub async fn paf_to_m8(
 }
 
 
-/// Loads the taxid (taxid → [species, genus, family])
-/// and acc2tax (accession bytes → taxid) DB's
-/// async
+/// Loads taxonomic lineage and accession-to-taxid databases into memory.
+///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct
+/// * `config`: the run configuration
 ///
 /// # Returns
-/// Result:
-///     Arc<AHashMap<Taxid, Lineage>>,
-///     Arc<Map<Vec<u8>>>,
+///
+/// Result containing:
+/// - map of taxids to their full lineages
+/// - FST map for accession to taxid lookups
 pub async fn load_lineage_and_acc2tax_maps(
     config: Arc<RunConfig>,
 ) -> Result<(
@@ -2679,9 +2894,19 @@ pub async fn load_lineage_and_acc2tax_maps(
     Ok((lineage_map, acc2taxid_map))
 }
 
-/// Sorts an m8 byte stream by read ID (first column) using GNU sort.
+/// Sorts an BLAST m8 format byte stream by read ID (first column) using GNU sort.
 /// RAM-first via choose_temp_dir, falls back to NVMe scratch.
 /// Guarantees consecutive lines per read ID. Never drops data.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of unsorted m8 records
+/// * `db_type`: database type (e.g., "nt", "nr") for tagging
+///
+/// # Returns
+///
+/// Result containing the sorted m8 record stream
 pub async fn sort_m8_by_read_id(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -2829,6 +3054,27 @@ pub async fn sort_m8_by_read_id(
 ///  -hit-summary TSV stream
 /// - Vec of cleanup tasks
 /// - Vec of cleanup receivers
+/// Calls taxonomic hits from a sorted m8 stream.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `m8_input`: stream of m8 records sorted by read ID
+/// * `sample_base_buf`: base path for the sample
+/// * `lineage_map`: map of taxids to lineages
+/// * `acc2taxid_map`: map of accessions to taxids
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `min_aln_len`: minimum alignment length to consider a hit
+/// * `concurrency`: number of concurrent workers
+/// * `tag`: tag for logging
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of top m8 hits per read
+/// - stream of hit summary records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 pub async fn call_hits_m8(
     config: Arc<RunConfig>,
     mut m8_input: ReceiverStream<ParseOutput>, // MUST be sorted by read ID
@@ -3185,6 +3431,20 @@ pub async fn call_hits_m8(
 
 
 // Helper: runs Diamond on one file, waits for both parse and write to finish, returns only the m8 path
+/// Runs Diamond alignment on a single query file.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `query_path`: path to the query FASTA/FASTQ file
+/// * `db_prefix`: path to the Diamond database
+/// * `options`: additional command-line options for Diamond
+/// * `temp_dir`: temporary directory for Diamond's work
+/// * `label`: label for logging
+///
+/// # Returns
+///
+/// Result containing the path to the output m8 file
 async fn run_diamond_single_file(
     config: Arc<RunConfig>,
     query_path: PathBuf,
@@ -3270,6 +3530,21 @@ async fn run_diamond_single_file(
     Ok(m8_path)
 }
 
+/// Aligns unmapped reads against NR database using Diamond.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `r1_path`: path to the R1 unmapped FASTQ file
+/// * `r2_path_opt`: optional path to the R2 unmapped FASTQ file
+///
+/// # Returns
+///
+/// Result containing:
+/// - receiver for alignment results (m8 format)
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - vector of temporary directories used
 async fn diamond_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3367,22 +3642,21 @@ async fn diamond_non_host_align(
     Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
 
-/// Generates ytaxon counts from a called m8 stream
+/// Generates taxonomic counts from a called m8 stream.
+///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct
-/// * `m8_stream` - line-based m8 format input stream
-/// * `summary_stream` - stream of summary information from m8
-/// * `duplicate_cluster_sizes_path` - optinal duplicate cluster sizes for weighting
-/// * `taxon_blacklist_path` - optional list of excluded taxa
-/// * `deuterostome_path` - optional list of excluded taxa
-/// * `taxon_whitelist_path` -optional list of included taxa
-/// * `count_type` - e.g. NT , type of DB being refernced
-/// *  `source_count_type` - optional second source, e.g. NR
-///
+/// * `config`: the run configuration
+/// * `m8_stream`: line-based m8 format input stream
+/// * `summary_stream`: stream of summary information from m8
+/// * `duplicate_clusters`: map of cluster information
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `count_type`: type of database being referenced (e.g., "NT")
+/// * `source_count_type`: optional second source type (e.g., "NR")
 ///
 /// # Returns
-/// vector of taxon counts
+///
+/// Result containing a vector of taxon counts
 pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
     m8_stream: ReceiverStream<ParseOutput>,
@@ -3739,6 +4013,29 @@ pub async fn generate_taxon_counts(
 }
 
 
+/// Computes merged taxonomic counts from both NT and NR databases.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `nt_m8_stream`: receiver for NT m8 records
+/// * `nt_hit_summary_stream`: receiver for NT hit summary records
+/// * `nt_contig_summary`: summary entries for NT contigs
+/// * `nr_m8_stream`: receiver for NR m8 records
+/// * `nr_hit_summary_stream`: receiver for NR hit summary records
+/// * `nr_contig_summary`: summary entries for NR contigs
+/// * `_lineage_map`: map of taxids to lineages (unused)
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `duplicate_clusters`: map of cluster information
+/// * `merged_m8_path`: output path for merged m8 file
+/// * `merged_hitsummary_path`: output path for merged hit summary file
+/// * `merged_taxon_counts_path`: output path for merged taxon counts file
+/// * `merged_contig_summary_path`: output path for merged contig summary file
+/// * `_nr_alignment_per_read`: map of NR alignments per read (unused)
+///
+/// # Returns
+///
+/// Result containing a vector of cleanup tasks
 pub async fn compute_merged_taxon_counts(
     config: Arc<RunConfig>,
     nt_m8_stream: mpsc::Receiver<ParseOutput>,
@@ -3957,18 +4254,19 @@ pub async fn compute_merged_taxon_counts(
     Ok(cleanup_tasks)
 }
 
-/// Concats the nt and nr and writes a json
-/// expects the TaxonCount streucture prodiced in generatre_taxon_counts
+/// Combines NT and NR taxon counts into a single JSON file.
 ///
 /// # Arguments
 ///
-/// * `nt_counts` - Vec<TaxonCount> from nt
-/// * `nr_counts` - Vec<TaxonCount> from nr
-/// * `output_path` - JSON pth
+/// * `nt_counts`: list of NT taxon counts
+/// * `nr_counts`: list of NR taxon counts
+/// * `output_path`: path for the output JSON file
 ///
 /// # Returns
 ///
-///
+/// Result containing:
+/// - path to the output JSON file
+/// - handle for the write task
 pub async fn combine_taxon_counts(
     nt_counts: &[TaxonCount],
     nr_counts: &[TaxonCount],
@@ -4013,17 +4311,16 @@ pub async fn combine_taxon_counts(
 }
 
 
-/// Conurrently generates small accession map contianing only the assembled contigs
+/// Collects hit summary information into a map from contig ID to best accession.
 ///
 /// # Arguments
 ///
-/// * `summary_stream` -stream from hit summary
+/// * `config`: the run configuration
+/// * `summary_stream`: stream of hit summary records
 ///
 /// # Returns
-/// Result of ahashmap of id:accession
 ///
-/// Concurrent collector: hit-summary stream → tiny contig_id → best_accession map
-/// Final map merge is offloaded to spawn_blocking (exactly as you requested).
+/// Result containing the map of contig IDs to best accessions
 pub async fn collect_hit_summary_to_accession_map_concurrent(
     config: Arc<RunConfig>,
     mut summary_stream: ReceiverStream<ParseOutput>,
@@ -5434,12 +5731,23 @@ pub async fn summarize_hits(
     ))
 }
 
-/// Helper for writing empty output of blast_contigs in no assemled results
-///
-/// # Arguments
-/// # Returns
-/// Result
+/// Writes empty BLAST outputs when no assembly results are present.
 
+/// # Arguments
+
+/// * `blast_m8`: path for the BLAST m8 file
+/// * `blast_top_m8`: path for the BLAST top m8 file
+/// * `refined_m8`: path for the refined m8 file
+/// * `refined_hit_summary`: path for the refined hit summary file
+/// * `refined_counts_with_dcr`: path for the refined counts with DCR file
+/// * `contig_summary_json`: path for the contig summary JSON file
+/// * `deduped_m8`: path to the input deduped m8 file to copy forward
+/// * `hit_summary`: path to the input hit summary file to copy forward
+/// * `orig_counts_with_dcr`: path to the input original counts with DCR file to copy forward
+
+/// # Returns
+
+/// Result<()>: success or error
 async fn write_empty_blast_outputs(
     blast_m8: &PathBuf,
     blast_top_m8: &PathBuf,
@@ -5447,8 +5755,6 @@ async fn write_empty_blast_outputs(
     refined_hit_summary: &PathBuf,
     refined_counts_with_dcr: &PathBuf,
     contig_summary_json: &PathBuf,
-
-    // These are the files we copy forward (same as Python)
     deduped_m8: &PathBuf,
     hit_summary: &PathBuf,
     orig_counts_with_dcr: &PathBuf,
@@ -5466,22 +5772,26 @@ async fn write_empty_blast_outputs(
     Ok(())
 }
 
-/// Updates the read_dict in blast_contigs from streamed m8 data.
-/// Updates it in place using a lock, does not return it
+/// Updates the read dictionary based on top BLAST m8 results for contigs.
+///
 /// # Arguments
-/// * `read2contig` - Assignment of reads to contigs
-/// * `top_m8_stream` - stream in m8 format, top as found in get_top_m8_nt/nr
-/// * `read_dict` - HashMap of ReadID -> ReadHits
-/// * `lneage_map` - Hashmap os taxon id -> full lineage (family, genus, species)
-/// * `accession_map` - accession → (species, genus, family)
-/// * `should_keep` - combination of taxon lists and deuterostome filters
-/// * `db_type` - denotes NT or NR DB's to keep intermdiate and output files distinguished form each other
-/// * `contig2lineage_tx` - json sender
-/// * `read2blastm8_tx` - refined m8 sender
-/// * 'updated_tx` - updated dict sender
-/// * `added_tx` - added to dict snde
+///
+/// * `config`: the run configuration
+/// * `read2contig`: map from read ID to contig ID
+/// * `top_m8_stream`: stream of top m8 results for contigs
+/// * `read_dict`: shared map of read IDs to their taxonomic hits
+/// * `lineage_map`: map of taxids to lineages
+/// * `accession_map`: map of accessions to hit metadata
+/// * `should_keep`: filter for taxids to keep
+/// * `db_type`: database type (e.g., "nt", "nr")
+/// * `contig2lineage_tx`: sender for contig-to-lineage mapping records
+/// * `read2blastm8_tx`: sender for refined m8 records
+/// * `updated_tx`: sender for records of reads with updated hits
+/// * `added_tx`: sender for records of reads with new hits
+///
 /// # Returns
-/// Result
+///
+/// Result<()>: success or error
 pub async fn update_read_dict(
     config: Arc<RunConfig>,
     read2contig: Arc<HashMap<String, String>>,
@@ -5755,6 +6065,21 @@ pub async fn update_read_dict(
     Ok(())
 }
 
+/// Generates a JSON summary of contig taxonomic assignments.
+///
+/// # Arguments
+///
+/// * `read2contig`: map from read ID to contig ID
+/// * `contig2lineage`: map from contig ID to validated taxonomic lineage
+/// * `read_dict`: shared map of read IDs to their taxonomic hits
+/// * `db_type`: database type (e.g., "nt", "nr")
+/// * `duplicate_clusters`: map of cluster information for duplicate weighting
+/// * `min_contig_size`: minimum number of reads a contig must have to be included
+/// * `output_tx`: sender for the generated JSON lines
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn generate_contig_summary_json(
     read2contig: Arc<HashMap<String, String>>,
     contig2lineage: AHashMap<String, [i32; 3]>,
@@ -5843,7 +6168,15 @@ pub async fn generate_contig_summary_json(
     Ok(())
 }
 
-// Helper: pull the first tab-delimited field from a complete line.
+/// Extracts the first field from a tab-separated byte slice.
+///
+/// # Arguments
+///
+/// * `bytes`: the tab-separated line bytes
+///
+/// # Returns
+///
+/// String: the extracted first field
 fn first_field(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .split('\t')
@@ -5853,8 +6186,15 @@ fn first_field(bytes: &[u8]) -> String {
         .to_string()
 }
 
-// Helper: collect a stream into a map keyed by the first field,
-// while preserving first-seen key order for deterministic appends.
+/// Collects a stream of bytes into a map keyed by the first tab-delimited field.
+///
+/// # Arguments
+///
+/// * `stream`: stream of bytes items
+///
+/// # Returns
+///
+/// Result containing the map and the order in which keys were first seen
 async fn collect_line_map(
     mut stream: ReceiverStream<ParseOutput>,
 ) -> Result<(AHashMap<String, Bytes>, Vec<String>)> {
@@ -5876,7 +6216,15 @@ async fn collect_line_map(
     Ok((map, order))
 }
 
-// Helper: collect a stream into ordered rows only.
+/// Collects a stream of bytes into an ordered vector of rows.
+///
+/// # Arguments
+///
+/// * `stream`: stream of bytes items
+///
+/// # Returns
+///
+/// Result containing the vector of row bytes
 #[allow(dead_code)]
 async fn collect_rows(
     mut stream: ReceiverStream<ParseOutput>,
@@ -5893,7 +6241,15 @@ async fn collect_rows(
     Ok(rows)
 }
 
-// collect a stream into keyed rows and preserve first-seen key order.
+/// Collects a stream of bytes into keyed rows, preserving first-seen key order.
+///
+/// # Arguments
+///
+/// * `stream`: stream of bytes items
+///
+/// # Returns
+///
+/// Result containing the vector of (key, bytes) pairs and the key order
 async fn collect_keyed_rows(
     mut stream: ReceiverStream<ParseOutput>,
 ) -> Result<(Vec<(String, Bytes)>, Vec<String>)> {
@@ -5913,6 +6269,22 @@ async fn collect_keyed_rows(
     Ok((rows, order))
 }
 
+/// Merges refined hit information into existing m8 and hit summary streams.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `updated_reads_stream`: stream of reads that were updated by contig hits
+/// * `added_reads_stream`: stream of reads that were newly identified by contig hits
+/// * `blast_hits_stream`: stream of raw BLAST hits for contigs
+/// * `original_hit_summary_stream`: stream of original hit summary records
+/// * `original_deduped_m8_stream`: stream of original deduped m8 records
+/// * `refined_m8_tx`: sender for the refined m8 stream
+/// * `refined_hit_summary_tx`: sender for the refined hit summary stream
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn generate_m8_and_hit_summary(
     config: Arc<RunConfig>,
     updated_reads_stream: ReceiverStream<ParseOutput>,
@@ -6036,6 +6408,27 @@ pub async fn generate_m8_and_hit_summary(
 
 
 
+/// Handles a graceful early exit for BLAST contigs when no usable results are found.
+///
+/// # Arguments
+///
+/// * `db_type`: database type (e.g., "nt", "nr")
+/// * `blast_m8`: path for the BLAST m8 file
+/// * `blast_top_m8`: path for the BLAST top m8 file
+/// * `refined_m8`: path for the refined m8 file
+/// * `refined_hit_summary`: path for the refined hit summary file
+/// * `refined_counts`: path for the refined counts file
+/// * `contig_summary`: path for the contig summary file
+/// * `deduped_m8`: optional path to the input deduped m8 file
+/// * `hit_summary`: optional path to the input hit summary file
+/// * `orig_counts`: optional path to the input original counts file
+/// * `read_dict`: shared map of read IDs to their taxonomic hits
+/// * `taxon_counts`: existing taxon counts
+/// * `fn_start`: start time of the blast_contigs function
+///
+/// # Returns
+///
+/// Result containing empty result sets and placeholders
 async fn early_blast_exit(
     db_type: &str,
     blast_m8: &PathBuf,
@@ -6105,7 +6498,29 @@ async fn early_blast_exit(
     ))
 }
 
-// ====================== blast_contigs ======================
+/// Refines taxonomic assignments of reads by aligning their parent contigs against NT/NR.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `db_type`: database type ("nt" or "nr")
+/// * `deduped_m8_stream`: stream of original m8 hits for reads
+/// * `hit_summary_stream`: stream of original hit summary records
+/// * `read_dict`: shared map of read IDs to their taxonomic hits
+/// * `accession_map`: map of accessions to hit metadata
+/// * `taxon_counts`: existing taxon counts for reads
+/// * `assembled_contig_fasta`: path to the assembled contigs FASTA file
+/// * `read2contig`: map from read ID to contig ID
+/// * `reference_fasta`: path to the reference sequences for alignment
+/// * `duplicate_clusters`: map of cluster information for duplicate weighting
+/// * `lineage_map`: map of taxids to lineages
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `blast_headroom`: memory headroom for BLAST/Diamond
+/// * `concurrency`: number of concurrent workers
+///
+/// # Returns
+///
+/// Result containing refined hits and summary data
 pub async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
@@ -7096,12 +7511,15 @@ pub async fn blast_contigs(
 }
 
 
-/// Extract original read ID from refined taxid-annotated FASTA header
+/// Extracts the original read ID and pair index from a taxid-annotated FASTA header.
+///
 /// # Arguments
-/// * `id` -header id line
-
+///
+/// * `id`: the FASTA header string
+///
 /// # Returns
-/// result of id and reead index
+///
+/// Result containing the original ID and the pair index (0 for R1, 1 for R2)
 fn extract_original_id_from_taxid_fasta(id: &str) -> Result<(String, usize)> {
     let mut header = id.to_string();
     let mut read_index = 0;
@@ -7135,12 +7553,16 @@ fn extract_original_id_from_taxid_fasta(id: &str) -> Result<(String, usize)> {
 }
 
 
-/// Build R1 and R2 header sets from the taxid-annotated FASTA stream
+/// Builds sets of non-host read IDs for R1 and R2 from a taxid-annotated stream.
+///
 /// # Arguments
-/// * `taxid_mapped_stream` stream of
-
+///
+/// * `taxid_mapped_stream`: stream of taxid-annotated FASTA records
+/// * `duplicate_clusters`: optional map of cluster information for including all duplicates
+///
 /// # Returns
-/// result of id and reead index
+///
+/// Result containing the set of R1 IDs and an optional set of R2 IDs
 async fn build_nonhost_header_sets(
     mut taxid_mapped_stream: ReceiverStream<ParseOutput>,
     duplicate_clusters: Option<Arc<DuplicateClusters>>,
@@ -7185,6 +7607,20 @@ async fn build_nonhost_header_sets(
 
 
 
+/// Generates non-host FASTQ files by filtering original files against identified non-host IDs.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `original_r1_path`: path to the original R1 (or single-end) FASTQ file
+/// * `original_r2_path`: optional path to the original R2 FASTQ file
+/// * `taxid_mapped_stream`: stream of taxid-annotated FASTA records
+/// * `duplicate_clusters`: optional map of cluster information
+/// * `output_dir`: directory where filtered FASTQ files will be written
+///
+/// # Returns
+///
+/// Result containing the paths to the filtered R1 and R2 FASTQ files
 pub async fn generate_nonhost_fastq_from_files(
     config: Arc<RunConfig>,
     original_r1_path: PathBuf,
@@ -7260,7 +7696,17 @@ pub async fn generate_nonhost_fastq_from_files(
     Ok((out_r1, out_r2))
 }
 
-/// Parallel preload of NR hit-summary → DashMap (exact Python semantics, >50k lines/s on EPYC)
+/// Preloads NR alignments from a hit-summary stream into a shared map.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `preload_rx`: receiver for hit summary records
+/// * `nr_alignment_per_read`: shared map to populate with NR alignment results
+///
+/// # Returns
+///
+/// Result<()>: success or error
 async fn preload_nr_alignments_parallel(
     config: Arc<RunConfig>,
     preload_rx: mpsc::Receiver<ParseOutput>,
@@ -7362,6 +7808,17 @@ fn resolve_mmseqs_db_path(config: &RunConfig) -> Result<PathBuf, PipelineError> 
     Ok(db_path)
 }
 
+/// Runs a single MMseqs2 command and monitors its progress.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `args`: command-line arguments for MMseqs2
+/// * `label`: label for logging and identification
+///
+/// # Returns
+///
+/// Result<()>: success or error
 async fn run_mmseqs_step(
     config: Arc<RunConfig>,
     args: Vec<String>,
@@ -7407,6 +7864,16 @@ async fn run_mmseqs_step(
     Ok(())
 }
 
+/// Starts the MMseqs2 GPU server for a specific database.
+///
+/// # Arguments
+///
+/// * `db`: path to the MMseqs2 database
+/// * `verbose`: whether to inherit stderr for verbose logging
+///
+/// # Returns
+///
+/// Result containing the child process handle for the GPU server
 async fn start_gpuserver(
     db: &PathBuf,
     verbose: bool,
@@ -7431,6 +7898,15 @@ async fn start_gpuserver(
     Ok(child)
 }
 
+/// Stops the MMseqs2 GPU server.
+///
+/// # Arguments
+///
+/// * `child`: handle to the GPU server child process
+///
+/// # Returns
+///
+/// Result<()>: success or error
 async fn stop_gpuserver(child: &mut Child) -> Result<(), PipelineError> {
     match child.try_wait() {
         Ok(Some(_)) => return Ok(()),
@@ -7456,6 +7932,19 @@ async fn stop_gpuserver(child: &mut Child) -> Result<(), PipelineError> {
 }
 
 
+/// Runs the MMseqs2 workflow to align a FASTQ file against a target database.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_fastq`: path to the input FASTQ file
+/// * `temp_dir`: temporary directory for MMseqs2 work
+/// * `label`: label for logging
+/// * `backend`: the alignment backend to use (CPU or GPU)
+///
+/// # Returns
+///
+/// Result containing the path to the output m8 file
 async fn mmseqs_fastq_to_m8_file(
     config: Arc<RunConfig>,
     input_fastq: PathBuf,
@@ -7641,6 +8130,22 @@ async fn mmseqs_fastq_to_m8_file(
     Ok(m8_path)
 }
 
+/// Aligns unmapped reads against NR database using MMseqs2.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `r1_path`: path to the R1 unmapped FASTQ file
+/// * `r2_path_opt`: optional path to the R2 unmapped FASTQ file
+/// * `backend`: the alignment backend to use (CPU or GPU)
+///
+/// # Returns
+///
+/// Result containing:
+/// - receiver for alignment results (m8 format)
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - vector of temporary directories used
 pub async fn mmseqs_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -7695,22 +8200,15 @@ pub async fn mmseqs_non_host_align(
     Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
 
-/// Run function for Short Read mNGS pipelines
+/// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
 ///
-/// * `config` - RunConfig struct from main.
+/// * `config`: the run configuration
 ///
 /// # Returns
-/// Result<(), PipelineError>
-/// Run function for Short Read mNGS pipelines
 ///
-/// # Arguments
-///
-/// * `config` - RunConfig struct from main.
-///
-/// # Returns
-/// Result<(), PipelineError>
+/// Result<()>: success or error
 pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let out_dir = config.out_dir.clone();

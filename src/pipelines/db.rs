@@ -8,6 +8,15 @@ use crate::utils::file::{file_path_manipulator, validate_file_inputs, rename_fil
 use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db};
 use crate::utils::fastx::build_fasta_index;
 
+/// Builds the taxid-lineages database from nodes.dmp and merged.dmp files.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("Building taxid lineages db");
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
@@ -42,6 +51,15 @@ pub async fn taxid_lineages_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pip
 }
 
 
+/// Builds the accession-to-taxid database (FST format) from NCBI accession2taxid files.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
 
@@ -93,6 +111,15 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     Ok(())
 }
 
+/// Builds an FST index of sequence offsets for a FASTA file.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn fasta_offset_db(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;

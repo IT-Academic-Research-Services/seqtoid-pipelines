@@ -71,6 +71,23 @@ struct Stats {
 
 
 
+/// Validates the input FASTQ files and returns an interleaved stream of sequence records.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `file1_path`: path to the R1 (or single-end) FASTQ file
+/// * `file2_path`: optional path to the R2 FASTQ file
+/// * `sample_base_buf`: base path for the sample
+/// * `out_dir`: directory where output files should be saved
+///
+/// # Returns
+///
+/// Result containing:
+/// - interleaved FASTQ stream
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - handle for the read stats task
 async fn validate_input(
     config: Arc<RunConfig>,
     file1_path: PathBuf,
@@ -173,6 +190,22 @@ async fn validate_input(
 
 
 
+/// Aligns reads against a host index to filter out host sequences.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `host_index_path`: path to the minimap2 host index
+/// * `no_host_file_path`: path where non-host reads will be written
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of non-host FASTQ records
+/// - stream of host-aligned BAM records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 async fn align_to_host(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>, // FASTQ raw byte stream
@@ -443,6 +476,23 @@ async fn align_to_host(
 
 
 
+/// Processes ERCC spike-in sequences to quantify their abundance.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `ercc_index_path`: path to the minimap2 ERCC index
+/// * `out_dir`: directory where ERCC outputs will be written
+/// * `no_ext_sample_base`: sample base name without extension
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of non-ERCC FASTQ records
+/// - optional handle for the ERCC count results task
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 async fn process_ercc(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>, // FASTQ byte stream
@@ -749,6 +799,22 @@ async fn process_ercc(
 /// cleanup_tasks
 /// quast_write_tasks
 ///
+/// Filters reads using Kraken2 to identify those belonging to a target taxon.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `out_dir`: directory where Kraken2 outputs will be written
+/// * `no_ext_sample_base_buf`: sample base name without extension
+/// * `target_taxid`: taxid of the target organism
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of Kraken2-assigned FASTQ records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
@@ -995,19 +1061,24 @@ async fn filter_with_kraken(
 }
 
 
-/// Runs minimap2 to align to the target reference, then sorts.
+/// Aligns reads against a target organism's reference index and sorts the resulting BAM.
 ///
 /// # Arguments
 ///
-/// * `config` - reading stream
-/// * `input_stream` - stream buffer size
-/// * 'targer_ref_path' -
+/// * `config`: the run configuration
+/// * `input_stream`: stream of interleaved FASTQ records
+/// * `target_index_path`: path to the minimap2 target index
+/// * `out_dir`: directory where alignment outputs will be saved
+/// * `no_ext_sample_base_buf`: sample base name without extension
 ///
 /// # Returns
-/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <- uncomrpessed BAM
-/// cleanup_tasks
-/// quast_write_tasks
 ///
+/// Result containing:
+/// - stream of target-aligned BAM records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - vector of QUAST write tasks
+/// - path to the generated BAM file
 async fn align_to_target(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,  // FASTQ SequenceRecord stream
@@ -1262,6 +1333,24 @@ async fn align_to_target(
     ))
 }
 
+/// Generates a consensus sequence from a BAM stream of aligned reads.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `bam_stream`: stream of uncompressed BAM records
+/// * `out_dir`: directory where consensus outputs will be written
+/// * `no_ext_sample_base_buf`: sample base name without extension
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream for consensus realignment
+/// - stream for consensus statistics
+/// - path to the generated consensus FASTA file
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - vector of additional consensus tasks
 async fn generate_consensus(
     config: Arc<RunConfig>,
     bam_stream: ReceiverStream<ParseOutput>, // Uncompressed BAM byte stream
@@ -1392,6 +1481,23 @@ async fn generate_consensus(
     ))
 }
 
+/// Calls variants from a BAM stream and a target reference FASTA.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `bam_stream`: stream of uncompressed BAM records
+/// * `target_ref_path`: path to the target reference FASTA file
+/// * `out_dir`: directory where variant calling outputs will be written
+/// * `no_ext_sample_base_buf`: sample base name without extension
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of variant calling statistics
+/// - path to the generated VCF file
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
 async fn call_variants(
     config: Arc<RunConfig>,
     bam_stream: ReceiverStream<ParseOutput>,  //Uncompressed BAM byte stream
@@ -1531,6 +1637,19 @@ async fn call_variants(
 }
 
 
+/// Realigns the generated consensus sequence back to the target reference.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `consensus_realign_stream`: receiver for consensus sequence bytes
+/// * `target_ref_fasta_path`: path to the target reference FASTA file
+/// * `out_dir`: directory where realignment outputs will be written
+/// * `no_ext_sample_base_buf`: sample base name without extension
+///
+/// # Returns
+///
+/// Result containing a vector of cleanup tasks
 async fn realign_consensus_to_ref(
     config: Arc<RunConfig>,
     consensus_realign_stream: Receiver<ParseOutput>,  // FASTA
@@ -1605,6 +1724,24 @@ async fn realign_consensus_to_ref(
 }
 
 
+/// Calculates pipeline statistics and writes them to a JSON file.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `no_ext_sample_base`: sample base name without extension
+/// * `consensus_bam_stats_stream`: optional stream of BAM statistics
+/// * `consensus_bam_depth_stream`: optional stream of BAM depth information
+/// * `no_host_seqkit_out_stream_stats`: stream of Seqkit stats for non-host reads
+/// * `ercc_stats_task`: optional handle for the ERCC count task
+/// * `consensus_stats_stream`: optional stream of consensus sequence statistics
+/// * `call_bcftools_stats_stream`: optional stream of variant calling statistics
+/// * `out_dir`: directory where statistics JSON will be written
+/// * `technology`: the sequencing technology used
+///
+/// # Returns
+///
+/// Result<()>: success or error
 async fn calculate_statistics(
     config: Arc<RunConfig>,
     no_ext_sample_base: &str,
@@ -1818,6 +1955,18 @@ async fn calculate_statistics(
     Ok(())
 }
 
+/// Evaluates the generated assembly using QUAST.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `target_ref_fasta_path`: path to the target reference FASTA file
+/// * `align_bam_path`: path to the BAM file of reads aligned to the target
+/// * `consensus_file_path`: path to the generated consensus FASTA file
+///
+/// # Returns
+///
+/// Result containing a vector of cleanup tasks
 async fn evaluate_assembly(
     config: Arc<RunConfig>,
     target_ref_fasta_path: PathBuf,
@@ -1870,6 +2019,15 @@ async fn evaluate_assembly(
 
 
 
+/// The main entry point for the consensus genome pipeline.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let ram_temp_dir = config.ram_temp_dir.clone();
