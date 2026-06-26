@@ -1,10 +1,10 @@
+import boto3
+import hashlib
+import logging
 import os
 import subprocess
-import logging
-import boto3
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from botocore.exceptions import ClientError
-import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

@@ -1,38 +1,38 @@
 //! Stream functions
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::Result;
-use log::{self, debug, info, error, warn};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter, ReadBuf};
-use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, sleep};
-use tokio::time::{interval, Interval};
-use tokio_stream::{Stream, StreamExt};
-use tokio_stream::wrappers::ReceiverStream;
-use tokio::task::JoinHandle;
-use tokio::sync::Notify;
-use tokio::fs::File as TokioFile;
-use tokio::fs::{metadata, remove_file};
-use tokio::fs::OpenOptions as TokioOpenOptions;
+use bytes::Bytes;
+use log::{self, debug, error, info, warn};
+use std::fs::Permissions;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
+use tokio::fs::File as TokioFile;
+use tokio::fs::OpenOptions as TokioOpenOptions;
 use tokio::fs::{self, set_permissions};
-use std::fs::Permissions;
-use bytes::Bytes;
+use tokio::fs::{metadata, remove_file};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, ReadBuf};
+use tokio::process::{Child, Command};
+use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, Interval};
+use tokio::time::{sleep, Duration};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use which;
 
-use crate::utils::fastx::{SequenceRecord, parse_header};
-use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG, SPADES_TAG};
 use crate::config::defs::{CoreAllocation, RunConfig};
+use crate::config::defs::{PipelineError, StreamDataType, DIAMOND_TAG, MMSEQS_TAG, SPADES_TAG};
+use crate::utils::fastx::{parse_header, SequenceRecord};
 
 
 /// Trait for converting types into a `Bytes` representation.
@@ -1842,28 +1842,28 @@ pub async fn fanout_to_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::Path;
-    use std::io::Read;
-    use log::{self, LevelFilter, debug, error};
-    use tokio::process::Command;
-    use tokio::task;
-    use tokio::time::{self, Duration};
-    use crate::utils::fastx::fastx_generator;
-    use crate::config::defs::{GpuDetection, RunConfig, StreamDataType, NRAlignmentBackend, SimdLevel};
-    use std::sync::Arc;
-    use rayon::ThreadPoolBuilder;
-    use tokio::sync::Semaphore;
-    use tokio::fs::File;
-    use std::path::PathBuf;
     use crate::cli::Arguments;
+    use crate::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType};
+    use crate::utils::fastx::fastx_generator;
+    use crate::utils::fastx::SequenceRecord;
+    use crate::utils::system::{detect_ram, generate_rng};
+    use log::{self, debug, error, LevelFilter};
+    use rayon::ThreadPoolBuilder;
+    use std::fs;
+    use std::io::Read;
+    use std::os::unix::fs::FileTypeExt;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::fs::metadata;
-    use std::os::unix::fs::FileTypeExt;
-    use crate::utils::fastx::SequenceRecord;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::fs::File;
     use tokio::io::duplex;
-    use crate::utils::system::{detect_ram, generate_rng};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::process::Command;
+    use tokio::sync::Semaphore;
+    use tokio::task;
+    use tokio::time::{self, Duration};
 
 
     /// Helper function to create a `RunConfig` for tests.

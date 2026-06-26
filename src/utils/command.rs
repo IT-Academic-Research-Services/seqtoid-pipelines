@@ -2266,7 +2266,6 @@ pub mod star {
 }
 
 pub mod czid_dedup {
-
     use crate::config::defs::{RunConfig, CZID_DEDUP_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
@@ -2356,7 +2355,6 @@ pub mod czid_dedup {
 }
 
 pub mod diamond {
-
     use crate::config::defs::{DiamondSubcommand, PipelineError, RunConfig, DIAMOND_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::available_space_for_path;

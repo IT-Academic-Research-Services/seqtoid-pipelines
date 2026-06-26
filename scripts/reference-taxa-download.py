@@ -9,14 +9,14 @@ Preers genomes with the --reference argument, falls back to --assembly-level chr
 hndles multiple FASTA files by seleting the best assembly based on metadata.
 """
 
-import os
-import subprocess
+import json
 import logging
 import multiprocessing as mp
+import os
+import subprocess
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
 from tqdm import tqdm
-import json
+from typing import Dict, Tuple, List, Optional
 
 SCIENTIFIC_NAME_TAG = 'scientific name'
 SYNONYM_NAME_TAG = 'synonym'

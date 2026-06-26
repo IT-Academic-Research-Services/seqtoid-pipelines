@@ -1,12 +1,16 @@
+//! Database pipelines
+
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::fs;
+
 use anyhow::anyhow;
 use log::info;
+
 use crate::config::defs::{PipelineError, RunConfig};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, rename_file_path};
-use crate::utils::taxonomy::{build_taxid_lineages_db, build_accession2taxid_db};
 use crate::utils::fastx::build_fasta_index;
+use crate::utils::file::{file_path_manipulator, rename_file_path, validate_file_inputs};
+use crate::utils::taxonomy::{build_accession2taxid_db, build_taxid_lineages_db};
 
 /// Builds the taxid-lineages database from nodes.dmp and merged.dmp files.
 ///
