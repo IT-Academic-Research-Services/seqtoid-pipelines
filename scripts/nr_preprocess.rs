@@ -11,9 +11,9 @@
 // Then: mmseqs createdb /scratch/nr_clean.fa /data/refs/nrDB --dbtype 1 --compressed 1 --threads 64 ...
 // Focus: correctness first, then speed. Reports exact counts at end.
 
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::collections::HashSet;
 
 fn main() -> io::Result<()> {
     // For future CLI expansion, but stdin/stdout for true streaming pipeline

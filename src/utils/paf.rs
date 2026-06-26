@@ -1,20 +1,26 @@
-// Functions and definitions for the minimap2-associated PAF file format
-use anyhow::{anyhow, Result};
-use log::{info, debug};
+//! Functions and definitions for the minimap2-associated PAF file format
+
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use lexical::parse as lexical_parse;
+use log::{debug, info};
+use memchr::memchr2_iter;
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc::Sender;
-use rayon::prelude::*;
-use memchr::memchr2_iter;
-use lexical::parse as lexical_parse;
-use once_cell::sync::Lazy;
-use bytes::Bytes;
+use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::utils::streams::ParseOutput;
-use crate::config::defs::{SIMD_LEVEL, SimdLevel};
+use crate::config::defs::{PipelineError, RunConfig, SimdLevel, StreamDataType, SIMD_LEVEL};
+use crate::utils::file::write_byte_stream_to_file;
+use crate::utils::streams::{batch_rayon_process, fanout_to_channels, ParseOutput};
 
 const LAMBDA: f64 = 1.58;
 const K: f64 = 0.1;
@@ -44,7 +50,9 @@ impl PafRecord {
 
         macro_rules! next {
             ($name:literal) => {
-                fields.next().ok_or_else(|| anyhow!(concat!("Missing ", $name)))?
+                fields
+                    .next()
+                    .ok_or_else(|| anyhow!(concat!("Missing ", $name)))?
             };
         }
         macro_rules! parse_u64 {
@@ -55,18 +63,21 @@ impl PafRecord {
             }};
         }
 
-        let qname  = next!("qname").to_string();
-        let qlen   = parse_u64!("qlen");
+        let qname = next!("qname").to_string();
+        let qlen = parse_u64!("qlen");
         let qstart = parse_u64!("qstart");
-        let qend   = parse_u64!("qend");
-        let strand = next!("strand").chars().next().ok_or_else(|| anyhow!("Invalid strand"))?;
-        let tname  = next!("tname").to_string();
-        let tlen   = parse_u64!("tlen");
+        let qend = parse_u64!("qend");
+        let strand = next!("strand")
+            .chars()
+            .next()
+            .ok_or_else(|| anyhow!("Invalid strand"))?;
+        let tname = next!("tname").to_string();
+        let tlen = parse_u64!("tlen");
         let tstart = parse_u64!("tstart");
-        let tend   = parse_u64!("tend");
+        let tend = parse_u64!("tend");
         let nmatch = parse_u64!("nmatch");
-        let alen   = parse_u64!("alen");
-        let mapq   = parse_u64!("mapq");
+        let alen = parse_u64!("alen");
+        let mapq = parse_u64!("mapq");
 
         let mut tags = HashMap::new();
         for tag_str in fields {
@@ -76,7 +87,21 @@ impl PafRecord {
             }
         }
 
-        Ok(Self { qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq, tags })
+        Ok(Self {
+            qname,
+            qlen,
+            qstart,
+            qend,
+            strand,
+            tname,
+            tlen,
+            tstart,
+            tend,
+            nmatch,
+            alen,
+            mapq,
+            tags,
+        })
     }
 
     /// AVX-512 inner parser.
@@ -144,9 +169,9 @@ impl PafRecord {
             .map_err(|_| anyhow!("qname not UTF-8"))?
             .to_string();
 
-        let qlen   = parse_u64!(1,  "qlen");
-        let qstart = parse_u64!(2,  "qstart");
-        let qend   = parse_u64!(3,  "qend");
+        let qlen = parse_u64!(1, "qlen");
+        let qstart = parse_u64!(2, "qstart");
+        let qend = parse_u64!(3, "qend");
 
         let strand = match field!(4).first() {
             Some(&b'+') => '+',
@@ -158,21 +183,24 @@ impl PafRecord {
             .map_err(|_| anyhow!("tname not UTF-8"))?
             .to_string();
 
-        let tlen   = parse_u64!(6,  "tlen");
-        let tstart = parse_u64!(7,  "tstart");
-        let tend   = parse_u64!(8,  "tend");
-        let nmatch = parse_u64!(9,  "nmatch");
-        let alen   = parse_u64!(10, "alen");
-        let mapq   = parse_u64!(11, "mapq");
+        let tlen = parse_u64!(6, "tlen");
+        let tstart = parse_u64!(7, "tstart");
+        let tend = parse_u64!(8, "tend");
+        let nmatch = parse_u64!(9, "nmatch");
+        let alen = parse_u64!(10, "alen");
+        let mapq = parse_u64!(11, "mapq");
 
         // Phase 3: Tags — match scalar exactly
         let mut tags = HashMap::new();
-        for fi in 12..=tab_pos.len() {  // note: <= to include last field
-            let start = tab_pos[fi - 1] + 1;  // safe because we checked tab_pos.len()
+        for fi in 12..=tab_pos.len() {
+            // note: <= to include last field
+            let start = tab_pos[fi - 1] + 1; // safe because we checked tab_pos.len()
             let end = if fi < tab_pos.len() { tab_pos[fi] } else { len };
             let tag_bytes = &bytes[start..end];
 
-            if tag_bytes.is_empty() { continue; }
+            if tag_bytes.is_empty() {
+                continue;
+            }
             if let Ok(s) = std::str::from_utf8(tag_bytes) {
                 let parts: Vec<&str> = s.splitn(3, ':').collect();
                 if parts.len() == 3 {
@@ -181,7 +209,21 @@ impl PafRecord {
             }
         }
 
-        Ok(Self { qname, qlen, qstart, qend, strand, tname, tlen, tstart, tend, nmatch, alen, mapq, tags })
+        Ok(Self {
+            qname,
+            qlen,
+            qstart,
+            qend,
+            strand,
+            tname,
+            tlen,
+            tstart,
+            tend,
+            nmatch,
+            alen,
+            mapq,
+            tags,
+        })
     }
 
     /// Safe wrapper — satisfies the `fn(&str) -> Result<Self>` type required by the dispatch static.
@@ -207,8 +249,18 @@ impl PafRecord {
     pub fn to_paf_line(&self) -> String {
         let mut line = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            self.qname, self.qlen, self.qstart, self.qend, self.strand,
-            self.tname, self.tlen, self.tstart, self.tend, self.nmatch, self.alen, self.mapq,
+            self.qname,
+            self.qlen,
+            self.qstart,
+            self.qend,
+            self.strand,
+            self.tname,
+            self.tlen,
+            self.tstart,
+            self.tend,
+            self.nmatch,
+            self.alen,
+            self.mapq,
         );
 
         for (key, value) in &self.tags {
@@ -218,11 +270,11 @@ impl PafRecord {
         line
     }
 
-    pub async fn merge_paf_files(
-        paf_paths: &[PathBuf],
-        tx: Sender<ParseOutput>,
-    ) -> Result<()> {
-        info!("Merging {} raw PAF files → streaming PAF output (no conversion)", paf_paths.len());
+    pub async fn merge_paf_files(paf_paths: &[PathBuf], tx: Sender<ParseOutput>) -> Result<()> {
+        info!(
+            "Merging {} raw PAF files → streaming PAF output (no conversion)",
+            paf_paths.len()
+        );
 
         let start = std::time::Instant::now();
         let total_lines = 0u64;
@@ -234,7 +286,8 @@ impl PafRecord {
             let tx_clone = tx.clone();
 
             handles.push(tokio::spawn(async move {
-                let file = File::open(&path).await
+                let file = File::open(&path)
+                    .await
                     .map_err(|e| anyhow!("Failed to open PAF {}: {}", path.display(), e))?;
 
                 let mut reader = BufReader::new(file);
@@ -254,14 +307,23 @@ impl PafRecord {
 
                     // Forward raw PAF line unchanged
                     let bytes = (trimmed.to_string() + "\n").into_bytes();
-                    if tx_clone.send(ParseOutput::Bytes(Bytes::from(bytes))).await.is_err() {
+                    if tx_clone
+                        .send(ParseOutput::Bytes(Bytes::from(bytes)))
+                        .await
+                        .is_err()
+                    {
                         return Ok(());
                     }
 
                     line.clear();
                 }
 
-                info!("Merged {}: {} lines ({} skipped)", path.display(), local_lines, local_skipped);
+                info!(
+                    "Merged {}: {} lines ({} skipped)",
+                    path.display(),
+                    local_lines,
+                    local_skipped
+                );
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -270,19 +332,31 @@ impl PafRecord {
             h.await??;
         }
 
-        info!("Raw PAF merge complete: {} total lines in {:.2?}", total_lines, start.elapsed());
+        info!(
+            "Raw PAF merge complete: {} total lines in {:.2?}",
+            total_lines,
+            start.elapsed()
+        );
         Ok(())
     }
 
     fn calc_bitscore(&self) -> f64 {
-        let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let nonmatch = self
+            .tags
+            .get("NM")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
         let alen = self.alen as f64;
         let score = alen - 2.0 * nonmatch;
         (score * LAMBDA - K.ln()) / 2.0f64.ln()
     }
 
     fn calc_evalue(&self, genome_size: f64) -> f64 {
-        let nonmatch = self.tags.get("NM").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let nonmatch = self
+            .tags
+            .get("NM")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
         let alen = self.alen as f64;
         let score = alen - 2.0 * nonmatch;
         K * alen * genome_size * (-LAMBDA * score).exp()
@@ -318,7 +392,11 @@ impl PafRecord {
 
     pub fn to_m8_line(&self, genome_size: f64) -> String {
         let accession = self.extract_accession();
-        let base_accession = accession.split('.').next().unwrap_or(&accession).to_string();
+        let base_accession = accession
+            .split('.')
+            .next()
+            .unwrap_or(&accession)
+            .to_string();
 
         if accession.is_empty() {
             return String::new();
@@ -329,10 +407,16 @@ impl PafRecord {
             std::mem::swap(&mut tstart, &mut tend);
         }
         let qstart_1 = self.qstart + 1;
-        let tstart_adj = if self.strand == '+' { tstart + 1 } else { tstart };
-        let tend_adj   = if self.strand == '+' { tend } else { tend + 1 };
+        let tstart_adj = if self.strand == '+' {
+            tstart + 1
+        } else {
+            tstart
+        };
+        let tend_adj = if self.strand == '+' { tend } else { tend + 1 };
 
-        let nonmatch = self.tags.get("NM")
+        let nonmatch = self
+            .tags
+            .get("NM")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         let gap_openings = self.calc_gap_openings();
@@ -342,9 +426,18 @@ impl PafRecord {
 
         format!(
             "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-            self.qname, base_accession, percent_ident, self.alen,
-            nonmatch, gap_openings, qstart_1, self.qend,
-            tstart_adj, tend_adj, evalue, bitscore
+            self.qname,
+            base_accession,
+            percent_ident,
+            self.alen,
+            nonmatch,
+            gap_openings,
+            qstart_1,
+            self.qend,
+            tstart_adj,
+            tend_adj,
+            evalue,
+            bitscore
         )
     }
 }
@@ -359,6 +452,16 @@ static PARSE_PAF_LINE: Lazy<fn(&str) -> Result<PafRecord>> = Lazy::new(|| {
     PafRecord::parse_line_scalar
 });
 
+/// Parses a batch of PAF records and converts them to BLAST m8 format.
+///
+/// # Arguments
+///
+/// * `batch`: raw bytes containing multiple PAF lines
+/// * `genome_size`: estimated genome size for E-value calculation
+///
+/// # Returns
+///
+/// Vec<Vec<u8>>: a vector of converted m8 line bytes
 pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
     batch
         .par_split(|&b| b == b'\n')
@@ -375,6 +478,106 @@ pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Converts a PAF stream to an BLAST m8 format stream and writes it to a file.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of PAF records
+/// * `m8_path`: path where the converted m8 file will be written
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of m8 records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+pub async fn paf_to_m8(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    m8_path: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+)> {
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+
+    let genome_size = config.args.nt_db_size as f64;
+
+    let paf_record_count = Arc::new(AtomicUsize::new(0));
+    let m8_line_count = Arc::new(AtomicUsize::new(0));
+
+    let paf_counter = paf_record_count.clone();
+    let m8_counter = m8_line_count.clone();
+
+    let batched_stream = batch_rayon_process(
+        config.clone(),
+        input_stream,
+        move |batch: Vec<u8>| {
+            let m8_lines = parse_paf_batch_to_m8(batch.clone(), genome_size);
+
+            // Count input PAF lines in the batch.
+            let paf_lines_in_batch = {
+                let newline_count = batch.iter().filter(|&&b| b == b'\n').count();
+                if batch.is_empty() {
+                    0
+                } else if *batch.last().unwrap_or(&b'\n') == b'\n' {
+                    newline_count
+                } else {
+                    newline_count + 1
+                }
+            };
+
+            paf_counter.fetch_add(paf_lines_in_batch, std::sync::atomic::Ordering::Relaxed);
+            m8_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed);
+
+            m8_lines
+        },
+        "paf_to_m8",
+        16 * 1024 * 1024, // 16 MiB batches
+    );
+
+    let (streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
+        batched_stream,
+        2,
+        "paf_to_m8_stream",
+        &config,
+        StreamDataType::JustBytes,
+    )
+    .await
+    .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(paf_to_m8_stream_done_rx);
+
+    let mut streams = streams;
+
+    let main_stream = ReceiverStream::new(streams.remove(0));
+
+    let file_stream = ReceiverStream::new(streams.remove(0));
+
+    let write_task = write_byte_stream_to_file(
+        &m8_path,
+        file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "paf_to_m8_m8",
+    )
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(write_task);
+
+    let paf_total = paf_record_count.load(std::sync::atomic::Ordering::Relaxed);
+    let m8_total = m8_line_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    info!(
+        "[paf_to_m8] wired conversion stage — ~{} PAF lines seen, {} m8 lines emitted so far",
+        paf_total, m8_total
+    );
+
+    Ok((main_stream, cleanup_tasks, cleanup_receivers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,23 +589,16 @@ mod tests {
             // Valid tag: key:type:value
             ("[A-Za-z0-9_]{1,10}", "[A-Za-z]:", "[^\\t\\n]{0,40}")
                 .prop_map(|(k, t, v)| format!("{}:{}{}", k, t, v)),
-
             // Malformed: missing type (only one colon)
-            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}")
-                .prop_map(|(k, v)| format!("{}:{}", k, v)),
-
+            ("[A-Za-z0-9_]{1,10}", "[^:\\t\\n]{0,30}").prop_map(|(k, v)| format!("{}:{}", k, v)),
             // Malformed: empty key
             (":[A-Za-z]:[^\\t\\n]{0,30}").prop_map(|s| s.to_string()),
-
             // Malformed: empty value
             ("[A-Za-z0-9_]{1,10}:[A-Za-z]:").prop_map(|s| s.to_string()),
-
             // Malformed: garbage / no colons
             "[A-Za-z0-9_:\\-]{1,40}".prop_map(|s| s),
-
             // Malformed: trailing colon only
             "[A-Za-z0-9_]{1,10}:".prop_map(|s| s.to_string()),
-
             // Empty tag field (consecutive tabs)
             Just("".to_string()),
         ]
@@ -476,36 +672,34 @@ mod tests {
     /// Assert two PafRecords are field-for-field identical.
     #[allow(dead_code)]
     fn assert_records_eq(a: &PafRecord, b: &PafRecord, context: &str) {
-        assert_eq!(a.qname,  b.qname,  "{context}: qname");
-        assert_eq!(a.qlen,   b.qlen,   "{context}: qlen");
+        assert_eq!(a.qname, b.qname, "{context}: qname");
+        assert_eq!(a.qlen, b.qlen, "{context}: qlen");
         assert_eq!(a.qstart, b.qstart, "{context}: qstart");
-        assert_eq!(a.qend,   b.qend,   "{context}: qend");
+        assert_eq!(a.qend, b.qend, "{context}: qend");
         assert_eq!(a.strand, b.strand, "{context}: strand");
-        assert_eq!(a.tname,  b.tname,  "{context}: tname");
-        assert_eq!(a.tlen,   b.tlen,   "{context}: tlen");
+        assert_eq!(a.tname, b.tname, "{context}: tname");
+        assert_eq!(a.tlen, b.tlen, "{context}: tlen");
         assert_eq!(a.tstart, b.tstart, "{context}: tstart");
-        assert_eq!(a.tend,   b.tend,   "{context}: tend");
+        assert_eq!(a.tend, b.tend, "{context}: tend");
         assert_eq!(a.nmatch, b.nmatch, "{context}: nmatch");
-        assert_eq!(a.alen,   b.alen,   "{context}: alen");
-        assert_eq!(a.mapq,   b.mapq,   "{context}: mapq");
-        assert_eq!(a.tags,   b.tags,   "{context}: tags");
+        assert_eq!(a.alen, b.alen, "{context}: alen");
+        assert_eq!(a.mapq, b.mapq, "{context}: mapq");
+        assert_eq!(a.tags, b.tags, "{context}: tags");
     }
 
     /// Run both parsers against `line` and assert they agree.
     fn compare_parsers(line: &str) {
-        let scalar = PafRecord::parse_line_scalar(line)
-            .expect("scalar parse failed");
+        let scalar = PafRecord::parse_line_scalar(line).expect("scalar parse failed");
 
-        let dispatched = PafRecord::parse_line(line)
-            .expect("dispatched (AVX-512 or scalar) parse failed");
+        let dispatched =
+            PafRecord::parse_line(line).expect("dispatched (AVX-512 or scalar) parse failed");
 
         assert_records_eq(&scalar, &dispatched, line);
     }
 
     // ── representative real-world lines ───────────────────────────────────
 
-    const BASIC: &str =
-        "read1\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60";
+    const BASIC: &str = "read1\t150\t0\t150\t+\tNC_045512.2\t29903\t100\t250\t148\t150\t60";
 
     const WITH_TAGS: &str =
         "read2\t300\t10\t290\t-\tAB123456\t5000\t200\t480\t270\t280\t30\tcg:Z:10M2I5D\tNM:i:7\tAS:i:255";
@@ -513,8 +707,7 @@ mod tests {
     const REVERSE_STRAND: &str =
         "read3\t200\t5\t195\t-\tKJ660346\t18958\t500\t690\t185\t190\t60\tAS:i:180";
 
-    const ZERO_COORDS: &str =
-        "read4\t100\t0\t100\t+\tMN908947.3\t29903\t0\t100\t100\t100\t0";
+    const ZERO_COORDS: &str = "read4\t100\t0\t100\t+\tMN908947.3\t29903\t0\t100\t100\t100\t0";
 
     const MAX_VALUES: &str =
         "read5\t1000000\t0\t999999\t+\tNC_000001\t248956422\t0\t999999\t999000\t1000000\t60";
@@ -589,7 +782,10 @@ mod tests {
             .unwrap()
             .to_m8_line(genome_size);
 
-        assert_eq!(scalar_m8, dispatched_m8, "to_m8_line output differs between scalar and dispatched");
+        assert_eq!(
+            scalar_m8, dispatched_m8,
+            "to_m8_line output differs between scalar and dispatched"
+        );
         assert!(!scalar_m8.is_empty());
     }
 

@@ -1,12 +1,32 @@
-use anyhow::Result;
-use plotters::prelude::*;
+//! Plotting utilities.
+
 use std::collections::HashMap;
 use std::path::Path;
 
-pub fn plot_depths(depth_map: &HashMap<usize, u32>, sample_name: &str, output_path: &Path) -> Result<()> {
+use anyhow::Result;
+use plotters::prelude::*;
+
+/// Plots sequencing depth across positions and saves it as an image.
+///
+/// # Arguments
+///
+/// * `depth_map`: A map from position to depth count.
+/// * `sample_name`: The name of the sample, used as the plot caption.
+/// * `output_path`: The path where the plot image will be saved.
+///
+/// # Returns
+///
+/// Result<()>: Ok if the plot was successfully created and saved, or an error otherwise.
+pub fn plot_depths(
+    depth_map: &HashMap<usize, u32>,
+    sample_name: &str,
+    output_path: &Path,
+) -> Result<()> {
     // Convert depth_map to Vec, ensuring all positions are included
     let max_pos = depth_map.keys().max().copied().unwrap_or(1);
-    let depths: Vec<u32> = (1..=max_pos).map(|i| *depth_map.get(&i).unwrap_or(&0)).collect();
+    let depths: Vec<u32> = (1..=max_pos)
+        .map(|i| *depth_map.get(&i).unwrap_or(&0))
+        .collect();
 
     if depths.is_empty() {
         return Err(anyhow::anyhow!("No depth data available for plotting"));
@@ -24,7 +44,8 @@ pub fn plot_depths(depth_map: &HashMap<usize, u32>, sample_name: &str, output_pa
         .y_label_area_size(40)
         .build_cartesian_2d(1..max_pos, (1u32..max_depth + 1).log_scale())?;
 
-    chart.configure_mesh()
+    chart
+        .configure_mesh()
         .x_desc("position")
         .y_desc("depth (log scale)")
         .draw()?;
@@ -38,25 +59,56 @@ pub fn plot_depths(depth_map: &HashMap<usize, u32>, sample_name: &str, output_pa
     Ok(())
 }
 
-pub fn plot_insert_sizes(insert_sizes: &[(u32, u64)], sample_name: &str, output_path: &Path) -> Result<()> {
+/// Plots a histogram of insert sizes and saves it as an image.
+///
+/// # Arguments
+///
+/// * `insert_sizes`: A slice of (insert_size, count) tuples.
+/// * `sample_name`: The name of the sample, used in the plot caption.
+/// * `output_path`: The path where the plot image will be saved.
+///
+/// # Returns
+///
+/// Result<()>: Ok if the plot was successfully created and saved, or an error otherwise.
+pub fn plot_insert_sizes(
+    insert_sizes: &[(u32, u64)],
+    sample_name: &str,
+    output_path: &Path,
+) -> Result<()> {
     if insert_sizes.is_empty() {
-        return Err(anyhow::anyhow!("No insert size data available for plotting"));
+        return Err(anyhow::anyhow!(
+            "No insert size data available for plotting"
+        ));
     }
 
     let root = BitMapBackend::new(output_path, (800, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
     // Find max insert size and count for axis scaling
-    let max_insert_size = insert_sizes.iter().map(|(size, _)| *size).max().unwrap_or(1).max(1);
-    let max_count = insert_sizes.iter().map(|(_, count)| *count).max().unwrap_or(1).max(1);
+    let max_insert_size = insert_sizes
+        .iter()
+        .map(|(size, _)| *size)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let max_count = insert_sizes
+        .iter()
+        .map(|(_, count)| *count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     let mut chart = ChartBuilder::on(&root)
-        .caption(format!("Insert Size Histogram: {}", sample_name), ("sans-serif", 20))
+        .caption(
+            format!("Insert Size Histogram: {}", sample_name),
+            ("sans-serif", 20),
+        )
         .x_label_area_size(40)
         .y_label_area_size(40)
         .build_cartesian_2d(0u32..max_insert_size + 1, 0u64..max_count + 1)?;
 
-    chart.configure_mesh()
+    chart
+        .configure_mesh()
         .x_desc("Insert Size (bp)")
         .y_desc("Count")
         .draw()?;
@@ -71,4 +123,3 @@ pub fn plot_insert_sizes(insert_sizes: &[(u32, u64)], sample_name: &str, output_
     root.present()?;
     Ok(())
 }
-

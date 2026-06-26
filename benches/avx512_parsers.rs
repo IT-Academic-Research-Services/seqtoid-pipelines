@@ -4,26 +4,22 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ahash::AHashMap;
+use bytes::Bytes;
+use dashmap::DashMap;
 use needletail::parser::FastqReader;
 use needletail::FastxReader;
-use ahash::AHashMap;
-use dashmap::DashMap;
-use bytes::Bytes;
 
 
-use tokio::sync::{mpsc, Semaphore};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::Semaphore;
 
-use seqtoid_pipelines::config::defs::{Taxid, Lineage, StreamDataType, RunConfig, SimdLevel, GpuDetection, NRAlignmentBackend};
-use seqtoid_pipelines::utils::fastx::{write_fasta_stream_to_file};
-use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord, parse_header};
-use seqtoid_pipelines::utils::streams::{ParseOutput};
-use seqtoid_pipelines::utils::paf::PafRecord;
+use seqtoid_pipelines::config::defs::{GpuDetection, Lineage, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType, Taxid};
 use seqtoid_pipelines::utils::blast::{
-    process_record_pair, M8Record, AggBucket, merge_aggregations, summarize_m8_hits, consensus_level
+    consensus_level, merge_aggregations, process_record_pair, summarize_m8_hits, AggBucket, M8Record
 };
-use seqtoid_pipelines::utils::taxonomy::{get_valid_lineage};
-
+use seqtoid_pipelines::utils::fastx::{parse_header, SequenceRecord};
+use seqtoid_pipelines::utils::paf::PafRecord;
+use seqtoid_pipelines::utils::taxonomy::get_valid_lineage;
 
 
 // ── Existing micro benchmarks (kept for reference) ───────────────────────
@@ -307,8 +303,8 @@ fn bench_blast_hit_processing(c: &mut Criterion) {
 use fst::{Map, MapBuilder};
 use log::LevelFilter;
 use rayon::ThreadPoolBuilder;
-use seqtoid_pipelines::Arguments;
 use seqtoid_pipelines::utils::system::{detect_ram, generate_rng};
+use seqtoid_pipelines::Arguments;
 
 fn lineage(species: i32, genus: i32, family: i32) -> Lineage {
     [species, genus, family]

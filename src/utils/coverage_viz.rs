@@ -1,12 +1,14 @@
+//! Coverage visualization utilities.
+
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use log::{self, warn};
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
+use log::{self, warn};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
@@ -18,7 +20,6 @@ use crate::utils::streams::{ParseOutput, ToBytes};
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
 const MIN_CONTIG_SIZE: u64 = 500;
-
 
 #[derive(Debug, Clone, Default)]
 struct TaxonData {
@@ -100,7 +101,6 @@ struct CoverageBin {
     num_reads: u64,
 }
 
-
 pub async fn generate_coverage_viz(
     refined_gsnap_hitsummary2_tab: ReceiverStream<ParseOutput>,
     refined_gsnap_blast_top_m8: ReceiverStream<ParseOutput>,
@@ -131,16 +131,13 @@ pub async fn generate_coverage_viz(
         acc_per_taxon,
         keep_taxons_with_no_contigs,
     )
-        .await?;
+    .await?;
 
-    let coverage_viz_data = generate_coverage_viz_data(&accession_data, &contig_data, &read_data, max_bins).await?;
+    let coverage_viz_data =
+        generate_coverage_viz_data(&accession_data, &contig_data, &read_data, max_bins).await?;
 
-    let summary_data = generate_coverage_viz_summary_data(
-        &taxon_data,
-        &accession_data,
-        &coverage_viz_data,
-    );
-
+    let summary_data =
+        generate_coverage_viz_summary_data(&taxon_data, &accession_data, &coverage_viz_data);
 
     let summary_path = output_dir.join("coverage_viz_summary.json");
     let mut summary_file = BufWriter::new(File::create(&summary_path)?);
@@ -196,7 +193,7 @@ async fn prepare_data(
 
     augment_accession_data_with_info(&info_dict, &mut accession_data);
 
-    let assigned_reads = get_unassigned_reads_set(&accession_data);  // actually assigned, per Python
+    let assigned_reads = get_unassigned_reads_set(&accession_data); // actually assigned, per Python
 
     let mut contig_data = generate_contig_data(blast_top_m8, &valid_contigs).await?;
 
@@ -204,11 +201,8 @@ async fn prepare_data(
 
     augment_contig_data_with_coverage(contig_coverage_json, &mut contig_data)?;
 
-    let (taxon_data, accession_data) = select_best_accessions_per_taxon(
-        taxon_data,
-        accession_data,
-        num_accessions_per_taxon,
-    );
+    let (taxon_data, accession_data) =
+        select_best_accessions_per_taxon(taxon_data, accession_data, num_accessions_per_taxon);
 
     Ok((taxon_data, accession_data, contig_data, read_data))
 }
@@ -230,10 +224,7 @@ fn load_nt_info_db(path: &Path) -> Result<HashMap<String, (String, u64)>> {
     Ok(map)
 }
 
-fn get_valid_contigs_with_read_counts(
-    path: &Path,
-    min_size: u64,
-) -> Result<HashMap<String, u64>> {
+fn get_valid_contigs_with_read_counts(path: &Path, min_size: u64) -> Result<HashMap<String, u64>> {
     let file = File::open(path)?;
     let mut contents = String::new();
     std::io::Read::read_to_string(&mut BufReader::new(file), &mut contents)?;
@@ -268,14 +259,22 @@ async fn generate_accession_data(
             let acc = fields[8].to_string();
             let contig = fields[7].to_string();
 
-            taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
+            taxon_data
+                .entry(taxon)
+                .or_default()
+                .accessions
+                .insert(acc.clone());
             accession_data.entry(acc).or_default().contigs.push(contig);
         } else if fields.len() >= 5 {
             let taxon = fields[4].to_string();
             let acc = fields[3].to_string();
             let read = fields[0].to_string();
 
-            taxon_data.entry(taxon).or_default().accessions.insert(acc.clone());
+            taxon_data
+                .entry(taxon)
+                .or_default()
+                .accessions
+                .insert(acc.clone());
             accession_data.entry(acc).or_default().reads.push(read);
         }
     }
@@ -476,7 +475,11 @@ fn select_best_accessions_per_taxon(
             .filter_map(|acc| accession_data.get(acc).map(|ad| (acc.clone(), ad.score)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        td.best_accessions = scored.into_iter().take(num_per_taxon).map(|(acc, _)| acc).collect();
+        td.best_accessions = scored
+            .into_iter()
+            .take(num_per_taxon)
+            .map(|(acc, _)| acc)
+            .collect();
     }
 
     (taxon_data, accession_data)
@@ -537,7 +540,8 @@ async fn generate_coverage_viz_data(
 
     let mut result = HashMap::with_capacity(accession_data.len());
     while let Some(task_result) = tasks.next().await {
-        let task_result: Result<Result<(String, CoverageVizData)>, tokio::task::JoinError> = task_result;
+        let task_result: Result<Result<(String, CoverageVizData)>, tokio::task::JoinError> =
+            task_result;
         let (acc_id, viz) = task_result.context("Task join error")??;
         result.insert(acc_id, viz);
     }
@@ -558,7 +562,8 @@ fn calculate_accession_coverage(
     for contig_name in &acc_obj.contigs {
         if let Some(hits) = contig_data.get(contig_name) {
             for hit in hits {
-                let (s_start, s_end) = decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
+                let (s_start, s_end) =
+                    decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
                 let (bin_start, bin_end) = align_interval(s_start / bin_size, s_end / bin_size);
 
                 let bin_start_i = floor_with_min(bin_start, 0);
@@ -593,7 +598,8 @@ fn calculate_accession_coverage(
                     };
 
                     let cov_start = floor_with_min(coverage_interval.0, 0) as usize;
-                    let cov_end = ceil_with_max(coverage_interval.1, hit.coverage.len() as i64) as usize;
+                    let cov_end =
+                        ceil_with_max(coverage_interval.1, hit.coverage.len() as i64) as usize;
 
                     if cov_end > cov_start {
                         let avg_cov = hit.coverage[cov_start..cov_end].iter().sum::<f64>()
@@ -617,7 +623,8 @@ fn calculate_accession_coverage(
                 if hit.accession != acc_id {
                     continue;
                 }
-                let (s_start, s_end) = decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
+                let (s_start, s_end) =
+                    decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
                 let (bin_start, bin_end) = align_interval(s_start / bin_size, s_end / bin_size);
 
                 let bin_start_i = floor_with_min(bin_start, 0);
@@ -698,14 +705,18 @@ fn calculate_accession_stats(
     for contig in &acc_obj.contigs {
         if let Some(hits) = contig_data.get(contig) {
             for hit in hits {
-                let (dec_start, dec_end) = decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
+                let (dec_start, dec_end) =
+                    decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
                 let (s_start, s_end) = align_interval(dec_start, dec_end);
                 let aligned_len = (s_end - s_start) as u64;
                 max_len = max_len.max(aligned_len);
 
-                let (q_dec_start, q_dec_end) = decrement_lower_bound(hit.query_start as f64, hit.query_end as f64);
+                let (q_dec_start, q_dec_end) =
+                    decrement_lower_bound(hit.query_start as f64, hit.query_end as f64);
                 let (q_start, q_end) = align_interval(q_dec_start, q_dec_end);
-                cov_sum += hit.coverage[q_start as usize..q_end as usize].iter().sum::<f64>();
+                cov_sum += hit.coverage[q_start as usize..q_end as usize]
+                    .iter()
+                    .sum::<f64>();
 
                 mismatch_sum += hit.prop_mismatch;
                 hit_count += 1;
@@ -719,7 +730,8 @@ fn calculate_accession_stats(
     for read in &acc_obj.reads {
         if let Some(hits) = read_data.get(read) {
             for hit in hits {
-                let (dec_start, dec_end) = decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
+                let (dec_start, dec_end) =
+                    decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
                 let (s_start, s_end) = align_interval(dec_start, dec_end);
                 let aligned_len = (s_end - s_start) as u64;
                 max_len = max_len.max(aligned_len);
@@ -743,9 +755,17 @@ fn calculate_accession_stats(
 
     Ok(AccessionStats {
         max_aligned_length: max_len,
-        coverage_depth: if total_len > 0.0 { cov_sum / total_len } else { 0.0 },
+        coverage_depth: if total_len > 0.0 {
+            cov_sum / total_len
+        } else {
+            0.0
+        },
         coverage_breadth: breadth,
-        avg_prop_mismatch: if hit_count > 0 { mismatch_sum / hit_count as f64 } else { 0.0 },
+        avg_prop_mismatch: if hit_count > 0 {
+            mismatch_sum / hit_count as f64
+        } else {
+            0.0
+        },
     })
 }
 
@@ -757,19 +777,23 @@ fn generate_coverage_viz_summary_data(
     let mut taxons = HashMap::new();
 
     for (taxon_id, td) in taxon_data {
-        let best_acc: Vec<AccessionSummary> = td.best_accessions.iter().map(|acc_id| {
-            let ad = &accession_data[acc_id];
-            let cv = &coverage_viz[acc_id];
-            AccessionSummary {
-                id: acc_id.clone(),
-                name: ad.name.clone(),
-                num_contigs: ad.contigs.len(),
-                num_reads: ad.reads.len(),
-                score: format_number(ad.score),
-                coverage_breadth: cv.coverage_breadth,
-                coverage_depth: cv.coverage_depth,
-            }
-        }).collect();
+        let best_acc: Vec<AccessionSummary> = td
+            .best_accessions
+            .iter()
+            .map(|acc_id| {
+                let ad = &accession_data[acc_id];
+                let cv = &coverage_viz[acc_id];
+                AccessionSummary {
+                    id: acc_id.clone(),
+                    name: ad.name.clone(),
+                    num_contigs: ad.contigs.len(),
+                    num_reads: ad.reads.len(),
+                    score: format_number(ad.score),
+                    coverage_breadth: cv.coverage_breadth,
+                    coverage_depth: cv.coverage_depth,
+                }
+            })
+            .collect();
 
         taxons.insert(
             taxon_id.clone(),
@@ -813,12 +837,20 @@ fn transform_interval(
 
 fn floor_with_min(n: f64, min_v: i64) -> i64 {
     let f = n.floor() as i64;
-    if f < min_v { min_v } else { f }
+    if f < min_v {
+        min_v
+    } else {
+        f
+    }
 }
 
 fn ceil_with_max(n: f64, max_v: i64) -> i64 {
     let c = n.ceil() as i64;
-    if c > max_v { max_v } else { c }
+    if c > max_v {
+        max_v
+    } else {
+        c
+    }
 }
 
 fn format_number(n: f64) -> f64 {

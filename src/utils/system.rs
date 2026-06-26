@@ -1,24 +1,22 @@
-// src/utils/system.rs: System functions
+//! System functions
 
 use std::cmp::min;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::Output;
 use std::time::Duration;
-use std::process::Command;
 
-use log::{self, debug, info, error, warn};
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tokio::time::sleep;
-use tokio::process::Command as TokioCommand;
 use anyhow::{anyhow, Result};
+use log::{self, debug, error, info, warn};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_core::{OsRng, RngCore};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use tokio::process::Command as TokioCommand;
+use tokio::time::sleep;
 
-use crate::config::defs::{RunConfig, StreamDataType, SimdLevel, GpuDetection, GpuInfo};
-
-
+use crate::config::defs::{GpuDetection, GpuInfo, RunConfig, SimdLevel, StreamDataType};
 
 /// Detects physical cores (not logical) — fallback to lscpu if sysinfo doesn't distinguish
 pub fn detect_physical_cores() -> usize {
@@ -41,12 +39,12 @@ pub fn detect_physical_cores() -> usize {
 ///
 /// # Arguments
 ///
-/// * `` -
+/// * `args_threads` - Number of threads requested via CLI (0 for auto)
+/// * `use_smt` - Whether to use logical cores (Hyperthreading)
 ///
 /// # Returns
 ///
-/// Result<usize, f32> maximum cores, current cpu usage
-// In system.rs
+/// Result<(usize, f32)> maximum cores, current cpu usage
 pub async fn detect_cores_and_load(args_threads: usize, use_smt: bool) -> Result<(usize, f32)> {
     let refresh_kind = RefreshKind::nothing().with_cpu(Default::default());
     let mut system = System::new_with_specifics(refresh_kind);
@@ -69,25 +67,37 @@ pub async fn detect_cores_and_load(args_threads: usize, use_smt: bool) -> Result
         max_cores
     };
 
-    debug!("Detected {} logical cores ({} physical); CPU load {}%; using {} threads (use_smt={})", logical_cores, physical_cores, load * 100.0, effective_cores, use_smt);
+    debug!(
+        "Detected {} logical cores ({} physical); CPU load {}%; using {} threads (use_smt={})",
+        logical_cores,
+        physical_cores,
+        load * 100.0,
+        effective_cores,
+        use_smt
+    );
 
     Ok((effective_cores, load))
 }
-
-
 
 /// Computes the number of stream threads based on cores, load, and OS.
 ///
 /// # Arguments
 ///
-/// * `physical_cores` - Number of real cores on the system
+/// * `cores` - Number of cores detected on the system
 /// * `cpu_load` - Estimate of load on CPU from detect_cores_and_load
+/// * `args_threads` - Max threads allowed (from CLI)
+/// * `use_smt` - Whether to use logical cores
 ///
 /// # Returns
 ///
-/// Result<usize, f32> maximum cores, current cpu usage
-pub fn compute_stream_threads(cores: usize, cpu_load: f32, args_threads: usize, use_smt: bool) -> usize {
-    let base = if use_smt { cores * 2 } else { cores };  
+/// The number of threads to use for streaming
+pub fn compute_stream_threads(
+    cores: usize,
+    cpu_load: f32,
+    args_threads: usize,
+    use_smt: bool,
+) -> usize {
+    let base = if use_smt { cores * 2 } else { cores };
     if cfg!(target_os = "linux") && base > 50 {
         let max_threads = if cpu_load > 50.0 { base } else { base * 2 };
         max_threads.min(args_threads).min(256)
@@ -96,15 +106,11 @@ pub fn compute_stream_threads(cores: usize, cpu_load: f32, args_threads: usize, 
     }
 }
 
-
-/// Finds the amount of total and avai;lable RAM, keyed to OS
-///
-/// # Arguments
-///
+/// Finds the amount of total and available RAM, keyed to OS.
 ///
 /// # Returns
 ///
-/// Result<u64, u64> total ram, available ram
+/// Result<(u64, u64)> (total ram, available ram) in bytes
 pub fn detect_ram() -> Result<(u64, u64)> {
     let (total_ram, available_ram) = if cfg!(target_os = "linux") {
         let mut system = System::new_all();
@@ -132,7 +138,6 @@ pub fn detect_ram() -> Result<(u64, u64)> {
     Ok((total_ram, available_ram))
 }
 
-
 /// Creates a project-wide RNG from the system, using entropy pool. Optional seed for
 /// reproducibility.
 ///
@@ -152,21 +157,15 @@ pub fn generate_rng(seed: Option<u64>) -> StdRng {
     StdRng::seed_from_u64(seed)
 }
 
-
-
-/// Computes the size of the RAM buffers used by system parameters.
-///
+/// Computes the base buffer size used for streaming data.
 ///
 /// # Arguments
 ///
-///  * `available_ram` - Amoutn of usable RAM,
-/// * `total_ram` - All physical ram on system
-/// * `data_type` - StreamDataType (short or long read)
-/// * `stream_threads` - Max Number of stream threads allowed
+/// * `total_input_size_bytes` - Total size of the input data in bytes
 ///
 /// # Returns
 ///
-/// Usize of basic buffer size per stream
+/// The number of records per channel
 pub fn compute_base_buffer_size(total_input_size_bytes: u64) -> usize {
     let input_gb = total_input_size_bytes as f64 / 1_000_000_000.0;
 
@@ -188,6 +187,17 @@ pub fn compute_base_buffer_size(total_input_size_bytes: u64) -> usize {
 }
 
 /// Single source of truth for buffer sizes — fully dynamic.
+///
+/// # Arguments
+///
+/// * `config` - RunConfig containing hardware and input info
+/// * `phase` - The pipeline phase name
+/// * `data_type` - Type of data being streamed
+/// * `multiplier` - A scaling factor for the buffer size
+///
+/// # Returns
+///
+/// The buffer size in bytes
 pub fn compute_buffer_size(
     config: &RunConfig,
     phase: &str,
@@ -239,12 +249,17 @@ pub fn compute_buffer_size(
         _ => {}
     }
 
-    let final_bytes = (bytes * multiplier)
-        .clamp(4.0 * 1024.0 * 1024.0, 128.0 * 1024.0 * 1024.0) as usize;
+    let final_bytes =
+        (bytes * multiplier).clamp(4.0 * 1024.0 * 1024.0, 128.0 * 1024.0 * 1024.0) as usize;
 
     debug!(
         "compute_buffer_size({}/{:?}) = {} MiB (input {:.1}GB, avail {:.1}GiB, mult {:.1})",
-        phase, data_type, final_bytes / (1024*1024), input_gb, avail_gib, multiplier
+        phase,
+        data_type,
+        final_bytes / (1024 * 1024),
+        input_gb,
+        avail_gib,
+        multiplier
     );
 
     final_bytes
@@ -277,9 +292,11 @@ pub fn get_ram_temp_dir() -> PathBuf {
     }
 }
 
-
-
-/// The iostat functions below are currently unused and just here for future use.
+/// Monitor I/O utilization for a specific device.
+///
+/// # Arguments
+///
+/// * `device` - The device name to monitor
 #[allow(dead_code)]
 async fn monitor_io_utilization(device: String) {
     loop {
@@ -301,21 +318,39 @@ async fn monitor_io_utilization(device: String) {
     }
 }
 
-// Helper: Run iostat -x -d <device> 1 1 (once, extended disk stats)
+/// Run iostat for a specific device.
+///
+/// # Arguments
+///
+/// * `device` - The device name
+///
+/// # Returns
+///
+/// The output of the iostat command
 #[allow(dead_code)]
 async fn run_iostat(device: &str) -> Result<Output> {
     TokioCommand::new("iostat")
-        .args(&["-x", "-d", device, "1", "1"])  // Extended, device-specific, 1s interval, count=1
+        .args(&["-x", "-d", device, "1", "1"]) // Extended, device-specific, 1s interval, count=1
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to run iostat: {}", e))
 }
 
-// Helper: Parse %util from iostat output (e.g., look for line with device and extract last column)
+/// Parse %util from iostat output.
+///
+/// # Arguments
+///
+/// * `output` - The stdout from iostat
+/// * `device` - The device name
+///
+/// # Returns
+///
+/// The utility percentage as a string
 #[allow(dead_code)]
 fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
     for line in output.lines() {
-        if line.contains(device) && !line.contains("Device") {  // Skip header
+        if line.contains(device) && !line.contains("Device") {
+            // Skip header
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let Some(util) = parts.last() {
                 return Some(util.to_string());
@@ -325,6 +360,11 @@ fn parse_iostat_util(output: &str, device: &str) -> Option<String> {
     None
 }
 
+/// Detects available GPUs on the system.
+///
+/// # Returns
+///
+/// Result<GpuDetection> containing count and info for each GPU
 pub fn detect_gpus() -> Result<GpuDetection> {
     #[cfg(target_os = "linux")]
     {
@@ -339,13 +379,19 @@ pub fn detect_gpus() -> Result<GpuDetection> {
         // Fallback: very basic lspci detection (just count + rough names)
         if let Ok(basic) = detect_lspci_basic() {
             if basic.count > 0 {
-                info!("Detected {} GPU(s) via lspci (no nvidia-smi available)", basic.count);
+                info!(
+                    "Detected {} GPU(s) via lspci (no nvidia-smi available)",
+                    basic.count
+                );
                 return Ok(basic);
             }
         }
 
         debug!("No GPUs detected on Linux");
-        return Ok(GpuDetection { count: 0, gpus: vec![] });
+        return Ok(GpuDetection {
+            count: 0,
+            gpus: vec![],
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -357,16 +403,27 @@ pub fn detect_gpus() -> Result<GpuDetection> {
             }
         }
         debug!("No GPUs detected on macOS");
-        Ok(GpuDetection { count: 0, gpus: vec![] })
+        Ok(GpuDetection {
+            count: 0,
+            gpus: vec![],
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         warn!("GPU detection not implemented for this platform");
-        Ok(GpuDetection { count: 0, gpus: vec![] })
+        Ok(GpuDetection {
+            count: 0,
+            gpus: vec![],
+        })
     }
 }
 
+/// Detects NVIDIA GPUs using nvidia-smi.
+///
+/// # Returns
+///
+/// Result<GpuDetection> with NVIDIA GPU info
 #[allow(dead_code)]
 fn detect_nvidia() -> Result<GpuDetection> {
     // Query name + memory + driver
@@ -380,7 +437,10 @@ fn detect_nvidia() -> Result<GpuDetection> {
 
     if !output.status.success() {
         debug!("nvidia-smi command failed");
-        return Ok(GpuDetection { count: 0, gpus: vec![] });
+        return Ok(GpuDetection {
+            count: 0,
+            gpus: vec![],
+        });
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -402,7 +462,7 @@ fn detect_nvidia() -> Result<GpuDetection> {
             index,
             name,
             memory_mib,
-            is_discrete: true,           // NVIDIA cards are always discrete
+            is_discrete: true, // NVIDIA cards are always discrete
             driver,
         });
     }
@@ -413,6 +473,11 @@ fn detect_nvidia() -> Result<GpuDetection> {
     })
 }
 
+/// Detects GPUs on macOS using system_profiler.
+///
+/// # Returns
+///
+/// Result<GpuDetection> with Apple GPU info
 fn detect_macos() -> Result<GpuDetection> {
     let output = Command::new("system_profiler")
         .args(["SPDisplaysDataType", "-json"])
@@ -420,7 +485,10 @@ fn detect_macos() -> Result<GpuDetection> {
         .map_err(|e| anyhow!("system_profiler failed: {}", e))?;
 
     if !output.status.success() {
-        return Ok(GpuDetection { count: 0, gpus: vec![] });
+        return Ok(GpuDetection {
+            count: 0,
+            gpus: vec![],
+        });
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -441,9 +509,13 @@ fn detect_macos() -> Result<GpuDetection> {
 
             gpus.push(GpuInfo {
                 index,
-                name: if name.is_empty() { "Apple GPU".to_string() } else { name },
-                memory_mib: None,           // macOS doesn't expose easily via CLI
-                is_discrete: false,         // Apple Silicon is integrated
+                name: if name.is_empty() {
+                    "Apple GPU".to_string()
+                } else {
+                    name
+                },
+                memory_mib: None,   // macOS doesn't expose easily via CLI
+                is_discrete: false, // Apple Silicon is integrated
                 driver: None,
             });
             index += 1;
@@ -467,17 +539,25 @@ fn detect_macos() -> Result<GpuDetection> {
     })
 }
 
+/// Performs basic GPU detection using lspci.
+///
+/// # Returns
+///
+/// Result<GpuDetection> with basic GPU info
 #[allow(dead_code)]
 fn detect_lspci_basic() -> Result<GpuDetection> {
     let output = Command::new("lspci")
-        .arg("-mm")           // machine-readable format, easier to parse
-        .arg("-v")            // more verbose (includes device class)
+        .arg("-mm") // machine-readable format, easier to parse
+        .arg("-v") // more verbose (includes device class)
         .output()
         .map_err(|e| anyhow!("Failed to run lspci: {}", e))?;
 
     if !output.status.success() {
         debug!("lspci command failed or not found");
-        return Ok(GpuDetection { count: 0, gpus: vec![] });
+        return Ok(GpuDetection {
+            count: 0,
+            gpus: vec![],
+        });
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -493,8 +573,8 @@ fn detect_lspci_basic() -> Result<GpuDetection> {
 
     // Common GPU vendors (for rough classification)
     let gpu_vendors = [
-        "NVIDIA", "AMD", "ATI", "Intel", "Matrox", "Radeon", "GeForce",
-        "Quadro", "Tesla", "RTX", "GTX", "FirePro", "Arc",
+        "NVIDIA", "AMD", "ATI", "Intel", "Matrox", "Radeon", "GeForce", "Quadro", "Tesla", "RTX",
+        "GTX", "FirePro", "Arc",
     ];
 
     for line in stdout.lines() {
@@ -506,7 +586,10 @@ fn detect_lspci_basic() -> Result<GpuDetection> {
         let lower = line.to_lowercase();
 
         // Check if this line describes a graphics device
-        if gpu_indicators.iter().any(|&kw| lower.contains(&kw.to_lowercase())) {
+        if gpu_indicators
+            .iter()
+            .any(|&kw| lower.contains(&kw.to_lowercase()))
+        {
             // Try to extract something that looks like a device name/model
             let mut name_parts = vec![];
 
@@ -533,7 +616,7 @@ fn detect_lspci_basic() -> Result<GpuDetection> {
             gpus.push(GpuInfo {
                 index,
                 name,
-                memory_mib: None,         // lspci doesn't show VRAM
+                memory_mib: None, // lspci doesn't show VRAM
                 is_discrete: !lower.contains("intel") && !lower.contains("integrated"),
                 driver: None,
             });
@@ -599,14 +682,26 @@ pub fn compute_phase_concurrency(
     concurrency
 }
 
+/// Computes the batch size for parallel processing.
+///
+/// # Arguments
+///
+/// * `est_total_lines` - Optional estimated total number of lines
+/// * `avg_line_bytes` - Average size of a line in bytes
+/// * `target_batch_mb` - Target batch size in megabytes
+/// * `concurrency` - Number of concurrent tasks
+///
+/// # Returns
+///
+/// The number of lines per batch
 pub fn compute_batch_size(
-    est_total_lines: Option<usize>,  // Optional: If known (e.g., from prior count); else None for defaults
-    avg_line_bytes: usize,           // ~200
-    target_batch_mb: usize,          // 100–500
+    est_total_lines: Option<usize>, // Optional: If known (e.g., from prior count); else None for defaults
+    avg_line_bytes: usize,          // ~200
+    target_batch_mb: usize,         // 100–500
     concurrency: usize,
 ) -> usize {
     let target_bytes = target_batch_mb * 1024 * 1024;
-    let base_batch = target_bytes / avg_line_bytes;  // e.g., 100MB / 200B = 500k lines
+    let base_batch = target_bytes / avg_line_bytes; // e.g., 100MB / 200B = 500k lines
 
     if let Some(total_lines) = est_total_lines {
         // Dynamic: ~10–20 batches per concurrent task for overlap
@@ -614,11 +709,16 @@ pub fn compute_batch_size(
         let from_total = total_lines / total_batches;
         base_batch.min(from_total)
     } else {
-        base_batch  // Fixed if unknown
+        base_batch // Fixed if unknown
     }
-        .clamp(10_000, 500_000)  // Min/max
+    .clamp(10_000, 500_000) // Min/max
 }
 
+/// Detects the highest supported SIMD level on the current CPU.
+///
+/// # Returns
+///
+/// SimdLevel (Scalar, Avx2, or Avx512)
 pub fn detect_simd_level() -> SimdLevel {
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -628,10 +728,11 @@ pub fn detect_simd_level() -> SimdLevel {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") &&
-            is_x86_feature_detected!("avx512bw") &&
-            is_x86_feature_detected!("avx512vl") &&
-            is_x86_feature_detected!("avx512dq") {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512dq")
+        {
             info!("AVX-512 (F+BW+VL+DQ) detected → enabling AVX512 path (r8id.48xlarge / EPYC)");
             SimdLevel::Avx512
         } else if is_x86_feature_detected!("avx2") {

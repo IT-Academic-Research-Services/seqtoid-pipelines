@@ -1,45 +1,47 @@
-use crate::utils::taxonomy::get_taxid;
+//! FASTX functions
+
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Cursor;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::io::{BufWriter as StdBufWriter, Write};
-
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::collections::HashSet;
-use anyhow::{Result, anyhow, Context};
-use log::{self, debug, info, error, warn};
 
-
-use std::collections::HashMap;
 use ahash::AHashMap;
-use lazy_static::lazy_static;
-use crate::utils::sequence::{DNA, normal_phred_qual_string}; 
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use fst::MapBuilder;
+use futures::stream::StreamExt;
 use futures::Stream;
+use lazy_static::lazy_static;
+use log::{self, debug, error, info, warn};
+use memchr::memmem;
+use needletail::{parse_fastx_file, parser::FastqReader, FastxReader};
+use once_cell::sync::Lazy;
+use tokio::fs::File as TokioFile;
+use tokio::io::AsyncSeekExt;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
+use tokio::task::JoinHandle;
+use tokio::time::Duration;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{self as stream};
 
-use needletail::{parse_fastx_file, FastxReader, parser::{FastqReader}};
-use futures::stream::StreamExt;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio::time::{Duration};
-use tokio::fs::File as TokioFile;
-use futures::future::try_join_all;
-use tokio::io::AsyncWriteExt;
-use tokio::task::JoinHandle;
-use tokio::sync::mpsc::Receiver;
-use tokio::io::AsyncSeekExt;
-use memchr::{memmem, memchr3};
-use fst::{MapBuilder};
-use once_cell::sync::Lazy;
-use bytes::Bytes;
-
-use crate::utils::streams::{ParseOutput, ToBytes};
-use crate::utils::file::{extension_remover};
 use crate::cli::Technology;
-use crate::config::defs::{StreamDataType, FASTA_TAG, FASTQ_TAG, FASTA_EXTS, FASTQ_EXTS, ReadStats, Taxid, Lineage, CONFORMING_PREAMBLE, PipelineError, RunConfig, TaxonSeqLocation, PairingMode, SIMD_LEVEL, SimdLevel};
-use crate::utils::taxonomy::{get_valid_lineage, combine_taxon_loc_json};
-use crate::utils::system::{compute_phase_concurrency};
+use crate::config::defs::{
+    Lineage, PairingMode, PipelineError, ReadStats, RunConfig, SimdLevel, StreamDataType, Taxid,
+    TaxonSeqLocation, CONFORMING_PREAMBLE, FASTA_EXTS, FASTA_TAG, FASTQ_EXTS, FASTQ_TAG,
+    SIMD_LEVEL,
+};
+use crate::utils::file::extension_remover;
+use crate::utils::sequence::{normal_phred_qual_string, DNA};
+use crate::utils::streams::{ParseOutput, ToBytes};
+use crate::utils::system::compute_phase_concurrency;
+use crate::utils::taxonomy::get_taxid;
+use crate::utils::taxonomy::{combine_taxon_loc_json, get_valid_lineage};
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -59,12 +61,9 @@ lazy_static! {
     };
 }
 
-
 lazy_static! {
     pub static ref CONTIG_THRESHOLDS: Vec<usize> = vec![0, 1000, 5000, 10000, 25000, 50000];
 }
-
-
 
 /// Defines FASTA and FASTQ as part of a unified FASTX structure.
 #[derive(Clone, Debug)]
@@ -98,7 +97,6 @@ impl SequenceRecord {
         }
     }
 
-
     /// Cheap clone of the sequence bytes (refcount bump only).
     pub fn seq(&self) -> Bytes {
         match self {
@@ -107,8 +105,6 @@ impl SequenceRecord {
         }
     }
 
-
-
     #[allow(dead_code)]
     pub fn qual(&self) -> Bytes {
         match self {
@@ -116,10 +112,7 @@ impl SequenceRecord {
             SequenceRecord::Fastq { qual, .. } => qual.clone(),
         }
     }
-
-
 }
-
 
 /// Enum to hold either FASTA or FASTQ reader
 pub enum SequenceReader {
@@ -147,8 +140,6 @@ impl From<needletail::parser::SequenceRecord<'_>> for SequenceRecord {
         }
     }
 }
-
-
 
 /// Validates that a sequence only contains allowed nucleotide bases.
 /// Accepts `&[u8]`, `Bytes`, `Vec<u8>`, `&Bytes`, etc.
@@ -195,7 +186,10 @@ pub async fn validate_sequence_parallel(
 
         let handle = tokio::spawn(async move {
             if let Some(&invalid) = chunk.iter().find(|b| !valid.contains(b)) {
-                Err(format!("Invalid nucleotide '{}' found in sequence", invalid as char))
+                Err(format!(
+                    "Invalid nucleotide '{}' found in sequence",
+                    invalid as char
+                ))
             } else {
                 Ok(())
             }
@@ -221,8 +215,12 @@ pub async fn validate_sequence_parallel(
 /// io::Result<SequenceReader>: Result bearing the correct SequenceReader.
 ///
 pub fn sequence_reader(path: &PathBuf) -> io::Result<SequenceReader> {
-    let reader = needletail::parse_fastx_file(path)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to open FASTX file {}: {}", path.display(), e)))?;
+    let reader = needletail::parse_fastx_file(path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to open FASTX file {}: {}", path.display(), e),
+        )
+    })?;
 
     let is_fasta = fastx_filetype(path)?;
     match is_fasta.as_str() {
@@ -234,7 +232,6 @@ pub fn sequence_reader(path: &PathBuf) -> io::Result<SequenceReader> {
         )),
     }
 }
-
 
 /// Determines if a file path is a FASTA, FASTQ, or neither.
 /// Checks extensions, not the body.
@@ -271,7 +268,6 @@ fn fastx_filetype(path: &PathBuf) -> io::Result<String> {
     ))
 }
 
-
 #[derive(Debug, PartialEq)]
 pub struct R1R2Result {
     pub delimiter: Option<char>,
@@ -279,7 +275,6 @@ pub struct R1R2Result {
     pub file_name: Option<String>,
     pub index: Option<usize>,
     pub prefix: Option<String>,
-    
 }
 
 /// Tries to locate
@@ -292,49 +287,46 @@ pub struct R1R2Result {
 /// # Returns
 /// Result<String>. Ok fastq or fasta, or err.
 ///
-pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
-
+pub fn r1r2_base(path: &PathBuf) -> R1R2Result {
     let delimiters = ['_', '.', '-'];
     let (stem, extensions) = extension_remover(&path);
-    
-    match stem.file_name() {
-        Some(name) => {
-            match name.to_str() {
-                Some(filename) => {
-                    for &delimiter in delimiters.iter() {
-                        let parts: Vec<&str> = filename.split(delimiter).collect();
-                        for (index, part) in parts.iter().enumerate() {
-                            if (*R1_R2_TAGS).contains_key(part) {
-                                let r1_tag = part.to_string();
-                                let prefix_parts = &parts[..index];
-                                let prefix = if prefix_parts.is_empty() {
-                                    String::new()
-                                } else {
-                                    prefix_parts.join(&delimiter.to_string())
-                                };
 
-                                let new_file = format!("{}.{}", prefix, extensions.join("."));
-                                
-                                return R1R2Result {
-                                    delimiter: Some(delimiter),
-                                    r1_tag: Some(r1_tag),
-                                    file_name: Some(new_file),
-                                    index: Some(index),
-                                    prefix: Some(prefix),
-                                };
-                            }
+    match stem.file_name() {
+        Some(name) => match name.to_str() {
+            Some(filename) => {
+                for &delimiter in delimiters.iter() {
+                    let parts: Vec<&str> = filename.split(delimiter).collect();
+                    for (index, part) in parts.iter().enumerate() {
+                        if (*R1_R2_TAGS).contains_key(part) {
+                            let r1_tag = part.to_string();
+                            let prefix_parts = &parts[..index];
+                            let prefix = if prefix_parts.is_empty() {
+                                String::new()
+                            } else {
+                                prefix_parts.join(&delimiter.to_string())
+                            };
+
+                            let new_file = format!("{}.{}", prefix, extensions.join("."));
+
+                            return R1R2Result {
+                                delimiter: Some(delimiter),
+                                r1_tag: Some(r1_tag),
+                                file_name: Some(new_file),
+                                index: Some(index),
+                                prefix: Some(prefix),
+                            };
                         }
                     }
                 }
-                None => {
-                    return R1R2Result {
-                        delimiter: None,
-                        r1_tag: None,
-                        file_name: None,
-                        index: None,
-                        prefix: None,
-                    };
-                }
+            }
+            None => {
+                return R1R2Result {
+                    delimiter: None,
+                    r1_tag: None,
+                    file_name: None,
+                    index: None,
+                    prefix: None,
+                };
             }
         },
         None => {
@@ -347,7 +339,7 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
             };
         }
     }
-    
+
     return R1R2Result {
         delimiter: None,
         r1_tag: None,
@@ -355,7 +347,6 @@ pub fn r1r2_base(path: &PathBuf)  -> R1R2Result {
         index: None,
         prefix: None,
     };
-    
 }
 
 /// Parses a FASTX header.
@@ -395,16 +386,15 @@ unsafe fn parse_header_avx512_inner(head: &[u8], prefix: char) -> (String, Optio
     }
 
     let space_splat = _mm512_set1_epi8(b' ' as i8);
-    let tab_splat   = _mm512_set1_epi8(b'\t' as i8);
-    let nl_splat    = _mm512_set1_epi8(b'\n' as i8);
+    let tab_splat = _mm512_set1_epi8(b'\t' as i8);
+    let nl_splat = _mm512_set1_epi8(b'\n' as i8);
 
     let mut i = 0usize;
     while i + 64 <= len {
         let chunk = _mm512_loadu_si512(head.as_ptr().add(i).cast::<__m512i>());
-        let mask: u64 =
-            _mm512_cmpeq_epi8_mask(chunk, space_splat) |
-                _mm512_cmpeq_epi8_mask(chunk, tab_splat)   |
-                _mm512_cmpeq_epi8_mask(chunk, nl_splat);
+        let mask: u64 = _mm512_cmpeq_epi8_mask(chunk, space_splat)
+            | _mm512_cmpeq_epi8_mask(chunk, tab_splat)
+            | _mm512_cmpeq_epi8_mask(chunk, nl_splat);
 
         if mask != 0 {
             let pos = i + mask.trailing_zeros() as usize;
@@ -452,9 +442,6 @@ static PARSE_HEADER_FN: Lazy<fn(&[u8], char) -> (String, Option<String>)> = Lazy
     parse_header_scalar
 });
 
-
-
-
 /// Reads a FASTQ file.
 ///
 /// # Arguments
@@ -478,9 +465,11 @@ pub fn read_fastq(
     min_read_len: Option<usize>,
     max_read_len: Option<usize>,
     tag: &str,
-    config: &RunConfig,         // ← added
-) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<ReadStats, anyhow::Error>>)> {
-
+    config: &RunConfig, // ← added
+) -> Result<(
+    mpsc::Receiver<ParseOutput>,
+    JoinHandle<Result<ReadStats, anyhow::Error>>,
+)> {
     let effective_chunk = crate::utils::system::compute_buffer_size(
         config,
         "read_fastq",
@@ -488,7 +477,7 @@ pub fn read_fastq(
             Some(Technology::ONT) => StreamDataType::OntFastq,
             _ => StreamDataType::IlluminaFastq,
         },
-        1.1,                        // light boost for reader
+        1.1, // light boost for reader
     );
 
     let (tx, rx) = mpsc::channel(effective_chunk / 1024); // ~1KB per item
@@ -519,11 +508,18 @@ pub fn read_fastq(
                         break;
                     }
                     let record = result.map_err(|e| {
-                        anyhow!("Parse error at read {}: {}", validated_reads + undersized_reads + oversized_reads + 1, e)
+                        anyhow!(
+                            "Parse error at read {}: {}",
+                            validated_reads + undersized_reads + oversized_reads + 1,
+                            e
+                        )
                     })?;
 
                     if record.qual().is_none() {
-                        return Err(anyhow!("Expected FASTQ, got FASTA at read {}", validated_reads + undersized_reads + oversized_reads + 1));
+                        return Err(anyhow!(
+                            "Expected FASTQ, got FASTA at read {}",
+                            validated_reads + undersized_reads + oversized_reads + 1
+                        ));
                     }
 
                     let seq_len = record.seq().len();
@@ -556,14 +552,25 @@ pub fn read_fastq(
                     validated_reads += 1;
 
                     if buffer.len() >= effective_chunk {
-                        if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
-                            return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
+                        if tx
+                            .send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer))))
+                            .await
+                            .is_err()
+                        {
+                            return Err(anyhow!(
+                                "Failed to send byte chunk at read {}",
+                                validated_reads
+                            ));
                         }
                     }
                 }
 
                 if !buffer.is_empty() {
-                    if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
+                    if tx
+                        .send(ParseOutput::Bytes(Bytes::from(buffer)))
+                        .await
+                        .is_err()
+                    {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
@@ -589,7 +596,10 @@ pub fn read_fastq(
                     return Err(anyhow!("Paired-end not supported for ONT"));
                 }
 
-                debug!("read_fastq: Opening paired-end FASTQ: R1={:?}, R2={:?}", path1, path2);
+                debug!(
+                    "read_fastq: Opening paired-end FASTQ: R1={:?}, R2={:?}",
+                    path1, path2
+                );
 
                 let mut reader1 = parse_fastx_file(&path1)
                     .map_err(|e| anyhow!("Failed to open R1 FASTQ {}: {}", path1.display(), e))?;
@@ -599,7 +609,13 @@ pub fn read_fastq(
                 let mut buffer = Vec::with_capacity(effective_chunk);
 
                 loop {
-                    if validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 >= max_reads {
+                    if validated_reads
+                        + undersized_reads
+                        + oversized_reads
+                        + unpaired_r1
+                        + unpaired_r2
+                        >= max_reads
+                    {
                         debug!("read_fastq: Reached max_reads={}", max_reads);
                         break;
                     }
@@ -608,8 +624,16 @@ pub fn read_fastq(
                     let r1_record = match r1_opt {
                         Some(Ok(rec)) => Some(rec),
                         Some(Err(e)) => {
-                            warn!("R1 parse error at read {}: {} — discarding unpaired",
-                                  validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 + 1, e);
+                            warn!(
+                                "R1 parse error at read {}: {} — discarding unpaired",
+                                validated_reads
+                                    + undersized_reads
+                                    + oversized_reads
+                                    + unpaired_r1
+                                    + unpaired_r2
+                                    + 1,
+                                e
+                            );
                             unpaired_r1 += 1;
                             continue;
                         }
@@ -620,8 +644,16 @@ pub fn read_fastq(
                     let r2_record = match r2_opt {
                         Some(Ok(rec)) => Some(rec),
                         Some(Err(e)) => {
-                            warn!("R2 parse error at read {}: {} — discarding unpaired",
-                                  validated_reads + undersized_reads + oversized_reads + unpaired_r1 + unpaired_r2 + 1, e);
+                            warn!(
+                                "R2 parse error at read {}: {} — discarding unpaired",
+                                validated_reads
+                                    + undersized_reads
+                                    + oversized_reads
+                                    + unpaired_r1
+                                    + unpaired_r2
+                                    + 1,
+                                e
+                            );
                             unpaired_r2 += 1;
                             continue;
                         }
@@ -631,15 +663,22 @@ pub fn read_fastq(
                     match (r1_record, r2_record) {
                         (Some(r1), Some(r2)) => {
                             if r1.qual().is_none() || r2.qual().is_none() {
-                                return Err(anyhow!("Expected FASTQ for pair at read {}", validated_reads + undersized_reads + oversized_reads + 1));
+                                return Err(anyhow!(
+                                    "Expected FASTQ for pair at read {}",
+                                    validated_reads + undersized_reads + oversized_reads + 1
+                                ));
                             }
 
-                            if matches!(pairing_mode, PairingMode::Strict) && !compare_read_ids_bytes(r1.id(), r2.id()) {
-                                warn!("{}: ID mismatch at pair {} — discarding unpaired: {} vs {}",
-                                      tag,
-                                      validated_reads + undersized_reads + oversized_reads + 1,
-                                      String::from_utf8_lossy(r1.id()),
-                                      String::from_utf8_lossy(r2.id()));
+                            if matches!(pairing_mode, PairingMode::Strict)
+                                && !compare_read_ids_bytes(r1.id(), r2.id())
+                            {
+                                warn!(
+                                    "{}: ID mismatch at pair {} — discarding unpaired: {} vs {}",
+                                    tag,
+                                    validated_reads + undersized_reads + oversized_reads + 1,
+                                    String::from_utf8_lossy(r1.id()),
+                                    String::from_utf8_lossy(r2.id())
+                                );
                                 unpaired_r1 += 1;
                                 unpaired_r2 += 1;
                                 continue;
@@ -689,25 +728,45 @@ pub fn read_fastq(
                             validated_reads += 1;
 
                             if buffer.len() >= effective_chunk {
-                                if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
-                                    return Err(anyhow!("Failed to send byte chunk at read {}", validated_reads));
+                                if tx
+                                    .send(ParseOutput::Bytes(Bytes::from(std::mem::take(
+                                        &mut buffer,
+                                    ))))
+                                    .await
+                                    .is_err()
+                                {
+                                    return Err(anyhow!(
+                                        "Failed to send byte chunk at read {}",
+                                        validated_reads
+                                    ));
                                 }
                             }
                         }
-                        (Some(_), None) => { unpaired_r1 += 1; }
-                        (None, Some(_)) => { unpaired_r2 += 1; }
+                        (Some(_), None) => {
+                            unpaired_r1 += 1;
+                        }
+                        (None, Some(_)) => {
+                            unpaired_r2 += 1;
+                        }
                         (None, None) => break,
                     }
                 }
 
                 if !buffer.is_empty() {
-                    if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
+                    if tx
+                        .send(ParseOutput::Bytes(Bytes::from(buffer)))
+                        .await
+                        .is_err()
+                    {
                         return Err(anyhow!("Failed to send final byte chunk"));
                     }
                 }
 
                 if unpaired_r1 > 0 || unpaired_r2 > 0 {
-                    warn!("{}: Discarded {} unpaired R1 and {} unpaired R2 reads", tag, unpaired_r1, unpaired_r2);
+                    warn!(
+                        "{}: Discarded {} unpaired R1 and {} unpaired R2 reads",
+                        tag, unpaired_r1, unpaired_r2
+                    );
                 }
 
                 debug!("read_fastq: Processed {} paired-end reads (undersized: {}, validated: {}, oversized: {}, unpaired R1: {}, unpaired R2: {})",
@@ -728,7 +787,6 @@ pub fn read_fastq(
     Ok((rx, task))
 }
 
-
 /// Reads a FASTA file.
 ///
 ///
@@ -748,12 +806,11 @@ pub fn read_fasta(
     max_seq_len: Option<usize>,
     config: &RunConfig,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-
     let effective_chunk = crate::utils::system::compute_buffer_size(
         config,
         "read_fasta",
         StreamDataType::JustBytes,
-        1.2,                         // moderate boost for FASTA reader
+        1.2, // moderate boost for FASTA reader
     );
 
     let (tx, rx) = mpsc::channel(effective_chunk / 1024);
@@ -773,25 +830,37 @@ pub fn read_fasta(
                 debug!("read_fasta: Reached max_records={}", max_records);
                 break;
             }
-            let record = result.map_err(|e| {
-                anyhow!("Parse error at record {}: {}", record_count + 1, e)
-            })?;
+            let record =
+                result.map_err(|e| anyhow!("Parse error at record {}: {}", record_count + 1, e))?;
 
             if record.qual().is_some() {
-                return Err(anyhow!("Expected FASTA, got FASTQ at record {}", record_count + 1));
+                return Err(anyhow!(
+                    "Expected FASTA, got FASTQ at record {}",
+                    record_count + 1
+                ));
             }
 
             let seq_len = record.seq().len();
 
             if let Some(min) = min_seq_len {
                 if seq_len < min {
-                    debug!("read_fasta: Skipping record {}: seq_len={} < min={}", record_count + 1, seq_len, min);
+                    debug!(
+                        "read_fasta: Skipping record {}: seq_len={} < min={}",
+                        record_count + 1,
+                        seq_len,
+                        min
+                    );
                     continue;
                 }
             }
             if let Some(max) = max_seq_len {
                 if seq_len > max {
-                    debug!("read_fasta: Skipping record {}: seq_len={} > max={}", record_count + 1, seq_len, max);
+                    debug!(
+                        "read_fasta: Skipping record {}: seq_len={} > max={}",
+                        record_count + 1,
+                        seq_len,
+                        max
+                    );
                     continue;
                 }
             }
@@ -807,14 +876,25 @@ pub fn read_fasta(
             record_count += 1;
 
             if buffer.len() >= effective_chunk {
-                if tx.send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer)))).await.is_err() {
-                    return Err(anyhow!("Failed to send byte chunk at record {}", record_count));
+                if tx
+                    .send(ParseOutput::Bytes(Bytes::from(std::mem::take(&mut buffer))))
+                    .await
+                    .is_err()
+                {
+                    return Err(anyhow!(
+                        "Failed to send byte chunk at record {}",
+                        record_count
+                    ));
                 }
             }
         }
 
         if !buffer.is_empty() {
-            if tx.send(ParseOutput::Bytes(Bytes::from(buffer))).await.is_err() {
+            if tx
+                .send(ParseOutput::Bytes(Bytes::from(buffer)))
+                .await
+                .is_err()
+            {
                 return Err(anyhow!("Failed to send final byte chunk"));
             }
         }
@@ -828,7 +908,6 @@ pub fn read_fasta(
 
     Ok(rx)
 }
-
 
 /// Write any ParseOutput stream that contains FASTA records to a file.
 /// The caller decides the destination path (RAM temp, scratch, final output, …).
@@ -844,25 +923,28 @@ pub fn read_fasta(
 pub fn write_fasta_stream_to_file(
     stream: ReceiverStream<ParseOutput>,
     dest_path: PathBuf,
-    config: Arc<RunConfig>,           // ← Arc for 'static spawn
-    data_type: StreamDataType,        // ← added
-    label: &str,                      // optional label for logging
+    config: Arc<RunConfig>,    // ← Arc for 'static spawn
+    data_type: StreamDataType, // ← added
+    label: &str,               // optional label for logging
 ) -> JoinHandle<Result<()>> {
-
     let dest_path_clone = dest_path.clone();
     let label_owned = label.to_string();
 
     tokio::spawn(async move {
-        let file = TokioFile::create(&dest_path_clone)
-            .await
-            .map_err(|e| anyhow!("Cannot create FASTA file {}: {}", dest_path_clone.display(), e))?;
+        let file = TokioFile::create(&dest_path_clone).await.map_err(|e| {
+            anyhow!(
+                "Cannot create FASTA file {}: {}",
+                dest_path_clone.display(),
+                e
+            )
+        })?;
 
         // Dynamic hot buffer
         let effective_buffer = crate::utils::system::compute_buffer_size(
             &config,
             "write_fasta_stream_to_file",
             data_type,
-            2.0,                          // very hot write path
+            2.0, // very hot write path
         );
 
         let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
@@ -878,23 +960,33 @@ pub fn write_fasta_stream_to_file(
             batch.extend_from_slice(&bytes);
 
             if batch.len() >= effective_buffer / 4 {
-                writer.write_all(&batch).await
+                writer
+                    .write_all(&batch)
+                    .await
                     .map_err(|e| anyhow!("Write error to {}: {}", dest_path_clone.display(), e))?;
                 batch.clear();
             }
         }
 
         if !batch.is_empty() {
-            writer.write_all(&batch).await
-                .map_err(|e| anyhow!("Final write error to {}: {}", dest_path_clone.display(), e))?;
+            writer.write_all(&batch).await.map_err(|e| {
+                anyhow!("Final write error to {}: {}", dest_path_clone.display(), e)
+            })?;
         }
 
-        writer.flush().await
+        writer
+            .flush()
+            .await
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
         let final_size = writer.stream_position().await.unwrap_or(0);
-        info!("{} written to {} ({} bytes, buffer {} MiB)",
-              label_owned, dest_path_clone.display(), final_size, effective_buffer / (1024*1024));
+        info!(
+            "{} written to {} ({} bytes, buffer {} MiB)",
+            label_owned,
+            dest_path_clone.display(),
+            final_size,
+            effective_buffer / (1024 * 1024)
+        );
 
         Ok(())
     })
@@ -911,18 +1003,9 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
 
     // Strip common suffixes (byte-level)
     let suffixes: [&[u8]; 24] = [
-        b"/1", b"/2",
-        b".1", b".2",
-        b" 1:", b" 2:",
-        b" 1:N:0:", b" 2:N:0:",
-        b"/1:N:0:", b"/2:N:0:",
-        b"_1", b"_2",
-        b" 1#0/1", b" 2#0/2",
-        b"|1", b"|2",
-        b" 1#", b" 2#",
-        b"/R1", b"/R2",
-        b"_R1", b"_R2",
-        b" 1:0", b" 2:0",
+        b"/1", b"/2", b".1", b".2", b" 1:", b" 2:", b" 1:N:0:", b" 2:N:0:", b"/1:N:0:", b"/2:N:0:",
+        b"_1", b"_2", b" 1#0/1", b" 2#0/2", b"|1", b"|2", b" 1#", b" 2#", b"/R1", b"/R2", b"_R1",
+        b"_R2", b" 1:0", b" 2:0",
     ];
 
     let mut stripped1 = false;
@@ -958,7 +1041,14 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
     // Clean up any trailing characters
     while !base1.is_empty() {
         let last = base1[base1.len() - 1];
-        if last == b' ' || last == b'\t' || last == b':' || last == b'#' || last == b'.' || last == b'/' || last == b'_' {
+        if last == b' '
+            || last == b'\t'
+            || last == b':'
+            || last == b'#'
+            || last == b'.'
+            || last == b'/'
+            || last == b'_'
+        {
             base1 = &base1[..base1.len() - 1];
         } else {
             break;
@@ -966,7 +1056,14 @@ fn compare_read_ids_bytes(id1: &[u8], id2: &[u8]) -> bool {
     }
     while !base2.is_empty() {
         let last = base2[base2.len() - 1];
-        if last == b' ' || last == b'\t' || last == b':' || last == b'#' || last == b'.' || last == b'/' || last == b'_' {
+        if last == b' '
+            || last == b'\t'
+            || last == b':'
+            || last == b'#'
+            || last == b'.'
+            || last == b'/'
+            || last == b'_'
+        {
             base2 = &base2[..base2.len() - 1];
         } else {
             break;
@@ -999,7 +1096,8 @@ pub fn raw_read_count(
             if count1 != count2 {
                 return Err(anyhow!(
                     "Mismatched read counts in paired files: {} (R1) vs {} (R2)",
-                    count1, count2
+                    count1,
+                    count2
                 ));
             }
             Ok(count1 * 2)
@@ -1041,11 +1139,16 @@ async fn count_fastx_sequences(path: &PathBuf) -> Result<u64> {
 /// * `num_records` - Number of SequenceRecords to make.
 /// * 'seq_len' = Length of each seq.
 /// * 'mean' = Mean quality of bases
-/// * 'stdev' = St Dev of quality of bases. 
+/// * 'stdev' = St Dev of quality of bases.
 ///
 /// # Returns
 /// Stream<Item = SequenceRecord>
-pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32) -> impl Stream<Item = SequenceRecord> {
+pub fn fastx_generator(
+    num_records: usize,
+    seq_len: usize,
+    mean: f32,
+    stdev: f32,
+) -> impl Stream<Item = SequenceRecord> {
     let records: Vec<SequenceRecord> = if seq_len == 0 {
         Vec::new() // Empty vector for zero read size
     } else {
@@ -1065,9 +1168,8 @@ pub fn fastx_generator(num_records: usize, seq_len: usize, mean: f32, stdev: f32
     stream::iter(records)
 }
 
-
 /// Compares the headers ot two FASTQ reads.
-/// If two FASTQ, the stream is interleaved and a header check is performed 
+/// If two FASTQ, the stream is interleaved and a header check is performed
 /// to ensure each pair of reads is really an R1/R2 pair.
 /// # Arguments
 ///
@@ -1094,14 +1196,23 @@ pub fn compare_read_ids(id1: &str, id2: &str) -> bool {
 pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<()> {
     let mut reader = match sequence_reader(fasta_path)? {
         SequenceReader::Fasta(reader) => reader,
-        _ => return Err(anyhow!("Input file {} is not a FASTA file", fasta_path.display())),
+        _ => {
+            return Err(anyhow!(
+                "Input file {} is not a FASTA file",
+                fasta_path.display()
+            ))
+        }
     };
 
     let mut fifo_file = File::create(fifo_path)?;
     while let Some(record_result) = reader.next() {
         let record = record_result.map_err(|e| anyhow!("Error reading FASTA: {}", e))?;
         let seq_record: SequenceRecord = record.to_owned().into();
-        let fasta_line = format!(">{}\n{}\n", seq_record.id(), String::from_utf8_lossy(&seq_record.seq()));
+        let fasta_line = format!(
+            ">{}\n{}\n",
+            seq_record.id(),
+            String::from_utf8_lossy(&seq_record.seq())
+        );
         fifo_file.write_all(fasta_line.as_bytes())?;
     }
     fifo_file.flush()?;
@@ -1160,7 +1271,10 @@ pub fn parse_and_filter_fastq_id(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
     pattern: String,
-) -> (mpsc::Receiver<SequenceRecord>, JoinHandle<Result<(), anyhow::Error>>) {
+) -> (
+    mpsc::Receiver<SequenceRecord>,
+    JoinHandle<Result<(), anyhow::Error>>,
+) {
     let pattern_bytes = pattern.into_bytes();
     let (filtered_tx, filtered_rx) = mpsc::channel(buffer_size);
     let task = tokio::spawn(async move {
@@ -1185,18 +1299,23 @@ pub fn parse_and_filter_fastq_id(
                 }
             }
         }
-        debug!("Filtered {} FASTQ records from Kraken2 classified stream", count);
+        debug!(
+            "Filtered {} FASTQ records from Kraken2 classified stream",
+            count
+        );
         Ok(())
     });
     (filtered_rx, task)
 }
 
-
 pub async fn parse_byte_stream_to_fastq(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
     stall_threshold_secs: u64,
-) -> Result<(mpsc::Receiver<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>)> {
+) -> Result<(
+    mpsc::Receiver<ParseOutput>,
+    JoinHandle<Result<(), anyhow::Error>>,
+)> {
     let (tx, rx) = mpsc::channel(buffer_size);
 
     let task = tokio::spawn(async move {
@@ -1207,7 +1326,10 @@ pub async fn parse_byte_stream_to_fastq(
 
         while let Some(item) = stream.next().await {
             if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
-                warn!("parse_byte_stream_to_fastq: Stall detected at {} records", record_count);
+                warn!(
+                    "parse_byte_stream_to_fastq: Stall detected at {} records",
+                    record_count
+                );
                 last_progress = tokio::time::Instant::now();
             }
 
@@ -1216,7 +1338,10 @@ pub async fn parse_byte_stream_to_fastq(
                     full_buffer.extend_from_slice(&*bytes);
                 }
                 _ => {
-                    warn!("parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}", record_count + 1);
+                    warn!(
+                        "parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}",
+                        record_count + 1
+                    );
                     continue;
                 }
             }
@@ -1234,17 +1359,27 @@ pub async fn parse_byte_stream_to_fastq(
                 Ok(record) => {
                     let owned_record: SequenceRecord = record.to_owned().into();
                     if tx.send(ParseOutput::Fastq(owned_record)).await.is_err() {
-                        return Err(anyhow!("Failed to send FASTQ record at count {}", record_count + 1));
+                        return Err(anyhow!(
+                            "Failed to send FASTQ record at count {}",
+                            record_count + 1
+                        ));
                     }
                     record_count += 1;
                 }
                 Err(e) => {
-                    return Err(anyhow!("FASTQ parsing error at count {}: {}", record_count + 1, e));
+                    return Err(anyhow!(
+                        "FASTQ parsing error at count {}: {}",
+                        record_count + 1,
+                        e
+                    ));
                 }
             }
         }
 
-        debug!("parse_byte_stream_to_fastq: Parsed {} FASTQ records", record_count);
+        debug!(
+            "parse_byte_stream_to_fastq: Parsed {} FASTQ records",
+            record_count
+        );
         Ok(())
     });
 
@@ -1284,7 +1419,10 @@ pub async fn concatenate_paired_reads(
 
         while let Some(item) = stream.next().await {
             if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
-                warn!("concatenate_paired_reads: Stall detected at {} read pairs", pair_count);
+                warn!(
+                    "concatenate_paired_reads: Stall detected at {} read pairs",
+                    pair_count
+                );
                 last_progress = tokio::time::Instant::now();
             }
 
@@ -1322,11 +1460,11 @@ pub async fn concatenate_paired_reads(
                             new_seq.extend_from_slice(&r2_seq);
 
                             // Concatenate quality scores: R1 + ! + R2
-                            let mut new_qual = Vec::with_capacity(r1_qual.len() + r2_qual.len() + 1);
+                            let mut new_qual =
+                                Vec::with_capacity(r1_qual.len() + r2_qual.len() + 1);
                             new_qual.extend_from_slice(&r1_qual);
                             new_qual.push(b'!'); // Low quality for 'N'
                             new_qual.extend_from_slice(&r2_qual);
-
 
                             let new_record = SequenceRecord::Fastq {
                                 id: r1_id.clone(),
@@ -1343,7 +1481,10 @@ pub async fn concatenate_paired_reads(
                             }
                             pair_count += 1;
                         } else {
-                            return Err(anyhow!("Non-FASTQ record in pair at count {}", pair_count + 1));
+                            return Err(anyhow!(
+                                "Non-FASTQ record in pair at count {}",
+                                pair_count + 1
+                            ));
                         }
                     } else {
                         // This is R1; store and wait for R2
@@ -1362,7 +1503,10 @@ pub async fn concatenate_paired_reads(
             return Err(anyhow!("Unpaired R1 record at end of stream"));
         }
 
-        debug!("concatenate_paired_reads: Processed {} read pairs", pair_count);
+        debug!(
+            "concatenate_paired_reads: Processed {} read pairs",
+            pair_count
+        );
         Ok(())
     });
 
@@ -1379,17 +1523,13 @@ pub async fn concatenate_paired_reads(
 ///
 /// # Returns
 /// Result \ , Box error
-pub fn build_fasta_index(
-    fasta_path: &PathBuf,
-    index_path: &PathBuf,
-    verify: bool,
-) -> Result<()> {
+pub fn build_fasta_index(fasta_path: &PathBuf, index_path: &PathBuf, verify: bool) -> Result<()> {
     let file = File::open(fasta_path)
         .with_context(|| format!("Failed to open FASTA file: {}", fasta_path.display()))?;
 
     let mut reader = BufReader::new(file);
     let mut line = String::with_capacity(1024);
-    let mut entries = Vec::with_capacity(8_000_000);  // trying to size for NR
+    let mut entries = Vec::with_capacity(8_000_000); // trying to size for NR
 
     let mut pos: u64 = 0;
 
@@ -1430,7 +1570,11 @@ pub fn build_fasta_index(
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     entries.dedup_by(|a, b| a.0 == b.0);
 
-    info!("Writing FST index with {} unique accessions → {}", entries.len(), index_path.display());
+    info!(
+        "Writing FST index with {} unique accessions → {}",
+        entries.len(),
+        index_path.display()
+    );
 
     let mut builder = MapBuilder::new(StdBufWriter::new(
         File::create(index_path)
@@ -1447,7 +1591,6 @@ pub fn build_fasta_index(
     Ok(())
 }
 
-
 pub async fn generate_taxid_fasta(
     config: Arc<RunConfig>,
     mapped_contigs_stream: ReceiverStream<ParseOutput>,
@@ -1456,11 +1599,11 @@ pub async fn generate_taxid_fasta(
     nr_hit_summary_stream: ReceiverStream<ParseOutput>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
 ) -> Result<(
-    mpsc::Receiver<ParseOutput>,           // mapped contigs with taxid headers
-    mpsc::Receiver<ParseOutput>,           // combined (mapped + conformed unmapped)
-    JoinHandle<Result<()>>,                // load_nt_task
-    JoinHandle<Result<()>>,                // load_nr_task
-    JoinHandle<Result<()>>,                // main_task
+    mpsc::Receiver<ParseOutput>, // mapped contigs with taxid headers
+    mpsc::Receiver<ParseOutput>, // combined (mapped + conformed unmapped)
+    JoinHandle<Result<()>>,      // load_nt_task
+    JoinHandle<Result<()>>,      // load_nr_task
+    JoinHandle<Result<()>>,      // main_task
 )> {
     // Output channels
     let (mapped_tx, mapped_rx) = mpsc::channel(1024);
@@ -1479,16 +1622,23 @@ pub async fn generate_taxid_fasta(
             while let Some(item) = stream.next().await {
                 if let ParseOutput::Bytes(bytes) = item {
                     let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
-                    if line.is_empty() { continue; }
+                    if line.is_empty() {
+                        continue;
+                    }
                     let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() < 4 { continue; }
+                    if fields.len() < 4 {
+                        continue;
+                    }
                     let read_id = fields[0].to_string();
                     let level: u8 = fields[1].parse().unwrap_or(255);
                     let taxid: Taxid = fields[3].parse().unwrap_or(-1);
                     hits.insert(read_id, (taxid, level));
                 }
             }
-            nt_hits_tx.send(Arc::new(hits)).await.map_err(|_| anyhow!("NT hits tx dropped"))?;
+            nt_hits_tx
+                .send(Arc::new(hits))
+                .await
+                .map_err(|_| anyhow!("NT hits tx dropped"))?;
             Ok(())
         }
     });
@@ -1502,16 +1652,23 @@ pub async fn generate_taxid_fasta(
             while let Some(item) = stream.next().await {
                 if let ParseOutput::Bytes(bytes) = item {
                     let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
-                    if line.is_empty() { continue; }
+                    if line.is_empty() {
+                        continue;
+                    }
                     let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() < 4 { continue; }
+                    if fields.len() < 4 {
+                        continue;
+                    }
                     let read_id = fields[0].to_string();
                     let level: u8 = fields[1].parse().unwrap_or(255);
                     let taxid: Taxid = fields[3].parse().unwrap_or(-1);
                     hits.insert(read_id, (taxid, level));
                 }
             }
-            nr_hits_tx.send(Arc::new(hits)).await.map_err(|_| anyhow!("NR hits tx dropped"))?;
+            nr_hits_tx
+                .send(Arc::new(hits))
+                .await
+                .map_err(|_| anyhow!("NR hits tx dropped"))?;
             Ok(())
         }
     });
@@ -1519,16 +1676,22 @@ pub async fn generate_taxid_fasta(
     // Main processing task
     let main_task = tokio::spawn(async move {
         // Wait for both maps
-        let nt_hits = nt_hits_rx.recv().await.ok_or(anyhow!("NT hits map not received"))?;
-        let nr_hits = nr_hits_rx.recv().await.ok_or(anyhow!("NR hits map not received"))?;
+        let nt_hits = nt_hits_rx
+            .recv()
+            .await
+            .ok_or(anyhow!("NT hits map not received"))?;
+        let nr_hits = nr_hits_rx
+            .recv()
+            .await
+            .ok_or(anyhow!("NR hits map not received"))?;
 
         let concurrency = compute_phase_concurrency(
             &config,
             "generate_taxid_fasta",
-            0.5,           // ~0.5 GB per thread max
-            4.0,           // 4 threads per core
-            64,            // cap
-            8,             // min for meaningful parallelism
+            0.5, // ~0.5 GB per thread max
+            4.0, // 4 threads per core
+            64,  // cap
+            8,   // min for meaningful parallelism
         );
 
         const BATCH_SIZE: usize = 1000;
@@ -1537,7 +1700,7 @@ pub async fn generate_taxid_fasta(
         {
             let (batch_tx, batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
             let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
-            
+
             let mut worker_handles = Vec::with_capacity(concurrency);
             for _ in 0..concurrency {
                 let rx = batch_rx.clone();
@@ -1602,11 +1765,18 @@ pub async fn generate_taxid_fasta(
                                 .map_err(|_| anyhow!("batch_tx dropped unexpectedly during mapped_stream processing"))?;
                         }
                     }
-                    _ => return Err(anyhow!("Unexpected item type in mapped_contigs_stream: expected Fasta")),
+                    _ => {
+                        return Err(anyhow!(
+                            "Unexpected item type in mapped_contigs_stream: expected Fasta"
+                        ))
+                    }
                 }
             }
             if !current_batch.is_empty() {
-                batch_tx.send(current_batch).await.map_err(|_| anyhow!("batch_tx dropped"))?;
+                batch_tx
+                    .send(current_batch)
+                    .await
+                    .map_err(|_| anyhow!("batch_tx dropped"))?;
             }
             drop(batch_tx);
 
@@ -1617,18 +1787,12 @@ pub async fn generate_taxid_fasta(
 
         // Process unidentified contigs → conform headers (parallel + buffered)
         {
-            let unidentified_concurrency = compute_phase_concurrency(
-                &config,
-                "unidentified_taxid_conform",
-                0.5,
-                4.0,
-                128,
-                16,
-            );
+            let unidentified_concurrency =
+                compute_phase_concurrency(&config, "unidentified_taxid_conform", 0.5, 4.0, 128, 16);
             let unid_batch_size = 32_000;
 
-
-            let (unid_batch_tx, unid_batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(unidentified_concurrency * 3);
+            let (unid_batch_tx, unid_batch_rx) =
+                mpsc::channel::<Vec<SequenceRecord>>(unidentified_concurrency * 3);
             let unid_batch_rx = Arc::new(tokio::sync::Mutex::new(unid_batch_rx));
 
             let mut unid_workers = Vec::with_capacity(unidentified_concurrency);
@@ -1659,7 +1823,6 @@ pub async fn generate_taxid_fasta(
                                 desc: new_desc,
                                 seq: rec.seq(),
                             };
-
 
                             let _ = c_tx.send(ParseOutput::Fasta(new_rec)).await;
                         }
@@ -1698,7 +1861,6 @@ pub async fn generate_taxid_fasta(
             for worker in unid_workers {
                 worker.await??;
             }
-            
         }
 
         drop(mapped_tx);
@@ -1715,8 +1877,6 @@ pub async fn generate_taxid_fasta(
     ))
 }
 
-
-
 pub async fn generate_taxid_locator(
     config: Arc<RunConfig>,
     fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
@@ -1729,15 +1889,12 @@ pub async fn generate_taxid_locator(
     ),
     PipelineError,
 > {
-    let concurrency = compute_phase_concurrency(
-        &config,
-        "generate_taxid_locator",
-        0.5,
-        4.0,
-        128,
-        16,
+    let concurrency =
+        compute_phase_concurrency(&config, "generate_taxid_locator", 0.5, 4.0, 128, 16);
+    info!(
+        "generate_taxid_locator starting — {} output workers",
+        concurrency
     );
-    info!("generate_taxid_locator starting — {} output workers", concurrency);
 
     let levels = vec!["species", "genus", "family"];
     let hit_types = vec!["NT", "NR"];
@@ -1754,7 +1911,10 @@ pub async fn generate_taxid_locator(
             let taxid_field = format!("{}_{}", level_owned, hit_type_owned.to_lowercase());
 
             let fa_name = if level_owned == "species" {
-                format!("refined_taxid_annot_sorted_{}.fasta", hit_type_owned.to_lowercase())
+                format!(
+                    "refined_taxid_annot_sorted_{}.fasta",
+                    hit_type_owned.to_lowercase()
+                )
             } else {
                 format!(
                     "refined_taxid_annot_sorted_{}_{}.fasta",
@@ -1786,7 +1946,10 @@ pub async fn generate_taxid_locator(
                 let mut rx = rx;
                 while let Some((header, seq)) = rx.recv().await {
                     let taxid = get_taxid(&header, &taxid_field_for_worker).unwrap_or(-1);
-                    records_by_taxid.entry(taxid).or_default().push((header, seq));
+                    records_by_taxid
+                        .entry(taxid)
+                        .or_default()
+                        .push((header, seq));
                 }
 
                 if records_by_taxid.is_empty() {
@@ -1829,7 +1992,8 @@ pub async fn generate_taxid_locator(
                     });
                 }
 
-                writer.flush()
+                writer
+                    .flush()
                     .map_err(|e| anyhow!("flush {}: {}", fa_path_for_worker.display(), e))?;
 
                 let json_bytes = serde_json::to_vec(&locations)?;
@@ -1951,7 +2115,6 @@ pub async fn write_combined_fastq(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1965,8 +2128,18 @@ mod tests {
     fn compare_header(head: &[u8], prefix: char) {
         let scalar = parse_header_scalar(head, prefix);
         let dispatched = parse_header(head, prefix);
-        assert_eq!(scalar.0, dispatched.0, "id mismatch for {:?}", std::str::from_utf8(head));
-        assert_eq!(scalar.1, dispatched.1, "desc mismatch for {:?}", std::str::from_utf8(head));
+        assert_eq!(
+            scalar.0,
+            dispatched.0,
+            "id mismatch for {:?}",
+            std::str::from_utf8(head)
+        );
+        assert_eq!(
+            scalar.1,
+            dispatched.1,
+            "desc mismatch for {:?}",
+            std::str::from_utf8(head)
+        );
     }
 
     #[test]
@@ -1983,7 +2156,10 @@ mod tests {
         let head = b"NC_045512.2 Severe acute respiratory syndrome coronavirus 2";
         let (id, desc) = parse_header_scalar(head, '>');
         assert_eq!(id, "NC_045512.2");
-        assert_eq!(desc.as_deref(), Some("Severe acute respiratory syndrome coronavirus 2"));
+        assert_eq!(
+            desc.as_deref(),
+            Some("Severe acute respiratory syndrome coronavirus 2")
+        );
         compare_header(head, '>');
     }
 
@@ -2010,7 +2186,10 @@ mod tests {
         let head = b"contig_00001 ";
         let (id, desc) = parse_header_scalar(head, '>');
         assert_eq!(id, "contig_00001");
-        assert!(desc.is_none(), "trailing space with empty desc should give None");
+        assert!(
+            desc.is_none(),
+            "trailing space with empty desc should give None"
+        );
         compare_header(head, '>');
     }
 
@@ -2165,7 +2344,10 @@ mod tests {
 
         match sequence_reader(&path)? {
             SequenceReader::Fasta(_) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fasta reader")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Expected Fasta reader",
+            )),
         }
     }
 
@@ -2177,7 +2359,10 @@ mod tests {
 
         match sequence_reader(&path)? {
             SequenceReader::Fastq(_) => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Expected Fastq reader")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Expected Fastq reader",
+            )),
         }
     }
 
@@ -2211,14 +2396,8 @@ mod tests {
         let r1 = dir.path().join("r1.fastq");
         let r2 = dir.path().join("r2.fastq");
 
-        fs::write(
-            &r1,
-            b"@read1/1\nACGT\n+\nIIII\n@read2/1\nTGCA\n+\nHHHH\n",
-        )?;
-        fs::write(
-            &r2,
-            b"@read1/2\nACGT\n+\nIIII\n@read2/2\nTGCA\n+\nHHHH\n",
-        )?;
+        fs::write(&r1, b"@read1/1\nACGT\n+\nIIII\n@read2/1\nTGCA\n+\nHHHH\n")?;
+        fs::write(&r2, b"@read1/2\nACGT\n+\nIIII\n@read2/2\nTGCA\n+\nHHHH\n")?;
 
         let handle = raw_read_count(r1, Some(r2));
         let count = handle.await??;
@@ -2293,8 +2472,8 @@ mod tests {
                 seq: Bytes::from_static(b"ATCG"),
                 qual: Bytes::from_static(b"IIII"),
             }))
-                .await
-                .unwrap();
+            .await
+            .unwrap();
 
             tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
                 id: "ignore_me_02".to_string(),
@@ -2302,8 +2481,8 @@ mod tests {
                 seq: Bytes::from_static(b"TGCA"),
                 qual: Bytes::from_static(b"HHHH"),
             }))
-                .await
-                .unwrap();
+            .await
+            .unwrap();
         });
 
         let (filtered_rx, task) = parse_and_filter_fastq_id(rx, 10, "keep_me".to_string());
@@ -2328,8 +2507,8 @@ mod tests {
         tx.send(ParseOutput::Bytes(
             b"@read1\nACGT\n+\nIIII\n".to_vec().into(),
         ))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         drop(tx);
 
         let (out_rx, task) = parse_byte_stream_to_fastq(rx, 10, 1).await?;
@@ -2427,7 +2606,8 @@ mod tests {
             let actual = parse_header(header, '>');
 
             assert_eq!(
-                scalar, actual,
+                scalar,
+                actual,
                 "Header mismatch on: {:?}\n  scalar: {:?}\n  actual: {:?}",
                 std::str::from_utf8(header),
                 scalar,
@@ -2453,7 +2633,8 @@ mod tests {
             let actual = parse_header(header, prefix);
 
             assert_eq!(
-                scalar, actual,
+                scalar,
+                actual,
                 "Failed on header: {:?} (prefix '{}')",
                 std::str::from_utf8(header),
                 prefix

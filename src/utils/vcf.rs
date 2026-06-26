@@ -1,10 +1,13 @@
+//! VCF functions
+
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use crate::utils::streams::ParseOutput;
-use std::collections::HashSet;
 
+use crate::utils::streams::ParseOutput;
 
 /// Parses the output stream from `bcftools stats` to extract counts of SNPs, MNPs, and indels.
 ///
@@ -22,7 +25,9 @@ use std::collections::HashSet;
 /// # Errors
 ///
 /// Returns an error if parsing fails or if expected lines are missing (though it defaults to 0 if not found).
-pub async fn count_variants_from_bcftools_stats(rx: Receiver<ParseOutput>) -> Result<(u64, u64, u64)> {
+pub async fn count_variants_from_bcftools_stats(
+    rx: Receiver<ParseOutput>,
+) -> Result<(u64, u64, u64)> {
     let mut snps = 0u64;
     let mut mnps = 0u64;
     let mut indels = 0u64;
@@ -39,7 +44,7 @@ pub async fn count_variants_from_bcftools_stats(rx: Receiver<ParseOutput>) -> Re
                     "number of SNPs" => snps = value,
                     "number of MNPs" => mnps = value,
                     "number of indels" => indels = value,
-                    _ => {},
+                    _ => {}
                 }
             }
         }
@@ -47,7 +52,6 @@ pub async fn count_variants_from_bcftools_stats(rx: Receiver<ParseOutput>) -> Re
 
     Ok((snps, mnps, indels))
 }
-
 
 /// Compute allele counts from a stream
 ///
@@ -109,4 +113,3 @@ pub async fn parse_vcf_stream(rx: Receiver<ParseOutput>) -> anyhow::Result<(u64,
     }
     Ok((snps, mnps, indels))
 }
-

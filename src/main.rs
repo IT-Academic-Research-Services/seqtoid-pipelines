@@ -1,50 +1,58 @@
+//! Metagenomics bioinformatics pipeline suite.
+//!
+//! High-performance, concurrent pipelines for:
+//! - Short-read (Illumina) mNGS
+//! - Long-read (Nanopore) mNGS
+//! - Consensus genome assembly
+//! - Antimicrobial resistance profiling
+//! - Phylogenetic analysis
+
+mod cli;
+mod config;
 mod pipelines;
 mod utils;
-mod config;
-mod cli;
 
-use sysinfo::CpuRefreshKind;
-use std::time::{Instant, SystemTime};
-use std::{env, fs};
-use chrono::{DateTime};
-use std::cmp::min;
 use std::path::PathBuf;
 use std::sync::Arc;
-use sysinfo::{System, RefreshKind, MemoryRefreshKind};
+use std::time::Instant;
+use std::{env, fs};
+
 use std::io::Write;
 
 use anyhow::Result;
-use log::{self, LevelFilter, debug, info, error, warn};
 use env_logger::Builder;
-use clap::Parser;
+use log::{self, debug, error, info, warn, LevelFilter};
+use rand_core::OsRng;
 use rayon::ThreadPool;
-use tokio::sync::Semaphore;
 use rayon::ThreadPoolBuilder;
-use tokio::process::Command as TokioCommand;
-use tokio::time::{sleep, Duration};
-use std::process::Output;
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use rand_core::{RngCore, OsRng};
-use crate::cli::parse;
-use crate::config::defs::{RunConfig, StreamDataType, PipelineError, NRAlignmentBackend, GpuDetection, GpuInfo};
-use crate::cli::args::Technology;
-use crate::utils::file::{file_path_manipulator, resolve_existing_input_path, derive_sample_base_from_file1};
-use crate::utils::fastx::r1r2_base;
-use crate::utils::system::{detect_cores_and_load, compute_stream_threads, detect_ram, generate_rng,
-                           compute_buffer_size, get_ram_temp_dir, detect_gpus, detect_physical_cores,
-                           detect_simd_level, ensure_transparent_hugepages};
-use pipelines::consensus_genome;
-use pipelines::short_read_mngs;
-use pipelines::db;
+use sysinfo::MemoryRefreshKind;
+use tokio::sync::Semaphore;
+use tokio::time::Duration;
 
+use crate::cli::args::Technology;
+use crate::cli::parse;
+use crate::config::defs::{
+    GpuDetection, GpuInfo, NRAlignmentBackend, PipelineError, RunConfig, StreamDataType,
+};
+use crate::utils::file::{derive_sample_base_from_file1, resolve_existing_input_path};
+use crate::utils::system::{
+    compute_buffer_size, compute_stream_threads, detect_cores_and_load, detect_gpus,
+    detect_physical_cores, detect_ram, detect_simd_level, ensure_transparent_hugepages,
+    generate_rng, get_ram_temp_dir,
+};
+
+use pipelines::consensus_genome;
+use pipelines::db;
+use pipelines::short_read_mngs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let run_start = Instant::now();
 
     #[cfg(not(unix))]
-    Err(anyhow!("Named pipes are not supported on non-Unix systems."));
+    Err(anyhow!(
+        "Named pipes are not supported on non-Unix systems."
+    ));
 
     let args = parse();
 
@@ -79,27 +87,36 @@ async fn main() -> Result<()> {
     let (max_cores, cpu_load) = detect_cores_and_load(args.threads, args.use_smt).await?;
     let stream_threads = compute_stream_threads(max_cores, cpu_load, args.threads, args.use_smt);
 
-    let thread_pool = Arc::new(ThreadPoolBuilder::new()
-        .num_threads(max_cores)
-        .build()
-        .expect("Failed to create thread pool"));
+    let thread_pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(max_cores)
+            .build()
+            .expect("Failed to create thread pool"),
+    );
 
     let maximal_semaphore = Arc::new(Semaphore::new(2));
 
     let mut has_gpu = false;
     let mut use_mmseqs_gpu = false;
-    let gpu_info = detect_gpus().unwrap_or(GpuDetection { count: 0, gpus: vec![] });
+    let gpu_info = detect_gpus().unwrap_or(GpuDetection {
+        count: 0,
+        gpus: vec![],
+    });
 
     if gpu_info.count > 0 {
         has_gpu = true;
         for gpu in &gpu_info.gpus {
             info!(
-            "GPU {}: {} ({}{} MiB)",
-            gpu.index,
-            gpu.name,
-            gpu.memory_mib.map_or("?".to_string(), |m| m.to_string()),
-            if gpu.memory_mib.is_some() { "" } else { "unknown" }
-        );
+                "GPU {}: {} ({}{} MiB)",
+                gpu.index,
+                gpu.name,
+                gpu.memory_mib.map_or("?".to_string(), |m| m.to_string()),
+                if gpu.memory_mib.is_some() {
+                    ""
+                } else {
+                    "unknown"
+                }
+            );
         }
 
         use_mmseqs_gpu = gpu_info.gpus.iter().any(|g| {
@@ -121,8 +138,16 @@ async fn main() -> Result<()> {
     };
 
     let (total_ram, available_ram) = detect_ram()?;
-    debug!("Available RAM: {} bytes (~{} GiB)", available_ram, available_ram / 1_073_741_824);
-    debug!("Total RAM: {} bytes (~{} GiB)", total_ram, total_ram / 1_073_741_824);
+    debug!(
+        "Available RAM: {} bytes (~{} GiB)",
+        available_ram,
+        available_ram / 1_073_741_824
+    );
+    debug!(
+        "Total RAM: {} bytes (~{} GiB)",
+        total_ram,
+        total_ram / 1_073_741_824
+    );
 
     let input_size = get_input_size(&args.file1, &args.file2).unwrap_or(0);
     debug!("Total input file size: {} Bytes", input_size);
@@ -133,7 +158,6 @@ async fn main() -> Result<()> {
         Technology::Illumina => StreamDataType::IlluminaFastq,
         Technology::ONT => StreamDataType::OntFastq,
     };
-
 
     let simd = detect_simd_level();
 
@@ -158,25 +182,18 @@ async fn main() -> Result<()> {
         gpu_info: gpu_info,
         has_gpu: has_gpu,
         alignment_backend: backend,
-
     });
 
     if let Err(e) = ensure_transparent_hugepages(&run_config).await {
         warn!("THP setup failed (non-fatal): {}", e);
     }
 
-    let base_buffer_size = compute_buffer_size(
-        &run_config,
-        "global_default",
-        sdt,
-        1.0,
-    );
+    let base_buffer_size = compute_buffer_size(&run_config, "global_default", sdt, 1.0);
 
     let run_config = Arc::new(RunConfig {
-        base_buffer_size,   // now correct
-        ..(*run_config).clone()   // copy everything else
+        base_buffer_size,        // now correct
+        ..(*run_config).clone()  // copy everything else
     });
-
 
     if let Err(e) = match module.as_str() {
         "consensus_genome" => consensus_genome_run(run_config).await,
@@ -184,17 +201,25 @@ async fn main() -> Result<()> {
         "build_taxid_lineages" => build_taxid_lineages_run(run_config).await,
         "build_accession2taxid" => build_accession2taxid_run(run_config).await,
         "build_fasta_offset" => build_fasta_offset_db_run(run_config).await,
-        _ => Err(PipelineError::InvalidConfig(format!("Invalid module: {}", module))),
+        _ => Err(PipelineError::InvalidConfig(format!(
+            "Invalid module: {}",
+            module
+        ))),
     } {
-        error!("Pipeline failed: {} at {} milliseconds.", e, run_start.elapsed().as_millis());
+        error!(
+            "Pipeline failed: {} at {} milliseconds.",
+            e,
+            run_start.elapsed().as_millis()
+        );
         std::process::exit(1);
     }
 
-    println!("Run complete: {} milliseconds.", run_start.elapsed().as_millis());
+    println!(
+        "Run complete: {} milliseconds.",
+        run_start.elapsed().as_millis()
+    );
     Ok(())
 }
-
-
 
 async fn consensus_genome_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     consensus_genome::run(run_config).await
@@ -255,7 +280,6 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
     Ok(out_dir)
 }
 
-
 /// Creates a pool of threads for running sub-processes.
 ///
 /// # Arguments
@@ -269,7 +293,6 @@ fn create_thread_pool(max_cores: usize) -> ThreadPool {
         .build()
         .expect("Failed to create thread pool")
 }
-
 
 /// Gets the file size(s) of the input file(s) from metadata
 ///
