@@ -6804,7 +6804,7 @@ async fn mmseqs_non_host_align(
 /// # Returns
 ///
 /// Result<()>: success or error
-async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
+pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let out_dir = config.out_dir.clone();
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
