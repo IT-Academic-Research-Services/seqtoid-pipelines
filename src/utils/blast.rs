@@ -18,10 +18,16 @@ use dashmap::DashMap;
 use bytes::Bytes;
 use once_cell::sync::Lazy;
 
-use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel};
-use crate::utils::streams::ParseOutput;
-use crate::utils::taxonomy::validate_taxid_lineage;
-use crate::utils::streams::ToBytes;
+use crate::config::defs::{Taxid, Lineage, ClusterInfo, MIN_NORMAL_POSITIVE_DOUBLE, READ_COUNTING_MODE, ReadCountingMode, SIMD_LEVEL, SimdLevel, PipelineError, RunConfig, StreamDataType, SORT_TAG};
+use crate::utils::streams::{ParseOutput, parse_lines, fanout_to_channels, ToBytes, spawn_cmd};
+use crate::utils::taxonomy::{validate_taxid_lineage};
+use crate::utils::file::{choose_temp_dir, write_byte_stream_to_file, rename_file_path};
+use crate::utils::command::generate_cli;
+use tokio::fs::File as TokioFile;
+use tokio::time::Instant;
+use tokio::sync::oneshot;
+use std::path::PathBuf;
+use std::collections::HashMap;
 
 /// Represents an entry in the contig summary, grouping metadata and hit stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,6 +776,490 @@ pub fn shard_for_read_id(read_id: &str, workers: usize) -> usize {
     let mut hasher = state.build_hasher();
     read_id.hash(&mut hasher);
     (hasher.finish() as usize) % workers
+}
+
+/// Sorts an BLAST m8 format byte stream by read ID (first column) using GNU sort.
+/// RAM-first via choose_temp_dir, falls back to NVMe scratch.
+/// Guarantees consecutive lines per read ID. Never drops data.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of unsorted m8 records
+/// * `db_type`: database type (e.g., "nt", "nr") for tagging
+///
+/// # Returns
+///
+/// Result containing the sorted m8 record stream
+pub async fn sort_m8_by_read_id(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    db_type: &str,
+) -> Result<ReceiverStream<ParseOutput>, PipelineError> {
+    let tag = format!("sort_m8_{}", db_type);
+    let estimated_bytes = (config.input_size * 4).max(1_000_000_000);
+
+    let temp_dir = choose_temp_dir(
+        estimated_bytes,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    )
+        .await?;
+
+    let unsorted_path = temp_dir.path().join(format!("{}_unsorted.m8", db_type));
+    let sorted_path = temp_dir.path().join(format!("{}_sorted_by_read.m8", db_type));
+
+    info!(
+        "[{}] Starting m8 sort (est {} bytes) using RAM/NVMe scratch",
+        tag, estimated_bytes
+    );
+
+    // 1) Write the unsorted stream to disk and wait for the file to be fully closed.
+    let write_task = write_byte_stream_to_file(
+        &unsorted_path,
+        input_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        &tag,
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    write_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("{} writer task panicked: {}", tag, e)))?
+        .map_err(|e| PipelineError::IOError(format!("{} writer task failed: {}", tag, e)))?;
+
+    let sort_buffer = if config.available_ram > 256 * 1024 * 1024 * 1024 {
+        "32G"
+    } else {
+        "8G"
+    };
+
+    // 2) Only now spawn GNU sort, so it reads a complete file.
+    let sort_config = crate::utils::command::sort::SortConfig {
+        key: "-k1,1".to_string(),
+        parallel: None,
+        buffer_size: Some(sort_buffer.to_string()),
+        temp_dir: Some(temp_dir.path().to_string_lossy().into_owned()),
+        output: Some(sorted_path.to_string_lossy().into_owned()),
+        extra_fields: HashMap::new(),
+        input: Some(unsorted_path.to_string_lossy().into_owned()),
+    };
+
+    let sort_args = generate_cli(
+        crate::config::defs::SORT_TAG,
+        &config,
+        Some(&sort_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut sort_child, sort_err_task) = spawn_cmd(
+        config.clone(),
+        crate::config::defs::SORT_TAG,
+        sort_args,
+        config.args.verbose,
+        None
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let status = sort_child
+        .wait()
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    if !status.success() {
+        let _ = sort_err_task.await;
+        return Err(PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: format!("GNU sort exited with {:?}", status.code()),
+        });
+    }
+
+    sort_err_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("sort stderr task panicked: {}", e)))?
+        .map_err(|e| PipelineError::Other(anyhow!("sort stderr task failed: {}", e)))?;
+
+    info!("[{}] m8 sort completed → {}", tag, sorted_path.display());
+
+    // 3) Stream the sorted file back.
+    let sorted_file = TokioFile::open(&sorted_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let meta = tokio::fs::metadata(&sorted_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    info!(
+    "[{}] sorted output exists: {} bytes at {}",
+    tag,
+    meta.len(),
+    sorted_path.display()
+);
+
+
+    let rx = parse_lines(sorted_file, &config, StreamDataType::JustBytes)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    Ok(ReceiverStream::new(rx))
+}
+
+/// Calls taxonomic hits from a sorted m8 stream.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `m8_input`: stream of m8 records sorted by read ID
+/// * `sample_base_buf`: base path for the sample
+/// * `lineage_map`: map of taxids to lineages
+/// * `acc2taxid_map`: map of accessions to taxids
+/// * `should_keep_filter`: filter for taxids to keep
+/// * `min_aln_len`: minimum alignment length to consider a hit
+/// * `concurrency`: number of concurrent workers
+/// * `tag`: tag for logging
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of top m8 hits per read
+/// - stream of hit summary records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+pub async fn call_hits_m8(
+    config: Arc<RunConfig>,
+    mut m8_input: ReceiverStream<ParseOutput>, // MUST be sorted by read ID
+    sample_base_buf: PathBuf,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    acc2taxid_map: Arc<Map<Vec<u8>>>,
+    should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    min_aln_len: u64,
+    concurrency: usize,
+    tag: String,
+) -> Result<(
+    ReceiverStream<ParseOutput>, // dedup m8 stream
+    ReceiverStream<ParseOutput>, // summary stream
+    Vec<tokio::task::JoinHandle<Result<()>>>,
+    Vec<oneshot::Receiver<Result<()>>>,
+), PipelineError> {
+    let worker_count = concurrency.max(1);
+    let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
+
+    info!(
+        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
+        tag, worker_count, min_aln_len
+    );
+
+    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+
+    #[derive(Debug)]
+    enum WorkerMsgLocal {
+        ProcessRead {
+            read_id: String,
+            hits: Vec<M8Record>,
+        },
+        Flush,
+    }
+
+    // One sender per worker; reads are sharded by read_id.
+    let mut worker_txs: Vec<mpsc::Sender<WorkerMsgLocal>> = Vec::with_capacity(worker_count);
+
+    for worker_idx in 0..worker_count {
+        let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerMsgLocal>(config.base_buffer_size * 16);
+        worker_txs.push(worker_tx);
+
+        let lineage_map = lineage_map.clone();
+        let acc2taxid_map = acc2taxid_map.clone();
+        let should_keep_filter = should_keep_filter.clone();
+        let dedup_tx = dedup_tx.clone();
+        let summary_tx = summary_tx.clone();
+        let worker_tag = tag.clone();
+
+        let worker_handle = tokio::spawn(async move {
+            let mut total_emitted = 0usize;
+            let start = Instant::now();
+
+            debug!(
+                "[call_hits_m8:{}] worker {} started (streaming mode)",
+                worker_tag, worker_idx
+            );
+
+            while let Some(msg) = worker_rx.recv().await {
+                match msg {
+                    WorkerMsgLocal::ProcessRead { read_id, hits } => {
+                        let reduced = summarize_m8_hits(
+                            0,
+                            read_id,
+                            &hits,
+                            &lineage_map,
+                            &acc2taxid_map,
+                            &*should_keep_filter,
+                            min_aln_len,
+                        );
+
+                        if let Some(reduced) = reduced {
+                            total_emitted += 1;
+
+                            dedup_tx
+                                .send(ParseOutput::Bytes(Bytes::from(reduced.dedup)))
+                                .await
+                                .map_err(|e| anyhow!("dedup output channel closed: {}", e))?;
+
+                            summary_tx
+                                .send(ParseOutput::Bytes(Bytes::from(reduced.summary)))
+                                .await
+                                .map_err(|e| anyhow!("summary output channel closed: {}", e))?;
+                        }
+                    }
+                    WorkerMsgLocal::Flush => break,
+                }
+            }
+
+            info!(
+                "[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}",
+                worker_tag, worker_idx, total_emitted, start.elapsed()
+            );
+            Ok::<(), anyhow::Error>(())
+        });
+
+        cleanup_tasks.push(worker_handle);
+    }
+
+    // Coordinator: consume the sorted stream, accumulate one read at a time,
+    // and dispatch finished read blocks to a shard.
+    let coordinator_tag = tag.clone();
+    let coordinator_handle = tokio::spawn(async move {
+        let mut current_read_id: Option<String> = None;
+        let mut current_hits: Vec<M8Record> = Vec::with_capacity(32);
+        let mut total_lines = 0usize;
+        let mut total_reads = 0usize;
+        let start = Instant::now();
+
+        #[cfg(debug_assertions)]
+        let mut last_seen_read_id: Option<String> = None;
+
+        debug!(
+            "[call_hits_m8:{}] coordinator started (streaming group-by)",
+            coordinator_tag
+        );
+
+        while let Some(item) = m8_input.next().await {
+            let bytes = match item.to_bytes() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let line_str = match std::str::from_utf8(&bytes) {
+                Ok(s) => s.trim_end(),
+                Err(_) => continue,
+            };
+
+            if line_str.is_empty() || line_str.starts_with('#') {
+                continue;
+            }
+
+            total_lines += 1;
+
+            let read_id = match read_id_from_m8_line(line_str) {
+                Some(r) => r.to_string(),
+                None => continue,
+            };
+
+            let rec = match M8Record::parse_line_nr(line_str) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if total_lines == 1 {
+                info!(
+                    "[call_hits_m8:{}] first input line: read_id={} line={}",
+                    coordinator_tag, read_id, line_str
+                );
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                if let Some(prev) = &last_seen_read_id {
+                    if prev > &read_id {
+                        warn!(
+                            "[call_hits_m8:{}] read IDs appear to go backwards: prev={} current={}",
+                            coordinator_tag, prev, read_id
+                        );
+                    }
+                }
+                last_seen_read_id = Some(read_id.clone());
+            }
+
+            // If the read ID changes, the previous read is complete.
+            if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
+                let prev_read_id = current_read_id.take().unwrap();
+                let shard = shard_for_read_id(&prev_read_id, worker_count);
+
+                worker_txs[shard]
+                    .send(WorkerMsgLocal::ProcessRead {
+                        read_id: prev_read_id,
+                        hits: std::mem::take(&mut current_hits),
+                    })
+                    .await
+                    .map_err(|e| anyhow!("failed to dispatch completed read to worker: {}", e))?;
+
+                total_reads += 1;
+            }
+
+            if current_read_id.is_none() {
+                current_read_id = Some(read_id.clone());
+            }
+
+            current_hits.push(rec);
+        }
+
+        // Final read.
+        if let Some(read_id) = current_read_id {
+            if !current_hits.is_empty() {
+                let shard = shard_for_read_id(&read_id, worker_count);
+
+                worker_txs[shard]
+                    .send(WorkerMsgLocal::ProcessRead {
+                        read_id,
+                        hits: current_hits,
+                    })
+                    .await
+                    .map_err(|e| anyhow!("failed to dispatch final read to worker: {}", e))?;
+
+                total_reads += 1;
+            }
+        }
+
+        // Flush all workers after all reads have been dispatched.
+        for (_, tx) in worker_txs.iter().enumerate() {
+            tx.send(WorkerMsgLocal::Flush)
+                .await
+                .map_err(|e| anyhow!("failed to flush worker: {}", e))?;
+        }
+
+        info!(
+            "[call_hits_m8:{}] coordinator done — processed {} lines, {} reads in {:?}",
+            coordinator_tag,
+            total_lines,
+            total_reads,
+            start.elapsed()
+        );
+
+        if total_lines == 0 {
+            warn!(
+                "[call_hits_m8:{}] coordinator saw zero input lines; upstream sort/stream wiring is wrong",
+                coordinator_tag
+            );
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(coordinator_handle);
+
+    let dedup_stream = ReceiverStream::new(dedup_rx);
+    let (dedup_branches, dedup_router_done_rx) = fanout_to_channels(
+        dedup_stream,
+        2,
+        "call_hits_m8_dedup",
+        &config,
+        StreamDataType::JustBytes
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    // track router task (replaces cleanup_receivers)
+    cleanup_receivers.push(dedup_router_done_rx);
+
+    let mut dedup_branches = dedup_branches.into_iter();
+
+    let dedup_main = ReceiverStream::new(
+        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let dedup_file_stream = ReceiverStream::new(
+        dedup_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let call_file_write_task = write_byte_stream_to_file(
+        &config.out_dir.join(rename_file_path(
+            &sample_base_buf,
+            None,
+            Some(&format!("{}.dedup.m8", tag)),
+            "_",
+        )),
+        dedup_file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "call_hits_m8_dedup",
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(call_file_write_task);
+
+    let summary_stream = ReceiverStream::new(summary_rx);
+    let (summary_branches, summary_router_done_rx) = fanout_to_channels(
+        summary_stream,
+        2,
+        "call_hits_m8_summary",
+        &config,
+        StreamDataType::JustBytes
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    // track router task instead of oneshot receiver
+    cleanup_receivers.push(summary_router_done_rx);
+
+    let mut summary_branches = summary_branches.into_iter();
+
+    let summary_main = ReceiverStream::new(
+        summary_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let summary_file_stream = ReceiverStream::new(
+        summary_branches.next().ok_or(PipelineError::EmptyStream)?
+    );
+
+    let summary_file_write_task = write_byte_stream_to_file(
+        &config.out_dir.join(rename_file_path(
+            &sample_base_buf,
+            None,
+            Some(&format!("{}.summary.txt", tag)),
+            "_",
+        )),
+        summary_file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "call_hits_m8_summary",
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(summary_file_write_task);
+
+    info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
+
+    Ok((
+        dedup_main,
+        summary_main,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 /// Summarizes BLAST m8 hits for a single read into a ReducedRead structure.
