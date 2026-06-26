@@ -3419,82 +3419,6 @@ async fn collect_hit_summary_to_accession_map_concurrent(
     Ok(map)
 }
 
-/// Generates an annotated FASTA using deduped stream from  dedup_and_subsample
-/// and the full duplicate cluster size stream
-///
-/// # Arguments
-/// * `config` - RunConfig struct
-/// * `dedup_stream` - deduped FASTQ stream
-/// * `cluster_stream - full stream if cluster sizes
-/// * `nt_map` -
-///
-/// # Returns
-/// Result of hashmap of id:accession
-///
-fn parse_fasta_batch_to_annotated(
-    batch: Vec<u8>,
-    duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
-    nt_map: &HashMap<String, String>,
-    nr_map: &HashMap<String, String>,
-) -> Vec<Vec<u8>> {
-    let mut results = Vec::new();
-    let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(batch))
-        .expect("Failed to parse fastx batch");
-
-    while let Some(record) = reader.next() {
-        if let Ok(rec) = record {
-            let record: SequenceRecord = rec.into();
-            let rep_id = record.id().to_string();
-
-            let nr_acc = nr_map.get(&rep_id).cloned().unwrap_or_default();
-            let nt_acc = nt_map.get(&rep_id).cloned().unwrap_or_default();
-            let is_unidentified = nr_acc.is_empty() && nt_acc.is_empty();
-
-            let dup_count = duplicate_clusters
-                .get(&rep_id)
-                .map(|r| r.size)
-                .unwrap_or(1u64);
-
-            if !is_unidentified {
-                let id = format!("NR:{}:NT:{}:{}", nr_acc, nt_acc, rep_id);
-                let mapped_rec = SequenceRecord::Fasta {
-                    id,
-                    desc: None,
-                    seq: record.seq(),
-                };
-                if let Ok(bytes) = mapped_rec.to_bytes() {
-                    let mut tagged = vec![0u8];
-                    tagged.extend_from_slice(&bytes);
-                    results.push(tagged);
-                }
-            } else {
-                let fasta_rep = SequenceRecord::Fasta {
-                    id: rep_id.clone(),
-                    desc: None,
-                    seq: record.seq(),
-                };
-                if let Ok(bytes) = fasta_rep.to_bytes() {
-                    // Unidentified (expanded)
-                    let mut tagged_unid = vec![1u8];
-                    tagged_unid.extend_from_slice(&bytes);
-                    results.push(tagged_unid.clone());
-
-                    if dup_count > 1 {
-                        for _ in 1..dup_count {
-                            results.push(tagged_unid.clone());
-                        }
-                    }
-
-                    // Unique unidentified
-                    let mut tagged_uniq = vec![2u8];
-                    tagged_uniq.extend_from_slice(&bytes);
-                    results.push(tagged_uniq);
-                }
-            }
-        }
-    }
-    results
-}
 
 /// Streaing parser if fasta to annotated
 ///
@@ -4840,46 +4764,6 @@ async fn summarize_hits(
     ))
 }
 
-/// Writes empty BLAST outputs when no assembly results are present.
-
-/// # Arguments
-
-/// * `blast_m8`: path for the BLAST m8 file
-/// * `blast_top_m8`: path for the BLAST top m8 file
-/// * `refined_m8`: path for the refined m8 file
-/// * `refined_hit_summary`: path for the refined hit summary file
-/// * `refined_counts_with_dcr`: path for the refined counts with DCR file
-/// * `contig_summary_json`: path for the contig summary JSON file
-/// * `deduped_m8`: path to the input deduped m8 file to copy forward
-/// * `hit_summary`: path to the input hit summary file to copy forward
-/// * `orig_counts_with_dcr`: path to the input original counts with DCR file to copy forward
-
-/// # Returns
-
-/// Result<()>: success or error
-async fn write_empty_blast_outputs(
-    blast_m8: &PathBuf,
-    blast_top_m8: &PathBuf,
-    refined_m8: &PathBuf,
-    refined_hit_summary: &PathBuf,
-    refined_counts_with_dcr: &PathBuf,
-    contig_summary_json: &PathBuf,
-    deduped_m8: &PathBuf,
-    hit_summary: &PathBuf,
-    orig_counts_with_dcr: &PathBuf,
-) -> Result<()> {
-    tokio::fs::write(blast_m8, b" ").await?;
-    tokio::fs::write(blast_top_m8, b" ").await?;
-
-    // Preserve previous read-level results (critical)
-    tokio::fs::copy(deduped_m8, refined_m8).await?;
-    tokio::fs::copy(hit_summary, refined_hit_summary).await?;
-    tokio::fs::copy(orig_counts_with_dcr, refined_counts_with_dcr).await?;
-
-    tokio::fs::write(contig_summary_json, b"[]").await?;
-
-    Ok(())
-}
 
 /// Updates the read dictionary based on top BLAST m8 results for contigs.
 ///
@@ -6592,107 +6476,6 @@ async fn blast_contigs(
     ))
 }
 
-/// Extracts the original read ID and pair index from a taxid-annotated FASTA header.
-///
-/// # Arguments
-///
-/// * `id`: the FASTA header string
-///
-/// # Returns
-///
-/// Result containing the original ID and the pair index (0 for R1, 1 for R2)
-fn extract_original_id_from_taxid_fasta(id: &str) -> Result<(String, usize)> {
-    let mut header = id.to_string();
-    let mut read_index = 0;
-
-    if header.ends_with("/1") {
-        read_index = 0;
-        header.truncate(header.len() - 2);
-    } else if header.ends_with("/2") {
-        read_index = 1;
-        header.truncate(header.len() - 2);
-    }
-
-    let parts: Vec<&str> = header.split(':').collect();
-    let nt_pos = parts
-        .iter()
-        .position(|&p| p == "NT")
-        .ok_or_else(|| anyhow!("No 'NT' tag in taxid header: {}", id))?;
-
-    if nt_pos + 2 >= parts.len() {
-        return Err(anyhow!("Malformed header: not enough fields after NT"));
-    }
-
-    let original_id = parts[(nt_pos + 2)..].join(":");
-    let full_id = if read_index == 0 {
-        format!("{}/1", original_id)
-    } else {
-        format!("{}/2", original_id)
-    };
-
-    Ok((full_id, read_index))
-}
-
-/// Builds sets of non-host read IDs for R1 and R2 from a taxid-annotated stream.
-///
-/// # Arguments
-///
-/// * `taxid_mapped_stream`: stream of taxid-annotated FASTA records
-/// * `duplicate_clusters`: optional map of cluster information for including all duplicates
-///
-/// # Returns
-///
-/// Result containing the set of R1 IDs and an optional set of R2 IDs
-async fn build_nonhost_header_sets(
-    mut taxid_mapped_stream: ReceiverStream<ParseOutput>,
-    duplicate_clusters: Option<Arc<DuplicateClusters>>,
-) -> Result<(HashSet<String>, Option<HashSet<String>>)> {
-    tokio::task::spawn_blocking(move || {
-        let mut r1_set: HashSet<String> = HashSet::new();
-        let mut r2_set: HashSet<String> = HashSet::new();
-
-        while let Some(item) = futures::executor::block_on(taxid_mapped_stream.next()) {
-            if let ParseOutput::Fasta(record) = item {
-                if let Ok((full_id, read_index)) = extract_original_id_from_taxid_fasta(record.id())
-                {
-                    let target_set = if read_index == 0 {
-                        &mut r1_set
-                    } else {
-                        &mut r2_set
-                    };
-
-                    if READ_COUNTING_MODE == ReadCountingMode::CountAll {
-                        if let Some(clusters) = &duplicate_clusters {
-                            let mut rep_key = full_id.clone();
-                            if !clusters.contains_key(&rep_key) {
-                                rep_key = rep_key
-                                    .trim_end_matches("/1")
-                                    .trim_end_matches("/2")
-                                    .to_string();
-                            }
-
-                            if let Some(cluster) = clusters.get(&rep_key) {
-                                for member in &cluster.members {
-                                    target_set.insert(member.clone());
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    target_set.insert(full_id);
-                }
-            }
-        }
-
-        let r2_opt = if r2_set.is_empty() {
-            None
-        } else {
-            Some(r2_set)
-        };
-        Ok((r1_set, r2_opt))
-    })
-    .await?
-}
 
 /// Preloads NR alignments from a hit-summary stream into a shared map.
 ///
@@ -6839,7 +6622,6 @@ async fn run_mmseqs_step(
         .join("mmseqs")
         .join(format!("{}.stderr.log", label));
 
-    // spawn_cmd now handles numactl internally via prepend_numactl_if_beneficial
     let (mut child, stderr_task) = spawn_cmd(
         config.clone(),
         MMSEQS_TAG,

@@ -135,40 +135,6 @@ pub async fn version_check(
     Ok(version)
 }
 
-/// Prepends `numactl --interleave=all` for large multi-socket Linux machines (EPYC).
-/// Does nothing on MacBooks, small machines, or non-Linux.
-/// Prepends numactl for tools that benefit from memory interleaving on large EPYC nodes.
-/// Prepends numactl + explicit hugepage advice for memory-heavy tools
-pub fn prepend_numactl_if_beneficial(
-    config: &RunConfig,
-    args: Vec<String>,
-    cmd_tag: &str,
-) -> Vec<String> {
-    if !cfg!(target_os = "linux") || config.max_cores < 64 {
-        return args;
-    }
-
-    if matches!(cmd_tag, DIAMOND_TAG | MMSEQS_TAG | SPADES_TAG) {
-        let mut numa_args = vec![
-            "--interleave=all".to_string(),
-            "--".to_string(),    // end of numactl options
-            "prctl".to_string(), // set per-process hugepage hint
-            "--set-current".to_string(),
-            "madvise_hugepage".to_string(), // tells kernel to prefer 2MB pages
-            cmd_tag.to_string(),
-        ];
-        numa_args.extend(args);
-
-        debug!(
-            "Prepended numactl --interleave=all + prctl madvise_hugepage for {}",
-            cmd_tag
-        );
-        numa_args
-    } else {
-        args
-    }
-}
-
 pub mod fastp {
     use crate::config::defs::{RunConfig, FASTP_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
