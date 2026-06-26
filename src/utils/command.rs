@@ -28,6 +28,21 @@ pub trait ArgGenerator {
 ///
 /// # Returns
 /// Result<f32>major/minor version number
+/// Checks for the presence and version of an external command.
+///
+/// # Arguments
+///
+/// * `command_tag`: the name or path of the command
+/// * `version_args`: arguments to pass for the version check (e.g., `["--version"]`)
+/// * `version_line`: the line index (0-based) in the output containing the version string
+/// * `version_column`: the column index (0-based) in the split line containing the version number
+/// * `child_stream`: which stream (stdout/stderr) to read from
+/// * `version_file`: optional path to a file containing the version
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<f32>: the parsed version number
 pub async fn version_check(
     command_tag: &str,
     version_args: Vec<&str>,
@@ -136,6 +151,15 @@ pub mod fastp {
     }
     pub struct FastpArgGenerator;
 
+    /// Checks if `fastp` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the fastp version
     pub async fn fastp_presence_check(config: &RunConfig) -> Result<f32> {
         let version = version_check(FASTP_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -199,6 +223,15 @@ mod pigz {
 
     pub struct PigzArgGenerator;
 
+    /// Checks if `pigz` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the pigz version
     #[allow(dead_code)]
     pub async fn pigz_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(PIGZ_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
@@ -221,6 +254,15 @@ mod h5dump {
     use crate::utils::command::version_check;
     use crate::utils::streams::ChildStream;
 
+    /// Checks if `h5dump` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the h5dump version
     pub async fn h5dump_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(H5DUMP_TAG,vec!["-V"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -251,11 +293,34 @@ pub mod minimap2 {
 
     pub struct Minimap2ArgGenerator;
 
+    /// Checks if `minimap2` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    /// * `version_file`: optional path to a file containing the version
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the minimap2 version
     pub async fn minimap2_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
         let version = version_check(MINIMAP2_TAG, vec!["--version"], 0, 0, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
+    /// Prepares the minimap2 index for a reference sequence.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    /// * `ram_temp_dir`: temporary directory in RAM
+    /// * `sequence`: optional path to the reference sequence FASTA
+    /// * `index_path`: optional path to an existing index
+    /// * `ref_type`: type of reference (e.g., "host")
+    ///
+    /// # Returns
+    ///
+    /// Result containing paths to FASTA and index, temporary files, and a vector of preparation tasks
     pub async fn minimap2_index_prep(
         config: &RunConfig,
         ram_temp_dir: &PathBuf,
@@ -540,6 +605,15 @@ pub mod samtools {
 
     pub struct SamtoolsArgGenerator;
 
+    /// Checks if `samtools` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the samtools version
     pub async fn samtools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(SAMTOOLS_TAG, vec!["--version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -640,6 +714,15 @@ pub mod bcftools {
 
     pub struct BcftoolsArgGenerator;
 
+    /// Checks if `bcftools` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the bcftools version
     pub async fn bcftools_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(BCFTOOLS_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -710,6 +793,15 @@ pub mod kraken2 {
 
     pub struct Kraken2ArgGenerator;
 
+    /// Checks if `kraken2` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the kraken2 version
     pub async fn kraken2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(KRAKEN2_TAG,vec!["--version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -772,6 +864,15 @@ pub mod ivar {
 
     pub struct IvarArgGenerator;
 
+    /// Checks if `ivar` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the ivar version
     pub async fn ivar_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(IVAR_TAG,vec!["version"], 0, 2 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -816,6 +917,15 @@ pub mod muscle {
     use crate::utils::streams::ChildStream;
 
     pub struct MuscleArgGenerator;
+    /// Checks if `muscle` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the muscle version
     pub async fn muscle_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(MUSCLE_TAG,vec!["-version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -828,6 +938,15 @@ pub mod mafft {
     use crate::utils::streams::ChildStream;
 
     pub struct MafftArgGenerator;
+    /// Checks if `mafft` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the mafft version
     pub async fn mafft_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(MAFFT_TAG,vec!["--version"], 0, 0 , ChildStream::Stderr, None, &config).await?;
         Ok(version)
@@ -862,6 +981,15 @@ pub mod quast {
         pub assembly_fasta: String,
     }
 
+    /// Checks if `quast` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the quast version
     pub async fn quast_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(QUAST_TAG,vec!["-v"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -909,6 +1037,15 @@ pub mod nucmer {
         pub assembly_fasta: PathBuf,
     }
 
+    /// Checks if `nucmer` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the nucmer version
     pub async fn nucmer_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(NUCMER_TAG,vec!["--version"], 0, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -969,6 +1106,15 @@ pub mod seqkit {
 
     pub struct SeqkitArgGenerator;
 
+    /// Checks if `seqkit` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the seqkit version
     pub async fn seqkit_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(SEQKIT_TAG,vec!["--help"], 1, 1 , ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -1031,6 +1177,15 @@ pub mod bowtie2 {
 
     pub struct Bowtie2ArgGenerator;
 
+    /// Checks if `bowtie2` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the bowtie2 version
     pub async fn bowtie2_presence_check(config: &RunConfig)-> anyhow::Result<f32> {
         let version = version_check(BOWTIE2_TAG, vec!["-h"], 0, 3, ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -1038,6 +1193,16 @@ pub mod bowtie2 {
 
     /// Prepares the Bowtie2 index by handling directory, tar, or tar.gz inputs.
     /// Returns the PathBuf to the basename (e.g., /path/to/ercc for files ercc.1.bt2, etc.).
+    /// Prepares a Bowtie2 index for the given input sequence.
+    ///
+    /// # Arguments
+    ///
+    /// * `input_path`: path to the reference sequence FASTA
+    /// * `cwd`: current working directory for temporary files
+    ///
+    /// # Returns
+    ///
+    /// Result<PathBuf>: path to the generated Bowtie2 index
     pub fn bowtie2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
         let input = input_path.as_ref();
 
@@ -1662,6 +1827,15 @@ pub mod czid_dedup {
 
     pub struct CzidDedupArgGenerator;
 
+    /// Checks if `czid-dedup` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the czid-dedup version
     pub async fn czid_dedup_presence_check(config: &RunConfig)-> Result<f32> {
         let version = version_check(CZID_DEDUP_TAG, vec!["--help"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -1737,11 +1911,31 @@ pub mod diamond {
 
     pub struct DiamondArgGenerator;
 
+    /// Checks if `diamond` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    /// * `version_file`: optional path to a file containing the version
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the diamond version
     pub async fn diamond_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> anyhow::Result<f32> {
         let version = version_check(DIAMOND_TAG, vec!["help"], 0, 1, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
     }
 
+    /// Prepares the Diamond index for a reference sequence.
+    ///
+    /// # Arguments
+    ///
+    /// * `index_path`: optional path to the Diamond index file
+    /// * `ref_type`: type of reference (e.g., "non_host")
+    ///
+    /// # Returns
+    ///
+    /// Result containing the database prefix path and a vector of preparation tasks
     pub async fn diamond_index_prep(
         index_path: Option<String>,
         ref_type: &str,
@@ -1813,6 +2007,15 @@ pub mod diamond {
         }
     }
 
+    /// Computes the optimal block size for Diamond based on available RAM and database size.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f64>: the optimal block size in billions of letters
     pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
         let (_, available_ram) = detect_ram()?;
         let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
@@ -1938,6 +2141,16 @@ pub mod spades {
 
     pub struct SpadesArgGenerator;
 
+    /// Checks if `spades` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    /// * `version_file`: optional path to a file containing the version
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the spades version
     pub async fn spades_presence_check(config: &RunConfig, version_file: Option<PathBuf>) -> Result<f32> {
         let version = version_check(SPADES_TAG, vec!["-v"], 0, 3, ChildStream::Stdout, version_file, &config).await?;
         Ok(version)
@@ -2025,6 +2238,15 @@ pub mod makeblastdb {
 
     pub struct MakeblastdbArgGenerator;
 
+    /// Checks if `makeblastdb` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the makeblastdb version
     pub async fn makeblastdb_presence_check(config: &RunConfig)-> Result<f32> {
         let version = version_check(MAKEBLASTDB_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -2079,6 +2301,15 @@ pub mod blastn {
 
     pub struct BlastnArgGenerator;
 
+    /// Checks if `blastn` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the blastn version
     pub async fn blastn_presence_check(config: &RunConfig)-> Result<f32> {
         let version = version_check(BLASTN_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -2146,6 +2377,15 @@ pub mod blastx {
 
     pub struct BlastxArgGenerator;
 
+    /// Checks if `blastx` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the blastx version
     pub async fn blastx_presence_check(config: &RunConfig)-> Result<f32> {
         let version = version_check(BLASTX_TAG, vec!["-version"], 0, 1, ChildStream::Stdout, None, &config).await?;
         Ok(version)
@@ -2214,6 +2454,15 @@ pub mod sort {
 
     pub struct SortArgGenerator;
 
+    /// Checks if `sort` (GNU coreutils) is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the sort version
     pub async fn sort_presence_check(config: &RunConfig)-> Result<f32> {
         // GNU sort doesn't have a clean --version that always works the same way,
         // but "sort --version" is reliable on all modern coreutils.
@@ -2466,6 +2715,15 @@ pub mod mmseqs {
     }
     
 
+    /// Checks if `mmseqs` is present and returns its version.
+    ///
+    /// # Arguments
+    ///
+    /// * `_config`: the run configuration
+    ///
+    /// # Returns
+    ///
+    /// Result<f32>: the mmseqs version
     pub async fn mmseqs_presence_check(_config: &RunConfig)-> Result<f32> {
         let output = Command::new(MMSEQS_TAG)
             .arg("version")
@@ -2981,6 +3239,17 @@ pub mod mmseqs {
 
 
 
+/// Generates the command-line arguments for a given tool.
+///
+/// # Arguments
+///
+/// * `tool`: the tag identifying the tool
+/// * `run_config`: the run configuration
+/// * `extra`: optional configuration struct specific to the tool
+///
+/// # Returns
+///
+/// Result<Vec<String>>: the generated command-line arguments
 pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::any::Any>) -> Result<Vec<String>> {
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
@@ -3013,6 +3282,17 @@ pub fn generate_cli(tool: &str, run_config: &RunConfig, extra: Option<&dyn std::
     generator.generate_args(run_config, extra)
 }
 
+/// Verifies the presence and versions of a list of tools.
+///
+/// # Arguments
+///
+/// * `tools`: a list of tool tags to check
+/// * `out_dir`: directory to write the tool versions JSON file
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<()>: success or error
 pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunConfig) -> Result<()> {
     let assembly_dir = out_dir.join("assembly");
     fs::create_dir_all(&assembly_dir).await

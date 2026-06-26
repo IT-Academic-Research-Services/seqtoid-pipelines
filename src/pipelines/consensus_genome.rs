@@ -786,19 +786,6 @@ async fn process_ercc(
 }
 
 
-/// Filters input FASTQ stream through Kraken2
-///
-/// # Arguments
-///
-/// * `config` - reading stream
-/// * `input_stream` - ReceiverStream<ParseOutput>,
-/// * 'targer_ref_path' -
-///
-/// # Returns
-/// samtools_sort_out_stream: Result<(ReceiverStream<ParseOutput>, <--- FASTQ uncompressed
-/// cleanup_tasks
-/// quast_write_tasks
-///
 /// Filters reads using Kraken2 to identify those belonging to a target taxon.
 ///
 /// # Arguments

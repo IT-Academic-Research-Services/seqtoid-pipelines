@@ -61,15 +61,15 @@ pub fn compute_lx(lengths: &[u64], fraction: f64) -> u32 {
 
 
 
-/// Parses samtools stats lines.
+/// Parses `samtools stats` output lines.
 ///
 /// # Arguments
 ///
-/// * `rx` - samtools stats `ParseOutput::Bytes`
+/// * `rx`: receiver stream of `ParseOutput::Bytes` from `samtools stats`
 ///
 /// # Returns
 ///
-/// Hamshmap <String, String>
+/// Result<SamtoolsStats>: parsed summary and insert size metrics
 pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<SamtoolsStats> {
     let mut summary = HashMap::new();
     let mut insert_sizes = Vec::new();
@@ -156,15 +156,15 @@ pub async fn parse_samtools_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<Sam
 }
 
 
-/// Parses samtools depth lines.
+/// Parses `samtools depth` output lines.
 ///
 /// # Arguments
 ///
-/// * `rx` - samtools stats `ParseOutput::Bytes`
+/// * `rx`: receiver stream of `ParseOutput::Bytes` from `samtools depth`
 ///
 /// # Returns
 ///
-/// Hamshmap <String, u32>
+/// Result<HashMap<String, HashMap<usize, u32>>>: map of chromosome to (position to depth)
 pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, HashMap<usize, u32>>> {
     let mut depth_map: HashMap<String, HashMap<usize, u32>> = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
@@ -215,15 +215,15 @@ pub async fn parse_samtools_depth(rx: mpsc::Receiver<ParseOutput>) -> Result<Has
 }
 
 
-/// The is meant to be used by the results of parse_samtools_depth
+/// Computes depth statistics from a slice of depth values.
 ///
 /// # Arguments
 ///
-/// * `depth_map` - Hamshmap <String, u32>`
+/// * `depths`: slice of coverage depth values
 ///
 /// # Returns
 ///
-/// Hashmap <String, f64>
+/// Result<HashMap<String, f64>>: map of statistic names to their values
 pub fn compute_depth_stats(depths: &[u32]) -> Result<HashMap<String, f64>> {
     if depths.is_empty() {
         return Err(anyhow!("InsufficientReadsError: There was insufficient coverage so a consensus genome could not be created."));
@@ -278,15 +278,15 @@ pub fn compute_depth_stats(depths: &[u32]) -> Result<HashMap<String, f64>> {
 }
 
 
-/// Pars seqkit stats output
+/// Parses `seqkit stats` output.
 ///
 /// # Arguments
 ///
-/// * `rx` - A Receiver stream of ParseOutput::Lines containing seqkit stats output
+/// * `rx`: receiver stream of `ParseOutput::Bytes` containing `seqkit stats` output
 ///
 /// # Returns
 ///
-/// HashMap<String, String>
+/// Result<HashMap<String, String>>: map of statistic names to their values
 pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, String>> {
     let mut stats = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
@@ -336,15 +336,15 @@ pub async fn parse_seqkit_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashM
 }
 
 
-/// Parse  stats from ERCC stream
+/// Parses ERCC statistics from `samtools stats` output.
 ///
 /// # Arguments
 ///
-/// * `rx` - A Receiver stream of ParseOutput::Lines containing seqkit stats output
+/// * `rx`: receiver stream of `ParseOutput::Bytes` from `samtools stats` on ERCC alignments
 ///
 /// # Returns
 ///
-/// HashMap<String, u64>
+/// Result<HashMap<String, u64>>: map of ERCC-related statistic names to their values
 pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<String, u64>> {
     let mut stats = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
@@ -405,15 +405,15 @@ pub async fn parse_ercc_stats(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap
 }
 
 
-/// Compute allel counts from a stream
+/// Computes allele counts from a FASTA sequence stream.
 ///
 /// # Arguments
 ///
-/// * `rx` - A Receiver stream of  ParseMode::Fasta,
+/// * `rx`: receiver stream of `ParseOutput::Fasta` records
 ///
 /// # Returns
 ///
-/// HashMap<char, u64>
+/// Result<HashMap<char, u64>>: map of base character to its frequency
 pub async fn compute_allele_counts(rx: mpsc::Receiver<ParseOutput>) -> Result<HashMap<char, u64>> {
     let mut counts = HashMap::new();
     let mut stream = ReceiverStream::new(rx);
@@ -439,16 +439,16 @@ pub async fn compute_allele_counts(rx: mpsc::Receiver<ParseOutput>) -> Result<Ha
 }
 
 
-/// Compute covergae bins
+/// Computes coverage bins for visualization.
 ///
 /// # Arguments
 ///
-/// * depths: vector of depth
-/// * max_nums_bins: maximum number of bins
+/// * `depths`: slice of depth values
+/// * `max_num_bins`: maximum number of bins to create
 ///
 /// # Returns
 ///
-/// (f64, Vec<(usize, f64, f64, u8, u8)> where: index, avg_depth, avg_breafdth, 1, 0
+/// (f64, Vec<(usize, f64, f64, u8, u8)>): tuple of (bin size, vector of (bin index, avg depth, avg breadth, 1, 0))
 pub fn compute_coverage_bins(depths: &[u32], max_num_bins: usize) -> (f64, Vec<(usize, f64, f64, u8, u8)>) {
     let len = depths.len();
     let num_bins = if len <= max_num_bins { len } else { max_num_bins };

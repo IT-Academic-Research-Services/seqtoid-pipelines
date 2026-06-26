@@ -3,18 +3,23 @@ use anyhow::{anyhow, Result};
 use log::{info, debug};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use rayon::prelude::*;
 use memchr::memchr2_iter;
 use lexical::parse as lexical_parse;
 use once_cell::sync::Lazy;
 use bytes::Bytes;
 
-use crate::utils::streams::ParseOutput;
-use crate::config::defs::{SIMD_LEVEL, SimdLevel};
+use crate::utils::streams::{ParseOutput, batch_rayon_process, fanout_to_channels};
+use crate::utils::file::write_byte_stream_to_file;
+use crate::config::defs::{SIMD_LEVEL, SimdLevel, RunConfig, StreamDataType, PipelineError};
 
 const LAMBDA: f64 = 1.58;
 const K: f64 = 0.1;
@@ -359,6 +364,16 @@ static PARSE_PAF_LINE: Lazy<fn(&str) -> Result<PafRecord>> = Lazy::new(|| {
     PafRecord::parse_line_scalar
 });
 
+/// Parses a batch of PAF records and converts them to BLAST m8 format.
+///
+/// # Arguments
+///
+/// * `batch`: raw bytes containing multiple PAF lines
+/// * `genome_size`: estimated genome size for E-value calculation
+///
+/// # Returns
+///
+/// Vec<Vec<u8>>: a vector of converted m8 line bytes
 pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
     batch
         .par_split(|&b| b == b'\n')
@@ -373,6 +388,106 @@ pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
             vec![]
         })
         .collect()
+}
+
+/// Converts a PAF stream to an BLAST m8 format stream and writes it to a file.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `input_stream`: stream of PAF records
+/// * `m8_path`: path where the converted m8 file will be written
+///
+/// # Returns
+///
+/// Result containing:
+/// - stream of m8 records
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+pub async fn paf_to_m8(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    m8_path: PathBuf,
+) -> Result<(
+    ReceiverStream<ParseOutput>,
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+)> {
+    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+
+    let genome_size = config.args.nt_db_size as f64;
+
+    let paf_record_count = Arc::new(AtomicUsize::new(0));
+    let m8_line_count = Arc::new(AtomicUsize::new(0));
+
+    let paf_counter = paf_record_count.clone();
+    let m8_counter = m8_line_count.clone();
+
+    let batched_stream = batch_rayon_process(
+        config.clone(),
+        input_stream,
+        move |batch: Vec<u8>| {
+            let m8_lines = parse_paf_batch_to_m8(batch.clone(), genome_size);
+
+            // Count input PAF lines in the batch.
+            let paf_lines_in_batch = {
+                let newline_count = batch.iter().filter(|&&b| b == b'\n').count();
+                if batch.is_empty() {
+                    0
+                } else if *batch.last().unwrap_or(&b'\n') == b'\n' {
+                    newline_count
+                } else {
+                    newline_count + 1
+                }
+            };
+
+            paf_counter.fetch_add(paf_lines_in_batch, std::sync::atomic::Ordering::Relaxed);
+            m8_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed);
+
+            m8_lines
+        },
+        "paf_to_m8",
+        16 * 1024 * 1024, // 16 MiB batches
+    );
+
+    let (streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
+        batched_stream,
+        2,
+        "paf_to_m8_stream",
+        &config,
+        StreamDataType::JustBytes,
+    )
+    .await
+    .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(paf_to_m8_stream_done_rx);
+
+    let mut streams = streams;
+
+    let main_stream = ReceiverStream::new(streams.remove(0));
+
+    let file_stream = ReceiverStream::new(streams.remove(0));
+
+    let write_task = write_byte_stream_to_file(
+        &m8_path,
+        file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "paf_to_m8_m8",
+    )
+    .await
+    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(write_task);
+
+    let paf_total = paf_record_count.load(std::sync::atomic::Ordering::Relaxed);
+    let m8_total = m8_line_count.load(std::sync::atomic::Ordering::Relaxed);
+
+    info!(
+        "[paf_to_m8] wired conversion stage — ~{} PAF lines seen, {} m8 lines emitted so far",
+        paf_total, m8_total
+    );
+
+    Ok((main_stream, cleanup_tasks, cleanup_receivers))
 }
 
 #[cfg(test)]

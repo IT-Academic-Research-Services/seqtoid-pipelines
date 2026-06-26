@@ -71,7 +71,7 @@ use crate::utils::file::{choose_temp_dir, file_path_manipulator,
                          file_size, rename_file_path, resolve_optional_path,
                          validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
                          write_vecu8_to_file};
-use crate::utils::paf::{parse_paf_batch_to_m8};
+use crate::utils::paf::{parse_paf_batch_to_m8, paf_to_m8};
 use crate::utils::plotting::plot_insert_sizes;
 use crate::utils::sambam::{generate_info_from_bam_stream, compute_insert_size_stats_from_bam};
 use crate::utils::streams::{deinterleave_fastq_stream, join_with_error_handling,
@@ -856,24 +856,6 @@ async fn bowtie2_filter_files(
     ))
 }
 
-
-/// HISAT2 filter
-///
-/// # Arguments
-///
-/// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream.
-/// * `hisat2_index_path` - Path to HISAT2 index.
-/// * `paired` - Whether the input is paired-end.
-/// * `hisat2_options` - Additional HISAT2 options as a HashMap (e.g., HashMap::from([("--no-spliced-alignment".to_string(), None)])).
-/// * `output_bam_path` - Optional path to save the aligned BAM file (name-sorted).
-///
-/// # Returns
-/// Tuple:
-/// - Unmapped FASTQ stream.
-/// - Optional receiver for the total mapped count (u64) if count is needed.
-/// - Vector of cleanup tasks.
-/// - Vector of cleanup receivers.
 
 /// Filters reads using HISAT2 and returns a stream of unmapped FASTQ records.
 ///
@@ -2738,114 +2720,6 @@ pub async fn minimap2_non_host_align(
 ///
 /// # Arguments
 ///
-/// * `config`: the run configuration
-/// * `input_stream`: stream of PAF records
-/// * `m8_path`: path where the converted m8 file will be written
-///
-/// # Returns
-///
-/// Result containing:
-/// - stream of m8 records
-/// - vector of cleanup tasks
-/// - vector of cleanup receivers
-pub async fn paf_to_m8(
-    config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>,
-    m8_path: PathBuf,
-) -> Result<(
-    ReceiverStream<ParseOutput>,
-    Vec<JoinHandle<Result<(), anyhow::Error>>>,
-    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
-)> {
-
-    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-
-    let genome_size = config.args.nt_db_size as f64;
-
-    let paf_record_count = Arc::new(AtomicUsize::new(0));
-    let m8_line_count = Arc::new(AtomicUsize::new(0));
-
-    let paf_counter = paf_record_count.clone();
-    let m8_counter = m8_line_count.clone();
-
-    let batched_stream = batch_rayon_process(
-        config.clone(),
-        input_stream,
-        move |batch: Vec<u8>| {
-            let m8_lines = parse_paf_batch_to_m8(batch.clone(), genome_size);
-
-            // Count input PAF lines in the batch.
-            let paf_lines_in_batch = {
-                let newline_count = batch.iter().filter(|&&b| b == b'\n').count();
-                if batch.is_empty() {
-                    0
-                } else if *batch.last().unwrap_or(&b'\n') == b'\n' {
-                    newline_count
-                } else {
-                    newline_count + 1
-                }
-            };
-
-            paf_counter.fetch_add(paf_lines_in_batch, std::sync::atomic::Ordering::Relaxed);
-            m8_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed);
-
-            m8_lines
-        },
-        "paf_to_m8",
-        16 * 1024 * 1024, // 16 MiB batches
-    );
-
-    // Split the converted stream immediately; no extra intermediate mpsc queue.
-    use tokio_stream::wrappers::ReceiverStream;
-
-    let (streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
-        batched_stream,
-        2,
-        "paf_to_m8_stream",
-        &config,
-        StreamDataType::JustBytes
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(paf_to_m8_stream_done_rx);
-
-
-    let mut streams = streams;
-
-    let main_stream = ReceiverStream::new(
-        streams.remove(0)
-    );
-
-    let file_stream = ReceiverStream::new(
-        streams.remove(0)
-    );
-
-    let write_task = write_byte_stream_to_file(
-        &m8_path,
-        file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "paf_to_m8_m8",
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(write_task);
-
-    let paf_total = paf_record_count.load(std::sync::atomic::Ordering::Relaxed);
-    let m8_total = m8_line_count.load(std::sync::atomic::Ordering::Relaxed);
-
-    info!(
-        "[paf_to_m8] wired conversion stage — ~{} PAF lines seen, {} m8 lines emitted so far",
-        paf_total, m8_total
-    );
-
-    Ok((
-        main_stream,
-        cleanup_tasks,
-        cleanup_receivers,
-    ))
-}
 
 
 /// Loads taxonomic lineage and accession-to-taxid databases into memory.
