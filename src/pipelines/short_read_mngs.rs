@@ -2486,7 +2486,7 @@ async fn subsample_uniform(
 /// - stream of alignment results (PAF format)
 /// - vector of cleanup tasks
 /// - vector of cleanup receivers
-pub async fn minimap2_non_host_align(
+async fn minimap2_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
@@ -2951,7 +2951,7 @@ async fn diamond_non_host_align(
 /// Result containing:
 /// - path to the output JSON file
 /// - handle for the write task
-pub async fn combine_taxon_counts(
+async fn combine_taxon_counts(
     nt_counts: &[TaxonCount],
     nr_counts: &[TaxonCount],
     output_path: PathBuf,
@@ -3005,7 +3005,7 @@ pub async fn combine_taxon_counts(
 /// # Returns
 ///
 /// Result containing the map of contig IDs to best accessions
-pub async fn collect_hit_summary_to_accession_map_concurrent(
+async fn collect_hit_summary_to_accession_map_concurrent(
     config: Arc<RunConfig>,
     mut summary_stream: ReceiverStream<ParseOutput>,
 ) -> Result<AHashMap<String, String>> {
@@ -3097,7 +3097,7 @@ pub async fn collect_hit_summary_to_accession_map_concurrent(
 /// # Returns
 /// Result of hashmap of id:accession
 ///
-pub fn parse_fasta_batch_to_annotated(
+fn parse_fasta_batch_to_annotated(
     batch: Vec<u8>,
     duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
     nt_map: &HashMap<String, String>,
@@ -3176,7 +3176,7 @@ pub fn parse_fasta_batch_to_annotated(
 /// # Returns
 /// Result of hashmap of id:accession
 ///
-pub fn parse_fasta_batch_to_annotated_streaming(
+fn parse_fasta_batch_to_annotated_streaming(
     batch: Vec<u8>,
     duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
     nt_map: &AHashMap<String, String>,   // tiny contig_id → best NT accession
@@ -3251,7 +3251,7 @@ pub fn parse_fasta_batch_to_annotated_streaming(
     results
 }
 
-pub async fn generate_annotated_fasta_stream(
+async fn generate_annotated_fasta_stream(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,           // contig FASTA
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
@@ -3362,7 +3362,7 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
 /// * `input_stream` - Raw byte FASTQ stream
 ///
 /// # Returns
-pub async fn process_assembly(
+async fn process_assembly(
     config: Arc<RunConfig>,
     assembly_out_dir: &PathBuf,   // to make clear this is <out_dir>/assembly
     r1_path: PathBuf,
@@ -3807,7 +3807,7 @@ pub async fn process_assembly(
 ///
 /// # Returns
 /// Result
-pub async fn generate_assembly_coverage(
+async fn generate_assembly_coverage(
     config: Arc<RunConfig>,
     assembly_bam_rx: ReceiverStream<ParseOutput>,
     contigs_fasta_path: &PathBuf,
@@ -4034,7 +4034,7 @@ fn fix_header(header_line: &str) -> String {
 /// * `out_path
 /// # Returns
 /// Result of hashset of the accessions
-pub async fn build_reference_fasta_from_selected_genera(
+async fn build_reference_fasta_from_selected_genera(
     config: Arc<RunConfig>,
     selected_genera: &HashMap<i32, Vec<String>>,  // genus_taxid → [accessions]
     db_type: &str,
@@ -4176,7 +4176,7 @@ pub async fn build_reference_fasta_from_selected_genera(
 /// # Returns
 /// read dicttionary of read id's -> Readhit
 ///  accesions -> Accesiohit
-pub async fn summarize_hits(
+async fn summarize_hits(
     config: Arc<RunConfig>,
     mut stream: ReceiverStream<ParseOutput>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
@@ -4764,7 +4764,7 @@ pub async fn update_read_dict(
 /// # Returns
 ///
 /// Result<()>: success or error
-pub async fn generate_contig_summary_json(
+async fn generate_contig_summary_json(
     read2contig: Arc<HashMap<String, String>>,
     contig2lineage: AHashMap<String, [i32; 3]>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
@@ -4969,7 +4969,7 @@ async fn collect_keyed_rows(
 /// # Returns
 ///
 /// Result<()>: success or error
-pub async fn generate_m8_and_hit_summary(
+async fn generate_m8_and_hit_summary(
     config: Arc<RunConfig>,
     updated_reads_stream: ReceiverStream<ParseOutput>,
     added_reads_stream: ReceiverStream<ParseOutput>,
@@ -5205,7 +5205,7 @@ async fn early_blast_exit(
 /// # Returns
 ///
 /// Result containing refined hits and summary data
-pub async fn blast_contigs(
+async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
     deduped_m8_stream: ReceiverStream<ParseOutput>,
@@ -6741,7 +6741,7 @@ async fn mmseqs_fastq_to_m8_file(
 /// - vector of cleanup tasks
 /// - vector of cleanup receivers
 /// - vector of temporary directories used
-pub async fn mmseqs_non_host_align(
+async fn mmseqs_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
@@ -6804,7 +6804,7 @@ pub async fn mmseqs_non_host_align(
 /// # Returns
 ///
 /// Result<()>: success or error
-pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
+async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let out_dir = config.out_dir.clone();
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
