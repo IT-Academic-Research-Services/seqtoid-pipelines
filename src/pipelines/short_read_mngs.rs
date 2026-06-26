@@ -85,7 +85,7 @@ use crate::utils::streams::{deinterleave_fastq_stream, join_with_error_handling,
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::system::{compute_phase_concurrency, compute_batch_size};
 use crate::utils::taxonomy::{build_should_keep_filter, get_top_m8_nr,
-                             get_top_m8_nt, load_taxid_lineages_db};
+                             get_top_m8_nt, load_lineage_and_acc2tax_maps};
 
 const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
 
@@ -2725,51 +2725,6 @@ pub async fn minimap2_non_host_align(
 ///
 
 
-/// Loads taxonomic lineage and accession-to-taxid databases into memory.
-///
-/// # Arguments
-///
-/// * `config`: the run configuration
-///
-/// # Returns
-///
-/// Result containing:
-/// - map of taxids to their full lineages
-/// - FST map for accession to taxid lookups
-pub async fn load_lineage_and_acc2tax_maps(
-    config: Arc<RunConfig>,
-) -> Result<(
-    Arc<AHashMap<Taxid, Lineage>>,
-    Arc<Map<Vec<u8>>>,
-)> {
-    let lineage_path = PathBuf::from(&config.args.taxid_lineages_db);
-    let acc2taxid_path = PathBuf::from(&config.args.acc2taxid_db);
-
-    let lineage_future = async move {
-        load_taxid_lineages_db(&lineage_path).await
-            .map_err(|e| anyhow!("Failed to load lineage DB from {}: {}", lineage_path.display(), e))
-    };
-
-    let acc2taxid_future = async move {
-        let bytes = tokio::fs::read(&acc2taxid_path).await
-            .map_err(|e| anyhow!("Failed to read acc2taxid DB {}: {}", acc2taxid_path.display(), e))?;
-
-        let map = Map::new(bytes)
-            .map_err(|e| anyhow!("Failed to parse acc2taxid fst map: {}", e))?;
-
-        Ok::<Arc<Map<Vec<u8>>>, anyhow::Error>(Arc::new(map))
-    };
-
-    let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
-
-    info!(
-        "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
-        lineage_map.len(),
-        acc2taxid_map.len()
-    );
-
-    Ok((lineage_map, acc2taxid_map))
-}
 
 // Helper: runs Diamond on one file, waits for both parse and write to finish, returns only the m8 path
 /// Runs Diamond alignment on a single query file.

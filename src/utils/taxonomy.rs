@@ -14,16 +14,17 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use flate2::read::GzDecoder;
 use csv::ReaderBuilder;
-use fst::{MapBuilder};
+use fst::{Map, MapBuilder};
 use needletail::parse_fastx_file;
 use bincode::{encode_into_std_write, decode_from_std_read};
 use ahash::AHashMap;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::sync::{mpsc, Mutex};
-use crate::config::defs::{Taxid, Lineage, TaxonSeqLocation};
+use crate::config::defs::{Taxid, Lineage, TaxonSeqLocation, RunConfig};
 use crate::utils::blast::M8Record;
 use crate::utils::streams::ParseOutput;
 use bytes::Bytes;
+use tokio::try_join;
 
 const SPECIES_NON_SPECIFIC: Taxid = -100;
 const GENUS_NON_SPECIFIC: Taxid = -200;
@@ -895,6 +896,52 @@ pub fn get_taxid(header: &str, field: &str) -> Result<i32> {
     Ok(taxid)
 }
 
+
+/// Loads taxonomic lineage and accession-to-taxid databases into memory.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result containing:
+/// - map of taxids to their full lineages
+/// - FST map for accession to taxid lookups
+pub async fn load_lineage_and_acc2tax_maps(
+    config: Arc<RunConfig>,
+) -> Result<(
+    Arc<AHashMap<Taxid, Lineage>>,
+    Arc<Map<Vec<u8>>>,
+)> {
+    let lineage_path = PathBuf::from(&config.args.taxid_lineages_db);
+    let acc2taxid_path = PathBuf::from(&config.args.acc2taxid_db);
+
+    let lineage_future = async move {
+        load_taxid_lineages_db(&lineage_path).await
+            .map_err(|e| anyhow!("Failed to load lineage DB from {}: {}", lineage_path.display(), e))
+    };
+
+    let acc2taxid_future = async move {
+        let bytes = tokio::fs::read(&acc2taxid_path).await
+            .map_err(|e| anyhow!("Failed to read acc2taxid DB {}: {}", acc2taxid_path.display(), e))?;
+
+        let map = Map::new(bytes)
+            .map_err(|e| anyhow!("Failed to parse acc2taxid fst map: {}", e))?;
+
+        Ok::<Arc<Map<Vec<u8>>>, anyhow::Error>(Arc::new(map))
+    };
+
+    let (lineage_map, acc2taxid_map) = try_join!(lineage_future, acc2taxid_future)?;
+
+    info!(
+        "Loaded taxonomy databases: {} lineages, acc2taxid map with {} entries",
+        lineage_map.len(),
+        acc2taxid_map.len()
+    );
+
+    Ok((lineage_map, acc2taxid_map))
+}
 
 #[allow(dead_code)]
 fn get_taxid_field_num(sample_headers: &[String], taxid_field: &str) -> i32 {
