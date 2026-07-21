@@ -670,7 +670,7 @@ pub async fn validate_file_inputs(
     let file2_path = match &config.args.file2 {
         Some(file) => {
             // paired-end always requires a real file
-            let resolved = resolve_existing_input_path(file, cwd, true)?;
+            let resolved = resolve_existing_input_path(file, cwd, require_file)?;
             Some(resolved)
         }
         None => None,
