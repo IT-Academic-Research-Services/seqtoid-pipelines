@@ -7065,7 +7065,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     })?;
 
     let (file1_path, file2_path, sample_base_buf, sample_base) =
-        validate_file_inputs(&config, &cwd).await?;
+        validate_file_inputs(&config, &cwd, true).await?;
     let paired = file2_path.is_some();
 
     debug!(
