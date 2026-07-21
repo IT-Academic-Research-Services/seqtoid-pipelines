@@ -73,7 +73,7 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     
     let (mandatory_path, _file2, _base_buf, _base) =
         validate_file_inputs(&config, &cwd, false).await?;
-
+    eprintln!("ran validate_file_inputs");
     let gz_paths: Vec<PathBuf> = if mandatory_path.is_dir() {
         let mut entries = tokio::fs::read_dir(&mandatory_path).await.map_err(|e| {
             PipelineError::Other(anyhow!(

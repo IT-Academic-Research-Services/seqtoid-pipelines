@@ -80,7 +80,7 @@ pub fn resolve_optional_path(cli: &Option<String>, base_dir: &Path) -> Result<Op
                 return Err(anyhow!("File not found: {}", abs.display()));
             }
             if !abs.is_file() {
-                return Err(anyhow!("Not a file: {}", abs.display()));
+                return Err(anyhow!("resolve_optional_path: Not a file: {}", abs.display()));
             }
             Ok(Some(abs))
         }
@@ -579,7 +579,7 @@ pub fn resolve_existing_input_path(
     }
     if require_file && !resolved.is_file() {
         return Err(PipelineError::InvalidConfig(format!(
-            "Not a file: {}",
+            "resolve_existing_input_path: Not a file: {}",
             resolved.display()
         )));
     }
@@ -655,6 +655,9 @@ pub async fn validate_file_inputs(
     cwd: &PathBuf,
     require_file: bool,
 ) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
+
+    eprintln!("alidate_file_inputs with require file {}", require_file);
+
     let file1_path = match &config.args.file1 {
         Some(file) => resolve_existing_input_path(file, cwd, require_file)?,
         None => {
