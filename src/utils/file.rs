@@ -655,9 +655,7 @@ pub async fn validate_file_inputs(
     cwd: &PathBuf,
     require_file: bool,
 ) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
-
-    eprintln!("alidate_file_inputs with require file {}", require_file);
-
+    
     let file1_path = match &config.args.file1 {
         Some(file) => resolve_existing_input_path(file, cwd, require_file)?,
         None => {

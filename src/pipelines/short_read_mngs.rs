@@ -8108,7 +8108,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
     .await
     .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
-    eprintln!("coverage result {:?}", generate_assembly_coverage_result);
 
     for rx in post_assembly_cleanup_receivers {
         rx.await??;

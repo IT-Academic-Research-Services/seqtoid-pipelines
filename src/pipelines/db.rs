@@ -73,7 +73,6 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     
     let (mandatory_path, _file2, _base_buf, _base) =
         validate_file_inputs(&config, &cwd, false).await?;
-    eprintln!("ran validate_file_inputs");
     let gz_paths: Vec<PathBuf> = if mandatory_path.is_dir() {
         let mut entries = tokio::fs::read_dir(&mandatory_path).await.map_err(|e| {
             PipelineError::Other(anyhow!(
@@ -115,7 +114,6 @@ pub async fn accession2taxid_db(config: Arc<RunConfig>) -> anyhow::Result<(), Pi
     let nr_path: Option<PathBuf> = config.args.nr.clone().map(PathBuf::from);
 
     let db_out_path = file_path_manipulator(&PathBuf::from("accession2_taxid"), Some(&cwd), None, Some(".fst"), "_");
-    eprintln!("Writing to DB {:?}", db_out_path);
     
     build_accession2taxid_db(&gz_paths, nt_path.as_ref(), nr_path.as_ref(), &db_out_path)
         .await
