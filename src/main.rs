@@ -262,8 +262,9 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             }
         }
         None => {
+            // main.rs – setup_output_dir
             let file1 = match &args.file1 {
-                Some(file) => resolve_existing_input_path(file, cwd)
+                Some(file) => resolve_existing_input_path(file, cwd, false)
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?,
                 None => return Err(anyhow::anyhow!("File1 path required")),
             };

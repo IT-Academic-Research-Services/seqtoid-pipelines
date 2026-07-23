@@ -7065,7 +7065,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     })?;
 
     let (file1_path, file2_path, sample_base_buf, sample_base) =
-        validate_file_inputs(&config, &cwd).await?;
+        validate_file_inputs(&config, &cwd, true).await?;
     let paired = file2_path.is_some();
 
     debug!(
@@ -8108,7 +8108,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
     .await
     .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
-    eprintln!("coverage result {:?}", generate_assembly_coverage_result);
 
     for rx in post_assembly_cleanup_receivers {
         rx.await??;

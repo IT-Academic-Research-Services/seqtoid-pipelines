@@ -2151,7 +2151,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     .map_err(|e| PipelineError::Other(e.into()))?;
 
     let (file1_path, file2_path, no_ext_sample_base_buf, no_ext_sample_base) =
-        validate_file_inputs(&config, &cwd).await?;
+        validate_file_inputs(&config, &cwd, true).await?;
 
     let technology = config.args.technology.clone();
 
