@@ -2,9 +2,12 @@
 // High-performance, correct streaming FASTA preprocessor for MMseqs2 nr DB creation.
 // - Never silently drops data: every input record is processed and output (or explicitly handled).
 // - Validates amino acid sequences, fixes invalid chars to 'X' (logs examples).
-// - Sanitizes headers: removes control characters (including ^A) and collapses whitespace.
+// - Aggressive header cleaning: keeps ONLY the first accession/ID.
+//   This is the most reliable form for MMseqs2 (avoids "Cannot extract identifier"
+//   and dbtype corruption caused by multi-accession NR headers).
 // - Large I/O buffers for speed on Epyc / high-core systems.
 // - Pure Rust, std only.
+//
 // Compile:
 //   rustc -O -C target-cpu=native nr_preprocess.rs -o nr_preprocess
 //
@@ -16,6 +19,10 @@
 // Then:
 //   mmseqs createdb /scratch/nr_clean.fa /data/refs/nr_clean/nrcleanDB \
 //     --dbtype 1 --compressed 1 --threads 64 2>&1 | tee createdb.log
+//
+// Immediately verify type:
+//   od -An -t u4 /data/refs/nr_clean/nrcleanDB.dbtype
+//   (must print 1)
 
 use std::collections::HashSet;
 use std::env;
@@ -35,7 +42,7 @@ fn main() -> io::Result<()> {
 
     eprintln!("nr_preprocess starting | input: {} | output: {}", input_name, output_name);
     eprintln!("Strict mode: no silent drops. All sequences will be output. Invalid AA -> 'X' with logging.");
-    eprintln!("Header cleaning: remove control characters (including ^A) and collapse whitespace.");
+    eprintln!("Header policy: AGGRESSIVE — keep only the first accession/ID (most reliable for MMseqs2).");
 
     let stdin = io::stdin();
     let reader: Box<dyn BufRead> = if input_name == "stdin" || input_name == "-" {
@@ -157,32 +164,20 @@ fn process_and_write_record(
     entry_num: u64,
 ) -> io::Result<()> {
     // ---------------------------------------------------------------
-    // Header sanitization for MMseqs2
-    // - Remove all control characters (including the famous NR ^A = 0x01)
-    // - Collapse multiple whitespace into single spaces
-    // - Keep as much original information as possible
+    // Aggressive header cleaning for MMseqs2 reliability
+    // Keep ONLY the first accession/ID.
+    // Split on whitespace OR the original NR control character ^A (0x01).
+    // This produces simple headers like: >EFG1759503.1
+    // which MMseqs handles cleanly and avoids dbtype / identifier problems.
     // ---------------------------------------------------------------
     let clean_header = {
-        let mut h = header.trim().to_string();
-
-        // Remove every control character
-        h.retain(|c| !c.is_control());
-
-        // Collapse runs of whitespace into a single space
-        let mut result = String::with_capacity(h.len());
-        let mut last_was_space = false;
-        for c in h.chars() {
-            if c.is_whitespace() {
-                if !last_was_space {
-                    result.push(' ');
-                    last_was_space = true;
-                }
-            } else {
-                result.push(c);
-                last_was_space = false;
-            }
-        }
-        result.trim().to_string()
+        let first_id = header
+            .trim_start_matches('>')
+            .split(|c: char| c.is_whitespace() || c == '\u{01}')
+            .next()
+            .unwrap_or("unknown")
+            .trim();
+        format!(">{}", first_id)
     };
 
     // ---------------------------------------------------------------
