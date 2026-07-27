@@ -844,7 +844,6 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     config: &RunConfig,
     data_type: StreamDataType,
 ) -> Result<mpsc::Receiver<ParseOutput>> {
-
     let channel_buffer = crate::utils::system::compute_buffer_size(
         config,
         "parse_lines",
@@ -857,39 +856,59 @@ pub async fn parse_lines<R: AsyncRead + Unpin + Send + 'static>(
     let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
     tokio::spawn(async move {
-        let mut line = String::new();
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        let mut lines_emitted: u64 = 0;
+        let mut bytes_read_total: u64 = 0;
 
         loop {
-            line.clear();
+            buf.clear();
 
-            let bytes_read = match reader.read_line(&mut line).await {
+            let n = match reader.read_until(b'\n', &mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    error!("Error reading line: {}", e);
+                    error!(
+                        "[parse_lines] read_until failed after {} lines / {} bytes: {}",
+                        lines_emitted, bytes_read_total, e
+                    );
+                    // propagate failure by closing the channel; do NOT silently continue
                     return;
                 }
             };
 
-            if bytes_read == 0 {
-                break;
+            if n == 0 {
+                break; // EOF
             }
 
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                continue;
+            bytes_read_total += n as u64;
+
+            // strip trailing \n and optional \r
+            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                buf.pop();
             }
 
-            let bytes = trimmed.as_bytes().to_vec();
+            if buf.is_empty() {
+                continue; // pure empty line – counted only via bytes
+            }
 
             if tx
-                .send(ParseOutput::Bytes(Bytes::from(bytes)))
+                .send(ParseOutput::Bytes(Bytes::from(buf.clone())))
                 .await
                 .is_err()
             {
-                error!("Receiver dropped while sending line");
+                error!(
+                    "[parse_lines] receiver dropped after {} lines / {} bytes",
+                    lines_emitted, bytes_read_total
+                );
                 break;
             }
+
+            lines_emitted += 1;
         }
+
+        info!(
+            "[parse_lines] finished — emitted {} lines, {} bytes read",
+            lines_emitted, bytes_read_total
+        );
     });
 
     Ok(rx)
