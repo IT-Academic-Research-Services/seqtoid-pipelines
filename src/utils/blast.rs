@@ -1,6 +1,7 @@
 //! BLAST-related file functions and structures
 //! including m8 file-based
 
+use tokio::time::Duration;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -1070,6 +1071,50 @@ pub async fn call_hits_m8(
         tag, worker_count, min_aln_len
     );
 
+    // ─── ENTRY COUNTER ─────────────────────────────────────────────────────
+    // Counts every item that enters the function before any filtering.
+    let (entry_tx, entry_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+    let entry_tag = tag.clone();
+    let entry_counter = tokio::spawn(async move {
+        let mut total = 0u64;
+        let mut unique = ahash::AHashSet::with_capacity(100_000);
+        let mut stream = m8_input;
+        while let Some(item) = stream.next().await {
+            match &item {
+                ParseOutput::Bytes(b) => {
+                    total += 1;
+                    if let Some(tab) = memchr::memchr(b'\t', b) {
+                        unique.insert(b[..tab].to_vec());
+                    }
+                }
+                other => {
+                    return Err(anyhow!(
+                        "[call_hits_m8:{}] ENTRY: unexpected ParseOutput: {:?}",
+                        entry_tag, other
+                    ));
+                }
+            }
+            if entry_tx.send(item).await.is_err() {
+                break;
+            }
+        }
+        info!(
+            "[call_hits_m8:{}] ENTRY: received {} lines, {} unique queries",
+            entry_tag, total, unique.len()
+        );
+        if total == 0 {
+            return Err(anyhow!(
+                "[call_hits_m8:{}] ENTRY: zero lines entered the function",
+                entry_tag
+            ));
+        }
+        Ok(())
+    });
+    cleanup_tasks.push(entry_counter);
+
+    // From here on we consume the counted stream
+    let mut m8_input = ReceiverStream::new(entry_rx);
+
     let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
     let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
 
@@ -1082,7 +1127,11 @@ pub async fn call_hits_m8(
         Flush,
     }
 
-    // One sender per worker; reads are sharded by read_id.
+    // Shared atomics so every worker reports drops
+    let total_reads_dispatched = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_reads_emitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_reads_dropped_by_summarize = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let mut worker_txs: Vec<mpsc::Sender<WorkerMsgLocal>> = Vec::with_capacity(worker_count);
 
     for worker_idx in 0..worker_count {
@@ -1096,9 +1145,12 @@ pub async fn call_hits_m8(
         let dedup_tx = dedup_tx.clone();
         let summary_tx = summary_tx.clone();
         let worker_tag = tag.clone();
+        let total_reads_emitted = total_reads_emitted.clone();
+        let total_reads_dropped_by_summarize = total_reads_dropped_by_summarize.clone();
 
         let worker_handle = tokio::spawn(async move {
             let mut total_emitted = 0usize;
+            let mut total_dropped = 0usize;
             let start = Instant::now();
 
             debug!(
@@ -1121,6 +1173,7 @@ pub async fn call_hits_m8(
 
                         if let Some(reduced) = reduced {
                             total_emitted += 1;
+                            total_reads_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                             dedup_tx
                                 .send(ParseOutput::Bytes(Bytes::from(reduced.dedup)))
@@ -1131,6 +1184,10 @@ pub async fn call_hits_m8(
                                 .send(ParseOutput::Bytes(Bytes::from(reduced.summary)))
                                 .await
                                 .map_err(|e| anyhow!("summary output channel closed: {}", e))?;
+                        } else {
+                            total_dropped += 1;
+                            total_reads_dropped_by_summarize
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     WorkerMsgLocal::Flush => break,
@@ -1138,10 +1195,11 @@ pub async fn call_hits_m8(
             }
 
             info!(
-                "[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}",
+                "[call_hits_m8:{}] worker {} finished — emitted {} reads, dropped {} by summarize_m8_hits in {:?}",
                 worker_tag,
                 worker_idx,
                 total_emitted,
+                total_dropped,
                 start.elapsed()
             );
             Ok::<(), anyhow::Error>(())
@@ -1150,14 +1208,18 @@ pub async fn call_hits_m8(
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator: consume the sorted stream, accumulate one read at a time,
-    // and dispatch finished read blocks to a shard.
+    // Coordinator
     let coordinator_tag = tag.clone();
+    let total_reads_dispatched_c = total_reads_dispatched.clone();
     let coordinator_handle = tokio::spawn(async move {
         let mut current_read_id: Option<String> = None;
         let mut current_hits: Vec<M8Record> = Vec::with_capacity(32);
-        let mut total_lines = 0usize;
-        let mut total_reads = 0usize;
+        let mut total_lines = 0u64;
+        let mut skipped_empty_or_comment = 0u64;
+        let mut skipped_bad_utf8 = 0u64;
+        let mut skipped_no_read_id = 0u64;
+        let mut skipped_parse_err = 0u64;
+        let mut total_reads = 0u64;
         let start = Instant::now();
 
         #[cfg(debug_assertions)]
@@ -1171,15 +1233,22 @@ pub async fn call_hits_m8(
         while let Some(item) = m8_input.next().await {
             let bytes = match item.to_bytes() {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped_bad_utf8 += 1;
+                    continue;
+                }
             };
 
             let line_str = match std::str::from_utf8(&bytes) {
                 Ok(s) => s.trim_end(),
-                Err(_) => continue,
+                Err(_) => {
+                    skipped_bad_utf8 += 1;
+                    continue;
+                }
             };
 
             if line_str.is_empty() || line_str.starts_with('#') {
+                skipped_empty_or_comment += 1;
                 continue;
             }
 
@@ -1187,12 +1256,18 @@ pub async fn call_hits_m8(
 
             let read_id = match read_id_from_m8_line(line_str) {
                 Some(r) => r.to_string(),
-                None => continue,
+                None => {
+                    skipped_no_read_id += 1;
+                    continue;
+                }
             };
 
             let rec = match M8Record::parse_line_nr(line_str) {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(_) => {
+                    skipped_parse_err += 1;
+                    continue;
+                }
             };
 
             if total_lines == 1 {
@@ -1229,6 +1304,7 @@ pub async fn call_hits_m8(
                     .map_err(|e| anyhow!("failed to dispatch completed read to worker: {}", e))?;
 
                 total_reads += 1;
+                total_reads_dispatched_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
             if current_read_id.is_none() {
@@ -1252,29 +1328,36 @@ pub async fn call_hits_m8(
                     .map_err(|e| anyhow!("failed to dispatch final read to worker: {}", e))?;
 
                 total_reads += 1;
+                total_reads_dispatched_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
-        // Flush all workers after all reads have been dispatched.
-        for (_, tx) in worker_txs.iter().enumerate() {
+        // Flush all workers
+        for tx in worker_txs.iter() {
             tx.send(WorkerMsgLocal::Flush)
                 .await
                 .map_err(|e| anyhow!("failed to flush worker: {}", e))?;
         }
 
         info!(
-            "[call_hits_m8:{}] coordinator done — processed {} lines, {} reads in {:?}",
+            "[call_hits_m8:{}] coordinator done — \
+             lines={} (skipped empty/comment={}, bad_utf8={}, no_read_id={}, parse_err={}), \
+             reads_dispatched={} in {:?}",
             coordinator_tag,
             total_lines,
+            skipped_empty_or_comment,
+            skipped_bad_utf8,
+            skipped_no_read_id,
+            skipped_parse_err,
             total_reads,
             start.elapsed()
         );
 
         if total_lines == 0 {
-            warn!(
+            return Err(anyhow!(
                 "[call_hits_m8:{}] coordinator saw zero input lines; upstream sort/stream wiring is wrong",
                 coordinator_tag
-            );
+            ));
         }
 
         Ok::<(), anyhow::Error>(())
@@ -1282,7 +1365,69 @@ pub async fn call_hits_m8(
 
     cleanup_tasks.push(coordinator_handle);
 
-    let dedup_stream = ReceiverStream::new(dedup_rx);
+    // ─── EXIT COUNTERS on the two output streams ───────────────────────────
+    let (dedup_counted_tx, dedup_counted_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+    let dedup_exit_tag = tag.clone();
+    let dedup_exit_counter = tokio::spawn({
+        let mut n = 0u64;
+        async move {
+            let mut stream = ReceiverStream::new(dedup_rx);
+            while let Some(item) = stream.next().await {
+                n += 1;
+                if dedup_counted_tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+            info!(
+                "[call_hits_m8:{}] EXIT dedup stream: {} records",
+                dedup_exit_tag, n
+            );
+            Ok(())
+        }
+    });
+    cleanup_tasks.push(dedup_exit_counter);
+
+    let (summary_counted_tx, summary_counted_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+    let summary_exit_tag = tag.clone();
+    let summary_exit_counter = tokio::spawn({
+        let mut n = 0u64;
+        async move {
+            let mut stream = ReceiverStream::new(summary_rx);
+            while let Some(item) = stream.next().await {
+                n += 1;
+                if summary_counted_tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+            info!(
+                "[call_hits_m8:{}] EXIT summary stream: {} records",
+                summary_exit_tag, n
+            );
+            Ok(())
+        }
+    });
+    cleanup_tasks.push(summary_exit_counter);
+
+    // Final accounting log (runs after workers finish because of the atomics)
+    let final_tag = tag.clone();
+    let final_accounting = tokio::spawn(async move {
+        // give workers a moment to finish their last messages
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        info!(
+            "[call_hits_m8:{}] FINAL ACCOUNTING — dispatched={} emitted={} dropped_by_summarize={}",
+            final_tag,
+            total_reads_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            total_reads_emitted.load(std::sync::atomic::Ordering::Relaxed),
+            total_reads_dropped_by_summarize.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        Ok(())
+    });
+    cleanup_tasks.push(final_accounting);
+
+    // Fan-outs now operate on the counted streams
+    let dedup_stream = ReceiverStream::new(dedup_counted_rx);
     let (dedup_branches, dedup_router_done_rx) = fanout_to_channels(
         dedup_stream,
         2,
@@ -1290,10 +1435,9 @@ pub async fn call_hits_m8(
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // track router task (replaces cleanup_receivers)
     cleanup_receivers.push(dedup_router_done_rx);
 
     let mut dedup_branches = dedup_branches.into_iter();
@@ -1315,11 +1459,11 @@ pub async fn call_hits_m8(
         StreamDataType::JustBytes,
         "call_hits_m8_dedup",
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(call_file_write_task);
 
-    let summary_stream = ReceiverStream::new(summary_rx);
+    let summary_stream = ReceiverStream::new(summary_counted_rx);
     let (summary_branches, summary_router_done_rx) = fanout_to_channels(
         summary_stream,
         2,
@@ -1327,10 +1471,9 @@ pub async fn call_hits_m8(
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    // track router task instead of oneshot receiver
     cleanup_receivers.push(summary_router_done_rx);
 
     let mut summary_branches = summary_branches.into_iter();
@@ -1353,8 +1496,8 @@ pub async fn call_hits_m8(
         StreamDataType::JustBytes,
         "call_hits_m8_summary",
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
     cleanup_tasks.push(summary_file_write_task);
 
     info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
