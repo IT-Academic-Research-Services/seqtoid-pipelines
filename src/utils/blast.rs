@@ -1302,6 +1302,7 @@ pub async fn call_hits_m8(
             while let Some(msg) = worker_rx.recv().await {
                 match msg {
                     WorkerMsgLocal::ProcessRead { read_id, hits } => {
+                        let log_misses = worker_tag == "nr";
                         let reduced = summarize_m8_hits(
                             0,
                             read_id,
@@ -1310,6 +1311,7 @@ pub async fn call_hits_m8(
                             &acc2taxid_map,
                             &*should_keep_filter,
                             min_aln_len,
+                            log_misses,
                         );
 
                         if let Some(reduced) = reduced {
@@ -1671,6 +1673,7 @@ pub fn summarize_m8_hits<F>(
     acc2taxid_map: &Map<Vec<u8>>,
     should_keep_filter: &F,
     min_aln_len: u64,
+    log_misses: bool,
 ) -> Option<ReducedRead>
 where
     F: Fn(&[i32]) -> bool + Send + Sync,
@@ -1686,13 +1689,14 @@ where
 
         match acc2taxid_map.get(hit.tname.as_bytes()) {
             None => {
-                // log a few misses then stop spamming
-                static LOGGED: AtomicU64 = AtomicU64::new(0);
-                if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
-                    warn!(
-                    "[summarize_m8_hits] acc2taxid miss: q={} t={}",
-                    hit.qname, hit.tname
-                );
+                if log_misses {
+                    static LOGGED: AtomicU64 = AtomicU64::new(0);
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 200 {
+                        warn!(
+                            "[summarize_m8_hits] acc2taxid miss: q={} t={:?}",
+                            hit.qname, hit.tname
+                        );
+                    }
                 }
                 continue;
             }
@@ -1703,12 +1707,14 @@ where
                 }
                 let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
                 if !should_keep_filter(&lineage) {
-                    static LOGGED_F: AtomicU64 = AtomicU64::new(0);
-                    if LOGGED_F.fetch_add(1, Ordering::Relaxed) < 20 {
-                        warn!(
-                        "[summarize_m8_hits] should_keep rejected: t={} taxid={} lineage={:?}",
-                        hit.tname, taxid, lineage
-                    );
+                    if log_misses {
+                        static LOGGED_F: AtomicU64 = AtomicU64::new(0);
+                        if LOGGED_F.fetch_add(1, Ordering::Relaxed) < 20 {
+                            warn!(
+                                "[summarize_m8_hits] should_keep rejected: t={} taxid={} lineage={:?}",
+                                hit.tname, taxid, lineage
+                            );
+                        }
                     }
                     continue;
                 }
@@ -3379,6 +3385,7 @@ mod tests {
             &acc2taxid_map,
             &should_keep,
             50,
+            false,
         )
         .expect("expected a reduced read");
 
@@ -3408,6 +3415,7 @@ mod tests {
             &acc2taxid_map,
             &should_keep,
             50,
+            false,
         );
 
         assert!(reduced.is_none());
