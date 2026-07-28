@@ -5,6 +5,7 @@ use tokio::time::Duration;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::RandomState as AHashRandomState;
 use ahash::{AHashMap, RandomState as AHashState};
@@ -1683,18 +1684,36 @@ where
             continue;
         }
 
-        if let Some(taxid_u64) = acc2taxid_map.get(hit.tname.as_bytes()) {
-            let taxid = taxid_u64 as i32;
-            if taxid <= 0 {
+        match acc2taxid_map.get(hit.tname.as_bytes()) {
+            None => {
+                // log a few misses then stop spamming
+                static LOGGED: AtomicU64 = AtomicU64::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+                    warn!(
+                    "[summarize_m8_hits] acc2taxid miss: q={} t={}",
+                    hit.qname, hit.tname
+                );
+                }
                 continue;
             }
-
-            let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
-            if !should_keep_filter(&lineage) {
-                continue;
+            Some(taxid_u64) => {
+                let taxid = taxid_u64 as i32;
+                if taxid <= 0 {
+                    continue;
+                }
+                let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
+                if !should_keep_filter(&lineage) {
+                    static LOGGED_F: AtomicU64 = AtomicU64::new(0);
+                    if LOGGED_F.fetch_add(1, Ordering::Relaxed) < 20 {
+                        warn!(
+                        "[summarize_m8_hits] should_keep rejected: t={} taxid={} lineage={:?}",
+                        hit.tname, taxid, lineage
+                    );
+                    }
+                    continue;
+                }
+                valid_hits.push(hit);
             }
-
-            valid_hits.push(hit);
         }
     }
 
