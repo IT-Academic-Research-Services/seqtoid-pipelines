@@ -15,6 +15,7 @@ use ahash::RandomState as AHashRandomState;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
+use fst::Map;
 use futures::future::try_join_all;
 use log::{self, debug, error, info, warn};
 use needletail::parse_fastx_file;
@@ -43,6 +44,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 use twox_hash::XxHash64;
+use fst::Streamer;
 
 use crate::config::defs::{
     ClusterInfo, DiamondSubcommand, DuplicateClusters, KallistoSubcommand, Lineage,
@@ -7173,6 +7175,83 @@ async fn mmseqs_non_host_align(
     ))
 }
 
+
+pub fn inspect_accession2taxid_map(
+    acc2taxid_map: &Map<Vec<u8>>,
+    keys_out_path: &PathBuf,
+    limit: usize,
+) -> Result<()> {
+    // ── 1. First N keys → flat file + log ────────────────────────────────
+    let file = std::fs::File::create(keys_out_path)
+        .map_err(|e| anyhow!("cannot create {}: {}", keys_out_path.display(), e))?;
+    let mut writer = std::io::BufWriter::new(file);
+
+    let mut stream = acc2taxid_map.stream();
+    let mut n = 0usize;
+    let mut sample_for_log: Vec<(String, u64)> = Vec::with_capacity(limit.min(32));
+
+    while let Some((key_bytes, taxid)) = stream.next() {
+        if n >= limit {
+            break;
+        }
+        let key = String::from_utf8_lossy(key_bytes);
+        writeln!(writer, "{}\t{}", key, taxid)?;
+        if sample_for_log.len() < 32 {
+            sample_for_log.push((key.into_owned(), taxid));
+        }
+        n += 1;
+    }
+    writer.flush()?;
+
+    info!(
+        "[acc2taxid inspect] wrote first {} keys to {}",
+        n,
+        keys_out_path.display()
+    );
+    for (k, t) in &sample_for_log {
+        info!("[acc2taxid inspect] sample key={:?} taxid={}", k, t);
+    }
+
+    // ── 2. Probe known shapes (versioned / unversioned / PDB) ───────────
+    let probes: &[&str] = &[
+        "EFG1759503",
+        "EFG1759503.1",
+        "WP_198835266",
+        "WP_198835266.1",
+        "KJX92028",
+        "KJX92028.1",
+        "MBD3193859",
+        "MBD3193859.1",
+        "1JZX_A",
+        "1JZX",
+        "4U67_X",
+        "9NRI_BA",
+        "",
+    ];
+
+    info!("[acc2taxid inspect] probing {} lookup keys", probes.len());
+    for p in probes {
+        match acc2taxid_map.get(p.as_bytes()) {
+            Some(taxid) => info!(
+                "[acc2taxid inspect] HIT  key={:?} taxid={}",
+                p, taxid
+            ),
+            None => info!("[acc2taxid inspect] MISS key={:?}", p),
+        }
+    }
+
+    Ok(())
+}
+
+pub fn inspect_accession2taxid_map_arc(
+    acc2taxid_map: &Arc<Map<Vec<u8>>>,
+    keys_out_path: &PathBuf,
+    limit: usize,
+) -> Result<()> {
+    inspect_accession2taxid_map(acc2taxid_map.as_ref(), keys_out_path, limit)
+}
+
+
 /// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -7716,6 +7795,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
 
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
+
+    inspect_accession2taxid_map_arc(
+        &acc2taxid_map,
+        &out_dir.join("acc2taxid_first250_keys.tsv"),
+        250,
+    )?;
 
     let nt_concurrency = compute_phase_concurrency(&config, "call_hits_nt", 1.0, 3.5, 64, 16);
     info!("call hits nt concurrency {}", nt_concurrency);
