@@ -425,7 +425,7 @@ impl PafRecord {
         let evalue = self.calc_evalue(genome_size);
 
         format!(
-            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
+            "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}",
             self.qname,
             base_accession,
             percent_ident,
@@ -466,14 +466,15 @@ pub fn parse_paf_batch_to_m8(batch: Vec<u8>, genome_size: f64) -> Vec<Vec<u8>> {
     batch
         .par_split(|&b| b == b'\n')
         .filter(|line: &&[u8]| !line.is_empty() && !line.starts_with(b"#"))
-        .flat_map(|line_bytes: &[u8]| {
-            if let Ok(line) = std::str::from_utf8(line_bytes) {
-                if let Ok(record) = PafRecord::parse_line(line) {
-                    let m8_line = record.to_m8_line(genome_size);
-                    return vec![m8_line.into_bytes()];
-                }
+        .filter_map(|line_bytes: &[u8]| {
+            let line = std::str::from_utf8(line_bytes).ok()?;
+            let record = PafRecord::parse_line(line).ok()?;
+            let m8 = record.to_m8_line(genome_size);
+            if m8.is_empty() {
+                None
+            } else {
+                Some(m8.into_bytes())
             }
-            vec![]
         })
         .collect()
 }
@@ -562,7 +563,7 @@ pub async fn paf_to_m8(
         config.clone(),
         StreamDataType::JustBytes,
         "paf_to_m8_m8",
-        false
+        true
     )
     .await
     .map_err(|e| PipelineError::IOError(e.to_string()))?;
