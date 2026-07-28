@@ -437,6 +437,7 @@ async fn validate_input(
         config.clone(),
         StreamDataType::IlluminaFastq,
         "validate_input",
+        false
     )
     .await
     .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -610,6 +611,7 @@ async fn bowtie2_align_and_sort_stream(
                 config.clone(),
                 StreamDataType::JustBytes,
                 "bt2_bam_write",
+                false
             )
             .await?;
             Ok(())
@@ -897,6 +899,7 @@ async fn bowtie2_filter_files(
             config.clone(),
             StreamDataType::JustBytes,
             "bt2_fastq_se",
+            false
         )
         .await?;
         cleanup_tasks.push(write_task);
@@ -1279,6 +1282,7 @@ async fn hisat2_filter(
             config.clone(),
             StreamDataType::JustBytes,
             "hisat2_bam_write",
+            false
         )
         .await?;
         cleanup_tasks.push(write_task);
@@ -2032,6 +2036,7 @@ async fn minimap2_filter(
             config.clone(),
             StreamDataType::JustBytes,
             "mm2_filter_bam",
+            false
         )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -3104,6 +3109,7 @@ async fn run_diamond_single_file(
         config.clone(),
         StreamDataType::JustBytes,
         &format!("diamond_{}", label),
+        false
     )
     .await?;
 
@@ -4013,6 +4019,7 @@ async fn process_assembly(
         config.clone(),
         StreamDataType::JustBytes,
         "process_assembly",
+        false
     )
     .await?;
     cleanup_tasks.push(write_bam_task);

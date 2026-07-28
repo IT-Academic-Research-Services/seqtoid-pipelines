@@ -973,6 +973,7 @@ pub async fn sort_m8_by_read_id(
         config.clone(),
         StreamDataType::JustBytes,
         &tag,
+        true
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -1597,6 +1598,7 @@ pub async fn call_hits_m8(
         config.clone(),
         StreamDataType::JustBytes,
         "call_hits_m8_dedup",
+        false
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -1634,6 +1636,7 @@ pub async fn call_hits_m8(
         config.clone(),
         StreamDataType::JustBytes,
         "call_hits_m8_summary",
+        false
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;

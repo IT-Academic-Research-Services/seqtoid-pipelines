@@ -562,6 +562,7 @@ pub async fn paf_to_m8(
         config.clone(),
         StreamDataType::JustBytes,
         "paf_to_m8_m8",
+        false
     )
     .await
     .map_err(|e| PipelineError::IOError(e.to_string()))?;
