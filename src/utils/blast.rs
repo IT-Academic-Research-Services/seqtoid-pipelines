@@ -23,6 +23,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use rand::prelude::IndexedRandom;
+use rand::SeedableRng;
 
 use futures::future::try_join_all;
 use std::collections::HashMap;
@@ -779,87 +781,6 @@ fn negative_taxid(level: u8) -> i64 {
     -100 * (level as i64)
 }
 
-/// Computes the common lineage for a set of hits,
-/// Assumes lineages are [species, genus, family] leaf-to-root with possible negatives.
-///
-/// # Arguments
-///
-///  * `hits` - list of m8 records
-/// * `lineage_map` - derived from taxid DB (taxid -> [species, genus, family])
-///
-/// # Returns
-///
-/// (level, consensus_taxid, selected_hits) where level=1 species, 2 genus, 3 family, 0 none;
-/// consensus_taxid is the taxid at that level.
-pub fn consensus_level(
-    hits: &[M8Record],
-    lineage_map: &AHashMap<Taxid, Lineage>,
-    acc2taxid_map: &Map<Vec<u8>>,
-    should_keep: &Arc<impl Fn(&[i32]) -> bool + Send + Sync>,
-) -> Result<(u8, i64, Vec<M8Record>)> {
-    let lineages: Vec<Lineage> = hits
-        .iter()
-        .filter_map(|r| {
-            let accession = &r.tname;
-
-            // 1. Try full accession (e.g., "ACC.1")
-            let taxid_opt = acc2taxid_map.get(accession.as_bytes());
-
-            // 2. Fallback: strip version → base accession (e.g., "ACC")
-            let taxid_u64 = taxid_opt
-                .or_else(|| {
-                    let base_acc = accession.split('.').next().unwrap_or(accession);
-                    if base_acc != accession {
-                        acc2taxid_map.get(base_acc.as_bytes())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow!("Accession not found in acc2taxid map: {}", accession))
-                .ok()?;
-
-            let taxid = taxid_u64 as i32;
-            if taxid <= 0 {
-                return None;
-            }
-
-            lineage_map.get(&taxid).cloned()
-        })
-        .collect();
-
-    if lineages.is_empty() {
-        return Ok((0, 0, Vec::new()));
-    }
-
-    let mut max_level = 0u8;
-    let mut consensus_taxid = 0i64;
-
-    for level in 0..3 {
-        let taxids: HashSet<i32> = lineages
-            .iter()
-            .map(|lin| lin[level])
-            .filter(|&t| t > 0)
-            .collect();
-
-        if taxids.len() == 1 {
-            let agreed = *taxids.iter().next().unwrap() as i64;
-            max_level = (level + 1) as u8;
-            consensus_taxid = agreed;
-        } else {
-            break;
-        }
-    }
-
-    if max_level > 0 {
-        let rep_lineage = lineages[0];
-        let validated = validate_taxid_lineage(&rep_lineage, consensus_taxid as i32, max_level);
-        if !(should_keep)(&validated) {
-            return Ok((0, 0, Vec::new()));
-        }
-    }
-
-    Ok((max_level, consensus_taxid, hits.to_vec()))
-}
 
 /// Extract the read ID from a BLAST m8 line.
 ///
@@ -1392,6 +1313,68 @@ pub async fn call_hits_m8(
 /// # Returns
 ///
 /// Option<ReducedRead>: the summarized read info, or None if no hits pass filters
+/// Python `call_hit_level_v2`: species-level majority only.
+/// Returns (level, taxid, best_accession).
+/// level is always 1 on success, -1 on empty.
+/// Python `call_hit_level_v2`: species-level majority only.
+/// Returns `(level, taxid, best_accession)`.
+/// `level` is always `1` on success, `-1` when there are no species hits.
+fn call_hit_level_v2(species_hits: &AHashMap<i32, Vec<String>>) -> (i32, i32, Option<String>) {
+    let mut max_match = 0usize;
+    let mut taxid_candidates: Vec<i32> = Vec::new();
+
+    for (&taxid, accession_list) in species_hits.iter() {
+        let n = accession_list.len();
+        if n > max_match {
+            taxid_candidates.clear();
+            taxid_candidates.push(taxid);
+            max_match = n;
+        } else if n == max_match && max_match > 0 {
+            if !taxid_candidates.contains(&taxid) {
+                taxid_candidates.push(taxid);
+            }
+        }
+    }
+
+    if max_match == 0 {
+        return (-1, -1, None);
+    }
+
+    // ★ HERE — replace whatever selected_taxid logic you have with this:
+    let selected_taxid = if taxid_candidates.len() == 1 {
+        taxid_candidates[0]
+    } else {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+        *taxid_candidates
+            .choose(&mut rng)
+            .unwrap_or(&taxid_candidates[0])
+    };
+
+    let accession_list = species_hits
+        .get(&selected_taxid)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let mut best_accession: Option<String> = None;
+    let mut best_count = 0usize;
+    let mut seen: AHashMap<&str, usize> = AHashMap::new();
+    for a in accession_list {
+        let c = seen.entry(a.as_str()).and_modify(|x| *x += 1).or_insert(1);
+        if *c > best_count {
+            best_count = *c;
+            best_accession = Some(a.clone());
+        }
+    }
+
+    (1, selected_taxid, best_accession)
+}
+
+/// Port of Python `_call_hits_m8_work` hit-calling for one read's hits.
+///
+/// - Only best-bitscore (and exact ties) participate
+/// - Level / taxid / accession from `call_hit_level_v2` (species majority)
+/// - Summary lineage from the chosen accession
+/// - Dedup m8 = best-bitscore row whose accession matches the choice
 pub fn summarize_m8_hits<F>(
     seq: u64,
     read_id: String,
@@ -1405,14 +1388,16 @@ pub fn summarize_m8_hits<F>(
 where
     F: Fn(&[i32]) -> bool + Send + Sync,
 {
-    let mut valid_hits: Vec<&M8Record> = Vec::with_capacity(hits.len().min(64));
+    // ── 1. Resolve accession → taxid → lineage; drop short / unknown ──────
+    let mut resolved: Vec<(&M8Record, i32, Lineage)> = Vec::with_capacity(hits.len().min(64));
 
     for hit in hits {
         if hit.alen < min_aln_len {
             continue;
         }
 
-        match acc2taxid_map.get(hit.tname.as_bytes()) {
+        let taxid_u64 = match acc2taxid_map.get(hit.tname.as_bytes()) {
+            Some(t) => t,
             None => {
                 if log_misses {
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1425,117 +1410,109 @@ where
                 }
                 continue;
             }
-            Some(taxid_u64) => {
-                let taxid = taxid_u64 as i32;
-                if taxid <= 0 {
-                    continue;
-                }
-                let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
-                if !should_keep_filter(&lineage) {
-                    if log_misses {
-                        static LOGGED_F: AtomicU64 = AtomicU64::new(0);
-                        if LOGGED_F.fetch_add(1, Ordering::Relaxed) < 20 {
-                            warn!(
-                                "[summarize_m8_hits] should_keep rejected: t={} taxid={} lineage={:?}",
-                                hit.tname, taxid, lineage
-                            );
-                        }
-                    }
-                    continue;
-                }
-                valid_hits.push(hit);
-            }
+        };
+
+        let taxid = taxid_u64 as i32;
+        if taxid <= 0 {
+            continue;
         }
+
+        let lineage = lineage_map
+            .get(&taxid)
+            .cloned()
+            .unwrap_or([-1i32; 3]);
+
+        resolved.push((hit, taxid, lineage));
     }
 
-    if valid_hits.is_empty() {
+    if resolved.is_empty() {
         return None;
     }
 
-    // Best bitscore (first wins on ties) — drives the dedup m8 row.
-    let mut best: Option<&M8Record> = None;
-    let mut max_bitscore = f64::NEG_INFINITY;
-    for &h in &valid_hits {
-        if h.bitscore > max_bitscore {
-            max_bitscore = h.bitscore;
-            best = Some(h);
+    // ── 2. Best bitscore only (Python restarts accumulate on higher score) ─
+    let max_bitscore = resolved
+        .iter()
+        .map(|(h, _, _)| h.bitscore)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let best_hits: Vec<(&M8Record, i32, Lineage)> = resolved
+        .into_iter()
+        .filter(|(h, _, _)| (h.bitscore - max_bitscore).abs() < 1e-12)
+        .collect();
+
+    // ── 3. Species-level taxid → [accession, ...] (skip negative species) ─
+    let mut species_hits: AHashMap<i32, Vec<String>> = AHashMap::new();
+    for (hit, _taxid, lineage) in &best_hits {
+        let species_taxid = lineage[0];
+        if species_taxid < 0 {
+            continue;
         }
+        species_hits
+            .entry(species_taxid)
+            .or_default()
+            .push(hit.tname.clone());
     }
-    let best = best?;
+
+    // ── 4. call_hit_level_v2 ──────────────────────────────────────────────
+    let (hit_level, hit_taxid, best_accession) = call_hit_level_v2(&species_hits);
+
+    if hit_level < 0 {
+        return None;
+    }
+    let best_accession = match best_accession {
+        Some(a) => a,
+        None => return None,
+    };
+
+    if hit_taxid > 0 && !should_keep_filter(&[hit_taxid]) {
+        return None;
+    }
+
+    // ── 5. Lineage columns from chosen accession (Python get_lineage) ─────
+    let (species_taxid, genus_taxid, family_taxid) = {
+        let t = acc2taxid_map
+            .get(best_accession.as_bytes())
+            .map(|x| x as i32)
+            .unwrap_or(-1);
+        if t > 0 {
+            let lin = lineage_map.get(&t).cloned().unwrap_or([-1i32; 3]);
+            (lin[0], lin[1], lin[2])
+        } else {
+            (-1, -1, -1)
+        }
+    };
+
+    // ── 6. Dedup m8: best-bitscore row with tname == best_accession ───────
+    let m8_src = best_hits
+        .iter()
+        .find(|(h, _, _)| h.tname == best_accession)
+        .map(|(h, _, _)| *h)
+        .or_else(|| best_hits.first().map(|(h, _, _)| *h))?;
 
     let dedup_line = format!(
         "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-        best.qname,
-        best.tname,
-        best.pident,
-        best.alen,
-        best.mismatch,
-        best.gapopen,
-        best.qstart,
-        best.qend,
-        best.tstart,
-        best.tend,
-        best.evalue,
-        best.bitscore
+        m8_src.qname,
+        m8_src.tname,
+        m8_src.pident,
+        m8_src.alen,
+        m8_src.mismatch,
+        m8_src.gapopen,
+        m8_src.qstart,
+        m8_src.qend,
+        m8_src.tstart,
+        m8_src.tend,
+        m8_src.evalue,
+        m8_src.bitscore
     )
         .into_bytes();
 
-    // Consensus over valid hits.
-    let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
-    let wrapped_filter = Arc::new(|l: &[i32]| should_keep_filter(l));
-
-    let (tax_level, cons_taxid, consensus_hits) =
-        consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter).unwrap_or((
-            0,
-            0,
-            Vec::new(),
-        ));
-
-    // Prefer accession from consensus; fall back to best-bitscore hit.
-    let chosen_accession = consensus_hits
-        .first()
-        .map(|h| h.tname.as_str())
-        .unwrap_or(best.tname.as_str());
-
-    // FST Map::get returns &u64 (Copy) — no deref
-    let lineage = acc2taxid_map
-        .get(chosen_accession.as_bytes())
-        .map(|t| t as i32)
-        .and_then(|taxid| lineage_map.get(&taxid).cloned())
-        .unwrap_or([-1i32; 3]);
-
-    let species_taxid = lineage[0];
-    let genus_taxid = lineage[1];
-    let family_taxid = lineage[2];
-
-    // HitSummaryWriter columns:
-    //   read_id, level, taxid, accession_id, species_taxid, genus_taxid, family_taxid
-    let level: i32 = if tax_level > 0 {
-        tax_level as i32
-    } else {
-        -1
-    };
-    let taxid: i32 = if cons_taxid > 0 {
-        cons_taxid as i32
-    } else if species_taxid > 0 {
-        species_taxid
-    } else {
-        -1
-    };
-
-    if taxid > 0 {
-        let called_lin = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
-        if !should_keep_filter(&called_lin) {
-            return None;
-        }
-    }
-
+    // ── 7. HitSummary 7-col ───────────────────────────────────────────────
     let summary_line = format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         read_id,
-        level,
-        taxid,
-        chosen_accession,
+        hit_level,
+        hit_taxid,
+        best_accession,
         species_taxid,
         genus_taxid,
         family_taxid
@@ -1546,7 +1523,7 @@ where
         seq,
         dedup: dedup_line,
         summary: summary_line,
-        accession: chosen_accession.to_string(),
+        accession: best_accession,
     })
 }
 
@@ -2925,58 +2902,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_consensus_level_single_hit_returns_family_level() {
-        let hits = vec![nr_record("read1", "ACC1", 100, 200.0)];
-        let lineage_map = build_lineage_map();
-        let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
-        let should_keep = Arc::new(|_: &[i32]| true);
-
-        let (level, taxid, kept) =
-            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-                .expect("consensus_level should succeed");
-
-        assert_eq!(level, 3);
-        assert_eq!(taxid, 100);
-        assert_eq!(kept.len(), 1);
-    }
-
-    #[test]
-    fn test_consensus_level_species_and_genus_agree() {
-        let mut lineage_map = AHashMap::default();
-        lineage_map.insert(1 as Taxid, lineage(1, 10, 100));
-        lineage_map.insert(2 as Taxid, lineage(1, 10, 200));
-
-        let hits = vec![
-            nr_record("read1", "ACC1", 100, 200.0),
-            nr_record("read1", "ACC2", 100, 199.0),
-        ];
-        let acc2taxid_map = build_acc_map(&[("ACC1", 1), ("ACC2", 2)]);
-        let should_keep = Arc::new(|_: &[i32]| true);
-
-        let (level, taxid, kept) =
-            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-                .expect("consensus_level should succeed");
-
-        assert_eq!(level, 2);
-        assert_eq!(taxid, 10);
-        assert_eq!(kept.len(), 2);
-    }
-
-    #[test]
-    fn test_consensus_level_rejected_by_filter() {
-        let hits = vec![nr_record("read1", "ACC1", 100, 200.0)];
-        let lineage_map = build_lineage_map();
-        let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
-        let should_keep = Arc::new(|_: &[i32]| false);
-
-        let (level, taxid, kept) =
-            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-                .expect("consensus_level should return ok");
-
-        assert_eq!((level, taxid), (0, 0));
-        assert!(kept.is_empty());
-    }
 
     #[test]
     fn test_merge_aggregations_is_additive() {
@@ -3015,6 +2940,64 @@ mod tests {
         assert_eq!(bucket.sum_e_value, -120.0);
         assert!(bucket.source_count_type.contains("NT"));
         assert!(bucket.source_count_type.contains("NR"));
+    }
+
+    #[test]
+    fn call_hit_level_v2_majority_species() {
+        let mut species = AHashMap::new();
+        species.insert(1, vec!["A".into(), "A".into(), "B".into()]); // taxid 1 wins
+        species.insert(2, vec!["C".into()]);
+        let (level, taxid, acc) = call_hit_level_v2(&species);
+        assert_eq!(level, 1);
+        assert_eq!(taxid, 1);
+        assert_eq!(acc.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn call_hit_level_v2_empty_is_minus_one() {
+        let species = AHashMap::new();
+        let (level, taxid, acc) = call_hit_level_v2(&species);
+        assert_eq!(level, -1);
+        assert_eq!(taxid, -1);
+        assert!(acc.is_none());
+    }
+
+    #[test]
+    fn summarize_emits_seven_cols_level_one() {
+        let lineage_map = build_lineage_map(); // taxid 1 → [1, 10, 100]
+        let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
+        let should_keep = |_: &[i32]| true;
+
+        let hits = vec![nr_record("read1", "ACC1", 100, 200.0)];
+
+        let reduced = summarize_m8_hits(
+            0,
+            "read1".to_string(),
+            &hits,
+            &lineage_map,
+            &acc2taxid_map,
+            &should_keep,
+            50,
+            false,
+        )
+            .expect("one valid hit must produce a ReducedRead");
+
+        assert_eq!(reduced.accession, "ACC1");
+
+        let summary = std::str::from_utf8(&reduced.summary).unwrap();
+        let fields: Vec<&str> = summary.trim_end().split('\t').collect();
+
+        assert_eq!(fields.len(), 7, "summary must be 7 columns, got: {summary}");
+        assert_eq!(fields[0], "read1");
+        assert_eq!(fields[1], "1");    // call_hit_level_v2 → always species level
+        assert_eq!(fields[2], "1");    // species taxid
+        assert_eq!(fields[3], "ACC1"); // accession
+        assert_eq!(fields[4], "1");    // species_taxid from lineage
+        assert_eq!(fields[5], "10");   // genus
+        assert_eq!(fields[6], "100");  // family
+
+        let dedup = std::str::from_utf8(&reduced.dedup).unwrap();
+        assert!(dedup.starts_with("read1\tACC1\t"), "dedup m8: {dedup}");
     }
 
     #[test]
@@ -3141,7 +3124,7 @@ mod tests {
         let should_keep = |_: &[i32]| true;
 
         let hits = vec![
-            nr_record("read1", "SHORT", 20, 500.0),
+            nr_record("read1", "SHORT", 20, 500.0), // alen < 50 → drop
             nr_record("read1", "ACC2", 100, 150.0),
             nr_record("read1", "ACC1", 100, 150.0),
         ];
@@ -3159,26 +3142,24 @@ mod tests {
             .expect("expected a reduced read");
 
         assert_eq!(reduced.seq, 7);
+        // SHORT gone; ACC2 first among best-bitscore → first-wins on accession tie
         assert_eq!(reduced.accession, "ACC2");
 
-        // dedup m8: still qname\ttname\t...
         assert!(std::str::from_utf8(&reduced.dedup)
             .unwrap()
             .starts_with("read1\tACC2\t"));
 
-        // HitSummary: read_id, level, taxid, accession, species, genus, family
-        // Both ACC1/ACC2 → taxid 1 → lineage [1, 10, 100]
-        // consensus_level on a single taxid → family level 3, taxid 100
+        // call_hit_level_v2: always level 1, species taxid 1
         let summary = std::str::from_utf8(&reduced.summary).unwrap();
         let fields: Vec<&str> = summary.trim_end().split('\t').collect();
-        assert_eq!(fields.len(), 7, "summary must be 7 columns: {}", summary);
+        assert_eq!(fields.len(), 7, "summary must be 7 columns: {summary}");
         assert_eq!(fields[0], "read1");
-        assert_eq!(fields[1], "3"); // tax_level (family)
-        assert_eq!(fields[2], "100"); // cons taxid (family)
+        assert_eq!(fields[1], "1");    // level (species)
+        assert_eq!(fields[2], "1");    // taxid
         assert_eq!(fields[3], "ACC2"); // accession
-        assert_eq!(fields[4], "1"); // species
-        assert_eq!(fields[5], "10"); // genus
-        assert_eq!(fields[6], "100"); // family
+        assert_eq!(fields[4], "1");    // species_taxid
+        assert_eq!(fields[5], "10");   // genus
+        assert_eq!(fields[6], "100");  // family
     }
 
     #[test]
