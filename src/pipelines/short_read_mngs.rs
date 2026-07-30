@@ -7558,10 +7558,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
 
-    let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
+    let nt_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("_nt.m8"), "."));
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) =
-        paf_to_m8(config.clone(), non_host_mm2_out_stream, m8_file_path).await?;
+        paf_to_m8(config.clone(), non_host_mm2_out_stream, nt_m8_file_path).await?;
     cleanup_tasks.append(&mut m8_cleanup_tasks);
 
     // ────────────────────────────────────────────────────────────────
@@ -7834,6 +7834,35 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut non_host_cleanup_receivers);
     final_temp_dirs.extend(non_host_align_temp_dirs);
 
+    let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
+        ReceiverStream::new(non_host_m8_stream),
+        2,
+        "nr_m8_stream",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(paf_to_m8_stream_done_rx);
+
+    let mut nr_m8_streams_it = nr_m8_streams.into_iter();
+    let nr_m8_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_m8_file_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
+
+    let nr_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("_nr.m8"), "."));
+
+    let write_task = write_byte_stream_to_file(
+        &nr_m8_file_path,
+        nr_m8_file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "nr_m8_file",
+        true
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(write_task);
+
     let nr_concurrency = compute_phase_concurrency(
         &config,
         "call_hits_nr",
@@ -7853,7 +7882,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let nr_m8_sorted = sort_m8_by_read_id(
         config.clone(),
-        ReceiverStream::new(non_host_m8_stream),
+        nr_m8_stream,
         "nr",
     )
         .await?;
