@@ -926,55 +926,14 @@ pub async fn sort_m8_by_read_id(
         tag, estimated_bytes
     );
 
-    // ─── ENTRY COUNTER ─────────────────────────────────────────────────────
-    let (entry_tx, entry_rx) = mpsc::channel(config.base_buffer_size * 8);
-    let entry_tag = tag.clone();
-    let entry_counter = tokio::spawn({
-        let mut lines = 0u64;
-        let mut unique = ahash::AHashSet::with_capacity(100_000);
-        async move {
-            let mut stream = input_stream;
-            while let Some(item) = stream.next().await {
-                match &item {
-                    ParseOutput::Bytes(b) => {
-                        lines += 1;
-                        if let Some(tab) = memchr::memchr(b'\t', b) {
-                            unique.insert(b[..tab].to_vec());
-                        }
-                    }
-                    other => {
-                        return Err(anyhow!(
-                            "[{}] ENTRY: unexpected ParseOutput: {:?}",
-                            entry_tag, other
-                        ));
-                    }
-                }
-                if entry_tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-            info!(
-                "[{}] ENTRY: received {} lines, {} unique queries",
-                entry_tag, lines, unique.len()
-            );
-            if lines == 0 {
-                return Err(anyhow!(
-                    "[{}] ENTRY: zero lines entered sort_m8_by_read_id",
-                    entry_tag
-                ));
-            }
-            Ok(lines)
-        }
-    });
-
-    // 1) Write the counted stream to disk and wait for the file to be fully closed.
+    // 1) Write the stream to disk and wait for the file to be fully closed.
     let write_task = write_byte_stream_to_file(
         &unsorted_path,
-        ReceiverStream::new(entry_rx),
+        input_stream,
         config.clone(),
         StreamDataType::JustBytes,
         &tag,
-        true
+        true,
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -984,25 +943,12 @@ pub async fn sort_m8_by_read_id(
         .map_err(|e| PipelineError::Other(anyhow!("{} writer task panicked: {}", tag, e)))?
         .map_err(|e| PipelineError::IOError(format!("{} writer task failed: {}", tag, e)))?;
 
-    // Make sure the entry counter finished and reported
-    let entry_lines = entry_counter
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("{} entry counter panicked: {}", tag, e)))?
-        .map_err(|e| PipelineError::Other(e))?;
-
-    // ─── UNSORTED FILE CHECK ───────────────────────────────────────────────
     let unsorted_meta = tokio::fs::metadata(&unsorted_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    info!(
-        "[{}] unsorted file on disk: {} bytes (entry counted {} lines)",
-        tag,
-        unsorted_meta.len(),
-        entry_lines
-    );
     if unsorted_meta.len() == 0 {
         return Err(PipelineError::Other(anyhow!(
-            "[{}] unsorted m8 is empty after write – data lost in write_byte_stream_to_file",
+            "[{}] unsorted m8 is empty after write",
             tag
         )));
     }
@@ -1013,7 +959,7 @@ pub async fn sort_m8_by_read_id(
         "8G"
     };
 
-    // 2) Only now spawn GNU sort, so it reads a complete file.
+    // 2) GNU sort on the complete file.
     let sort_config = crate::utils::command::sort::SortConfig {
         key: "-k1,1".to_string(),
         parallel: None,
@@ -1066,34 +1012,25 @@ pub async fn sort_m8_by_read_id(
         .map_err(|e| PipelineError::Other(anyhow!("sort stderr task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("sort stderr task failed: {}", e)))?;
 
-    // ─── SORTED FILE CHECK ─────────────────────────────────────────────────
     let sorted_meta = tokio::fs::metadata(&sorted_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    info!(
-        "[{}] sorted file on disk: {} bytes (unsorted was {} bytes)",
-        tag,
-        sorted_meta.len(),
-        unsorted_meta.len()
-    );
     if sorted_meta.len() == 0 {
         return Err(PipelineError::Other(anyhow!(
-            "[{}] GNU sort produced an empty file – data lost inside sort",
+            "[{}] GNU sort produced an empty file",
             tag
         )));
     }
-    if sorted_meta.len() < unsorted_meta.len() / 2 {
-        warn!(
-            "[{}] sorted file is dramatically smaller than unsorted ({} vs {}) – possible truncation",
-            tag,
-            sorted_meta.len(),
-            unsorted_meta.len()
-        );
-    }
 
-    info!("[{}] m8 sort completed → {}", tag, sorted_path.display());
+    info!(
+        "[{}] m8 sort completed → {} ({} bytes)",
+        tag,
+        sorted_path.display(),
+        sorted_meta.len()
+    );
 
     // 3) Stream the sorted file back.
+    // Hold TempDir in the relay task so paths stay valid until the consumer drains.
     let sorted_file = TokioFile::open(&sorted_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -1102,65 +1039,20 @@ pub async fn sort_m8_by_read_id(
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // ─── EXIT COUNTER ──────────────────────────────────────────────────────
-    // Critical: keep temp_dir alive until the stream is fully consumed.
-    // We do this by moving temp_dir into the counter task; the task only
-    // finishes after the last item has been forwarded, at which point it is
-    // safe for the directory to be deleted.
-    let (exit_tx, exit_rx) = mpsc::channel(config.base_buffer_size * 8);
-    let exit_tag = tag.clone();
-    let _exit_counter = tokio::spawn({
-        let mut lines = 0u64;
-        let mut unique = ahash::AHashSet::with_capacity(100_000);
-        // hold the TempDir so the sorted file stays on disk while we stream
+    let (out_tx, out_rx) = mpsc::channel(config.base_buffer_size * 8);
+    tokio::spawn(async move {
         let _keep_alive = temp_dir;
-        async move {
-            let mut stream = ReceiverStream::new(rx);
-            while let Some(item) = stream.next().await {
-                match &item {
-                    ParseOutput::Bytes(b) => {
-                        lines += 1;
-                        if let Some(tab) = memchr::memchr(b'\t', b) {
-                            unique.insert(b[..tab].to_vec());
-                        }
-                    }
-                    other => {
-                        return Err(anyhow!(
-                            "[{}] EXIT: unexpected ParseOutput: {:?}",
-                            exit_tag, other
-                        ));
-                    }
-                }
-                if exit_tx.send(item).await.is_err() {
-                    break;
-                }
+        let mut stream = ReceiverStream::new(rx);
+        while let Some(item) = stream.next().await {
+            if out_tx.send(item).await.is_err() {
+                break;
             }
-            info!(
-                "[{}] EXIT: streamed {} lines, {} unique queries",
-                exit_tag, lines, unique.len()
-            );
-            if lines == 0 {
-                return Err(anyhow!(
-                    "[{}] EXIT: zero lines left sort_m8_by_read_id after a non-empty sorted file",
-                    exit_tag
-                ));
-            }
-            if lines < entry_lines / 2 {
-                warn!(
-                    "[{}] EXIT: dramatic line-count drop (entry={}, exit={})",
-                    exit_tag, entry_lines, lines
-                );
-            }
-            Ok(())
         }
+        // temp_dir dropped here after stream ends or consumer disconnects
+        Ok::<(), anyhow::Error>(())
     });
-    // We deliberately do NOT push _exit_counter into a cleanup list here.
-    // The returned stream must outlive this function; the counter task keeps
-    // temp_dir alive for as long as the stream is being consumed.  The caller
-    // (the post-sort counter we already added) will drain the stream, at which
-    // point the task finishes and the directory is cleaned up.
 
-    Ok(ReceiverStream::new(exit_rx))
+    Ok(ReceiverStream::new(out_rx))
 }
 
 /// Calls taxonomic hits from a sorted m8 stream.
