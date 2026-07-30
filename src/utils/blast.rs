@@ -1319,20 +1319,21 @@ pub async fn call_hits_m8(
 /// Python `call_hit_level_v2`: species-level majority only.
 /// Returns `(level, taxid, best_accession)`.
 /// `level` is always `1` on success, `-1` when there are no species hits.
-fn call_hit_level_v2(species_hits: &AHashMap<i32, Vec<String>>) -> (i32, i32, Option<String>) {
+fn call_hit_level_v2(
+    species_hits: &AHashMap<i32, Vec<String>>,
+    taxid_order: &[i32],
+) -> (i32, i32, Option<String>) {
     let mut max_match = 0usize;
     let mut taxid_candidates: Vec<i32> = Vec::new();
 
-    for (&taxid, accession_list) in species_hits.iter() {
-        let n = accession_list.len();
+    for &taxid in taxid_order {
+        let n = species_hits.get(&taxid).map(|v| v.len()).unwrap_or(0);
         if n > max_match {
             taxid_candidates.clear();
             taxid_candidates.push(taxid);
             max_match = n;
         } else if n == max_match && max_match > 0 {
-            if !taxid_candidates.contains(&taxid) {
-                taxid_candidates.push(taxid);
-            }
+            taxid_candidates.push(taxid);
         }
     }
 
@@ -1340,7 +1341,6 @@ fn call_hit_level_v2(species_hits: &AHashMap<i32, Vec<String>>) -> (i32, i32, Op
         return (-1, -1, None);
     }
 
-    // ★ HERE — replace whatever selected_taxid logic you have with this:
     let selected_taxid = if taxid_candidates.len() == 1 {
         taxid_candidates[0]
     } else {
@@ -1350,6 +1350,7 @@ fn call_hit_level_v2(species_hits: &AHashMap<i32, Vec<String>>) -> (i32, i32, Op
             .unwrap_or(&taxid_candidates[0])
     };
 
+    // most_frequent_accession unchanged (list order is already hit order)
     let accession_list = species_hits
         .get(&selected_taxid)
         .map(|v| v.as_slice())
@@ -1441,20 +1442,32 @@ where
         .collect();
 
     // ── 3. Species-level taxid → [accession, ...] (skip negative species) ─
+    // In summarize_m8_hits, when building species_hits:
     let mut species_hits: AHashMap<i32, Vec<String>> = AHashMap::new();
+    let mut taxid_order: Vec<i32> = Vec::new(); // first-seen order
+
     for (hit, _taxid, lineage) in &best_hits {
         let species_taxid = lineage[0];
         if species_taxid < 0 {
             continue;
         }
-        species_hits
-            .entry(species_taxid)
-            .or_default()
-            .push(hit.tname.clone());
+        use std::collections::hash_map::Entry;
+        match species_hits.entry(species_taxid) {
+            Entry::Vacant(v) => {
+                taxid_order.push(species_taxid);
+                v.insert(vec![hit.tname.clone()]);
+            }
+            Entry::Occupied(mut o) => {
+                o.get_mut().push(hit.tname.clone());
+            }
+        }
     }
 
+
+
     // ── 4. call_hit_level_v2 ──────────────────────────────────────────────
-    let (hit_level, hit_taxid, best_accession) = call_hit_level_v2(&species_hits);
+    let (hit_level, hit_taxid, best_accession) =
+        call_hit_level_v2(&species_hits, &taxid_order);
 
     if hit_level < 0 {
         return None;
@@ -2947,7 +2960,9 @@ mod tests {
         let mut species = AHashMap::new();
         species.insert(1, vec!["A".into(), "A".into(), "B".into()]); // taxid 1 wins
         species.insert(2, vec!["C".into()]);
-        let (level, taxid, acc) = call_hit_level_v2(&species);
+        // first-seen order: 1 then 2
+        let taxid_order = vec![1, 2];
+        let (level, taxid, acc) = call_hit_level_v2(&species, &taxid_order);
         assert_eq!(level, 1);
         assert_eq!(taxid, 1);
         assert_eq!(acc.as_deref(), Some("A"));
@@ -2956,7 +2971,8 @@ mod tests {
     #[test]
     fn call_hit_level_v2_empty_is_minus_one() {
         let species = AHashMap::new();
-        let (level, taxid, acc) = call_hit_level_v2(&species);
+        let taxid_order: Vec<i32> = vec![];
+        let (level, taxid, acc) = call_hit_level_v2(&species, &taxid_order);
         assert_eq!(level, -1);
         assert_eq!(taxid, -1);
         assert!(acc.is_none());

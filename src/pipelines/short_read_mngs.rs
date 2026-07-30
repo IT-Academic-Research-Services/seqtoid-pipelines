@@ -7566,7 +7566,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
 
-    let nt_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("_nt.m8"), "."));
+    let nt_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nt.m8"), "."));
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) =
         paf_to_m8(config.clone(), non_host_mm2_out_stream, nt_m8_file_path).await?;
