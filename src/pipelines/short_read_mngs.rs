@@ -3358,6 +3358,7 @@ async fn collect_hit_summary_to_accession_map_concurrent(
                 let mut g = rx.lock().await;
                 g.recv().await
             } {
+                // HitSummary: [0]=read_id, [1]=level, [2]=taxid, [3]=accession_id, ...
                 let lines: Vec<(String, String)> = batch
                     .par_iter()
                     .filter_map(|bytes| {
@@ -3366,10 +3367,14 @@ async fn collect_hit_summary_to_accession_map_concurrent(
                             return None;
                         }
                         let fields: Vec<&str> = line.split('\t').collect();
-                        if fields.len() < 2 {
+                        if fields.len() < 4 {
                             return None;
                         }
-                        Some((fields[0].to_string(), fields[1].to_string()))
+                        let accession = fields[3];
+                        if accession.is_empty() || accession == "-" || accession == "None" {
+                            return None;
+                        }
+                        Some((fields[0].to_string(), accession.to_string()))
                     })
                     .collect();
                 for (k, v) in lines {
@@ -3381,7 +3386,6 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         worker_handles.push(handle);
     }
 
-    // Producer
     let producer = tokio::spawn(async move {
         let mut batch = Vec::with_capacity(batch_size);
         while let Some(item) = summary_stream.next().await {
@@ -3401,7 +3405,6 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         Ok::<(), anyhow::Error>(())
     });
 
-    // Await all workers FIRST (in async context)
     let mut partial_maps = Vec::with_capacity(worker_handles.len());
     for handle in worker_handles {
         let partial = handle
@@ -3410,7 +3413,6 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         partial_maps.push(partial);
     }
 
-    // FINAL MERGE OFFLOADED TO spawn_blocking
     let map = tokio::task::spawn_blocking(move || {
         let mut final_map = AHashMap::with_capacity(2_500_000);
         for partial in partial_maps {
@@ -3418,12 +3420,15 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         }
         final_map
     })
-    .await
-    .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
+        .await
+        .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
 
     producer.await??;
 
-    info!("collect_hit_summary_to_accession_map_concurrent → {} entries (tiny contig map, final merge in spawn_blocking)", map.len());
+    info!(
+        "collect_hit_summary_to_accession_map_concurrent → {} entries",
+        map.len()
+    );
     Ok(map)
 }
 
@@ -4580,7 +4585,8 @@ async fn summarize_hits(
                     None => break,
                 };
 
-                let parsed: Vec<(String, String, i32, i32, i32, u8)> =
+                // HitSummary: read_id, level, taxid, accession, species, genus, family
+                let parsed: Vec<(String, u8, i32, String, i32, i32, i32)> =
                     tokio::task::spawn_blocking({
                         let batch = batch;
                         move || {
@@ -4594,28 +4600,33 @@ async fn summarize_hits(
                                     }
 
                                     let parts: Vec<&str> = line.split('\t').collect();
-                                    if parts.len() != 6 {
+                                    if parts.len() < 7 {
                                         return None;
                                     }
 
                                     let read_id = parts[0].to_string();
-                                    let accession_id = if parts[1].is_empty() || parts[1] == "-" {
+                                    let level: u8 = parts[1].parse().unwrap_or(0);
+                                    let taxid: i32 = parts[2].parse().unwrap_or(0);
+                                    let accession_id = if parts[3].is_empty()
+                                        || parts[3] == "-"
+                                        || parts[3] == "None"
+                                    {
                                         "-".to_string()
                                     } else {
-                                        parts[1].to_string()
+                                        parts[3].to_string()
                                     };
-                                    let hit_taxid: i32 = parts[2].parse().unwrap_or(0);
-                                    let genus_taxid: i32 = parts[3].parse().unwrap_or(0);
-                                    let family_taxid: i32 = parts[4].parse().unwrap_or(0);
-                                    let level: u8 = parts[5].parse().unwrap_or(0);
+                                    let species_taxid: i32 = parts[4].parse().unwrap_or(-1);
+                                    let genus_taxid: i32 = parts[5].parse().unwrap_or(-1);
+                                    let family_taxid: i32 = parts[6].parse().unwrap_or(-1);
 
                                     Some((
                                         read_id,
+                                        level,
+                                        taxid,
                                         accession_id,
-                                        hit_taxid,
+                                        species_taxid,
                                         genus_taxid,
                                         family_taxid,
-                                        level,
                                     ))
                                 })
                                 .collect()
@@ -4624,32 +4635,29 @@ async fn summarize_hits(
                         .await
                         .expect("summarize_hits batch parsing panicked");
 
-                for (read_id, accession_id, hit_taxid, genus_taxid, family_taxid, level) in parsed {
+                for (
+                    read_id,
+                    level,
+                    taxid,
+                    accession_id,
+                    species_taxid,
+                    genus_taxid,
+                    family_taxid,
+                ) in parsed
+                {
                     tr.fetch_add(1, AtomicOrdering::Relaxed);
-
-                    let species_taxid = if level >= 3 && hit_taxid > 0 {
-                        hit_taxid
-                    } else {
-                        0
-                    };
-                    let assigned_taxid = if level >= 3 {
-                        species_taxid
-                    } else if level == 2 || level == 1 {
-                        genus_taxid
-                    } else {
-                        hit_taxid
-                    };
 
                     let cluster_size: u64 = dup_clusters
                         .get(&read_id)
                         .map(|e| e.value().size)
                         .unwrap_or(1);
 
+                    // Python: taxid is the called taxid; species/genus/family from lineage cols
                     local_read_dict.insert(
                         read_id.clone(),
                         Arc::new(ReadHit {
                             level,
-                            taxid: assigned_taxid,
+                            taxid,
                             accession_id: accession_id.clone(),
                             species_taxid,
                             genus_taxid,
@@ -8668,20 +8676,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         rx.await??;
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // PRELOAD NR alignments (parallel version)
-    // ────────────────────────────────────────────────────────────────
-    let nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>> =
-        Arc::new(DashMap::with_capacity_and_hasher(
-            80_000_000,
-            AHashRandomState::new(),
-        ));
-
-    let preload_handle = tokio::spawn(preload_nr_alignments_parallel(
-        config.clone(),
-        nr_hit_summary_preload,
-        Arc::clone(&nr_alignment_per_read),
-    ));
 
     // ────────────────────────────────────────────────────────────────
     // Spawn merged taxon counts (unchanged except we await preload first)
@@ -8701,15 +8695,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("refined.hitsummary.tab"),
         out_dir.join("refined_taxon_counts_with_dcr.json"),
         out_dir.join("assembly_combined_contig_summary.json"),
-        nr_alignment_per_read,
     )
-    .await?;
+        .await?;
     cleanup_tasks.extend(merged_cleanup_tasks);
 
-    // Wait for preload before proceeding (keeps exact ordering semantics from Python)
-    let _ = preload_handle
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("NR preload task panicked: {}", e)))??;
 
     let refined_combined_path = out_dir.join(rename_file_path(
         &sample_base_buf,

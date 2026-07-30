@@ -1613,6 +1613,8 @@ pub async fn generate_taxid_fasta(
     let (nt_hits_tx, mut nt_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
     let (nr_hits_tx, mut nr_hits_rx) = mpsc::channel::<Arc<AHashMap<String, (Taxid, u8)>>>(1);
 
+    // HitSummary: [0]=read_id [1]=level [2]=taxid [3]=accession [4]=species [5]=genus [6]=family
+
     // Load NT hit summary → build map
     let load_nt_task = tokio::spawn({
         let nt_stream = nt_hit_summary_stream;
@@ -1626,12 +1628,15 @@ pub async fn generate_taxid_fasta(
                         continue;
                     }
                     let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() < 4 {
+                    if fields.len() < 3 {
                         continue;
                     }
                     let read_id = fields[0].to_string();
                     let level: u8 = fields[1].parse().unwrap_or(255);
-                    let taxid: Taxid = fields[3].parse().unwrap_or(-1);
+                    let taxid: Taxid = fields[2].parse().unwrap_or(-1);
+                    if taxid <= 0 {
+                        continue;
+                    }
                     hits.insert(read_id, (taxid, level));
                 }
             }
@@ -1656,12 +1661,15 @@ pub async fn generate_taxid_fasta(
                         continue;
                     }
                     let fields: Vec<&str> = line.split('\t').collect();
-                    if fields.len() < 4 {
+                    if fields.len() < 3 {
                         continue;
                     }
                     let read_id = fields[0].to_string();
                     let level: u8 = fields[1].parse().unwrap_or(255);
-                    let taxid: Taxid = fields[3].parse().unwrap_or(-1);
+                    let taxid: Taxid = fields[2].parse().unwrap_or(-1);
+                    if taxid <= 0 {
+                        continue;
+                    }
                     hits.insert(read_id, (taxid, level));
                 }
             }
@@ -1688,10 +1696,10 @@ pub async fn generate_taxid_fasta(
         let concurrency = compute_phase_concurrency(
             &config,
             "generate_taxid_fasta",
-            0.5, // ~0.5 GB per thread max
-            4.0, // 4 threads per core
-            64,  // cap
-            8,   // min for meaningful parallelism
+            0.5,
+            4.0,
+            64,
+            8,
         );
 
         const BATCH_SIZE: usize = 1000;
@@ -1738,15 +1746,20 @@ pub async fn generate_taxid_fasta(
                                 annotated_id
                             );
 
-                            let (new_id, new_desc) = parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
+                            let (new_id, new_desc) =
+                                parse_header(new_header.trim_start_matches('>').as_bytes(), '>');
                             let new_rec = SequenceRecord::Fasta {
                                 id: new_id,
                                 desc: new_desc,
-                                seq: rec.seq(),   // ← cheap Bytes clone (just refcount bump)
+                                seq: rec.seq(),
                             };
 
-                            m_tx.send(ParseOutput::Fasta(new_rec.clone())).await.map_err(|_| anyhow!("mapped_tx dropped"))?;
-                            c_tx.send(ParseOutput::Fasta(new_rec)).await.map_err(|_| anyhow!("combined_tx dropped"))?;
+                            m_tx.send(ParseOutput::Fasta(new_rec.clone()))
+                                .await
+                                .map_err(|_| anyhow!("mapped_tx dropped"))?;
+                            c_tx.send(ParseOutput::Fasta(new_rec))
+                                .await
+                                .map_err(|_| anyhow!("combined_tx dropped"))?;
                         }
                     }
                     Ok::<(), anyhow::Error>(())
@@ -1760,9 +1773,14 @@ pub async fn generate_taxid_fasta(
                     ParseOutput::Fasta(rec) => {
                         current_batch.push(rec);
                         if current_batch.len() >= BATCH_SIZE {
-                            batch_tx.send(std::mem::take(&mut current_batch))
+                            batch_tx
+                                .send(std::mem::take(&mut current_batch))
                                 .await
-                                .map_err(|_| anyhow!("batch_tx dropped unexpectedly during mapped_stream processing"))?;
+                                .map_err(|_| {
+                                    anyhow!(
+                                        "batch_tx dropped unexpectedly during mapped_stream processing"
+                                    )
+                                })?;
                         }
                     }
                     _ => {
@@ -1832,7 +1850,6 @@ pub async fn generate_taxid_fasta(
                 }));
             }
 
-            // Producer: batch incoming unidentified FASTA records
             let mut unid_stream = unidentified_contigs_stream;
             let mut current_batch: Vec<SequenceRecord> = Vec::with_capacity(unid_batch_size);
 
@@ -1857,7 +1874,6 @@ pub async fn generate_taxid_fasta(
 
             drop(unid_batch_tx);
 
-            // Wait for all workers
             for worker in unid_workers {
                 worker.await??;
             }

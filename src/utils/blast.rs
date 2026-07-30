@@ -583,19 +583,29 @@ pub fn process_record_pair(
     count_type: &str,
     source_count_type: Option<&str>,
 ) -> Result<(), anyhow::Error> {
+    //   read_id, level, taxid, accession_id, species_taxid, genus_taxid, family_taxid [, source_count_type]
     let hit_str = std::str::from_utf8(hit_bytes)?;
     let hit_fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
     if hit_fields.len() < 7 {
-        return Ok(()); // malformed hit summary line → skip (matches Python)
+        return Ok(()); // malformed — skip (do not invent data)
     }
 
-    let read_id = hit_fields[0].to_string();
-    let level: u8 = hit_fields.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let consensus_taxid: i32 = hit_fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let read_id = hit_fields[0];
+    // level may be 1 or -1; do NOT require level > 0
+    let level: i32 = hit_fields[1].parse().unwrap_or(-1);
+    let hit_taxid: i32 = hit_fields[2].parse().unwrap_or(-1);
 
-    if consensus_taxid <= 0 || level == 0 {
+    if hit_taxid <= 0 {
         return Ok(());
     }
+
+    // Prefer explicit arg; else column 8 from merge (source_count_type)
+    let src: Option<&str> = source_count_type.or_else(|| {
+        hit_fields
+            .get(7)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    });
 
     let m8_str = std::str::from_utf8(m8_bytes)?;
     let m8 = M8Record::parse_line_nr(m8_str)?;
@@ -608,23 +618,24 @@ pub fn process_record_pair(
     }
     let ev_log10 = ev.log10();
 
-    // Exact Python merged_NT_NR adjustment (still needed)
-    if count_type == "merged_NT_NR" && source_count_type == Some("NR") {
+    // only for merged_NT_NR + source NR
+    if count_type == "merged_NT_NR" && src == Some("NR") {
         alen *= 3.0;
     }
 
-    // Build raw lineage from hit summary columns (indices 4,5,6)
-    let species = hit_fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let genus = hit_fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let family = hit_fields.get(6).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let species: i32 = hit_fields[4].parse().unwrap_or(-1);
+    let genus: i32 = hit_fields[5].parse().unwrap_or(-1);
+    let family: i32 = hit_fields[6].parse().unwrap_or(-1);
     let raw = vec![species, genus, family];
 
-    // Lineage cache (exactly like summarize_hits)
-    let cleaned = if let Some(cached) = lineage_cache.get(&consensus_taxid) {
+    // level for validate_taxid_lineage: uses hit_level as-is (may be -1)
+    let level_u8: u8 = if level > 0 { level as u8 } else { 0 };
+
+    let cleaned = if let Some(cached) = lineage_cache.get(&hit_taxid) {
         cached.clone()
     } else {
-        let c = validate_taxid_lineage(&raw, consensus_taxid, level);
-        lineage_cache.insert(consensus_taxid, c.clone());
+        let c = validate_taxid_lineage(&raw, hit_taxid, level_u8);
+        lineage_cache.insert(hit_taxid, c.clone());
         c
     };
 
@@ -633,7 +644,7 @@ pub fn process_record_pair(
     }
 
     let cluster_size = duplicate_clusters
-        .get(&read_id)
+        .get(read_id)
         .map(|e| e.value().size)
         .unwrap_or(1);
 
@@ -648,8 +659,8 @@ pub fn process_record_pair(
         bucket.sum_alignment_length += alen;
         bucket.sum_e_value += ev_log10;
 
-        if let Some(src) = source_count_type {
-            bucket.source_count_type.insert(src.to_string());
+        if let Some(s) = src {
+            bucket.source_count_type.insert(s.to_string());
         }
 
         agg_key = agg_key[1..].to_vec();
@@ -1394,8 +1405,6 @@ pub fn summarize_m8_hits<F>(
 where
     F: Fn(&[i32]) -> bool + Send + Sync,
 {
-    // Preserve existing semantics: ignore short hits, invalid accessions, invalid lineages,
-    // and only keep hits that pass should_keep_filter.
     let mut valid_hits: Vec<&M8Record> = Vec::with_capacity(hits.len().min(64));
 
     for hit in hits {
@@ -1443,17 +1452,15 @@ where
         return None;
     }
 
-    // Best hit = max bitscore, first seen wins on ties.
+    // Best bitscore (first wins on ties) — drives the dedup m8 row.
     let mut best: Option<&M8Record> = None;
     let mut max_bitscore = f64::NEG_INFINITY;
-
     for &h in &valid_hits {
         if h.bitscore > max_bitscore {
             max_bitscore = h.bitscore;
             best = Some(h);
         }
     }
-
     let best = best?;
 
     let dedup_line = format!(
@@ -1471,37 +1478,75 @@ where
         best.evalue,
         best.bitscore
     )
-    .into_bytes();
+        .into_bytes();
 
-    // Keep the same consensus logic as the current code.
+    // Consensus over valid hits.
     let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
     let wrapped_filter = Arc::new(|l: &[i32]| should_keep_filter(l));
 
-    let (tax_level, _cons_taxid, consensus_hits) =
+    let (tax_level, cons_taxid, consensus_hits) =
         consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter).unwrap_or((
             0,
             0,
             Vec::new(),
         ));
 
-    let first_lineage = consensus_hits
+    // Prefer accession from consensus; fall back to best-bitscore hit.
+    let chosen_accession = consensus_hits
         .first()
-        .and_then(|h| acc2taxid_map.get(h.tname.as_bytes()))
-        .map(|taxid_u64| taxid_u64 as i32)
+        .map(|h| h.tname.as_str())
+        .unwrap_or(best.tname.as_str());
+
+    // FST Map::get returns &u64 (Copy) — no deref
+    let lineage = acc2taxid_map
+        .get(chosen_accession.as_bytes())
+        .map(|t| t as i32)
         .and_then(|taxid| lineage_map.get(&taxid).cloned())
         .unwrap_or([-1i32; 3]);
 
+    let species_taxid = lineage[0];
+    let genus_taxid = lineage[1];
+    let family_taxid = lineage[2];
+
+    // HitSummaryWriter columns:
+    //   read_id, level, taxid, accession_id, species_taxid, genus_taxid, family_taxid
+    let level: i32 = if tax_level > 0 {
+        tax_level as i32
+    } else {
+        -1
+    };
+    let taxid: i32 = if cons_taxid > 0 {
+        cons_taxid as i32
+    } else if species_taxid > 0 {
+        species_taxid
+    } else {
+        -1
+    };
+
+    if taxid > 0 {
+        let called_lin = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
+        if !should_keep_filter(&called_lin) {
+            return None;
+        }
+    }
+
     let summary_line = format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\n",
-        read_id, best.tname, first_lineage[0], first_lineage[1], first_lineage[2], tax_level
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        read_id,
+        level,
+        taxid,
+        chosen_accession,
+        species_taxid,
+        genus_taxid,
+        family_taxid
     )
-    .into_bytes();
+        .into_bytes();
 
     Some(ReducedRead {
         seq,
         dedup: dedup_line,
         summary: summary_line,
-        accession: best.tname.clone(),
+        accession: chosen_accession.to_string(),
     })
 }
 
@@ -2237,244 +2282,252 @@ pub async fn compute_merged_taxon_counts(
     nt_m8_stream: mpsc::Receiver<ParseOutput>,
     nt_hit_summary_stream: mpsc::Receiver<ParseOutput>,
     nt_contig_summary: Vec<ContigSummaryEntry>,
-
     nr_m8_stream: mpsc::Receiver<ParseOutput>,
     nr_hit_summary_stream: mpsc::Receiver<ParseOutput>,
     nr_contig_summary: Vec<ContigSummaryEntry>,
-
     _lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-
     merged_m8_path: PathBuf,
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-    _nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
 ) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
-    // 1. Parallel NR preload
-    let (nr_alignment_map, nr_hit_lines) = tokio::task::spawn_blocking(move || {
-        let mut alignment_map: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
-        let mut hit_lines: AHashMap<String, Bytes> = AHashMap::new();
-
-        let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
-
-        while let Some(item) = futures::executor::block_on(nr_hit_stream.next()) {
-            let bytes = match item.to_bytes() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let line = String::from_utf8_lossy(&bytes);
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let fields: Vec<&str> = trimmed.split('\t').collect();
-            if fields.len() < 10 {
-                continue;
-            }
-
-            let read_id = fields[0].to_string();
-            let contig_species = fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-            let read_species = fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
-
-            alignment_map.insert(
-                read_id.clone(),
-                SpeciesAlignmentResults {
-                    contig: contig_species,
-                    read: read_species,
-                },
-            );
-            hit_lines.insert(read_id, bytes);
+    // HitSummary from call_hits (NT and NR identical):
+    //   [0] read_id
+    //   [1] level
+    //   [2] taxid
+    //   [3] accession_id
+    //   [4] species_taxid   ← Python merge "read" hit
+    //   [5] genus_taxid
+    //   [6] family_taxid
+    //   [7+] optional contig_species_taxid (refined); absent → None
+    fn parse_alignment(fields: &[&str]) -> Option<(String, SpeciesAlignmentResults)> {
+        if fields.len() < 7 {
+            return None;
         }
-        (alignment_map, hit_lines)
-    })
-    .await
-    .map_err(|e| PipelineError::Other(e.into()))?;
+        let read_id = fields[0].to_string();
+        let species = fields[4].parse::<Taxid>().ok().filter(|&t| t > 0);
+        let contig = fields
+            .get(7)
+            .and_then(|s| s.parse::<Taxid>().ok())
+            .filter(|&t| t > 0);
+        Some((
+            read_id,
+            SpeciesAlignmentResults {
+                contig,
+                read: species,
+            },
+        ))
+    }
 
-    // 2. Parallel file writers (background cleanup)
+    // PHitSummary + source_count_type for process_record_pair:
+    //   read_id, level, taxid, accession, species, genus, family, SOURCE
+    fn hit_line_for_counts(fields: &[&str], source: &str) -> Option<Bytes> {
+        if fields.len() < 7 {
+            return None;
+        }
+        Some(Bytes::from(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], source
+        )))
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // step 1: load ALL NR hit summaries into nr_alignment_per_read
+    // ────────────────────────────────────────────────────────────────────────
+    let mut nr_alignment_per_read: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
+    let mut nr_hit_by_read: AHashMap<String, Bytes> = AHashMap::new();
+    {
+        let mut stream = ReceiverStream::new(nr_hit_summary_stream);
+        while let Some(item) = stream.next().await {
+            let Ok(bytes) = item.to_bytes() else { continue };
+            let line = String::from_utf8_lossy(&bytes);
+            let fields: Vec<&str> = line.trim_end().split('\t').collect();
+            let Some((read_id, align)) = parse_alignment(&fields) else { continue };
+            nr_alignment_per_read.insert(read_id.clone(), align);
+            nr_hit_by_read.insert(read_id, Bytes::from(bytes));
+        }
+        info!(
+            "[merged] NR index: {} alignment entries",
+            nr_alignment_per_read.len()
+        );
+    }
+
+    // Background writers for merged.m8 / merged.hitsummary.tab
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
     let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
-
     let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Bytes>(4096);
     let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Bytes>(4096);
 
     cleanup_tasks.push(tokio::spawn(async move {
-        while let Some(bytes) = m8_write_rx.recv().await {
-            let _ = merged_m8_file.write_all(&bytes).await;
-            let _ = merged_m8_file.write_all(b"\n").await;
+        while let Some(b) = m8_write_rx.recv().await {
+            merged_m8_file.write_all(&b).await?;
+            merged_m8_file.write_all(b"\n").await?;
         }
-        let _ = merged_m8_file.flush().await;
+        merged_m8_file.flush().await?;
         Ok::<(), anyhow::Error>(())
     }));
-
     cleanup_tasks.push(tokio::spawn(async move {
-        while let Some(bytes) = hit_write_rx.recv().await {
-            let _ = merged_hit_file.write_all(&bytes).await;
-            let _ = merged_hit_file.write_all(b"\n").await;
+        while let Some(b) = hit_write_rx.recv().await {
+            merged_hit_file.write_all(&b).await?;
+            merged_hit_file.write_all(b"\n").await?;
         }
-        let _ = merged_hit_file.flush().await;
+        merged_hit_file.flush().await?;
         Ok::<(), anyhow::Error>(())
     }));
 
-    // 3. Parallel selection passes (NT first, then NR)
     let (merged_m8_tx, merged_m8_rx) = mpsc::channel::<ParseOutput>(4096);
     let (merged_hit_tx, merged_hit_rx) = mpsc::channel::<ParseOutput>(4096);
 
-    // NT pass
-    let nt_m8_write_tx = m8_write_tx.clone();
-    let nt_hit_write_tx = hit_write_tx.clone();
-    let merged_m8_tx_nt = merged_m8_tx.clone();
-    let merged_hit_tx_nt = merged_hit_tx.clone();
+    // ────────────────────────────────────────────────────────────────────────
+    // step 2: zip NT m8 + NT hit; selection rule; del from NR map
+    // ────────────────────────────────────────────────────────────────────────
+    let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
+    let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
+    let mut nt_kept = 0u64;
+    let mut nt_deferred_to_nr = 0u64;
 
-    let nt_task = tokio::spawn({
-        let nr_alignment_map = nr_alignment_map.clone();
-        async move {
-            let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
-            let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
+    while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
+        let ParseOutput::Bytes(m8_bytes) = m8_item else { continue };
+        let Ok(hit_bytes) = hit_item.to_bytes() else { continue };
 
-            while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
-                let m8_bytes = match m8_item {
-                    ParseOutput::Bytes(b) => b,
-                    _ => continue,
-                };
-                let hit_bytes = hit_item.to_bytes()?;
+        let hit_str = String::from_utf8_lossy(&hit_bytes);
+        let fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
+        let Some((read_id, nt_align)) = parse_alignment(&fields) else { continue };
 
-                let hit_line = String::from_utf8_lossy(&hit_bytes);
-                let trimmed = hit_line.trim_end();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let hit_fields: Vec<&str> = trimmed.split('\t').collect();
-                if hit_fields.len() < 10 {
-                    continue;
-                }
-
-                let read_id = hit_fields[0];
-
-                let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-                let nt_read = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
-
-                let nr_align = nr_alignment_map.get(read_id);
-                let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
-                let _has_nr_read = nr_align.map_or(false, |a| a.read.is_some());
-
-                if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
-                    let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
-                    let mut hit_with_source = hit_fields.to_vec();
-                    hit_with_source.push(NT_TAG);
-                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
-                    let _ = nt_hit_write_tx.send(hit_bytes_out.clone()).await;
-
-                    let _ = merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await;
-                    let _ = merged_hit_tx_nt
-                        .send(ParseOutput::Bytes(hit_bytes_out))
-                        .await;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
+        let m8_q = {
+            let s = String::from_utf8_lossy(&m8_bytes);
+            s.split('\t').next().unwrap_or("").to_string()
+        };
+        if m8_q != read_id {
+            warn!(
+                "[merged] NT m8/hit read_id mismatch: m8={} hit={}",
+                m8_q, read_id
+            );
+            continue;
         }
-    });
-    cleanup_tasks.push(nt_task);
 
-    // NR pass (remaining reads)
-    let nr_m8_write_tx = m8_write_tx;
-    let nr_hit_write_tx = hit_write_tx;
-    let merged_m8_tx_nr = merged_m8_tx;
-    let merged_hit_tx_nr = merged_hit_tx;
+        let nr_align = nr_alignment_per_read.get(&read_id);
+        let has_nt_contig = nt_align.contig.is_some();
+        let has_nr_contig = nr_align.and_then(|a| a.contig).is_some();
+        let has_nt_read = nt_align.read.is_some();
+        let has_nr_read = nr_align.and_then(|a| a.read).is_some();
 
-    let nr_task = tokio::spawn({
-        let nr_hit_lines = nr_hit_lines.clone();
-        async move {
-            let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
-
-            while let Some(m8_item) = nr_m8.next().await {
-                let m8_bytes = match m8_item {
-                    ParseOutput::Bytes(b) => b,
-                    _ => continue,
-                };
-
-                let m8_str = String::from_utf8_lossy(&m8_bytes);
-                let trimmed_m8 = m8_str.trim_end();
-                if trimmed_m8.is_empty() {
-                    continue;
-                }
-
-                let m8_fields: Vec<&str> = trimmed_m8.split('\t').collect();
-                let read_id = m8_fields[0];
-
-                if let Some(hit_bytes) = nr_hit_lines.get(read_id) {
-                    let _ = nr_m8_write_tx.send(m8_bytes.clone()).await;
-
-                    let mut hit_with_source = String::from_utf8_lossy(hit_bytes)
-                        .trim_end()
-                        .split('\t')
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>();
-                    hit_with_source.push(NR_TAG.to_string());
-
-                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
-                    let _ = nr_hit_write_tx.send(hit_bytes_out.clone()).await;
-
-                    let _ = merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await;
-                    let _ = merged_hit_tx_nr
-                        .send(ParseOutput::Bytes(hit_bytes_out))
-                        .await;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
+        // Exact Python predicate
+        if has_nt_contig || (!has_nr_contig && has_nt_read) {
+            let Some(hit_out) = hit_line_for_counts(&fields, NT_TAG) else { continue };
+            let _ = m8_write_tx.send(m8_bytes.clone()).await;
+            let _ = hit_write_tx.send(hit_out.clone()).await;
+            let _ = merged_m8_tx.send(ParseOutput::Bytes(m8_bytes)).await;
+            let _ = merged_hit_tx.send(ParseOutput::Bytes(hit_out)).await;
+            nr_alignment_per_read.remove(&read_id);
+            nt_kept += 1;
+        } else if has_nr_contig || has_nr_read {
+            nt_deferred_to_nr += 1;
+            continue;
+        } else {
+            warn!(
+                "[merged] NT read {} has no NT/NR alignment flags — skipping",
+                read_id
+            );
         }
-    });
-    cleanup_tasks.push(nr_task);
+    }
+    info!(
+        "[merged] NT pass kept={} deferred_to_nr={}",
+        nt_kept, nt_deferred_to_nr
+    );
 
-    // 4. Taxon counting (already highly parallel from earlier work)
+    // ────────────────────────────────────────────────────────────────────────
+    // step 3: NR m8; emit only if still in nr_alignment_per_read
+    // ────────────────────────────────────────────────────────────────────────
+    let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
+    let mut nr_kept = 0u64;
+
+    while let Some(m8_item) = nr_m8.next().await {
+        let ParseOutput::Bytes(m8_bytes) = m8_item else { continue };
+
+        let read_id = {
+            let m8_str = String::from_utf8_lossy(&m8_bytes);
+            m8_str
+                .split('\t')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        if read_id.is_empty() {
+            continue;
+        }
+
+        if !nr_alignment_per_read.contains_key(&read_id) {
+            continue;
+        }
+
+        let Some(hit_bytes) = nr_hit_by_read.get(&read_id) else { continue };
+        let hit_str = String::from_utf8_lossy(hit_bytes);
+        let fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
+        let Some(hit_out) = hit_line_for_counts(&fields, NR_TAG) else { continue };
+
+        let _ = m8_write_tx.send(m8_bytes.clone()).await;
+        let _ = hit_write_tx.send(hit_out.clone()).await;
+        let _ = merged_m8_tx.send(ParseOutput::Bytes(m8_bytes)).await;
+        let _ = merged_hit_tx.send(ParseOutput::Bytes(hit_out)).await;
+        nr_alignment_per_read.remove(&read_id);
+        nr_kept += 1;
+    }
+
+    drop(m8_write_tx);
+    drop(hit_write_tx);
+    drop(merged_m8_tx);
+    drop(merged_hit_tx);
+    info!("[merged] NR pass kept={}", nr_kept);
+
+    // ────────────────────────────────────────────────────────────────────────
+    // generate_taxon_counts on merged streams
+    // ────────────────────────────────────────────────────────────────────────
     let merged_taxon_counts = generate_taxon_counts(
         config.clone(),
         ReceiverStream::new(merged_m8_rx),
         ReceiverStream::new(merged_hit_rx),
-        duplicate_clusters.clone(),
-        should_keep_filter.clone(),
+        duplicate_clusters,
+        should_keep_filter,
         "merged_NT_NR".to_string(),
         None,
     )
-    .await?;
+        .await?;
 
     let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
     tokio::fs::write(&merged_taxon_counts_path, json).await?;
-    info!("Merged taxon counts generated (fully streaming)");
+    info!(
+        "Merged taxon counts generated ({} taxa)",
+        merged_taxon_counts.len()
+    );
 
-    // 5. Parallel contig merge (exact Python _merge_contigs)
+    // ────────────────────────────────────────────────────────────────────────
+    // merge_contigs
+    // ────────────────────────────────────────────────────────────────────────
     let final_contigs = tokio::task::spawn_blocking(move || {
         let mut merged_contigs: HashMap<Taxid, Vec<ContigSummaryEntry>> = HashMap::new();
-        let mut nt_contig_names: HashSet<String> = HashSet::new();
+        let mut nt_names: HashSet<String> = HashSet::new();
 
-        for mut entry in nt_contig_summary {
-            entry.db_type = "merged_NT_NR".to_string();
-            nt_contig_names.insert(entry.contig_name.clone());
-            merged_contigs
-                .entry(entry.species_taxid)
-                .or_default()
-                .push(entry);
+        for mut e in nt_contig_summary {
+            e.db_type = "merged_NT_NR".to_string();
+            nt_names.insert(e.contig_name.clone());
+            merged_contigs.entry(e.species_taxid).or_default().push(e);
         }
-
-        for mut entry in nr_contig_summary {
-            if !nt_contig_names.contains(&entry.contig_name) {
-                entry.db_type = "merged_NT_NR".to_string();
-                merged_contigs
-                    .entry(entry.species_taxid)
-                    .or_default()
-                    .push(entry);
+        for mut e in nr_contig_summary {
+            if !nt_names.contains(&e.contig_name) {
+                e.db_type = "merged_NT_NR".to_string();
+                merged_contigs.entry(e.species_taxid).or_default().push(e);
             }
         }
-
         merged_contigs.into_values().flatten().collect::<Vec<_>>()
     })
-    .await
-    .map_err(|e| PipelineError::Other(e.into()))?;
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
     let json = serde_json::to_string_pretty(&final_contigs)?;
     tokio::fs::write(&merged_contig_summary_path, json).await?;
@@ -2483,7 +2536,7 @@ pub async fn compute_merged_taxon_counts(
         final_contigs.len()
     );
 
-    info!("compute_merged_taxon_counts complete — exact Python logic, fully streaming");
+    info!("compute_merged_taxon_counts complete");
     Ok(cleanup_tasks)
 }
 
@@ -3103,16 +3156,29 @@ mod tests {
             50,
             false,
         )
-        .expect("expected a reduced read");
+            .expect("expected a reduced read");
 
         assert_eq!(reduced.seq, 7);
         assert_eq!(reduced.accession, "ACC2");
+
+        // dedup m8: still qname\ttname\t...
         assert!(std::str::from_utf8(&reduced.dedup)
             .unwrap()
             .starts_with("read1\tACC2\t"));
-        assert!(std::str::from_utf8(&reduced.summary)
-            .unwrap()
-            .starts_with("read1\tACC2\t"));
+
+        // HitSummary: read_id, level, taxid, accession, species, genus, family
+        // Both ACC1/ACC2 → taxid 1 → lineage [1, 10, 100]
+        // consensus_level on a single taxid → family level 3, taxid 100
+        let summary = std::str::from_utf8(&reduced.summary).unwrap();
+        let fields: Vec<&str> = summary.trim_end().split('\t').collect();
+        assert_eq!(fields.len(), 7, "summary must be 7 columns: {}", summary);
+        assert_eq!(fields[0], "read1");
+        assert_eq!(fields[1], "3"); // tax_level (family)
+        assert_eq!(fields[2], "100"); // cons taxid (family)
+        assert_eq!(fields[3], "ACC2"); // accession
+        assert_eq!(fields[4], "1"); // species
+        assert_eq!(fields[5], "10"); // genus
+        assert_eq!(fields[6], "100"); // family
     }
 
     #[test]
