@@ -4522,45 +4522,21 @@ async fn summarize_hits(
 )> {
     let concurrency = compute_phase_concurrency(&config, "summarize_hits", 0.35, 4.0, 96, 8);
 
-    // ─── ENTRY COUNTER ─────────────────────────────────────────────────────
-    let (entry_tx, entry_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 8);
-    let entry_counter = tokio::spawn({
-        let mut total = 0u64;
-        async move {
-            while let Some(item) = stream.next().await {
-                total += 1;
-                if entry_tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-            info!("[summarize_hits] ENTRY: received {} items from upstream", total);
-            if total == 0 {
-                return Err(anyhow!(
-                    "[summarize_hits] ENTRY: zero items entered the function"
-                ));
-            }
-            Ok(total)
-        }
-    });
-
     let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
     let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
-    let producer = tokio::spawn({
-        let mut stream = ReceiverStream::new(entry_rx);
-        async move {
-            let mut batch = Vec::with_capacity(8192);
-            while let Some(item) = stream.next().await {
-                batch.push(item);
-                if batch.len() >= 8192 {
-                    let _ = batch_tx.send(std::mem::take(&mut batch)).await;
-                }
+    let producer = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(8192);
+        while let Some(item) = stream.next().await {
+            batch.push(item);
+            if batch.len() >= 8192 {
+                let _ = batch_tx.send(std::mem::take(&mut batch)).await;
             }
-            if !batch.is_empty() {
-                let _ = batch_tx.send(batch).await;
-            }
-            Ok::<(), anyhow::Error>(())
         }
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch).await;
+        }
+        Ok::<(), anyhow::Error>(())
     });
 
     let final_read_dict = Arc::new(DashMap::with_capacity(8_000_000));
@@ -4570,10 +4546,6 @@ async fn summarize_hits(
     let final_genus_accessions = Arc::new(DashMap::<i32, HashSet<String>>::new());
 
     let total_reads = Arc::new(AtomicUsize::new(0));
-    let skipped_bad_bytes = Arc::new(AtomicUsize::new(0));
-    let skipped_bad_utf8 = Arc::new(AtomicUsize::new(0));
-    let skipped_empty = Arc::new(AtomicUsize::new(0));
-    let skipped_wrong_field_count = Arc::new(AtomicUsize::new(0));
 
     let mut worker_handles = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
@@ -4586,10 +4558,6 @@ async fn summarize_hits(
         let f_gs = final_genus_species.clone();
         let f_ga = final_genus_accessions.clone();
         let tr = total_reads.clone();
-        let skip_bytes = skipped_bad_bytes.clone();
-        let skip_utf8 = skipped_bad_utf8.clone();
-        let skip_empty = skipped_empty.clone();
-        let skip_fields = skipped_wrong_field_count.clone();
 
         worker_handles.push(tokio::spawn(async move {
             let mut local_read_dict: AHashMap<String, Arc<ReadHit>> = AHashMap::with_capacity(8192);
@@ -4615,36 +4583,18 @@ async fn summarize_hits(
                 let parsed: Vec<(String, String, i32, i32, i32, u8)> =
                     tokio::task::spawn_blocking({
                         let batch = batch;
-                        let skip_bytes = skip_bytes.clone();
-                        let skip_utf8 = skip_utf8.clone();
-                        let skip_empty = skip_empty.clone();
-                        let skip_fields = skip_fields.clone();
                         move || {
                             batch
                                 .par_iter()
                                 .filter_map(|item| {
-                                    let bytes = match item.to_bytes() {
-                                        Ok(b) => b,
-                                        Err(_) => {
-                                            skip_bytes.fetch_add(1, AtomicOrdering::Relaxed);
-                                            return None;
-                                        }
-                                    };
-                                    let line = match std::str::from_utf8(&bytes) {
-                                        Ok(s) => s.trim_end(),
-                                        Err(_) => {
-                                            skip_utf8.fetch_add(1, AtomicOrdering::Relaxed);
-                                            return None;
-                                        }
-                                    };
+                                    let bytes = item.to_bytes().ok()?;
+                                    let line = std::str::from_utf8(&bytes).ok()?.trim_end();
                                     if line.is_empty() {
-                                        skip_empty.fetch_add(1, AtomicOrdering::Relaxed);
                                         return None;
                                     }
 
                                     let parts: Vec<&str> = line.split('\t').collect();
                                     if parts.len() != 6 {
-                                        skip_fields.fetch_add(1, AtomicOrdering::Relaxed);
                                         return None;
                                     }
 
@@ -4725,7 +4675,6 @@ async fn summarize_hits(
                                 count: cluster_size,
                             });
 
-                        // +1 per read (matches Python exactly)
                         *local_genus_read.entry(genus_taxid).or_insert(0) += 1;
                         local_genus_species
                             .entry(genus_taxid)
@@ -4739,7 +4688,6 @@ async fn summarize_hits(
                 }
             }
 
-            // Merge into final structures
             for (k, v) in local_read_dict {
                 f_read.insert(k, v);
             }
@@ -4763,50 +4711,27 @@ async fn summarize_hits(
         }));
     }
 
-    let entry_total = entry_counter.await??;
     producer.await??;
     for h in worker_handles {
         h.await??;
     }
 
     let total_reads_val = total_reads.load(AtomicOrdering::SeqCst);
-    let skipped_bytes = skipped_bad_bytes.load(AtomicOrdering::SeqCst);
-    let skipped_utf8 = skipped_bad_utf8.load(AtomicOrdering::SeqCst);
-    let skipped_empty = skipped_empty.load(AtomicOrdering::SeqCst);
-    let skipped_fields = skipped_wrong_field_count.load(AtomicOrdering::SeqCst);
 
     info!(
-        "[summarize_hits] ACCOUNTING — entry={} kept={}  \
-         skipped(bad_bytes={}, bad_utf8={}, empty={}, wrong_fields={})  \
-         unique_accessions={} ({} workers)",
-        entry_total,
+        "[summarize_hits] processed {} reads, {} unique accessions ({} workers)",
         total_reads_val,
-        skipped_bytes,
-        skipped_utf8,
-        skipped_empty,
-        skipped_fields,
         final_accession_dict.len(),
         concurrency
     );
 
-    if total_reads_val == 0 && entry_total > 0 {
-        return Err(anyhow!(
-            "[summarize_hits] all {} input items were filtered out during parsing",
-            entry_total
-        ));
-    }
-
     // Final selected_genera (exact original Python logic)
     let mut selected_genera: HashMap<i32, Vec<String>> = HashMap::new();
-    let mut genera_rejected_low_reads = 0usize;
-    let mut genera_rejected_single_species = 0usize;
-
     for entry in final_genus_read.iter() {
         let genus_taxid = *entry.key();
         let read_count = *entry.value();
 
         if read_count < min_reads_per_genus {
-            genera_rejected_low_reads += 1;
             continue;
         }
 
@@ -4815,7 +4740,6 @@ async fn summarize_hits(
             .map(|s| s.len())
             .unwrap_or(0);
         if species_count <= 1 {
-            genera_rejected_single_species += 1;
             continue;
         }
 
@@ -4824,13 +4748,6 @@ async fn summarize_hits(
             selected_genera.insert(genus_taxid, accessions);
         }
     }
-
-    info!(
-        "[summarize_hits] selected_genera={}  (rejected low_reads={}, single_species={})",
-        selected_genera.len(),
-        genera_rejected_low_reads,
-        genera_rejected_single_species
-    );
 
     let read_dict_final: AHashMap<String, Arc<ReadHit>> = Arc::try_unwrap(final_read_dict)
         .map_err(|_| anyhow!("Failed to unwrap final_read_dict"))?
@@ -7049,7 +6966,7 @@ async fn mmseqs_non_host_align(
     ),
     PipelineError,
 > {
-    let mut cleanup_tasks = Vec::new();
+    let cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
 
     info!("Running mmseqs non-host align (backend: {:?})", backend);
@@ -7076,14 +6993,14 @@ async fn mmseqs_non_host_align(
     )
         .await?;
 
-    // ─── hard file-level check before any streaming ───
-    let meta = fs::metadata(&merged_m8)
-        .await
-        .map_err(|e| PipelineError::IOError(format!(
+    // Hard fail before streaming if convertalis produced nothing.
+    let meta = fs::metadata(&merged_m8).await.map_err(|e| {
+        PipelineError::IOError(format!(
             "mmseqs m8 metadata failed for {}: {}",
             merged_m8.display(),
             e
-        )))?;
+        ))
+    })?;
 
     let m8_size = meta.len();
     info!(
@@ -7099,18 +7016,19 @@ async fn mmseqs_non_host_align(
         )));
     }
 
+    // Durable copy for post-run inspection (optional but useful).
     let durable = config.out_dir.join("nr_raw.m8");
-
     tokio::fs::copy(&merged_m8, &durable)
         .await
-        .map_err(|e| PipelineError::IOError(format!(
-            "failed to persist NR m8 {} → {}: {}",
-            merged_m8.display(),
-            durable.display(),
-            e
-        )))?;
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "failed to persist NR m8 {} → {}: {}",
+                merged_m8.display(),
+                durable.display(),
+                e
+            ))
+        })?;
     info!("[mmseqs NR] raw m8 retained at {}", durable.display());
-
 
     let m8_file = fs::File::open(&merged_m8)
         .await
@@ -7120,135 +7038,7 @@ async fn mmseqs_non_host_align(
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    // ─── non-dropping counter immediately after parse_lines ───
-    // This is the first place the stream exists. If this reports 0 while
-    // the file size above is non-zero, the drop is inside parse_lines.
-    let (counted_tx, counted_rx) = mpsc::channel(config.base_buffer_size * 8);
-
-    let post_mmseqs_counter = tokio::spawn({
-        let mut lines: u64 = 0;
-        let mut unique = ahash::AHashSet::with_capacity(100_000);
-        async move {
-            let mut stream = ReceiverStream::new(m8_rx);
-            while let Some(item) = stream.next().await {
-                match &item {
-                    ParseOutput::Bytes(b) => {
-                        lines += 1;
-                        // first field = query id
-                        if let Some(tab) = memchr::memchr(b'\t', b) {
-                            unique.insert(b[..tab].to_vec());
-                        }
-                    }
-                    other => {
-                        // never silently drop a non-Bytes item
-                        return Err(anyhow!(
-                            "[mmseqs NR] unexpected ParseOutput variant after parse_lines: {:?}",
-                            other
-                        ));
-                    }
-                }
-                if counted_tx.send(item).await.is_err() {
-                    // downstream closed; still report what we observed
-                    break;
-                }
-            }
-            info!(
-                "[mmseqs NR post-parse_lines] streamed {} m8 lines, {} unique queries",
-                lines,
-                unique.len()
-            );
-            if lines == 0 {
-                return Err(anyhow!(
-                    "[mmseqs NR] parse_lines produced zero records from a non-empty m8 file"
-                ));
-            }
-            Ok(())
-        }
-    });
-    cleanup_tasks.push(post_mmseqs_counter);
-
-    Ok((
-        counted_rx,
-        cleanup_tasks,
-        cleanup_receivers,
-        vec![temp_dir],
-    ))
-}
-
-
-pub fn inspect_accession2taxid_map(
-    acc2taxid_map: &Map<Vec<u8>>,
-    keys_out_path: &PathBuf,
-    limit: usize,
-) -> Result<()> {
-    // ── 1. First N keys → flat file + log ────────────────────────────────
-    let file = std::fs::File::create(keys_out_path)
-        .map_err(|e| anyhow!("cannot create {}: {}", keys_out_path.display(), e))?;
-    let mut writer = std::io::BufWriter::new(file);
-
-    let mut stream = acc2taxid_map.stream();
-    let mut n = 0usize;
-    let mut sample_for_log: Vec<(String, u64)> = Vec::with_capacity(limit.min(32));
-
-    while let Some((key_bytes, taxid)) = stream.next() {
-        if n >= limit {
-            break;
-        }
-        let key = String::from_utf8_lossy(key_bytes);
-        writeln!(writer, "{}\t{}", key, taxid)?;
-        if sample_for_log.len() < 32 {
-            sample_for_log.push((key.into_owned(), taxid));
-        }
-        n += 1;
-    }
-    writer.flush()?;
-
-    info!(
-        "[acc2taxid inspect] wrote first {} keys to {}",
-        n,
-        keys_out_path.display()
-    );
-    for (k, t) in &sample_for_log {
-        info!("[acc2taxid inspect] sample key={:?} taxid={}", k, t);
-    }
-
-    // ── 2. Probe known shapes (versioned / unversioned / PDB) ───────────
-    let probes: &[&str] = &[
-        "EFG1759503",
-        "EFG1759503.1",
-        "WP_198835266",
-        "WP_198835266.1",
-        "KJX92028",
-        "KJX92028.1",
-        "MBD3193859",
-        "MBD3193859.1",
-        "1JZX_A",
-        "1JZX",
-        "4U67_X",
-        "9NRI_BA",
-        "",
-    ];
-
-    info!("[acc2taxid inspect] probing {} lookup keys", probes.len());
-    for p in probes {
-        match acc2taxid_map.get(p.as_bytes()) {
-            Some(taxid) => info!(
-                "[acc2taxid inspect] HIT  key={:?} taxid={}",
-                p, taxid
-            ),
-            None => info!("[acc2taxid inspect] MISS key={:?}", p),
-        }
-    }
-
-    Ok(())
-}
-
-pub fn inspect_accession2taxid_map_arc(
-    acc2taxid_map: &Arc<Map<Vec<u8>>>,
-    keys_out_path: &PathBuf,
-    limit: usize,
-) -> Result<()> {
-    inspect_accession2taxid_map(acc2taxid_map.as_ref(), keys_out_path, limit)
+    Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
 
 
@@ -7796,12 +7586,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
-    inspect_accession2taxid_map_arc(
-        &acc2taxid_map,
-        &out_dir.join("acc2taxid_first250_keys.tsv"),
-        250,
-    )?;
-
     let nt_concurrency = compute_phase_concurrency(&config, "call_hits_nt", 1.0, 3.5, 64, 16);
     info!("call hits nt concurrency {}", nt_concurrency);
 
@@ -8065,106 +7849,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Sort NR m8 by read ID before call_hits_m8
     // Guarantees consecutive lines per read → enables true streaming group-by
     // ────────────────────────────────────────────────────────────────
-    // ──────────────────────────────────────────────────────────────
-    // NR sort stage – non-dropping pre / post counters
-    // ──────────────────────────────────────────────────────────────
     let nr_sort_start = Instant::now();
 
-    // Pre-sort counter (confirms what left mmseqs_non_host_align)
-    let (pre_sort_tx, pre_sort_rx) = mpsc::channel(config.base_buffer_size * 8);
-    let pre_sort_counter = tokio::spawn({
-        let mut lines = 0u64;
-        let mut unique = ahash::AHashSet::with_capacity(100_000);
-        async move {
-            let mut stream = ReceiverStream::new(non_host_m8_stream);
-            while let Some(item) = stream.next().await {
-                match &item {
-                    ParseOutput::Bytes(b) => {
-                        lines += 1;
-                        if let Some(tab) = memchr::memchr(b'\t', b) {
-                            unique.insert(b[..tab].to_vec());
-                        }
-                    }
-                    other => {
-                        return Err(anyhow!(
-                        "[NR pre-sort] unexpected ParseOutput: {:?}",
-                        other
-                    ));
-                    }
-                }
-                if pre_sort_tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-            info!(
-            "[NR pre-sort] streamed {} lines, {} unique queries",
-            lines,
-            unique.len()
-        );
-            if lines == 0 {
-                return Err(anyhow!("[NR pre-sort] zero lines entering sort_m8_by_read_id"));
-            }
-            Ok(())
-        }
-    });
-    cleanup_tasks.push(pre_sort_counter);
-
-    // The actual sort – returns ReceiverStream already
     let nr_m8_sorted = sort_m8_by_read_id(
         config.clone(),
-        ReceiverStream::new(pre_sort_rx),
+        ReceiverStream::new(non_host_m8_stream),
         "nr",
     )
         .await?;
 
     info!(
-    "[run] sort_m8_by_read_id(nr) completed after {:?}",
-    nr_sort_start.elapsed()
-);
-
-    // Post-sort counter – consume the ReceiverStream directly
-    let (post_sort_tx, post_sort_rx) = mpsc::channel(config.base_buffer_size * 8);
-    let post_sort_counter = tokio::spawn({
-        let mut lines = 0u64;
-        let mut unique = ahash::AHashSet::with_capacity(100_000);
-        async move {
-            let mut stream = nr_m8_sorted; // already a ReceiverStream
-            while let Some(item) = stream.next().await {
-                match &item {
-                    ParseOutput::Bytes(b) => {
-                        lines += 1;
-                        if let Some(tab) = memchr::memchr(b'\t', b) {
-                            unique.insert(b[..tab].to_vec());
-                        }
-                    }
-                    other => {
-                        return Err(anyhow!(
-                        "[NR post-sort] unexpected ParseOutput: {:?}",
-                        other
-                    ));
-                    }
-                }
-                if post_sort_tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-            info!(
-            "[NR post-sort] streamed {} lines, {} unique queries",
-            lines,
-            unique.len()
-        );
-            if lines == 0 {
-                return Err(anyhow!(
-                "[NR post-sort] zero lines left sort_m8_by_read_id – data was dropped inside the sort"
-            ));
-            }
-            Ok(())
-        }
-    });
-    cleanup_tasks.push(post_sort_counter);
-
-    // Hand the post-sort stream to call_hits_m8
-    let nr_m8_for_call = post_sort_rx;
+        "[run] sort_m8_by_read_id(nr) completed after {:?}",
+        nr_sort_start.elapsed()
+    );
 
     let (
         nr_call_stream,
@@ -8173,7 +7870,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut nr_call_cleanup_receivers,
     ) = call_hits_m8(
         config.clone(),
-        ReceiverStream::new(nr_m8_for_call),
+        nr_m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -8182,8 +7879,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_concurrency,
         "nr".to_string(),
     )
-    .await?;
+        .await?;
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
     let nr_split_start = Instant::now();
     info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
