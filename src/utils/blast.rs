@@ -2292,10 +2292,15 @@ pub async fn compute_merged_taxon_counts(
         }
         let read_id = fields[0].to_string();
         let species = fields[4].parse::<Taxid>().ok().filter(|&t| t > 0);
-        let contig = fields
-            .get(7)
-            .and_then(|s| s.parse::<Taxid>().ok())
-            .filter(|&t| t > 0);
+
+        // Contig species taxid only when 7-col + contig block present
+        // [7]=contig_id, [8]=contig_accession, [9]=contig_species_taxid
+        let contig = if fields.len() >= 10 {
+            fields[9].parse::<Taxid>().ok().filter(|&t| t > 0)
+        } else {
+            None
+        };
+
         Some((
             read_id,
             SpeciesAlignmentResults {
