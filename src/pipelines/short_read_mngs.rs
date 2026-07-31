@@ -263,8 +263,30 @@ impl ReadHit {
     /// # Returns
     ///
     /// String: tab-separated representation of the hit
+    /// HitSummary line: read_id, level, taxid, accession, species, genus, family
+    /// Optional contig fields appended when present (hitsummary2-compatible).
     pub fn to_full_tab_line(&self, read_id: &str) -> String {
-        format!("{}\t{}", read_id, self.to_tab_string())
+        let mut line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            read_id,
+            self.level,
+            self.taxid,
+            self.accession_id,
+            self.species_taxid,
+            self.genus_taxid,
+            self.family_taxid,
+        );
+        if self.contig_id.is_some() || self.from_assembly {
+            line.push_str(&format!(
+                "\t{}\t{}\t{}\t{}\t{}",
+                self.contig_id.as_deref().unwrap_or(""),
+                self.contig_accession_id.as_deref().unwrap_or(""),
+                self.contig_species_taxid,
+                self.contig_genus_taxid,
+                self.contig_family_taxid,
+            ));
+        }
+        line
     }
 
     /// Parses a read hit from a tab-separated line.
@@ -4943,14 +4965,8 @@ pub async fn update_read_dict(
                     let genus_taxid = acc_hit.genus_taxid;
                     let family_taxid = acc_hit.family_taxid;
 
-                    let mut lineage_line = json!({
-                        "contig_name": contig_id,
-                        "species_taxid": lineage[0],
-                        "genus_taxid": lineage[1],
-                        "family_taxid": lineage[2],
-                    })
+                    let mut lineage_line = format!("{}\t{}\t{}\t{}\n", contig_id, lineage[0], lineage[1], lineage[2])
                     .to_string();
-                    lineage_line.push('\n');
                     batch.contig2lineage_lines.push(lineage_line.into_bytes());
 
                     let mut m8_line = m8_row.to_tab_string();
@@ -5708,34 +5724,16 @@ async fn blast_contigs(
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         let mut listing = String::new();
-        if let Ok(mut rd) = tokio::fs::read_dir(parent).await {
+        if let Ok(mut rd) = tokio::fs::read_dir(&parent).await {
             while let Ok(Some(ent)) = rd.next_entry().await {
                 listing.push_str(&format!("{} ", ent.file_name().to_string_lossy()));
             }
         }
-        warn!(
-            "[blast_contigs:{}] makeblastdb finished but index not ready at prefix={} (dir: {}). Falling back gracefully.",
-            db_type,
-            blastdb_path.display(),
-            listing
-        );
-
-        return early_blast_exit(
-            db_type,
-            &blast_m8_path,
-            &blast_top_m8_path,
-            &refined_m8_path,
-            &refined_hit_summary_path,
-            &refined_counts_path,
-            &contig_summary_path,
-            None,
-            None,
-            None,
-            &read_dict,
-            taxon_counts,
-            fn_start,
-        )
-            .await;
+        return Err(anyhow!(
+        "makeblastdb succeeded but index not ready at prefix={} (dir contents: {})",
+        blastdb_path.display(),
+        listing
+    ));
     }
 
     info!(
@@ -6344,6 +6342,19 @@ async fn blast_contigs(
     ])
     .await
     .map_err(|e| PipelineError::Other(anyhow!("contig processing task panicked: {}", e)))?;
+
+    let blast_status = blast_child
+        .wait()
+        .await
+        .map_err(|e| anyhow!("blast wait failed: {}", e))?;
+    if !blast_status.success() {
+        return Err(anyhow!(
+        "{} exited with {:?} (db_type={})",
+        blast_command,
+        blast_status.code(),
+        db_type
+    ));
+    }
 
     for res in results {
         res.map_err(|e| PipelineError::Other(anyhow!("contig processing task failed: {}", e)))?;
