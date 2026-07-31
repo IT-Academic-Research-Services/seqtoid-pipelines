@@ -5545,7 +5545,18 @@ async fn blast_contigs(
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
 )> {
-    use tokio::time::Instant; // ← use tokio's Instant
+    // Single-volume: .nhr/.nin/.nsq (nucl) or .phr/.pin/.psq (prot)
+    // Multi-volume only: .nal / .pal
+    fn blastdb_ready(prefix: &PathBuf, db_type: &str) -> bool {
+        let (a, b, c, alias) = if db_type == NT_TAG {
+            ("nhr", "nin", "nsq", "nal")
+        } else {
+            ("phr", "pin", "psq", "pal")
+        };
+        let p = |ext: &str| prefix.with_extension(ext).exists();
+        p(alias) || (p(a) && p(b) && p(c))
+    }
+    use tokio::time::Instant;
 
     let fn_start = Instant::now();
     info!(
@@ -5613,11 +5624,11 @@ async fn blast_contigs(
             taxon_counts,
             fn_start,
         )
-        .await;
+            .await;
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Normal path
+    // Normal path — one makeblastdb; index = prefix under temp_dir
     // ─────────────────────────────────────────────────────────────
     let temp_dir = choose_temp_dir(
         ref_size + contig_size,
@@ -5626,7 +5637,7 @@ async fn blast_contigs(
         blast_headroom,
         true,
     )
-    .await?;
+        .await?;
     info!(
         "[blast_contigs:{}] temp dir chosen: {}",
         db_type,
@@ -5640,7 +5651,7 @@ async fn blast_contigs(
     temp_files.push(blastdb_ram_path);
 
     info!(
-        "[blast_contigs:{}] blastdb path: {}",
+        "[blast_contigs:{}] blastdb path (prefix): {}",
         db_type,
         blastdb_path.display()
     );
@@ -5671,24 +5682,42 @@ async fn blast_contigs(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
-    makeblastdb_child
+    let makeblastdb_status = makeblastdb_child
         .wait()
         .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: MAKEBLASTDB_TAG.to_string(),
-            error: format!("makeblastdb failed: {}", e),
+            error: format!("makeblastdb wait failed: {}", e),
         })?;
     makeblastdb_err_task.await??;
 
-    let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
-    let expected_index = blastdb_path.with_extension(index_ext);
+    if !makeblastdb_status.success() {
+        return Err(anyhow!(
+            "makeblastdb exited with {:?} (db_type={}, prefix={})",
+            makeblastdb_status.code(),
+            db_type,
+            blastdb_path.display()
+        ));
+    }
 
-    if !expected_index.exists() {
+    if !blastdb_ready(&blastdb_path, db_type) {
+        let parent = blastdb_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut listing = String::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(parent).await {
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                listing.push_str(&format!("{} ", ent.file_name().to_string_lossy()));
+            }
+        }
         warn!(
-            "[blast_contigs:{}] makeblastdb did not produce expected index at {}. Falling back gracefully.",
-            db_type, expected_index.display()
+            "[blast_contigs:{}] makeblastdb finished but index not ready at prefix={} (dir: {}). Falling back gracefully.",
+            db_type,
+            blastdb_path.display(),
+            listing
         );
 
         return early_blast_exit(
@@ -5706,110 +5735,18 @@ async fn blast_contigs(
             taxon_counts,
             fn_start,
         )
-        .await;
+            .await;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Index exists → continue with blastn/x
-    // ─────────────────────────────────────────────────────────────
-
-    let temp_dir = choose_temp_dir(
-        ref_size + contig_size,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        blast_headroom,
-        true,
-    )
-    .await?;
     info!(
-        "[blast_contigs:{}] temp dir chosen: {}",
-        db_type,
-        temp_dir.path().display()
-    );
-
-    let blastdb_suffix = format!("{}_blastindex", db_type);
-    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let blastdb_path = blastdb_ram_path.path().to_owned();
-    temp_files.push(blastdb_ram_path);
-
-    info!(
-        "[blast_contigs:{}] blastdb path: {}",
+        "[blast_contigs:{}] blastdb ready at prefix={}",
         db_type,
         blastdb_path.display()
     );
 
-    let makeblastdb_config = MakeblastdbConfig {
-        input: reference_fasta.clone(),
-        dbtype: if db_type == NT_TAG {
-            "nucl".to_string()
-        } else {
-            "prot".to_string()
-        },
-        output: blastdb_path.clone(),
-        option_fields: HashMap::new(),
-    };
-
-    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    info!("[blast_contigs:{}] launching makeblastdb", db_type);
-
-    let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
-        config.clone(),
-        MAKEBLASTDB_TAG,
-        makeblastdb_args,
-        config.args.verbose,
-        None,
-    )
-    .await?;
-
-    // Wait for makeblastdb to finish
-    makeblastdb_child
-        .wait()
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: format!("makeblastdb failed: {}", e),
-        })?;
-    makeblastdb_err_task.await??;
-
-    // Verify the index was created
-    let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
-    let expected_index = blastdb_path.with_extension(index_ext);
-
-    if !expected_index.exists() {
-        warn!(
-        "[blast_contigs:{}] makeblastdb did not produce expected index at {}. Falling back gracefully.",
-        db_type, expected_index.display()
-    );
-
-        return early_blast_exit(
-            db_type,
-            &blast_m8_path,
-            &blast_top_m8_path,
-            &refined_m8_path,
-            &refined_hit_summary_path,
-            &refined_counts_path,
-            &contig_summary_path,
-            None,
-            None,
-            None,
-            &read_dict,
-            taxon_counts,
-            fn_start,
-        )
-        .await; // ← add this
-    }
-
     // ─────────────────────────────────────────────────────────────
-    // If we reach here, the index exists — continue with blastn/x
-    // (rest of the function stays the same)
+    // Index exists → blastn / blastx
     // ─────────────────────────────────────────────────────────────
-
     let blast_command = if db_type == NT_TAG {
         BLASTN_TAG
     } else {
@@ -5850,6 +5787,7 @@ async fn blast_contigs(
         db_type, blast_command
     );
     info!("blast_contigs right before spawning");
+
     let blast_spawn_start = Instant::now();
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
@@ -7857,7 +7795,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_m8_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
     let nr_m8_file_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
 
-    let nr_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("_nr.m8"), "."));
+    let nr_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nr.m8"), "."));
 
     let write_task = write_byte_stream_to_file(
         &nr_m8_file_path,
