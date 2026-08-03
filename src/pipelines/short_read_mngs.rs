@@ -5802,8 +5802,8 @@ async fn blast_contigs(
     );
 
     // ── Top hits ────────────────────────────────────────────────
-    let (top_internal_tx, top_internal_rx) = mpsc::channel(1024);
-    let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
+    let (top_internal_tx, top_internal_rx) = mpsc::channel(131_072);
+    let (top_for_update_tx, top_for_update_rx) = mpsc::channel(131_072);
     let (top_for_caller_tx, top_for_caller_rx) = mpsc::unbounded_channel();
 
     info!(
