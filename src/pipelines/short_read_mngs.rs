@@ -6204,14 +6204,10 @@ async fn blast_contigs(
     let taxon_count_concurrency =
         compute_phase_concurrency(&config, "taxon_counting", 0.4, 4.0, 64, 4);
     let taxon_count_batch_size = compute_batch_size(None, 220, 150, taxon_count_concurrency);
-    let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
+    let (refined_counts_tx, refined_counts_rx) = mpsc::unbounded_channel();
 
     let counts_handle = tokio::spawn({
         let start = Instant::now();
-        info!(
-            "[blast_contigs:{}] generate_taxon_count_json_from_m8 started",
-            db_type
-        );
         let fut = generate_taxon_count_json_from_m8(
             ReceiverStream::new(refined_m8_for_counts_rx),
             ReceiverStream::new(refined_hit_for_counts_rx),
@@ -6219,17 +6215,17 @@ async fn blast_contigs(
             lineage_map.clone(),
             should_keep_filter.clone(),
             duplicate_clusters.clone(),
-            refined_counts_tx,
+            refined_counts_tx, // UnboundedSender
             taxon_count_concurrency,
             taxon_count_batch_size,
         );
         async move {
             let res = fut.await;
             info!(
-                "[blast_contigs:{}] generate_taxon_count_json_from_m8 finished after {:?}",
-                db_type,
-                start.elapsed()
-            );
+            "[blast_contigs:{}] generate_taxon_count_json_from_m8 finished after {:?}",
+            db_type,
+            start.elapsed()
+        );
             res
         }
     });
@@ -6327,7 +6323,7 @@ async fn blast_contigs(
     );
 
     let mut refined_counts = Vec::new();
-    let mut rx = ReceiverStream::new(refined_counts_rx);
+    let mut rx = UnboundedReceiverStream::new(refined_counts_rx);
     let mut refined_counts_seen = 0usize;
     while let Some(item) = rx.next().await {
         refined_counts_seen += 1;

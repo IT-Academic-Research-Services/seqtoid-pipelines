@@ -1659,206 +1659,230 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 ///
 /// Result<()>: success or error
 pub async fn generate_taxon_count_json_from_m8(
-    m8_stream_rx: ReceiverStream<ParseOutput>,
-    hit_summary_stream_rx: ReceiverStream<ParseOutput>,
+    mut m8_stream_rx: ReceiverStream<ParseOutput>,
+    mut hit_summary_stream_rx: ReceiverStream<ParseOutput>,
     db_type: &str,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    output_tx: mpsc::Sender<ParseOutput>,
-    concurrency: usize,
-    batch_size_lines: usize,
+    output_tx: mpsc::UnboundedSender<ParseOutput>,
+    _concurrency: usize,       // call-site compat; global agg is sequential
+    _batch_size_lines: usize,  // call-site compat
 ) -> Result<()> {
-    if concurrency == 0 {
-        return Err(anyhow::anyhow!("concurrency must be > 0"));
-    }
-
-    let db_type = db_type.to_string();
-
-    // HitSummary (call_hits / refined):
-    //   read_id, level, taxid, accession, species, genus, family [, contig…]
+    // Python: zip HitSummary × m8, assert same read_id, global aggregation tree.
     const MIN_HIT_FIELDS: usize = 7;
+    const MIN_NORMAL_POSITIVE_DOUBLE: f64 = 2.2250738585072014e-308; // ~2^-1022
+    const NUM_RANKS: usize = 3;
 
-    let (job_tx, job_rx) = mpsc::channel::<(Vec<String>, Vec<String>)>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+    let count_type = db_type.to_string();
+    let count_type_upper = count_type.to_uppercase();
 
-    let producer_handle = tokio::spawn({
-        let mut m8_stream = m8_stream_rx;
-        let mut hit_stream = hit_summary_stream_rx;
-        async move {
-            let mut batch_m8 = Vec::with_capacity(batch_size_lines);
-            let mut batch_hit = Vec::with_capacity(batch_size_lines);
+    // agg_key = cleaned lineage suffix (species,genus,family) → chomp lowest rank
+    let mut aggregation: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
+    let mut pairs = 0u64;
+    let mut skipped = 0u64;
 
-            loop {
-                let m8_item = m8_stream.next().await;
-                let hit_item = hit_stream.next().await;
+    loop {
+        let m8_item = m8_stream_rx.next().await;
+        let hit_item = hit_summary_stream_rx.next().await;
 
-                match (m8_item, hit_item) {
-                    (Some(m8), Some(hit)) => {
-                        if let Ok(bytes) = m8.to_bytes() {
-                            let trimmed = String::from_utf8_lossy(&bytes).trim_end().to_string();
-                            if !trimmed.is_empty() {
-                                batch_m8.push(trimmed);
-                            }
-                        }
-                        if let Ok(bytes) = hit.to_bytes() {
-                            let trimmed = String::from_utf8_lossy(&bytes).trim_end().to_string();
-                            if !trimmed.is_empty() {
-                                batch_hit.push(trimmed);
-                            }
-                        }
-
-                        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines
-                        {
-                            if job_tx
-                                .send((
-                                    std::mem::take(&mut batch_m8),
-                                    std::mem::take(&mut batch_hit),
-                                ))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {
-                        if !batch_m8.is_empty() || !batch_hit.is_empty() {
-                            let _ = job_tx.send((batch_m8, batch_hit)).await;
-                        }
-                        break;
-                    }
-                }
+        match (m8_item, hit_item) {
+            (None, None) => break,
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(anyhow!(
+                    "[generate_taxon_count_json_from_m8:{}] m8/hit streams ended at different lengths (pairs so far={})",
+                    count_type,
+                    pairs
+                ));
             }
-            drop(job_tx);
-            Ok::<(), anyhow::Error>(())
-        }
-    });
-
-    let mut workers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let rx = shared_rx.clone();
-        let output_tx = output_tx.clone();
-        let lineage_map = lineage_map.clone();
-        let should_keep_filter = should_keep_filter.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        let db_type = db_type.clone();
-
-        let worker = tokio::spawn(async move {
-            loop {
-                let job = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-
-                let Some((batch_m8, batch_hit)) = job else {
-                    break;
-                };
-
-                let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::new();
-
-                for (m8_line, hit_line) in batch_m8.into_iter().zip(batch_hit) {
-                    let hit_fields: Vec<&str> = hit_line.split('\t').collect();
-                    if hit_fields.len() < MIN_HIT_FIELDS {
-                        // malformed — do not invent fields; skip this pair only
+            (Some(m8_item), Some(hit_item)) => {
+                let m8_bytes = match m8_item.to_bytes() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        skipped += 1;
                         continue;
                     }
-
-                    // 7-col: read_id, level, taxid, accession, species, genus, family
-                    let read_id = hit_fields[0];
-                    let level: i32 = hit_fields[1].parse().unwrap_or(-1);
-                    let taxid: i32 = hit_fields[2].parse().unwrap_or(-1);
-
-                    // Uncalled / invalid: level may be -1; taxid must be positive
-                    if taxid <= 0 {
+                };
+                let hit_bytes = match hit_item.to_bytes() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        skipped += 1;
                         continue;
                     }
-                    // Optional: skip explicit uncalled level (czid allows level -1 with taxid)
-                    // Keep taxid gate only so level==-1 with valid taxid still counts if present.
-                    let _ = level;
+                };
 
-                    let Ok(m8) = M8Record::parse_line_nt(&m8_line)
-                        .or_else(|_| M8Record::parse_line_nr(&m8_line))
-                    else {
+                let m8_line = String::from_utf8_lossy(&m8_bytes);
+                let m8_line = m8_line.trim_end();
+                let hit_line = String::from_utf8_lossy(&hit_bytes);
+                let hit_line = hit_line.trim_end();
+                if m8_line.is_empty() || hit_line.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+
+                let hit_fields: Vec<&str> = hit_line.split('\t').collect();
+                if hit_fields.len() < MIN_HIT_FIELDS {
+                    skipped += 1;
+                    continue;
+                }
+
+                // 7-col: read_id, level, taxid, accession, species, genus, family
+                let read_id = hit_fields[0];
+                let hit_level: i32 = hit_fields[1].parse().unwrap_or(-1);
+                let hit_taxid: i32 = hit_fields[2].parse().unwrap_or(-1);
+                let hit_source_count_type = hit_fields.get(7).map(|s| s.to_string());
+
+                let m8 = match M8Record::parse_line_nt(m8_line)
+                    .or_else(|_| M8Record::parse_line_nr(m8_line))
+                {
+                    Ok(m) => m,
+                    Err(_) => {
+                        skipped += 1;
                         continue;
-                    };
+                    }
+                };
 
-                    let cluster_size = duplicate_clusters
-                        .get(read_id)
-                        .map(|e| e.value().size)
-                        .unwrap_or(1);
+                // Python: assert blastn_6_row["qseqid"] == read_id
+                if m8.qname != read_id {
+                    return Err(anyhow!(
+                        "[generate_taxon_count_json_from_m8:{}] read_ids do not match: m8={} hit={}",
+                        count_type,
+                        m8.qname,
+                        read_id
+                    ));
+                }
 
-                    let bucket = buckets.entry(taxid).or_default();
-                    // unique = one per read line; nonunique weighted by duplicate cluster
-                    bucket.unique_count += 1;
+                if hit_taxid <= 0 {
+                    skipped += 1;
+                    continue;
+                }
+
+                let mut alignment_length = m8.alen as f64;
+                // Python: merged_NT_NR + NR → ×3 (not used in per-db blast_contigs path)
+                if count_type_upper == "MERGED_NT_NR"
+                    && hit_source_count_type.as_deref() == Some("NR")
+                {
+                    alignment_length *= 3.0;
+                }
+
+                let percent_identity = m8.pident;
+                let mut e_value = m8.evalue;
+                if e_value <= MIN_NORMAL_POSITIVE_DOUBLE {
+                    e_value = MIN_NORMAL_POSITIVE_DOUBLE;
+                }
+                let e_value_log10 = e_value.log10();
+
+                // Lineage from hit_taxid + validate (same idea as Python validate_taxid_lineage)
+                let raw_lineage = lineage_map
+                    .get(&hit_taxid)
+                    .cloned()
+                    .unwrap_or([-1i32; 3]);
+                let cleaned = validate_taxid_lineage(&raw_lineage, hit_taxid, hit_level as u8);
+
+                if !should_keep_filter(&cleaned) {
+                    skipped += 1;
+                    continue;
+                }
+
+                let cluster_size = duplicate_clusters
+                    .get(read_id)
+                    .map(|e| e.value().size)
+                    .unwrap_or(1);
+
+                // Aggregate up the tree (chomp lowest rank each step)
+                let mut agg_key: Vec<i32> = cleaned.to_vec();
+                while !agg_key.is_empty() {
+                    let bucket = aggregation.entry(agg_key.clone()).or_default();
                     bucket.nonunique_count += cluster_size;
-                    bucket.base_count += m8.alen.saturating_mul(cluster_size as u64);
-                    bucket.sum_percent_identity += m8.pident;
-                    bucket.sum_alignment_length += m8.alen as f64;
-                    bucket.sum_e_value += m8.evalue;
-                    bucket.source_count_type.insert(db_type.clone());
+                    bucket.unique_count += 1;
+                    // Python default read_to_base_count={} → base_count stays 0 here
+                    bucket.base_count += 0;
+                    bucket.sum_percent_identity += percent_identity;
+                    bucket.sum_alignment_length += alignment_length;
+                    bucket.sum_e_value += e_value_log10;
+                    if let Some(ref src) = hit_source_count_type {
+                        if !src.is_empty() {
+                            bucket.source_count_type.insert(src.clone());
+                        }
+                    } else {
+                        bucket.source_count_type.insert(count_type_upper.clone());
+                    }
+                    agg_key = agg_key[1..].to_vec();
                 }
 
-                for (taxid, bucket) in buckets {
-                    let Some(lineage) = lineage_map.get(&taxid) else {
-                        continue;
-                    };
-                    if !should_keep_filter(lineage) {
-                        continue;
-                    }
-
-                    let dcr = if bucket.nonunique_count > 0 {
-                        bucket.unique_count as f64 / bucket.nonunique_count as f64
-                    } else {
-                        0.0
-                    };
-
-                    let n = bucket.unique_count.max(1) as f64;
-                    let percent_identity = bucket.sum_percent_identity / n;
-                    let alignment_length = bucket.sum_alignment_length / n;
-                    let e_value = bucket.sum_e_value / n;
-
-                    let count = TaxonCount {
-                        tax_id: taxid,
-                        tax_level: 1,
-                        genus_taxid: lineage[1],
-                        family_taxid: lineage[2],
-                        count: bucket.unique_count,
-                        nonunique_count: bucket.nonunique_count,
-                        unique_count: bucket.unique_count,
-                        dcr,
-                        percent_identity,
-                        alignment_length,
-                        e_value,
-                        count_type: db_type.clone(),
-                        base_count: bucket.base_count,
-                        source_count_type: Some(bucket.source_count_type.into_iter().collect()),
-                    };
-
-                    let json = serde_json::to_string(&count)? + "\n";
-                    if output_tx
-                        .send(ParseOutput::Bytes(Bytes::from(json)))
-                        .await
-                        .is_err()
-                    {
-                        // downstream closed — stop this worker
-                        return Ok(());
-                    }
+                pairs += 1;
+                if pairs % 100_000 == 0 {
+                    info!(
+                        "[generate_taxon_count_json_from_m8:{}] pairs={} taxa_keys={}",
+                        count_type,
+                        pairs,
+                        aggregation.len()
+                    );
                 }
             }
-            Ok::<(), anyhow::Error>(())
-        });
-        workers.push(worker);
-    }
-
-    producer_handle.await??;
-    for w in workers {
-        w.await??;
+        }
     }
 
     info!(
-        "Finished taxon count JSON generation for {} (7-col HitSummary, {} workers)",
-        db_type, concurrency
+        "[generate_taxon_count_json_from_m8:{}] loop done: pairs={} skipped={} keys={}",
+        count_type,
+        pairs,
+        skipped,
+        aggregation.len()
+    );
+
+    // Python loop 2 — one row per agg_key
+    let mut emitted = 0usize;
+    for (agg_key, bucket) in aggregation {
+        let unique_count = bucket.unique_count;
+        let nonunique_count = bucket.nonunique_count;
+        if unique_count == 0 {
+            continue;
+        }
+
+        let tax_level = (NUM_RANKS - agg_key.len() + 1) as i32;
+        let tax_id = agg_key[0];
+
+        // genus_taxid / family_taxid as in Python
+        let genus_taxid = if tax_level <= 2 {
+            agg_key[2 - tax_level as usize]
+        } else {
+            -200
+        };
+        let family_taxid = if tax_level <= 3 {
+            agg_key.get(3 - tax_level as usize).copied().unwrap_or(-300)
+        } else {
+            -300
+        };
+
+        let n = unique_count as f64;
+        let count = TaxonCount {
+            tax_id,
+            tax_level: tax_level as u8,
+            genus_taxid,
+            family_taxid,
+            count: nonunique_count as u64,
+            nonunique_count: nonunique_count as u64,
+            unique_count: unique_count as u64,
+            dcr: nonunique_count as f64 / n,
+            percent_identity: bucket.sum_percent_identity / n,
+            alignment_length: bucket.sum_alignment_length / n,
+            e_value: bucket.sum_e_value / n,
+            count_type: count_type_upper.clone(),
+            base_count: bucket.base_count as u64,
+            source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+        };
+
+        let json = serde_json::to_string(&count)? + "\n";
+        output_tx
+            .send(ParseOutput::Bytes(Bytes::from(json)))
+            .map_err(|_| anyhow!("refined_counts output closed"))?;
+        emitted += 1;
+    }
+
+    info!(
+        "Finished taxon count JSON generation for {} ({} taxa, {} pairs)",
+        count_type_upper, emitted, pairs
     );
     Ok(())
 }
