@@ -862,18 +862,27 @@ pub fn validate_taxid_lineage(
 ///
 /// The validated Lineage
 pub fn get_valid_lineage(
-    hits_by_read_id: &AHashMap<String, (Taxid, u8)>, // contig_id → (taxid, level)
-    lineage_map: &Arc<AHashMap<Taxid, Lineage>>,
+    hits_by_read_id: &AHashMap<String, (Taxid, i32)>, // read_id → (taxid, level)
+    lineage_map: &AHashMap<Taxid, Lineage>,
     read_id: &str,
 ) -> Lineage {
-    let (hit_taxid, hit_level) = hits_by_read_id.get(read_id).copied().unwrap_or((-1, 255)); // 255 = invalid level
+    // Python: hits_by_read_id.get(read_id, (-1, -1))
+    let (hit_taxid, hit_level) = hits_by_read_id
+        .get(read_id)
+        .copied()
+        .unwrap_or((-1, -1));
 
     if hit_taxid <= 0 {
         return NULL_LINEAGE;
     }
 
+    // Prefer real lineage when level indicates species (1). Non-specific levels
+    // use artificial taxids (same idea as validate_taxid_lineage / NULL handling).
     if hit_level == 1 {
-        lineage_map.get(&hit_taxid).copied().unwrap_or(NULL_LINEAGE)
+        lineage_map
+            .get(&hit_taxid)
+            .copied()
+            .unwrap_or(NULL_LINEAGE)
     } else {
         [
             SPECIES_NON_SPECIFIC,
@@ -1214,35 +1223,35 @@ mod tests {
     #[test]
     fn test_get_valid_lineage_species_hit_uses_map() {
         let mut hits = AHashMap::new();
-        hits.insert("read1".to_string(), (42, 1));
+        hits.insert("read1".to_string(), (42, 1i32));
 
         let mut lineage_map = AHashMap::new();
         lineage_map.insert(42, [11, 22, 33]);
 
         let lineage_map = Arc::new(lineage_map);
-        let got = get_valid_lineage(&hits, &lineage_map, "read1");
+        let got = get_valid_lineage(&hits, lineage_map.as_ref(), "read1");
         assert_eq!(got, [11, 22, 33]);
     }
 
     #[test]
     fn test_get_valid_lineage_non_species_hit_returns_non_specific_lineage() {
         let mut hits = AHashMap::new();
-        hits.insert("read1".to_string(), (42, 2));
+        hits.insert("read1".to_string(), (42, 2i32));
 
         let mut lineage_map = AHashMap::new();
         lineage_map.insert(42, [11, 22, 33]);
 
         let lineage_map = Arc::new(lineage_map);
-        let got = get_valid_lineage(&hits, &lineage_map, "read1");
-        assert_eq!(got, [-100, -200, -300]);
+        let got = get_valid_lineage(&hits, lineage_map.as_ref(), "read1");
+        assert_eq!(got, [-100, -200, -300]); // SPECIES/GENUS/FAMILY_NON_SPECIFIC
     }
 
     #[test]
     fn test_get_valid_lineage_missing_hit_returns_null_lineage() {
-        let hits: AHashMap<String, (Taxid, u8)> = AHashMap::new();
+        let hits: AHashMap<String, (Taxid, i32)> = AHashMap::new();
         let lineage_map = Arc::new(AHashMap::new());
 
-        let got = get_valid_lineage(&hits, &lineage_map, "missing");
+        let got = get_valid_lineage(&hits, lineage_map.as_ref(), "missing");
         assert_eq!(got, [-1, -1, -1]);
     }
 
