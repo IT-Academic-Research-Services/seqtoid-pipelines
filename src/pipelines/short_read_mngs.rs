@@ -4905,7 +4905,7 @@ pub async fn update_read_dict(
             continue;
         }
 
-        let m8 = if db_type == "nt" {
+        let m8 = if db_type.eq_ignore_ascii_case("nt") {
             M8Record::parse_line_nt(line_trimmed)?
         } else {
             M8Record::parse_line_nr(line_trimmed)?
@@ -8548,7 +8548,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let nr_hit_summary_merge = nr_hitsummary_iter
                 .next()
                 .ok_or(PipelineError::EmptyStream)?;
-            
+
             let nr_hit_summary_taxid = nr_hitsummary_iter
                 .next()
                 .ok_or(PipelineError::EmptyStream)?;
