@@ -525,8 +525,8 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
 pub async fn get_top_m8_nt(
     mut input: ReceiverStream<ParseOutput>,
     output_tx: mpsc::Sender<ParseOutput>,
-    _concurrency: usize, // kept for call-site compatibility; unused
-    _batch_size: usize,  // kept for call-site compatibility; unused
+    _concurrency: usize,
+    _batch_size: usize,
 ) -> Result<()> {
     let mut best: AHashMap<String, M8Record> = AHashMap::with_capacity(64_000);
     let mut lines_in = 0u64;
@@ -574,46 +574,57 @@ pub async fn get_top_m8_nt(
         }
     }
 
-    let emitted = best.len();
-    for (_, m8) in best {
+    info!(
+        "[get_top_m8_nt] emit starting — {} contigs (lines_in={})",
+        best.len(),
+        lines_in
+    );
+
+    let items: Vec<M8Record> = best.into_iter().map(|(_, m)| m).collect();
+    let n = items.len();
+
+    for (i, m8) in items.into_iter().enumerate() {
         let line = m8.to_tab_string() + "\n";
         if output_tx
             .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
             .await
             .is_err()
         {
-            return Err(anyhow!("[get_top_m8_nt] output channel closed"));
+            return Err(anyhow!(
+                "[get_top_m8_nt] output channel closed at emit {}/{}",
+                i + 1,
+                n
+            ));
+        }
+        if (i + 1) % 5_000 == 0 {
+            info!("[get_top_m8_nt] emit progress {}/{}", i + 1, n);
         }
     }
 
     info!(
         "[get_top_m8_nt] finished — lines={} parse_err={} emitted={}",
-        lines_in, parse_err, emitted
+        lines_in, parse_err, n
     );
     Ok(())
 }
 
 #[inline]
 fn is_better_nt(a: &M8Record, b: &M8Record) -> bool {
-    // Primary: longer alignment
     match a.alen.cmp(&b.alen) {
         std::cmp::Ordering::Greater => return true,
         std::cmp::Ordering::Less => return false,
         std::cmp::Ordering::Equal => {}
     }
-    // Fewer mismatches
     match a.mismatch.cmp(&b.mismatch) {
         std::cmp::Ordering::Less => return true,
         std::cmp::Ordering::Greater => return false,
         std::cmp::Ordering::Equal => {}
     }
-    // Fewer gaps
     match a.gapopen.cmp(&b.gapopen) {
         std::cmp::Ordering::Less => return true,
         std::cmp::Ordering::Greater => return false,
         std::cmp::Ordering::Equal => {}
     }
-    // Lower evalue
     match a
         .evalue
         .partial_cmp(&b.evalue)
@@ -623,7 +634,6 @@ fn is_better_nt(a: &M8Record, b: &M8Record) -> bool {
         std::cmp::Ordering::Greater => return false,
         std::cmp::Ordering::Equal => {}
     }
-    // Higher bitscore
     matches!(
         a.bitscore
             .partial_cmp(&b.bitscore)
@@ -650,7 +660,6 @@ pub async fn get_top_m8_nr(
         representative: M8Record,
     }
 
-    // (qname, tname) → merged HSPs
     let mut by_pair: AHashMap<(String, String), MergedHsp> = AHashMap::with_capacity(128_000);
     let mut lines_in = 0u64;
     let mut parse_err = 0u64;
@@ -713,7 +722,6 @@ pub async fn get_top_m8_nr(
         }
     }
 
-    // Best subject per contig
     let mut best_per_contig: AHashMap<String, MergedHsp> = AHashMap::with_capacity(by_pair.len());
     for ((contig, _subject), merged) in by_pair {
         match best_per_contig.get(&contig) {
@@ -730,8 +738,16 @@ pub async fn get_top_m8_nr(
         }
     }
 
-    let emitted = best_per_contig.len();
-    for (_contig, best) in best_per_contig {
+    info!(
+        "[get_top_m8_nr] emit starting — {} contigs (lines_in={})",
+        best_per_contig.len(),
+        lines_in
+    );
+
+    let items: Vec<(String, MergedHsp)> = best_per_contig.into_iter().collect();
+    let n = items.len();
+
+    for (i, (_contig, best)) in items.into_iter().enumerate() {
         let rep = &best.representative;
         let avg_pident = if best.total_alen > 0 {
             best.sum_pident / best.total_alen as f64
@@ -758,13 +774,20 @@ pub async fn get_top_m8_nr(
             .await
             .is_err()
         {
-            return Err(anyhow!("[get_top_m8_nr] output channel closed"));
+            return Err(anyhow!(
+                "[get_top_m8_nr] output channel closed at emit {}/{}",
+                i + 1,
+                n
+            ));
+        }
+        if (i + 1) % 5_000 == 0 {
+            info!("[get_top_m8_nr] emit progress {}/{}", i + 1, n);
         }
     }
 
     info!(
         "[get_top_m8_nr] finished — lines={} parse_err={} emitted={}",
-        lines_in, parse_err, emitted
+        lines_in, parse_err, n
     );
     Ok(())
 }
