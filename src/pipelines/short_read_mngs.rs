@@ -4866,32 +4866,12 @@ pub async fn update_read_dict(
         curr.tend = curr.tend.max(row.tend);
     }
 
-    // Snapshot the current read dict once so the fan-out stage does not keep
-    // taking the mutex for every contig/read pair.
-    let existing_reads: AHashMap<String, Arc<ReadHit>> = {
-        let guard = read_dict
-            .lock()
-            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
-        guard.clone()
-    };
-    let existing_reads = Arc::new(existing_reads);
-
-    // Invert read2contig once: contig -> reads.
-    let mut contig2reads: AHashMap<String, Vec<String>> =
-        AHashMap::with_capacity(read2contig.len());
-    for (read_id, contig_id) in read2contig.iter() {
-        contig2reads
-            .entry(contig_id.clone())
-            .or_default()
-            .push(read_id.clone());
-    }
-    let contig2reads = Arc::new(contig2reads);
-
-    // Pass 1: read top m8 stream and build one merged row per contig.
-    // This mirrors the Python logic: contig2accession stores the merged row,
-    // and duplicate contig rows are merged into that row.
-    let mut contig2accession: AHashMap<String, (String, M8Record, Lineage)> = AHashMap::new();
     let db_type_upper = db_type.to_uppercase();
+
+    // ── Pass 1 first: drain tops immediately (no heavy setup before recv) ──
+    info!("[update_read_dict:{}] pass1: draining top m8", db_type);
+    let mut contig2accession: AHashMap<String, (String, M8Record, Lineage)> = AHashMap::new();
+    let mut tops_seen = 0u64;
 
     while let Some(item) = top_m8_stream.next().await {
         let bytes = match item {
@@ -4937,10 +4917,45 @@ pub async fn update_read_dict(
                 (accession_id.clone(), m8.clone(), lineage),
             );
         }
+
+        tops_seen += 1;
+        if tops_seen % 5_000 == 0 {
+            info!(
+                "[update_read_dict:{}] pass1: tops_seen={} contigs={}",
+                db_type,
+                tops_seen,
+                contig2accession.len()
+            );
+        }
     }
 
-    // Pass 2: parallel fan-out by contig.
-    // Each worker only builds local vectors, then we merge once at the end.
+    info!(
+        "[update_read_dict:{}] pass1 done: tops_seen={} contigs={}",
+        db_type,
+        tops_seen,
+        contig2accession.len()
+    );
+
+    // ── Heavy setup only after top stream is fully consumed ───────────────
+    let existing_reads: AHashMap<String, Arc<ReadHit>> = {
+        let guard = read_dict
+            .lock()
+            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
+        guard.clone()
+    };
+    let existing_reads = Arc::new(existing_reads);
+
+    let mut contig2reads: AHashMap<String, Vec<String>> =
+        AHashMap::with_capacity(read2contig.len());
+    for (read_id, contig_id) in read2contig.iter() {
+        contig2reads
+            .entry(contig_id.clone())
+            .or_default()
+            .push(read_id.clone());
+    }
+    let contig2reads = Arc::new(contig2reads);
+
+    // ── Pass 2: parallel fan-out by contig (unchanged) ────────────────────
     let fanout_batches: Vec<FanoutBatch> = {
         let contig2accession = Arc::new(contig2accession);
         let accession_map = accession_map.clone();
@@ -4965,8 +4980,10 @@ pub async fn update_read_dict(
                     let genus_taxid = acc_hit.genus_taxid;
                     let family_taxid = acc_hit.family_taxid;
 
-                    let mut lineage_line = format!("{}\t{}\t{}\t{}\n", contig_id, lineage[0], lineage[1], lineage[2])
-                    .to_string();
+                    let lineage_line = format!(
+                        "{}\t{}\t{}\t{}\n",
+                        contig_id, lineage[0], lineage[1], lineage[2]
+                    );
                     batch.contig2lineage_lines.push(lineage_line.into_bytes());
 
                     let mut m8_line = m8_row.to_tab_string();
@@ -4984,7 +5001,6 @@ pub async fn update_read_dict(
                             hit.contig_family_taxid = family_taxid;
                             hit.from_assembly = true;
                             hit.source_count_type = Some(db_type_upper.clone());
-
                             batch.updated.push((read_id.clone(), Arc::new(hit)));
                         } else {
                             let hit = ReadHit {
@@ -5002,7 +5018,6 @@ pub async fn update_read_dict(
                                 from_assembly: true,
                                 source_count_type: Some(db_type_upper.clone()),
                             };
-
                             batch.added.push((read_id.clone(), Arc::new(hit)));
                         }
 
@@ -5015,11 +5030,10 @@ pub async fn update_read_dict(
 
             Ok(batches)
         })
-        .await
-        .map_err(|e| anyhow!("update_read_dict fan-out task panicked: {}", e))??
+            .await
+            .map_err(|e| anyhow!("update_read_dict fan-out task panicked: {}", e))??
     };
 
-    // Merge local results once.
     let mut updated_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
     let mut added_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
     let mut contig2lineage_lines: Vec<Vec<u8>> = Vec::new();
