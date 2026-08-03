@@ -8536,7 +8536,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
             let (nr_hitsummary_rxs, nr_hitsummary_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_hit_summary_stream_out),
-                3,
+                2,
                 "nr_hitsummary",
                 &config,
                 StreamDataType::JustBytes,
@@ -8548,9 +8548,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let nr_hit_summary_merge = nr_hitsummary_iter
                 .next()
                 .ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_preload = nr_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
+            
             let nr_hit_summary_taxid = nr_hitsummary_iter
                 .next()
                 .ok_or(PipelineError::EmptyStream)?;
@@ -8562,7 +8560,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nr_m8_merge,
                 nr_m8_map,
                 nr_hit_summary_merge,
-                nr_hit_summary_preload,
                 nr_hit_summary_taxid,
                 cleanup_tasks,
                 cleanup_receivers,
@@ -8605,7 +8602,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_m8_merge,
         _nr_m8_map,
         nr_hit_summary_merge,
-        nr_hit_summary_preload,
         nr_hit_summary_taxid,
         nr_cleanup_tasks,
         nr_cleanup_receivers,
