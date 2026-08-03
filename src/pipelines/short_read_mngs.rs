@@ -3608,15 +3608,33 @@ async fn generate_annotated_fasta_stream(
 
                     match tag {
                         0 => {
-                            let _ = mapped_tx.send(out_item).await;
+                            mapped_tx
+                                .send(out_item)
+                                .await
+                                .map_err(|_| anyhow!(
+                                "generate_annotated_fasta_stream: mapped_tx closed (consumer dropped)"
+                            ))?;
                         }
                         1 => {
-                            let _ = unid_tx.send(out_item).await;
+                            unid_tx
+                                .send(out_item)
+                                .await
+                                .map_err(|_| anyhow!(
+                                "generate_annotated_fasta_stream: unid_tx closed (consumer dropped)"
+                            ))?;
                         }
                         2 => {
-                            let _ = uniq_tx.send(out_item).await;
+                            uniq_tx
+                                .send(out_item)
+                                .await
+                                .map_err(|_| anyhow!(
+                                "generate_annotated_fasta_stream: uniq_tx closed (consumer dropped)"
+                            ))?;
                         }
-                        _ => warn!("Unknown tag in generate_annotated_fasta_stream: {}", tag),
+                        _ => warn!(
+                        "Unknown tag in generate_annotated_fasta_stream: {}",
+                        tag
+                    ),
                     }
                 }
             }
