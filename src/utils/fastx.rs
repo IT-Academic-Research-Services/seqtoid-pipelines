@@ -1910,95 +1910,117 @@ pub async fn generate_taxid_locator(
     (
         Vec<PathBuf>,
         Vec<JoinHandle<Result<()>>>,
-        Vec<Receiver<Result<()>>>,
+        Vec<oneshot::Receiver<Result<()>>>,
     ),
     PipelineError,
 > {
-    let concurrency =
-        compute_phase_concurrency(&config, "generate_taxid_locator", 0.5, 4.0, 128, 16);
+    info!("generate_taxid_locator starting");
+
+    // ── 1. Drain full input once (Python reads one FA per field; we reuse one buffer) ──
+    let mut records: Vec<(String, String)> = Vec::with_capacity(100_000);
+    let mut stream = ReceiverStream::new(fasta_stream_rx);
+
+    while let Some(item) = stream.next().await {
+        match item {
+            ParseOutput::Fasta(rec) => {
+                let header = rec.id().to_string();
+                let seq = String::from_utf8(rec.seq().to_vec()).map_err(|e| {
+                    PipelineError::Other(anyhow!("Invalid UTF-8 in sequence: {}", e))
+                })?;
+                records.push((header, seq));
+            }
+            ParseOutput::Bytes(b) => {
+                // Tolerate byte-oriented fanout: expect full FASTA text chunks is unsafe;
+                // only accept if you know upstream converted one-record-per-item.
+                // Prefer Fasta. Skip opaque bytes to avoid corrupt locators.
+                warn!(
+                    "generate_taxid_locator: skipping Bytes item ({} bytes); pass ParseOutput::Fasta",
+                    b.len()
+                );
+            }
+            other => {
+                warn!(
+                    "generate_taxid_locator: unexpected item {:?}",
+                    other
+                );
+            }
+        }
+    }
+
     info!(
-        "generate_taxid_locator starting — {} output workers",
-        concurrency
+        "generate_taxid_locator collected {} records",
+        records.len()
     );
 
-    let levels = vec!["species", "genus", "family"];
-    let hit_types = vec!["NT", "NR"];
+    let levels = ["species", "genus", "family"];
+    let hit_types = ["NT", "NR"];
+    let records = Arc::new(records);
 
-    let mut output_paths = Vec::new();
-    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-    let mut record_channels = Vec::new(); // (taxid_field, sender)
+    let mut output_paths: Vec<PathBuf> = Vec::with_capacity(13);
+    let mut handles: Vec<JoinHandle<Result<()>>> = Vec::with_capacity(6);
 
-    // Create one channel + one task per output type (8 total)
-    for level in levels.iter() {
-        for hit_type in hit_types.iter() {
-            let level_owned = level.to_string();
-            let hit_type_owned = hit_type.to_string();
-            let taxid_field = format!("{}_{}", level_owned, hit_type_owned.to_lowercase());
+    // ── 2. One worker per (level, hit_type) — every record appears in every FA (Python) ──
+    for level in levels {
+        for hit_type in hit_types {
+            let taxid_field = format!("{}_{}", level, hit_type.to_lowercase());
 
-            let fa_name = if level_owned == "species" {
+            let fa_name = if level == "species" {
                 format!(
                     "refined_taxid_annot_sorted_{}.fasta",
-                    hit_type_owned.to_lowercase()
+                    hit_type.to_lowercase()
                 )
             } else {
                 format!(
                     "refined_taxid_annot_sorted_{}_{}.fasta",
-                    level_owned,
-                    hit_type_owned.to_lowercase()
+                    level,
+                    hit_type.to_lowercase()
                 )
             };
             let fa_path = assembly_dir.join(&fa_name);
             let json_path = assembly_dir.join(format!(
                 "refined_taxid_locations_{}_{}.json",
-                level_owned,
-                hit_type_owned.to_lowercase()
+                level,
+                hit_type.to_lowercase()
             ));
 
             output_paths.push(fa_path.clone());
             output_paths.push(json_path.clone());
 
-            let (tx, rx) = mpsc::channel::<(String, String)>(32768);
+            let records = records.clone();
+            let taxid_field = taxid_field.clone();
+            let hit_type = hit_type.to_string();
 
-            // Clone what the worker needs before moving into closure
-            let taxid_field_for_worker = taxid_field.clone();
-            let hit_type_for_worker = hit_type_owned.clone();
-            let fa_path_for_worker = fa_path.clone();
-            let json_path_for_worker = json_path.clone();
-
-            let task = tokio::spawn(async move {
-                let mut records_by_taxid: AHashMap<i32, Vec<(String, String)>> = AHashMap::new();
-
-                let mut rx = rx;
-                while let Some((header, seq)) = rx.recv().await {
-                    let taxid = get_taxid(&header, &taxid_field_for_worker).unwrap_or(-1);
-                    records_by_taxid
-                        .entry(taxid)
-                        .or_default()
-                        .push((header, seq));
+            handles.push(tokio::task::spawn_blocking(move || {
+                // Group by taxid for this field (Python: sort by that key, then scan)
+                let mut by_taxid: AHashMap<i32, Vec<usize>> = AHashMap::new();
+                for (idx, (header, _)) in records.iter().enumerate() {
+                    let taxid = get_taxid(header, &taxid_field).unwrap_or(-1);
+                    by_taxid.entry(taxid).or_default().push(idx);
                 }
 
-                if records_by_taxid.is_empty() {
-                    std::fs::write(&fa_path_for_worker, b"")?;
-                    std::fs::write(&json_path_for_worker, b"[]")?;
-                    debug!("Empty output written: {}", fa_path_for_worker.display());
+                if by_taxid.is_empty() {
+                    std::fs::write(&fa_path, b"")?;
+                    std::fs::write(&json_path, b"[]")?;
                     return Ok(());
                 }
 
-                let mut sorted_taxids: Vec<i32> = records_by_taxid.keys().copied().collect();
-                sorted_taxids.sort();
+                let mut sorted_taxids: Vec<i32> = by_taxid.keys().copied().collect();
+                sorted_taxids.sort_unstable();
 
-                let file = std::fs::File::create(&fa_path_for_worker)
-                    .map_err(|e| anyhow!("create {}: {}", fa_path_for_worker.display(), e))?;
+                let file = std::fs::File::create(&fa_path)
+                    .map_err(|e| anyhow!("create {}: {}", fa_path.display(), e))?;
                 let mut writer = std::io::BufWriter::with_capacity(32 * 1024 * 1024, file);
 
                 let mut pos: u64 = 0;
-                let mut locations = Vec::with_capacity(records_by_taxid.len());
+                let mut locations = Vec::with_capacity(sorted_taxids.len());
 
                 for taxid in sorted_taxids {
-                    let recs = records_by_taxid.get(&taxid).unwrap();
+                    let idxs = by_taxid.get(&taxid).unwrap();
                     let start = pos;
 
-                    for (header, seq) in recs {
+                    for &idx in idxs {
+                        let (header, seq) = &records[idx];
+                        // Two-line FASTA records; header id without leading '>'
                         writer.write_all(b">")?;
                         writer.write_all(header.as_bytes())?;
                         writer.write_all(b"\n")?;
@@ -2013,59 +2035,37 @@ pub async fn generate_taxid_locator(
                         taxid,
                         first_byte: start,
                         last_byte: pos.saturating_sub(1),
-                        hit_type: hit_type_for_worker.clone(),
+                        hit_type: hit_type.clone(),
                     });
                 }
 
                 writer
                     .flush()
-                    .map_err(|e| anyhow!("flush {}: {}", fa_path_for_worker.display(), e))?;
+                    .map_err(|e| anyhow!("flush {}: {}", fa_path.display(), e))?;
 
-                let json_bytes = serde_json::to_vec(&locations)?;
-                std::fs::write(&json_path_for_worker, json_bytes)?;
+                let json_bytes = serde_json::to_vec(&locations)
+                    .map_err(|e| anyhow!("json {}: {}", json_path.display(), e))?;
+                std::fs::write(&json_path, json_bytes)
+                    .map_err(|e| anyhow!("write {}: {}", json_path.display(), e))?;
 
                 info!(
                     "Wrote {} ({} taxids, {} records)",
-                    fa_path_for_worker.display(),
+                    fa_path.display(),
                     locations.len(),
-                    records_by_taxid.values().map(|v| v.len()).sum::<usize>()
+                    records.len()
                 );
                 Ok(())
-            });
-
-            tasks.push(task);
-            record_channels.push((taxid_field, tx));
+            }));
         }
     }
 
-    // Stream parsing + selective broadcast
-    let mut fasta_stream = ReceiverStream::new(fasta_stream_rx);
-    while let Some(item) = fasta_stream.next().await {
-        if let ParseOutput::Fasta(rec) = item {
-            let header = rec.id().to_string();
-            let seq = String::from_utf8(rec.seq().to_vec())
-                .map_err(|e| anyhow!("Invalid UTF-8 in sequence: {}", e))?;
-
-            // Send only to channels where this header has a valid taxid for that field
-            for (field, tx) in &record_channels {
-                if get_taxid(&header, field).unwrap_or(-1) != -1 {
-                    let _ = tx.send((header.clone(), seq.clone())).await;
-                }
-            }
-        }
+    for h in handles {
+        h.await
+            .map_err(|e| PipelineError::Other(anyhow!("locator worker panicked: {e}")))?
+            .map_err(|e| PipelineError::Other(e))?;
     }
 
-    // Close all channels
-    for (_, tx) in record_channels {
-        drop(tx);
-    }
-
-    // Wait for all workers
-    for task in tasks {
-        task.await??;
-    }
-
-    // Combine JSON locators
+    // ── 3. Combined JSON (Python combine_json) ──
     let json_paths: Vec<PathBuf> = output_paths
         .iter()
         .filter(|p| p.extension().map_or(false, |e| e == "json"))
@@ -2073,11 +2073,12 @@ pub async fn generate_taxid_locator(
         .collect();
 
     let combined_path = assembly_dir.join("refined_taxid_locations_combined.json");
-    combine_taxon_loc_json(json_paths, combined_path.clone())?;
-
+    combine_taxon_loc_json(json_paths, combined_path.clone())
+        .map_err(|e| PipelineError::Other(e))?;
     output_paths.push(combined_path);
 
     info!("generate_taxid_locator complete");
+    // Work finished inline — no leftover tasks/receivers
     Ok((output_paths, vec![], vec![]))
 }
 
