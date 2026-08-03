@@ -4986,10 +4986,6 @@ pub async fn update_read_dict(
                     );
                     batch.contig2lineage_lines.push(lineage_line.into_bytes());
 
-                    let mut m8_line = m8_row.to_tab_string();
-                    m8_line.push('\n');
-                    let m8_bytes = m8_line.into_bytes();
-
                     for read_id in read_ids {
                         if let Some(existing) = existing_reads.get(read_id) {
                             let mut hit: ReadHit = (**existing).clone();
@@ -5021,7 +5017,12 @@ pub async fn update_read_dict(
                             batch.added.push((read_id.clone(), Arc::new(hit)));
                         }
 
-                        batch.read2blastm8_lines.push(m8_bytes.clone());
+                        // Key = read_id so generate_m8 can join to original call_hits m8
+                        let mut m8_for_read = m8_row.clone();
+                        m8_for_read.qname = read_id.clone();
+                        let mut m8_line = m8_for_read.to_tab_string();
+                        m8_line.push('\n');
+                        batch.read2blastm8_lines.push(m8_line.into_bytes());
                     }
 
                     batch
@@ -5321,7 +5322,8 @@ async fn generate_m8_and_hit_summary(
     refined_m8_tx: Sender<ParseOutput>,
     refined_hit_summary_tx: Sender<ParseOutput>,
 ) -> Result<()> {
-    // Drain all inputs concurrently.
+    info!("[generate_m8_and_hit_summary] collecting inputs (5 streams)");
+
     let updated_fut = collect_line_map(updated_reads_stream);
     let added_fut = collect_line_map(added_reads_stream);
     let blast_hits_fut = collect_line_map(blast_hits_stream);
@@ -5331,7 +5333,7 @@ async fn generate_m8_and_hit_summary(
     let (
         (updated_reads, _updated_order),
         (added_reads, added_order),
-        (blast_hits, blast_order),
+        (blast_hits, _blast_order),
         (original_hit_rows, original_hit_order),
         (original_m8_rows, original_m8_order),
     ) = tokio::try_join!(
@@ -5342,7 +5344,18 @@ async fn generate_m8_and_hit_summary(
         m8_rows_fut
     )?;
 
-    // Original IDs for append checks.
+    let original_hit_map: AHashMap<String, Bytes> = original_hit_rows.into_iter().collect();
+    let original_m8_map: AHashMap<String, Bytes> = original_m8_rows.into_iter().collect();
+
+    info!(
+        "[generate_m8_and_hit_summary] collected: updated={} added={} blast_hits={} orig_hit={} orig_m8={}",
+        updated_reads.len(),
+        added_reads.len(),
+        blast_hits.len(),
+        original_hit_map.len(),
+        original_m8_map.len()
+    );
+
     let original_hit_ids: HashSet<String> = original_hit_order.iter().cloned().collect();
     let original_m8_ids: HashSet<String> = original_m8_order.iter().cloned().collect();
 
@@ -5351,84 +5364,119 @@ async fn generate_m8_and_hit_summary(
     let (rewritten_m8, rewritten_hit_summary) = thread_pool.install(|| {
         rayon::join(
             || {
-                original_m8_rows
+                original_m8_order
                     .par_iter()
-                    .map(|(qseqid, row)| {
+                    .filter_map(|read_id| {
                         blast_hits
-                            .get(qseqid)
+                            .get(read_id)
                             .cloned()
-                            .unwrap_or_else(|| row.clone())
+                            .or_else(|| original_m8_map.get(read_id).cloned())
                     })
                     .collect::<Vec<Bytes>>()
             },
             || {
-                original_hit_rows
+                original_hit_order
                     .par_iter()
-                    .map(|(read_id, row)| {
+                    .filter_map(|read_id| {
                         updated_reads
                             .get(read_id)
                             .or_else(|| added_reads.get(read_id))
                             .cloned()
-                            .unwrap_or_else(|| row.clone())
+                            .or_else(|| original_hit_map.get(read_id).cloned())
                     })
                     .collect::<Vec<Bytes>>()
             },
         )
     });
 
-    // Emit M8.
+    info!(
+        "[generate_m8_and_hit_summary] rewrite done: m8={} hit={}",
+        rewritten_m8.len(),
+        rewritten_hit_summary.len()
+    );
+
+    // m8 append only for added_reads (new_read_ids)
     let m8_tx = refined_m8_tx;
+    let blast_hits_m8 = blast_hits.clone();
+    let added_order_m8 = added_order.clone();
+    let original_m8_ids_m8 = original_m8_ids;
     let m8_send = async move {
+        let mut emitted = 0usize;
         for row in rewritten_m8 {
             m8_tx
                 .send(ParseOutput::Bytes(row))
                 .await
                 .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+            emitted += 1;
+            if emitted % 100_000 == 0 {
+                info!("[generate_m8_and_hit_summary] m8 emit progress {}", emitted);
+            }
         }
 
-        // Append blast rows that were not present in the original deduped M8.
-        for read_id in blast_order {
-            if !original_m8_ids.contains(&read_id) {
-                if let Some(row) = blast_hits.get(&read_id) {
+        let mut appended = 0usize;
+        for read_id in &added_order_m8 {
+            if !original_m8_ids_m8.contains(read_id) {
+                if let Some(row) = blast_hits_m8.get(read_id) {
                     m8_tx
                         .send(ParseOutput::Bytes(row.clone()))
                         .await
                         .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+                    appended += 1;
                 }
             }
         }
 
+        info!(
+            "[generate_m8_and_hit_summary] m8 emit done: rewritten_path={} appended={}",
+            emitted, appended
+        );
         drop(m8_tx);
         Ok::<(), anyhow::Error>(())
     };
 
-    // Emit hit summary.
+    // hit append only for added_reads
     let hit_tx = refined_hit_summary_tx;
+    let added_reads_hit = added_reads;
+    let added_order_hit = added_order;
     let hit_send = async move {
+        let mut emitted = 0usize;
         for row in rewritten_hit_summary {
             hit_tx
                 .send(ParseOutput::Bytes(row))
                 .await
                 .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+            emitted += 1;
+            if emitted % 100_000 == 0 {
+                info!(
+                    "[generate_m8_and_hit_summary] hit emit progress {}",
+                    emitted
+                );
+            }
         }
 
-        // Append added reads that were not already in the original hit summary.
-        for read_id in added_order {
-            if !original_hit_ids.contains(&read_id) {
-                if let Some(row) = added_reads.get(&read_id) {
+        let mut appended = 0usize;
+        for read_id in &added_order_hit {
+            if !original_hit_ids.contains(read_id) {
+                if let Some(row) = added_reads_hit.get(read_id) {
                     hit_tx
                         .send(ParseOutput::Bytes(row.clone()))
                         .await
                         .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+                    appended += 1;
                 }
             }
         }
 
+        info!(
+            "[generate_m8_and_hit_summary] hit emit done: rewritten_path={} appended={}",
+            emitted, appended
+        );
         drop(hit_tx);
         Ok::<(), anyhow::Error>(())
     };
 
     tokio::try_join!(m8_send, hit_send)?;
+    info!("[generate_m8_and_hit_summary] complete");
     Ok(())
 }
 
@@ -6348,108 +6396,6 @@ async fn blast_contigs(
 }
 
 
-/// Preloads NR alignments from a hit-summary stream into a shared map.
-///
-/// # Arguments
-///
-/// * `config`: the run configuration
-/// * `preload_rx`: receiver for hit summary records
-/// * `nr_alignment_per_read`: shared map to populate with NR alignment results
-///
-/// # Returns
-///
-/// Result<()>: success or error
-async fn preload_nr_alignments_parallel(
-    config: Arc<RunConfig>,
-    preload_rx: mpsc::Receiver<ParseOutput>,
-    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
-) -> Result<()> {
-    let concurrency = compute_phase_concurrency(
-        &config,
-        "nr_preload_alignments",
-        0.3, // tiny RAM per worker
-        2.0, // almost pure parse+insert
-        128, // safe even on 256-core EPYC
-        8,
-    );
-
-    let batch_size = compute_batch_size(None, 180, 200, concurrency);
-
-    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-    let mut workers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let rx = Arc::clone(&shared_rx);
-        let map = Arc::clone(&nr_alignment_per_read);
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let batch = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-                let Some(batch) = batch else { break };
-
-                batch.par_iter().for_each(|line| {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        return;
-                    }
-
-                    let fields: Vec<&str> = trimmed.split('\t').collect();
-                    if fields.len() < 10 {
-                        return;
-                    }
-
-                    let read_id = fields[0].to_string();
-                    let contig_taxid = fields[9].parse::<Taxid>().ok();
-                    let read_taxid = fields[3].parse::<Taxid>().ok();
-
-                    map.insert(
-                        read_id,
-                        SpeciesAlignmentResults {
-                            contig: contig_taxid,
-                            read: read_taxid,
-                        },
-                    );
-                });
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        workers.push(handle);
-    }
-
-    // Producer (same lockstep style as all your other high-throughput stages)
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut stream = ReceiverStream::new(preload_rx);
-    while let Some(item) = stream.next().await {
-        if let ParseOutput::Bytes(b) = item {
-            let line = String::from_utf8_lossy(&b).trim_end().to_string();
-            if !line.is_empty() {
-                batch.push(line);
-            }
-        }
-        if batch.len() >= batch_size {
-            let _ = job_tx.send(std::mem::take(&mut batch)).await;
-        }
-    }
-    if !batch.is_empty() {
-        let _ = job_tx.send(batch).await;
-    }
-    drop(job_tx);
-
-    for h in workers {
-        h.await??;
-    }
-
-    info!(
-        "Preloaded {} NR alignments (parallel, {} workers)",
-        nr_alignment_per_read.len(),
-        concurrency
-    );
-    Ok(())
-}
 
 /// Resolve the production MMseqs database path once and reuse it everywhere.
 fn resolve_mmseqs_db_path(config: &RunConfig) -> Result<PathBuf, PipelineError> {
