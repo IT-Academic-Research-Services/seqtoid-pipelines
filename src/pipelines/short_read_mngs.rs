@@ -6718,6 +6718,28 @@ async fn mmseqs_non_host_align(
     Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
 
+/// Refined m8 → qseqid → sseqid (Python get_map on reassigned m8).
+async fn collect_m8_accession_map(
+    mut stream: ReceiverStream<ParseOutput>,
+) -> Result<AHashMap<String, String>> {
+    let mut map = AHashMap::with_capacity(1_000_000);
+    while let Some(item) = stream.next().await {
+        let Ok(bytes) = item.to_bytes() else { continue };
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let Some(q) = fields.next() else { continue };
+        let Some(s) = fields.next() else { continue };
+        if !s.is_empty() && s != "-" {
+            map.insert(q.to_string(), s.to_string());
+        }
+    }
+    info!("collect_m8_accession_map → {} entries", map.len());
+    Ok(map)
+}
 
 /// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
 ///
@@ -8296,12 +8318,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         PipelineError::Other(anyhow!("NR blast_contigs postprocess task panicked: {e}"))
     })??;
 
+
+
+
     let (
         _nt_read_dict,
         nt_refined_counts,
         nt_contig_summary,
         nt_m8_merge,
-        _nt_m8_map,
+        nt_m8_map, // was _nt_m8_map — must be drained
         nt_m8_viz,
         nt_hit_summary_merge,
         nt_hit_summary_taxid,
@@ -8319,7 +8344,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_refined_counts,
         nr_contig_summary,
         nr_m8_merge,
-        _nr_m8_map,
+        nr_m8_map, // was _nr_m8_map — must be drained
         nr_hit_summary_merge,
         nr_hit_summary_taxid,
         nr_cleanup_tasks,
@@ -8329,8 +8354,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(nr_cleanup_tasks);
     temp_files.extend(nr_temp_files);
 
-    // or is nt_blast_stream done here?
-
     for rx in nt_cleanup_receivers {
         rx.await??;
     }
@@ -8338,13 +8361,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         rx.await??;
     }
 
-    // 2. Now safe to await the big summary fanout
-    //    (because blast_hit branch has finished)
     nt_summary_done_rx.await??;
     nr_summary_done_rx.await??;
 
-    // 3. Now safe to await call_hits_m8 internal fanouts
-    //    (their outputs were consumed by nt_call + nt_call_summary fanouts)
     for rx in nt_call_cleanup_receivers {
         rx.await??;
     }
@@ -8352,11 +8371,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         rx.await??;
     }
 
-
-    // ────────────────────────────────────────────────────────────────
-    // Spawn merged taxon counts (unchanged except we await preload first)
-    // ────────────────────────────────────────────────────────────────
-    let merged_cleanup_tasks = compute_merged_taxon_counts(
+    // Merge + accession maps from refined m8 (parallel). Not HitSummary.
+    let merged_fut = compute_merged_taxon_counts(
         config.clone(),
         nt_m8_merge,
         nt_hit_summary_merge,
@@ -8371,10 +8387,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("refined.hitsummary.tab"),
         out_dir.join("refined_taxon_counts_with_dcr.json"),
         out_dir.join("assembly_combined_contig_summary.json"),
-    )
-        .await?;
-    cleanup_tasks.extend(merged_cleanup_tasks);
+    );
 
+    let (merged_cleanup_tasks, nt_refined_map, nr_refined_map) = tokio::try_join!(
+    merged_fut,
+    async {
+        collect_m8_accession_map(ReceiverStream::new(nt_m8_map))
+            .await
+            .map_err(|e| PipelineError::Other(e))
+    },
+    async {
+        collect_m8_accession_map(ReceiverStream::new(nr_m8_map))
+            .await
+            .map_err(|e| PipelineError::Other(e))
+    },
+)?;
+    cleanup_tasks.extend(merged_cleanup_tasks);
 
     let refined_combined_path = out_dir.join(rename_file_path(
         &sample_base_buf,
@@ -8387,61 +8415,72 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &nr_refined_counts,
         refined_combined_path,
     )
-    .await
-    .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
     cleanup_tasks.push(refined_write_json_task);
 
-    // ────────────────────────────────────────────────────────────────
-    // NEW: Build tiny contig-level maps for the REFINED path
-    // ────────────────────────────────────────────────────────────────
-    let (nt_refined_map, nr_refined_map) = tokio::try_join!(
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nt_hit_summary_for_refined),
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nr_hit_summary_for_refined)
-    )?;
-
-    // Contig FASTA stream (from assembly)
-    // ───────────────────────────────────────────────────────────────
-    let contigs_fasta = assembly_outputs.contigs_fasta.clone();
-    let contigs_file = tokio::fs::File::open(&contigs_fasta)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
-
-    let contigs_rx = parse_bytes::<TokioFile>(contigs_file, &config, StreamDataType::JustBytes)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("parse_bytes failed: {}", e)))?;
-
-    let contigs_stream = ReceiverStream::new(contigs_rx);
-
-    // Empty cluster stream (contigs have no duplicates)
-    let (_cluster_tx, _cluster_rx) = mpsc::channel::<ParseOutput>(1);
-    drop(_cluster_tx);
+    // Old call_hits HitSummary "for_refined" branches — drain if unused elsewhere
+    tokio::spawn(async move {
+        let mut s = nt_hit_summary_for_refined;
+        while s.next().await.is_some() {}
+    });
+    tokio::spawn(async move {
+        let mut s = nr_hit_summary_for_refined;
+        while s.next().await.is_some() {}
+    });
 
     let assembly_dir = out_dir.join("assembly");
     tokio::fs::create_dir_all(&assembly_dir)
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
 
-    let nr_annot_concurrency =
-        compute_phase_concurrency(&config, "nr_annot_concurrency", 0.4, 4.0, 128, 8);
+    // Non-host READS (WDL host_filter), not contigs. Same open path as contigs.
+    let nonhost_path = out_dir.join("nonhost_R1.fastq");
+    let nonhost_file = tokio::fs::File::open(&nonhost_path)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!("Failed to open nonhost_R1.fastq: {}", e))
+        })?;
+
+    let nonhost_rx = parse_bytes::<TokioFile>(nonhost_file, &config, StreamDataType::JustBytes)
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("parse_bytes nonhost failed: {}", e)))?;
+
+    let nonhost_stream = ReceiverStream::new(nonhost_rx);
+
+    let annot_concurrency =
+        compute_phase_concurrency(&config, "refined_annotate", 0.4, 4.0, 128, 8);
 
     let (
         mapped_contigs_rx,
         unidentified_contigs_rx,
-        _unique_unidentified_rx,
+        unique_unidentified_rx,
         mut annot_tasks,
         mut annot_rxs,
     ) = generate_annotated_fasta_stream(
         config.clone(),
-        contigs_stream,
+        nonhost_stream,
         duplicate_clusters.clone(),
-        nt_refined_map, // tiny contig → NT accession
-        nr_refined_map, // tiny contig → NR accession
-        nr_annot_concurrency,
+        nt_refined_map,
+        nr_refined_map,
+        annot_concurrency,
     )
-    .await
-    .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e))
+        })?;
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
+
+    let unique_path = assembly_dir.join("unique_refined_unidentified.fa");
+    let unique_write = write_fasta_stream_to_file(
+        ReceiverStream::new(unique_unidentified_rx),
+        unique_path,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "unique_refined_unidentified",
+    );
+    cleanup_tasks.push(unique_write);
 
     let (taxid_mapped_rx, taxid_combined_rx, load_nt_task, load_nr_task, taxid_main_task) =
         generate_taxid_fasta(
@@ -8452,12 +8491,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ReceiverStream::new(nr_hit_summary_taxid),
             lineage_map.clone(),
         )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
 
     cleanup_tasks.push(load_nt_task);
     cleanup_tasks.push(load_nr_task);
     cleanup_tasks.push(taxid_main_task);
+
+
 
     let (taxid_mapped_rxs, taxid_mapped_done_rx) = fanout_to_channels(
         ReceiverStream::new(taxid_mapped_rx),
