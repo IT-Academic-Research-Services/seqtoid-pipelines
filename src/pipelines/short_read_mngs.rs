@@ -8498,7 +8498,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nr_contig_summary,
                 nr_refined_m8_stream_out,
                 nr_refined_hit_summary_stream_out,
-                _nr_refined_m8_top_stream_out,
+                nr_refined_m8_top_stream_out,
                 nr_cleanup_tasks,
                 nr_cleanup_receivers,
                 nr_temp_files,
@@ -8507,6 +8507,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut cleanup_tasks = nr_cleanup_tasks;
             let mut cleanup_receivers = nr_cleanup_receivers;
             let temp_files = nr_temp_files;
+
+
+            // Immediate drain for nr_refined_m8_top_stream_out. Unused on NR side.
+            tokio::spawn(async move {
+                let mut rx = ReceiverStream::new(nr_refined_m8_top_stream_out);
+                let mut n = 0u64;
+                while let Some(_) = rx.next().await {
+                    n += 1;
+                }
+                info!("[nr] drained {} top m8 lines (unused)", n);
+            });
 
             let (nr_m8_rxs, nr_m8_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nr_refined_m8_stream_out),
