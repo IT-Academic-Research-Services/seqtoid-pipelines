@@ -40,7 +40,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 use twox_hash::XxHash64;
@@ -5459,7 +5459,7 @@ async fn early_blast_exit(
     Vec<ContigSummaryEntry>,
     mpsc::Receiver<ParseOutput>,
     mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
+    mpsc::UnboundedReceiver<ParseOutput>,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
@@ -5490,7 +5490,7 @@ async fn early_blast_exit(
     let final_read_dict = read_dict.lock().unwrap().clone();
     let (_m8_tx, m8_rx) = mpsc::channel(1);
     let (_hit_tx, hit_rx) = mpsc::channel(1);
-    let (_top_tx, top_rx) = mpsc::channel(1);
+    let (_top_tx, top_rx) = mpsc::unbounded_channel();
 
     info!(
         "[blast_contigs:{}] empty-output fast path complete after {:?}",
@@ -5556,7 +5556,7 @@ async fn blast_contigs(
     Vec<ContigSummaryEntry>,
     mpsc::Receiver<ParseOutput>,
     mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
+    mpsc::UnboundedReceiver<ParseOutput>,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
     Vec<NamedTempFile>,
@@ -5821,7 +5821,7 @@ async fn blast_contigs(
     // ────────────────────────────────────────────────
     let (top_internal_tx, top_internal_rx) = mpsc::channel(1024);
     let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
-    let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
+    let (top_for_caller_tx, top_for_caller_rx) = mpsc::unbounded_channel();
 
     info!(
         "[blast_contigs:{}] top-hits fanout channels created (1024 each)",
@@ -5923,23 +5923,24 @@ async fn blast_contigs(
                 let update_send_start = Instant::now();
                 if tx_update.send(item.clone()).await.is_err() {
                     warn!(
-                        "[blast_contigs:{}] top forward: update branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
-                    );
+                    "[blast_contigs:{}] top forward: update branch dropped at item {} after {:?}",
+                    db_type,
+                    total,
+                    start.elapsed()
+                );
                     break;
                 }
                 let update_wait = update_send_start.elapsed();
 
+                // UnboundedSender::send is sync — never blocks the top pipeline
                 let caller_send_start = Instant::now();
-                if tx_caller.send(item).await.is_err() {
+                if tx_caller.send(item).is_err() {
                     warn!(
-                        "[blast_contigs:{}] top forward: caller branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
-                    );
+                    "[blast_contigs:{}] top forward: caller branch dropped at item {} after {:?}",
+                    db_type,
+                    total,
+                    start.elapsed()
+                );
                     break;
                 }
                 let caller_wait = caller_send_start.elapsed();
@@ -5949,23 +5950,23 @@ async fn blast_contigs(
                     || last_log.elapsed() >= Duration::from_secs(10)
                 {
                     info!(
-                        "[blast_contigs:{}] top forward progress: total={} update_wait={:?} caller_wait={:?} elapsed={:?}",
-                        db_type,
-                        total,
-                        update_wait,
-                        caller_wait,
-                        start.elapsed()
-                    );
+                    "[blast_contigs:{}] top forward progress: total={} update_wait={:?} caller_wait={:?} elapsed={:?}",
+                    db_type,
+                    total,
+                    update_wait,
+                    caller_wait,
+                    start.elapsed()
+                );
                     last_log = Instant::now();
                 }
             }
 
             info!(
-                "[blast_contigs:{}] top forward complete: total={} elapsed={:?}",
-                db_type,
-                total,
-                start.elapsed()
-            );
+            "[blast_contigs:{}] top forward complete: total={} elapsed={:?}",
+            db_type,
+            total,
+            start.elapsed()
+        );
 
             Ok::<(), anyhow::Error>(())
         }
@@ -8511,7 +8512,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
             // Immediate drain for nr_refined_m8_top_stream_out. Unused on NR side.
             tokio::spawn(async move {
-                let mut rx = ReceiverStream::new(nr_refined_m8_top_stream_out);
+                let mut rx = UnboundedReceiverStream::new(nr_refined_m8_top_stream_out);
                 let mut n = 0u64;
                 while let Some(_) = rx.next().await {
                     n += 1;
@@ -8966,7 +8967,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Some(tokio::spawn(async move {
             generate_coverage_viz(
                 ReceiverStream::new(nt_hit_summary_coverage),
-                ReceiverStream::new(nt_refined_m8_top_stream_out),
+                UnboundedReceiverStream::new(nt_refined_m8_top_stream_out),
                 coverage_json_path,
                 assembly_outputs.contig_stats_json,
                 ReceiverStream::new(nt_m8_viz),

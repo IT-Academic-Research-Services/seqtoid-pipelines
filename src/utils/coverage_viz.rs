@@ -12,7 +12,7 @@ use log::{self, warn};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
 use crate::utils::blast::M8Record;
 use crate::utils::streams::{ParseOutput, ToBytes};
@@ -103,7 +103,7 @@ struct CoverageBin {
 
 pub async fn generate_coverage_viz(
     refined_gsnap_hitsummary2_tab: ReceiverStream<ParseOutput>,
-    refined_gsnap_blast_top_m8: ReceiverStream<ParseOutput>,
+    refined_gsnap_blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     contig_coverage_json: PathBuf,
     contig_stats_json: PathBuf,
     gsnap_deduped_m8: ReceiverStream<ParseOutput>,
@@ -168,7 +168,7 @@ pub async fn generate_coverage_viz(
 
 async fn prepare_data(
     hit_summary: ReceiverStream<ParseOutput>,
-    blast_top_m8: ReceiverStream<ParseOutput>,
+    blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     contig_coverage_json: &Path,
     contig_stats_json: &Path,
     gsnap_deduped_m8: ReceiverStream<ParseOutput>,
@@ -335,7 +335,7 @@ fn get_unassigned_reads_set(accession_data: &HashMap<String, AccessionData>) -> 
 }
 
 async fn generate_contig_data(
-    mut blast_top_m8: ReceiverStream<ParseOutput>,
+    mut blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     valid_contigs: &HashMap<String, u64>,
 ) -> Result<HashMap<String, Vec<ContigHit>>> {
     let mut contig_data: HashMap<String, Vec<ContigHit>> = HashMap::new();
