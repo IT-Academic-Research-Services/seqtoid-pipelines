@@ -40,6 +40,7 @@ use tokio_stream::Stream;
 use crate::config::defs::{
     ClusterInfo, Lineage, PipelineError, ReadCountingMode, RunConfig, SimdLevel, StreamDataType,
     Taxid, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, READ_COUNTING_MODE, SIMD_LEVEL, SORT_TAG,
+    ReducedRead
 };
 use crate::utils::command::generate_cli;
 use crate::utils::file::{choose_temp_dir, rename_file_path, write_byte_stream_to_file};
@@ -88,14 +89,6 @@ pub struct M8Record {
     pub slen: u64, // Subject length: From column in NT; 0 in NR (unused entirely)
 }
 
-/// Internal structure for grouped batch processing of read hits.
-#[derive(Debug, Clone)]
-pub struct ReducedRead {
-    pub seq: u64,
-    pub dedup: Vec<u8>,
-    pub summary: Vec<u8>,
-    pub accession: String,
-}
 
 /// Holds hits for a read that are waiting to be processed as a group.
 #[derive(Debug)]
@@ -1022,8 +1015,7 @@ pub async fn call_hits_m8(
     tag: String,
 ) -> Result<
     (
-        ReceiverStream<ParseOutput>, // dedup m8 stream
-        ReceiverStream<ParseOutput>, // summary stream
+        ReceiverStream<ReducedRead>, // paired dedup m8 + hitsummary
         Vec<tokio::task::JoinHandle<Result<()>>>,
         Vec<oneshot::Receiver<Result<()>>>,
     ),
@@ -1031,15 +1023,16 @@ pub async fn call_hits_m8(
 > {
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
+    let cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
 
     info!(
-        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
+        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={} (ReducedRead pairs)",
         tag, worker_count, min_aln_len
     );
 
-    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
-    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+    // Single channel: association never leaves the struct.
+    let (pair_tx, mut pair_rx) =
+        mpsc::channel::<ReducedRead>(config.base_buffer_size * 256);
 
     #[derive(Debug)]
     enum WorkerMsgLocal {
@@ -1051,6 +1044,7 @@ pub async fn call_hits_m8(
     }
 
     let mut worker_txs: Vec<mpsc::Sender<WorkerMsgLocal>> = Vec::with_capacity(worker_count);
+    let seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     for worker_idx in 0..worker_count {
         let (worker_tx, mut worker_rx) =
@@ -1060,13 +1054,13 @@ pub async fn call_hits_m8(
         let lineage_map = lineage_map.clone();
         let acc2taxid_map = acc2taxid_map.clone();
         let should_keep_filter = should_keep_filter.clone();
-        let dedup_tx = dedup_tx.clone();
-        let summary_tx = summary_tx.clone();
+        let pair_tx = pair_tx.clone();
+        let seq_counter = seq_counter.clone();
         let worker_tag = tag.clone();
 
         let worker_handle = tokio::spawn(async move {
             debug!(
-                "[call_hits_m8:{}] worker {} started (streaming mode)",
+                "[call_hits_m8:{}] worker {} started (ReducedRead mode)",
                 worker_tag, worker_idx
             );
 
@@ -1074,8 +1068,11 @@ pub async fn call_hits_m8(
                 match msg {
                     WorkerMsgLocal::ProcessRead { read_id, hits } => {
                         let log_misses = worker_tag == "nr";
-                        let reduced = summarize_m8_hits(
-                            0,
+                        let seq = seq_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                        if let Some(mut reduced) = summarize_m8_hits(
+                            seq,
                             read_id,
                             &hits,
                             &lineage_map,
@@ -1083,18 +1080,14 @@ pub async fn call_hits_m8(
                             &*should_keep_filter,
                             min_aln_len,
                             log_misses,
-                        );
-
-                        if let Some(reduced) = reduced {
-                            dedup_tx
-                                .send(ParseOutput::Bytes(Bytes::from(reduced.dedup)))
+                        ) {
+                            reduced.seq = seq;
+                            pair_tx
+                                .send(reduced)
                                 .await
-                                .map_err(|e| anyhow!("dedup output channel closed: {}", e))?;
-
-                            summary_tx
-                                .send(ParseOutput::Bytes(Bytes::from(reduced.summary)))
-                                .await
-                                .map_err(|e| anyhow!("summary output channel closed: {}", e))?;
+                                .map_err(|e| {
+                                    anyhow!("ReducedRead output channel closed: {}", e)
+                                })?;
                         }
                     }
                     WorkerMsgLocal::Flush => break,
@@ -1107,7 +1100,9 @@ pub async fn call_hits_m8(
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator: group consecutive lines by read ID, dispatch complete groups.
+    // Coordinator must not hold pair_tx (channel closes when workers finish).
+    drop(pair_tx);
+
     let coordinator_tag = tag.clone();
     let coordinator_handle = tokio::spawn(async move {
         let mut current_read_id: Option<String> = None;
@@ -1140,7 +1135,6 @@ pub async fn call_hits_m8(
                 None => continue,
             };
 
-            // parse_line_nr strips accession version into M8Record.tname
             let rec = match M8Record::parse_line_nr(line_str) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -1169,7 +1163,9 @@ pub async fn call_hits_m8(
                         hits: std::mem::take(&mut current_hits),
                     })
                     .await
-                    .map_err(|e| anyhow!("failed to dispatch completed read to worker: {}", e))?;
+                    .map_err(|e| {
+                        anyhow!("failed to dispatch completed read to worker: {}", e)
+                    })?;
 
                 total_reads += 1;
             }
@@ -1181,7 +1177,6 @@ pub async fn call_hits_m8(
             current_hits.push(rec);
         }
 
-        // Final read group.
         if let Some(read_id) = current_read_id {
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
@@ -1192,7 +1187,9 @@ pub async fn call_hits_m8(
                         hits: current_hits,
                     })
                     .await
-                    .map_err(|e| anyhow!("failed to dispatch final read to worker: {}", e))?;
+                    .map_err(|e| {
+                        anyhow!("failed to dispatch final read to worker: {}", e)
+                    })?;
 
                 total_reads += 1;
             }
@@ -1221,83 +1218,117 @@ pub async fn call_hits_m8(
 
     cleanup_tasks.push(coordinator_handle);
 
-    // Fan-out dedup → main stream + file write
-    let dedup_stream = ReceiverStream::new(dedup_rx);
-    let (dedup_branches, dedup_router_done_rx) = fanout_to_channels(
-        dedup_stream,
-        2,
-        "call_hits_m8_dedup",
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    // Tee: main consumer + file writer share the same ReducedRead order.
+    let (main_tx, main_rx) =
+        mpsc::channel::<ReducedRead>(config.base_buffer_size * 256);
+    let (file_tx, mut file_rx) =
+        mpsc::channel::<ReducedRead>(config.base_buffer_size * 256);
 
-    cleanup_receivers.push(dedup_router_done_rx);
+    let tee_tag = tag.clone();
+    let tee_handle = tokio::spawn(async move {
+        let mut n = 0u64;
+        while let Some(item) = pair_rx.recv().await {
+            n += 1;
+            if main_tx.send(item.clone()).await.is_err() {
+                // Downstream closed — still drain into files so we don't lose audit trails.
+                let _ = file_tx.send(item).await;
+                while let Some(rest) = pair_rx.recv().await {
+                    n += 1;
+                    let _ = file_tx.send(rest).await;
+                }
+                break;
+            }
+            if file_tx.send(item).await.is_err() {
+                warn!(
+                    "[call_hits_m8:{}] file tee closed after {} pairs; continuing main only",
+                    tee_tag, n
+                );
+                while let Some(rest) = pair_rx.recv().await {
+                    n += 1;
+                    if main_tx.send(rest).await.is_err() {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        info!("[call_hits_m8:{}] tee finished — {} ReducedRead pairs", tee_tag, n);
+        Ok::<(), anyhow::Error>(())
+    });
+    cleanup_tasks.push(tee_handle);
 
-    let mut dedup_branches = dedup_branches.into_iter();
-    let dedup_main = ReceiverStream::new(dedup_branches.next().ok_or(PipelineError::EmptyStream)?);
-    let dedup_file_stream =
-        ReceiverStream::new(dedup_branches.next().ok_or(PipelineError::EmptyStream)?);
+    // Both files written from the same struct → identical line counts and order.
+    let dedup_path = config.out_dir.join(rename_file_path(
+        &sample_base_buf,
+        None,
+        Some(&format!("{}.dedup.m8", tag)),
+        "_",
+    ));
+    let summary_path = config.out_dir.join(rename_file_path(
+        &sample_base_buf,
+        None,
+        Some(&format!("{}.summary.txt", tag)),
+        "_",
+    ));
+    let write_tag = tag.clone();
 
-    // summarize_m8_hits already embeds '\n' in dedup/summary lines
-    let call_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
-            None,
-            Some(&format!("{}.dedup.m8", tag)),
-            "_",
-        )),
-        dedup_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "call_hits_m8_dedup",
-        false,
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(call_file_write_task);
+    let file_write_handle = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
 
-    // Fan-out summary → main stream + file write
-    let summary_stream = ReceiverStream::new(summary_rx);
-    let (summary_branches, summary_router_done_rx) = fanout_to_channels(
-        summary_stream,
-        2,
-        "call_hits_m8_summary",
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        let dedup_file = tokio::fs::File::create(&dedup_path)
+            .await
+            .map_err(|e| anyhow!("create {}: {}", dedup_path.display(), e))?;
+        let summary_file = tokio::fs::File::create(&summary_path)
+            .await
+            .map_err(|e| anyhow!("create {}: {}", summary_path.display(), e))?;
 
-    cleanup_receivers.push(summary_router_done_rx);
+        let mut dedup_w = tokio::io::BufWriter::with_capacity(8 << 20, dedup_file);
+        let mut summary_w = tokio::io::BufWriter::with_capacity(8 << 20, summary_file);
 
-    let mut summary_branches = summary_branches.into_iter();
-    let summary_main =
-        ReceiverStream::new(summary_branches.next().ok_or(PipelineError::EmptyStream)?);
-    let summary_file_stream =
-        ReceiverStream::new(summary_branches.next().ok_or(PipelineError::EmptyStream)?);
+        let mut n = 0u64;
+        while let Some(r) = file_rx.recv().await {
+            // summarize_m8_hits already embeds trailing '\n' in both buffers
+            dedup_w
+                .write_all(&r.dedup)
+                .await
+                .map_err(|e| anyhow!("write dedup.m8: {}", e))?;
+            summary_w
+                .write_all(&r.summary)
+                .await
+                .map_err(|e| anyhow!("write summary.txt: {}", e))?;
+            n += 1;
+        }
 
-    let summary_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
-            None,
-            Some(&format!("{}.summary.txt", tag)),
-            "_",
-        )),
-        summary_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "call_hits_m8_summary",
-        false,
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(summary_file_write_task);
+        dedup_w
+            .flush()
+            .await
+            .map_err(|e| anyhow!("flush dedup.m8: {}", e))?;
+        summary_w
+            .flush()
+            .await
+            .map_err(|e| anyhow!("flush summary.txt: {}", e))?;
 
-    info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
+        info!(
+            "[call_hits_m8:{}] wrote {} paired lines → {} and {}",
+            write_tag,
+            n,
+            dedup_path.display(),
+            summary_path.display()
+        );
+        Ok::<(), anyhow::Error>(())
+    });
+    cleanup_tasks.push(file_write_handle);
 
-    Ok((dedup_main, summary_main, cleanup_tasks, cleanup_receivers))
+    info!(
+        "[call_hits_m8:{}] wiring complete — ReducedRead stream ready",
+        tag
+    );
+
+    Ok((
+        ReceiverStream::new(main_rx),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 /// Summarizes BLAST m8 hits for a single read into a ReducedRead structure.
@@ -1906,8 +1937,7 @@ pub async fn generate_taxon_count_json_from_m8(
 /// Result containing a vector of taxon counts
 pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
-    mut m8_stream: impl Stream<Item = ParseOutput> + Unpin + Send,
-    mut summary_stream: impl Stream<Item = ParseOutput> + Unpin + Send,
+    mut pairs: impl Stream<Item = ReducedRead> + Unpin + Send,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,
@@ -1927,7 +1957,7 @@ pub async fn generate_taxon_counts(
         .max(1);
 
     info!(
-        "generate_taxon_counts({}) — {} workers (strict m8/hit lockstep, Python parity)",
+        "generate_taxon_counts({}) — {} workers (ReducedRead pairs, no cross-stream zip)",
         count_type, num_workers
     );
 
@@ -1952,7 +1982,6 @@ pub async fn generate_taxon_counts(
                 let start = Instant::now();
 
                 while let Some((m8_batch, hit_batch)) = rx.recv().await {
-                    // Batches are always equal length (producer invariant)
                     debug_assert_eq!(m8_batch.len(), hit_batch.len());
                     batches += 1;
 
@@ -1984,7 +2013,6 @@ pub async fn generate_taxon_counts(
         })
         .collect();
 
-    // ── Producer: strict 1:1 lockstep (Python zip + assert) ───────────────
     const BATCH_SIZE: usize = 8192;
     let mut m8_batch: Vec<Bytes> = Vec::with_capacity(BATCH_SIZE);
     let mut hit_batch: Vec<Bytes> = Vec::with_capacity(BATCH_SIZE);
@@ -1994,123 +2022,82 @@ pub async fn generate_taxon_counts(
     let producer_start = Instant::now();
     let mut last_log = Instant::now();
 
-    loop {
-        let m8_item = m8_stream.next().await;
-        let hit_item = summary_stream.next().await;
+    while let Some(pair) = pairs.next().await {
+        let m8_bytes = Bytes::from(pair.dedup);
+        let hit_bytes = Bytes::from(pair.summary);
 
-        match (m8_item, hit_item) {
-            (None, None) => break,
+        if m8_bytes.is_empty() && hit_bytes.is_empty() {
+            skipped_empty += 1;
+            continue;
+        }
+        if m8_bytes.is_empty() || hit_bytes.is_empty() {
+            return Err(PipelineError::Other(anyhow!(
+                "generate_taxon_counts({}): empty dedup or summary inside ReducedRead at pairs={}",
+                count_type,
+                total_pairs
+            )));
+        }
 
-            (Some(_), None) | (None, Some(_)) => {
+        // Integrity check inside the struct (should never fire if call_hits is correct)
+        {
+            let m8_id = m8_bytes
+                .split(|&b| b == b'\t')
+                .next()
+                .unwrap_or_default();
+            let hit_id = hit_bytes
+                .split(|&b| b == b'\t')
+                .next()
+                .unwrap_or_default();
+            if m8_id != hit_id {
                 return Err(PipelineError::Other(anyhow!(
-                    "generate_taxon_counts({}): m8/hit stream length mismatch at pairs={} \
-                     (Python asserts equal length)",
+                    "generate_taxon_counts({}): ReducedRead internal mismatch m8={:?} hit={:?} at pairs={}",
                     count_type,
+                    String::from_utf8_lossy(m8_id),
+                    String::from_utf8_lossy(hit_id),
                     total_pairs
                 )));
             }
+        }
 
-            (Some(m8_item), Some(hit_item)) => {
-                let m8_bytes = match m8_item {
-                    ParseOutput::Bytes(b) => b,
-                    other => {
-                        return Err(PipelineError::Other(anyhow!(
-                            "generate_taxon_counts({}): unexpected m8 item {:?}",
-                            count_type,
-                            other
-                        )));
-                    }
-                };
-                let hit_bytes = match hit_item {
-                    ParseOutput::Bytes(b) => b,
-                    other => {
-                        return Err(PipelineError::Other(anyhow!(
-                            "generate_taxon_counts({}): unexpected hit item {:?}",
-                            count_type,
-                            other
-                        )));
-                    }
-                };
+        m8_batch.push(m8_bytes);
+        hit_batch.push(hit_bytes);
+        total_pairs += 1;
 
-                // Skip empty pair together (never advance one side alone)
-                if m8_bytes.is_empty() && hit_bytes.is_empty() {
-                    skipped_empty += 1;
-                    continue;
-                }
-                if m8_bytes.is_empty() || hit_bytes.is_empty() {
-                    return Err(PipelineError::Other(anyhow!(
-                        "generate_taxon_counts({}): one of m8/hit empty at pairs={} \
-                         (refusing to desync)",
+        if m8_batch.len() >= BATCH_SIZE {
+            let worker_idx = batch_idx % num_workers;
+            worker_txs[worker_idx]
+                .send((
+                    std::mem::take(&mut m8_batch),
+                    std::mem::take(&mut hit_batch),
+                ))
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "generate_taxon_counts({}): worker {} send failed: {}",
                         count_type,
-                        total_pairs
-                    )));
-                }
+                        worker_idx,
+                        e
+                    ))
+                })?;
+            batch_idx += 1;
+            m8_batch = Vec::with_capacity(BATCH_SIZE);
+            hit_batch = Vec::with_capacity(BATCH_SIZE);
+        }
 
-                // Optional read_id check (first field) — log, do not drop
-                {
-                    let m8_id = m8_bytes
-                        .split(|&b| b == b'\t')
-                        .next()
-                        .unwrap_or_default();
-                    let hit_id = hit_bytes
-                        .split(|&b| b == b'\t')
-                        .next()
-                        .unwrap_or_default();
-                    if m8_id != hit_id {
-                        return Err(PipelineError::Other(anyhow!(
-                            "generate_taxon_counts({}): read_id mismatch m8={:?} hit={:?} at pairs={}",
-                            count_type,
-                            String::from_utf8_lossy(m8_id),
-                            String::from_utf8_lossy(hit_id),
-                            total_pairs
-                        )));
-                    }
-                }
-
-                m8_batch.push(m8_bytes);
-                hit_batch.push(hit_bytes);
-                total_pairs += 1;
-
-                if m8_batch.len() >= BATCH_SIZE {
-                    debug_assert_eq!(m8_batch.len(), hit_batch.len());
-                    let worker_idx = batch_idx % num_workers;
-                    worker_txs[worker_idx]
-                        .send((
-                            std::mem::take(&mut m8_batch),
-                            std::mem::take(&mut hit_batch),
-                        ))
-                        .await
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "generate_taxon_counts({}): worker {} send failed: {}",
-                                count_type,
-                                worker_idx,
-                                e
-                            ))
-                        })?;
-                    batch_idx += 1;
-                    m8_batch = Vec::with_capacity(BATCH_SIZE);
-                    hit_batch = Vec::with_capacity(BATCH_SIZE);
-                }
-
-                if last_log.elapsed() >= Duration::from_secs(10) {
-                    info!(
-                        "[generate_taxon_counts:{}] producer: pairs={} batches={} skipped_empty={} elapsed={:?}",
-                        count_type,
-                        total_pairs,
-                        batch_idx,
-                        skipped_empty,
-                        producer_start.elapsed()
-                    );
-                    last_log = Instant::now();
-                }
-            }
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            info!(
+                "[generate_taxon_counts:{}] producer: pairs={} batches={} skipped_empty={} elapsed={:?}",
+                count_type,
+                total_pairs,
+                batch_idx,
+                skipped_empty,
+                producer_start.elapsed()
+            );
+            last_log = Instant::now();
         }
     }
 
-    // Final partial batch — still equal length by construction
     if !m8_batch.is_empty() {
-        debug_assert_eq!(m8_batch.len(), hit_batch.len());
         let worker_idx = batch_idx % num_workers;
         worker_txs[worker_idx]
             .send((m8_batch, hit_batch))
@@ -2149,8 +2136,7 @@ pub async fn generate_taxon_counts(
     Ok(result)
 }
 
-/// Computes merged taxonomic counts from both NT and NR databases.
-///
+
 /// # Arguments
 ///
 /// * `config`: the run configuration
@@ -2174,11 +2160,9 @@ pub async fn generate_taxon_counts(
 /// Result containing a vector of cleanup tasks
 pub async fn compute_merged_taxon_counts(
     config: Arc<RunConfig>,
-    nt_m8_stream: mpsc::Receiver<ParseOutput>,
-    nt_hit_summary_stream: mpsc::Receiver<ParseOutput>,
+    mut nt_pairs: impl Stream<Item = ReducedRead> + Unpin + Send,
     nt_contig_summary: Vec<ContigSummaryEntry>,
-    nr_m8_stream: mpsc::Receiver<ParseOutput>,
-    nr_hit_summary_stream: mpsc::Receiver<ParseOutput>,
+    mut nr_pairs: impl Stream<Item = ReducedRead> + Unpin + Send,
     nr_contig_summary: Vec<ContigSummaryEntry>,
     _lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
@@ -2190,10 +2174,10 @@ pub async fn compute_merged_taxon_counts(
 ) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
-    // Refined HitSummary (7+ cols):
+    // Refined HitSummary (7+ cols) in pair.summary:
     //   [0] read_id  [1] level  [2] taxid  [3] accession
-    //   [4] species_taxid  [5] genus  [6] family
-    //   optional: [7] contig_id [8] contig_acc [9] contig_species_taxid ...
+    //   [4] species  [5] genus  [6] family
+    //   optional contig fields from update_read_dict
     fn parse_alignment(fields: &[&str]) -> Option<(String, SpeciesAlignmentResults)> {
         if fields.len() < 7 {
             return None;
@@ -2224,47 +2208,32 @@ pub async fn compute_merged_taxon_counts(
         )))
     }
 
-    fn m8_qseqid(m8_bytes: &[u8]) -> String {
-        let s = String::from_utf8_lossy(m8_bytes);
-        s.split('\t').next().unwrap_or("").trim().to_string()
+    fn summary_fields(pair: &ReducedRead) -> Option<Vec<String>> {
+        let line = String::from_utf8_lossy(&pair.summary);
+        let line = line.trim_end();
+        if line.is_empty() {
+            return None;
+        }
+        Some(line.split('\t').map(|s| s.to_string()).collect())
     }
 
-    // ── step 1: index NR hits (Python opens NR hitsummary first) ───────────
-    // Keep ordered list so NR pass can walk in hit-file order (zip parity).
+    // ── step 1: index NR pairs (Python opens NR hitsummary first) ─────────
     let mut nr_alignment_per_read: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
-    let mut nr_hit_by_read: AHashMap<String, Bytes> = AHashMap::new();
+    let mut nr_pair_by_read: AHashMap<String, ReducedRead> = AHashMap::new();
     let mut nr_hit_order: Vec<String> = Vec::new();
-    {
-        let mut stream = ReceiverStream::new(nr_hit_summary_stream);
-        while let Some(item) = stream.next().await {
-            let Ok(bytes) = item.to_bytes() else { continue };
-            let line = String::from_utf8_lossy(&bytes);
-            let fields: Vec<&str> = line.trim_end().split('\t').collect();
-            let Some((read_id, align)) = parse_alignment(&fields) else { continue };
-            nr_hit_order.push(read_id.clone());
-            nr_alignment_per_read.insert(read_id.clone(), align);
-            nr_hit_by_read.insert(read_id, Bytes::from(bytes));
-        }
-        info!(
-            "[merged] NR index: {} alignment entries",
-            nr_alignment_per_read.len()
-        );
-    }
 
-    // Also index NR m8 by read_id so NR pass can zip in hit order (Python zip).
-    let mut nr_m8_by_read: AHashMap<String, Bytes> = AHashMap::new();
-    {
-        let mut stream = ReceiverStream::new(nr_m8_stream);
-        while let Some(item) = stream.next().await {
-            let ParseOutput::Bytes(m8_bytes) = item else { continue };
-            let q = m8_qseqid(&m8_bytes);
-            if q.is_empty() {
-                continue;
-            }
-            nr_m8_by_read.insert(q, m8_bytes);
-        }
-        info!("[merged] NR m8 index: {} rows", nr_m8_by_read.len());
+    while let Some(pair) = nr_pairs.next().await {
+        let Some(fields) = summary_fields(&pair) else { continue };
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let Some((read_id, align)) = parse_alignment(&field_refs) else { continue };
+        nr_hit_order.push(read_id.clone());
+        nr_alignment_per_read.insert(read_id.clone(), align);
+        nr_pair_by_read.insert(read_id, pair);
     }
+    info!(
+        "[merged] NR index: {} alignment entries",
+        nr_alignment_per_read.len()
+    );
 
     // Disk writers
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
@@ -2293,72 +2262,52 @@ pub async fn compute_merged_taxon_counts(
         Ok::<(), anyhow::Error>(())
     }));
 
-    // Unbounded → generate_taxon_counts can start after producers finish without 4096 deadlock
-    let (merged_m8_tx, merged_m8_rx) = mpsc::unbounded_channel::<ParseOutput>();
-    let (merged_hit_tx, merged_hit_rx) = mpsc::unbounded_channel::<ParseOutput>();
+    // Merged pairs for generate_taxon_counts (already ReducedRead-native)
+    let (merged_pair_tx, merged_pair_rx) = mpsc::unbounded_channel::<ReducedRead>();
 
-    // ── step 2: zip NT m8 + NT hit (Python) ───────────────────────────────
-    let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
-    let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
+    // ── step 2: NT pairs (no cross-stream zip) ────────────────────────────
     let mut nt_kept = 0u64;
     let mut nt_deferred_to_nr = 0u64;
+    let mut seq = 0u64;
 
-    loop {
-        let m8_item = nt_m8.next().await;
-        let hit_item = nt_hit.next().await;
-        match (m8_item, hit_item) {
-            (None, None) => break,
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(PipelineError::Other(anyhow!(
-                    "[merged] NT m8/hit stream length mismatch (Python would assert)"
-                )));
-            }
-            (Some(m8_item), Some(hit_item)) => {
-                let ParseOutput::Bytes(m8_bytes) = m8_item else { continue };
-                let Ok(hit_bytes) = hit_item.to_bytes() else { continue };
+    while let Some(pair) = nt_pairs.next().await {
+        let Some(fields) = summary_fields(&pair) else { continue };
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let Some((read_id, nt_align)) = parse_alignment(&field_refs) else {
+            continue;
+        };
 
-                let hit_str = String::from_utf8_lossy(&hit_bytes);
-                let fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
-                let Some((read_id, nt_align)) = parse_alignment(&fields) else {
-                    continue;
-                };
+        let nr_align = nr_alignment_per_read.get(&read_id);
+        let has_nt_contig = nt_align.contig.is_some();
+        let has_nr_contig = nr_align.and_then(|a| a.contig).is_some();
+        let has_nt_read = nt_align.read.is_some();
+        let has_nr_read = nr_align.and_then(|a| a.read).is_some();
 
-                let m8_q = m8_qseqid(&m8_bytes);
-                if m8_q != read_id {
-                    return Err(PipelineError::Other(anyhow!(
-                        "[merged] NT m8/hit read_id mismatch: m8={} hit={}",
-                        m8_q,
-                        read_id
-                    )));
-                }
+        // Exact Python predicate
+        if has_nt_contig || (!has_nr_contig && has_nt_read) {
+            let Some(hit_out) = hit_line_for_counts(&field_refs, "NT") else {
+                continue;
+            };
+            let m8_bytes = Bytes::from(pair.dedup.clone());
+            let _ = m8_write_tx.send(m8_bytes);
+            let _ = hit_write_tx.send(hit_out.clone());
 
-                let nr_align = nr_alignment_per_read.get(&read_id);
-                let has_nt_contig = nt_align.contig.is_some();
-                let has_nr_contig = nr_align.and_then(|a| a.contig).is_some();
-                let has_nt_read = nt_align.read.is_some();
-                let has_nr_read = nr_align.and_then(|a| a.read).is_some();
-
-                // Exact Python predicate
-                if has_nt_contig || (!has_nr_contig && has_nt_read) {
-                    let Some(hit_out) = hit_line_for_counts(&fields, "NT") else {
-                        continue;
-                    };
-                    let _ = m8_write_tx.send(m8_bytes.clone());
-                    let _ = hit_write_tx.send(hit_out.clone());
-                    let _ = merged_m8_tx.send(ParseOutput::Bytes(m8_bytes));
-                    let _ = merged_hit_tx.send(ParseOutput::Bytes(hit_out));
-                    nr_alignment_per_read.remove(&read_id);
-                    nt_kept += 1;
-                } else if has_nr_contig || has_nr_read {
-                    nt_deferred_to_nr += 1;
-                } else {
-                    // Python raises; we skip with warning
-                    warn!(
-                        "[merged] NT read {} has no NT/NR alignment flags — skipping",
-                        read_id
-                    );
-                }
-            }
+            seq += 1;
+            let _ = merged_pair_tx.send(ReducedRead {
+                seq,
+                dedup: pair.dedup,
+                summary: hit_out.to_vec(),
+                accession: pair.accession,
+            });
+            nr_alignment_per_read.remove(&read_id);
+            nt_kept += 1;
+        } else if has_nr_contig || has_nr_read {
+            nt_deferred_to_nr += 1;
+        } else {
+            warn!(
+                "[merged] NT read {} has no NT/NR alignment flags — skipping",
+                read_id
+            );
         }
     }
     info!(
@@ -2366,46 +2315,48 @@ pub async fn compute_merged_taxon_counts(
         nt_kept, nt_deferred_to_nr
     );
 
-    // ── step 3: NR remaining — walk in NR hit order, require matching m8 (Python zip) ──
+    // ── step 3: NR remaining in NR hit order ──────────────────────────────
     let mut nr_kept = 0u64;
     for read_id in &nr_hit_order {
         if !nr_alignment_per_read.contains_key(read_id) {
             continue; // claimed by NT
         }
-        let Some(m8_bytes) = nr_m8_by_read.get(read_id) else {
+        let Some(pair) = nr_pair_by_read.remove(read_id) else {
             warn!(
-                "[merged] NR hit {} has no matching m8 row — skip (zip would assert)",
+                "[merged] NR hit {} missing pair — skip",
                 read_id
             );
             continue;
         };
-        let Some(hit_bytes) = nr_hit_by_read.get(read_id) else {
-            continue;
-        };
-        let hit_str = String::from_utf8_lossy(hit_bytes);
-        let fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
-        let Some(hit_out) = hit_line_for_counts(&fields, "NR") else {
+        let Some(fields) = summary_fields(&pair) else { continue };
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let Some(hit_out) = hit_line_for_counts(&field_refs, "NR") else {
             continue;
         };
 
-        let _ = m8_write_tx.send(m8_bytes.clone());
+        let m8_bytes = Bytes::from(pair.dedup.clone());
+        let _ = m8_write_tx.send(m8_bytes);
         let _ = hit_write_tx.send(hit_out.clone());
-        let _ = merged_m8_tx.send(ParseOutput::Bytes(m8_bytes.clone()));
-        let _ = merged_hit_tx.send(ParseOutput::Bytes(hit_out));
+
+        seq += 1;
+        let _ = merged_pair_tx.send(ReducedRead {
+            seq,
+            dedup: pair.dedup,
+            summary: hit_out.to_vec(),
+            accession: pair.accession,
+        });
         nr_alignment_per_read.remove(read_id);
         nr_kept += 1;
     }
     drop(m8_write_tx);
     drop(hit_write_tx);
-    drop(merged_m8_tx);
-    drop(merged_hit_tx);
+    drop(merged_pair_tx);
     info!("[merged] NR pass kept={}", nr_kept);
 
-    // ── taxon counts on merged streams ────────────────────────────────────
+    // ── taxon counts on merged pairs ─────────────────────────────────────
     let merged_taxon_counts = generate_taxon_counts(
         config.clone(),
-        UnboundedReceiverStream::new(merged_m8_rx),
-        UnboundedReceiverStream::new(merged_hit_rx),
+        UnboundedReceiverStream::new(merged_pair_rx),
         duplicate_clusters,
         should_keep_filter,
         "merged_NT_NR".to_string(),
@@ -2420,15 +2371,11 @@ pub async fn compute_merged_taxon_counts(
         merged_taxon_counts.len()
     );
 
-    // ── merge_contigs (Python _merge_contigs, flat ContigSummaryEntry) ─────
-    // Python: list of {taxid, contig_counts: {name → count}}
-    // Rust:   list of one entry per contig (contig_name + species_taxid + …)
-    // Equivalent rule: NT names win; NR contig_name not in NT set is kept.
+    // ── merge_contigs ────────────────────────────────────────────────────
     let final_contigs = tokio::task::spawn_blocking(move || {
         let mut nt_contig_names: HashSet<String> = HashSet::new();
-        let mut out: Vec<ContigSummaryEntry> = Vec::with_capacity(
-            nt_contig_summary.len() + nr_contig_summary.len(),
-        );
+        let mut out: Vec<ContigSummaryEntry> =
+            Vec::with_capacity(nt_contig_summary.len() + nr_contig_summary.len());
 
         for mut e in nt_contig_summary {
             e.db_type = "merged_NT_NR".to_string();

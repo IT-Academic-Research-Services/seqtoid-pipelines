@@ -34,7 +34,7 @@ use crate::cli::Technology;
 use crate::config::defs::{
     Lineage, PairingMode, PipelineError, ReadStats, RunConfig, SimdLevel, StreamDataType, Taxid,
     TaxonSeqLocation, CONFORMING_PREAMBLE, FASTA_EXTS, FASTA_TAG, FASTQ_EXTS, FASTQ_TAG,
-    SIMD_LEVEL,
+    SIMD_LEVEL, ReducedRead
 };
 use crate::utils::file::extension_remover;
 use crate::utils::sequence::{normal_phred_qual_string, DNA};
@@ -1595,8 +1595,8 @@ pub async fn generate_taxid_fasta(
     config: Arc<RunConfig>,
     mapped_contigs_stream: ReceiverStream<ParseOutput>,
     unidentified_contigs_stream: ReceiverStream<ParseOutput>,
-    nt_hit_summary_stream: ReceiverStream<ParseOutput>,
-    nr_hit_summary_stream: ReceiverStream<ParseOutput>,
+    nt_pairs: ReceiverStream<ReducedRead>,
+    nr_pairs: ReceiverStream<ReducedRead>,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
 ) -> Result<(
     mpsc::Receiver<ParseOutput>, // mapped with taxid headers
@@ -1605,26 +1605,23 @@ pub async fn generate_taxid_fasta(
     JoinHandle<Result<()>>,      // load_nr_task
     JoinHandle<Result<()>>,      // main_task
 )> {
-    // Larger buffers: main waits for hit maps before draining annotate → avoid early stall
     let mapped_cap = (config.base_buffer_size / 4).max(65_536);
     let combined_cap = (config.base_buffer_size / 2).max(131_072);
     let (mapped_tx, mapped_rx) = mpsc::channel(mapped_cap);
     let (combined_tx, combined_rx) = mpsc::channel(combined_cap);
 
     // HitSummary 7-col: [0]=read_id [1]=level [2]=taxid …
-    // Python stores (taxid, level) including negatives; level is signed.
     let (nt_hits_tx, mut nt_hits_rx) =
         mpsc::channel::<Arc<AHashMap<String, (Taxid, i32)>>>(1);
     let (nr_hits_tx, mut nr_hits_rx) =
         mpsc::channel::<Arc<AHashMap<String, (Taxid, i32)>>>(1);
 
     let load_nt_task = tokio::spawn({
-        let mut stream = nt_hit_summary_stream;
+        let mut stream = nt_pairs;
         async move {
             let mut hits = AHashMap::with_capacity(100_000);
-            while let Some(item) = stream.next().await {
-                let ParseOutput::Bytes(bytes) = item else { continue };
-                let line = String::from_utf8_lossy(&bytes);
+            while let Some(pair) = stream.next().await {
+                let line = String::from_utf8_lossy(&pair.summary);
                 let line = line.trim_end();
                 if line.is_empty() {
                     continue;
@@ -1649,12 +1646,11 @@ pub async fn generate_taxid_fasta(
     });
 
     let load_nr_task = tokio::spawn({
-        let mut stream = nr_hit_summary_stream;
+        let mut stream = nr_pairs;
         async move {
             let mut hits = AHashMap::with_capacity(100_000);
-            while let Some(item) = stream.next().await {
-                let ParseOutput::Bytes(bytes) = item else { continue };
-                let line = String::from_utf8_lossy(&bytes);
+            while let Some(pair) = stream.next().await {
+                let line = String::from_utf8_lossy(&pair.summary);
                 let line = line.trim_end();
                 if line.is_empty() {
                     continue;
@@ -1691,7 +1687,7 @@ pub async fn generate_taxid_fasta(
             compute_phase_concurrency(&config, "generate_taxid_fasta", 0.5, 4.0, 64, 8).max(1);
         const BATCH_SIZE: usize = 1000;
 
-        // ── mapped / annotated reads (Python generate_taxid_fasta body) ──
+        // ── mapped / annotated reads ──
         {
             let (batch_tx, batch_rx) = mpsc::channel::<Vec<SequenceRecord>>(concurrency * 2);
             let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
@@ -1714,8 +1710,6 @@ pub async fn generate_taxid_fasta(
                         let Some(batch) = batch else { break };
 
                         for rec in batch {
-                            // Header from annotate: NR:{nr}:NT:{nt}:{original_id}
-                            // Python: annotated_read_id.split(":", 4)[-1]
                             let annotated_id = rec.id();
                             let read_id = annotated_id
                                 .splitn(5, ':')
@@ -1723,10 +1717,11 @@ pub async fn generate_taxid_fasta(
                                 .unwrap_or(annotated_id)
                                 .to_string();
 
-                            let nr_lineage = get_valid_lineage(nr_hits.as_ref(), lineage_map.as_ref(), &read_id);
-                            let nt_lineage = get_valid_lineage(nt_hits.as_ref(), lineage_map.as_ref(), &read_id);
+                            let nr_lineage =
+                                get_valid_lineage(nr_hits.as_ref(), lineage_map.as_ref(), &read_id);
+                            let nt_lineage =
+                                get_valid_lineage(nt_hits.as_ref(), lineage_map.as_ref(), &read_id);
 
-                            // species=0 genus=1 family=2
                             let new_header = format!(
                                 "family_nr:{}:family_nt:{}:genus_nr:{}:genus_nt:{}:species_nr:{}:species_nt:{}:{}",
                                 nr_lineage[2],
@@ -1795,7 +1790,7 @@ pub async fn generate_taxid_fasta(
             info!("[generate_taxid_fasta] mapped path complete");
         }
 
-        // ── unidentified → conform headers (Python generate_fasta_with_unmapped_included) ──
+        // ── unidentified → conform headers ──
         {
             let unid_concurrency = compute_phase_concurrency(
                 &config,
@@ -1826,7 +1821,6 @@ pub async fn generate_taxid_fasta(
                         let Some(batch) = batch else { break };
 
                         for rec in batch {
-                            // Python: CONFORMING_PREAMBLE + header.lstrip('>')
                             let conformed =
                                 format!("{}{}", CONFORMING_PREAMBLE, rec.id());
                             let (new_id, new_desc) =
@@ -1839,9 +1833,7 @@ pub async fn generate_taxid_fasta(
                             c_tx.send(ParseOutput::Fasta(new_rec))
                                 .await
                                 .map_err(|_| {
-                                    anyhow!(
-                                        "combined_tx dropped during unidentified"
-                                    )
+                                    anyhow!("combined_tx dropped during unidentified")
                                 })?;
                         }
                     }
@@ -1861,9 +1853,7 @@ pub async fn generate_taxid_fasta(
                             unid_batch_tx
                                 .send(std::mem::take(&mut current_batch))
                                 .await
-                                .map_err(|_| {
-                                    anyhow!("unid_batch_tx dropped")
-                                })?;
+                                .map_err(|_| anyhow!("unid_batch_tx dropped"))?;
                         }
                     }
                     _ => {
