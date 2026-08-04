@@ -1767,25 +1767,31 @@ where
 ///
 /// # Returns
 /// A result containing a vector of receivers for each branch and a oneshot receiver for completion status.
-pub async fn fanout_to_channels(
-    mut upstream: ReceiverStream<ParseOutput>,
+pub async fn fanout_to_channels<T>(
+    mut upstream: ReceiverStream<T>,
     n_branches: usize,
     label: &str,
     config: &RunConfig,
     data_type: StreamDataType,
-) -> Result<(Vec<mpsc::Receiver<ParseOutput>>, oneshot::Receiver<Result<(), anyhow::Error>>), PipelineError> {
+) -> Result<(Vec<mpsc::Receiver<T>>, oneshot::Receiver<Result<(), anyhow::Error>>), PipelineError>
+where
+    T: Clone + Send + 'static,
+{
     if n_branches == 0 {
-        return Err(PipelineError::Other(anyhow!("fanout_to_channels called with 0 branches in {}", label)));
+        return Err(PipelineError::Other(anyhow!(
+            "fanout_to_channels called with 0 branches in {}",
+            label
+        )));
     }
 
     let buffer_size = crate::utils::system::compute_buffer_size(
         config,
         "fanout_to_channels",
         data_type,
-        1.5, // slightly higher multiplier than normal paths because we duplicate
+        1.5,
     );
 
-    let mut txs: Vec<mpsc::Sender<ParseOutput>> = Vec::with_capacity(n_branches);
+    let mut txs: Vec<mpsc::Sender<T>> = Vec::with_capacity(n_branches);
     let mut rxs = Vec::with_capacity(n_branches);
 
     for _ in 0..n_branches {
@@ -1806,7 +1812,6 @@ pub async fn fanout_to_channels(
         while let Some(item) = upstream.next().await {
             item_count += 1;
 
-            // Track slowest branch for backpressure (prevents router from buffering forever)
             let mut lowest_capacity = 1.0f64;
 
             for (i, tx) in txs.iter().enumerate() {
@@ -1834,24 +1839,24 @@ pub async fn fanout_to_channels(
                 }
             }
 
-            // Smart backpressure — only slow down when the slowest branch is getting full
             if lowest_capacity < 0.10 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             } else if lowest_capacity < 0.25 {
                 tokio::task::yield_now().await;
             }
 
-            // Occasional progress for very long streams (cheap)
             if item_count % 50_000 == 0 && last_progress.elapsed() > Duration::from_secs(30) {
                 debug!("[fanout {}] forwarded {} items so far", label, item_count);
                 last_progress = Instant::now();
             }
         }
 
-        // Upstream ended (including the 0-item case). Drop all senders so branches see EOF.
         drop(txs);
 
-        debug!("[fanout {}] finished cleanly — forwarded {} items to {} branches", label, item_count, n_branches);
+        debug!(
+            "[fanout {}] finished cleanly — forwarded {} items to {} branches",
+            label, item_count, n_branches
+        );
         let _ = done_tx.send(Ok(()));
     });
 
