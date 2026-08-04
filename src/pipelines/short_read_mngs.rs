@@ -7803,6 +7803,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
+    // Part of Experimental phase but starting this as early as possible to avvoid stalling the fanout
+    let experimental_taxid_handle = tokio::spawn({
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let mapped = ReceiverStream::new(initial_annotated_taxon_stream);
+        let unid = ReceiverStream::new(initial_unidentified_taxon_stream);
+        let nt = nt_pairs_taxid_initial;
+        let nr = nr_pairs_taxid_initial;
+        async move {
+            generate_taxid_fasta(config, mapped, unid, nt, nr, lineage_map).await
+        }
+    });
+
+
     // Add monitors so you can actually see progress (no more 30-minute silences)
     let initial_annotated_file_stream = monitor_stream(
         ReceiverStream::new(initial_annotated_file_stream),
@@ -8511,17 +8525,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         initial_load_nt_task,
         initial_load_nr_task,
         initial_taxid_main_task,
-    ) = generate_taxid_fasta(
-        config.clone(),
-        ReceiverStream::new(initial_annotated_taxon_stream),
-        ReceiverStream::new(initial_unidentified_taxon_stream),
-        nt_pairs_taxid_initial,
-        nr_pairs_taxid_initial,
-        lineage_map.clone(),
-    )
+    ) = experimental_taxid_handle
         .await
         .map_err(|e| {
-            PipelineError::Other(anyhow!("Experimental generate_taxid_fasta failed: {}", e))
+            PipelineError::Other(anyhow!(
+            "Experimental generate_taxid_fasta task panicked: {e}"
+        ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Experimental generate_taxid_fasta failed: {e}"
+        ))
         })?;
 
     cleanup_tasks.push(initial_load_nt_task);
