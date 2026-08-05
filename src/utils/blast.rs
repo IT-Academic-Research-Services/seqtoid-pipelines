@@ -1696,8 +1696,8 @@ pub async fn generate_taxon_count_json_from_m8(
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     output_tx: mpsc::UnboundedSender<ParseOutput>,
-    _concurrency: usize,       // call-site compat; global agg is sequential
-    _batch_size_lines: usize,  // call-site compat
+    _concurrency: usize,      // call-site compat; global agg is sequential
+    _batch_size_lines: usize, // call-site compat
 ) -> Result<()> {
     // Python: zip HitSummary × m8, assert same read_id, global aggregation tree.
     const MIN_HIT_FIELDS: usize = 7;
@@ -1757,10 +1757,15 @@ pub async fn generate_taxon_count_json_from_m8(
                 }
 
                 // 7-col: read_id, level, taxid, accession, species, genus, family
+                // optional [7] = source_count_type (merged path only)
                 let read_id = hit_fields[0];
                 let hit_level: i32 = hit_fields[1].parse().unwrap_or(-1);
                 let hit_taxid: i32 = hit_fields[2].parse().unwrap_or(-1);
-                let hit_source_count_type = hit_fields.get(7).map(|s| s.to_string());
+                let hit_source_count_type = hit_fields
+                    .get(7)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
 
                 let m8 = match M8Record::parse_line_nt(m8_line)
                     .or_else(|_| M8Record::parse_line_nr(m8_line))
@@ -1802,7 +1807,6 @@ pub async fn generate_taxon_count_json_from_m8(
                 }
                 let e_value_log10 = e_value.log10();
 
-                // Lineage from hit_taxid + validate (same idea as Python validate_taxid_lineage)
                 let raw_lineage = lineage_map
                     .get(&hit_taxid)
                     .cloned()
@@ -1831,9 +1835,7 @@ pub async fn generate_taxon_count_json_from_m8(
                     bucket.sum_alignment_length += alignment_length;
                     bucket.sum_e_value += e_value_log10;
                     if let Some(ref src) = hit_source_count_type {
-                        if !src.is_empty() {
-                            bucket.source_count_type.insert(src.clone());
-                        }
+                        bucket.source_count_type.insert(src.clone());
                     }
 
                     agg_key = agg_key[1..].to_vec();
@@ -1872,16 +1874,29 @@ pub async fn generate_taxon_count_json_from_m8(
         let tax_level = (NUM_RANKS - agg_key.len() + 1) as i32;
         let tax_id = agg_key[0];
 
-        // genus_taxid / family_taxid as in Python
         let genus_taxid = if tax_level <= 2 {
             agg_key[2 - tax_level as usize]
         } else {
             -200
         };
         let family_taxid = if tax_level <= 3 {
-            agg_key.get(3 - tax_level as usize).copied().unwrap_or(-300)
+            agg_key
+                .get(3 - tax_level as usize)
+                .copied()
+                .unwrap_or(-300)
         } else {
             -300
+        };
+
+        // omit / null when no source was present on any contributing hit
+        let source_vec = {
+            let mut v: Vec<String> = bucket.source_count_type.into_iter().collect();
+            if v.is_empty() {
+                None
+            } else {
+                v.sort_unstable();
+                Some(v)
+            }
         };
 
         let n = unique_count as f64;
@@ -1899,7 +1914,7 @@ pub async fn generate_taxon_count_json_from_m8(
             e_value: bucket.sum_e_value / n,
             count_type: count_type_upper.clone(),
             base_count: bucket.base_count as u64,
-            source_count_type: Some(bucket.source_count_type.into_iter().collect()),
+            source_count_type: source_vec,
         };
 
         let json = serde_json::to_string(&count)? + "\n";
