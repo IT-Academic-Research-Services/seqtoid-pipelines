@@ -4861,247 +4861,212 @@ pub async fn update_read_dict(
     read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
-    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    _lineage_map: Arc<AHashMap<Taxid, Lineage>>, // unused: Python uses accession_dict only
     accession_map: Arc<AHashMap<String, AccessionHit>>,
-    should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    _should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>, // not applied here (Python)
     db_type: &str,
     contig2lineage_tx: Sender<ParseOutput>,
     read2blastm8_tx: Sender<ParseOutput>,
     updated_tx: Sender<ParseOutput>,
     added_tx: Sender<ParseOutput>,
 ) -> Result<()> {
-    let update_concurrency =
-        compute_phase_concurrency(&config, "update_read_dict", 0.05, 8.0, 128, 4);
-    info!("update_read_dict concurrency: {} jobs", update_concurrency);
-
-    #[derive(Default)]
-    struct FanoutBatch {
-        updated: Vec<(String, Arc<ReadHit>)>,
-        added: Vec<(String, Arc<ReadHit>)>,
-        contig2lineage_lines: Vec<Vec<u8>>,
-        read2blastm8_lines: Vec<Vec<u8>>,
-    }
+    let _ = compute_phase_concurrency(&config, "update_read_dict", 0.05, 8.0, 128, 4);
 
     fn merge_m8_rows(curr: &mut M8Record, row: &M8Record) {
         let curr_len = curr.alen as f64;
         let row_len = row.alen as f64;
         let denom = curr_len + row_len;
-
         if denom > 0.0 {
             curr.pident = (curr.pident * curr_len + row.pident * row_len) / denom;
             curr.evalue = (curr.evalue * curr_len + row.evalue * row_len) / denom;
         }
-
         curr.mismatch += row.mismatch;
         curr.gapopen += row.gapopen;
         curr.bitscore += row.bitscore;
         curr.alen += row.alen;
-
         curr.qstart = curr.qstart.min(row.qstart);
         curr.qend = curr.qend.max(row.qend);
         curr.tstart = curr.tstart.min(row.tstart);
         curr.tend = curr.tend.max(row.tend);
     }
 
+    // Python accession_dict keys are hit_summary accessions; BLAST sseqid may be versioned.
+    fn lookup_acc<'a>(
+        map: &'a AHashMap<String, AccessionHit>,
+        acc: &str,
+    ) -> Option<(&'a String, &'a AccessionHit)> {
+        if let Some((k, h)) = map.get_key_value(acc) {
+            return Some((k, h));
+        }
+        if let Some(base) = acc.split('.').next() {
+            if base != acc {
+                if let Some((k, h)) = map.get_key_value(base) {
+                    return Some((k, h));
+                }
+            }
+        }
+        None
+    }
+
     let db_type_upper = db_type.to_uppercase();
 
-    // ── Pass 1 first: drain tops immediately (no heavy setup before recv) ──
-    info!("[update_read_dict:{}] pass1: draining top m8", db_type);
-    let mut contig2accession: AHashMap<String, (String, M8Record, Lineage)> = AHashMap::new();
+    // ── loop 1: blast top → contig2accession + contig2lineage ──────
+    let mut contig2accession: AHashMap<String, (String, M8Record)> = AHashMap::new();
+    let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
     let mut tops_seen = 0u64;
+    let mut acc_miss = 0u64;
 
     while let Some(item) = top_m8_stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => continue,
-        };
-
+        let ParseOutput::Bytes(bytes) = item else { continue };
         let line = String::from_utf8_lossy(&bytes);
-        let line_trimmed = line.trim_end();
-        if line_trimmed.is_empty() {
+        let line = line.trim_end();
+        if line.is_empty() {
             continue;
         }
 
         let m8 = if db_type.eq_ignore_ascii_case("nt") {
-            M8Record::parse_line_nt(line_trimmed)?
+            M8Record::parse_line_nt(line)?
         } else {
-            M8Record::parse_line_nr(line_trimmed)?
+            M8Record::parse_line_nr(line)?
         };
+        tops_seen += 1;
 
         let contig_id = m8.qname.clone();
         let accession_id = m8.tname.clone();
 
-        let taxid = accession_map
-            .get(&accession_id)
-            .map(|hit| hit.taxid)
-            .unwrap_or(0);
-
-        let lineage = if taxid > 0 {
-            lineage_map.get(&taxid).cloned().unwrap_or([0; 3])
-        } else {
-            [0; 3]
-        };
-
-        if !(should_keep)(&lineage) {
+        // contig2lineage[contig] = accession_dict[accession]  (must exist)
+        let Some((_key, acc_hit)) = lookup_acc(&accession_map, &accession_id) else {
+            acc_miss += 1;
+            // Do not insert contig without lineage — Python would KeyError
             continue;
-        }
+        };
+        let lineage = [acc_hit.taxid, acc_hit.genus_taxid, acc_hit.family_taxid];
+        contig2lineage.insert(contig_id.clone(), lineage);
 
-        if let Some((_, curr_row, _)) = contig2accession.get_mut(&contig_id) {
-            merge_m8_rows(curr_row, &m8);
+        if let Some((_, curr)) = contig2accession.get_mut(&contig_id) {
+            merge_m8_rows(curr, &m8);
         } else {
-            contig2accession.insert(
-                contig_id.clone(),
-                (accession_id.clone(), m8.clone(), lineage),
-            );
+            contig2accession.insert(contig_id, (accession_id, m8));
         }
 
-        tops_seen += 1;
         if tops_seen % 5_000 == 0 {
             info!(
-                "[update_read_dict:{}] pass1: tops_seen={} contigs={}",
+                "[update_read_dict:{}] tops={} contigs={} lineage={} acc_miss={}",
                 db_type,
                 tops_seen,
-                contig2accession.len()
+                contig2accession.len(),
+                contig2lineage.len(),
+                acc_miss
             );
         }
     }
 
     info!(
-        "[update_read_dict:{}] pass1 done: tops_seen={} contigs={}",
+        "[update_read_dict:{}] pass1 done: tops={} contigs={} lineage={} acc_miss={}",
         db_type,
         tops_seen,
-        contig2accession.len()
+        contig2accession.len(),
+        contig2lineage.len(),
+        acc_miss
     );
 
-    // ── Heavy setup only after top stream is fully consumed ───────────────
+    // ── loop 2: for read_id, contig_id in read2contig ──────────────
     let existing_reads: AHashMap<String, Arc<ReadHit>> = {
-        let guard = read_dict
+        let g = read_dict
             .lock()
-            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
-        guard.clone()
-    };
-    let existing_reads = Arc::new(existing_reads);
-
-    let mut contig2reads: AHashMap<String, Vec<String>> =
-        AHashMap::with_capacity(read2contig.len());
-    for (read_id, contig_id) in read2contig.iter() {
-        contig2reads
-            .entry(contig_id.clone())
-            .or_default()
-            .push(read_id.clone());
-    }
-    let contig2reads = Arc::new(contig2reads);
-
-    // ── Pass 2: parallel fan-out by contig (unchanged) ────────────────────
-    let fanout_batches: Vec<FanoutBatch> = {
-        let contig2accession = Arc::new(contig2accession);
-        let accession_map = accession_map.clone();
-        let existing_reads = existing_reads.clone();
-        let contig2reads = contig2reads.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<FanoutBatch>> {
-            let batches = contig2reads
-                .par_iter()
-                .map(|(contig_id, read_ids)| {
-                    let mut batch = FanoutBatch::default();
-
-                    let Some((accession, m8_row, lineage)) = contig2accession.get(contig_id) else {
-                        return batch;
-                    };
-
-                    let Some(acc_hit) = accession_map.get(accession) else {
-                        return batch;
-                    };
-
-                    let species_taxid = acc_hit.taxid;
-                    let genus_taxid = acc_hit.genus_taxid;
-                    let family_taxid = acc_hit.family_taxid;
-
-                    let lineage_line = format!(
-                        "{}\t{}\t{}\t{}\n",
-                        contig_id, lineage[0], lineage[1], lineage[2]
-                    );
-                    batch.contig2lineage_lines.push(lineage_line.into_bytes());
-
-                    for read_id in read_ids {
-                        if let Some(existing) = existing_reads.get(read_id) {
-                            let mut hit: ReadHit = (**existing).clone();
-                            hit.taxid = species_taxid;
-                            hit.contig_id = Some(contig_id.clone());
-                            hit.contig_accession_id = Some(accession.clone());
-                            hit.contig_species_taxid = species_taxid;
-                            hit.contig_genus_taxid = genus_taxid;
-                            hit.contig_family_taxid = family_taxid;
-                            hit.from_assembly = true;
-                            hit.source_count_type = Some(db_type_upper.clone());
-                            batch.updated.push((read_id.clone(), Arc::new(hit)));
-                        } else {
-                            let hit = ReadHit {
-                                level: 1,
-                                taxid: species_taxid,
-                                accession_id: accession.clone(),
-                                species_taxid,
-                                genus_taxid,
-                                family_taxid,
-                                contig_id: Some(contig_id.clone()),
-                                contig_accession_id: Some(accession.clone()),
-                                contig_species_taxid: species_taxid,
-                                contig_genus_taxid: genus_taxid,
-                                contig_family_taxid: family_taxid,
-                                from_assembly: true,
-                                source_count_type: Some(db_type_upper.clone()),
-                            };
-                            batch.added.push((read_id.clone(), Arc::new(hit)));
-                        }
-
-                        // Key = read_id so generate_m8 can join to original call_hits m8
-                        let mut m8_for_read = m8_row.clone();
-                        m8_for_read.qname = read_id.clone();
-                        let mut m8_line = m8_for_read.to_tab_string();
-                        m8_line.push('\n');
-                        batch.read2blastm8_lines.push(m8_line.into_bytes());
-                    }
-
-                    batch
-                })
-                .collect();
-
-            Ok(batches)
-        })
-            .await
-            .map_err(|e| anyhow!("update_read_dict fan-out task panicked: {}", e))??
+            .map_err(|e| anyhow!("read_dict lock poisoned: {e}"))?;
+        g.clone()
     };
 
     let mut updated_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
     let mut added_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
-    let mut contig2lineage_lines: Vec<Vec<u8>> = Vec::new();
     let mut read2blastm8_lines: Vec<Vec<u8>> = Vec::new();
+    let mut reads_with_contig_hit = 0u64;
+    let mut reads_acc_ok = 0u64;
 
-    for mut batch in fanout_batches {
-        updated_entries.append(&mut batch.updated);
-        added_entries.append(&mut batch.added);
-        contig2lineage_lines.append(&mut batch.contig2lineage_lines);
-        read2blastm8_lines.append(&mut batch.read2blastm8_lines);
+    for (read_id, contig_id) in read2contig.iter() {
+        let Some((accession, m8_row)) = contig2accession.get(contig_id) else {
+            continue; // contig has no BLAST top
+        };
+        reads_with_contig_hit += 1;
+
+        // Python: if accession and accession in accession_dict
+        if let Some((_k, acc_hit)) = lookup_acc(&accession_map, accession) {
+            reads_acc_ok += 1;
+            let species_taxid = acc_hit.taxid;
+            let genus_taxid = acc_hit.genus_taxid;
+            let family_taxid = acc_hit.family_taxid;
+
+            if let Some(existing) = existing_reads.get(read_id) {
+                let mut hit: ReadHit = (**existing).clone();
+                hit.taxid = species_taxid;
+                hit.contig_id = Some(contig_id.clone());
+                hit.contig_accession_id = Some(accession.clone());
+                hit.contig_species_taxid = species_taxid;
+                hit.contig_genus_taxid = genus_taxid;
+                hit.contig_family_taxid = family_taxid;
+                hit.from_assembly = true;
+                hit.source_count_type = Some(db_type_upper.clone());
+                updated_entries.push((read_id.clone(), Arc::new(hit)));
+            } else {
+                added_entries.push((
+                    read_id.clone(),
+                    Arc::new(ReadHit {
+                        level: 1,
+                        taxid: species_taxid,
+                        accession_id: accession.clone(),
+                        species_taxid,
+                        genus_taxid,
+                        family_taxid,
+                        contig_id: Some(contig_id.clone()),
+                        contig_accession_id: Some(accession.clone()),
+                        contig_species_taxid: species_taxid,
+                        contig_genus_taxid: genus_taxid,
+                        contig_family_taxid: family_taxid,
+                        from_assembly: true,
+                        source_count_type: Some(db_type_upper.clone()),
+                    }),
+                ));
+            }
+        }
+
+        // Python: if m8_row: read2blastm8[read_id] = m8_row  (qseqid forced to read_id later)
+        let mut m8_for_read = m8_row.clone();
+        m8_for_read.qname = read_id.clone();
+        let mut m8_line = m8_for_read.to_tab_string();
+        m8_line.push('\n');
+        read2blastm8_lines.push(m8_line.into_bytes());
+    }
+
+    info!(
+        "[update_read_dict:{}] pass2: reads_with_contig_hit={} acc_ok={} updated={} added={} blast_m8={}",
+        db_type,
+        reads_with_contig_hit,
+        reads_acc_ok,
+        updated_entries.len(),
+        added_entries.len(),
+        read2blastm8_lines.len()
+    );
+
+    // Emit contig2lineage
+    for (contig_id, lin) in &contig2lineage {
+        let line = format!("{}\t{}\t{}\t{}\n", contig_id, lin[0], lin[1], lin[2]);
+        contig2lineage_tx
+            .send(ParseOutput::Bytes(Bytes::from(line)))
+            .await
+            .map_err(|_| anyhow!("contig2lineage_tx closed"))?;
     }
 
     {
         let mut dict = read_dict
             .lock()
-            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
-
-        for (read_id, hit) in &updated_entries {
-            dict.insert(read_id.clone(), hit.clone());
+            .map_err(|e| anyhow!("read_dict lock poisoned: {e}"))?;
+        for (id, hit) in &updated_entries {
+            dict.insert(id.clone(), hit.clone());
         }
-        for (read_id, hit) in &added_entries {
-            dict.insert(read_id.clone(), hit.clone());
+        for (id, hit) in &added_entries {
+            dict.insert(id.clone(), hit.clone());
         }
-    }
-
-    for line in contig2lineage_lines {
-        contig2lineage_tx
-            .send(ParseOutput::Bytes(Bytes::from(line)))
-            .await
-            .map_err(|_| anyhow!("contig2lineage_tx closed"))?;
     }
 
     for line in read2blastm8_lines {
@@ -5110,7 +5075,6 @@ pub async fn update_read_dict(
             .await
             .map_err(|_| anyhow!("read2blastm8_tx closed"))?;
     }
-
     for (read_id, hit) in updated_entries {
         let mut line = hit.to_full_tab_line(&read_id);
         line.push('\n');
@@ -5119,7 +5083,6 @@ pub async fn update_read_dict(
             .await
             .map_err(|_| anyhow!("updated_tx closed"))?;
     }
-
     for (read_id, hit) in added_entries {
         let mut line = hit.to_full_tab_line(&read_id);
         line.push('\n');
@@ -5129,6 +5092,11 @@ pub async fn update_read_dict(
             .map_err(|_| anyhow!("added_tx closed"))?;
     }
 
+    info!(
+        "[update_read_dict:{}] emitted contig2lineage={}",
+        db_type,
+        contig2lineage.len()
+    );
     Ok(())
 }
 
@@ -5168,8 +5136,6 @@ async fn generate_contig_summary_json(
             .lock()
             .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
 
-        // After update_read_dict, dict includes both updated and added reads (Python:
-        // updated_read_dict + added_reads).
         for (read_id, hit_arc) in dict.iter() {
             let hit: &ReadHit = hit_arc.as_ref();
 
@@ -5178,7 +5144,6 @@ async fn generate_contig_summary_json(
                 .cloned()
                 .unwrap_or_else(|| "*".to_string());
 
-            // Prefer contig BLAST lineage when present
             let (species_taxid, genus_taxid, family_taxid) = if contig != "*" {
                 if let Some(lineage) = contig2lineage.get(&contig) {
                     (lineage[0], lineage[1], lineage[2])
@@ -5189,7 +5154,6 @@ async fn generate_contig_summary_json(
                 (hit.species_taxid, hit.genus_taxid, hit.family_taxid)
             };
 
-            // Same filter as generate_taxon_count_json_from_m8
             if !should_keep(&[species_taxid, genus_taxid, family_taxid]) {
                 continue;
             }
@@ -5217,7 +5181,6 @@ async fn generate_contig_summary_json(
         }
     }
 
-    // keep contigs with unique read count >= MIN_CONTIG_SIZE; value = nonunique
     for (tax_level, summary_map) in [(1u8, species_summary), (2u8, genus_summary)] {
         for (taxid, contig_counts) in summary_map {
             if taxid <= 0 {
@@ -5234,14 +5197,13 @@ async fn generate_contig_summary_json(
                 continue;
             }
 
-            // (one object per taxid × level)
-            let entry = serde_json::json!({
-                "taxid": taxid,
-                "tax_level": tax_level,
-                "count_type": db_type_upper,
-                "contig_counts": filtered
-            });
-            let line = format!("{entry}\n");
+            let entry = ContigSummaryEntry {
+                taxid,
+                tax_level,
+                count_type: db_type_upper.clone(),
+                contig_counts: filtered,
+            };
+            let line = serde_json::to_string(&entry)? + "\n";
             output_tx
                 .send(ParseOutput::Bytes(Bytes::from(line)))
                 .await
@@ -6331,12 +6293,19 @@ async fn blast_contigs(
         refined_counts.len()
     );
 
-    let mut contig_summary = Vec::new();
+    let mut contig_summary: Vec<ContigSummaryEntry> = Vec::new();
     let mut rx = ReceiverStream::new(contig_summary_rx);
     while let Some(item) = rx.next().await {
         let bytes = item.to_bytes()?;
         let line = String::from_utf8_lossy(&bytes);
-        contig_summary.push(serde_json::from_str(&line)?);
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        contig_summary.push(
+            serde_json::from_str(line)
+                .map_err(|e| anyhow!("contig_summary JSON parse failed: {e}; line={line}"))?,
+        );
     }
     info!(
         "[blast_contigs:{}] contig_summary: {}",
