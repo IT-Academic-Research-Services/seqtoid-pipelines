@@ -1834,9 +1834,8 @@ pub async fn generate_taxon_count_json_from_m8(
                         if !src.is_empty() {
                             bucket.source_count_type.insert(src.clone());
                         }
-                    } else {
-                        bucket.source_count_type.insert(count_type_upper.clone());
                     }
+
                     agg_key = agg_key[1..].to_vec();
                 }
 
