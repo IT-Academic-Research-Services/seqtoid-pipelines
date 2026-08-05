@@ -49,18 +49,15 @@ use crate::utils::system::compute_phase_concurrency;
 use crate::utils::taxonomy::validate_taxid_lineage;
 
 /// Represents an entry in the contig summary, grouping metadata and hit stats.
+/// Python / WDL contig summary shape (one object per taxid × level).
+/// Emitted by generate_contig_summary_json; consumed by merge_contigs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
-    pub contig_name: String,
-    pub common_name: Option<String>,
-    pub category_name: Option<String>,
-    pub score: Option<f64>,
-    pub db_type: String,
-    pub reads: u64,
-    pub bases: u64,
-    pub species_taxid: i32,
-    pub genus_taxid: i32,
-    pub family_taxid: i32,
+    pub taxid: i32,
+    pub tax_level: u8,
+    pub count_type: String,
+    /// contig_name → nonunique (duplicate-weighted) read count
+    pub contig_counts: HashMap<String, u64>,
 }
 
 /// Stores the best taxonomic alignment results for both a contig and its constituent read.
@@ -2378,17 +2375,23 @@ pub async fn compute_merged_taxon_counts(
             Vec::with_capacity(nt_contig_summary.len() + nr_contig_summary.len());
 
         for mut e in nt_contig_summary {
-            e.db_type = "merged_NT_NR".to_string();
-            nt_contig_names.insert(e.contig_name.clone());
+            for name in e.contig_counts.keys() {
+                nt_contig_names.insert(name.clone());
+            }
+            e.count_type = "merged_NT_NR".to_string();
             out.push(e);
         }
+
         for mut e in nr_contig_summary {
-            if nt_contig_names.contains(&e.contig_name) {
+            e.contig_counts
+                .retain(|name, _| !nt_contig_names.contains(name));
+            if e.contig_counts.is_empty() {
                 continue;
             }
-            e.db_type = "merged_NT_NR".to_string();
+            e.count_type = "merged_NT_NR".to_string();
             out.push(e);
         }
+
         out
     })
         .await
