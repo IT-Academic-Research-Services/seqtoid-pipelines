@@ -3311,15 +3311,18 @@ async fn diamond_non_host_align(
 async fn combine_taxon_counts(
     nt_counts: &[TaxonCount],
     nr_counts: &[TaxonCount],
+    merged_counts: &[TaxonCount],
     output_path: PathBuf,
 ) -> Result<(PathBuf, JoinHandle<Result<()>>)> {
     let nt_len = nt_counts.len();
     let nr_len = nr_counts.len();
-    let total = nt_len + nr_len;
+    let merged_len = merged_counts.len();
+    let total = nt_len + nr_len + merged_len;
 
     let mut all_counts = Vec::with_capacity(total);
     all_counts.extend_from_slice(nt_counts);
     all_counts.extend_from_slice(nr_counts);
+    all_counts.extend_from_slice(merged_counts);
 
     let output_json = json!({
         "pipeline_output": {
@@ -3335,15 +3338,16 @@ async fn combine_taxon_counts(
     }
 
     let data_arc = Arc::new(payload);
-    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20) // 1 Mb
+    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20)
         .await
         .map_err(|e| anyhow!("Failed to spawn JSON write: {}", e))?;
 
     info!(
-        "Combined {} taxon count entries ({} NT + {} NR); spawning write to {}",
+        "Combined {} taxon count entries ({} NT + {} NR + {} merged); write → {}",
         total,
         nt_len,
         nr_len,
+        merged_len,
         output_path.display()
     );
 
@@ -8040,10 +8044,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let (_combined_path, write_json_task) = combine_taxon_counts(
             &nt_counts_for_combine,
             &nr_counts_for_combine,
+            &[], // no merged yet
             combined_path,
         )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
 
         write_json_task.await.map_err(|e| {
             PipelineError::Other(anyhow!("combine_taxon_counts write task failed: {}", e))
@@ -8331,23 +8336,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         duplicate_clusters.clone(),
         out_dir.join("refined.m8"),
         out_dir.join("refined.hitsummary.tab"),
-        out_dir.join("refined_taxon_counts_with_dcr.json"),
+        out_dir.join("merged_taxon_counts_with_dcr.json"),
         out_dir.join("assembly_combined_contig_summary.json"),
     );
 
-    let (merged_cleanup_tasks, nt_refined_map, nr_refined_map) = tokio::try_join!(
-    merged_fut,
-    async {
-        collect_m8_accession_map(nt_pairs_map)
-            .await
-            .map_err(|e| PipelineError::Other(e))
-    },
-    async {
-        collect_m8_accession_map(nr_pairs_map)
-            .await
-            .map_err(|e| PipelineError::Other(e))
-    },
-)?;
+    let ((merged_taxon_counts, merged_cleanup_tasks), nt_refined_map, nr_refined_map) =
+        tokio::try_join!(
+        merged_fut,
+        async {
+            collect_m8_accession_map(nt_pairs_map)
+                .await
+                .map_err(PipelineError::Other)
+        },
+        async {
+            collect_m8_accession_map(nr_pairs_map)
+                .await
+                .map_err(PipelineError::Other)
+        },
+    )?;
     cleanup_tasks.extend(merged_cleanup_tasks);
 
     let refined_combined_path = out_dir.join(rename_file_path(
@@ -8356,13 +8362,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Some("refined_taxon_counts_with_dcr.json"),
         "_",
     ));
-    let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
+    let (_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
         &nr_refined_counts,
+        &merged_taxon_counts,
         refined_combined_path,
     )
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {e}")))?;
     cleanup_tasks.push(refined_write_json_task);
 
     let assembly_dir = out_dir.join("assembly");

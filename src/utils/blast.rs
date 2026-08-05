@@ -2167,7 +2167,7 @@ pub async fn compute_merged_taxon_counts(
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
+) -> Result<(Vec<TaxonCount>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
     // Refined HitSummary (7+ cols) in pair.summary:
@@ -2219,9 +2219,13 @@ pub async fn compute_merged_taxon_counts(
     let mut nr_hit_order: Vec<String> = Vec::new();
 
     while let Some(pair) = nr_pairs.next().await {
-        let Some(fields) = summary_fields(&pair) else { continue };
+        let Some(fields) = summary_fields(&pair) else {
+            continue;
+        };
         let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-        let Some((read_id, align)) = parse_alignment(&field_refs) else { continue };
+        let Some((read_id, align)) = parse_alignment(&field_refs) else {
+            continue;
+        };
         nr_hit_order.push(read_id.clone());
         nr_alignment_per_read.insert(read_id.clone(), align);
         nr_pair_by_read.insert(read_id, pair);
@@ -2258,16 +2262,17 @@ pub async fn compute_merged_taxon_counts(
         Ok::<(), anyhow::Error>(())
     }));
 
-    // Merged pairs for generate_taxon_counts (already ReducedRead-native)
     let (merged_pair_tx, merged_pair_rx) = mpsc::unbounded_channel::<ReducedRead>();
 
-    // ── step 2: NT pairs (no cross-stream zip) ────────────────────────────
+    // ── step 2: NT pairs ──────────────────────────────────────────────────
     let mut nt_kept = 0u64;
     let mut nt_deferred_to_nr = 0u64;
     let mut seq = 0u64;
 
     while let Some(pair) = nt_pairs.next().await {
-        let Some(fields) = summary_fields(&pair) else { continue };
+        let Some(fields) = summary_fields(&pair) else {
+            continue;
+        };
         let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
         let Some((read_id, nt_align)) = parse_alignment(&field_refs) else {
             continue;
@@ -2315,16 +2320,15 @@ pub async fn compute_merged_taxon_counts(
     let mut nr_kept = 0u64;
     for read_id in &nr_hit_order {
         if !nr_alignment_per_read.contains_key(read_id) {
-            continue; // claimed by NT
+            continue;
         }
         let Some(pair) = nr_pair_by_read.remove(read_id) else {
-            warn!(
-                "[merged] NR hit {} missing pair — skip",
-                read_id
-            );
+            warn!("[merged] NR hit {} missing pair — skip", read_id);
             continue;
         };
-        let Some(fields) = summary_fields(&pair) else { continue };
+        let Some(fields) = summary_fields(&pair) else {
+            continue;
+        };
         let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
         let Some(hit_out) = hit_line_for_counts(&field_refs, "NR") else {
             continue;
@@ -2363,8 +2367,9 @@ pub async fn compute_merged_taxon_counts(
     let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
     tokio::fs::write(&merged_taxon_counts_path, json).await?;
     info!(
-        "Merged taxon counts generated ({} taxa)",
-        merged_taxon_counts.len()
+        "Merged taxon counts generated ({} taxa) → {}",
+        merged_taxon_counts.len(),
+        merged_taxon_counts_path.display()
     );
 
     // ── merge_contigs ────────────────────────────────────────────────────
@@ -2404,7 +2409,7 @@ pub async fn compute_merged_taxon_counts(
     );
 
     info!("compute_merged_taxon_counts complete");
-    Ok(cleanup_tasks)
+    Ok((merged_taxon_counts, cleanup_tasks))
 }
 
 #[cfg(test)]
