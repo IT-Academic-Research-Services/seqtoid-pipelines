@@ -5544,7 +5544,6 @@ async fn early_blast_exit(
     mpsc::UnboundedReceiver<ParseOutput>,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
-    Vec<NamedTempFile>,
 )> {
     warn!(
         "[blast_contigs:{}] graceful early exit (no usable BLAST results)",
@@ -5586,7 +5585,6 @@ async fn early_blast_exit(
         vec![],
         pairs_rx,
         top_rx,
-        vec![],
         vec![],
         vec![],
     ))
@@ -5638,7 +5636,7 @@ async fn blast_contigs(
     mpsc::UnboundedReceiver<ParseOutput>, // top contig m8 for coverage viz
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
-    Vec<NamedTempFile>,
+    Option<TempDir>,
 )> {
     fn blastdb_ready(prefix: &PathBuf, db_type: &str) -> bool {
         let (a, b, c, alias) = if db_type == NT_TAG {
@@ -5668,7 +5666,6 @@ async fn blast_contigs(
 
     let mut cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
-    let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
     let out_dir = config.out_dir.join(format!("blast_{}", db_type));
     tokio::fs::create_dir_all(&out_dir).await?;
@@ -5688,9 +5685,17 @@ async fn blast_contigs(
     );
 
     if contig_size < MIN_ASSEMBLED_CONTIG_SIZE || ref_size < MIN_REF_FASTA_SIZE {
-        // Drain so upstream fanout sees EOF
         while pairs.next().await.is_some() {}
-        return early_blast_exit(
+
+        let (
+            dict,
+            counts,
+            contigs,
+            pairs_rx,
+            top_rx,
+            tasks,
+            recvs,
+        ) = early_blast_exit(
             db_type,
             &blast_m8_path,
             &blast_top_m8_path,
@@ -5705,7 +5710,12 @@ async fn blast_contigs(
             taxon_counts,
             fn_start,
         )
-            .await;
+            .await?;
+
+        // No makeblastdb → no index TempDir
+        return Ok((
+            dict, counts, contigs, pairs_rx, top_rx, tasks, recvs, None,
+        ));
     }
 
     // Split ReducedRead → original m8 + hit for generate_m8_and_hit_summary
@@ -5761,11 +5771,7 @@ async fn blast_contigs(
     )
         .await?;
 
-    let blastdb_suffix = format!("{}_blastindex", db_type);
-    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let blastdb_path = blastdb_ram_path.path().to_owned();
-    temp_files.push(blastdb_ram_path);
+    let blastdb_path = temp_dir.path().join(format!("{}_blastindex", db_type));
 
     let makeblastdb_config = MakeblastdbConfig {
         input: reference_fasta.clone(),
@@ -6335,7 +6341,7 @@ async fn blast_contigs(
         top_for_caller_rx,
         cleanup_tasks,
         cleanup_receivers,
-        temp_files,
+        Some(temp_dir),
     ))
 }
 
@@ -8291,10 +8297,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nt_refined_m8_top_stream_out,
         nt_cleanup_tasks,
         nt_cleanup_receivers,
-        nt_temp_files,
+        nt_blast_temp_dir,
     ) = nt_post_res;
     cleanup_tasks.extend(nt_cleanup_tasks);
-    temp_files.extend(nt_temp_files);
+    if let Some(td) = nt_blast_temp_dir {
+        final_temp_dirs.push(td);
+    }
 
     let (
         _nr_read_dict,
@@ -8305,10 +8313,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_pairs_taxid_refined,
         nr_cleanup_tasks,
         nr_cleanup_receivers,
-        nr_temp_files,
+        nr_blast_temp_dir,
     ) = nr_post_res;
     cleanup_tasks.extend(nr_cleanup_tasks);
-    temp_files.extend(nr_temp_files);
+    if let Some(td) = nr_blast_temp_dir {
+        final_temp_dirs.push(td);
+    }
 
     for rx in nt_cleanup_receivers {
         rx.await??;
