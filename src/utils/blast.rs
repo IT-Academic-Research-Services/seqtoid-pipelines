@@ -104,17 +104,18 @@ pub enum WorkerMsg {
 }
 
 impl M8Record {
+    /// Strip leading '>' (FASTA defline artifact) and version suffix.
+    /// BLAST sseqid should never contain '>', but local blastdb construction
+    /// can leave it; the accession map is keyed without it.
+    #[inline]
+    fn clean_accession(raw: &str) -> String {
+        let s = raw.trim_start_matches('>').trim();
+        s.split('.').next().unwrap_or(s).to_string()
+    }
+
     // ── NT scalar ──────────────────────────────────────────────────────────
 
     /// Parses a 14-column NT (blastn) output line using a scalar implementation.
-    ///
-    /// # Arguments
-    ///
-    /// * `line`: the m8 line string to parse
-    ///
-    /// # Returns
-    ///
-    /// Result<Self>: the parsed M8Record or an error
     pub fn parse_line_nt_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
@@ -145,12 +146,7 @@ impl M8Record {
         }
 
         let qname = next!("qname").to_string();
-        let raw_accession = next!("tname");
-        let tname = raw_accession
-            .split('.')
-            .next()
-            .unwrap_or(raw_accession)
-            .to_string();
+        let tname = Self::clean_accession(next!("tname"));
         let pident = parse_float!("pident");
         let alen = parse_u64!("alen");
         let mismatch = parse_u64!("mismatch");
@@ -188,14 +184,6 @@ impl M8Record {
     // ── NR scalar ──────────────────────────────────────────────────────────
 
     /// Parses a 12-column NR (blastx) output line using a scalar implementation.
-    ///
-    /// # Arguments
-    ///
-    /// * `line`: the m8 line string to parse
-    ///
-    /// # Returns
-    ///
-    /// Result<Self>: the parsed M8Record or an error
     pub fn parse_line_nr_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
@@ -226,12 +214,7 @@ impl M8Record {
         }
 
         let qname = next!("qname").to_string();
-        let raw_accession = next!("tname");
-        let tname = raw_accession
-            .split('.')
-            .next()
-            .unwrap_or(raw_accession)
-            .to_string();
+        let tname = Self::clean_accession(next!("tname"));
         let pident = parse_float!("pident");
         let alen = parse_u64!("alen");
         let mismatch = parse_u64!("mismatch");
@@ -341,7 +324,7 @@ impl M8Record {
             .map_err(|_| anyhow!("qname not UTF-8"))?
             .to_string();
         let raw = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
-        let tname = raw.split('.').next().unwrap_or(raw).to_string();
+        let tname = Self::clean_accession(raw);
 
         let pident = parse_f64!(2, "pident");
         let alen = parse_u64!(3, "alen");
@@ -428,7 +411,7 @@ impl M8Record {
             .map_err(|_| anyhow!("qname not UTF-8"))?
             .to_string();
         let raw = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
-        let tname = raw.split('.').next().unwrap_or(raw).to_string();
+        let tname = Self::clean_accession(raw);
 
         let pident = parse_f64!(2, "pident");
         let alen = parse_u64!(3, "alen");
@@ -442,7 +425,7 @@ impl M8Record {
         let bitscore = parse_f64!(11, "bitscore");
 
         if tab_pos.len() > 11 {
-            warn!("Extra columns in NT m8 line (expected 12): {}", trimmed);
+            warn!("Extra columns in NR m8 line (expected 12): {}", trimmed);
         }
 
         Ok(Self {
