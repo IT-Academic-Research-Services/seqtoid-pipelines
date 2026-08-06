@@ -467,9 +467,36 @@ fn augment_contig_data_with_coverage(
     contig_data: &mut HashMap<String, Vec<ContigHit>>,
 ) -> Result<()> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let contig_coverage: HashMap<String, Vec<f64>> = serde_json::from_reader(&mut reader)
+    let root: Value = serde_json::from_reader(BufReader::new(file))
         .map_err(|e| anyhow!("Failed to parse contig_coverage_json: {}", e))?;
+
+    let obj = root
+        .as_object()
+        .ok_or_else(|| anyhow!("contig_coverage_json root is not an object"))?;
+
+    let mut contig_coverage: HashMap<String, Vec<f64>> = HashMap::with_capacity(obj.len());
+    for (name, v) in obj {
+        let arr = match v {
+            Value::Array(a) => a,
+            Value::Object(o) => o
+                .get("coverage")
+                .or_else(|| o.get("depths"))
+                .or_else(|| o.get("depth"))
+                .and_then(|x| x.as_array())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "contig_coverage entry '{}' is neither array nor object with coverage[]",
+                        name
+                    )
+                })?,
+            _ => {
+                warn!("Skipping contig_coverage entry '{}': unexpected JSON type", name);
+                continue;
+            }
+        };
+        let depths: Vec<f64> = arr.iter().filter_map(|x| x.as_f64()).collect();
+        contig_coverage.insert(name.clone(), depths);
+    }
 
     for (contig_name, hits) in contig_data.iter_mut() {
         if let Some(cov) = contig_coverage.get(contig_name) {
@@ -480,7 +507,6 @@ fn augment_contig_data_with_coverage(
             warn!("No coverage data for contig: {}", contig_name);
         }
     }
-
     Ok(())
 }
 
