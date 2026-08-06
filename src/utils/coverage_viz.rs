@@ -19,7 +19,7 @@ use crate::utils::streams::{ParseOutput, ToBytes};
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
-const MIN_CONTIG_SIZE: u64 = 500;
+const MIN_CONTIG_SIZE: u64 = 4;
 
 #[derive(Debug, Clone, Default)]
 struct TaxonData {
