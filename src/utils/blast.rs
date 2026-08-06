@@ -1432,7 +1432,7 @@ where
             None => {
                 if log_misses {
                     static LOGGED: AtomicU64 = AtomicU64::new(0);
-                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 200 {
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
                         warn!(
                             "[summarize_m8_hits] acc2taxid miss: q={} t={:?}",
                             hit.qname, hit.tname
