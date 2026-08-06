@@ -105,7 +105,7 @@ const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
-const MIN_CONTIG_SIZE: u64 = 500;
+const MIN_CONTIG_SIZE: u64 = 4;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
@@ -6183,7 +6183,7 @@ async fn blast_contigs(
             db_type,
             duplicate_clusters.clone(),
             should_keep_filter.clone(),
-            4, // MIN_CONTIG_SIZE
+            MIN_CONTIG_SIZE,
             contig_summary_tx,
         );
         async move {
