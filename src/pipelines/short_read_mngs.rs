@@ -92,7 +92,7 @@ use crate::utils::sambam::{compute_insert_size_stats_from_bam, generate_info_fro
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::streams::{
     batch_rayon_process, deinterleave_fastq_stream, fanout_to_channels, join_with_error_handling,
-    monitor_stream, parse_bytes, parse_child_output, parse_fastq, parse_lines,
+    parse_bytes, parse_child_output, parse_fastq, parse_lines,
     read_child_output_to_vec, spawn_cmd, stream_to_cmd, stream_to_file, ChannelReader, ChildStream,
     ParseMode, ParseOutput, ToBytes,
 };
@@ -7137,7 +7137,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         human_hisat2_out_stream
     };
 
-    // let post_filter_monitored = monitor_stream(post_filter_stream, "Post_Hisat2", Duration::from_secs(5));
 
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
         post_filter_stream.into_inner(),
@@ -7795,23 +7794,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
-
-    // Add monitors so you can actually see progress (no more 30-minute silences)
-    let initial_annotated_file_stream = monitor_stream(
-        ReceiverStream::new(initial_annotated_file_stream),
-        "initial_annotated_file_stream_to_write",
-        Duration::from_secs(15),
-    );
-
-    let initial_unidentified_file_stream = monitor_stream(
-        ReceiverStream::new(initial_unidentified_file_stream),
-        "initial_unidentified_file_stream_to_write",
-        Duration::from_secs(15),
-    );
-
     // Write tasks are now eager consumers → EOF propagates instantly
     cleanup_tasks.push(write_fasta_stream_to_file(
-        initial_annotated_file_stream,
+        ReceiverStream::new(initial_annotated_file_stream),
         annotated_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -7819,7 +7804,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ));
 
     cleanup_tasks.push(write_fasta_stream_to_file(
-        initial_unidentified_file_stream,
+        ReceiverStream::new(initial_unidentified_file_stream),
         unidentified_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -8572,20 +8557,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
-    // Add monitors so we finally see progress logs again
-    let initial_taxid_mapped_file = monitor_stream(
-        ReceiverStream::new(initial_taxid_mapped_file),
-        "initial_taxid_mapped_file_to_write",
-        Duration::from_secs(15),
-    );
-    let initial_taxid_combined_file = monitor_stream(
-        ReceiverStream::new(initial_taxid_combined_file),
-        "initial_taxid_combined_file_to_write",
-        Duration::from_secs(15),
-    );
-
     let initial_write_mapped_handle = write_fasta_stream_to_file(
-        initial_taxid_mapped_file, // Clone rx if needed for logging
+        ReceiverStream::new(initial_taxid_mapped_file), // Clone rx if needed for logging
         initial_mapped_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -8594,7 +8567,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(initial_write_mapped_handle);
 
     let initial_write_combined_handle = write_fasta_stream_to_file(
-        initial_taxid_combined_file,
+        ReceiverStream::new(initial_taxid_combined_file),
         initial_combined_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
