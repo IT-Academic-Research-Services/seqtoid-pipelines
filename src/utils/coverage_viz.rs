@@ -553,11 +553,16 @@ async fn generate_coverage_viz_data(
         let contig_data = Arc::clone(&contig_data);
         let read_data = Arc::clone(&read_data);
 
+        if acc_obj.total_length == 0 {
+            warn!(
+            "Skipping zero-length / unknown accession {} (no nt_info entry)",
+            acc_id
+        );
+            continue;
+        }
+
         tasks.push(tokio::task::spawn_blocking(move || {
             let total_len = acc_obj.total_length as f64;
-            if total_len == 0.0 {
-                return Err(anyhow!("Zero length accession: {}", acc_id));
-            }
 
             let num_bins = max_num_bins.min(total_len as usize);
             let bin_size = total_len / num_bins as f64;
