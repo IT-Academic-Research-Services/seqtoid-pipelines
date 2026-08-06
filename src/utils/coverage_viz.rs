@@ -765,9 +765,11 @@ fn calculate_accession_stats(
                 let (q_dec_start, q_dec_end) =
                     decrement_lower_bound(hit.query_start as f64, hit.query_end as f64);
                 let (q_start, q_end) = align_interval(q_dec_start, q_dec_end);
-                cov_sum += hit.coverage[q_start as usize..q_end as usize]
-                    .iter()
-                    .sum::<f64>();
+                if !hit.coverage.is_empty() {
+                    let lo = (q_start as usize).min(hit.coverage.len());
+                    let hi = (q_end as usize).min(hit.coverage.len()).max(lo);
+                    cov_sum += hit.coverage[lo..hi].iter().sum::<f64>();
+                }
 
                 mismatch_sum += hit.prop_mismatch;
                 hit_count += 1;
