@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{self, warn};
+use log::{self, warn, info};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
@@ -339,13 +339,13 @@ async fn generate_contig_data(
     valid_contigs: &HashMap<String, u64>,
 ) -> Result<HashMap<String, Vec<ContigHit>>> {
     let mut contig_data: HashMap<String, Vec<ContigHit>> = HashMap::new();
-
-    let mut line_count = 0;
+    let mut line_count = 0u64;
+    let mut parse_err = 0u64;
 
     while let Some(item) = blast_top_m8.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
-            log::info!("Processed {} blast_top_m8 lines", line_count);
+            info!("Processed {} blast_top_m8 lines", line_count);
         }
 
         let bytes = item.to_bytes()?;
@@ -355,10 +355,16 @@ async fn generate_contig_data(
             continue;
         }
 
-        let m8 = match M8Record::parse_line_nt(line_trim) {
+        // 12-col standard m8 *or* 14-col blastn with qlen/slen
+        let m8 = match M8Record::parse_line_nt(line_trim)
+            .or_else(|_| M8Record::parse_line_nr(line_trim))
+        {
             Ok(record) => record,
             Err(e) => {
-                warn!("Failed to parse m8 line: {} - {}", line_trim, e);
+                parse_err += 1;
+                if parse_err <= 20 {
+                    warn!("Failed to parse blast_top_m8 line: {} — {}", line_trim, e);
+                }
                 continue;
             }
         };
@@ -369,9 +375,13 @@ async fn generate_contig_data(
         }
 
         let total_length = *valid_contigs.get(&contig_name).unwrap_or(&0);
-        let prop_mismatch = m8.mismatch as f64 / m8.alen as f64;
+        let prop_mismatch = if m8.alen > 0 {
+            m8.mismatch as f64 / m8.alen as f64
+        } else {
+            0.0
+        };
 
-        let hit = ContigHit {
+        contig_data.entry(contig_name).or_default().push(ContigHit {
             subject_start: m8.tstart,
             subject_end: m8.tend,
             query_start: m8.qstart,
@@ -379,11 +389,15 @@ async fn generate_contig_data(
             total_length,
             coverage: vec![],
             prop_mismatch,
-        };
-
-        contig_data.entry(contig_name).or_default().push(hit);
+        });
     }
 
+    info!(
+        "[generate_contig_data] done: lines={} parse_err={} contigs={}",
+        line_count,
+        parse_err,
+        contig_data.len()
+    );
     Ok(contig_data)
 }
 
@@ -392,13 +406,13 @@ async fn generate_read_data(
     assigned_reads: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<ReadHit>>> {
     let mut read_data: HashMap<String, Vec<ReadHit>> = HashMap::new();
-
-    let mut line_count = 0;
+    let mut line_count = 0u64;
+    let mut parse_err = 0u64;
 
     while let Some(item) = gsnap_deduped_m8.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
-            log::info!("Processed {} gsnap_deduped_m8 lines", line_count);
+            info!("Processed {} gsnap_deduped_m8 lines", line_count);
         }
 
         let bytes = item.to_bytes()?;
@@ -408,10 +422,15 @@ async fn generate_read_data(
             continue;
         }
 
-        let m8 = match M8Record::parse_line_nt(line_trim) {
+        let m8 = match M8Record::parse_line_nt(line_trim)
+            .or_else(|_| M8Record::parse_line_nr(line_trim))
+        {
             Ok(record) => record,
             Err(e) => {
-                warn!("Failed to parse m8 line: {} - {}", line_trim, e);
+                parse_err += 1;
+                if parse_err <= 20 {
+                    warn!("Failed to parse deduped m8 line: {} — {}", line_trim, e);
+                }
                 continue;
             }
         };
@@ -421,22 +440,28 @@ async fn generate_read_data(
             continue;
         }
 
-        let accession_id = m8.tname.clone();
-        let prop_mismatch = m8.mismatch as f64 / m8.alen as f64;
+        let prop_mismatch = if m8.alen > 0 {
+            m8.mismatch as f64 / m8.alen as f64
+        } else {
+            0.0
+        };
 
-        let hit = ReadHit {
+        read_data.entry(read_name).or_default().push(ReadHit {
             subject_start: m8.tstart,
             subject_end: m8.tend,
             prop_mismatch,
-            accession: accession_id,
-        };
-
-        read_data.entry(read_name).or_default().push(hit);
+            accession: m8.tname.clone(),
+        });
     }
 
+    info!(
+        "[generate_read_data] done: lines={} parse_err={} reads={}",
+        line_count,
+        parse_err,
+        read_data.len()
+    );
     Ok(read_data)
 }
-
 fn augment_contig_data_with_coverage(
     path: &Path,
     contig_data: &mut HashMap<String, Vec<ContigHit>>,
