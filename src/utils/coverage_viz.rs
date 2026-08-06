@@ -516,16 +516,28 @@ fn select_best_accessions_per_taxon(
     num_per_taxon: usize,
 ) -> (HashMap<String, TaxonData>, HashMap<String, AccessionData>) {
     for ad in accession_data.values_mut() {
-        ad.score = ad.contigs.len() as f64 * 1000.0 + ad.reads.len() as f64;
+        if ad.total_length == 0 {
+            ad.score = f64::NEG_INFINITY; // never selected
+        } else {
+            ad.score = ad.contigs.len() as f64 * 1000.0 + ad.reads.len() as f64;
+        }
     }
 
     for td in taxon_data.values_mut() {
         let mut scored: Vec<_> = td
             .accessions
             .iter()
-            .filter_map(|acc| accession_data.get(acc).map(|ad| (acc.clone(), ad.score)))
+            .filter_map(|acc| {
+                let ad = accession_data.get(acc)?;
+                if ad.total_length == 0 {
+                    return None;
+                }
+                Some((acc.clone(), ad.score))
+            })
             .collect();
+
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
         td.best_accessions = scored
             .into_iter()
             .take(num_per_taxon)
@@ -838,10 +850,10 @@ fn generate_coverage_viz_summary_data(
         let best_acc: Vec<AccessionSummary> = td
             .best_accessions
             .iter()
-            .map(|acc_id| {
-                let ad = &accession_data[acc_id];
-                let cv = &coverage_viz[acc_id];
-                AccessionSummary {
+            .filter_map(|acc_id| {
+                let ad = accession_data.get(acc_id)?;
+                let cv = coverage_viz.get(acc_id)?;
+                Some(AccessionSummary {
                     id: acc_id.clone(),
                     name: ad.name.clone(),
                     num_contigs: ad.contigs.len(),
@@ -849,7 +861,7 @@ fn generate_coverage_viz_summary_data(
                     score: format_number(ad.score),
                     coverage_breadth: cv.coverage_breadth,
                     coverage_depth: cv.coverage_depth,
-                }
+                })
             })
             .collect();
 
