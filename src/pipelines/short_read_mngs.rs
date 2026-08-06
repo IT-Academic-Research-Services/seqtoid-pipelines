@@ -4919,6 +4919,7 @@ pub async fn update_read_dict(
     let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
     let mut tops_seen = 0u64;
     let mut acc_miss = 0u64;
+    const ACC_MISS_LOG_CAP: u64 = 20; // first 20 only
 
     while let Some(item) = top_m8_stream.next().await {
         let ParseOutput::Bytes(bytes) = item else { continue };
@@ -4941,6 +4942,12 @@ pub async fn update_read_dict(
         // contig2lineage[contig] = accession_dict[accession]  (must exist)
         let Some((_key, acc_hit)) = lookup_acc(&accession_map, &accession_id) else {
             acc_miss += 1;
+            if acc_miss <= ACC_MISS_LOG_CAP {
+                warn!(
+                "[update_read_dict:{}] acc_miss contig={} acc={} (raw tname from top m8)",
+                db_type, contig_id, accession_id
+            );
+            }
             // Do not insert contig without lineage — Python would KeyError
             continue;
         };
@@ -4955,24 +4962,30 @@ pub async fn update_read_dict(
 
         if tops_seen % 5_000 == 0 {
             info!(
-                "[update_read_dict:{}] tops={} contigs={} lineage={} acc_miss={}",
-                db_type,
-                tops_seen,
-                contig2accession.len(),
-                contig2lineage.len(),
-                acc_miss
-            );
+            "[update_read_dict:{}] tops={} contigs={} lineage={} acc_miss={}",
+            db_type,
+            tops_seen,
+            contig2accession.len(),
+            contig2lineage.len(),
+            acc_miss
+        );
         }
     }
 
     info!(
-        "[update_read_dict:{}] pass1 done: tops={} contigs={} lineage={} acc_miss={}",
-        db_type,
-        tops_seen,
-        contig2accession.len(),
-        contig2lineage.len(),
-        acc_miss
+    "[update_read_dict:{}] pass1 done: tops={} contigs={} lineage={} acc_miss={}",
+    db_type,
+    tops_seen,
+    contig2accession.len(),
+    contig2lineage.len(),
+    acc_miss
+);
+    if acc_miss > ACC_MISS_LOG_CAP {
+        warn!(
+        "[update_read_dict:{}] acc_miss total={} (only first {} logged)",
+        db_type, acc_miss, ACC_MISS_LOG_CAP
     );
+    }
 
     // ── loop 2: for read_id, contig_id in read2contig ──────────────
     let existing_reads: AHashMap<String, Arc<ReadHit>> = {
