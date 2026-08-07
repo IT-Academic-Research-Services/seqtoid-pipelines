@@ -6280,6 +6280,53 @@ async fn blast_contigs(
         pairs_out.len()
     );
 
+
+    // Durable hitsummary2 + reassigned m8 (CZID: gsnap.hitsummary2.tab / gsnap.reassigned.m8)
+    // Written from the same pairs_out that feeds merge / taxid / coverage.
+    let hitsummary2_path = config
+        .out_dir
+        .join(format!("{}.hitsummary2.tab", db_type));
+    let reassigned_m8_path = config
+        .out_dir
+        .join(format!("{}.reassigned.m8", db_type));
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut hit_w =
+            tokio::io::BufWriter::new(tokio::fs::File::create(&hitsummary2_path).await?);
+        let mut m8_w =
+            tokio::io::BufWriter::new(tokio::fs::File::create(&reassigned_m8_path).await?);
+
+        let mut long_rows = 0u64;
+        for p in &pairs_out {
+            let nf = p.summary.split(|&b| b == b'\t').count();
+            if nf >= 12 {
+                long_rows += 1;
+            }
+            hit_w.write_all(&p.summary).await?;
+            if !p.summary.ends_with(b"\n") {
+                hit_w.write_all(b"\n").await?;
+            }
+            m8_w.write_all(&p.dedup).await?;
+            if !p.dedup.ends_with(b"\n") {
+                m8_w.write_all(b"\n").await?;
+            }
+        }
+        hit_w.flush().await?;
+        m8_w.flush().await?;
+
+        info!(
+            "[blast_contigs:{}] wrote hitsummary2={} lines={} long_rows(>=12)={} reassigned_m8={}",
+            db_type,
+            hitsummary2_path.display(),
+            pairs_out.len(),
+            long_rows,
+            reassigned_m8_path.display()
+        );
+    }
+
+
+
     let (refined_pairs_tx, refined_pairs_rx) = mpsc::channel(pairs_out.len().max(1));
     tokio::spawn(async move {
         for p in pairs_out {
@@ -8665,7 +8712,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut pairs = nt_pairs_coverage;
             let (tx, rx) = mpsc::channel(65_536);
             tokio::spawn(async move {
+                let mut n = 0u64;
                 while let Some(p) = pairs.next().await {
+
+                    n += 1;
+                    if n <= 5 {
+                        let s = String::from_utf8_lossy(&p.summary);
+                        let nf = s.trim().split('\t').count();
+                        info!("[viz hit] n={} nf={} line={}", n, nf, s.trim());
+                    }
+
                     if tx
                         .send(ParseOutput::Bytes(Bytes::from(p.summary)))
                         .await

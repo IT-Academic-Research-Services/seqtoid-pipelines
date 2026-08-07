@@ -1247,7 +1247,7 @@ pub async fn call_hits_m8(
     let summary_path = config.out_dir.join(rename_file_path(
         &sample_base_buf,
         None,
-        Some(&format!("{}.summary.txt", tag)),
+        Some(&format!("{}.hitsummary.tab", tag)),
         "_",
     ));
     let write_tag = tag.clone();
