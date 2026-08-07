@@ -223,6 +223,17 @@ async fn prepare_data(
         num_accessions_per_taxon,
     );
 
+    info!(
+  "[coverage prepare] valid_contigs={} accession_data={} taxon_data={} contig_data={} read_data={}",
+  valid_contigs.len(),
+  accession_data.len(),
+  taxon_data.len(),
+  contig_data.len(),
+  read_data.len()
+);
+    let n_contig_acc = accession_data.values().filter(|a| !a.contigs.is_empty()).count();
+    info!("[coverage prepare] accessions_with_contigs={}", n_contig_acc);
+
     Ok((taxon_data, accession_data, contig_data, read_data))
 }
 
