@@ -454,8 +454,8 @@ async fn generate_read_data(
         };
 
         let read_name = m8.qname.clone();
-        if assigned_reads.contains(&read_name) {
-            continue;
+        if !assigned_reads.contains(&read_name) {
+            continue; // not a loose/unassigned read for coverage viz
         }
 
         let prop_mismatch = if m8.alen > 0 {
