@@ -4048,9 +4048,9 @@ async fn process_assembly(
     let (non_host_streams, non_host_done_rx) = fanout_to_channels(
         ReceiverStream::new(samtools_sort_out_stream),
         3,
-        "process_assembly_sam",
-        &config,                   // ← added
-        StreamDataType::JustBytes, // ← correct (BAM bytes from samtools sort)
+        "process_assembly_bam",
+        &config,
+        StreamDataType::JustBytes,
     )
     .await
     .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -4079,7 +4079,7 @@ async fn process_assembly(
     );
 
     let write_bam_task = write_byte_stream_to_file(
-        &bam_path,
+        &final_bam_path,
         bam_for_file,
         config.clone(),
         StreamDataType::JustBytes,
