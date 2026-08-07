@@ -677,6 +677,9 @@ fn calculate_accession_coverage(
     for contig_name in &acc_obj.contigs {
         if let Some(hits) = contig_data.get(contig_name) {
             for hit in hits {
+                if hit.accession != acc_id {
+                    continue;
+                }
                 let (s_start, s_end) =
                     decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
                 let (bin_start, bin_end) = align_interval(s_start / bin_size, s_end / bin_size);
