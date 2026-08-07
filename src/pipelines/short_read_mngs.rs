@@ -4099,7 +4099,7 @@ async fn process_assembly(
     let (read2contig, contig_stats, _contig_uniques) = generate_info_from_bam_stream(
         bam_for_stats.into_inner(),
         &duplicate_clusters,
-        config.args.min_contig_length,
+        MIN_CONTIG_SIZE,
         bam_concurrency,
     )
     .await?;
