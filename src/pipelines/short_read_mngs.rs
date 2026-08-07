@@ -5629,6 +5629,7 @@ async fn early_blast_exit(
 async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
+    sample_base: &String,
     mut pairs: ReceiverStream<ReducedRead>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     accession_map: Arc<AHashMap<String, AccessionHit>>,
@@ -6285,10 +6286,10 @@ async fn blast_contigs(
     // Written from the same pairs_out that feeds merge / taxid / coverage.
     let hitsummary2_path = config
         .out_dir
-        .join(format!("{}.hitsummary2.tab", db_type));
+        .join(format!("{}_{}.hitsummary2.tab", sample_base, db_type));
     let reassigned_m8_path = config
         .out_dir
-        .join(format!("{}.reassigned.m8", db_type));
+        .join(format!("{}_{}.reassigned.m8", sample_base, db_type));
 
     {
         use tokio::io::AsyncWriteExt;
@@ -8128,11 +8129,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
         let nt_pairs_blast = nt_pairs_blast;
+        let sample_base = sample_base.clone();
 
         async move {
             blast_contigs(
                 config,
                 NT_TAG,
+                &sample_base,
                 nt_pairs_blast,
                 nt_read_dict.clone(),
                 nt_accession_dict,
@@ -8168,11 +8171,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
         let nr_pairs_blast = nr_pairs_blast;
+        let sample_base = sample_base.clone();
 
         async move {
             blast_contigs(
                 config,
                 NR_TAG,
+                &sample_base,
                 nr_pairs_blast,
                 nr_read_dict.clone(),
                 nr_accession_dict,
