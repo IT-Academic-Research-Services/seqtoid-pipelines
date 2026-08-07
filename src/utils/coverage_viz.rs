@@ -39,21 +39,32 @@ struct AccessionData {
 
 #[derive(Debug, Clone)]
 struct ContigHit {
+    accession: String,
     subject_start: u64,
     subject_end: u64,
     query_start: u64,
     query_end: u64,
-    total_length: u64,
+    alignment_length: u64,
+    percent_id: f64,
+    num_mismatches: u64,
+    num_gaps: u64,
+    total_length: u64,       // bp — set in augment_contig_data_with_coverage
     coverage: Vec<f64>,
     prop_mismatch: f64,
+    num_reads: u64,          // from valid_contigs
+    byterange: Option<(u64, u64)>, // [offset, length] in contigs.fasta; set by byterange augment
 }
 
 #[derive(Debug, Clone)]
 struct ReadHit {
+    accession: String,
     subject_start: u64,
     subject_end: u64,
+    alignment_length: u64,
+    percent_id: f64,
+    num_mismatches: u64,
+    num_gaps: u64,
     prop_mismatch: f64,
-    accession: String,
 }
 
 // Output JSON structures
@@ -381,14 +392,21 @@ async fn generate_contig_data(
             0.0
         };
 
-        contig_data.entry(contig_name).or_default().push(ContigHit {
+        contig_data.entry(contig_name.clone()).or_default().push(ContigHit {
+            accession: m8.tname.clone(),
             subject_start: m8.tstart,
             subject_end: m8.tend,
             query_start: m8.qstart,
             query_end: m8.qend,
-            total_length: 0, // placeholder; set in augment_contig_data_with_coverage
+            alignment_length: m8.alen,
+            percent_id: m8.pident,
+            num_mismatches: m8.mismatch,
+            num_gaps: m8.gapopen,
+            total_length: 0, // bp — set in augment_contig_data_with_coverage
             coverage: vec![],
             prop_mismatch,
+            num_reads: *valid_contigs.get(&contig_name).unwrap_or(&0),
+            byterange: None, // set in augment_contig_data_with_byteranges
         });
     }
 
@@ -447,10 +465,14 @@ async fn generate_read_data(
         };
 
         read_data.entry(read_name).or_default().push(ReadHit {
+            accession: m8.tname.clone(),
             subject_start: m8.tstart,
             subject_end: m8.tend,
+            alignment_length: m8.alen,
+            percent_id: m8.pident,
+            num_mismatches: m8.mismatch,
+            num_gaps: m8.gapopen,
             prop_mismatch,
-            accession: m8.tname.clone(),
         });
     }
 
@@ -603,10 +625,18 @@ async fn generate_coverage_viz_data(
 
             let stats = calculate_accession_stats(&acc_obj, &contig_data, &read_data, total_len)?;
 
+            let hit_groups = generate_hit_group_json(
+                &acc_obj,
+                &acc_id,
+                &contig_data,
+                &read_data,
+                num_bins,
+            );
+
             let viz = CoverageVizData {
                 total_length: acc_obj.total_length,
                 name: acc_obj.name.clone(),
-                hit_groups: json!([]),
+                hit_groups: hit_groups,
                 coverage,
                 coverage_bin_size: bin_size,
                 max_aligned_length: stats.max_aligned_length,
@@ -888,6 +918,206 @@ fn generate_coverage_viz_summary_data(
     }
 
     CoverageVizSummary { taxons }
+}
+
+/// Aggregate reads/contigs into hit groups for one accession.
+/// Layout of each group matches Python get_hit_group_json:
+/// [num_contigs, num_reads, contig_r, start, end, avg_alen, avg_pident,
+///  avg_mismatch, avg_gaps, bin_index, contig_byteranges]
+fn generate_hit_group_json(
+    accession_obj: &AccessionData,
+    accession_id: &str,
+    contig_data: &HashMap<String, Vec<ContigHit>>,
+    read_data: &HashMap<String, Vec<ReadHit>>,
+    num_bins: usize,
+) -> Value {
+    if accession_obj.total_length == 0 || num_bins == 0 {
+        return json!([]);
+    }
+
+    let bin_size = accession_obj.total_length as f64 / num_bins as f64;
+
+    // Individual hits (span >= bin_size) vs binned small hits
+    let mut individual_reads: Vec<(String, usize)> = Vec::new();
+    let mut individual_contigs: Vec<(String, usize)> = Vec::new();
+    let mut read_bins: Vec<Vec<(String, usize)>> = vec![Vec::new(); num_bins];
+    let mut contig_bins: Vec<Vec<(String, usize)>> = vec![Vec::new(); num_bins];
+
+    // ── process one hit ──────────────────────────────────────────────
+    let mut process_contig = |name: &str| {
+        let Some(hits) = contig_data.get(name) else {
+            warn!("Could not find contig in map: {}", name);
+            return;
+        };
+        for (ind, hit) in hits.iter().enumerate() {
+            if hit.accession != accession_id {
+                warn!(
+                    "Mismatched accession for {}: {} (hit) versus {} (hitsummary)",
+                    name, hit.accession, accession_id
+                );
+                continue;
+            }
+            let (start, end) =
+                align_interval_u64(hit.subject_start, hit.subject_end);
+            let (dec_s, dec_e) = decrement_lower_bound(start as f64, end as f64);
+            let (acc_s, acc_e) = align_interval(dec_s, dec_e);
+            let span = acc_e - acc_s;
+
+            if span >= bin_size {
+                individual_contigs.push((name.to_string(), ind));
+            } else {
+                let mid = (acc_s + acc_e) / 2.0;
+                let bin_idx = floor_with_min(mid / bin_size, 0) as usize;
+                let bin_idx = bin_idx.min(num_bins.saturating_sub(1));
+                contig_bins[bin_idx].push((name.to_string(), ind));
+            }
+        }
+    };
+
+    let mut process_read = |name: &str| {
+        let Some(hits) = read_data.get(name) else {
+            warn!("Could not find read in map: {}", name);
+            return;
+        };
+        for (ind, hit) in hits.iter().enumerate() {
+            if hit.accession != accession_id {
+                continue;
+            }
+            let (start, end) =
+                align_interval_u64(hit.subject_start, hit.subject_end);
+            let (dec_s, dec_e) = decrement_lower_bound(start as f64, end as f64);
+            let (acc_s, acc_e) = align_interval(dec_s, dec_e);
+            let span = acc_e - acc_s;
+
+            if span >= bin_size {
+                individual_reads.push((name.to_string(), ind));
+            } else {
+                let mid = (acc_s + acc_e) / 2.0;
+                let bin_idx = floor_with_min(mid / bin_size, 0) as usize;
+                let bin_idx = bin_idx.min(num_bins.saturating_sub(1));
+                read_bins[bin_idx].push((name.to_string(), ind));
+            }
+        }
+    };
+
+    for r in &accession_obj.reads {
+        process_read(r);
+    }
+    for c in &accession_obj.contigs {
+        process_contig(c);
+    }
+
+    // ── emit groups ──────────────────────────────────────────────────
+    let mut hit_groups: Vec<Value> = Vec::new();
+
+    for (name, ind) in &individual_reads {
+        if let Some(hits) = read_data.get(name) {
+            if let Some(h) = hits.get(*ind) {
+                hit_groups.push(get_hit_group_json(&[], &[h], bin_size));
+            }
+        }
+    }
+    for (name, ind) in &individual_contigs {
+        if let Some(hits) = contig_data.get(name) {
+            if let Some(h) = hits.get(*ind) {
+                hit_groups.push(get_hit_group_json(&[h], &[], bin_size));
+            }
+        }
+    }
+
+    for i in 0..num_bins {
+        let read_refs: Vec<&ReadHit> = read_bins[i]
+            .iter()
+            .filter_map(|(n, ind)| read_data.get(n).and_then(|v| v.get(*ind)))
+            .collect();
+        let contig_refs: Vec<&ContigHit> = contig_bins[i]
+            .iter()
+            .filter_map(|(n, ind)| contig_data.get(n).and_then(|v| v.get(*ind)))
+            .collect();
+
+        if read_refs.is_empty() && contig_refs.is_empty() {
+            continue;
+        }
+        hit_groups.push(get_hit_group_json(&contig_refs, &read_refs, bin_size));
+    }
+
+    json!(hit_groups)
+}
+
+/// One hit-group array
+fn get_hit_group_json(
+    contig_objs: &[&ContigHit],
+    read_objs: &[&ReadHit],
+    bin_size: f64,
+) -> Value {
+    let num_contigs = contig_objs.len();
+    let num_reads = read_objs.len();
+    let num_hits = num_contigs + num_reads;
+    if num_hits == 0 {
+        return json!([]);
+    }
+
+    // Unique byteranges → sum num_reads once per contig sequence
+    let mut seen = HashSet::new();
+    let mut contig_r: u64 = 0;
+    let mut contig_byteranges: Vec<Value> = Vec::new();
+    for c in contig_objs {
+        let key = c.byterange.unwrap_or((0, 0));
+        if seen.insert(key) {
+            contig_r += c.num_reads;
+            if let Some((off, len)) = c.byterange {
+                contig_byteranges.push(json!([off, len]));
+            }
+        }
+    }
+
+    // Bounds + averages over all hits
+    let mut endpoints: Vec<u64> = Vec::with_capacity(num_hits * 2);
+    let mut sum_alen = 0.0;
+    let mut sum_pident = 0.0;
+    let mut sum_mismatch = 0.0;
+    let mut sum_gaps = 0.0;
+
+    for c in contig_objs {
+        endpoints.push(c.subject_start);
+        endpoints.push(c.subject_end);
+        sum_alen += c.alignment_length as f64;
+        sum_pident += c.percent_id;
+        sum_mismatch += c.num_mismatches as f64;
+        sum_gaps += c.num_gaps as f64;
+    }
+    for r in read_objs {
+        endpoints.push(r.subject_start);
+        endpoints.push(r.subject_end);
+        sum_alen += r.alignment_length as f64;
+        sum_pident += r.percent_id;
+        sum_mismatch += r.num_mismatches as f64;
+        sum_gaps += r.num_gaps as f64;
+    }
+
+    let hit_group_start = *endpoints.iter().min().unwrap_or(&0);
+    let hit_group_end = *endpoints.iter().max().unwrap_or(&0);
+    let mid = ((hit_group_start as f64 - 1.0) + hit_group_end as f64) / 2.0;
+    let bin_index = floor_with_min(mid / bin_size, 0);
+
+    let n = num_hits as f64;
+    json!([
+        num_contigs,
+        num_reads,
+        contig_r,
+        hit_group_start,
+        hit_group_end,
+        format_number(sum_alen / n),
+        format_percent(sum_pident / n / 100.0), //  avg(percent_id)/100
+        format_number(sum_mismatch / n),
+        format_number(sum_gaps / n),
+        bin_index,
+        contig_byteranges,
+    ])
+}
+
+fn align_interval_u64(a: u64, b: u64) -> (u64, u64) {
+    (a.min(b), a.max(b))
 }
 
 // Interval utilities — exact ports from Python
