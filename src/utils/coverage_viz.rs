@@ -117,6 +117,7 @@ pub async fn generate_coverage_viz(
     refined_gsnap_blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     contig_coverage_json: PathBuf,
     contig_stats_json: PathBuf,
+    contigs_fasta: PathBuf,
     gsnap_deduped_m8: ReceiverStream<ParseOutput>,
     nt_info_db: PathBuf,
     output_dir: PathBuf,
@@ -136,6 +137,7 @@ pub async fn generate_coverage_viz(
         refined_gsnap_blast_top_m8,
         &contig_coverage_json,
         &contig_stats_json,
+        &contigs_fasta,
         gsnap_deduped_m8,
         info_dict,
         min_size,
@@ -182,6 +184,7 @@ async fn prepare_data(
     blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     contig_coverage_json: &Path,
     contig_stats_json: &Path,
+    contigs_fasta: &Path,
     gsnap_deduped_m8: ReceiverStream<ParseOutput>,
     info_dict: HashMap<String, (String, u64)>,
     min_contig_size: u64,
@@ -211,6 +214,7 @@ async fn prepare_data(
     let read_data = generate_read_data(gsnap_deduped_m8, &assigned_reads).await?;
 
     augment_contig_data_with_coverage(contig_coverage_json, &mut contig_data)?;
+    augment_contig_data_with_byteranges(contigs_fasta, &mut contig_data)?;
 
     let (taxon_data, accession_data) =
         select_best_accessions_per_taxon(taxon_data, accession_data, num_accessions_per_taxon);
@@ -1118,6 +1122,54 @@ fn get_hit_group_json(
 
 fn align_interval_u64(a: u64, b: u64) -> (u64, u64) {
     (a.min(b), a.max(b))
+}
+
+
+
+fn augment_contig_data_with_byteranges(
+    contigs_fasta: &Path,
+    contig_data: &mut HashMap<String, Vec<ContigHit>>,
+) -> Result<()> {
+    let file = File::open(contigs_fasta)
+        .with_context(|| format!("open contigs_fasta {}", contigs_fasta.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut seq_offset: u64 = 0;
+    let mut seq_len: u64 = 0;
+    let mut contig_name = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        // Re-add the newline that lines() strips — file offsets must match on-disk bytes.
+        let line_bytes = (line.len() + 1) as u64; // +1 for '\n'
+
+        if line.starts_with('>') {
+            // Finalize previous record
+            if seq_len > 0 {
+                if let Some(hits) = contig_data.get_mut(&contig_name) {
+                    for hit in hits.iter_mut() {
+                        hit.byterange = Some((seq_offset, seq_len));
+                    }
+                }
+                seq_offset += seq_len;
+            }
+            seq_len = line_bytes;
+            contig_name = line[1..].trim().to_string();
+        } else {
+            seq_len += line_bytes;
+        }
+    }
+
+    // Last contig in the file
+    if seq_len > 0 {
+        if let Some(hits) = contig_data.get_mut(&contig_name) {
+            for hit in hits.iter_mut() {
+                hit.byterange = Some((seq_offset, seq_len));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Interval utilities — exact ports from Python

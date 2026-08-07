@@ -8702,6 +8702,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 UnboundedReceiverStream::new(nt_refined_m8_top_stream_out), // pure contig top m8
                 coverage_json_path,
                 assembly_outputs.contig_stats_json,
+                assembly_outputs.contigs_fasta,
                 ReceiverStream::new(m8_for_viz),
                 nt_info_db_path,
                 out_dir_for_viz,
