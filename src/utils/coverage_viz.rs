@@ -559,7 +559,7 @@ fn select_best_accessions_per_taxon(
     contig_data: &HashMap<String, Vec<ContigHit>>,
     num_per_taxon: usize,
 ) -> (HashMap<String, TaxonData>, HashMap<String, AccessionData>) {
-    // Score = max_contig_alen + sum_contig_alen + num_reads 
+    // Score = max_contig_alen + sum_contig_alen + num_reads
     for ad in accession_data.values_mut() {
         if ad.total_length == 0 {
             ad.score = f64::NEG_INFINITY;
@@ -881,7 +881,6 @@ fn calculate_accession_stats(
     let mut max_len = 0u64;
     let mut cov_sum = 0.0;
     let mut mismatch_sum = 0.0;
-    let mut hit_count = 0usize;
     let mut endpoints = Vec::new();
 
     for contig in &acc_obj.contigs {
@@ -903,8 +902,6 @@ fn calculate_accession_stats(
                 }
 
                 mismatch_sum += hit.prop_mismatch;
-                hit_count += 1;
-
                 endpoints.push((s_start, 1));
                 endpoints.push((s_end, -1));
             }
@@ -921,10 +918,7 @@ fn calculate_accession_stats(
                 max_len = max_len.max(aligned_len);
 
                 cov_sum += aligned_len as f64;
-
                 mismatch_sum += hit.prop_mismatch;
-                hit_count += 1;
-
                 endpoints.push((s_start, 1));
                 endpoints.push((s_end, -1));
             }
@@ -937,6 +931,9 @@ fn calculate_accession_stats(
         0.0
     };
 
+    //prop_total_mismatch / (len(contigs) + len(reads))
+    let n_names = acc_obj.contigs.len() + acc_obj.reads.len();
+
     Ok(AccessionStats {
         max_aligned_length: max_len,
         coverage_depth: if total_len > 0.0 {
@@ -945,8 +942,8 @@ fn calculate_accession_stats(
             0.0
         },
         coverage_breadth: breadth,
-        avg_prop_mismatch: if hit_count > 0 {
-            mismatch_sum / hit_count as f64
+        avg_prop_mismatch: if n_names > 0 {
+            mismatch_sum / n_names as f64
         } else {
             0.0
         },
