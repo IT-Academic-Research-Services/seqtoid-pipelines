@@ -216,8 +216,12 @@ async fn prepare_data(
     augment_contig_data_with_coverage(contig_coverage_json, &mut contig_data)?;
     augment_contig_data_with_byteranges(contigs_fasta, &mut contig_data)?;
 
-    let (taxon_data, accession_data) =
-        select_best_accessions_per_taxon(taxon_data, accession_data, num_accessions_per_taxon);
+    let (taxon_data, accession_data) = select_best_accessions_per_taxon(
+        taxon_data,
+        accession_data,
+        &contig_data,
+        num_accessions_per_taxon,
+    );
 
     Ok((taxon_data, accession_data, contig_data, read_data))
 }
@@ -552,39 +556,99 @@ fn augment_contig_data_with_coverage(
 fn select_best_accessions_per_taxon(
     mut taxon_data: HashMap<String, TaxonData>,
     mut accession_data: HashMap<String, AccessionData>,
+    contig_data: &HashMap<String, Vec<ContigHit>>,
     num_per_taxon: usize,
 ) -> (HashMap<String, TaxonData>, HashMap<String, AccessionData>) {
+    // Score = max_contig_alen + sum_contig_alen + num_reads 
     for ad in accession_data.values_mut() {
         if ad.total_length == 0 {
-            ad.score = f64::NEG_INFINITY; // never selected
-        } else {
-            ad.score = ad.contigs.len() as f64 * 1000.0 + ad.reads.len() as f64;
+            ad.score = f64::NEG_INFINITY;
+            continue;
         }
+        let mut max_alen = 0u64;
+        let mut sum_alen = 0u64;
+        for cname in &ad.contigs {
+            if let Some(hits) = contig_data.get(cname) {
+                for h in hits {
+                    max_alen = max_alen.max(h.alignment_length);
+                    sum_alen += h.alignment_length;
+                }
+            }
+        }
+        ad.score = max_alen as f64 + sum_alen as f64 + ad.reads.len() as f64;
     }
+
+    let mut filtered_accessions: HashMap<String, AccessionData> = HashMap::new();
 
     for td in taxon_data.values_mut() {
-        let mut scored: Vec<_> = td
-            .accessions
+        let mut sorted: Vec<String> = td.accessions.iter().cloned().collect();
+        sorted.sort_by(|a, b| {
+            let sa = accession_data
+                .get(a)
+                .map(|x| x.score)
+                .unwrap_or(f64::NEG_INFINITY);
+            let sb = accession_data
+                .get(b)
+                .map(|x| x.score)
+                .unwrap_or(f64::NEG_INFINITY);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // All accessions with ≥1 contig (no cap)
+        let with_contigs: Vec<String> = sorted
             .iter()
-            .filter_map(|acc| {
-                let ad = accession_data.get(acc)?;
-                if ad.total_length == 0 {
-                    return None;
-                }
-                Some((acc.clone(), ad.score))
+            .filter(|a| {
+                accession_data
+                    .get(*a)
+                    .map(|x| !x.contigs.is_empty() && x.total_length > 0)
+                    .unwrap_or(false)
             })
+            .cloned()
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let best = if with_contigs.len() >= num_per_taxon {
+            with_contigs
+        } else {
+            // Fill remaining slots with best read-only accessions
+            let without: Vec<String> = sorted
+                .iter()
+                .filter(|a| {
+                    accession_data
+                        .get(*a)
+                        .map(|x| x.contigs.is_empty() && x.total_length > 0)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            let need = num_per_taxon - with_contigs.len();
+            let mut v = with_contigs;
+            v.extend(without.into_iter().take(need));
+            // Re-sort: a read-only accession can outscore a contig accession
+            v.sort_by(|a, b| {
+                let sa = accession_data
+                    .get(a)
+                    .map(|x| x.score)
+                    .unwrap_or(f64::NEG_INFINITY);
+                let sb = accession_data
+                    .get(b)
+                    .map(|x| x.score)
+                    .unwrap_or(f64::NEG_INFINITY);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            v
+        };
 
-        td.best_accessions = scored
-            .into_iter()
-            .take(num_per_taxon)
-            .map(|(acc, _)| acc)
-            .collect();
+        for a in &best {
+            if let Some(ad) = accession_data.remove(a) {
+                filtered_accessions.insert(a.clone(), ad);
+            }
+        }
+        td.best_accessions = best;
     }
 
-    (taxon_data, accession_data)
+    taxon_data.retain(|_, td| !td.best_accessions.is_empty());
+
+    (taxon_data, filtered_accessions)
 }
 
 async fn generate_coverage_viz_data(
