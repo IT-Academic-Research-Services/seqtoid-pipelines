@@ -260,6 +260,8 @@ async fn generate_accession_data(
 ) -> Result<(HashMap<String, AccessionData>, HashMap<String, TaxonData>)> {
     let mut accession_data: HashMap<String, AccessionData> = HashMap::new();
     let mut taxon_data: HashMap<String, TaxonData> = HashMap::new();
+    // Contigs deduped per accession (Python uses a set)
+    let mut contig_sets: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut line_count = 0;
 
@@ -283,7 +285,8 @@ async fn generate_accession_data(
                 .or_default()
                 .accessions
                 .insert(acc.clone());
-            accession_data.entry(acc).or_default().contigs.push(contig);
+            contig_sets.entry(acc.clone()).or_default().insert(contig);
+            accession_data.entry(acc).or_default(); // ensure key exists
         } else if fields.len() >= 5 {
             let taxon = fields[4].to_string();
             let acc = fields[3].to_string();
@@ -298,13 +301,18 @@ async fn generate_accession_data(
         }
     }
 
+    for (acc, set) in contig_sets {
+        if let Some(ad) = accession_data.get_mut(&acc) {
+            ad.contigs = set.into_iter().collect();
+        }
+    }
+
     for td in taxon_data.values_mut() {
         td.num_total_accessions = td.accessions.len();
     }
 
     Ok((accession_data, taxon_data))
 }
-
 fn remove_taxons_with_no_contigs(
     accession_data: &mut HashMap<String, AccessionData>,
     taxon_data: &mut HashMap<String, TaxonData>,
