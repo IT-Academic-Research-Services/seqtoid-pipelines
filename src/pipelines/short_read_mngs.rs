@@ -6840,20 +6840,6 @@ async fn mmseqs_non_host_align(
         )));
     }
 
-    // Durable copy for post-run inspection (optional but useful).
-    let durable = config.out_dir.join("nr_raw.m8");
-    tokio::fs::copy(&merged_m8, &durable)
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "failed to persist NR m8 {} → {}: {}",
-                merged_m8.display(),
-                durable.display(),
-                e
-            ))
-        })?;
-    info!("[mmseqs NR] raw m8 retained at {}", durable.display());
-
     let m8_file = fs::File::open(&merged_m8)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;

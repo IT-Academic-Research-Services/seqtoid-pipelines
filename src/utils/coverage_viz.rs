@@ -567,12 +567,9 @@ fn select_best_accessions_per_taxon(
     contig_data: &HashMap<String, Vec<ContigHit>>,
     num_per_taxon: usize,
 ) -> (HashMap<String, TaxonData>, HashMap<String, AccessionData>) {
-    // Score = max_contig_alen + sum_contig_alen + num_reads
+    // Score = max_contig_alen + sum_contig_alen + num_reads  (Python get_score)
+    // Do not zero out score when total_length == 0 — contig accessions still rank by alen.
     for ad in accession_data.values_mut() {
-        if ad.total_length == 0 {
-            ad.score = f64::NEG_INFINITY;
-            continue;
-        }
         let mut max_alen = 0u64;
         let mut sum_alen = 0u64;
         for cname in &ad.contigs {
@@ -602,13 +599,13 @@ fn select_best_accessions_per_taxon(
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // All accessions with ≥1 contig (no cap)
+        // Python: len(contigs) >= 1 — no total_length check
         let with_contigs: Vec<String> = sorted
             .iter()
             .filter(|a| {
                 accession_data
                     .get(*a)
-                    .map(|x| !x.contigs.is_empty() && x.total_length > 0)
+                    .map(|x| !x.contigs.is_empty())
                     .unwrap_or(false)
             })
             .cloned()
@@ -617,13 +614,13 @@ fn select_best_accessions_per_taxon(
         let best = if with_contigs.len() >= num_per_taxon {
             with_contigs
         } else {
-            // Fill remaining slots with best read-only accessions
+            // Python: fill with accessions that have zero contigs
             let without: Vec<String> = sorted
                 .iter()
                 .filter(|a| {
                     accession_data
                         .get(*a)
-                        .map(|x| x.contigs.is_empty() && x.total_length > 0)
+                        .map(|x| x.contigs.is_empty())
                         .unwrap_or(false)
                 })
                 .cloned()
@@ -631,7 +628,6 @@ fn select_best_accessions_per_taxon(
             let need = num_per_taxon - with_contigs.len();
             let mut v = with_contigs;
             v.extend(without.into_iter().take(need));
-            // Re-sort: a read-only accession can outscore a contig accession
             v.sort_by(|a, b| {
                 let sa = accession_data
                     .get(a)
