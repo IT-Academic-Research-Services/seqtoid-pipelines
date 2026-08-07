@@ -355,7 +355,6 @@ async fn generate_contig_data(
             continue;
         }
 
-        // 12-col standard m8 *or* 14-col blastn with qlen/slen
         let m8 = match M8Record::parse_line_nt(line_trim)
             .or_else(|_| M8Record::parse_line_nr(line_trim))
         {
@@ -374,7 +373,8 @@ async fn generate_contig_data(
             continue;
         }
 
-        let total_length = *valid_contigs.get(&contig_name).unwrap_or(&0);
+        // total_length is contig length in bp — filled later from coverage JSON
+        // (valid_contigs values are read counts, not lengths)
         let prop_mismatch = if m8.alen > 0 {
             m8.mismatch as f64 / m8.alen as f64
         } else {
@@ -386,7 +386,7 @@ async fn generate_contig_data(
             subject_end: m8.tend,
             query_start: m8.qstart,
             query_end: m8.qend,
-            total_length,
+            total_length: 0, // placeholder; set in augment_contig_data_with_coverage
             coverage: vec![],
             prop_mismatch,
         });
@@ -474,39 +474,52 @@ fn augment_contig_data_with_coverage(
         .as_object()
         .ok_or_else(|| anyhow!("contig_coverage_json root is not an object"))?;
 
-    let mut contig_coverage: HashMap<String, Vec<f64>> = HashMap::with_capacity(obj.len());
     for (name, v) in obj {
-        let arr = match v {
-            Value::Array(a) => a,
-            Value::Object(o) => o
-                .get("coverage")
-                .or_else(|| o.get("depths"))
-                .or_else(|| o.get("depth"))
-                .and_then(|x| x.as_array())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "contig_coverage entry '{}' is neither array nor object with coverage[]",
-                        name
-                    )
-                })?,
+        let (depths, contig_len) = match v {
+            Value::Array(a) => {
+                let depths: Vec<f64> = a.iter().filter_map(|x| x.as_f64()).collect();
+                let len = depths.len() as u64; // 1 depth per base
+                (depths, len)
+            }
+            Value::Object(o) => {
+                let arr = o
+                    .get("coverage")
+                    .or_else(|| o.get("depths"))
+                    .or_else(|| o.get("depth"))
+                    .and_then(|x| x.as_array())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "contig_coverage entry '{}' missing coverage[]",
+                            name
+                        )
+                    })?;
+                let depths: Vec<f64> = arr.iter().filter_map(|x| x.as_f64()).collect();
+                // Prefer explicit contig_len; fall back to coverage array length
+                let len = o
+                    .get("contig_len")
+                    .or_else(|| o.get("total_length"))
+                    .or_else(|| o.get("length"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(depths.len() as u64);
+                (depths, len)
+            }
             _ => {
                 warn!("Skipping contig_coverage entry '{}': unexpected JSON type", name);
                 continue;
             }
         };
-        let depths: Vec<f64> = arr.iter().filter_map(|x| x.as_f64()).collect();
-        contig_coverage.insert(name.clone(), depths);
+
+        if let Some(hits) = contig_data.get_mut(name) {
+            for hit in hits.iter_mut() {
+                hit.coverage = depths.clone();
+                hit.total_length = contig_len;
+            }
+        }
+        // contigs present only in coverage JSON (no blast hit) are intentionally ignored
     }
 
-    for (contig_name, hits) in contig_data.iter_mut() {
-        if let Some(cov) = contig_coverage.get(contig_name) {
-            for hit in hits.iter_mut() {
-                hit.coverage = cov.clone();
-            }
-        } else {
-            warn!("No coverage data for contig: {}", contig_name);
-        }
-    }
+    // Contigs that had blast hits but no coverage entry stay at total_length=0;
+    // calculate_accession_coverage already guards on empty coverage / zero length.
     Ok(())
 }
 
