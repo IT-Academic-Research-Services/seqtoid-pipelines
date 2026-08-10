@@ -192,26 +192,26 @@ impl M8Record {
         let mut fields = line.split('\t');
 
         macro_rules! next {
-            ($name:literal) => {
-                fields
-                    .next()
-                    .ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
-            };
-        }
+        ($name:literal) => {
+            fields
+                .next()
+                .ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
+        };
+    }
         macro_rules! parse_float {
-            ($name:literal) => {{
-                let s = next!($name);
-                lexical_parse::<f64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!(concat!("invalid float ", $name, ": {}"), e))?
-            }};
-        }
+        ($name:literal) => {{
+            let s = next!($name);
+            lexical_parse::<f64, _>(s.as_bytes())
+                .map_err(|e| anyhow!(concat!("invalid float ", $name, ": {}"), e))?
+        }};
+    }
         macro_rules! parse_u64 {
-            ($name:literal) => {{
-                let s = next!($name);
-                lexical_parse::<u64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!(concat!("invalid u64 ", $name, ": {}"), e))?
-            }};
-        }
+        ($name:literal) => {{
+            let s = next!($name);
+            lexical_parse::<u64, _>(s.as_bytes())
+                .map_err(|e| anyhow!(concat!("invalid u64 ", $name, ": {}"), e))?
+        }};
+    }
 
         let qname = next!("qname").to_string();
         let tname = Self::clean_accession(next!("tname"));
@@ -226,9 +226,19 @@ impl M8Record {
         let evalue = parse_float!("evalue");
         let bitscore = parse_float!("bitscore");
 
+        // Optional trailing qlen/slen (NT outfmt or to_tab_string rewrite)
+        let qlen = fields
+            .next()
+            .and_then(|s| lexical_parse::<u64, _>(s.as_bytes()).ok())
+            .unwrap_or(0);
+        let slen = fields
+            .next()
+            .and_then(|s| lexical_parse::<u64, _>(s.as_bytes()).ok())
+            .unwrap_or(0);
         if fields.next().is_some() {
-            warn!("Extra columns in NR m8 line (expected 12): {}", line);
+            warn!("Extra columns beyond 14 in NR/NT-like m8: {}", line);
         }
+
         Ok(Self {
             qname,
             tname,
@@ -242,8 +252,8 @@ impl M8Record {
             tend,
             evalue,
             bitscore,
-            qlen: 0,
-            slen: 0,
+            qlen,
+            slen,
         })
     }
 
@@ -380,32 +390,33 @@ impl M8Record {
         let tab_pos = Self::collect_tab_positions(bytes);
         let len = bytes.len();
 
+        // 11 tabs = 12 fields (required); 13 tabs = 14 fields (optional qlen/slen)
         if tab_pos.len() < 11 {
             return Err(anyhow!(
-                "NR m8 line has {} tabs, need ≥11 for 12 fields",
-                tab_pos.len()
-            ));
+            "NR m8 line has {} tabs, need ≥11 for 12 fields",
+            tab_pos.len()
+        ));
         }
 
         macro_rules! field {
-            ($n:expr) => {{
-                let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
-                let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
-                &bytes[start..end]
-            }};
-        }
+        ($n:expr) => {{
+            let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
+            let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+            &bytes[start..end]
+        }};
+    }
         macro_rules! parse_u64 {
-            ($n:expr, $name:literal) => {
-                lexical_parse::<u64, _>(field!($n))
-                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
-            };
-        }
+        ($n:expr, $name:literal) => {
+            lexical_parse::<u64, _>(field!($n))
+                .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+        };
+    }
         macro_rules! parse_f64 {
-            ($n:expr, $name:literal) => {
-                lexical_parse::<f64, _>(field!($n))
-                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
-            };
-        }
+        ($n:expr, $name:literal) => {
+            lexical_parse::<f64, _>(field!($n))
+                .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+        };
+    }
 
         let qname = std::str::from_utf8(field!(0))
             .map_err(|_| anyhow!("qname not UTF-8"))?
@@ -424,8 +435,18 @@ impl M8Record {
         let evalue = parse_f64!(10, "evalue");
         let bitscore = parse_f64!(11, "bitscore");
 
-        if tab_pos.len() > 11 {
-            warn!("Extra columns in NR m8 line (expected 12): {}", trimmed);
+        // Optional trailing qlen/slen (NT outfmt or to_tab_string rewrite)
+        let (qlen, slen) = if tab_pos.len() >= 13 {
+            (
+                lexical_parse::<u64, _>(field!(12)).unwrap_or(0),
+                lexical_parse::<u64, _>(field!(13)).unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+
+        if tab_pos.len() > 13 {
+            warn!("Extra columns beyond 14 in NR/NT-like m8: {}", trimmed);
         }
 
         Ok(Self {
@@ -441,8 +462,8 @@ impl M8Record {
             tend,
             evalue,
             bitscore,
-            qlen: 0,
-            slen: 0,
+            qlen,
+            slen,
         })
     }
 
@@ -482,6 +503,18 @@ impl M8Record {
             self.qlen,
             self.slen
         )
+    }
+
+    /// Dispatch by column count. Use only when the stream may mix 12- and 14-col
+    /// (e.g. process_record_pair). Prefer parse_line_nt / parse_line_nr on known paths.
+    #[inline]
+    pub fn parse_line_auto(line: &str) -> Result<Self> {
+        let tabs = line.as_bytes().iter().filter(|&&b| b == b'\t').count();
+        if tabs >= 13 {
+            Self::parse_line_nt(line)
+        } else {
+            Self::parse_line_nr(line)
+        }
     }
 }
 
@@ -585,8 +618,8 @@ pub fn process_record_pair(
     });
 
     let m8_str = std::str::from_utf8(m8_bytes)?;
-    debug!("parse_line_nr caller=process_record_pair:nr");
-    let m8 = M8Record::parse_line_nr(m8_str)?;
+    debug!("parse_line_auto caller=process_record_pair:nr");
+    let m8 = M8Record::parse_line_auto(m8_str)?;
 
     let mut alen = m8.alen as f64;
     let pident = m8.pident;
