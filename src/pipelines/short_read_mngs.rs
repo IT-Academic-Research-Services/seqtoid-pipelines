@@ -8703,16 +8703,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut pairs = nt_pairs_coverage;
             let (tx, rx) = mpsc::channel(65_536);
             tokio::spawn(async move {
-                let mut n = 0u64;
+
                 while let Some(p) = pairs.next().await {
-
-                    n += 1;
-                    if n <= 5 {
-                        let s = String::from_utf8_lossy(&p.summary);
-                        let nf = s.trim().split('\t').count();
-                        info!("[viz hit] n={} nf={} line={}", n, nf, s.trim());
-                    }
-
                     if tx
                         .send(ParseOutput::Bytes(Bytes::from(p.summary)))
                         .await
