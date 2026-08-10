@@ -674,8 +674,7 @@ pub async fn get_top_m8_nr(
             continue;
         }
         lines_in += 1;
-
-        debug!("parse_line_nr caller=get_top_m8_nr:nr");
+        
         let m8 = match M8Record::parse_line_nr(line) {
             Ok(m) => m,
             Err(e) => {

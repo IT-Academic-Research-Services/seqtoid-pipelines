@@ -1148,8 +1148,7 @@ pub async fn call_hits_m8(
                 Some(r) => r.to_string(),
                 None => continue,
             };
-
-            debug!("parse_line_nr caller=call_hits_m8:nr");
+            
             let rec = match M8Record::parse_line_nr(line_str) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -1784,8 +1783,7 @@ pub async fn generate_taxon_count_json_from_m8(
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-
-                debug!("parse_line_nr caller=generate_taxon_count_json_from_m8");
+                
                 let m8 = match M8Record::parse_line_nt(m8_line)
                     .or_else(|_| M8Record::parse_line_nr(m8_line))
                 {

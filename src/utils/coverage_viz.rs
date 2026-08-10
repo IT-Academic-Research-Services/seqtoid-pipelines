@@ -298,11 +298,6 @@ async fn generate_accession_data(
     let mut contig_sets: HashMap<String, HashSet<String>> = HashMap::new();
 
     let mut line_count = 0u64;
-    let mut n_empty = 0u64;
-    let mut n_ge12 = 0u64;
-    let mut n_ge12_valid = 0u64;
-    let mut n_ge5 = 0u64;
-    let mut n_skipped = 0u64;
 
     while let Some(item) = hit_summary.next().await {
         line_count += 1;
@@ -315,41 +310,23 @@ async fn generate_accession_data(
         let fields: Vec<&str> = line.trim().split('\t').collect();
 
         if fields.is_empty() || (fields.len() == 1 && fields[0].is_empty()) {
-            n_empty += 1;
             continue;
         }
 
-        if fields.len() >= 12 {
-            n_ge12 += 1;
-            if valid_contigs.contains_key(fields[7]) {
-                n_ge12_valid += 1;
-                let taxon = fields[9].to_string();
-                let acc = fields[8].to_string();
-                let contig = fields[7].to_string();
+        if fields.len() >= 12 && valid_contigs.contains_key(fields[7]) {
+            let taxon = fields[9].to_string();
+            let acc = fields[8].to_string();
+            let contig = fields[7].to_string();
 
-                taxon_data
-                    .entry(taxon)
-                    .or_default()
-                    .accessions
-                    .insert(acc.clone());
-                contig_sets.entry(acc.clone()).or_default().insert(contig);
-                accession_data.entry(acc).or_default(); // ensure key exists
-            } else {
-                // 12-col but contig not in valid_contigs → treat as read row (Python else branch)
-                n_ge5 += 1;
-                let taxon = fields[4].to_string();
-                let acc = fields[3].to_string();
-                let read = fields[0].to_string();
-
-                taxon_data
-                    .entry(taxon)
-                    .or_default()
-                    .accessions
-                    .insert(acc.clone());
-                accession_data.entry(acc).or_default().reads.push(read);
-            }
+            taxon_data
+                .entry(taxon)
+                .or_default()
+                .accessions
+                .insert(acc.clone());
+            contig_sets.entry(acc.clone()).or_default().insert(contig);
+            accession_data.entry(acc).or_default();
         } else if fields.len() >= 5 {
-            n_ge5 += 1;
+            // Includes 12-col rows whose contig is not in valid_contigs (Python else branch)
             let taxon = fields[4].to_string();
             let acc = fields[3].to_string();
             let read = fields[0].to_string();
@@ -360,8 +337,6 @@ async fn generate_accession_data(
                 .accessions
                 .insert(acc.clone());
             accession_data.entry(acc).or_default().reads.push(read);
-        } else {
-            n_skipped += 1;
         }
     }
 
@@ -374,24 +349,6 @@ async fn generate_accession_data(
     for td in taxon_data.values_mut() {
         td.num_total_accessions = td.accessions.len();
     }
-
-    let contig_acc = accession_data
-        .values()
-        .filter(|a| !a.contigs.is_empty())
-        .count();
-
-    info!(
-        "[generate_accession_data] lines={} empty={} ge12={} ge12_valid={} ge5={} skipped={} accessions={} taxons={} contig_acc={}",
-        line_count,
-        n_empty,
-        n_ge12,
-        n_ge12_valid,
-        n_ge5,
-        n_skipped,
-        accession_data.len(),
-        taxon_data.len(),
-        contig_acc,
-    );
 
     Ok((accession_data, taxon_data))
 }
@@ -464,7 +421,7 @@ async fn generate_contig_data(
         if line_trim.is_empty() {
             continue;
         }
-        debug!("parse_line_nr caller=compute_merged_taxon_counts:nr");
+
         let m8 = match M8Record::parse_line_nt(line_trim)
             .or_else(|_| M8Record::parse_line_nr(line_trim))
         {
