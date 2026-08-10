@@ -4932,6 +4932,7 @@ pub async fn update_read_dict(
         let m8 = if db_type.eq_ignore_ascii_case("nt") {
             M8Record::parse_line_nt(line)?
         } else {
+            debug!("parse_line_nr caller=update_read_dict:nr");
             M8Record::parse_line_nr(line)?
         };
         tops_seen += 1;

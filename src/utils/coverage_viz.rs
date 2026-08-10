@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{self, warn, info};
+use log::{self, warn, info, debug};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
@@ -415,7 +415,7 @@ async fn generate_contig_data(
         if line_trim.is_empty() {
             continue;
         }
-
+        debug!("parse_line_nr caller=compute_merged_taxon_counts:nr");
         let m8 = match M8Record::parse_line_nt(line_trim)
             .or_else(|_| M8Record::parse_line_nr(line_trim))
         {
@@ -490,6 +490,7 @@ async fn generate_read_data(
             continue;
         }
 
+        debug!("parse_line_nt/nr caller=generate_read_data");
         let m8 = match M8Record::parse_line_nt(line_trim)
             .or_else(|_| M8Record::parse_line_nr(line_trim))
         {
