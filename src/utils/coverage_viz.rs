@@ -238,19 +238,42 @@ async fn prepare_data(
 }
 
 fn load_nt_info_db(path: &Path) -> Result<HashMap<String, (String, u64)>> {
-    let file = File::open(path)?;
+    let file = File::open(path)
+        .with_context(|| format!("open nt_info {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut map = HashMap::new();
+    let mut bad = 0u64;
+
     for line in reader.lines() {
         let line = line?;
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let acc = parts[0].to_string();
-            let name = parts[1].to_string();
-            let len: u64 = parts[2].parse()?;
-            map.insert(acc, (name, len));
+        if parts.len() < 3 {
+            bad += 1;
+            continue;
         }
+        let len_str = parts[parts.len() - 1];
+        let Ok(len) = len_str.parse::<u64>() else {
+            bad += 1;
+            continue;
+        };
+        let acc_raw = parts[0];
+        let name = if parts.len() == 3 {
+            parts[1].to_string()
+        } else {
+            parts[1..parts.len() - 1].join(" ")
+        };
+
+        // Prefer file already unversioned; still accept versioned keys.
+        let acc = acc_raw.split('.').next().unwrap_or(acc_raw).to_string();
+        map.entry(acc).or_insert((name, len));
     }
+
+    info!(
+        "[load_nt_info_db] path={} entries={} bad_lines={}",
+        path.display(),
+        map.len(),
+        bad
+    );
     Ok(map)
 }
 
