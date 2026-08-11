@@ -495,8 +495,7 @@ async fn generate_read_data(
         if line_trim.is_empty() {
             continue;
         }
-
-        debug!("parse_line_nt/nr caller=generate_read_data");
+        
         let m8 = match M8Record::parse_line_nt(line_trim)
             .or_else(|_| M8Record::parse_line_nr(line_trim))
         {

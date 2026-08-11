@@ -618,7 +618,6 @@ pub fn process_record_pair(
     });
 
     let m8_str = std::str::from_utf8(m8_bytes)?;
-    debug!("parse_line_auto caller=process_record_pair:nr");
     let m8 = M8Record::parse_line_auto(m8_str)?;
 
     let mut alen = m8.alen as f64;
@@ -1074,7 +1073,7 @@ pub async fn call_hits_m8(
 
         let worker_handle = tokio::spawn(async move {
             debug!(
-                "[call_hits_m8:{}] worker {} started (ReducedRead mode)",
+                "[call_hits_m8:{}] worker {} started",
                 worker_tag, worker_idx
             );
 
@@ -1148,7 +1147,7 @@ pub async fn call_hits_m8(
                 Some(r) => r.to_string(),
                 None => continue,
             };
-            
+
             let rec = match M8Record::parse_line_nr(line_str) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -1783,7 +1782,7 @@ pub async fn generate_taxon_count_json_from_m8(
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                
+
                 let m8 = match M8Record::parse_line_nt(m8_line)
                     .or_else(|_| M8Record::parse_line_nr(m8_line))
                 {
