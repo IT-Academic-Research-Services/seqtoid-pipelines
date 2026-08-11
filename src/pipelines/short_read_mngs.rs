@@ -15,6 +15,7 @@ use ahash::RandomState as AHashRandomState;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
+use fst::Map;
 use futures::future::try_join_all;
 use log::{self, debug, error, info, warn};
 use needletail::parse_fastx_file;
@@ -39,17 +40,18 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration, Instant};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 use twox_hash::XxHash64;
+use fst::Streamer;
 
 use crate::config::defs::{
     ClusterInfo, DiamondSubcommand, DuplicateClusters, KallistoSubcommand, Lineage,
     NRAlignmentBackend, PairingMode, PipelineError, ReadCountingMode, ReadStats, RunConfig,
     SamtoolsSubcommand, StreamDataType, Taxid, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, DIAMOND_TAG,
     FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, NR_TAG, NT_TAG,
-    READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG,
+    READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG, ReducedRead
 };
 use crate::utils::blast::{
     build_taxon_counts_list, call_hits_m8, compute_merged_taxon_counts,
@@ -90,7 +92,7 @@ use crate::utils::sambam::{compute_insert_size_stats_from_bam, generate_info_fro
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::streams::{
     batch_rayon_process, deinterleave_fastq_stream, fanout_to_channels, join_with_error_handling,
-    monitor_stream, parse_bytes, parse_child_output, parse_fastq, parse_lines,
+    parse_bytes, parse_child_output, parse_fastq, parse_lines,
     read_child_output_to_vec, spawn_cmd, stream_to_cmd, stream_to_file, ChannelReader, ChildStream,
     ParseMode, ParseOutput, ToBytes,
 };
@@ -103,7 +105,7 @@ const MAX_SPADES_WORK_DIR: u64 = 500_000_000;
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
-const MIN_CONTIG_SIZE: u64 = 500;
+const MIN_CONTIG_SIZE: u64 = 4;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
@@ -261,8 +263,30 @@ impl ReadHit {
     /// # Returns
     ///
     /// String: tab-separated representation of the hit
+    /// HitSummary line: read_id, level, taxid, accession, species, genus, family
+    /// Optional contig fields appended when present (hitsummary2-compatible).
     pub fn to_full_tab_line(&self, read_id: &str) -> String {
-        format!("{}\t{}", read_id, self.to_tab_string())
+        let mut line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            read_id,
+            self.level,
+            self.taxid,
+            self.accession_id,
+            self.species_taxid,
+            self.genus_taxid,
+            self.family_taxid,
+        );
+        if self.contig_id.is_some() || self.from_assembly {
+            line.push_str(&format!(
+                "\t{}\t{}\t{}\t{}\t{}",
+                self.contig_id.as_deref().unwrap_or(""),
+                self.contig_accession_id.as_deref().unwrap_or(""),
+                self.contig_species_taxid,
+                self.contig_genus_taxid,
+                self.contig_family_taxid,
+            ));
+        }
+        line
     }
 
     /// Parses a read hit from a tab-separated line.
@@ -437,6 +461,7 @@ async fn validate_input(
         config.clone(),
         StreamDataType::IlluminaFastq,
         "validate_input",
+        false
     )
     .await
     .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -610,6 +635,7 @@ async fn bowtie2_align_and_sort_stream(
                 config.clone(),
                 StreamDataType::JustBytes,
                 "bt2_bam_write",
+                false
             )
             .await?;
             Ok(())
@@ -897,6 +923,7 @@ async fn bowtie2_filter_files(
             config.clone(),
             StreamDataType::JustBytes,
             "bt2_fastq_se",
+            false
         )
         .await?;
         cleanup_tasks.push(write_task);
@@ -1279,6 +1306,7 @@ async fn hisat2_filter(
             config.clone(),
             StreamDataType::JustBytes,
             "hisat2_bam_write",
+            false
         )
         .await?;
         cleanup_tasks.push(write_task);
@@ -2032,6 +2060,7 @@ async fn minimap2_filter(
             config.clone(),
             StreamDataType::JustBytes,
             "mm2_filter_bam",
+            false
         )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
@@ -3104,6 +3133,7 @@ async fn run_diamond_single_file(
         config.clone(),
         StreamDataType::JustBytes,
         &format!("diamond_{}", label),
+        false
     )
     .await?;
 
@@ -3281,15 +3311,18 @@ async fn diamond_non_host_align(
 async fn combine_taxon_counts(
     nt_counts: &[TaxonCount],
     nr_counts: &[TaxonCount],
+    merged_counts: &[TaxonCount],
     output_path: PathBuf,
 ) -> Result<(PathBuf, JoinHandle<Result<()>>)> {
     let nt_len = nt_counts.len();
     let nr_len = nr_counts.len();
-    let total = nt_len + nr_len;
+    let merged_len = merged_counts.len();
+    let total = nt_len + nr_len + merged_len;
 
     let mut all_counts = Vec::with_capacity(total);
     all_counts.extend_from_slice(nt_counts);
     all_counts.extend_from_slice(nr_counts);
+    all_counts.extend_from_slice(merged_counts);
 
     let output_json = json!({
         "pipeline_output": {
@@ -3305,15 +3338,16 @@ async fn combine_taxon_counts(
     }
 
     let data_arc = Arc::new(payload);
-    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20) // 1 Mb
+    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20)
         .await
         .map_err(|e| anyhow!("Failed to spawn JSON write: {}", e))?;
 
     info!(
-        "Combined {} taxon count entries ({} NT + {} NR); spawning write to {}",
+        "Combined {} taxon count entries ({} NT + {} NR + {} merged); write → {}",
         total,
         nt_len,
         nr_len,
+        merged_len,
         output_path.display()
     );
 
@@ -3332,13 +3366,14 @@ async fn combine_taxon_counts(
 /// Result containing the map of contig IDs to best accessions
 async fn collect_hit_summary_to_accession_map_concurrent(
     config: Arc<RunConfig>,
-    mut summary_stream: ReceiverStream<ParseOutput>,
+    mut pairs: ReceiverStream<ReducedRead>,
 ) -> Result<AHashMap<String, String>> {
     let concurrency =
         compute_phase_concurrency(&config, "accession_map_final_merge", 0.2, 4.0, 32, 4);
     let batch_size = compute_batch_size(None, 1024, 512, concurrency);
 
-    let (job_tx, job_rx) = mpsc::channel::<Vec<Vec<u8>>>(concurrency);
+    // Batch of (read_id, accession) already extracted — workers only insert
+    let (job_tx, job_rx) = mpsc::channel::<Vec<(String, String)>>(concurrency);
     let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
 
     let mut worker_handles = Vec::with_capacity(concurrency);
@@ -3350,21 +3385,7 @@ async fn collect_hit_summary_to_accession_map_concurrent(
                 let mut g = rx.lock().await;
                 g.recv().await
             } {
-                let lines: Vec<(String, String)> = batch
-                    .par_iter()
-                    .filter_map(|bytes| {
-                        let line = String::from_utf8_lossy(bytes).trim_end().to_string();
-                        if line.is_empty() {
-                            return None;
-                        }
-                        let fields: Vec<&str> = line.split('\t').collect();
-                        if fields.len() < 2 {
-                            return None;
-                        }
-                        Some((fields[0].to_string(), fields[1].to_string()))
-                    })
-                    .collect();
-                for (k, v) in lines {
+                for (k, v) in batch {
                     partial.insert(k, v);
                 }
             }
@@ -3373,27 +3394,57 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         worker_handles.push(handle);
     }
 
-    // Producer
     let producer = tokio::spawn(async move {
         let mut batch = Vec::with_capacity(batch_size);
-        while let Some(item) = summary_stream.next().await {
-            if let ParseOutput::Bytes(b) = item {
-                batch.push(b.to_vec());
-                if batch.len() >= batch_size {
-                    if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                        break;
-                    }
+        while let Some(pair) = pairs.next().await {
+            // HitSummary: [0]=read_id … [3]=accession — prefer struct field for accession
+            let line = String::from_utf8_lossy(&pair.summary);
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            let read_id = fields[0];
+            if read_id.is_empty() {
+                continue;
+            }
+            let accession = if !pair.accession.is_empty()
+                && pair.accession != "-"
+                && pair.accession != "None"
+            {
+                pair.accession
+            } else {
+                let a = fields[3];
+                if a.is_empty() || a == "-" || a == "None" {
+                    continue;
                 }
+                a.to_string()
+            };
+
+            batch.push((read_id.to_string(), accession));
+            if batch.len() >= batch_size {
+                if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                    return Err(anyhow!(
+                        "collect_hit_summary_to_accession_map: workers closed while producer still had data"
+                    ));
+                }
+                batch = Vec::with_capacity(batch_size);
             }
         }
         if !batch.is_empty() {
-            let _ = job_tx.send(batch).await;
+            if job_tx.send(batch).await.is_err() {
+                return Err(anyhow!(
+                    "collect_hit_summary_to_accession_map: workers closed on final batch"
+                ));
+            }
         }
         drop(job_tx);
         Ok::<(), anyhow::Error>(())
     });
 
-    // Await all workers FIRST (in async context)
     let mut partial_maps = Vec::with_capacity(worker_handles.len());
     for handle in worker_handles {
         let partial = handle
@@ -3402,7 +3453,6 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         partial_maps.push(partial);
     }
 
-    // FINAL MERGE OFFLOADED TO spawn_blocking
     let map = tokio::task::spawn_blocking(move || {
         let mut final_map = AHashMap::with_capacity(2_500_000);
         for partial in partial_maps {
@@ -3410,12 +3460,15 @@ async fn collect_hit_summary_to_accession_map_concurrent(
         }
         final_map
     })
-    .await
-    .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
+        .await
+        .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
 
     producer.await??;
 
-    info!("collect_hit_summary_to_accession_map_concurrent → {} entries (tiny contig map, final merge in spawn_blocking)", map.len());
+    info!(
+        "collect_hit_summary_to_accession_map_concurrent → {} entries",
+        map.len()
+    );
     Ok(map)
 }
 
@@ -3573,15 +3626,33 @@ async fn generate_annotated_fasta_stream(
 
                     match tag {
                         0 => {
-                            let _ = mapped_tx.send(out_item).await;
+                            mapped_tx
+                                .send(out_item)
+                                .await
+                                .map_err(|_| anyhow!(
+                                "generate_annotated_fasta_stream: mapped_tx closed (consumer dropped)"
+                            ))?;
                         }
                         1 => {
-                            let _ = unid_tx.send(out_item).await;
+                            unid_tx
+                                .send(out_item)
+                                .await
+                                .map_err(|_| anyhow!(
+                                "generate_annotated_fasta_stream: unid_tx closed (consumer dropped)"
+                            ))?;
                         }
                         2 => {
-                            let _ = uniq_tx.send(out_item).await;
+                            uniq_tx
+                                .send(out_item)
+                                .await
+                                .map_err(|_| anyhow!(
+                                "generate_annotated_fasta_stream: uniq_tx closed (consumer dropped)"
+                            ))?;
                         }
-                        _ => warn!("Unknown tag in generate_annotated_fasta_stream: {}", tag),
+                        _ => warn!(
+                        "Unknown tag in generate_annotated_fasta_stream: {}",
+                        tag
+                    ),
                     }
                 }
             }
@@ -3977,9 +4048,9 @@ async fn process_assembly(
     let (non_host_streams, non_host_done_rx) = fanout_to_channels(
         ReceiverStream::new(samtools_sort_out_stream),
         3,
-        "process_assembly_sam",
-        &config,                   // ← added
-        StreamDataType::JustBytes, // ← correct (BAM bytes from samtools sort)
+        "process_assembly_bam",
+        &config,
+        StreamDataType::JustBytes,
     )
     .await
     .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -4008,11 +4079,12 @@ async fn process_assembly(
     );
 
     let write_bam_task = write_byte_stream_to_file(
-        &bam_path,
+        &final_bam_path,
         bam_for_file,
         config.clone(),
         StreamDataType::JustBytes,
         "process_assembly",
+        false
     )
     .await?;
     cleanup_tasks.push(write_bam_task);
@@ -4027,7 +4099,7 @@ async fn process_assembly(
     let (read2contig, contig_stats, _contig_uniques) = generate_info_from_bam_stream(
         bam_for_stats.into_inner(),
         &duplicate_clusters,
-        config.args.min_contig_length,
+        MIN_CONTIG_SIZE,
         bam_concurrency,
     )
     .await?;
@@ -4502,7 +4574,7 @@ async fn build_reference_fasta_from_selected_genera(
 ///  accesions -> Accesiohit
 async fn summarize_hits(
     config: Arc<RunConfig>,
-    mut stream: ReceiverStream<ParseOutput>,
+    mut stream: ReceiverStream<ReducedRead>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     min_reads_per_genus: usize,
 ) -> Result<(
@@ -4513,7 +4585,7 @@ async fn summarize_hits(
 )> {
     let concurrency = compute_phase_concurrency(&config, "summarize_hits", 0.35, 4.0, 96, 8);
 
-    let (batch_tx, batch_rx) = mpsc::channel::<Vec<ParseOutput>>(concurrency * 2);
+    let (batch_tx, batch_rx) = mpsc::channel::<Vec<ReducedRead>>(concurrency * 2);
     let batch_rx = Arc::new(tokio::sync::Mutex::new(batch_rx));
 
     let producer = tokio::spawn(async move {
@@ -4521,18 +4593,24 @@ async fn summarize_hits(
         while let Some(item) = stream.next().await {
             batch.push(item);
             if batch.len() >= 8192 {
-                let _ = batch_tx.send(std::mem::take(&mut batch)).await;
+                batch_tx
+                    .send(std::mem::take(&mut batch))
+                    .await
+                    .map_err(|_| anyhow!("summarize_hits: batch channel closed"))?;
             }
         }
         if !batch.is_empty() {
-            let _ = batch_tx.send(batch).await;
+            batch_tx
+                .send(batch)
+                .await
+                .map_err(|_| anyhow!("summarize_hits: batch channel closed on flush"))?;
         }
         Ok::<(), anyhow::Error>(())
     });
 
     let final_read_dict = Arc::new(DashMap::with_capacity(8_000_000));
     let final_accession_dict = Arc::new(DashMap::with_capacity(2_000_000));
-    let final_genus_read = Arc::new(DashMap::<i32, usize>::new()); // usize, +1 per read
+    let final_genus_read = Arc::new(DashMap::<i32, usize>::new());
     let final_genus_species = Arc::new(DashMap::<i32, HashSet<i32>>::new());
     let final_genus_accessions = Arc::new(DashMap::<i32, HashSet<String>>::new());
 
@@ -4548,7 +4626,7 @@ async fn summarize_hits(
         let f_gr = final_genus_read.clone();
         let f_gs = final_genus_species.clone();
         let f_ga = final_genus_accessions.clone();
-        let _tr = total_reads.clone();
+        let tr = total_reads.clone();
 
         worker_handles.push(tokio::spawn(async move {
             let mut local_read_dict: AHashMap<String, Arc<ReadHit>> = AHashMap::with_capacity(8192);
@@ -4571,69 +4649,68 @@ async fn summarize_hits(
                     None => break,
                 };
 
-                let parsed: Vec<(String, String, i32, i32, i32, u8)> =
+                // HitSummary from ReducedRead.summary:
+                // read_id, level, taxid, accession, species, genus, family
+                let parsed: Vec<(String, u8, i32, String, i32, i32, i32)> =
                     tokio::task::spawn_blocking({
                         let batch = batch;
                         move || {
                             batch
                                 .par_iter()
                                 .filter_map(|item| {
-                                    let bytes = match item.to_bytes() {
-                                        Ok(b) => b,
-                                        Err(_) => return None,
-                                    };
-                                    let line = match std::str::from_utf8(&bytes) {
-                                        Ok(s) => s.trim_end(),
-                                        Err(_) => return None,
-                                    };
+                                    let line =
+                                        std::str::from_utf8(&item.summary).ok()?.trim_end();
                                     if line.is_empty() {
                                         return None;
                                     }
 
                                     let parts: Vec<&str> = line.split('\t').collect();
-                                    if parts.len() != 6 {
+                                    if parts.len() < 7 {
                                         return None;
                                     }
 
                                     let read_id = parts[0].to_string();
-                                    let accession_id = if parts[1].is_empty() || parts[1] == "-" {
+                                    let level: u8 = parts[1].parse().unwrap_or(0);
+                                    let taxid: i32 = parts[2].parse().unwrap_or(0);
+                                    let accession_id = if parts[3].is_empty()
+                                        || parts[3] == "-"
+                                        || parts[3] == "None"
+                                    {
                                         "-".to_string()
                                     } else {
-                                        parts[1].to_string()
+                                        parts[3].to_string()
                                     };
-                                    let hit_taxid: i32 = parts[2].parse().unwrap_or(0);
-                                    let genus_taxid: i32 = parts[3].parse().unwrap_or(0);
-                                    let family_taxid: i32 = parts[4].parse().unwrap_or(0);
-                                    let level: u8 = parts[5].parse().unwrap_or(0);
+                                    let species_taxid: i32 = parts[4].parse().unwrap_or(-1);
+                                    let genus_taxid: i32 = parts[5].parse().unwrap_or(-1);
+                                    let family_taxid: i32 = parts[6].parse().unwrap_or(-1);
 
                                     Some((
                                         read_id,
+                                        level,
+                                        taxid,
                                         accession_id,
-                                        hit_taxid,
+                                        species_taxid,
                                         genus_taxid,
                                         family_taxid,
-                                        level,
                                     ))
                                 })
                                 .collect()
                         }
                     })
-                    .await
-                    .expect("summarize_hits batch parsing panicked");
+                        .await
+                        .map_err(|e| anyhow!("summarize_hits batch parsing panicked: {}", e))?;
 
-                for (read_id, accession_id, hit_taxid, genus_taxid, family_taxid, level) in parsed {
-                    let species_taxid = if level >= 3 && hit_taxid > 0 {
-                        hit_taxid
-                    } else {
-                        0
-                    };
-                    let assigned_taxid = if level >= 3 {
-                        species_taxid
-                    } else if level == 2 || level == 1 {
-                        genus_taxid
-                    } else {
-                        hit_taxid
-                    };
+                for (
+                    read_id,
+                    level,
+                    taxid,
+                    accession_id,
+                    species_taxid,
+                    genus_taxid,
+                    family_taxid,
+                ) in parsed
+                {
+                    tr.fetch_add(1, AtomicOrdering::Relaxed);
 
                     let cluster_size: u64 = dup_clusters
                         .get(&read_id)
@@ -4644,7 +4721,7 @@ async fn summarize_hits(
                         read_id.clone(),
                         Arc::new(ReadHit {
                             level,
-                            taxid: assigned_taxid,
+                            taxid,
                             accession_id: accession_id.clone(),
                             species_taxid,
                             genus_taxid,
@@ -4670,7 +4747,6 @@ async fn summarize_hits(
                                 count: cluster_size,
                             });
 
-                        // IMPORTANT: +1 per read (matches Python exactly)
                         *local_genus_read.entry(genus_taxid).or_insert(0) += 1;
                         local_genus_species
                             .entry(genus_taxid)
@@ -4684,7 +4760,6 @@ async fn summarize_hits(
                 }
             }
 
-            // Merge into final structures
             for (k, v) in local_read_dict {
                 f_read.insert(k, v);
             }
@@ -4714,14 +4789,14 @@ async fn summarize_hits(
     }
 
     let total_reads_val = total_reads.load(AtomicOrdering::SeqCst);
+
     info!(
-        "summarize_hits: processed {} reads, {} unique accessions ({} workers, local maps)",
+        "[summarize_hits] processed {} reads, {} unique accessions ({} workers)",
         total_reads_val,
         final_accession_dict.len(),
         concurrency
     );
 
-    // Final selected_genera (exact original Python logic)
     let mut selected_genera: HashMap<i32, Vec<String>> = HashMap::new();
     for entry in final_genus_read.iter() {
         let genus_taxid = *entry.key();
@@ -4790,238 +4865,225 @@ pub async fn update_read_dict(
     read2contig: Arc<HashMap<String, String>>,
     mut top_m8_stream: ReceiverStream<ParseOutput>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
-    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    _lineage_map: Arc<AHashMap<Taxid, Lineage>>, // unused: Python uses accession_dict only
     accession_map: Arc<AHashMap<String, AccessionHit>>,
-    should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    _should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>, // not applied here (Python)
     db_type: &str,
     contig2lineage_tx: Sender<ParseOutput>,
     read2blastm8_tx: Sender<ParseOutput>,
     updated_tx: Sender<ParseOutput>,
     added_tx: Sender<ParseOutput>,
 ) -> Result<()> {
-    let update_concurrency =
-        compute_phase_concurrency(&config, "update_read_dict", 0.05, 8.0, 128, 4);
-    info!("update_read_dict concurrency: {} jobs", update_concurrency);
-
-    #[derive(Default)]
-    struct FanoutBatch {
-        updated: Vec<(String, Arc<ReadHit>)>,
-        added: Vec<(String, Arc<ReadHit>)>,
-        contig2lineage_lines: Vec<Vec<u8>>,
-        read2blastm8_lines: Vec<Vec<u8>>,
-    }
+    let _ = compute_phase_concurrency(&config, "update_read_dict", 0.05, 8.0, 128, 4);
 
     fn merge_m8_rows(curr: &mut M8Record, row: &M8Record) {
         let curr_len = curr.alen as f64;
         let row_len = row.alen as f64;
         let denom = curr_len + row_len;
-
         if denom > 0.0 {
             curr.pident = (curr.pident * curr_len + row.pident * row_len) / denom;
             curr.evalue = (curr.evalue * curr_len + row.evalue * row_len) / denom;
         }
-
         curr.mismatch += row.mismatch;
         curr.gapopen += row.gapopen;
         curr.bitscore += row.bitscore;
         curr.alen += row.alen;
-
         curr.qstart = curr.qstart.min(row.qstart);
         curr.qend = curr.qend.max(row.qend);
         curr.tstart = curr.tstart.min(row.tstart);
         curr.tend = curr.tend.max(row.tend);
     }
 
-    // Snapshot the current read dict once so the fan-out stage does not keep
-    // taking the mutex for every contig/read pair.
-    let existing_reads: AHashMap<String, Arc<ReadHit>> = {
-        let guard = read_dict
-            .lock()
-            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
-        guard.clone()
-    };
-    let existing_reads = Arc::new(existing_reads);
-
-    // Invert read2contig once: contig -> reads.
-    let mut contig2reads: AHashMap<String, Vec<String>> =
-        AHashMap::with_capacity(read2contig.len());
-    for (read_id, contig_id) in read2contig.iter() {
-        contig2reads
-            .entry(contig_id.clone())
-            .or_default()
-            .push(read_id.clone());
+    // Python accession_dict keys are hit_summary accessions; BLAST sseqid may be versioned.
+    fn lookup_acc<'a>(
+        map: &'a AHashMap<String, AccessionHit>,
+        acc: &str,
+    ) -> Option<(&'a String, &'a AccessionHit)> {
+        if let Some((k, h)) = map.get_key_value(acc) {
+            return Some((k, h));
+        }
+        if let Some(base) = acc.split('.').next() {
+            if base != acc {
+                if let Some((k, h)) = map.get_key_value(base) {
+                    return Some((k, h));
+                }
+            }
+        }
+        None
     }
-    let contig2reads = Arc::new(contig2reads);
 
-    // Pass 1: read top m8 stream and build one merged row per contig.
-    // This mirrors the Python logic: contig2accession stores the merged row,
-    // and duplicate contig rows are merged into that row.
-    let mut contig2accession: AHashMap<String, (String, M8Record, Lineage)> = AHashMap::new();
     let db_type_upper = db_type.to_uppercase();
 
-    while let Some(item) = top_m8_stream.next().await {
-        let bytes = match item {
-            ParseOutput::Bytes(b) => b,
-            _ => continue,
-        };
+    // ── loop 1: blast top → contig2accession + contig2lineage ──────
+    let mut contig2accession: AHashMap<String, (String, M8Record)> = AHashMap::new();
+    let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
+    let mut tops_seen = 0u64;
+    let mut acc_miss = 0u64;
+    const ACC_MISS_LOG_CAP: u64 = 20; // first 20 only
 
+    while let Some(item) = top_m8_stream.next().await {
+        let ParseOutput::Bytes(bytes) = item else { continue };
         let line = String::from_utf8_lossy(&bytes);
-        let line_trimmed = line.trim_end();
-        if line_trimmed.is_empty() {
+        let line = line.trim_end();
+        if line.is_empty() {
             continue;
         }
 
-        let m8 = if db_type == "nt" {
-            M8Record::parse_line_nt(line_trimmed)?
+        let m8 = if db_type.eq_ignore_ascii_case("nt") {
+            M8Record::parse_line_nt(line)?
         } else {
-            M8Record::parse_line_nr(line_trimmed)?
+            M8Record::parse_line_nr(line)?
         };
+        tops_seen += 1;
 
         let contig_id = m8.qname.clone();
         let accession_id = m8.tname.clone();
 
-        let taxid = accession_map
-            .get(&accession_id)
-            .map(|hit| hit.taxid)
-            .unwrap_or(0);
-
-        let lineage = if taxid > 0 {
-            lineage_map.get(&taxid).cloned().unwrap_or([0; 3])
-        } else {
-            [0; 3]
-        };
-
-        if !(should_keep)(&lineage) {
+        // contig2lineage[contig] = accession_dict[accession]  (must exist)
+        let Some((_key, acc_hit)) = lookup_acc(&accession_map, &accession_id) else {
+            acc_miss += 1;
+            if acc_miss <= ACC_MISS_LOG_CAP {
+                warn!(
+                "[update_read_dict:{}] acc_miss contig={} acc={} (raw tname from top m8)",
+                db_type, contig_id, accession_id
+            );
+            }
+            // Do not insert contig without lineage — Python would KeyError
             continue;
+        };
+        let lineage = [acc_hit.taxid, acc_hit.genus_taxid, acc_hit.family_taxid];
+        contig2lineage.insert(contig_id.clone(), lineage);
+
+        if let Some((_, curr)) = contig2accession.get_mut(&contig_id) {
+            merge_m8_rows(curr, &m8);
+        } else {
+            contig2accession.insert(contig_id, (accession_id, m8));
         }
 
-        if let Some((_, curr_row, _)) = contig2accession.get_mut(&contig_id) {
-            merge_m8_rows(curr_row, &m8);
-        } else {
-            contig2accession.insert(
-                contig_id.clone(),
-                (accession_id.clone(), m8.clone(), lineage),
-            );
+        if tops_seen % 5_000 == 0 {
+            info!(
+            "[update_read_dict:{}] tops={} contigs={} lineage={} acc_miss={}",
+            db_type,
+            tops_seen,
+            contig2accession.len(),
+            contig2lineage.len(),
+            acc_miss
+        );
         }
     }
 
-    // Pass 2: parallel fan-out by contig.
-    // Each worker only builds local vectors, then we merge once at the end.
-    let fanout_batches: Vec<FanoutBatch> = {
-        let contig2accession = Arc::new(contig2accession);
-        let accession_map = accession_map.clone();
-        let existing_reads = existing_reads.clone();
-        let contig2reads = contig2reads.clone();
+    info!(
+    "[update_read_dict:{}] pass1 done: tops={} contigs={} lineage={} acc_miss={}",
+    db_type,
+    tops_seen,
+    contig2accession.len(),
+    contig2lineage.len(),
+    acc_miss
+);
+    if acc_miss > ACC_MISS_LOG_CAP {
+        warn!(
+        "[update_read_dict:{}] acc_miss total={} (only first {} logged)",
+        db_type, acc_miss, ACC_MISS_LOG_CAP
+    );
+    }
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<FanoutBatch>> {
-            let batches = contig2reads
-                .par_iter()
-                .map(|(contig_id, read_ids)| {
-                    let mut batch = FanoutBatch::default();
-
-                    let Some((accession, m8_row, lineage)) = contig2accession.get(contig_id) else {
-                        return batch;
-                    };
-
-                    let Some(acc_hit) = accession_map.get(accession) else {
-                        return batch;
-                    };
-
-                    let species_taxid = acc_hit.taxid;
-                    let genus_taxid = acc_hit.genus_taxid;
-                    let family_taxid = acc_hit.family_taxid;
-
-                    let mut lineage_line = json!({
-                        "contig_name": contig_id,
-                        "species_taxid": lineage[0],
-                        "genus_taxid": lineage[1],
-                        "family_taxid": lineage[2],
-                    })
-                    .to_string();
-                    lineage_line.push('\n');
-                    batch.contig2lineage_lines.push(lineage_line.into_bytes());
-
-                    let mut m8_line = m8_row.to_tab_string();
-                    m8_line.push('\n');
-                    let m8_bytes = m8_line.into_bytes();
-
-                    for read_id in read_ids {
-                        if let Some(existing) = existing_reads.get(read_id) {
-                            let mut hit: ReadHit = (**existing).clone();
-                            hit.taxid = species_taxid;
-                            hit.contig_id = Some(contig_id.clone());
-                            hit.contig_accession_id = Some(accession.clone());
-                            hit.contig_species_taxid = species_taxid;
-                            hit.contig_genus_taxid = genus_taxid;
-                            hit.contig_family_taxid = family_taxid;
-                            hit.from_assembly = true;
-                            hit.source_count_type = Some(db_type_upper.clone());
-
-                            batch.updated.push((read_id.clone(), Arc::new(hit)));
-                        } else {
-                            let hit = ReadHit {
-                                level: 1,
-                                taxid: species_taxid,
-                                accession_id: accession.clone(),
-                                species_taxid,
-                                genus_taxid,
-                                family_taxid,
-                                contig_id: Some(contig_id.clone()),
-                                contig_accession_id: Some(accession.clone()),
-                                contig_species_taxid: species_taxid,
-                                contig_genus_taxid: genus_taxid,
-                                contig_family_taxid: family_taxid,
-                                from_assembly: true,
-                                source_count_type: Some(db_type_upper.clone()),
-                            };
-
-                            batch.added.push((read_id.clone(), Arc::new(hit)));
-                        }
-
-                        batch.read2blastm8_lines.push(m8_bytes.clone());
-                    }
-
-                    batch
-                })
-                .collect();
-
-            Ok(batches)
-        })
-        .await
-        .map_err(|e| anyhow!("update_read_dict fan-out task panicked: {}", e))??
+    // ── loop 2: for read_id, contig_id in read2contig ──────────────
+    let existing_reads: AHashMap<String, Arc<ReadHit>> = {
+        let g = read_dict
+            .lock()
+            .map_err(|e| anyhow!("read_dict lock poisoned: {e}"))?;
+        g.clone()
     };
 
-    // Merge local results once.
     let mut updated_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
     let mut added_entries: Vec<(String, Arc<ReadHit>)> = Vec::new();
-    let mut contig2lineage_lines: Vec<Vec<u8>> = Vec::new();
     let mut read2blastm8_lines: Vec<Vec<u8>> = Vec::new();
+    let mut reads_with_contig_hit = 0u64;
+    let mut reads_acc_ok = 0u64;
 
-    for mut batch in fanout_batches {
-        updated_entries.append(&mut batch.updated);
-        added_entries.append(&mut batch.added);
-        contig2lineage_lines.append(&mut batch.contig2lineage_lines);
-        read2blastm8_lines.append(&mut batch.read2blastm8_lines);
+    for (read_id, contig_id) in read2contig.iter() {
+        let Some((accession, m8_row)) = contig2accession.get(contig_id) else {
+            continue; // contig has no BLAST top
+        };
+        reads_with_contig_hit += 1;
+
+        // Python: if accession and accession in accession_dict
+        if let Some((_k, acc_hit)) = lookup_acc(&accession_map, accession) {
+            reads_acc_ok += 1;
+            let species_taxid = acc_hit.taxid;
+            let genus_taxid = acc_hit.genus_taxid;
+            let family_taxid = acc_hit.family_taxid;
+
+            if let Some(existing) = existing_reads.get(read_id) {
+                let mut hit: ReadHit = (**existing).clone();
+                hit.taxid = species_taxid;
+                hit.contig_id = Some(contig_id.clone());
+                hit.contig_accession_id = Some(accession.clone());
+                hit.contig_species_taxid = species_taxid;
+                hit.contig_genus_taxid = genus_taxid;
+                hit.contig_family_taxid = family_taxid;
+                hit.from_assembly = true;
+                hit.source_count_type = Some(db_type_upper.clone());
+                updated_entries.push((read_id.clone(), Arc::new(hit)));
+            } else {
+                added_entries.push((
+                    read_id.clone(),
+                    Arc::new(ReadHit {
+                        level: 1,
+                        taxid: species_taxid,
+                        accession_id: accession.clone(),
+                        species_taxid,
+                        genus_taxid,
+                        family_taxid,
+                        contig_id: Some(contig_id.clone()),
+                        contig_accession_id: Some(accession.clone()),
+                        contig_species_taxid: species_taxid,
+                        contig_genus_taxid: genus_taxid,
+                        contig_family_taxid: family_taxid,
+                        from_assembly: true,
+                        source_count_type: Some(db_type_upper.clone()),
+                    }),
+                ));
+            }
+        }
+
+        // Python: if m8_row: read2blastm8[read_id] = m8_row  (qseqid forced to read_id later)
+        let mut m8_for_read = m8_row.clone();
+        m8_for_read.qname = read_id.clone();
+        let mut m8_line = m8_for_read.to_tab_string();
+        m8_line.push('\n');
+        read2blastm8_lines.push(m8_line.into_bytes());
+    }
+
+    info!(
+        "[update_read_dict:{}] pass2: reads_with_contig_hit={} acc_ok={} updated={} added={} blast_m8={}",
+        db_type,
+        reads_with_contig_hit,
+        reads_acc_ok,
+        updated_entries.len(),
+        added_entries.len(),
+        read2blastm8_lines.len()
+    );
+
+    // Emit contig2lineage
+    for (contig_id, lin) in &contig2lineage {
+        let line = format!("{}\t{}\t{}\t{}\n", contig_id, lin[0], lin[1], lin[2]);
+        contig2lineage_tx
+            .send(ParseOutput::Bytes(Bytes::from(line)))
+            .await
+            .map_err(|_| anyhow!("contig2lineage_tx closed"))?;
     }
 
     {
         let mut dict = read_dict
             .lock()
-            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
-
-        for (read_id, hit) in &updated_entries {
-            dict.insert(read_id.clone(), hit.clone());
+            .map_err(|e| anyhow!("read_dict lock poisoned: {e}"))?;
+        for (id, hit) in &updated_entries {
+            dict.insert(id.clone(), hit.clone());
         }
-        for (read_id, hit) in &added_entries {
-            dict.insert(read_id.clone(), hit.clone());
+        for (id, hit) in &added_entries {
+            dict.insert(id.clone(), hit.clone());
         }
-    }
-
-    for line in contig2lineage_lines {
-        contig2lineage_tx
-            .send(ParseOutput::Bytes(Bytes::from(line)))
-            .await
-            .map_err(|_| anyhow!("contig2lineage_tx closed"))?;
     }
 
     for line in read2blastm8_lines {
@@ -5030,7 +5092,6 @@ pub async fn update_read_dict(
             .await
             .map_err(|_| anyhow!("read2blastm8_tx closed"))?;
     }
-
     for (read_id, hit) in updated_entries {
         let mut line = hit.to_full_tab_line(&read_id);
         line.push('\n');
@@ -5039,7 +5100,6 @@ pub async fn update_read_dict(
             .await
             .map_err(|_| anyhow!("updated_tx closed"))?;
     }
-
     for (read_id, hit) in added_entries {
         let mut line = hit.to_full_tab_line(&read_id);
         line.push('\n');
@@ -5049,6 +5109,11 @@ pub async fn update_read_dict(
             .map_err(|_| anyhow!("added_tx closed"))?;
     }
 
+    info!(
+        "[update_read_dict:{}] emitted contig2lineage={}",
+        db_type,
+        contig2lineage.len()
+    );
     Ok(())
 }
 
@@ -5072,16 +5137,21 @@ async fn generate_contig_summary_json(
     contig2lineage: AHashMap<String, [i32; 3]>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     db_type: &str,
-    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>, // ← changed to DashMap
-    min_contig_size: u64,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+    should_keep: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
+    min_contig_size: u64, // Python MIN_CONTIG_SIZE = 4
     output_tx: Sender<ParseOutput>,
 ) -> Result<()> {
+    // taxid → contig → [unique_reads, nonunique_weighted]
     let mut genus_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
     let mut species_summary: AHashMap<i32, AHashMap<String, [u64; 2]>> = AHashMap::new();
 
-    // lock once
+    let db_type_upper = db_type.to_uppercase();
+
     {
-        let dict = read_dict.lock().unwrap();
+        let dict = read_dict
+            .lock()
+            .map_err(|e| anyhow!("read_dict lock poisoned: {}", e))?;
 
         for (read_id, hit_arc) in dict.iter() {
             let hit: &ReadHit = hit_arc.as_ref();
@@ -5091,63 +5161,70 @@ async fn generate_contig_summary_json(
                 .cloned()
                 .unwrap_or_else(|| "*".to_string());
 
-            let (species_taxid, genus_taxid) = if contig != "*" {
+            let (species_taxid, genus_taxid, family_taxid) = if contig != "*" {
                 if let Some(lineage) = contig2lineage.get(&contig) {
-                    (lineage[0], lineage[1])
+                    (lineage[0], lineage[1], lineage[2])
                 } else {
-                    (hit.species_taxid, hit.genus_taxid)
+                    (hit.species_taxid, hit.genus_taxid, hit.family_taxid)
                 }
             } else {
-                (hit.species_taxid, hit.genus_taxid)
+                (hit.species_taxid, hit.genus_taxid, hit.family_taxid)
             };
+
+            if !should_keep(&[species_taxid, genus_taxid, family_taxid]) {
+                continue;
+            }
 
             let cluster_size = duplicate_clusters
                 .get(read_id.as_str())
-                .map(|entry| entry.value().size)
+                .map(|e| e.value().size)
                 .unwrap_or(1u64);
 
-            // Species-level aggregation
-            let sp_entry = species_summary
+            let sp = species_summary
                 .entry(species_taxid)
                 .or_default()
                 .entry(contig.clone())
                 .or_insert([0, 0]);
-            sp_entry[0] += 1; // unique reads
-            sp_entry[1] += cluster_size; // weighted by duplicates
+            sp[0] += 1;
+            sp[1] += cluster_size;
 
-            // Genus-level aggregation
-            let gn_entry = genus_summary
+            let gn = genus_summary
                 .entry(genus_taxid)
                 .or_default()
                 .entry(contig)
                 .or_insert([0, 0]);
-            gn_entry[0] += 1;
-            gn_entry[1] += cluster_size;
+            gn[0] += 1;
+            gn[1] += cluster_size;
         }
-    } // ← MutexGuard dropped here — no await while holding lock
+    }
 
-    // Now emit JSON — safe to await
-    for (tax_level, summary_map) in [(1, species_summary), (2, genus_summary)] {
+    for (tax_level, summary_map) in [(1u8, species_summary), (2u8, genus_summary)] {
         for (taxid, contig_counts) in summary_map {
+            if taxid <= 0 {
+                continue;
+            }
+
             let filtered: HashMap<String, u64> = contig_counts
                 .into_iter()
                 .filter(|(_, [unique, _])| *unique >= min_contig_size)
                 .map(|(contig, [_, weighted])| (contig, weighted))
                 .collect();
 
-            if !filtered.is_empty() {
-                let entry = json!({
-                    "taxid": taxid,
-                    "tax_level": tax_level,
-                    "count_type": db_type.to_uppercase(),
-                    "contig_counts": filtered
-                });
-                let line = format!("{entry}\n");
-                output_tx
-                    .send(ParseOutput::Bytes(Bytes::from(line)))
-                    .await
-                    .map_err(|_| anyhow!("contig_summary_tx dropped"))?;
+            if filtered.is_empty() {
+                continue;
             }
+
+            let entry = ContigSummaryEntry {
+                taxid,
+                tax_level,
+                count_type: db_type_upper.clone(),
+                contig_counts: filtered,
+            };
+            let line = serde_json::to_string(&entry)? + "\n";
+            output_tx
+                .send(ParseOutput::Bytes(Bytes::from(line)))
+                .await
+                .map_err(|_| anyhow!("contig_summary_tx dropped"))?;
         }
     }
 
@@ -5279,7 +5356,8 @@ async fn generate_m8_and_hit_summary(
     refined_m8_tx: Sender<ParseOutput>,
     refined_hit_summary_tx: Sender<ParseOutput>,
 ) -> Result<()> {
-    // Drain all inputs concurrently.
+    info!("[generate_m8_and_hit_summary] collecting inputs (5 streams)");
+
     let updated_fut = collect_line_map(updated_reads_stream);
     let added_fut = collect_line_map(added_reads_stream);
     let blast_hits_fut = collect_line_map(blast_hits_stream);
@@ -5289,7 +5367,7 @@ async fn generate_m8_and_hit_summary(
     let (
         (updated_reads, _updated_order),
         (added_reads, added_order),
-        (blast_hits, blast_order),
+        (blast_hits, _blast_order),
         (original_hit_rows, original_hit_order),
         (original_m8_rows, original_m8_order),
     ) = tokio::try_join!(
@@ -5300,7 +5378,18 @@ async fn generate_m8_and_hit_summary(
         m8_rows_fut
     )?;
 
-    // Original IDs for append checks.
+    let original_hit_map: AHashMap<String, Bytes> = original_hit_rows.into_iter().collect();
+    let original_m8_map: AHashMap<String, Bytes> = original_m8_rows.into_iter().collect();
+
+    info!(
+        "[generate_m8_and_hit_summary] collected: updated={} added={} blast_hits={} orig_hit={} orig_m8={}",
+        updated_reads.len(),
+        added_reads.len(),
+        blast_hits.len(),
+        original_hit_map.len(),
+        original_m8_map.len()
+    );
+
     let original_hit_ids: HashSet<String> = original_hit_order.iter().cloned().collect();
     let original_m8_ids: HashSet<String> = original_m8_order.iter().cloned().collect();
 
@@ -5309,84 +5398,119 @@ async fn generate_m8_and_hit_summary(
     let (rewritten_m8, rewritten_hit_summary) = thread_pool.install(|| {
         rayon::join(
             || {
-                original_m8_rows
+                original_m8_order
                     .par_iter()
-                    .map(|(qseqid, row)| {
+                    .filter_map(|read_id| {
                         blast_hits
-                            .get(qseqid)
+                            .get(read_id)
                             .cloned()
-                            .unwrap_or_else(|| row.clone())
+                            .or_else(|| original_m8_map.get(read_id).cloned())
                     })
                     .collect::<Vec<Bytes>>()
             },
             || {
-                original_hit_rows
+                original_hit_order
                     .par_iter()
-                    .map(|(read_id, row)| {
+                    .filter_map(|read_id| {
                         updated_reads
                             .get(read_id)
                             .or_else(|| added_reads.get(read_id))
                             .cloned()
-                            .unwrap_or_else(|| row.clone())
+                            .or_else(|| original_hit_map.get(read_id).cloned())
                     })
                     .collect::<Vec<Bytes>>()
             },
         )
     });
 
-    // Emit M8.
+    info!(
+        "[generate_m8_and_hit_summary] rewrite done: m8={} hit={}",
+        rewritten_m8.len(),
+        rewritten_hit_summary.len()
+    );
+
+    // m8 append only for added_reads (new_read_ids)
     let m8_tx = refined_m8_tx;
+    let blast_hits_m8 = blast_hits.clone();
+    let added_order_m8 = added_order.clone();
+    let original_m8_ids_m8 = original_m8_ids;
     let m8_send = async move {
+        let mut emitted = 0usize;
         for row in rewritten_m8 {
             m8_tx
                 .send(ParseOutput::Bytes(row))
                 .await
                 .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+            emitted += 1;
+            if emitted % 100_000 == 0 {
+                info!("[generate_m8_and_hit_summary] m8 emit progress {}", emitted);
+            }
         }
 
-        // Append blast rows that were not present in the original deduped M8.
-        for read_id in blast_order {
-            if !original_m8_ids.contains(&read_id) {
-                if let Some(row) = blast_hits.get(&read_id) {
+        let mut appended = 0usize;
+        for read_id in &added_order_m8 {
+            if !original_m8_ids_m8.contains(read_id) {
+                if let Some(row) = blast_hits_m8.get(read_id) {
                     m8_tx
                         .send(ParseOutput::Bytes(row.clone()))
                         .await
                         .map_err(|_| anyhow!("refined_m8_tx dropped"))?;
+                    appended += 1;
                 }
             }
         }
 
+        info!(
+            "[generate_m8_and_hit_summary] m8 emit done: rewritten_path={} appended={}",
+            emitted, appended
+        );
         drop(m8_tx);
         Ok::<(), anyhow::Error>(())
     };
 
-    // Emit hit summary.
+    // hit append only for added_reads
     let hit_tx = refined_hit_summary_tx;
+    let added_reads_hit = added_reads;
+    let added_order_hit = added_order;
     let hit_send = async move {
+        let mut emitted = 0usize;
         for row in rewritten_hit_summary {
             hit_tx
                 .send(ParseOutput::Bytes(row))
                 .await
                 .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+            emitted += 1;
+            if emitted % 100_000 == 0 {
+                info!(
+                    "[generate_m8_and_hit_summary] hit emit progress {}",
+                    emitted
+                );
+            }
         }
 
-        // Append added reads that were not already in the original hit summary.
-        for read_id in added_order {
-            if !original_hit_ids.contains(&read_id) {
-                if let Some(row) = added_reads.get(&read_id) {
+        let mut appended = 0usize;
+        for read_id in &added_order_hit {
+            if !original_hit_ids.contains(read_id) {
+                if let Some(row) = added_reads_hit.get(read_id) {
                     hit_tx
                         .send(ParseOutput::Bytes(row.clone()))
                         .await
                         .map_err(|_| anyhow!("refined_hit_summary_tx dropped"))?;
+                    appended += 1;
                 }
             }
         }
 
+        info!(
+            "[generate_m8_and_hit_summary] hit emit done: rewritten_path={} appended={}",
+            emitted, appended
+        );
         drop(hit_tx);
         Ok::<(), anyhow::Error>(())
     };
 
     tokio::try_join!(m8_send, hit_send)?;
+    info!("[generate_m8_and_hit_summary] complete");
     Ok(())
 }
 
@@ -5429,12 +5553,10 @@ async fn early_blast_exit(
     AHashMap<String, Arc<ReadHit>>,
     Vec<TaxonCount>,
     Vec<ContigSummaryEntry>,
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ReducedRead>,
+    mpsc::UnboundedReceiver<ParseOutput>,
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
-    Vec<NamedTempFile>,
 )> {
     warn!(
         "[blast_contigs:{}] graceful early exit (no usable BLAST results)",
@@ -5460,9 +5582,8 @@ async fn early_blast_exit(
     }
 
     let final_read_dict = read_dict.lock().unwrap().clone();
-    let (_m8_tx, m8_rx) = mpsc::channel(1);
-    let (_hit_tx, hit_rx) = mpsc::channel(1);
-    let (_top_tx, top_rx) = mpsc::channel(1);
+    let (_pairs_tx, pairs_rx) = mpsc::channel::<ReducedRead>(1);
+    let (_top_tx, top_rx) = mpsc::unbounded_channel::<ParseOutput>();
 
     info!(
         "[blast_contigs:{}] empty-output fast path complete after {:?}",
@@ -5470,14 +5591,13 @@ async fn early_blast_exit(
         fn_start.elapsed()
     );
 
+
     Ok((
         final_read_dict,
         taxon_counts,
         vec![],
-        m8_rx,
-        hit_rx,
+        pairs_rx,
         top_rx,
-        vec![],
         vec![],
         vec![],
     ))
@@ -5509,8 +5629,8 @@ async fn early_blast_exit(
 async fn blast_contigs(
     config: Arc<RunConfig>,
     db_type: &'static str,
-    deduped_m8_stream: ReceiverStream<ParseOutput>,
-    hit_summary_stream: ReceiverStream<ParseOutput>,
+    sample_base: &String,
+    mut pairs: ReceiverStream<ReducedRead>,
     read_dict: Arc<Mutex<AHashMap<String, Arc<ReadHit>>>>,
     accession_map: Arc<AHashMap<String, AccessionHit>>,
     taxon_counts: Vec<TaxonCount>,
@@ -5526,14 +5646,28 @@ async fn blast_contigs(
     AHashMap<String, Arc<ReadHit>>,
     Vec<TaxonCount>,
     Vec<ContigSummaryEntry>,
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
-    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ReducedRead>,          // refined pairs (m8 + hit summary)
+    mpsc::UnboundedReceiver<ParseOutput>, // top contig m8 for coverage viz
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
-    Vec<NamedTempFile>,
+    Option<TempDir>,
 )> {
-    use tokio::time::Instant; // ← use tokio's Instant
+    fn blastdb_ready(prefix: &PathBuf, db_type: &str) -> bool {
+        let (a, b, c, alias) = if db_type == NT_TAG {
+            ("nhr", "nin", "nsq", "nal")
+        } else {
+            ("phr", "pin", "psq", "pal")
+        };
+        let p = |ext: &str| prefix.with_extension(ext).exists();
+        p(alias) || (p(a) && p(b) && p(c))
+    }
+
+    fn read_id_from_bytes(b: &[u8]) -> String {
+        let s = String::from_utf8_lossy(b);
+        s.split('\t').next().unwrap_or("").trim().to_string()
+    }
+
+    use tokio::time::Instant;
 
     let fn_start = Instant::now();
     info!(
@@ -5546,15 +5680,9 @@ async fn blast_contigs(
 
     let mut cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
-    let mut temp_files: Vec<NamedTempFile> = Vec::new();
 
     let out_dir = config.out_dir.join(format!("blast_{}", db_type));
     tokio::fs::create_dir_all(&out_dir).await?;
-    info!(
-        "[blast_contigs:{}] output directory ready: {}",
-        db_type,
-        out_dir.display()
-    );
 
     let blast_m8_path = out_dir.join("blast.m8");
     let blast_top_m8_path = out_dir.join("blast_top.m8");
@@ -5563,30 +5691,25 @@ async fn blast_contigs(
     let refined_counts_path = out_dir.join("refined_counts_with_dcr.json");
     let contig_summary_path = out_dir.join("contig_summary.json");
 
-    info!(
-        "[blast_contigs:{}] output files prepared: blast_m8={}, blast_top_m8={}, refined_m8={}, refined_hit_summary={}, refined_counts={}, contig_summary={}",
-        db_type,
-        blast_m8_path.display(),
-        blast_top_m8_path.display(),
-        refined_m8_path.display(),
-        refined_hit_summary_path.display(),
-        refined_counts_path.display(),
-        contig_summary_path.display()
-    );
-
     let contig_size = file_size(assembled_contig_fasta).await?;
     let ref_size = file_size(reference_fasta).await?;
-
     info!(
-        "[blast_contigs:{}] input sizes — assembled_contig={} bytes, reference={} bytes",
+        "[blast_contigs:{}] input sizes — contig={} ref={}",
         db_type, contig_size, ref_size
     );
 
-    // ─────────────────────────────────────────────────────────────
-    // Graceful early exit if there is nothing useful to BLAST
-    // ─────────────────────────────────────────────────────────────
     if contig_size < MIN_ASSEMBLED_CONTIG_SIZE || ref_size < MIN_REF_FASTA_SIZE {
-        return early_blast_exit(
+        while pairs.next().await.is_some() {}
+
+        let (
+            dict,
+            counts,
+            contigs,
+            pairs_rx,
+            top_rx,
+            tasks,
+            recvs,
+        ) = early_blast_exit(
             db_type,
             &blast_m8_path,
             &blast_top_m8_path,
@@ -5601,12 +5724,58 @@ async fn blast_contigs(
             taxon_counts,
             fn_start,
         )
-        .await;
+            .await?;
+
+        // No makeblastdb → no index TempDir
+        return Ok((
+            dict, counts, contigs, pairs_rx, top_rx, tasks, recvs, None,
+        ));
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Normal path
-    // ─────────────────────────────────────────────────────────────
+    // Split ReducedRead → original m8 + hit for generate_m8_and_hit_summary
+    // (that function keys by read_id; pairing is preserved in the maps)
+    let (orig_m8_tx, orig_m8_rx) = mpsc::channel::<ParseOutput>(131_072);
+    let (orig_hit_tx, orig_hit_rx) = mpsc::channel::<ParseOutput>(131_072);
+    let pairs_split_handle = tokio::spawn({
+        let db_type = db_type;
+        async move {
+            let mut n = 0u64;
+            while let Some(pair) = pairs.next().await {
+                if pair.dedup.is_empty() && pair.summary.is_empty() {
+                    continue;
+                }
+                if orig_m8_tx
+                    .send(ParseOutput::Bytes(Bytes::from(pair.dedup)))
+                    .await
+                    .is_err()
+                {
+                    return Err(anyhow!(
+                        "[blast_contigs:{}] orig_m8 consumer closed after {} pairs",
+                        db_type,
+                        n
+                    ));
+                }
+                if orig_hit_tx
+                    .send(ParseOutput::Bytes(Bytes::from(pair.summary)))
+                    .await
+                    .is_err()
+                {
+                    return Err(anyhow!(
+                        "[blast_contigs:{}] orig_hit consumer closed after {} pairs",
+                        db_type,
+                        n
+                    ));
+                }
+                n += 1;
+            }
+            info!(
+                "[blast_contigs:{}] pairs split complete: {} pairs",
+                db_type, n
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+
     let temp_dir = choose_temp_dir(
         ref_size + contig_size,
         &config.ram_temp_dir,
@@ -5614,24 +5783,9 @@ async fn blast_contigs(
         blast_headroom,
         true,
     )
-    .await?;
-    info!(
-        "[blast_contigs:{}] temp dir chosen: {}",
-        db_type,
-        temp_dir.path().display()
-    );
+        .await?;
 
-    let blastdb_suffix = format!("{}_blastindex", db_type);
-    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let blastdb_path = blastdb_ram_path.path().to_owned();
-    temp_files.push(blastdb_ram_path);
-
-    info!(
-        "[blast_contigs:{}] blastdb path: {}",
-        db_type,
-        blastdb_path.display()
-    );
+    let blastdb_path = temp_dir.path().join(format!("{}_blastindex", db_type));
 
     let makeblastdb_config = MakeblastdbConfig {
         input: reference_fasta.clone(),
@@ -5643,7 +5797,6 @@ async fn blast_contigs(
         output: blastdb_path.clone(),
         option_fields: HashMap::new(),
     };
-
     let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: MAKEBLASTDB_TAG.to_string(),
@@ -5651,7 +5804,6 @@ async fn blast_contigs(
         })?;
 
     info!("[blast_contigs:{}] launching makeblastdb", db_type);
-
     let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
         MAKEBLASTDB_TAG,
@@ -5659,156 +5811,48 @@ async fn blast_contigs(
         config.args.verbose,
         None,
     )
-    .await?;
-
-    makeblastdb_child
+        .await?;
+    let makeblastdb_status = makeblastdb_child
         .wait()
         .await
         .map_err(|e| PipelineError::ToolExecution {
             tool: MAKEBLASTDB_TAG.to_string(),
-            error: format!("makeblastdb failed: {}", e),
+            error: format!("makeblastdb wait failed: {}", e),
         })?;
     makeblastdb_err_task.await??;
-
-    let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
-    let expected_index = blastdb_path.with_extension(index_ext);
-
-    if !expected_index.exists() {
-        warn!(
-            "[blast_contigs:{}] makeblastdb did not produce expected index at {}. Falling back gracefully.",
-            db_type, expected_index.display()
-        );
-
-        return early_blast_exit(
+    if !makeblastdb_status.success() {
+        return Err(anyhow!(
+            "makeblastdb exited with {:?} (db_type={}, prefix={})",
+            makeblastdb_status.code(),
             db_type,
-            &blast_m8_path,
-            &blast_top_m8_path,
-            &refined_m8_path,
-            &refined_hit_summary_path,
-            &refined_counts_path,
-            &contig_summary_path,
-            None,
-            None,
-            None,
-            &read_dict,
-            taxon_counts,
-            fn_start,
+            blastdb_path.display()
         )
-        .await;
+            .into());
     }
-
-    // ─────────────────────────────────────────────────────────────
-    // Index exists → continue with blastn/x
-    // ─────────────────────────────────────────────────────────────
-
-    let temp_dir = choose_temp_dir(
-        ref_size + contig_size,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        blast_headroom,
-        true,
-    )
-    .await?;
+    if !blastdb_ready(&blastdb_path, db_type) {
+        return Err(anyhow!(
+            "makeblastdb succeeded but index not ready at prefix={}",
+            blastdb_path.display()
+        )
+            .into());
+    }
     info!(
-        "[blast_contigs:{}] temp dir chosen: {}",
-        db_type,
-        temp_dir.path().display()
-    );
-
-    let blastdb_suffix = format!("{}_blastindex", db_type);
-    let blastdb_ram_path = NamedTempFile::with_suffix_in(blastdb_suffix, &temp_dir)
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    let blastdb_path = blastdb_ram_path.path().to_owned();
-    temp_files.push(blastdb_ram_path);
-
-    info!(
-        "[blast_contigs:{}] blastdb path: {}",
+        "[blast_contigs:{}] blastdb ready at prefix={}",
         db_type,
         blastdb_path.display()
     );
-
-    let makeblastdb_config = MakeblastdbConfig {
-        input: reference_fasta.clone(),
-        dbtype: if db_type == NT_TAG {
-            "nucl".to_string()
-        } else {
-            "prot".to_string()
-        },
-        output: blastdb_path.clone(),
-        option_fields: HashMap::new(),
-    };
-
-    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    info!("[blast_contigs:{}] launching makeblastdb", db_type);
-
-    let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
-        config.clone(),
-        MAKEBLASTDB_TAG,
-        makeblastdb_args,
-        config.args.verbose,
-        None,
-    )
-    .await?;
-
-    // Wait for makeblastdb to finish
-    makeblastdb_child
-        .wait()
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: format!("makeblastdb failed: {}", e),
-        })?;
-    makeblastdb_err_task.await??;
-
-    // Verify the index was created
-    let index_ext = if db_type == NT_TAG { "nal" } else { "pal" };
-    let expected_index = blastdb_path.with_extension(index_ext);
-
-    if !expected_index.exists() {
-        warn!(
-        "[blast_contigs:{}] makeblastdb did not produce expected index at {}. Falling back gracefully.",
-        db_type, expected_index.display()
-    );
-
-        return early_blast_exit(
-            db_type,
-            &blast_m8_path,
-            &blast_top_m8_path,
-            &refined_m8_path,
-            &refined_hit_summary_path,
-            &refined_counts_path,
-            &contig_summary_path,
-            None,
-            None,
-            None,
-            &read_dict,
-            taxon_counts,
-            fn_start,
-        )
-        .await; // ← add this
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // If we reach here, the index exists — continue with blastn/x
-    // (rest of the function stays the same)
-    // ─────────────────────────────────────────────────────────────
 
     let blast_command = if db_type == NT_TAG {
         BLASTN_TAG
     } else {
         BLASTX_TAG
     };
-
     let blast_args = if db_type == NT_TAG {
         let blastn_config = BlastnConfig {
             query: assembled_contig_fasta.clone(),
             db: blastdb_path.clone(),
-            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen".to_string(),
+            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
+                .to_string(),
             evalue: 1e-10,
             max_target_seqs: 5000,
             option_fields: HashMap::new(),
@@ -5827,18 +5871,12 @@ async fn blast_contigs(
     };
 
     info!(
-        "[blast_contigs:{}] launching {} with query={} db={}",
+        "[blast_contigs:{}] launching {} query={} db={}",
         db_type,
         blast_command,
         assembled_contig_fasta.display(),
         blastdb_path.display()
     );
-    info!(
-        "[blast_contigs:{}] blast args prepared for {}",
-        db_type, blast_command
-    );
-    info!("blast_contigs right before spawning");
-    let blast_spawn_start = Instant::now();
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
         blast_command,
@@ -5846,113 +5884,59 @@ async fn blast_contigs(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
     cleanup_tasks.push(err_task);
 
-    info!(
-        "[blast_contigs:{}] {} spawned after {:?}",
-        db_type,
-        blast_command,
-        blast_spawn_start.elapsed()
-    );
-    info!("blast_contigs right before output aAAAAAAAAAA");
     let blast_out_stream = parse_child_output(
         &mut blast_child,
         ChildStream::Stdout,
         ParseMode::Lines,
         &config,
     )
-    .await?;
-    info!(
-        "[blast_contigs:{}] child stdout parser ready (buffer_size={})",
-        db_type, config.base_buffer_size
-    );
+        .await?;
 
-    // ────────────────────────────────────────────────
-    // Top hits and results processing
-    // ────────────────────────────────────────────────
-    let (top_internal_tx, top_internal_rx) = mpsc::channel(1024);
-    let (top_for_update_tx, top_for_update_rx) = mpsc::channel(1024);
-    let (top_for_caller_tx, top_for_caller_rx) = mpsc::channel(1024);
-
-    info!(
-        "[blast_contigs:{}] top-hits fanout channels created (1024 each)",
-        db_type
-    );
+    // ── Top hits ──────────────────────────────────────────────────────────
+    let (top_internal_tx, top_internal_rx) = mpsc::channel(131_072);
+    let (top_for_update_tx, top_for_update_rx) = mpsc::channel(131_072);
+    let (top_for_caller_tx, top_for_caller_rx) = mpsc::unbounded_channel();
 
     let top_handle = if db_type == NT_TAG {
-        let top_nt_concurrency = compute_phase_concurrency(&config, "top_m8_nt", 0.25, 1.0, 128, 2);
-        info!(
-            "[blast_contigs:{}] NT top_m8 concurrency={}",
-            db_type, top_nt_concurrency
+        let c = compute_phase_concurrency(&config, "top_m8_nt", 0.25, 1.0, 128, 2);
+        let bs = compute_batch_size(
+            None,
+            200,
+            if config.available_ram < 64 { 100 } else { 250 },
+            c,
         );
-
-        let avg_line_bytes = 200;
-        let target_batch_mb = if config.available_ram < 64 { 100 } else { 250 };
-        let est_total_lines = None;
-        let top_nt_batch_size = compute_batch_size(
-            est_total_lines,
-            avg_line_bytes,
-            target_batch_mb,
-            top_nt_concurrency,
-        );
-        info!(
-            "[blast_contigs:{}] NT top_m8 batch_size={}",
-            db_type, top_nt_batch_size
-        );
-
-        let top_start = Instant::now();
+        let t0 = Instant::now();
         tokio::spawn(async move {
             info!("[blast_contigs:{}] get_top_m8_nt started", db_type);
-            let res = get_top_m8_nt(
-                ReceiverStream::new(blast_out_stream),
-                top_internal_tx,
-                top_nt_concurrency,
-                top_nt_batch_size,
-            )
-            .await;
+            let res =
+                get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_internal_tx, c, bs).await;
             info!(
                 "[blast_contigs:{}] get_top_m8_nt finished after {:?}",
                 db_type,
-                top_start.elapsed()
+                t0.elapsed()
             );
             res
         })
     } else {
-        let top_nr_concurrency = compute_phase_concurrency(&config, "top_m8_nr", 0.5, 1.5, 128, 2);
-        info!(
-            "[blast_contigs:{}] NR top_m8 concurrency={}",
-            db_type, top_nr_concurrency
+        let c = compute_phase_concurrency(&config, "top_m8_nr", 0.5, 1.5, 128, 2);
+        let bs = compute_batch_size(
+            None,
+            200,
+            if config.available_ram < 64 { 100 } else { 250 },
+            c,
         );
-
-        let avg_line_bytes = 200;
-        let target_batch_mb = if config.available_ram < 64 { 100 } else { 250 };
-        let est_total_lines = None;
-        let top_nr_batch_size = compute_batch_size(
-            est_total_lines,
-            avg_line_bytes,
-            target_batch_mb,
-            top_nr_concurrency,
-        );
-        info!(
-            "[blast_contigs:{}] NR top_m8 batch_size={}",
-            db_type, top_nr_batch_size
-        );
-
-        let top_start = Instant::now();
+        let t0 = Instant::now();
         tokio::spawn(async move {
             info!("[blast_contigs:{}] get_top_m8_nr started", db_type);
-            let res = get_top_m8_nr(
-                ReceiverStream::new(blast_out_stream),
-                top_internal_tx,
-                top_nr_concurrency,
-                top_nr_batch_size,
-            )
-            .await;
+            let res =
+                get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_internal_tx, c, bs).await;
             info!(
                 "[blast_contigs:{}] get_top_m8_nr finished after {:?}",
                 db_type,
-                top_start.elapsed()
+                t0.elapsed()
             );
             res
         })
@@ -5963,80 +5947,40 @@ async fn blast_contigs(
         let tx_update = top_for_update_tx;
         let tx_caller = top_for_caller_tx;
         async move {
-            let start = Instant::now();
             let mut total = 0usize;
-            let mut last_log = Instant::now();
-
-            info!("[blast_contigs:{}] top forward task started", db_type);
-
             while let Some(item) = rx.recv().await {
                 total += 1;
-
-                let update_send_start = Instant::now();
                 if tx_update.send(item.clone()).await.is_err() {
                     warn!(
-                        "[blast_contigs:{}] top forward: update branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
+                        "[blast_contigs:{}] top forward: update dropped at {}",
+                        db_type, total
                     );
                     break;
                 }
-                let update_wait = update_send_start.elapsed();
-
-                let caller_send_start = Instant::now();
-                if tx_caller.send(item).await.is_err() {
+                if tx_caller.send(item).is_err() {
                     warn!(
-                        "[blast_contigs:{}] top forward: caller branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
+                        "[blast_contigs:{}] top forward: caller dropped at {}",
+                        db_type, total
                     );
                     break;
-                }
-                let caller_wait = caller_send_start.elapsed();
-
-                if update_wait >= Duration::from_millis(50)
-                    || caller_wait >= Duration::from_millis(50)
-                    || last_log.elapsed() >= Duration::from_secs(10)
-                {
-                    info!(
-                        "[blast_contigs:{}] top forward progress: total={} update_wait={:?} caller_wait={:?} elapsed={:?}",
-                        db_type,
-                        total,
-                        update_wait,
-                        caller_wait,
-                        start.elapsed()
-                    );
-                    last_log = Instant::now();
                 }
             }
-
             info!(
-                "[blast_contigs:{}] top forward complete: total={} elapsed={:?}",
-                db_type,
-                total,
-                start.elapsed()
+                "[blast_contigs:{}] top forward complete: total={}",
+                db_type, total
             );
-
             Ok::<(), anyhow::Error>(())
         }
     });
     cleanup_tasks.push(forward_handle);
 
-    let (contig2lineage_tx, contig2lineage_rx) = mpsc::channel(1024);
-    let (read2blastm8_tx, read2blastm8_rx) = mpsc::channel(1024);
-    let (updated_tx, updated_rx) = mpsc::channel(1024);
-    let (added_tx, added_rx) = mpsc::channel(1024);
-
-    info!(
-        "[blast_contigs:{}] downstream fanout channels created (contig2lineage/read2blastm8/updated/added)",
-        db_type
-    );
+    let (contig2lineage_tx, contig2lineage_rx) = mpsc::channel(64_000);
+    let (read2blastm8_tx, read2blastm8_rx) = mpsc::channel(64_000);
+    let (updated_tx, updated_rx) = mpsc::channel(64_000);
+    let (added_tx, added_rx) = mpsc::channel(64_000);
 
     let update_handle = tokio::spawn({
-        let start = Instant::now();
-        info!("[blast_contigs:{}] update_read_dict started", db_type);
+        let t0 = Instant::now();
         let fut = update_read_dict(
             config.clone(),
             read2contig.clone(),
@@ -6051,273 +5995,133 @@ async fn blast_contigs(
             updated_tx,
             added_tx,
         );
-
         async move {
             let res = fut.await;
             info!(
                 "[blast_contigs:{}] update_read_dict finished after {:?}",
                 db_type,
-                start.elapsed()
+                t0.elapsed()
             );
             res
         }
     });
-    cleanup_tasks.push(update_handle);
 
     let contig2lineage_task = tokio::spawn(async move {
-        let start = Instant::now();
-        info!(
-            "[blast_contigs:{}] contig2lineage collector started",
-            db_type
-        );
-
         let mut contig2lineage: AHashMap<String, [i32; 3]> = AHashMap::new();
-        let mut lineage_stream = ReceiverStream::new(contig2lineage_rx);
-        let mut total = 0usize;
-
-        while let Some(item) = lineage_stream.next().await {
-            total += 1;
+        let mut stream = ReceiverStream::new(contig2lineage_rx);
+        while let Some(item) = stream.next().await {
             let bytes = item.to_bytes()?;
             let line = String::from_utf8_lossy(&bytes);
             let fields: Vec<&str> = line.split('\t').collect();
             if fields.len() >= 4 {
-                let contig = fields[0].to_string();
-                let species = fields[1].parse().unwrap_or(0);
-                let genus = fields[2].parse().unwrap_or(0);
-                let family = fields[3].parse().unwrap_or(0);
-                contig2lineage.insert(contig, [species, genus, family]);
-            }
-
-            if total % 10_000 == 0 {
-                info!(
-                    "[blast_contigs:{}] contig2lineage collector progress: {} records after {:?}",
-                    db_type,
-                    total,
-                    start.elapsed()
+                contig2lineage.insert(
+                    fields[0].to_string(),
+                    [
+                        fields[1].parse().unwrap_or(0),
+                        fields[2].parse().unwrap_or(0),
+                        fields[3].parse().unwrap_or(0),
+                    ],
                 );
             }
         }
-
-        info!(
-            "[blast_contigs:{}] contig2lineage collector complete: {} records after {:?}",
-            db_type,
-            total,
-            start.elapsed()
-        );
-
         Ok::<_, anyhow::Error>(contig2lineage)
     });
 
+    // Internal dual streams for generate_m8 + counts (paired again before export)
     let (refined_m8_local_tx, refined_m8_local_rx) = mpsc::channel(2_000_000);
-    let (refined_hit_summary_local_tx, refined_hit_summary_local_rx) = mpsc::channel(2_000_000);
-
-    info!(
-        "[blast_contigs:{}] refined local channels created (2,000,000 each)",
-        db_type
-    );
+    let (refined_hit_local_tx, refined_hit_local_rx) = mpsc::channel(2_000_000);
 
     let generate_m8_handle = tokio::spawn({
-        let start = Instant::now();
-        info!(
-            "[blast_contigs:{}] generate_m8_and_hit_summary started",
-            db_type
-        );
+        let t0 = Instant::now();
         let fut = generate_m8_and_hit_summary(
             config.clone(),
             ReceiverStream::new(updated_rx),
             ReceiverStream::new(added_rx),
             ReceiverStream::new(read2blastm8_rx),
-            hit_summary_stream,
-            deduped_m8_stream,
-            refined_m8_local_tx.clone(),
-            refined_hit_summary_local_tx.clone(),
+            ReceiverStream::new(orig_hit_rx),
+            ReceiverStream::new(orig_m8_rx),
+            refined_m8_local_tx,
+            refined_hit_local_tx,
         );
-
         async move {
             let res = fut.await;
             info!(
                 "[blast_contigs:{}] generate_m8_and_hit_summary finished after {:?}",
                 db_type,
-                start.elapsed()
+                t0.elapsed()
             );
             res
         }
     });
 
-    let (refined_m8_tx, refined_m8_rx) = mpsc::channel(2_000_000);
-    let (refined_hit_summary_tx, refined_hit_summary_rx) = mpsc::channel(2_000_000);
-
     let (refined_m8_for_counts_tx, refined_m8_for_counts_rx) = mpsc::channel(2_000_000);
     let (refined_hit_for_counts_tx, refined_hit_for_counts_rx) = mpsc::channel(2_000_000);
 
-    info!(
-        "[blast_contigs:{}] refined export/count split channels created",
-        db_type
-    );
+    let (m8_acc_tx, mut m8_acc_rx) = mpsc::unbounded_channel::<ParseOutput>();
+    let (hit_acc_tx, mut hit_acc_rx) = mpsc::unbounded_channel::<ParseOutput>();
 
     let m8_forward_handle = tokio::spawn({
         let mut rx = refined_m8_local_rx;
-        let out_tx = refined_m8_tx.clone();
-        let counts_tx = refined_m8_for_counts_tx.clone();
+        let counts_tx = refined_m8_for_counts_tx;
         async move {
-            let start = Instant::now();
             let mut total = 0usize;
-            let mut last_log = Instant::now();
-
-            info!(
-                "[blast_contigs:{}] refined m8 forward task started",
-                db_type
-            );
-
             while let Some(item) = rx.recv().await {
                 total += 1;
-
-                let out_send_start = Instant::now();
-                if out_tx.send(item.clone()).await.is_err() {
-                    warn!(
-                        "[blast_contigs:{}] refined m8 forward: caller branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
-                    );
+                if counts_tx.send(item.clone()).await.is_err() {
+                    warn!("[blast_contigs] m8 counts branch closed at {}", total);
                     break;
                 }
-                let out_wait = out_send_start.elapsed();
-
-                let counts_send_start = Instant::now();
-                if counts_tx.send(item).await.is_err() {
-                    warn!(
-                        "[blast_contigs:{}] refined m8 forward: taxon-count branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
-                    );
+                if m8_acc_tx.send(item).is_err() {
                     break;
-                }
-                let counts_wait = counts_send_start.elapsed();
-
-                if out_wait >= Duration::from_millis(50)
-                    || counts_wait >= Duration::from_millis(50)
-                    || last_log.elapsed() >= Duration::from_secs(10)
-                {
-                    info!(
-                        "[blast_contigs:{}] refined m8 forward progress: total={} caller_wait={:?} counts_wait={:?} elapsed={:?}",
-                        db_type,
-                        total,
-                        out_wait,
-                        counts_wait,
-                        start.elapsed()
-                    );
-                    last_log = Instant::now();
                 }
             }
-
-            info!(
-                "[blast_contigs:{}] refined m8 forward complete: total={} elapsed={:?}",
-                db_type,
-                total,
-                start.elapsed()
-            );
-
+            info!("[blast_contigs] m8 forward complete: total={}", total);
             Ok::<(), anyhow::Error>(())
         }
     });
-    cleanup_tasks.push(m8_forward_handle);
 
     let hit_forward_handle = tokio::spawn({
-        let mut rx = refined_hit_summary_local_rx;
-        let out_tx = refined_hit_summary_tx.clone();
-        let counts_tx = refined_hit_for_counts_tx.clone();
+        let mut rx = refined_hit_local_rx;
+        let counts_tx = refined_hit_for_counts_tx;
         async move {
-            let start = Instant::now();
             let mut total = 0usize;
-            let mut last_log = Instant::now();
-
-            info!(
-                "[blast_contigs:{}] refined hit forward task started",
-                db_type
-            );
-
             while let Some(item) = rx.recv().await {
                 total += 1;
-
-                let out_send_start = Instant::now();
-                if out_tx.send(item.clone()).await.is_err() {
-                    warn!(
-                        "[blast_contigs:{}] refined hit forward: caller branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
-                    );
+                if counts_tx.send(item.clone()).await.is_err() {
+                    warn!("[blast_contigs] hit counts branch closed at {}", total);
                     break;
                 }
-                let out_wait = out_send_start.elapsed();
-
-                let counts_send_start = Instant::now();
-                if counts_tx.send(item).await.is_err() {
-                    warn!(
-                        "[blast_contigs:{}] refined hit forward: taxon-count branch dropped at item {} after {:?}",
-                        db_type,
-                        total,
-                        start.elapsed()
-                    );
+                if hit_acc_tx.send(item).is_err() {
                     break;
-                }
-                let counts_wait = counts_send_start.elapsed();
-
-                if out_wait >= Duration::from_millis(50)
-                    || counts_wait >= Duration::from_millis(50)
-                    || last_log.elapsed() >= Duration::from_secs(10)
-                {
-                    info!(
-                        "[blast_contigs:{}] refined hit forward progress: total={} caller_wait={:?} counts_wait={:?} elapsed={:?}",
-                        db_type,
-                        total,
-                        out_wait,
-                        counts_wait,
-                        start.elapsed()
-                    );
-                    last_log = Instant::now();
                 }
             }
-
-            info!(
-                "[blast_contigs:{}] refined hit forward complete: total={} elapsed={:?}",
-                db_type,
-                total,
-                start.elapsed()
-            );
-
+            info!("[blast_contigs] hit forward complete: total={}", total);
             Ok::<(), anyhow::Error>(())
         }
     });
-    cleanup_tasks.push(hit_forward_handle);
+
+    let m8_collect_handle = tokio::spawn(async move {
+        let mut v = Vec::with_capacity(1_000_000);
+        while let Some(item) = m8_acc_rx.recv().await {
+            v.push(item);
+        }
+        v
+    });
+    let hit_collect_handle = tokio::spawn(async move {
+        let mut v = Vec::with_capacity(1_000_000);
+        while let Some(item) = hit_acc_rx.recv().await {
+            v.push(item);
+        }
+        v
+    });
 
     let taxon_count_concurrency =
         compute_phase_concurrency(&config, "taxon_counting", 0.4, 4.0, 64, 4);
-    info!(
-        "[blast_contigs:{}] taxon_count_concurrency={}",
-        db_type, taxon_count_concurrency
-    );
-
     let taxon_count_batch_size = compute_batch_size(None, 220, 150, taxon_count_concurrency);
-    info!(
-        "[blast_contigs:{}] taxon_count_batch_size={}",
-        db_type, taxon_count_batch_size
-    );
-
-    let (refined_counts_tx, refined_counts_rx) = mpsc::channel(1024);
-    info!(
-        "[blast_contigs:{}] refined_counts output channel created",
-        db_type
-    );
+    let (refined_counts_tx, refined_counts_rx) = mpsc::unbounded_channel();
 
     let counts_handle = tokio::spawn({
-        let start = Instant::now();
-        info!(
-            "[blast_contigs:{}] generate_taxon_count_json_from_m8 started",
-            db_type
-        );
+        let t0 = Instant::now();
         let fut = generate_taxon_count_json_from_m8(
             ReceiverStream::new(refined_m8_for_counts_rx),
             ReceiverStream::new(refined_hit_for_counts_rx),
@@ -6329,256 +6133,280 @@ async fn blast_contigs(
             taxon_count_concurrency,
             taxon_count_batch_size,
         );
-
         async move {
             let res = fut.await;
             info!(
                 "[blast_contigs:{}] generate_taxon_count_json_from_m8 finished after {:?}",
                 db_type,
-                start.elapsed()
+                t0.elapsed()
             );
             res
         }
     });
 
+    // ── Ordered joins ─────────────────────────────────────────────────────
+    top_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("top_handle panicked: {e}")))?
+        .map_err(|e| PipelineError::Other(anyhow!("get_top_m8 failed: {e}")))?;
+    info!(
+        "[blast_contigs:{}] top stage joined after {:?}",
+        db_type,
+        fn_start.elapsed()
+    );
+
+    update_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("update_handle panicked: {e}")))?
+        .map_err(|e| PipelineError::Other(anyhow!("update_read_dict failed: {e}")))?;
+    info!(
+        "[blast_contigs:{}] update_read_dict joined after {:?}",
+        db_type,
+        fn_start.elapsed()
+    );
+
     let contig2lineage = contig2lineage_task
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("contig2lineage task panicked: {e}")))??;
-
+        .map_err(|e| PipelineError::Other(anyhow!("contig2lineage panicked: {e}")))??;
     info!(
-        "[blast_contigs:{}] contig2lineage map built with {} entries",
+        "[blast_contigs:{}] contig2lineage map: {} entries",
         db_type,
         contig2lineage.len()
     );
 
-    let (contig_summary_tx, contig_summary_rx) = mpsc::channel(1024);
-    info!(
-        "[blast_contigs:{}] contig_summary output channel created",
-        db_type
-    );
-
+    let (contig_summary_tx, contig_summary_rx) = mpsc::channel(64_000);
     let contig_summary_handle = tokio::spawn({
-        let start = Instant::now();
-        info!(
-            "[blast_contigs:{}] generate_contig_summary_json started",
-            db_type
-        );
+        let t0 = Instant::now();
         let fut = generate_contig_summary_json(
             read2contig.clone(),
             contig2lineage,
             read_dict.clone(),
             db_type,
             duplicate_clusters.clone(),
-            4,
+            should_keep_filter.clone(),
+            MIN_CONTIG_SIZE,
             contig_summary_tx,
         );
-
         async move {
             let res = fut.await;
             info!(
                 "[blast_contigs:{}] generate_contig_summary_json finished after {:?}",
                 db_type,
-                start.elapsed()
+                t0.elapsed()
             );
             res
         }
     });
 
-    info!("[blast_contigs:{}] awaiting processing task joins", db_type);
-
-    let results = try_join_all(vec![
-        top_handle,
+    let (gen_res, counts_res, contig_res, m8_fwd_res, hit_fwd_res, split_res) = tokio::try_join!(
         generate_m8_handle,
         counts_handle,
         contig_summary_handle,
-    ])
-    .await
-    .map_err(|e| PipelineError::Other(anyhow!("contig processing task panicked: {}", e)))?;
+        m8_forward_handle,
+        hit_forward_handle,
+        pairs_split_handle,
+    )
+        .map_err(|e| PipelineError::Other(anyhow!("contig task panicked: {e}")))?;
 
-    for res in results {
-        res.map_err(|e| PipelineError::Other(anyhow!("contig processing task failed: {}", e)))?;
-    }
+    gen_res.map_err(|e| PipelineError::Other(anyhow!("generate_m8: {e}")))?;
+    counts_res.map_err(|e| PipelineError::Other(anyhow!("counts: {e}")))?;
+    contig_res.map_err(|e| PipelineError::Other(anyhow!("contig_summary: {e}")))?;
+    m8_fwd_res.map_err(|e| PipelineError::Other(anyhow!("m8 forward: {e}")))?;
+    hit_fwd_res.map_err(|e| PipelineError::Other(anyhow!("hit forward: {e}")))?;
+    split_res.map_err(|e| PipelineError::Other(anyhow!("pairs split: {e}")))?;
+
+    let refined_m8_items = m8_collect_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("m8 collect panicked: {e}")))?;
+    let refined_hit_items = hit_collect_handle
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("hit collect panicked: {e}")))?;
 
     info!(
-        "[blast_contigs:{}] all processing tasks joined after {:?}",
+        "[blast_contigs:{}] refined buffered: m8={} hit={}",
         db_type,
-        fn_start.elapsed()
+        refined_m8_items.len(),
+        refined_hit_items.len()
     );
+
+    // ── Pair by read_id → ReducedRead export (never by index) ─────────────
+    let mut m8_by_id: AHashMap<String, Bytes> =
+        AHashMap::with_capacity(refined_m8_items.len());
+    for item in refined_m8_items {
+        let ParseOutput::Bytes(b) = item else { continue };
+        let id = read_id_from_bytes(&b);
+        if !id.is_empty() {
+            m8_by_id.insert(id, b);
+        }
+    }
+
+    let mut pairs_out: Vec<ReducedRead> = Vec::with_capacity(refined_hit_items.len());
+    let mut seq = 0u64;
+    let mut orphan_hits = 0u64;
+    for item in refined_hit_items {
+        let ParseOutput::Bytes(summary) = item else { continue };
+        let id = read_id_from_bytes(&summary);
+        let Some(dedup) = m8_by_id.remove(&id) else {
+            orphan_hits += 1;
+            continue;
+        };
+        let accession = {
+            let s = String::from_utf8_lossy(&summary);
+            s.split('\t').nth(3).unwrap_or("").trim().to_string()
+        };
+        seq += 1;
+        pairs_out.push(ReducedRead {
+            seq,
+            dedup: dedup.to_vec(),
+            summary: summary.to_vec(),
+            accession,
+        });
+    }
+    if !m8_by_id.is_empty() {
+        warn!(
+            "[blast_contigs:{}] {} refined m8 rows with no matching hit summary",
+            db_type,
+            m8_by_id.len()
+        );
+    }
+    if orphan_hits > 0 {
+        warn!(
+            "[blast_contigs:{}] {} refined hit rows with no matching m8",
+            db_type, orphan_hits
+        );
+    }
+    info!(
+        "[blast_contigs:{}] refined pairs: {}",
+        db_type,
+        pairs_out.len()
+    );
+
+
+    // Durable hitsummary2 + reassigned m8 (CZID: gsnap.hitsummary2.tab / gsnap.reassigned.m8)
+    // Written from the same pairs_out that feeds merge / taxid / coverage.
+    let hitsummary2_path = config
+        .out_dir
+        .join(format!("{}_{}.hitsummary2.tab", sample_base, db_type));
+    let reassigned_m8_path = config
+        .out_dir
+        .join(format!("{}_{}.reassigned.m8", sample_base, db_type));
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut hit_w =
+            tokio::io::BufWriter::new(tokio::fs::File::create(&hitsummary2_path).await?);
+        let mut m8_w =
+            tokio::io::BufWriter::new(tokio::fs::File::create(&reassigned_m8_path).await?);
+
+        let mut long_rows = 0u64;
+        for p in &pairs_out {
+            let nf = p.summary.split(|&b| b == b'\t').count();
+            if nf >= 12 {
+                long_rows += 1;
+            }
+            hit_w.write_all(&p.summary).await?;
+            if !p.summary.ends_with(b"\n") {
+                hit_w.write_all(b"\n").await?;
+            }
+            m8_w.write_all(&p.dedup).await?;
+            if !p.dedup.ends_with(b"\n") {
+                m8_w.write_all(b"\n").await?;
+            }
+        }
+        hit_w.flush().await?;
+        m8_w.flush().await?;
+
+        info!(
+            "[blast_contigs:{}] wrote hitsummary2={} lines={} long_rows(>=12)={} reassigned_m8={}",
+            db_type,
+            hitsummary2_path.display(),
+            pairs_out.len(),
+            long_rows,
+            reassigned_m8_path.display()
+        );
+    }
+
+
+
+    let (refined_pairs_tx, refined_pairs_rx) = mpsc::channel(pairs_out.len().max(1));
+    tokio::spawn(async move {
+        for p in pairs_out {
+            if refined_pairs_tx.send(p).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let blast_status = blast_child
+        .wait()
+        .await
+        .map_err(|e| anyhow!("blast wait failed: {}", e))?;
+    if !blast_status.success() {
+        return Err(anyhow!(
+            "{} exited with {:?} (db_type={})",
+            blast_command,
+            blast_status.code(),
+            db_type
+        )
+            .into());
+    }
 
     let mut refined_counts = Vec::new();
-    let mut rx = ReceiverStream::new(refined_counts_rx);
-    let mut refined_counts_seen = 0usize;
+    let mut rx = UnboundedReceiverStream::new(refined_counts_rx);
     while let Some(item) = rx.next().await {
-        refined_counts_seen += 1;
         let bytes = item.to_bytes()?;
         let line = String::from_utf8_lossy(&bytes);
-        let count: TaxonCount = serde_json::from_str(&line)?;
-        refined_counts.push(count);
-
-        if refined_counts_seen % 10_000 == 0 {
-            info!(
-                "[blast_contigs:{}] refined_counts decoded {} records",
-                db_type, refined_counts_seen
-            );
-        }
+        refined_counts.push(serde_json::from_str(&line)?);
     }
     info!(
-        "[blast_contigs:{}] refined_counts complete: {} records",
-        db_type, refined_counts_seen
+        "[blast_contigs:{}] refined_counts: {}",
+        db_type,
+        refined_counts.len()
     );
 
-    let mut contig_summary = Vec::new();
+    let mut contig_summary: Vec<ContigSummaryEntry> = Vec::new();
     let mut rx = ReceiverStream::new(contig_summary_rx);
-    let mut contig_summary_seen = 0usize;
     while let Some(item) = rx.next().await {
-        contig_summary_seen += 1;
         let bytes = item.to_bytes()?;
         let line = String::from_utf8_lossy(&bytes);
-        let entry: ContigSummaryEntry = serde_json::from_str(&line)?;
-        contig_summary.push(entry);
-
-        if contig_summary_seen % 10_000 == 0 {
-            info!(
-                "[blast_contigs:{}] contig_summary decoded {} records",
-                db_type, contig_summary_seen
-            );
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
         }
+        contig_summary.push(
+            serde_json::from_str(line)
+                .map_err(|e| anyhow!("contig_summary JSON parse failed: {e}; line={line}"))?,
+        );
     }
     info!(
-        "[blast_contigs:{}] contig_summary complete: {} records",
-        db_type, contig_summary_seen
+        "[blast_contigs:{}] contig_summary: {}",
+        db_type,
+        contig_summary.len()
     );
 
     let final_read_dict = read_dict.lock().unwrap().clone();
-
     info!(
-        "[blast_contigs:{}] DONE after {:?} — refined_counts={}, contig_summary={}, read_dict_size={}, cleanup_tasks={}, cleanup_receivers={}, temp_files={}",
+        "[blast_contigs:{}] DONE after {:?} — counts={} contig_summary={} read_dict={}",
         db_type,
         fn_start.elapsed(),
         refined_counts.len(),
         contig_summary.len(),
-        final_read_dict.len(),
-        cleanup_tasks.len(),
-        cleanup_receivers.len(),
-        temp_files.len()
+        final_read_dict.len()
     );
 
     Ok((
         final_read_dict,
         refined_counts,
         contig_summary,
-        refined_m8_rx,
-        refined_hit_summary_rx,
+        refined_pairs_rx,
         top_for_caller_rx,
         cleanup_tasks,
         cleanup_receivers,
-        temp_files,
+        Some(temp_dir),
     ))
 }
 
 
-/// Preloads NR alignments from a hit-summary stream into a shared map.
-///
-/// # Arguments
-///
-/// * `config`: the run configuration
-/// * `preload_rx`: receiver for hit summary records
-/// * `nr_alignment_per_read`: shared map to populate with NR alignment results
-///
-/// # Returns
-///
-/// Result<()>: success or error
-async fn preload_nr_alignments_parallel(
-    config: Arc<RunConfig>,
-    preload_rx: mpsc::Receiver<ParseOutput>,
-    nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
-) -> Result<()> {
-    let concurrency = compute_phase_concurrency(
-        &config,
-        "nr_preload_alignments",
-        0.3, // tiny RAM per worker
-        2.0, // almost pure parse+insert
-        128, // safe even on 256-core EPYC
-        8,
-    );
-
-    let batch_size = compute_batch_size(None, 180, 200, concurrency);
-
-    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-    let mut workers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let rx = Arc::clone(&shared_rx);
-        let map = Arc::clone(&nr_alignment_per_read);
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let batch = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-                let Some(batch) = batch else { break };
-
-                batch.par_iter().for_each(|line| {
-                    let trimmed = line.trim_end();
-                    if trimmed.is_empty() {
-                        return;
-                    }
-
-                    let fields: Vec<&str> = trimmed.split('\t').collect();
-                    if fields.len() < 10 {
-                        return;
-                    }
-
-                    let read_id = fields[0].to_string();
-                    let contig_taxid = fields[9].parse::<Taxid>().ok();
-                    let read_taxid = fields[3].parse::<Taxid>().ok();
-
-                    map.insert(
-                        read_id,
-                        SpeciesAlignmentResults {
-                            contig: contig_taxid,
-                            read: read_taxid,
-                        },
-                    );
-                });
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        workers.push(handle);
-    }
-
-    // Producer (same lockstep style as all your other high-throughput stages)
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut stream = ReceiverStream::new(preload_rx);
-    while let Some(item) = stream.next().await {
-        if let ParseOutput::Bytes(b) = item {
-            let line = String::from_utf8_lossy(&b).trim_end().to_string();
-            if !line.is_empty() {
-                batch.push(line);
-            }
-        }
-        if batch.len() >= batch_size {
-            let _ = job_tx.send(std::mem::take(&mut batch)).await;
-        }
-    }
-    if !batch.is_empty() {
-        let _ = job_tx.send(batch).await;
-    }
-    drop(job_tx);
-
-    for h in workers {
-        h.await??;
-    }
-
-    info!(
-        "Preloaded {} NR alignments (parallel, {} workers)",
-        nr_alignment_per_read.len(),
-        concurrency
-    );
-    Ok(())
-}
 
 /// Resolve the production MMseqs database path once and reuse it everywhere.
 fn resolve_mmseqs_db_path(config: &RunConfig) -> Result<PathBuf, PipelineError> {
@@ -6974,7 +6802,7 @@ async fn mmseqs_non_host_align(
         4,
         true,
     )
-    .await?;
+        .await?;
 
     let combined_fastq = temp_dir.path().join("mmseqs_non_host_combined.fastq");
 
@@ -6987,7 +6815,30 @@ async fn mmseqs_non_host_align(
         "nr_merged",
         backend,
     )
-    .await?;
+        .await?;
+
+    // Hard fail before streaming if convertalis produced nothing.
+    let meta = fs::metadata(&merged_m8).await.map_err(|e| {
+        PipelineError::IOError(format!(
+            "mmseqs m8 metadata failed for {}: {}",
+            merged_m8.display(),
+            e
+        ))
+    })?;
+
+    let m8_size = meta.len();
+    info!(
+        "[mmseqs NR] m8 file on disk: {} ({} bytes)",
+        merged_m8.display(),
+        m8_size
+    );
+
+    if m8_size == 0 {
+        return Err(PipelineError::Other(anyhow!(
+            "mmseqs produced an empty m8 file: {}",
+            merged_m8.display()
+        )));
+    }
 
     let m8_file = fs::File::open(&merged_m8)
         .await
@@ -6998,6 +6849,32 @@ async fn mmseqs_non_host_align(
         .map_err(|e| PipelineError::Other(e.into()))?;
 
     Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
+}
+async fn collect_m8_accession_map(
+    mut stream: ReceiverStream<ReducedRead>,
+) -> Result<AHashMap<String, String>> {
+    let mut map = AHashMap::with_capacity(1_000_000);
+    while let Some(pair) = stream.next().await {
+        let line = String::from_utf8_lossy(&pair.dedup);
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let Some(q) = fields.next() else { continue };
+        let Some(s) = fields.next() else { continue };
+        if !s.is_empty() && s != "-" {
+            // Prefer already-parsed accession when present
+            let acc = if !pair.accession.is_empty() {
+                pair.accession.as_str()
+            } else {
+                s
+            };
+            map.insert(q.to_string(), acc.to_string());
+        }
+    }
+    info!("collect_m8_accession_map → {} entries", map.len());
+    Ok(map)
 }
 
 /// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
@@ -7065,7 +6942,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     })?;
 
     let (file1_path, file2_path, sample_base_buf, sample_base) =
-        validate_file_inputs(&config, &cwd).await?;
+        validate_file_inputs(&config, &cwd, true).await?;
     let paired = file2_path.is_some();
 
     debug!(
@@ -7307,7 +7184,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         human_hisat2_out_stream
     };
 
-    // let post_filter_monitored = monitor_stream(post_filter_stream, "Post_Hisat2", Duration::from_secs(5));
 
     let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
         post_filter_stream.into_inner(),
@@ -7516,10 +7392,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
 
-    let m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("m8"), "."));
+    let nt_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nt.m8"), "."));
 
     let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) =
-        paf_to_m8(config.clone(), non_host_mm2_out_stream, m8_file_path).await?;
+        paf_to_m8(config.clone(), non_host_mm2_out_stream, nt_m8_file_path).await?;
     cleanup_tasks.append(&mut m8_cleanup_tasks);
 
     // ────────────────────────────────────────────────────────────────
@@ -7548,14 +7424,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("call hits nt concurrency {}", nt_concurrency);
 
     let nt_call_hits_start = Instant::now();
-    let (
-        nt_call_stream,
-        nt_call_summary_stream,
-        mut nt_call_cleanup_tasks,
-        mut nt_call_cleanup_receivers,
-    ) = call_hits_m8(
+    let (nt_pairs, mut nt_call_cleanup_tasks, mut nt_call_cleanup_receivers) = call_hits_m8(
         config.clone(),
-        m8_sorted, // ←←← NOW SORTED
+        m8_sorted, // sorted by read id
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -7564,161 +7435,81 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nt_concurrency,
         "nt".to_string(),
     )
-    .await?;
+        .await?;
     info!(
-        "[run] call_hits_m8(nt) returned after {:?}",
-        nt_call_hits_start.elapsed()
-    );
+    "[run] call_hits_m8(nt) returned after {:?}",
+    nt_call_hits_start.elapsed()
+);
 
     cleanup_tasks.append(&mut nt_call_cleanup_tasks);
+    cleanup_receivers.append(&mut nt_call_cleanup_receivers);
 
-    info!("[run] wrapping NT outputs with monitor_stream");
-
-    let nt_call_stream = monitor_stream(
-        nt_call_stream,
-        "nt_call_stream_from_call_hits_m8",
-        Duration::from_secs(10),
-    );
-
-    let nt_call_summary_stream = monitor_stream(
-        nt_call_summary_stream,
-        "nt_call_summary_stream_from_call_hits_m8",
-        Duration::from_secs(10),
-    );
-
+    // One fanout of paired hits — no separate m8 / summary graphs.
     let nt_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
+    info!("[run] fanout_to_channels(nt_pairs) ×5 ReducedRead");
 
-    let (nt_call_rxs, nt_call_done) = fanout_to_channels(
-        nt_call_stream, // already the monitored stream from call_hits_m8
-        2,              // generous buffer for m8 lines
-        "nt_call",
+    let (nt_pair_rxs, nt_pairs_done_rx) = fanout_to_channels(
+        nt_pairs,
+        5,
+        "nt_pairs",
         &config,
-        StreamDataType::JustBytes,
+        StreamDataType::JustBytes, // buffer-size hint only
     )
-    .await?;
+        .await?;
+    cleanup_receivers.push(nt_pairs_done_rx);
 
     info!(
-        "[run] fanout_to_channels(nt_call) ready after {:?} with 2 private channels",
-        nt_split_start.elapsed()
-    );
+    "[run] fanout_to_channels(nt_pairs) ready after {:?}",
+    nt_split_start.elapsed()
+);
 
-    let mut nt_call_rxs_iter = nt_call_rxs.into_iter();
-    let nt_call_stream =
-        ReceiverStream::new(nt_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nt_blast_stream =
-        ReceiverStream::new(nt_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-
-    let nt_call_stream = monitor_stream(
-        nt_call_stream,
-        "nt_call_stream_to_generate_taxon_counts",
-        Duration::from_secs(15),
-    );
-
-    let nt_blast_stream = monitor_stream(
-        nt_blast_stream,
-        "nt_blast_stream_to_blast_contigs",
-        Duration::from_secs(15),
-    );
-
-    let nt_summary_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NT summary (6 private channels)");
-
-    let (nt_summary_rxs, nt_summary_done_rx) = fanout_to_channels(
-        nt_call_summary_stream,
-        6,
-        "nt_call_summary",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await?;
-
-    info!(
-        "[run] fanout_to_channels(nt_call_summary) ready after {:?} with 6 private channels",
-        nt_summary_split_start.elapsed()
-    );
-
-    let mut nt_summary_rxs_iter = nt_summary_rxs.into_iter();
-    let nt_summary_taxon_stream = ReceiverStream::new(
-        nt_summary_rxs_iter
+    let mut nt_pair_rxs = nt_pair_rxs.into_iter();
+    let nt_pairs_taxon = ReceiverStream::new(
+        nt_pair_rxs
             .next()
             .ok_or(PipelineError::EmptyStream)?,
     );
-    let nt_summary_hit_stream = ReceiverStream::new(
-        nt_summary_rxs_iter
+    let nt_pairs_summarize = ReceiverStream::new(
+        nt_pair_rxs
             .next()
             .ok_or(PipelineError::EmptyStream)?,
     );
-    let nt_initial_stream = ReceiverStream::new(
-        nt_summary_rxs_iter
+    let nt_pairs_initial = ReceiverStream::new(
+        nt_pair_rxs
             .next()
             .ok_or(PipelineError::EmptyStream)?,
     );
-    let nt_blast_hit_stream = ReceiverStream::new(
-        nt_summary_rxs_iter
+    let nt_pairs_blast = ReceiverStream::new(
+        nt_pair_rxs
             .next()
             .ok_or(PipelineError::EmptyStream)?,
     );
-    let nt_hit_summary_for_refined = ReceiverStream::new(
-        nt_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-    let nt_hit_summary_for_taxid = ReceiverStream::new(
-        nt_summary_rxs_iter
+    let nt_pairs_taxid_initial = ReceiverStream::new(
+        nt_pair_rxs
             .next()
             .ok_or(PipelineError::EmptyStream)?,
     );
 
-    info!("[run] NT split wiring complete");
-    info!("[run] nt_summary_taxon_stream -> generate_taxon_counts");
-    info!("[run] nt_summary_hit_stream -> summarize_hits");
-    info!("[run] nt_initial_stream -> initial_taxid_fasta");
-    info!("[run] nt_blast_hit_stream -> blast_contigs");
-
-    let nt_summary_taxon_stream = monitor_stream(
-        nt_summary_taxon_stream,
-        "nt_summary_taxon_stream_to_generate_taxon_counts",
-        Duration::from_secs(10),
-    );
-
-    let nt_summary_hit_stream = monitor_stream(
-        nt_summary_hit_stream,
-        "nt_summary_hit_stream_to_summarize_hits",
-        Duration::from_secs(10),
-    );
-
-    let nt_initial_stream = monitor_stream(
-        nt_initial_stream,
-        "nt_initial_stream_to_initial_taxid_fasta",
-        Duration::from_secs(15),
-    );
-
-    let nt_blast_hit_stream = monitor_stream(
-        nt_blast_hit_stream,
-        "nt_blast_hit_stream_to_blast_contigs",
-        Duration::from_secs(15),
-    );
-
-    info!("Launching downstream consumers for NT results:");
-    info!("  -> nt_call_stream (to generate_taxon_counts + nt_map_task)");
-    info!("  -> nt_blast_stream (to blast_contigs later)");
-    info!("  -> nt_summary_hit_stream (to summarize_hits)");
-    info!("  -> nt_summary_taxon_stream (to generate_taxon_counts)");
+    info!("[run] NT pair wiring complete");
+    info!("[run] nt_pairs_taxon      -> generate_taxon_counts");
+    info!("[run] nt_pairs_summarize  -> summarize_hits");
+    info!("[run] nt_pairs_initial    -> collect_hit_summary / initial annotate maps");
+    info!("[run] nt_pairs_blast      -> blast_contigs");
+    info!("[run] nt_pairs_taxid      -> generate_taxid_fasta (experimental)");
 
     let nt_hit_summary_handle = tokio::spawn({
         let config = config.clone();
-        let nt_summary_hit_stream = nt_summary_hit_stream;
+        let nt_pairs_summarize = nt_pairs_summarize;
         let duplicate_clusters = duplicate_clusters.clone();
         async move {
             let start = Instant::now();
             info!("[run] summarize_hits(nt) started");
             let res =
-                summarize_hits(config.clone(), nt_summary_hit_stream, duplicate_clusters, 0).await;
+                summarize_hits(config.clone(), nt_pairs_summarize, duplicate_clusters, 0).await;
             info!(
-                "[run] summarize_hits(nt) finished after {:?}",
-                start.elapsed()
-            );
+            "[run] summarize_hits(nt) finished after {:?}",
+            start.elapsed()
+        );
             res
         }
     });
@@ -7727,28 +7518,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
-        let nt_call_stream = nt_call_stream;
-        let nt_summary_taxon_stream = nt_summary_taxon_stream;
+        let nt_pairs_taxon = nt_pairs_taxon;
         async move {
             let start = Instant::now();
             info!("[run] generate_taxon_counts(NT) started");
-            info!(
-                "[run] generate_taxon_counts(NT) awaiting nt_call_stream + nt_summary_taxon_stream"
-            );
             let res = generate_taxon_counts(
                 config,
-                nt_call_stream,
-                nt_summary_taxon_stream,
+                nt_pairs_taxon,
                 duplicate_clusters,
                 should_keep_filter,
                 "NT".to_string(),
                 None,
             )
-            .await;
+                .await;
             info!(
-                "[run] generate_taxon_counts(NT) finished after {:?}",
-                start.elapsed()
-            );
+            "[run] generate_taxon_counts(NT) finished after {:?}",
+            start.elapsed()
+        );
             res
         }
     });
@@ -7792,6 +7578,56 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut non_host_cleanup_receivers);
     final_temp_dirs.extend(non_host_align_temp_dirs);
 
+    let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
+        ReceiverStream::new(non_host_m8_stream),
+        2,
+        "nr_m8_stream",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+    cleanup_receivers.push(paf_to_m8_stream_done_rx);
+
+    let mut nr_m8_streams_it = nr_m8_streams.into_iter();
+    let nr_m8_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_m8_file_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
+
+    let nr_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nr.m8"), "."));
+
+    let write_task = write_byte_stream_to_file(
+        &nr_m8_file_path,
+        nr_m8_file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "nr_m8_file",
+        true
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    cleanup_tasks.push(write_task);
+
+
+
+    // ────────────────────────────────────────────────────────────────
+    // Sort NR m8 by read ID before call_hits_m8
+    // Guarantees consecutive lines per read → enables true streaming group-by
+    // ────────────────────────────────────────────────────────────────
+    let nr_sort_start = Instant::now();
+
+    let nr_m8_sorted = sort_m8_by_read_id(
+        config.clone(),
+        nr_m8_stream,
+        "nr",
+    )
+        .await?;
+
+    info!(
+        "[run] sort_m8_by_read_id(nr) completed after {:?}",
+        nr_sort_start.elapsed()
+    );
+
+
     let nr_concurrency = compute_phase_concurrency(
         &config,
         "call_hits_nr",
@@ -7803,25 +7639,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("call hits nr concurrency {}", nr_concurrency);
 
-    // ────────────────────────────────────────────────────────────────
-    // Sort NR m8 by read ID before call_hits_m8
-    // Guarantees consecutive lines per read → enables true streaming group-by
-    // ────────────────────────────────────────────────────────────────
-    let nr_sort_start = Instant::now();
-    let nr_m8_sorted = sort_m8_by_read_id(
-        config.clone(),
-        ReceiverStream::new(non_host_m8_stream),
-        "nr",
-    )
-    .await?;
-    info!(
-        "[run] sort_m8_by_read_id(nr) completed after {:?}",
-        nr_sort_start.elapsed()
-    );
-
+    let nr_call_hits_start = Instant::now();
     let (
-        nr_call_stream,
-        nr_call_summary_stream,
+        nr_pairs,
         mut nr_call_cleanup_tasks,
         mut nr_call_cleanup_receivers,
     ) = call_hits_m8(
@@ -7835,83 +7655,57 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nr_concurrency,
         "nr".to_string(),
     )
-    .await?;
+        .await?;
+    info!(
+    "[run] call_hits_m8(nr) returned after {:?}",
+    nr_call_hits_start.elapsed()
+);
+
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
+    // Single 5-way fanout of ReducedRead — pair stays together for every consumer
     let nr_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NT call m8 (2 private channels)");
+    info!("[run] starting fanout_to_channels for NR pairs (5 private channels)");
 
-    let (nr_call_rxs, nr_call_done) = fanout_to_channels(
-        nr_call_stream, // already the monitored stream from call_hits_m8
-        2,
-        "nr_call",
+    let (nr_pair_rxs, nr_pairs_done_rx) = fanout_to_channels(
+        nr_pairs,
+        5,
+        "nr_pairs",
         &config,
         StreamDataType::JustBytes,
     )
-    .await?;
+        .await?;
+    cleanup_receivers.push(nr_pairs_done_rx);
 
     info!(
-        "[run] fanout_to_channels(nr_call) ready after {:?} with 2 private channels",
-        nr_split_start.elapsed()
-    );
+    "[run] fanout_to_channels(nr_pairs) ready after {:?} with 5 private channels",
+    nr_split_start.elapsed()
+);
 
-    let mut nr_call_rxs_iter = nr_call_rxs.into_iter();
-    let nr_call_stream =
-        ReceiverStream::new(nr_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
-    let nr_blast_stream =
-        ReceiverStream::new(nr_call_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let mut nr_pair_rxs_iter = nr_pair_rxs.into_iter();
+    let nr_pairs_taxon =
+        ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_pairs_summarize =
+        ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_pairs_initial =
+        ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_pairs_blast =
+        ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_pairs_taxid_initial =
+        ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
 
-    let nr_summary_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NR summary (6 private channels)");
-    let (nr_summary_rxs, nr_summary_done_rx) = fanout_to_channels(
-        nr_call_summary_stream,
-        6,
-        "nr_call_summary",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await?;
+    info!("[run] NR pair wiring complete");
+    info!("[run] nr_pairs_taxon     -> generate_taxon_counts");
+    info!("[run] nr_pairs_summarize -> summarize_hits");
+    info!("[run] nr_pairs_initial   -> initial accession map");
+    info!("[run] nr_pairs_blast     -> blast_contigs");
+    info!("[run] nr_pairs_taxid     -> generate_taxid_fasta");
 
-    info!(
-        "[run] fanout_to_channels(nr_call_summary) ready after {:?} with 6 private channels",
-        nr_summary_split_start.elapsed()
-    );
-
-    let mut nr_summary_rxs_iter = nr_summary_rxs.into_iter();
-    let nr_summary_taxon_stream = ReceiverStream::new(
-        nr_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-    let nr_summary_hit_stream = ReceiverStream::new(
-        nr_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-    let nr_initial_stream = ReceiverStream::new(
-        nr_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-    let nr_blast_hit_stream = ReceiverStream::new(
-        nr_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-    let nr_hit_summary_for_refined = ReceiverStream::new(
-        nr_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-    let nr_hit_summary_for_taxid = ReceiverStream::new(
-        nr_summary_rxs_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(
         config.clone(),
-        nr_summary_hit_stream,
+        nr_pairs_summarize,
         duplicate_clusters.clone(),
         0,
     ));
@@ -7920,24 +7714,31 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
+        let nr_pairs_taxon = nr_pairs_taxon;
         async move {
-            generate_taxon_counts(
-                config,                  // RunConfig
-                nr_call_stream,          //m8_stream
-                nr_summary_taxon_stream, //summary_stream
-                duplicate_clusters,      //duplicate_clusters
-                should_keep_filter,      //should_keep_filter
-                "NR".to_string(),        // count_type
-                None, //source_count type, only relevantif/when i later implement the merged path (NT + NR together) pass Some("NT".to_string()) or Some("NR".to_string()) on the respective streams.
+            let start = Instant::now();
+            info!("[run] generate_taxon_counts(NR) started");
+            let res = generate_taxon_counts(
+                config,
+                nr_pairs_taxon,
+                duplicate_clusters,
+                should_keep_filter,
+                "NR".to_string(),
+                None,
             )
-            .await
+                .await;
+            info!(
+        "[run] generate_taxon_counts(NR) finished after {:?}",
+        start.elapsed()
+    );
+            res
         }
     });
 
     let annot_concurrency =
         compute_phase_concurrency(&config, "generate_annotated_fasta", 0.4, 4.0, 128, 8);
 
-    // Read non-host R1/R2 as proper parsed Fastq records (this fixes the Non-FASTQ error)
+    // Read non-host R1/R2 as proper parsed Fastq records
     let (interleaved_rx, read_stats_task) = read_fastq(
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
@@ -7965,9 +7766,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Build the small accession maps for NT/NR in parallel
     let (nt_map, nr_map) = tokio::try_join!(
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nt_initial_stream),
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nr_initial_stream)
-    )?;
+    collect_hit_summary_to_accession_map_concurrent(config.clone(), nt_pairs_initial),
+    collect_hit_summary_to_accession_map_concurrent(config.clone(), nr_pairs_initial)
+)?;
 
     // Generate the annotated FASTA stream
     let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) =
@@ -7975,12 +7776,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             config.clone(),
             interleaved_stream,
             duplicate_clusters.clone(),
-            nt_map, // small contig → NT accession map
-            nr_map, // small contig → NR accession map
+            nt_map,
+            nr_map,
             annot_concurrency,
         )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
 
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
@@ -8027,22 +7828,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
-    // Add monitors so you can actually see progress (no more 30-minute silences)
-    let initial_annotated_file_stream = monitor_stream(
-        ReceiverStream::new(initial_annotated_file_stream),
-        "initial_annotated_file_stream_to_write",
-        Duration::from_secs(15),
-    );
-
-    let initial_unidentified_file_stream = monitor_stream(
-        ReceiverStream::new(initial_unidentified_file_stream),
-        "initial_unidentified_file_stream_to_write",
-        Duration::from_secs(15),
-    );
+    // Part of Experimental phase but starting this as early as possible to avvoid stalling the fanout
+    let experimental_taxid_handle = tokio::spawn({
+        let config = config.clone();
+        let lineage_map = lineage_map.clone();
+        let mapped = ReceiverStream::new(initial_annotated_taxon_stream);
+        let unid = ReceiverStream::new(initial_unidentified_taxon_stream);
+        let nt = nt_pairs_taxid_initial;
+        let nr = nr_pairs_taxid_initial;
+        async move {
+            generate_taxid_fasta(config, mapped, unid, nt, nr, lineage_map).await
+        }
+    });
 
     // Write tasks are now eager consumers → EOF propagates instantly
     cleanup_tasks.push(write_fasta_stream_to_file(
-        initial_annotated_file_stream,
+        ReceiverStream::new(initial_annotated_file_stream),
         annotated_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -8050,7 +7851,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ));
 
     cleanup_tasks.push(write_fasta_stream_to_file(
-        initial_unidentified_file_stream,
+        ReceiverStream::new(initial_unidentified_file_stream),
         unidentified_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -8108,7 +7909,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
     .await
     .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
-    eprintln!("coverage result {:?}", generate_assembly_coverage_result);
 
     for rx in post_assembly_cleanup_receivers {
         rx.await??;
@@ -8282,10 +8082,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let (_combined_path, write_json_task) = combine_taxon_counts(
             &nt_counts_for_combine,
             &nr_counts_for_combine,
+            &[], // no merged yet
             combined_path,
         )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
 
         write_json_task.await.map_err(|e| {
             PipelineError::Other(anyhow!("combine_taxon_counts write task failed: {}", e))
@@ -8294,13 +8095,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(combine_handle);
 
+
+
     let nt_blast_concurrency = compute_phase_concurrency(
         &config,
         "nt_blast_contigs",
-        2.0, // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
-        5.0, // strong CPU-bound phase (alignment + scoring)
-        128, // high cap — BLAST scales decently to 128 on EPYC
-        8,   // min — still want parallelism on MacBook Air
+        2.0,
+        5.0,
+        128,
+        8,
     );
     info!("NT blast_contigs concurrency: {}", nt_blast_concurrency);
 
@@ -8311,17 +8114,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
+        let nt_pairs_blast = nt_pairs_blast;
+        let sample_base = sample_base.clone();
 
         async move {
             blast_contigs(
                 config,
                 NT_TAG,
-                nt_blast_stream.into(),
-                nt_blast_hit_stream,
+                &sample_base,
+                nt_pairs_blast,
                 nt_read_dict.clone(),
                 nt_accession_dict,
                 nt_counts,
-                &contigs_fasta_path.clone(),
+                &contigs_fasta_path,
                 read2contig,
                 &nt_ref_fasta_path,
                 duplicate_clusters,
@@ -8330,17 +8135,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 4,
                 nt_blast_concurrency,
             )
-            .await
+                .await
         }
     });
 
     let nr_blast_concurrency = compute_phase_concurrency(
         &config,
         "nr_blast_contigs",
-        2.0, // ~2 GB per thread — BLAST can be very memory-hungry (index + large queries)
-        5.0, // strong CPU-bound phase (alignment + scoring)
-        128, // high cap — BLAST scales decently to 128 on EPYC
-        8,   // min — still want parallelism on MacBook Air
+        2.0,
+        5.0,
+        128,
+        8,
     );
     info!("NR blast_contigs concurrency: {}", nr_blast_concurrency);
 
@@ -8351,17 +8156,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
         let read2contig = assembly_outputs.read2contig.clone();
+        let nr_pairs_blast = nr_pairs_blast;
+        let sample_base = sample_base.clone();
 
         async move {
             blast_contigs(
                 config,
                 NR_TAG,
-                nr_blast_stream,
-                nr_blast_hit_stream,
+                &sample_base,
+                nr_pairs_blast,
                 nr_read_dict.clone(),
                 nr_accession_dict,
                 nr_counts,
-                &contigs_fasta_path.clone(),
+                &contigs_fasta_path,
                 read2contig,
                 &nr_ref_fasta_path,
                 duplicate_clusters,
@@ -8370,10 +8177,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 4,
                 nr_blast_concurrency,
             )
-            .await
+                .await
         }
     });
 
+    // ── NT post: fanout refined ReducedRead pairs ─────────────────────────────
+    // Branches:
+    //   merge     → compute_merged_taxon_counts
+    //   map       → collect_m8_accession_map (use pair.dedup)
+    //   viz       → coverage viz m8 side (use pair.dedup)
+    //   taxid     → generate_taxid_fasta (use pair.summary)
+    //   coverage  → coverage viz hitsummary (use pair.summary)
     let nt_post_handle = tokio::spawn({
         let config = config.clone();
         async move {
@@ -8385,8 +8199,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nt_read_dict,
                 nt_refined_counts,
                 nt_contig_summary,
-                nt_refined_m8_stream_out,
-                nt_refined_hit_summary_stream_out,
+                nt_refined_pairs_out,
                 nt_refined_m8_top_stream_out,
                 nt_cleanup_tasks,
                 nt_cleanup_receivers,
@@ -8397,52 +8210,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut cleanup_receivers = nt_cleanup_receivers;
             let temp_files = nt_temp_files;
 
-            let (nt_m8_rxs, nt_m8_done_rx) = fanout_to_channels(
-                ReceiverStream::new(nt_refined_m8_stream_out),
-                3,
-                "nt_m8",
+            let (nt_pair_rxs, nt_pairs_done_rx) = fanout_to_channels(
+                ReceiverStream::new(nt_refined_pairs_out),
+                5,
+                "nt_refined_pairs",
                 &config,
                 StreamDataType::JustBytes,
             )
-            .await?;
-            cleanup_receivers.push(nt_m8_done_rx);
+                .await?;
+            cleanup_receivers.push(nt_pairs_done_rx);
 
-            let mut nt_m8_iter = nt_m8_rxs.into_iter();
-            let nt_m8_merge = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_m8_map = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nt_m8_viz = nt_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-            let (nt_hitsummary_rxs, nt_hitsummary_done_rx) = fanout_to_channels(
-                ReceiverStream::new(nt_refined_hit_summary_stream_out),
-                3,
-                "nt_hitsummary",
-                &config,
-                StreamDataType::JustBytes,
-            )
-            .await?;
-            cleanup_receivers.push(nt_hitsummary_done_rx);
-
-            let mut nt_hitsummary_iter = nt_hitsummary_rxs.into_iter();
-            let nt_hit_summary_merge = nt_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
-            let nt_hit_summary_taxid = nt_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
-            let nt_hit_summary_coverage = nt_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
+            let mut it = nt_pair_rxs.into_iter();
+            let nt_pairs_merge = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+            let nt_pairs_map = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+            let nt_pairs_viz = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+            let nt_pairs_taxid_refined = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+            let nt_pairs_coverage =
+                ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
 
             Ok::<_, PipelineError>((
                 nt_read_dict,
                 nt_refined_counts,
                 nt_contig_summary,
-                nt_m8_merge,
-                nt_m8_map,
-                nt_m8_viz,
-                nt_hit_summary_merge,
-                nt_hit_summary_taxid,
-                nt_hit_summary_coverage,
+                nt_pairs_merge,
+                nt_pairs_map,
+                nt_pairs_viz,
+                nt_pairs_taxid_refined,
+                nt_pairs_coverage,
                 nt_refined_m8_top_stream_out,
                 cleanup_tasks,
                 cleanup_receivers,
@@ -8451,10 +8245,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
-    // Both branches of nt_call fanout and nr_call fanout are done
-    nt_call_done.await??;
-    nr_call_done.await??;
-
+    // ── NR post: fanout refined ReducedRead pairs ─────────────────────────────
+    // Branches:
+    //   merge → compute_merged_taxon_counts
+    //   map   → collect_m8_accession_map (pair.dedup)
+    //   taxid → generate_taxid_fasta (pair.summary)
+    // top m8 is unused on NR — drain so the unbounded sender cannot stall
     let nr_post_handle = tokio::spawn({
         let config = config.clone();
         async move {
@@ -8466,9 +8262,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nr_read_dict,
                 nr_refined_counts,
                 nr_contig_summary,
-                nr_refined_m8_stream_out,
-                nr_refined_hit_summary_stream_out,
-                _nr_refined_m8_top_stream_out,
+                nr_refined_pairs_out,
+                nr_refined_m8_top_stream_out,
                 nr_cleanup_tasks,
                 nr_cleanup_receivers,
                 nr_temp_files,
@@ -8478,50 +8273,37 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut cleanup_receivers = nr_cleanup_receivers;
             let temp_files = nr_temp_files;
 
-            let (nr_m8_rxs, nr_m8_done_rx) = fanout_to_channels(
-                ReceiverStream::new(nr_refined_m8_stream_out),
-                2,
-                "nr_m8",
-                &config,
-                StreamDataType::JustBytes,
-            )
-            .await?;
-            cleanup_receivers.push(nr_m8_done_rx);
+            tokio::spawn(async move {
+                let mut rx = UnboundedReceiverStream::new(nr_refined_m8_top_stream_out);
+                let mut n = 0u64;
+                while rx.next().await.is_some() {
+                    n += 1;
+                }
+                info!("[nr] drained {} top m8 lines (unused)", n);
+            });
 
-            let mut nr_m8_iter = nr_m8_rxs.into_iter();
-            let nr_m8_merge = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
-            let nr_m8_map = nr_m8_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-            let (nr_hitsummary_rxs, nr_hitsummary_done_rx) = fanout_to_channels(
-                ReceiverStream::new(nr_refined_hit_summary_stream_out),
+            let (nr_pair_rxs, nr_pairs_done_rx) = fanout_to_channels(
+                ReceiverStream::new(nr_refined_pairs_out),
                 3,
-                "nr_hitsummary",
+                "nr_refined_pairs",
                 &config,
                 StreamDataType::JustBytes,
             )
-            .await?;
-            cleanup_receivers.push(nr_hitsummary_done_rx);
+                .await?;
+            cleanup_receivers.push(nr_pairs_done_rx);
 
-            let mut nr_hitsummary_iter = nr_hitsummary_rxs.into_iter();
-            let nr_hit_summary_merge = nr_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_preload = nr_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
-            let nr_hit_summary_taxid = nr_hitsummary_iter
-                .next()
-                .ok_or(PipelineError::EmptyStream)?;
+            let mut it = nr_pair_rxs.into_iter();
+            let nr_pairs_merge = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+            let nr_pairs_map = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
+            let nr_pairs_taxid_refined = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
 
             Ok::<_, PipelineError>((
                 nr_read_dict,
                 nr_refined_counts,
                 nr_contig_summary,
-                nr_m8_merge,
-                nr_m8_map,
-                nr_hit_summary_merge,
-                nr_hit_summary_preload,
-                nr_hit_summary_taxid,
+                nr_pairs_merge,
+                nr_pairs_map,
+                nr_pairs_taxid_refined,
                 cleanup_tasks,
                 cleanup_receivers,
                 temp_files,
@@ -8538,41 +8320,41 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         PipelineError::Other(anyhow!("NR blast_contigs postprocess task panicked: {e}"))
     })??;
 
+
     let (
         _nt_read_dict,
         nt_refined_counts,
         nt_contig_summary,
-        nt_m8_merge,
-        _nt_m8_map,
-        nt_m8_viz,
-        nt_hit_summary_merge,
-        nt_hit_summary_taxid,
-        nt_hit_summary_coverage,
+        nt_pairs_merge,
+        nt_pairs_map,
+        nt_pairs_viz,
+        nt_pairs_taxid_refined,
+        nt_pairs_coverage,
         nt_refined_m8_top_stream_out,
         nt_cleanup_tasks,
         nt_cleanup_receivers,
-        nt_temp_files,
+        nt_blast_temp_dir,
     ) = nt_post_res;
     cleanup_tasks.extend(nt_cleanup_tasks);
-    temp_files.extend(nt_temp_files);
+    if let Some(td) = nt_blast_temp_dir {
+        final_temp_dirs.push(td);
+    }
 
     let (
         _nr_read_dict,
         nr_refined_counts,
         nr_contig_summary,
-        nr_m8_merge,
-        _nr_m8_map,
-        nr_hit_summary_merge,
-        nr_hit_summary_preload,
-        nr_hit_summary_taxid,
+        nr_pairs_merge,
+        nr_pairs_map,
+        nr_pairs_taxid_refined,
         nr_cleanup_tasks,
         nr_cleanup_receivers,
-        nr_temp_files,
+        nr_blast_temp_dir,
     ) = nr_post_res;
     cleanup_tasks.extend(nr_cleanup_tasks);
-    temp_files.extend(nr_temp_files);
-
-    // or is nt_blast_stream done here?
+    if let Some(td) = nr_blast_temp_dir {
+        final_temp_dirs.push(td);
+    }
 
     for rx in nt_cleanup_receivers {
         rx.await??;
@@ -8581,13 +8363,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         rx.await??;
     }
 
-    // 2. Now safe to await the big summary fanout
-    //    (because blast_hit branch has finished)
-    nt_summary_done_rx.await??;
-    nr_summary_done_rx.await??;
-
-    // 3. Now safe to await call_hits_m8 internal fanouts
-    //    (their outputs were consumed by nt_call + nt_call_summary fanouts)
     for rx in nt_call_cleanup_receivers {
         rx.await??;
     }
@@ -8595,48 +8370,37 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         rx.await??;
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // PRELOAD NR alignments (parallel version)
-    // ────────────────────────────────────────────────────────────────
-    let nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>> =
-        Arc::new(DashMap::with_capacity_and_hasher(
-            80_000_000,
-            AHashRandomState::new(),
-        ));
-
-    let preload_handle = tokio::spawn(preload_nr_alignments_parallel(
+    // Merge on refined pairs (m8 + hit summary stay locked in ReducedRead)
+    let merged_fut = compute_merged_taxon_counts(
         config.clone(),
-        nr_hit_summary_preload,
-        Arc::clone(&nr_alignment_per_read),
-    ));
-
-    // ────────────────────────────────────────────────────────────────
-    // Spawn merged taxon counts (unchanged except we await preload first)
-    // ────────────────────────────────────────────────────────────────
-    let merged_cleanup_tasks = compute_merged_taxon_counts(
-        config.clone(),
-        nt_m8_merge,
-        nt_hit_summary_merge,
+        nt_pairs_merge,
         nt_contig_summary,
-        nr_m8_merge,
-        nr_hit_summary_merge,
+        nr_pairs_merge,
         nr_contig_summary,
         lineage_map.clone(),
         should_keep_filter.clone(),
         duplicate_clusters.clone(),
         out_dir.join("refined.m8"),
         out_dir.join("refined.hitsummary.tab"),
-        out_dir.join("refined_taxon_counts_with_dcr.json"),
+        out_dir.join("merged_taxon_counts_with_dcr.json"),
         out_dir.join("assembly_combined_contig_summary.json"),
-        nr_alignment_per_read,
-    )
-    .await?;
-    cleanup_tasks.extend(merged_cleanup_tasks);
+    );
 
-    // Wait for preload before proceeding (keeps exact ordering semantics from Python)
-    let _ = preload_handle
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("NR preload task panicked: {}", e)))??;
+    let ((merged_taxon_counts, merged_cleanup_tasks), nt_refined_map, nr_refined_map) =
+        tokio::try_join!(
+        merged_fut,
+        async {
+            collect_m8_accession_map(nt_pairs_map)
+                .await
+                .map_err(PipelineError::Other)
+        },
+        async {
+            collect_m8_accession_map(nr_pairs_map)
+                .await
+                .map_err(PipelineError::Other)
+        },
+    )?;
+    cleanup_tasks.extend(merged_cleanup_tasks);
 
     let refined_combined_path = out_dir.join(rename_file_path(
         &sample_base_buf,
@@ -8644,82 +8408,86 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Some("refined_taxon_counts_with_dcr.json"),
         "_",
     ));
-    let (_refined_combined_path, refined_write_json_task) = combine_taxon_counts(
+    let (_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
         &nr_refined_counts,
+        &merged_taxon_counts,
         refined_combined_path,
     )
-    .await
-    .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {}", e)))?;
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("combine_taxon_counts failed: {e}")))?;
     cleanup_tasks.push(refined_write_json_task);
-
-    // ────────────────────────────────────────────────────────────────
-    // NEW: Build tiny contig-level maps for the REFINED path
-    // ────────────────────────────────────────────────────────────────
-    let (nt_refined_map, nr_refined_map) = tokio::try_join!(
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nt_hit_summary_for_refined),
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nr_hit_summary_for_refined)
-    )?;
-
-    // Contig FASTA stream (from assembly)
-    // ───────────────────────────────────────────────────────────────
-    let contigs_fasta = assembly_outputs.contigs_fasta.clone();
-    let contigs_file = tokio::fs::File::open(&contigs_fasta)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to open contigs.fasta: {}", e)))?;
-
-    let contigs_rx = parse_bytes::<TokioFile>(contigs_file, &config, StreamDataType::JustBytes)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("parse_bytes failed: {}", e)))?;
-
-    let contigs_stream = ReceiverStream::new(contigs_rx);
-
-    // Empty cluster stream (contigs have no duplicates)
-    let (_cluster_tx, _cluster_rx) = mpsc::channel::<ParseOutput>(1);
-    drop(_cluster_tx);
 
     let assembly_dir = out_dir.join("assembly");
     tokio::fs::create_dir_all(&assembly_dir)
         .await
         .map_err(|e| PipelineError::Other(anyhow!("Failed to create assembly dir: {}", e)))?;
 
-    let nr_annot_concurrency =
-        compute_phase_concurrency(&config, "nr_annot_concurrency", 0.4, 4.0, 128, 8);
+    // Non-host READS (WDL host_filter), not contigs
+    let nonhost_path = out_dir.join("nonhost_R1.fastq");
+    let nonhost_file = tokio::fs::File::open(&nonhost_path)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!("Failed to open nonhost_R1.fastq: {}", e))
+        })?;
+
+    let nonhost_rx = parse_bytes::<TokioFile>(nonhost_file, &config, StreamDataType::JustBytes)
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("parse_bytes nonhost failed: {}", e)))?;
+
+    let nonhost_stream = ReceiverStream::new(nonhost_rx);
+
+    let annot_concurrency =
+        compute_phase_concurrency(&config, "refined_annotate", 0.4, 4.0, 128, 8);
 
     let (
         mapped_contigs_rx,
         unidentified_contigs_rx,
-        _unique_unidentified_rx,
+        unique_unidentified_rx,
         mut annot_tasks,
         mut annot_rxs,
     ) = generate_annotated_fasta_stream(
         config.clone(),
-        contigs_stream,
+        nonhost_stream,
         duplicate_clusters.clone(),
-        nt_refined_map, // tiny contig → NT accession
-        nr_refined_map, // tiny contig → NR accession
-        nr_annot_concurrency,
+        nt_refined_map,
+        nr_refined_map,
+        annot_concurrency,
     )
-    .await
-    .map_err(|e| PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e)))?;
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e))
+        })?;
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
 
+    let unique_path = assembly_dir.join("unique_refined_unidentified.fa");
+    let unique_write = write_fasta_stream_to_file(
+        ReceiverStream::new(unique_unidentified_rx),
+        unique_path,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "unique_refined_unidentified",
+    );
+    cleanup_tasks.push(unique_write);
+
+    // Hit maps from refined pairs (summary side only). Already ReceiverStream<ReducedRead>.
     let (taxid_mapped_rx, taxid_combined_rx, load_nt_task, load_nr_task, taxid_main_task) =
         generate_taxid_fasta(
             config.clone(),
             ReceiverStream::new(mapped_contigs_rx),
             ReceiverStream::new(unidentified_contigs_rx),
-            ReceiverStream::new(nt_hit_summary_taxid),
-            ReceiverStream::new(nr_hit_summary_taxid),
+            nt_pairs_taxid_refined,
+            nr_pairs_taxid_refined,
             lineage_map.clone(),
         )
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
 
     cleanup_tasks.push(load_nt_task);
     cleanup_tasks.push(load_nr_task);
     cleanup_tasks.push(taxid_main_task);
+
 
     let (taxid_mapped_rxs, taxid_mapped_done_rx) = fanout_to_channels(
         ReceiverStream::new(taxid_mapped_rx),
@@ -8779,18 +8547,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         initial_load_nt_task,
         initial_load_nr_task,
         initial_taxid_main_task,
-    ) = generate_taxid_fasta(
-        config.clone(),
-        ReceiverStream::new(initial_annotated_taxon_stream),
-        ReceiverStream::new(initial_unidentified_taxon_stream),
-        nt_hit_summary_for_taxid,
-        nr_hit_summary_for_taxid,
-        lineage_map.clone(),
-    )
-    .await
-    .map_err(|e| {
-        PipelineError::Other(anyhow!("Experimental generate_taxid_fasta failed: {}", e))
-    })?;
+    ) = experimental_taxid_handle
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Experimental generate_taxid_fasta task panicked: {e}"
+        ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Experimental generate_taxid_fasta failed: {e}"
+        ))
+        })?;
 
     cleanup_tasks.push(initial_load_nt_task);
     cleanup_tasks.push(initial_load_nr_task);
@@ -8840,20 +8608,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
-    // Add monitors so we finally see progress logs again
-    let initial_taxid_mapped_file = monitor_stream(
-        ReceiverStream::new(initial_taxid_mapped_file),
-        "initial_taxid_mapped_file_to_write",
-        Duration::from_secs(15),
-    );
-    let initial_taxid_combined_file = monitor_stream(
-        ReceiverStream::new(initial_taxid_combined_file),
-        "initial_taxid_combined_file_to_write",
-        Duration::from_secs(15),
-    );
-
     let initial_write_mapped_handle = write_fasta_stream_to_file(
-        initial_taxid_mapped_file, // Clone rx if needed for logging
+        ReceiverStream::new(initial_taxid_mapped_file), // Clone rx if needed for logging
         initial_mapped_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -8862,7 +8618,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(initial_write_mapped_handle);
 
     let initial_write_combined_handle = write_fasta_stream_to_file(
-        initial_taxid_combined_file,
+        ReceiverStream::new(initial_taxid_combined_file),
         initial_combined_path.clone(),
         config.clone(),
         StreamDataType::JustBytes,
@@ -8941,13 +8697,52 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir_for_viz = out_dir.clone();
     let coverage_task = if !skip_coverage_viz {
         info!("All coverage viz inputs present — spawning visualization task");
+
+        // Hit summary bytes from pairs (7-col / optional contig cols)
+        let hit_for_viz = {
+            let mut pairs = nt_pairs_coverage;
+            let (tx, rx) = mpsc::channel(65_536);
+            tokio::spawn(async move {
+
+                while let Some(p) = pairs.next().await {
+                    if tx
+                        .send(ParseOutput::Bytes(Bytes::from(p.summary)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            rx
+        };
+
+        // Refined dedup m8 bytes from pairs
+        let m8_for_viz = {
+            let mut pairs = nt_pairs_viz;
+            let (tx, rx) = mpsc::channel(65_536);
+            tokio::spawn(async move {
+                while let Some(p) = pairs.next().await {
+                    if tx
+                        .send(ParseOutput::Bytes(Bytes::from(p.dedup)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            rx
+        };
+
         Some(tokio::spawn(async move {
             generate_coverage_viz(
-                ReceiverStream::new(nt_hit_summary_coverage),
-                ReceiverStream::new(nt_refined_m8_top_stream_out),
+                ReceiverStream::new(hit_for_viz),
+                UnboundedReceiverStream::new(nt_refined_m8_top_stream_out), // pure contig top m8
                 coverage_json_path,
                 assembly_outputs.contig_stats_json,
-                ReceiverStream::new(nt_m8_viz),
+                assembly_outputs.contigs_fasta,
+                ReceiverStream::new(m8_for_viz),
                 nt_info_db_path,
                 out_dir_for_viz,
                 Some(MAX_NUM_BINS_COVERAGE),
@@ -8955,9 +8750,18 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 Some(MIN_CONTIG_SIZE),
                 false,
             )
-            .await
+                .await
         }))
     } else {
+        // Must still drain so fanout does not stall
+        tokio::spawn(async move {
+            let mut a = nt_pairs_coverage;
+            let mut b = nt_pairs_viz;
+            let mut c = UnboundedReceiverStream::new(nt_refined_m8_top_stream_out);
+            while a.next().await.is_some() {}
+            while b.next().await.is_some() {}
+            while c.next().await.is_some() {}
+        });
         warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
         None
     };

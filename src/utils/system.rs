@@ -745,71 +745,62 @@ pub fn detect_simd_level() -> SimdLevel {
     }
 }
 
-/// Configures Transparent Huge Pages (THP) safely for large EPYC nodes.
+
+/// Reports the current Transparent Huge Pages (THP) configuration.
 ///
-/// We deliberately use `madvise` instead of `always`. Forcing `always` globally
-/// interacts very badly with GNU sort (when using large `-S` buffers) and some
-/// other tools, causing severe memory fragmentation and massive slowdowns on
-/// machines with ≥ 512 GiB RAM.
-///
-/// `madvise` is the safe default: it lets the application (and libraries) opt
-/// into huge pages where it actually helps (large allocations, mmseqs, etc.)
-/// without punishing tools like `sort`, `samtools sort`, etc.
+/// This function only *reads* the kernel settings. It never attempts to
+/// modify them. THP should be configured at instance boot time (user-data,
+/// systemd, cloud-init, etc.) because the pipeline almost never runs as root.
 pub async fn ensure_transparent_hugepages(config: &RunConfig) -> Result<()> {
     if !cfg!(target_os = "linux") || config.max_cores < 64 {
-        debug!("THP configuration skipped (not a large Linux node)");
+        debug!("THP status check skipped (not a large Linux node)");
         return Ok(());
     }
 
-    info!("Configuring Transparent Huge Pages for large linux node...");
+    info!("Transparent Huge Pages status for large Linux nodes:");
 
     let paths = [
-        "/sys/kernel/mm/transparent_hugepage/enabled",
-        "/sys/kernel/mm/transparent_hugepage/shmem_enabled",
-        "/sys/kernel/mm/transparent_hugepage/defrag",
+        ("enabled", "/sys/kernel/mm/transparent_hugepage/enabled"),
+        ("defrag",  "/sys/kernel/mm/transparent_hugepage/defrag"),
+        ("shmem",   "/sys/kernel/mm/transparent_hugepage/shmem_enabled"),
     ];
 
-    for path in &paths {
-        let current = match tokio::fs::read_to_string(path).await {
-            Ok(s) => s.trim().to_string(),
-            Err(e) => {
-                debug!("Could not read {}: {}", path, e);
-                continue;
-            }
-        };
+    let mut enabled_ok = false;
+    let mut defrag_ok = false;
 
-        // Choose best supported value
-        let target = if path.ends_with("/defrag") {
-            // Prefer defer+madvise on modern kernels, fall back to madvise
-            if current.contains("[defer+madvise]") {
-                continue; // already optimal
-            }
-            "defer+madvise"
-        } else {
-            if current.contains("[madvise]") {
-                continue;
-            }
-            "madvise"
-        };
+    for (name, path) in &paths {
+        match tokio::fs::read_to_string(path).await {
+            Ok(raw) => {
+                let value = raw.trim();
+                info!("  {}: {}", name, value);
 
-        match tokio::fs::write(path, target).await {
-            Ok(_) => info!("Set {} → {}", path, target),
-            Err(e) => {
-                if path.ends_with("/defrag") && target == "defer+madvise" {
-                    // Fallback for older kernels
-                    warn!("defer+madvise not supported on this kernel, falling back to madvise");
-                    if let Err(e2) = tokio::fs::write(path, "madvise").await {
-                        warn!("Failed to set {} to madvise: {}", path, e2);
-                    } else {
-                        info!("Set {} → madvise (fallback)", path);
-                    }
-                } else {
-                    warn!("Failed to set {} to '{}': {}", path, target, e);
+                // Track whether the important settings look good
+                if *name == "enabled" && value.contains("[madvise]") {
+                    enabled_ok = true;
                 }
+                if *name == "defrag"
+                    && (value.contains("[defer+madvise]") || value.contains("[madvise]"))
+                {
+                    defrag_ok = true;
+                }
+            }
+            Err(e) => {
+                debug!("  {}: could not read ({})", name, e);
             }
         }
     }
 
-    info!("THP configuration complete (mode: madvise + safe defrag)");
+    if enabled_ok && defrag_ok {
+        info!("THP settings look good for this workload (madvise + safe defrag).");
+    } else if enabled_ok {
+        info!("THP enabled=madvise (good). Defrag setting is not optimal but acceptable.");
+    } else {
+        warn!(
+            "THP is not in the recommended 'madvise' mode. \
+             For best performance on large-memory nodes, configure \
+             enabled=madvise and defrag=defer+madvise at boot time."
+        );
+    }
+
     Ok(())
 }

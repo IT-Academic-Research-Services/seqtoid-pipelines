@@ -80,7 +80,7 @@ pub fn resolve_optional_path(cli: &Option<String>, base_dir: &Path) -> Result<Op
                 return Err(anyhow!("File not found: {}", abs.display()));
             }
             if !abs.is_file() {
-                return Err(anyhow!("Not a file: {}", abs.display()));
+                return Err(anyhow!("resolve_optional_path: Not a file: {}", abs.display()));
             }
             Ok(Some(abs))
         }
@@ -565,15 +565,21 @@ pub async fn write_parse_output_to_file(
     Ok(task)
 }
 
-pub fn resolve_existing_input_path(input: &str, cwd: &Path) -> Result<PathBuf, PipelineError> {
+/// Resolve an input path that must exist.
+/// When `require_file` is true the path must also be a regular file.
+pub fn resolve_existing_input_path(
+    input: &str,
+    cwd: &Path,
+    require_file: bool,
+) -> Result<PathBuf, PipelineError> {
     let resolved = resolve_to_absolute(input, cwd);
 
     if !resolved.exists() {
         return Err(PipelineError::FileNotFound(resolved));
     }
-    if !resolved.is_file() {
+    if require_file && !resolved.is_file() {
         return Err(PipelineError::InvalidConfig(format!(
-            "Not a file: {}",
+            "resolve_existing_input_path: Not a file: {}",
             resolved.display()
         )));
     }
@@ -647,9 +653,11 @@ pub fn derive_sample_base_from_file1(file1_path: &Path) -> Result<PathBuf, Pipel
 pub async fn validate_file_inputs(
     config: &RunConfig,
     cwd: &PathBuf,
+    require_file: bool,
 ) -> Result<(PathBuf, Option<PathBuf>, PathBuf, String), PipelineError> {
+    
     let file1_path = match &config.args.file1 {
-        Some(file) => resolve_existing_input_path(file, cwd)?,
+        Some(file) => resolve_existing_input_path(file, cwd, require_file)?,
         None => {
             return Err(PipelineError::InvalidConfig(
                 "File1 path required".to_string(),
@@ -659,7 +667,8 @@ pub async fn validate_file_inputs(
 
     let file2_path = match &config.args.file2 {
         Some(file) => {
-            let resolved = resolve_existing_input_path(file, cwd)?;
+            // paired-end always requires a real file
+            let resolved = resolve_existing_input_path(file, cwd, require_file)?;
             Some(resolved)
         }
         None => None,
@@ -696,10 +705,11 @@ pub async fn write_byte_stream_to_file(
     stream: ReceiverStream<ParseOutput>,
     config: Arc<RunConfig>,
     data_type: StreamDataType,
-    label: &str, // still &str here
+    label: &str,
+    append_newline: bool,         
 ) -> Result<JoinHandle<Result<()>>> {
     let dest_path_clone = dest_path.clone();
-    let label = label.to_string(); // ← clone to owned String
+    let label = label.to_string();
 
     let write_handle = tokio::spawn(async move {
         let file = TokioFile::create(&dest_path_clone)
@@ -714,9 +724,10 @@ pub async fn write_byte_stream_to_file(
         );
 
         let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
-
         let mut stream = stream;
         let mut batch: Vec<u8> = Vec::with_capacity(effective_buffer / 4);
+        let mut items: u64 = 0;
+        let mut bytes_written: u64 = 0;
 
         while let Some(item) = stream.next().await {
             let bytes = item
@@ -724,6 +735,12 @@ pub async fn write_byte_stream_to_file(
                 .map_err(|e| anyhow!("Failed to convert to bytes: {}", e))?;
 
             batch.extend_from_slice(&bytes);
+            if append_newline && bytes.last() != Some(&b'\n') {
+                batch.push(b'\n');
+            }
+
+            items += 1;
+            bytes_written += bytes.len() as u64 + if append_newline { 1 } else { 0 };
 
             if batch.len() >= effective_buffer / 4 {
                 writer
@@ -745,12 +762,13 @@ pub async fn write_byte_stream_to_file(
             .await
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
-        let final_size = writer.stream_position().await.unwrap_or(0);
         info!(
-            "{} written to {} ({} bytes, buffer {} MiB)",
+            "{} written to {} ({} items, {} bytes, append_newline={}, buffer {} MiB)",
             label,
             dest_path_clone.display(),
-            final_size,
+            items,
+            bytes_written,
+            append_newline,
             effective_buffer / (1024 * 1024)
         );
 

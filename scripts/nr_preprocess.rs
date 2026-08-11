@@ -2,21 +2,33 @@
 // High-performance, correct streaming FASTA preprocessor for MMseqs2 nr DB creation.
 // - Never silently drops data: every input record is processed and output (or explicitly handled).
 // - Validates amino acid sequences, fixes invalid chars to 'X' (logs examples).
-// - Sanitizes headers minimally to aid MMseqs identifier extraction (keeps original info).
+// - Aggressive header cleaning: keeps ONLY the first accession/ID.
+//   This is the most reliable form for MMseqs2 (avoids "Cannot extract identifier"
+//   and dbtype corruption caused by multi-accession NR headers).
 // - Large I/O buffers for speed on Epyc / high-core systems.
-// - Pure Rust, std only. Compile: rustc -O -C target-cpu=native nr_preprocess.rs -o nr_preprocess
+// - Pure Rust, std only.
+//
+// Compile:
+//   rustc -O -C target-cpu=native nr_preprocess.rs -o nr_preprocess
+//
 // Usage (stream style, no data loss):
 //   zcat /data/refs/nr.fa.gz | ./nr_preprocess > /scratch/nr_clean.fa
-//   or for uncompressed: cat /data/refs/nr.fa | ./nr_preprocess > /scratch/nr_clean.fa
-// Then: mmseqs createdb /scratch/nr_clean.fa /data/refs/nrDB --dbtype 1 --compressed 1 --threads 64 ...
-// Focus: correctness first, then speed. Reports exact counts at end.
+//   or:
+//   cat /data/refs/nr.fa | ./nr_preprocess > /scratch/nr_clean.fa
+//
+// Then:
+//   mmseqs createdb /scratch/nr_clean.fa /data/refs/nr_clean/nrcleanDB \
+//     --dbtype 1 --compressed 1 --threads 64 2>&1 | tee createdb.log
+//
+// Immediately verify type:
+//   od -An -t u4 /data/refs/nr_clean/nrcleanDB.dbtype
+//   (must print 1)
 
 use std::collections::HashSet;
 use std::env;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 
 fn main() -> io::Result<()> {
-    // For future CLI expansion, but stdin/stdout for true streaming pipeline
     let args: Vec<String> = env::args().collect();
     let mut input_name = "stdin".to_string();
     let mut output_name = "stdout".to_string();
@@ -30,6 +42,7 @@ fn main() -> io::Result<()> {
 
     eprintln!("nr_preprocess starting | input: {} | output: {}", input_name, output_name);
     eprintln!("Strict mode: no silent drops. All sequences will be output. Invalid AA -> 'X' with logging.");
+    eprintln!("Header policy: AGGRESSIVE — keep only the first accession/ID (most reliable for MMseqs2).");
 
     let stdin = io::stdin();
     let reader: Box<dyn BufRead> = if input_name == "stdin" || input_name == "-" {
@@ -47,6 +60,7 @@ fn main() -> io::Result<()> {
         Box::new(BufWriter::with_capacity(128 * 1024 * 1024, file))
     };
 
+    // Standard amino-acid alphabet + common specials used in NR
     let valid_aa: HashSet<char> = "ACDEFGHIKLMNPQRSTVWYXBZJUO*.-".chars().collect();
 
     let mut lines = reader.lines();
@@ -56,9 +70,9 @@ fn main() -> io::Result<()> {
     let mut total_replacements: u64 = 0;
     let mut bad_char_examples: Vec<(u64, char)> = Vec::new();
     let mut current_header: Option<String> = None;
-    let mut current_seq = String::with_capacity(4096); // typical protein len
+    let mut current_seq = String::with_capacity(4096);
 
-    let mut progress_every: u64 = 1_000_000;
+    let progress_every: u64 = 1_000_000;
 
     while let Some(line_res) = lines.next() {
         let line = line_res?;
@@ -89,10 +103,8 @@ fn main() -> io::Result<()> {
                 eprintln!("Progress: processed {} sequences so far...", input_seqs);
             }
         } else if current_header.is_some() && !line.trim().is_empty() {
-            // Append sequence line (trim trailing whitespace but keep internal if any; nr is clean)
             current_seq.push_str(line.trim_end());
         }
-        // Ignore blank lines or comments outside records
     }
 
     // Process last record
@@ -115,12 +127,15 @@ fn main() -> io::Result<()> {
     writer.flush()?;
 
     eprintln!("\n=== nr_preprocess FINAL REPORT ===");
-    eprintln!("Input sequences read:    {}", input_seqs);
+    eprintln!("Input sequences read:     {}", input_seqs);
     eprintln!("Output sequences written: {}", output_seqs);
     eprintln!("Sequences requiring AA fix (invalid char -> 'X'): {}", seqs_with_fixes);
     eprintln!("Total invalid chars replaced: {}", total_replacements);
     if !bad_char_examples.is_empty() {
-        eprintln!("First bad char examples (entry#, char): {:?}", &bad_char_examples[..bad_char_examples.len().min(10)]);
+        eprintln!(
+            "First bad char examples (entry#, char): {:?}",
+            &bad_char_examples[..bad_char_examples.len().min(10)]
+        );
     }
     if input_seqs == output_seqs {
         eprintln!("SUCCESS: ZERO data dropped. Streamed every record correctly. Ready for MMseqs createdb.");
@@ -128,9 +143,12 @@ fn main() -> io::Result<()> {
         eprintln!("ERROR: Count mismatch detected! Investigate parse logic. (This should never happen.)");
         std::process::exit(2);
     }
-    eprintln!("Next recommended: mmseqs createdb /scratch/nr_clean.fa /data/refs/nrDB --dbtype 1 --createdb-mode 0 --compressed 1 --threads 64 2>&1 | tee createdb.log");
-    eprintln!("Then force AA dbtype if needed: awk 'BEGIN {{ printf(\"%c%c%c%c\",0,0,0,0); exit }}' > /data/refs/nrDB.dbtype");
-    eprintln!("Then createindex ... on /data/refs/nrDB (verify path/prefix!)");
+    eprintln!("Next recommended:");
+    eprintln!("  mmseqs createdb /scratch/nr_clean.fa /data/refs/nr_clean/nrcleanDB \\");
+    eprintln!("    --dbtype 1 --compressed 1 --threads 64 2>&1 | tee createdb.log");
+    eprintln!("Then immediately verify type:");
+    eprintln!("  od -An -t u4 /data/refs/nr_clean/nrcleanDB.dbtype");
+    eprintln!("  (must print 1)");
 
     Ok(())
 }
@@ -145,15 +163,29 @@ fn process_and_write_record(
     bad_examples: &mut Vec<(u64, char)>,
     entry_num: u64,
 ) -> io::Result<()> {
-    // Minimal header sanitization to help MMseqs ID extraction while preserving info.
-    // Keeps the original header content but ensures clean start and no weird control chars.
-    let clean_header = header.trim();
-    // Optional aggressive simplify for stubborn parser issues (uncomment if still "cannot extract"):
-    // let first_id = clean_header.trim_start_matches('>').split_whitespace().next().unwrap_or("unknown");
-    // let clean_header = format!(">{}", first_id);
+    // ---------------------------------------------------------------
+    // Aggressive header cleaning for MMseqs2 reliability
+    // Keep ONLY the first accession/ID.
+    // Split on whitespace OR the original NR control character ^A (0x01).
+    // This produces simple headers like: >EFG1759503.1
+    // which MMseqs handles cleanly and avoids dbtype / identifier problems.
+    // ---------------------------------------------------------------
+    let clean_header = {
+        let first_id = header
+            .trim_start_matches('>')
+            .split(|c: char| c.is_whitespace() || c == '\u{01}')
+            .next()
+            .unwrap_or("unknown")
+            .trim();
+        format!(">{}", first_id)
+    };
 
+    // ---------------------------------------------------------------
+    // Sequence cleaning: invalid amino-acid characters → 'X'
+    // ---------------------------------------------------------------
     let mut fixed_this = false;
     let mut cleaned_seq = String::with_capacity(seq.len());
+
     for c in seq.chars() {
         let cu = c.to_ascii_uppercase();
         if valid_aa.contains(&cu) {
@@ -172,7 +204,7 @@ fn process_and_write_record(
         *seqs_with_fixes += 1;
     }
 
-    // Write: header (one line) + seq (one long line for createdb-mode 1 friendliness)
+    // Write one clean header line + one sequence line
     writeln!(writer, "{}", clean_header)?;
     writeln!(writer, "{}", cleaned_seq)?;
 

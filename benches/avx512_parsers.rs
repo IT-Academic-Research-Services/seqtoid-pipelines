@@ -379,6 +379,7 @@ fn bench_summarize_m8_hits(c: &mut Criterion) {
                     &acc2taxid_map,
                     &|_: &[i32]| true,
                     black_box(50),
+                    false
                 ));
             }
         })

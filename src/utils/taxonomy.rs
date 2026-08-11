@@ -519,262 +519,276 @@ pub async fn read_file_into_set(path: &PathBuf) -> Result<HashSet<i32>> {
 /// # Returns
 ///
 /// Result
+/// Global top hit per query (contig) for NT blastn m8.
+/// Ranking (matches prior sort): longer alen, fewer mismatch, fewer gapopen,
+/// lower evalue, higher bitscore.
 pub async fn get_top_m8_nt(
     mut input: ReceiverStream<ParseOutput>,
     output_tx: mpsc::Sender<ParseOutput>,
-    concurrency: usize,
-    batch_size: usize, // Lines per batch; aim for 10-50MB/batch
+    _concurrency: usize,
+    _batch_size: usize,
 ) -> Result<()> {
-    if concurrency == 0 {
-        return Err(anyhow!("concurrency must be > 0"));
-    }
+    let mut best: AHashMap<String, M8Record> = AHashMap::with_capacity(64_000);
+    let mut lines_in = 0u64;
+    let mut parse_err = 0u64;
 
-    // Bounded mpsc channel — hard concurrency cap + backpressure
-    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-    let mut worker_handles = Vec::with_capacity(concurrency);
-    for i in 0..concurrency {
-        let rx = shared_rx.clone();
-        let out_tx = output_tx.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let batch = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-
-                let batch_lines = match batch {
-                    Some(b) => b,
-                    None => break,
-                };
-
-                let mut hits_by_read: AHashMap<String, Vec<M8Record>> = AHashMap::new();
-                for line in batch_lines {
-                    match M8Record::parse_line_nt(&line) {
-                        Ok(m8) => {
-                            hits_by_read.entry(m8.qname.clone()).or_default().push(m8);
-                        }
-                        Err(e) => {
-                            log::warn!("Worker {} failed to parse NT m8 line: {} — {}", i, e, line);
-                        }
-                    }
-                }
-
-                for (_read_id, mut hits) in hits_by_read {
-                    if hits.is_empty() {
-                        continue;
-                    }
-                    // Sort: Descending alen, ascending mismatch+gapopen, ascending evalue, descending bitscore
-                    hits.sort_by(|a, b| {
-                        b.alen
-                            .cmp(&a.alen)
-                            .then_with(|| a.mismatch.cmp(&b.mismatch))
-                            .then_with(|| a.gapopen.cmp(&b.gapopen))
-                            .then_with(|| {
-                                a.evalue
-                                    .partial_cmp(&b.evalue)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .then_with(|| {
-                                b.bitscore
-                                    .partial_cmp(&a.bitscore)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                    });
-                    let best = hits.into_iter().next().expect("Non-empty vec after check");
-                    let line = best.to_tab_string() + "\n";
-                    if out_tx
-                        .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
-                        .await
-                        .is_err()
-                    {
-                        return Err(anyhow!("Output send failed in worker {}", i));
-                    }
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        worker_handles.push(handle);
-    }
-
-    // Producer: build batches and send to bounded channel
-    let mut batch = Vec::with_capacity(batch_size);
     while let Some(item) = input.next().await {
-        if let ParseOutput::Bytes(bytes) = item {
-            let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
-            if line.is_empty() {
+        let ParseOutput::Bytes(bytes) = item else {
+            continue;
+        };
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        lines_in += 1;
+
+        let m8 = match M8Record::parse_line_nt(line) {
+            Ok(m) => m,
+            Err(e) => {
+                parse_err += 1;
+                if parse_err <= 20 {
+                    warn!("[get_top_m8_nt] parse error: {} — {}", e, line);
+                }
                 continue;
             }
-            batch.push(line);
+        };
 
-            if batch.len() >= batch_size {
-                if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                    break;
+        match best.get(&m8.qname) {
+            None => {
+                best.insert(m8.qname.clone(), m8);
+            }
+            Some(cur) => {
+                if is_better_nt(&m8, cur) {
+                    best.insert(m8.qname.clone(), m8);
                 }
             }
         }
+
+        if lines_in % 50_000 == 0 {
+            info!(
+                "[get_top_m8_nt] progress: lines={} unique_contigs={}",
+                lines_in,
+                best.len()
+            );
+        }
     }
 
-    if !batch.is_empty() {
-        let _ = job_tx.send(batch).await;
-    }
-    drop(job_tx);
+    info!(
+        "[get_top_m8_nt] emit starting — {} contigs (lines_in={})",
+        best.len(),
+        lines_in
+    );
 
-    for handle in worker_handles {
-        handle
+    let items: Vec<M8Record> = best.into_iter().map(|(_, m)| m).collect();
+    let n = items.len();
+
+    for (i, m8) in items.into_iter().enumerate() {
+        let line = m8.to_tab_string() + "\n";
+        if output_tx
+            .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
             .await
-            .map_err(|e| anyhow!("Worker join failed: {}", e))??;
+            .is_err()
+        {
+            return Err(anyhow!(
+                "[get_top_m8_nt] output channel closed at emit {}/{}",
+                i + 1,
+                n
+            ));
+        }
+        if (i + 1) % 5_000 == 0 {
+            info!("[get_top_m8_nt] emit progress {}/{}", i + 1, n);
+        }
     }
 
+    info!(
+        "[get_top_m8_nt] finished — lines={} parse_err={} emitted={}",
+        lines_in, parse_err, n
+    );
     Ok(())
 }
 
-/// Retrieves the top hit from an m8 stream (NR version).
-/// Merges HSPs per (query, subject) pair.
-///
-/// # Arguments
-///
-/// * `input` - Stream of ParseOutput (lines)
-/// * `output_tx` - Channel to send best hits
-/// * `concurrency` - Number of worker tasks
-/// * `batch_size` - Number of lines per batch
-///
-/// # Returns
-///
-/// Result
+#[inline]
+fn is_better_nt(a: &M8Record, b: &M8Record) -> bool {
+    match a.alen.cmp(&b.alen) {
+        std::cmp::Ordering::Greater => return true,
+        std::cmp::Ordering::Less => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    match a.mismatch.cmp(&b.mismatch) {
+        std::cmp::Ordering::Less => return true,
+        std::cmp::Ordering::Greater => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    match a.gapopen.cmp(&b.gapopen) {
+        std::cmp::Ordering::Less => return true,
+        std::cmp::Ordering::Greater => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    match a
+        .evalue
+        .partial_cmp(&b.evalue)
+        .unwrap_or(std::cmp::Ordering::Equal)
+    {
+        std::cmp::Ordering::Less => return true,
+        std::cmp::Ordering::Greater => return false,
+        std::cmp::Ordering::Equal => {}
+    }
+    matches!(
+        a.bitscore
+            .partial_cmp(&b.bitscore)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        std::cmp::Ordering::Greater
+    )
+}
+
+/// Global top hit per query (contig) for NR blastx m8.
+/// HSPs for the same (query, subject) are merged, then the best subject
+/// per contig is chosen by bitscore, then evalue.
 pub async fn get_top_m8_nr(
     mut input: ReceiverStream<ParseOutput>,
     output_tx: mpsc::Sender<ParseOutput>,
-    concurrency: usize,
-    batch_size: usize, // Lines per batch; aim for 10-50MB/batch
+    _concurrency: usize,
+    _batch_size: usize,
 ) -> Result<()> {
-    if concurrency == 0 {
-        return Err(anyhow!("concurrency must be > 0"));
+    #[derive(Clone)]
+    struct MergedHsp {
+        total_alen: u64,
+        sum_pident: f64,
+        evalue: f64,
+        bitscore: f64,
+        representative: M8Record,
     }
 
-    // Bounded mpsc channel — hard concurrency cap + backpressure
-    let (job_tx, job_rx) = mpsc::channel::<Vec<String>>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+    let mut by_pair: AHashMap<(String, String), MergedHsp> = AHashMap::with_capacity(128_000);
+    let mut lines_in = 0u64;
+    let mut parse_err = 0u64;
 
-    let mut worker_handles = Vec::with_capacity(concurrency);
-    for i in 0..concurrency {
-        let rx = shared_rx.clone();
-        let out_tx = output_tx.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let batch = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-
-                let batch_lines = match batch {
-                    Some(b) => b,
-                    None => break,
-                };
-
-                // Merge HSPs per (contig, subject)
-                let mut merged: AHashMap<(String, String), MergedHsp> = AHashMap::new();
-                for line in batch_lines {
-                    match M8Record::parse_line_nr(&line) {
-                        Ok(m8) => {
-                            let key = (m8.qname.clone(), m8.tname.clone());
-                            let entry = merged.entry(key).or_default();
-                            entry.total_alen += m8.alen;
-                            entry.sum_pident += m8.pident * m8.alen as f64;
-                            entry.evalue = entry.evalue.min(m8.evalue);
-                            entry.bitscore = entry.bitscore.max(m8.bitscore);
-                            entry.hsp_count += 1;
-                            // Update representative if better bitscore
-                            if m8.bitscore > entry.representative.bitscore {
-                                entry.representative = m8;
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Worker {} failed to parse NR m8 line: {} — {}", i, e, line);
-                        }
-                    }
-                }
-
-                // Per contig, pick best subject
-                let mut best_per_contig: AHashMap<String, MergedHsp> = AHashMap::new();
-                for ((contig, _subject), merged_hsp) in merged {
-                    let current = best_per_contig.entry(contig).or_default();
-                    if merged_hsp.bitscore > current.bitscore
-                        || (merged_hsp.bitscore == current.bitscore
-                            && merged_hsp.evalue < current.evalue)
-                    {
-                        *current = merged_hsp;
-                    }
-                }
-
-                // Output reconstructed lines
-                for (_contig, best) in best_per_contig {
-                    let rep = &best.representative;
-                    let avg_pident = if best.total_alen > 0 {
-                        best.sum_pident / best.total_alen as f64
-                    } else {
-                        rep.pident
-                    };
-                    // Reconstruct line (12-column NR format: no qlen/slen)
-                    let line = format!(
-                        "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
-                        rep.qname,
-                        rep.tname,
-                        avg_pident,
-                        best.total_alen,
-                        rep.mismatch,
-                        rep.gapopen,
-                        rep.qstart,
-                        rep.qend,
-                        rep.tstart,
-                        rep.tend,
-                        best.evalue,
-                        best.bitscore
-                    );
-                    if out_tx
-                        .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
-                        .await
-                        .is_err()
-                    {
-                        return Err(anyhow!("Output send failed in worker {}", i));
-                    }
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        worker_handles.push(handle);
-    }
-
-    // Producer: build batches and send to bounded channel
-    let mut batch = Vec::with_capacity(batch_size);
     while let Some(item) = input.next().await {
-        if let ParseOutput::Bytes(bytes) = item {
-            let line = String::from_utf8_lossy(&bytes).trim_end().to_string();
-            if line.is_empty() {
+        let ParseOutput::Bytes(bytes) = item else {
+            continue;
+        };
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        lines_in += 1;
+        
+        let m8 = match M8Record::parse_line_nr(line) {
+            Ok(m) => m,
+            Err(e) => {
+                parse_err += 1;
+                if parse_err <= 20 {
+                    warn!("[get_top_m8_nr] parse error: {} — {}", e, line);
+                }
                 continue;
             }
-            batch.push(line);
+        };
 
-            if batch.len() >= batch_size {
-                if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                    break;
+        let key = (m8.qname.clone(), m8.tname.clone());
+        match by_pair.get_mut(&key) {
+            None => {
+                by_pair.insert(
+                    key,
+                    MergedHsp {
+                        total_alen: m8.alen,
+                        sum_pident: m8.pident * m8.alen as f64,
+                        evalue: m8.evalue,
+                        bitscore: m8.bitscore,
+                        representative: m8,
+                    },
+                );
+            }
+            Some(entry) => {
+                entry.total_alen += m8.alen;
+                entry.sum_pident += m8.pident * m8.alen as f64;
+                entry.evalue = entry.evalue.min(m8.evalue);
+                if m8.bitscore > entry.bitscore {
+                    entry.bitscore = m8.bitscore;
+                    entry.representative = m8;
+                } else {
+                    entry.bitscore = entry.bitscore.max(m8.bitscore);
+                }
+            }
+        }
+
+        if lines_in % 50_000 == 0 {
+            info!(
+                "[get_top_m8_nr] progress: lines={} pairs={}",
+                lines_in,
+                by_pair.len()
+            );
+        }
+    }
+
+    let mut best_per_contig: AHashMap<String, MergedHsp> = AHashMap::with_capacity(by_pair.len());
+    for ((contig, _subject), merged) in by_pair {
+        match best_per_contig.get(&contig) {
+            None => {
+                best_per_contig.insert(contig, merged);
+            }
+            Some(cur) => {
+                let better = merged.bitscore > cur.bitscore
+                    || (merged.bitscore == cur.bitscore && merged.evalue < cur.evalue);
+                if better {
+                    best_per_contig.insert(contig, merged);
                 }
             }
         }
     }
 
-    if !batch.is_empty() {
-        let _ = job_tx.send(batch).await;
-    }
-    drop(job_tx);
+    info!(
+        "[get_top_m8_nr] emit starting — {} contigs (lines_in={})",
+        best_per_contig.len(),
+        lines_in
+    );
 
-    for handle in worker_handles {
-        handle
+    let items: Vec<(String, MergedHsp)> = best_per_contig.into_iter().collect();
+    let n = items.len();
+
+    for (i, (_contig, best)) in items.into_iter().enumerate() {
+        let rep = &best.representative;
+        let avg_pident = if best.total_alen > 0 {
+            best.sum_pident / best.total_alen as f64
+        } else {
+            rep.pident
+        };
+        let line = format!(
+            "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
+            rep.qname,
+            rep.tname,
+            avg_pident,
+            best.total_alen,
+            rep.mismatch,
+            rep.gapopen,
+            rep.qstart,
+            rep.qend,
+            rep.tstart,
+            rep.tend,
+            best.evalue,
+            best.bitscore
+        );
+        if output_tx
+            .send(ParseOutput::Bytes(Bytes::from(line.into_bytes())))
             .await
-            .map_err(|e| anyhow!("Worker join failed: {}", e))??;
+            .is_err()
+        {
+            return Err(anyhow!(
+                "[get_top_m8_nr] output channel closed at emit {}/{}",
+                i + 1,
+                n
+            ));
+        }
+        if (i + 1) % 5_000 == 0 {
+            info!("[get_top_m8_nr] emit progress {}/{}", i + 1, n);
+        }
     }
 
+    info!(
+        "[get_top_m8_nr] finished — lines={} parse_err={} emitted={}",
+        lines_in, parse_err, n
+    );
     Ok(())
 }
 
@@ -848,18 +862,27 @@ pub fn validate_taxid_lineage(
 ///
 /// The validated Lineage
 pub fn get_valid_lineage(
-    hits_by_read_id: &AHashMap<String, (Taxid, u8)>, // contig_id → (taxid, level)
-    lineage_map: &Arc<AHashMap<Taxid, Lineage>>,
+    hits_by_read_id: &AHashMap<String, (Taxid, i32)>, // read_id → (taxid, level)
+    lineage_map: &AHashMap<Taxid, Lineage>,
     read_id: &str,
 ) -> Lineage {
-    let (hit_taxid, hit_level) = hits_by_read_id.get(read_id).copied().unwrap_or((-1, 255)); // 255 = invalid level
+    // Python: hits_by_read_id.get(read_id, (-1, -1))
+    let (hit_taxid, hit_level) = hits_by_read_id
+        .get(read_id)
+        .copied()
+        .unwrap_or((-1, -1));
 
     if hit_taxid <= 0 {
         return NULL_LINEAGE;
     }
 
+    // Prefer real lineage when level indicates species (1). Non-specific levels
+    // use artificial taxids (same idea as validate_taxid_lineage / NULL handling).
     if hit_level == 1 {
-        lineage_map.get(&hit_taxid).copied().unwrap_or(NULL_LINEAGE)
+        lineage_map
+            .get(&hit_taxid)
+            .copied()
+            .unwrap_or(NULL_LINEAGE)
     } else {
         [
             SPECIES_NON_SPECIFIC,
@@ -1200,35 +1223,35 @@ mod tests {
     #[test]
     fn test_get_valid_lineage_species_hit_uses_map() {
         let mut hits = AHashMap::new();
-        hits.insert("read1".to_string(), (42, 1));
+        hits.insert("read1".to_string(), (42, 1i32));
 
         let mut lineage_map = AHashMap::new();
         lineage_map.insert(42, [11, 22, 33]);
 
         let lineage_map = Arc::new(lineage_map);
-        let got = get_valid_lineage(&hits, &lineage_map, "read1");
+        let got = get_valid_lineage(&hits, lineage_map.as_ref(), "read1");
         assert_eq!(got, [11, 22, 33]);
     }
 
     #[test]
     fn test_get_valid_lineage_non_species_hit_returns_non_specific_lineage() {
         let mut hits = AHashMap::new();
-        hits.insert("read1".to_string(), (42, 2));
+        hits.insert("read1".to_string(), (42, 2i32));
 
         let mut lineage_map = AHashMap::new();
         lineage_map.insert(42, [11, 22, 33]);
 
         let lineage_map = Arc::new(lineage_map);
-        let got = get_valid_lineage(&hits, &lineage_map, "read1");
-        assert_eq!(got, [-100, -200, -300]);
+        let got = get_valid_lineage(&hits, lineage_map.as_ref(), "read1");
+        assert_eq!(got, [-100, -200, -300]); // SPECIES/GENUS/FAMILY_NON_SPECIFIC
     }
 
     #[test]
     fn test_get_valid_lineage_missing_hit_returns_null_lineage() {
-        let hits: AHashMap<String, (Taxid, u8)> = AHashMap::new();
+        let hits: AHashMap<String, (Taxid, i32)> = AHashMap::new();
         let lineage_map = Arc::new(AHashMap::new());
 
-        let got = get_valid_lineage(&hits, &lineage_map, "missing");
+        let got = get_valid_lineage(&hits, lineage_map.as_ref(), "missing");
         assert_eq!(got, [-1, -1, -1]);
     }
 

@@ -259,6 +259,15 @@ pub struct RunConfig {
     pub alignment_backend: NRAlignmentBackend,
 }
 
+/// Internal structure for grouped batch processing of read hits.
+#[derive(Debug, Clone)]
+pub struct ReducedRead {
+    pub seq: u64,
+    pub dedup: Vec<u8>,
+    pub summary: Vec<u8>,
+    pub accession: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TaxonSeqLocation {
     pub taxid: i32,
