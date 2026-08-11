@@ -1,9 +1,11 @@
 //! BLAST-related file functions and structures
 //! including m8 file-based
 
+use tokio::time::Duration;
 use std::collections::HashSet;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::RandomState as AHashRandomState;
 use ahash::{AHashMap, RandomState as AHashState};
@@ -21,6 +23,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use rand::prelude::IndexedRandom;
+use rand::SeedableRng;
 
 use futures::future::try_join_all;
 use std::collections::HashMap;
@@ -30,10 +34,13 @@ use tokio::io::BufWriter;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::Stream;
 
 use crate::config::defs::{
     ClusterInfo, Lineage, PipelineError, ReadCountingMode, RunConfig, SimdLevel, StreamDataType,
     Taxid, MIN_NORMAL_POSITIVE_DOUBLE, NR_TAG, NT_TAG, READ_COUNTING_MODE, SIMD_LEVEL, SORT_TAG,
+    ReducedRead
 };
 use crate::utils::command::generate_cli;
 use crate::utils::file::{choose_temp_dir, rename_file_path, write_byte_stream_to_file};
@@ -42,18 +49,15 @@ use crate::utils::system::compute_phase_concurrency;
 use crate::utils::taxonomy::validate_taxid_lineage;
 
 /// Represents an entry in the contig summary, grouping metadata and hit stats.
+/// Python / WDL contig summary shape (one object per taxid × level).
+/// Emitted by generate_contig_summary_json; consumed by merge_contigs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContigSummaryEntry {
-    pub contig_name: String,
-    pub common_name: Option<String>,
-    pub category_name: Option<String>,
-    pub score: Option<f64>,
-    pub db_type: String,
-    pub reads: u64,
-    pub bases: u64,
-    pub species_taxid: i32,
-    pub genus_taxid: i32,
-    pub family_taxid: i32,
+    pub taxid: i32,
+    pub tax_level: u8,
+    pub count_type: String,
+    /// contig_name → nonunique (duplicate-weighted) read count
+    pub contig_counts: HashMap<String, u64>,
 }
 
 /// Stores the best taxonomic alignment results for both a contig and its constituent read.
@@ -82,14 +86,6 @@ pub struct M8Record {
     pub slen: u64, // Subject length: From column in NT; 0 in NR (unused entirely)
 }
 
-/// Internal structure for grouped batch processing of read hits.
-#[derive(Debug, Clone)]
-pub struct ReducedRead {
-    pub seq: u64,
-    pub dedup: Vec<u8>,
-    pub summary: Vec<u8>,
-    pub accession: String,
-}
 
 /// Holds hits for a read that are waiting to be processed as a group.
 #[derive(Debug)]
@@ -108,17 +104,18 @@ pub enum WorkerMsg {
 }
 
 impl M8Record {
+    /// Strip leading '>' (FASTA defline artifact) and version suffix.
+    /// BLAST sseqid should never contain '>', but local blastdb construction
+    /// can leave it; the accession map is keyed without it.
+    #[inline]
+    fn clean_accession(raw: &str) -> String {
+        let s = raw.trim_start_matches('>').trim();
+        s.split('.').next().unwrap_or(s).to_string()
+    }
+
     // ── NT scalar ──────────────────────────────────────────────────────────
 
     /// Parses a 14-column NT (blastn) output line using a scalar implementation.
-    ///
-    /// # Arguments
-    ///
-    /// * `line`: the m8 line string to parse
-    ///
-    /// # Returns
-    ///
-    /// Result<Self>: the parsed M8Record or an error
     pub fn parse_line_nt_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
@@ -149,12 +146,7 @@ impl M8Record {
         }
 
         let qname = next!("qname").to_string();
-        let raw_accession = next!("tname");
-        let tname = raw_accession
-            .split('.')
-            .next()
-            .unwrap_or(raw_accession)
-            .to_string();
+        let tname = Self::clean_accession(next!("tname"));
         let pident = parse_float!("pident");
         let alen = parse_u64!("alen");
         let mismatch = parse_u64!("mismatch");
@@ -192,14 +184,6 @@ impl M8Record {
     // ── NR scalar ──────────────────────────────────────────────────────────
 
     /// Parses a 12-column NR (blastx) output line using a scalar implementation.
-    ///
-    /// # Arguments
-    ///
-    /// * `line`: the m8 line string to parse
-    ///
-    /// # Returns
-    ///
-    /// Result<Self>: the parsed M8Record or an error
     pub fn parse_line_nr_scalar(line: &str) -> Result<Self> {
         let line = line.trim_end();
         if line.is_empty() {
@@ -208,34 +192,29 @@ impl M8Record {
         let mut fields = line.split('\t');
 
         macro_rules! next {
-            ($name:literal) => {
-                fields
-                    .next()
-                    .ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
-            };
-        }
+        ($name:literal) => {
+            fields
+                .next()
+                .ok_or_else(|| anyhow!(concat!("missing ", $name, " in NR m8 line")))?
+        };
+    }
         macro_rules! parse_float {
-            ($name:literal) => {{
-                let s = next!($name);
-                lexical_parse::<f64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!(concat!("invalid float ", $name, ": {}"), e))?
-            }};
-        }
+        ($name:literal) => {{
+            let s = next!($name);
+            lexical_parse::<f64, _>(s.as_bytes())
+                .map_err(|e| anyhow!(concat!("invalid float ", $name, ": {}"), e))?
+        }};
+    }
         macro_rules! parse_u64 {
-            ($name:literal) => {{
-                let s = next!($name);
-                lexical_parse::<u64, _>(s.as_bytes())
-                    .map_err(|e| anyhow!(concat!("invalid u64 ", $name, ": {}"), e))?
-            }};
-        }
+        ($name:literal) => {{
+            let s = next!($name);
+            lexical_parse::<u64, _>(s.as_bytes())
+                .map_err(|e| anyhow!(concat!("invalid u64 ", $name, ": {}"), e))?
+        }};
+    }
 
         let qname = next!("qname").to_string();
-        let raw_accession = next!("tname");
-        let tname = raw_accession
-            .split('.')
-            .next()
-            .unwrap_or(raw_accession)
-            .to_string();
+        let tname = Self::clean_accession(next!("tname"));
         let pident = parse_float!("pident");
         let alen = parse_u64!("alen");
         let mismatch = parse_u64!("mismatch");
@@ -247,9 +226,19 @@ impl M8Record {
         let evalue = parse_float!("evalue");
         let bitscore = parse_float!("bitscore");
 
+        // Optional trailing qlen/slen (NT outfmt or to_tab_string rewrite)
+        let qlen = fields
+            .next()
+            .and_then(|s| lexical_parse::<u64, _>(s.as_bytes()).ok())
+            .unwrap_or(0);
+        let slen = fields
+            .next()
+            .and_then(|s| lexical_parse::<u64, _>(s.as_bytes()).ok())
+            .unwrap_or(0);
         if fields.next().is_some() {
-            warn!("Extra columns in NR m8 line (expected 12): {}", line);
+            warn!("Extra columns beyond 14 in NR/NT-like m8: {}", line);
         }
+
         Ok(Self {
             qname,
             tname,
@@ -263,8 +252,8 @@ impl M8Record {
             tend,
             evalue,
             bitscore,
-            qlen: 0,
-            slen: 0,
+            qlen,
+            slen,
         })
     }
 
@@ -345,7 +334,7 @@ impl M8Record {
             .map_err(|_| anyhow!("qname not UTF-8"))?
             .to_string();
         let raw = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
-        let tname = raw.split('.').next().unwrap_or(raw).to_string();
+        let tname = Self::clean_accession(raw);
 
         let pident = parse_f64!(2, "pident");
         let alen = parse_u64!(3, "alen");
@@ -401,38 +390,39 @@ impl M8Record {
         let tab_pos = Self::collect_tab_positions(bytes);
         let len = bytes.len();
 
+        // 11 tabs = 12 fields (required); 13 tabs = 14 fields (optional qlen/slen)
         if tab_pos.len() < 11 {
             return Err(anyhow!(
-                "NR m8 line has {} tabs, need ≥11 for 12 fields",
-                tab_pos.len()
-            ));
+            "NR m8 line has {} tabs, need ≥11 for 12 fields",
+            tab_pos.len()
+        ));
         }
 
         macro_rules! field {
-            ($n:expr) => {{
-                let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
-                let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
-                &bytes[start..end]
-            }};
-        }
+        ($n:expr) => {{
+            let start = if $n == 0 { 0 } else { tab_pos[$n - 1] + 1 };
+            let end = if $n < tab_pos.len() { tab_pos[$n] } else { len };
+            &bytes[start..end]
+        }};
+    }
         macro_rules! parse_u64 {
-            ($n:expr, $name:literal) => {
-                lexical_parse::<u64, _>(field!($n))
-                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
-            };
-        }
+        ($n:expr, $name:literal) => {
+            lexical_parse::<u64, _>(field!($n))
+                .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+        };
+    }
         macro_rules! parse_f64 {
-            ($n:expr, $name:literal) => {
-                lexical_parse::<f64, _>(field!($n))
-                    .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
-            };
-        }
+        ($n:expr, $name:literal) => {
+            lexical_parse::<f64, _>(field!($n))
+                .map_err(|e| anyhow!(concat!($name, ": {}"), e))?
+        };
+    }
 
         let qname = std::str::from_utf8(field!(0))
             .map_err(|_| anyhow!("qname not UTF-8"))?
             .to_string();
         let raw = std::str::from_utf8(field!(1)).map_err(|_| anyhow!("tname not UTF-8"))?;
-        let tname = raw.split('.').next().unwrap_or(raw).to_string();
+        let tname = Self::clean_accession(raw);
 
         let pident = parse_f64!(2, "pident");
         let alen = parse_u64!(3, "alen");
@@ -445,8 +435,18 @@ impl M8Record {
         let evalue = parse_f64!(10, "evalue");
         let bitscore = parse_f64!(11, "bitscore");
 
-        if tab_pos.len() > 11 {
-            warn!("Extra columns in NT m8 line (expected 12): {}", trimmed);
+        // Optional trailing qlen/slen (NT outfmt or to_tab_string rewrite)
+        let (qlen, slen) = if tab_pos.len() >= 13 {
+            (
+                lexical_parse::<u64, _>(field!(12)).unwrap_or(0),
+                lexical_parse::<u64, _>(field!(13)).unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+
+        if tab_pos.len() > 13 {
+            warn!("Extra columns beyond 14 in NR/NT-like m8: {}", trimmed);
         }
 
         Ok(Self {
@@ -462,8 +462,8 @@ impl M8Record {
             tend,
             evalue,
             bitscore,
-            qlen: 0,
-            slen: 0,
+            qlen,
+            slen,
         })
     }
 
@@ -503,6 +503,18 @@ impl M8Record {
             self.qlen,
             self.slen
         )
+    }
+
+    /// Dispatch by column count. Use only when the stream may mix 12- and 14-col
+    /// (e.g. process_record_pair). Prefer parse_line_nt / parse_line_nr on known paths.
+    #[inline]
+    pub fn parse_line_auto(line: &str) -> Result<Self> {
+        let tabs = line.as_bytes().iter().filter(|&&b| b == b'\t').count();
+        if tabs >= 13 {
+            Self::parse_line_nt(line)
+        } else {
+            Self::parse_line_nr(line)
+        }
     }
 }
 
@@ -581,22 +593,32 @@ pub fn process_record_pair(
     count_type: &str,
     source_count_type: Option<&str>,
 ) -> Result<(), anyhow::Error> {
+    //   read_id, level, taxid, accession_id, species_taxid, genus_taxid, family_taxid [, source_count_type]
     let hit_str = std::str::from_utf8(hit_bytes)?;
     let hit_fields: Vec<&str> = hit_str.trim_end().split('\t').collect();
     if hit_fields.len() < 7 {
-        return Ok(()); // malformed hit summary line → skip (matches Python)
+        return Ok(()); // malformed — skip (do not invent data)
     }
 
-    let read_id = hit_fields[0].to_string();
-    let level: u8 = hit_fields.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let consensus_taxid: i32 = hit_fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let read_id = hit_fields[0];
+    // level may be 1 or -1; do NOT require level > 0
+    let level: i32 = hit_fields[1].parse().unwrap_or(-1);
+    let hit_taxid: i32 = hit_fields[2].parse().unwrap_or(-1);
 
-    if consensus_taxid <= 0 || level == 0 {
+    if hit_taxid <= 0 {
         return Ok(());
     }
 
+    // Prefer explicit arg; else column 8 from merge (source_count_type)
+    let src: Option<&str> = source_count_type.or_else(|| {
+        hit_fields
+            .get(7)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    });
+
     let m8_str = std::str::from_utf8(m8_bytes)?;
-    let m8 = M8Record::parse_line_nr(m8_str)?;
+    let m8 = M8Record::parse_line_auto(m8_str)?;
 
     let mut alen = m8.alen as f64;
     let pident = m8.pident;
@@ -606,23 +628,24 @@ pub fn process_record_pair(
     }
     let ev_log10 = ev.log10();
 
-    // Exact Python merged_NT_NR adjustment (still needed)
-    if count_type == "merged_NT_NR" && source_count_type == Some("NR") {
+    // only for merged_NT_NR + source NR
+    if count_type == "merged_NT_NR" && src == Some("NR") {
         alen *= 3.0;
     }
 
-    // Build raw lineage from hit summary columns (indices 4,5,6)
-    let species = hit_fields.get(4).and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let genus = hit_fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let family = hit_fields.get(6).and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let species: i32 = hit_fields[4].parse().unwrap_or(-1);
+    let genus: i32 = hit_fields[5].parse().unwrap_or(-1);
+    let family: i32 = hit_fields[6].parse().unwrap_or(-1);
     let raw = vec![species, genus, family];
 
-    // Lineage cache (exactly like summarize_hits)
-    let cleaned = if let Some(cached) = lineage_cache.get(&consensus_taxid) {
+    // level for validate_taxid_lineage: uses hit_level as-is (may be -1)
+    let level_u8: u8 = if level > 0 { level as u8 } else { 0 };
+
+    let cleaned = if let Some(cached) = lineage_cache.get(&hit_taxid) {
         cached.clone()
     } else {
-        let c = validate_taxid_lineage(&raw, consensus_taxid, level);
-        lineage_cache.insert(consensus_taxid, c.clone());
+        let c = validate_taxid_lineage(&raw, hit_taxid, level_u8);
+        lineage_cache.insert(hit_taxid, c.clone());
         c
     };
 
@@ -631,7 +654,7 @@ pub fn process_record_pair(
     }
 
     let cluster_size = duplicate_clusters
-        .get(&read_id)
+        .get(read_id)
         .map(|e| e.value().size)
         .unwrap_or(1);
 
@@ -646,8 +669,8 @@ pub fn process_record_pair(
         bucket.sum_alignment_length += alen;
         bucket.sum_e_value += ev_log10;
 
-        if let Some(src) = source_count_type {
-            bucket.source_count_type.insert(src.to_string());
+        if let Some(s) = src {
+            bucket.source_count_type.insert(s.to_string());
         }
 
         agg_key = agg_key[1..].to_vec();
@@ -766,87 +789,6 @@ fn negative_taxid(level: u8) -> i64 {
     -100 * (level as i64)
 }
 
-/// Computes the common lineage for a set of hits,
-/// Assumes lineages are [species, genus, family] leaf-to-root with possible negatives.
-///
-/// # Arguments
-///
-///  * `hits` - list of m8 records
-/// * `lineage_map` - derived from taxid DB (taxid -> [species, genus, family])
-///
-/// # Returns
-///
-/// (level, consensus_taxid, selected_hits) where level=1 species, 2 genus, 3 family, 0 none;
-/// consensus_taxid is the taxid at that level.
-pub fn consensus_level(
-    hits: &[M8Record],
-    lineage_map: &AHashMap<Taxid, Lineage>,
-    acc2taxid_map: &Map<Vec<u8>>,
-    should_keep: &Arc<impl Fn(&[i32]) -> bool + Send + Sync>,
-) -> Result<(u8, i64, Vec<M8Record>)> {
-    let lineages: Vec<Lineage> = hits
-        .iter()
-        .filter_map(|r| {
-            let accession = &r.tname;
-
-            // 1. Try full accession (e.g., "ACC.1")
-            let taxid_opt = acc2taxid_map.get(accession.as_bytes());
-
-            // 2. Fallback: strip version → base accession (e.g., "ACC")
-            let taxid_u64 = taxid_opt
-                .or_else(|| {
-                    let base_acc = accession.split('.').next().unwrap_or(accession);
-                    if base_acc != accession {
-                        acc2taxid_map.get(base_acc.as_bytes())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow!("Accession not found in acc2taxid map: {}", accession))
-                .ok()?;
-
-            let taxid = taxid_u64 as i32;
-            if taxid <= 0 {
-                return None;
-            }
-
-            lineage_map.get(&taxid).cloned()
-        })
-        .collect();
-
-    if lineages.is_empty() {
-        return Ok((0, 0, Vec::new()));
-    }
-
-    let mut max_level = 0u8;
-    let mut consensus_taxid = 0i64;
-
-    for level in 0..3 {
-        let taxids: HashSet<i32> = lineages
-            .iter()
-            .map(|lin| lin[level])
-            .filter(|&t| t > 0)
-            .collect();
-
-        if taxids.len() == 1 {
-            let agreed = *taxids.iter().next().unwrap() as i64;
-            max_level = (level + 1) as u8;
-            consensus_taxid = agreed;
-        } else {
-            break;
-        }
-    }
-
-    if max_level > 0 {
-        let rep_lineage = lineages[0];
-        let validated = validate_taxid_lineage(&rep_lineage, consensus_taxid as i32, max_level);
-        if !(should_keep)(&validated) {
-            return Ok((0, 0, Vec::new()));
-        }
-    }
-
-    Ok((max_level, consensus_taxid, hits.to_vec()))
-}
 
 /// Extract the read ID from a BLAST m8 line.
 ///
@@ -912,7 +854,7 @@ pub async fn sort_m8_by_read_id(
         4,
         false,
     )
-    .await?;
+        .await?;
 
     let unsorted_path = temp_dir.path().join(format!("{}_unsorted.m8", db_type));
     let sorted_path = temp_dir
@@ -924,21 +866,32 @@ pub async fn sort_m8_by_read_id(
         tag, estimated_bytes
     );
 
-    // 1) Write the unsorted stream to disk and wait for the file to be fully closed.
+    // 1) Write the stream to disk and wait for the file to be fully closed.
     let write_task = write_byte_stream_to_file(
         &unsorted_path,
         input_stream,
         config.clone(),
         StreamDataType::JustBytes,
         &tag,
+        true,
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     write_task
         .await
         .map_err(|e| PipelineError::Other(anyhow!("{} writer task panicked: {}", tag, e)))?
         .map_err(|e| PipelineError::IOError(format!("{} writer task failed: {}", tag, e)))?;
+
+    let unsorted_meta = tokio::fs::metadata(&unsorted_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    if unsorted_meta.len() == 0 {
+        return Err(PipelineError::Other(anyhow!(
+            "[{}] unsorted m8 is empty after write",
+            tag
+        )));
+    }
 
     let sort_buffer = if config.available_ram > 256 * 1024 * 1024 * 1024 {
         "32G"
@@ -946,7 +899,7 @@ pub async fn sort_m8_by_read_id(
         "8G"
     };
 
-    // 2) Only now spawn GNU sort, so it reads a complete file.
+    // 2) GNU sort on the complete file.
     let sort_config = crate::utils::command::sort::SortConfig {
         key: "-k1,1".to_string(),
         parallel: None,
@@ -963,6 +916,8 @@ pub async fn sort_m8_by_read_id(
             error: e.to_string(),
         })?;
 
+    info!("[{}] GNU sort args: {:?}", tag, sort_args);
+
     let (mut sort_child, sort_err_task) = spawn_cmd(
         config.clone(),
         crate::config::defs::SORT_TAG,
@@ -970,11 +925,11 @@ pub async fn sort_m8_by_read_id(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: crate::config::defs::SORT_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: crate::config::defs::SORT_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     let status = sort_child
         .wait()
@@ -997,28 +952,47 @@ pub async fn sort_m8_by_read_id(
         .map_err(|e| PipelineError::Other(anyhow!("sort stderr task panicked: {}", e)))?
         .map_err(|e| PipelineError::Other(anyhow!("sort stderr task failed: {}", e)))?;
 
-    info!("[{}] m8 sort completed → {}", tag, sorted_path.display());
+    let sorted_meta = tokio::fs::metadata(&sorted_path)
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    if sorted_meta.len() == 0 {
+        return Err(PipelineError::Other(anyhow!(
+            "[{}] GNU sort produced an empty file",
+            tag
+        )));
+    }
+
+    info!(
+        "[{}] m8 sort completed → {} ({} bytes)",
+        tag,
+        sorted_path.display(),
+        sorted_meta.len()
+    );
 
     // 3) Stream the sorted file back.
+    // Hold TempDir in the relay task so paths stay valid until the consumer drains.
     let sorted_file = TokioFile::open(&sorted_path)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
-
-    let meta = tokio::fs::metadata(&sorted_path)
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    info!(
-        "[{}] sorted output exists: {} bytes at {}",
-        tag,
-        meta.len(),
-        sorted_path.display()
-    );
 
     let rx = parse_lines(sorted_file, &config, StreamDataType::JustBytes)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    Ok(ReceiverStream::new(rx))
+    let (out_tx, out_rx) = mpsc::channel(config.base_buffer_size * 8);
+    tokio::spawn(async move {
+        let _keep_alive = temp_dir;
+        let mut stream = ReceiverStream::new(rx);
+        while let Some(item) = stream.next().await {
+            if out_tx.send(item).await.is_err() {
+                break;
+            }
+        }
+        // temp_dir dropped here after stream ends or consumer disconnects
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok(ReceiverStream::new(out_rx))
 }
 
 /// Calls taxonomic hits from a sorted m8 stream.
@@ -1054,8 +1028,7 @@ pub async fn call_hits_m8(
     tag: String,
 ) -> Result<
     (
-        ReceiverStream<ParseOutput>, // dedup m8 stream
-        ReceiverStream<ParseOutput>, // summary stream
+        ReceiverStream<ReducedRead>, // paired dedup m8 + hitsummary
         Vec<tokio::task::JoinHandle<Result<()>>>,
         Vec<oneshot::Receiver<Result<()>>>,
     ),
@@ -1063,15 +1036,16 @@ pub async fn call_hits_m8(
 > {
     let worker_count = concurrency.max(1);
     let mut cleanup_tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
+    let cleanup_receivers: Vec<oneshot::Receiver<Result<()>>> = Vec::new();
 
     info!(
-        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={}",
+        "[call_hits_m8:{}] STARTING STREAMING VERSION — workers={}, min_aln_len={} (ReducedRead pairs)",
         tag, worker_count, min_aln_len
     );
 
-    let (dedup_tx, dedup_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
-    let (summary_tx, summary_rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size * 256);
+    // Single channel: association never leaves the struct.
+    let (pair_tx, mut pair_rx) =
+        mpsc::channel::<ReducedRead>(config.base_buffer_size * 256);
 
     #[derive(Debug)]
     enum WorkerMsgLocal {
@@ -1082,8 +1056,8 @@ pub async fn call_hits_m8(
         Flush,
     }
 
-    // One sender per worker; reads are sharded by read_id.
     let mut worker_txs: Vec<mpsc::Sender<WorkerMsgLocal>> = Vec::with_capacity(worker_count);
+    let seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     for worker_idx in 0..worker_count {
         let (worker_tx, mut worker_rx) =
@@ -1093,80 +1067,64 @@ pub async fn call_hits_m8(
         let lineage_map = lineage_map.clone();
         let acc2taxid_map = acc2taxid_map.clone();
         let should_keep_filter = should_keep_filter.clone();
-        let dedup_tx = dedup_tx.clone();
-        let summary_tx = summary_tx.clone();
+        let pair_tx = pair_tx.clone();
+        let seq_counter = seq_counter.clone();
         let worker_tag = tag.clone();
 
         let worker_handle = tokio::spawn(async move {
-            let mut total_emitted = 0usize;
-            let start = Instant::now();
-
             debug!(
-                "[call_hits_m8:{}] worker {} started (streaming mode)",
+                "[call_hits_m8:{}] worker {} started",
                 worker_tag, worker_idx
             );
 
             while let Some(msg) = worker_rx.recv().await {
                 match msg {
                     WorkerMsgLocal::ProcessRead { read_id, hits } => {
-                        let reduced = summarize_m8_hits(
-                            0,
+                        let log_misses = worker_tag == "nr";
+                        let seq = seq_counter
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                        if let Some(mut reduced) = summarize_m8_hits(
+                            seq,
                             read_id,
                             &hits,
                             &lineage_map,
                             &acc2taxid_map,
                             &*should_keep_filter,
                             min_aln_len,
-                        );
-
-                        if let Some(reduced) = reduced {
-                            total_emitted += 1;
-
-                            dedup_tx
-                                .send(ParseOutput::Bytes(Bytes::from(reduced.dedup)))
+                            log_misses,
+                        ) {
+                            reduced.seq = seq;
+                            pair_tx
+                                .send(reduced)
                                 .await
-                                .map_err(|e| anyhow!("dedup output channel closed: {}", e))?;
-
-                            summary_tx
-                                .send(ParseOutput::Bytes(Bytes::from(reduced.summary)))
-                                .await
-                                .map_err(|e| anyhow!("summary output channel closed: {}", e))?;
+                                .map_err(|e| {
+                                    anyhow!("ReducedRead output channel closed: {}", e)
+                                })?;
                         }
                     }
                     WorkerMsgLocal::Flush => break,
                 }
             }
 
-            info!(
-                "[call_hits_m8:{}] worker {} finished — emitted {} reads in {:?}",
-                worker_tag,
-                worker_idx,
-                total_emitted,
-                start.elapsed()
-            );
             Ok::<(), anyhow::Error>(())
         });
 
         cleanup_tasks.push(worker_handle);
     }
 
-    // Coordinator: consume the sorted stream, accumulate one read at a time,
-    // and dispatch finished read blocks to a shard.
+    // Coordinator must not hold pair_tx (channel closes when workers finish).
+    drop(pair_tx);
+
     let coordinator_tag = tag.clone();
     let coordinator_handle = tokio::spawn(async move {
         let mut current_read_id: Option<String> = None;
         let mut current_hits: Vec<M8Record> = Vec::with_capacity(32);
-        let mut total_lines = 0usize;
-        let mut total_reads = 0usize;
-        let start = Instant::now();
+        let mut total_lines = 0u64;
+        let mut total_reads = 0u64;
 
         #[cfg(debug_assertions)]
         let mut last_seen_read_id: Option<String> = None;
-
-        debug!(
-            "[call_hits_m8:{}] coordinator started (streaming group-by)",
-            coordinator_tag
-        );
 
         while let Some(item) = m8_input.next().await {
             let bytes = match item.to_bytes() {
@@ -1195,13 +1153,6 @@ pub async fn call_hits_m8(
                 Err(_) => continue,
             };
 
-            if total_lines == 1 {
-                info!(
-                    "[call_hits_m8:{}] first input line: read_id={} line={}",
-                    coordinator_tag, read_id, line_str
-                );
-            }
-
             #[cfg(debug_assertions)]
             {
                 if let Some(prev) = &last_seen_read_id {
@@ -1215,7 +1166,6 @@ pub async fn call_hits_m8(
                 last_seen_read_id = Some(read_id.clone());
             }
 
-            // If the read ID changes, the previous read is complete.
             if current_read_id.as_deref() != Some(&read_id) && !current_hits.is_empty() {
                 let prev_read_id = current_read_id.take().unwrap();
                 let shard = shard_for_read_id(&prev_read_id, worker_count);
@@ -1226,7 +1176,9 @@ pub async fn call_hits_m8(
                         hits: std::mem::take(&mut current_hits),
                     })
                     .await
-                    .map_err(|e| anyhow!("failed to dispatch completed read to worker: {}", e))?;
+                    .map_err(|e| {
+                        anyhow!("failed to dispatch completed read to worker: {}", e)
+                    })?;
 
                 total_reads += 1;
             }
@@ -1238,7 +1190,6 @@ pub async fn call_hits_m8(
             current_hits.push(rec);
         }
 
-        // Final read.
         if let Some(read_id) = current_read_id {
             if !current_hits.is_empty() {
                 let shard = shard_for_read_id(&read_id, worker_count);
@@ -1249,32 +1200,30 @@ pub async fn call_hits_m8(
                         hits: current_hits,
                     })
                     .await
-                    .map_err(|e| anyhow!("failed to dispatch final read to worker: {}", e))?;
+                    .map_err(|e| {
+                        anyhow!("failed to dispatch final read to worker: {}", e)
+                    })?;
 
                 total_reads += 1;
             }
         }
 
-        // Flush all workers after all reads have been dispatched.
-        for (_, tx) in worker_txs.iter().enumerate() {
+        for tx in worker_txs.iter() {
             tx.send(WorkerMsgLocal::Flush)
                 .await
                 .map_err(|e| anyhow!("failed to flush worker: {}", e))?;
         }
 
         info!(
-            "[call_hits_m8:{}] coordinator done — processed {} lines, {} reads in {:?}",
-            coordinator_tag,
-            total_lines,
-            total_reads,
-            start.elapsed()
+            "[call_hits_m8:{}] coordinator done — lines={}, reads_dispatched={}",
+            coordinator_tag, total_lines, total_reads
         );
 
         if total_lines == 0 {
-            warn!(
+            return Err(anyhow!(
                 "[call_hits_m8:{}] coordinator saw zero input lines; upstream sort/stream wiring is wrong",
                 coordinator_tag
-            );
+            ));
         }
 
         Ok::<(), anyhow::Error>(())
@@ -1282,84 +1231,117 @@ pub async fn call_hits_m8(
 
     cleanup_tasks.push(coordinator_handle);
 
-    let dedup_stream = ReceiverStream::new(dedup_rx);
-    let (dedup_branches, dedup_router_done_rx) = fanout_to_channels(
-        dedup_stream,
-        2,
-        "call_hits_m8_dedup",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    // Tee: main consumer + file writer share the same ReducedRead order.
+    let (main_tx, main_rx) =
+        mpsc::channel::<ReducedRead>(config.base_buffer_size * 256);
+    let (file_tx, mut file_rx) =
+        mpsc::channel::<ReducedRead>(config.base_buffer_size * 256);
 
-    // track router task (replaces cleanup_receivers)
-    cleanup_receivers.push(dedup_router_done_rx);
+    let tee_tag = tag.clone();
+    let tee_handle = tokio::spawn(async move {
+        let mut n = 0u64;
+        while let Some(item) = pair_rx.recv().await {
+            n += 1;
+            if main_tx.send(item.clone()).await.is_err() {
+                // Downstream closed — still drain into files so we don't lose audit trails.
+                let _ = file_tx.send(item).await;
+                while let Some(rest) = pair_rx.recv().await {
+                    n += 1;
+                    let _ = file_tx.send(rest).await;
+                }
+                break;
+            }
+            if file_tx.send(item).await.is_err() {
+                warn!(
+                    "[call_hits_m8:{}] file tee closed after {} pairs; continuing main only",
+                    tee_tag, n
+                );
+                while let Some(rest) = pair_rx.recv().await {
+                    n += 1;
+                    if main_tx.send(rest).await.is_err() {
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        info!("[call_hits_m8:{}] tee finished — {} ReducedRead pairs", tee_tag, n);
+        Ok::<(), anyhow::Error>(())
+    });
+    cleanup_tasks.push(tee_handle);
 
-    let mut dedup_branches = dedup_branches.into_iter();
+    // Both files written from the same struct → identical line counts and order.
+    let dedup_path = config.out_dir.join(rename_file_path(
+        &sample_base_buf,
+        None,
+        Some(&format!("{}.dedup.m8", tag)),
+        "_",
+    ));
+    let summary_path = config.out_dir.join(rename_file_path(
+        &sample_base_buf,
+        None,
+        Some(&format!("{}.hitsummary.tab", tag)),
+        "_",
+    ));
+    let write_tag = tag.clone();
 
-    let dedup_main = ReceiverStream::new(dedup_branches.next().ok_or(PipelineError::EmptyStream)?);
+    let file_write_handle = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
 
-    let dedup_file_stream =
-        ReceiverStream::new(dedup_branches.next().ok_or(PipelineError::EmptyStream)?);
+        let dedup_file = tokio::fs::File::create(&dedup_path)
+            .await
+            .map_err(|e| anyhow!("create {}: {}", dedup_path.display(), e))?;
+        let summary_file = tokio::fs::File::create(&summary_path)
+            .await
+            .map_err(|e| anyhow!("create {}: {}", summary_path.display(), e))?;
 
-    let call_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
-            None,
-            Some(&format!("{}.dedup.m8", tag)),
-            "_",
-        )),
-        dedup_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "call_hits_m8_dedup",
-    )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(call_file_write_task);
+        let mut dedup_w = tokio::io::BufWriter::with_capacity(8 << 20, dedup_file);
+        let mut summary_w = tokio::io::BufWriter::with_capacity(8 << 20, summary_file);
 
-    let summary_stream = ReceiverStream::new(summary_rx);
-    let (summary_branches, summary_router_done_rx) = fanout_to_channels(
-        summary_stream,
-        2,
-        "call_hits_m8_summary",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        let mut n = 0u64;
+        while let Some(r) = file_rx.recv().await {
+            // summarize_m8_hits already embeds trailing '\n' in both buffers
+            dedup_w
+                .write_all(&r.dedup)
+                .await
+                .map_err(|e| anyhow!("write dedup.m8: {}", e))?;
+            summary_w
+                .write_all(&r.summary)
+                .await
+                .map_err(|e| anyhow!("write summary.txt: {}", e))?;
+            n += 1;
+        }
 
-    // track router task instead of oneshot receiver
-    cleanup_receivers.push(summary_router_done_rx);
+        dedup_w
+            .flush()
+            .await
+            .map_err(|e| anyhow!("flush dedup.m8: {}", e))?;
+        summary_w
+            .flush()
+            .await
+            .map_err(|e| anyhow!("flush summary.txt: {}", e))?;
 
-    let mut summary_branches = summary_branches.into_iter();
+        info!(
+            "[call_hits_m8:{}] wrote {} paired lines → {} and {}",
+            write_tag,
+            n,
+            dedup_path.display(),
+            summary_path.display()
+        );
+        Ok::<(), anyhow::Error>(())
+    });
+    cleanup_tasks.push(file_write_handle);
 
-    let summary_main =
-        ReceiverStream::new(summary_branches.next().ok_or(PipelineError::EmptyStream)?);
+    info!(
+        "[call_hits_m8:{}] wiring complete — ReducedRead stream ready",
+        tag
+    );
 
-    let summary_file_stream =
-        ReceiverStream::new(summary_branches.next().ok_or(PipelineError::EmptyStream)?);
-
-    let summary_file_write_task = write_byte_stream_to_file(
-        &config.out_dir.join(rename_file_path(
-            &sample_base_buf,
-            None,
-            Some(&format!("{}.summary.txt", tag)),
-            "_",
-        )),
-        summary_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "call_hits_m8_summary",
-    )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(summary_file_write_task);
-
-    info!("[call_hits_m8:{}] wiring complete — outputs ready", tag);
-
-    Ok((dedup_main, summary_main, cleanup_tasks, cleanup_receivers))
+    Ok((
+        ReceiverStream::new(main_rx),
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 /// Summarizes BLAST m8 hits for a single read into a ReducedRead structure.
@@ -1377,6 +1359,69 @@ pub async fn call_hits_m8(
 /// # Returns
 ///
 /// Option<ReducedRead>: the summarized read info, or None if no hits pass filters
+/// Python `call_hit_level_v2`: species-level majority only.
+/// Returns (level, taxid, best_accession).
+/// level is always 1 on success, -1 on empty.
+/// Python `call_hit_level_v2`: species-level majority only.
+/// Returns `(level, taxid, best_accession)`.
+/// `level` is always `1` on success, `-1` when there are no species hits.
+fn call_hit_level_v2(
+    species_hits: &AHashMap<i32, Vec<String>>,
+    taxid_order: &[i32],
+) -> (i32, i32, Option<String>) {
+    let mut max_match = 0usize;
+    let mut taxid_candidates: Vec<i32> = Vec::new();
+
+    for &taxid in taxid_order {
+        let n = species_hits.get(&taxid).map(|v| v.len()).unwrap_or(0);
+        if n > max_match {
+            taxid_candidates.clear();
+            taxid_candidates.push(taxid);
+            max_match = n;
+        } else if n == max_match && max_match > 0 {
+            taxid_candidates.push(taxid);
+        }
+    }
+
+    if max_match == 0 {
+        return (-1, -1, None);
+    }
+
+    let selected_taxid = if taxid_candidates.len() == 1 {
+        taxid_candidates[0]
+    } else {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+        *taxid_candidates
+            .choose(&mut rng)
+            .unwrap_or(&taxid_candidates[0])
+    };
+
+    // most_frequent_accession unchanged (list order is already hit order)
+    let accession_list = species_hits
+        .get(&selected_taxid)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
+    let mut best_accession: Option<String> = None;
+    let mut best_count = 0usize;
+    let mut seen: AHashMap<&str, usize> = AHashMap::new();
+    for a in accession_list {
+        let c = seen.entry(a.as_str()).and_modify(|x| *x += 1).or_insert(1);
+        if *c > best_count {
+            best_count = *c;
+            best_accession = Some(a.clone());
+        }
+    }
+
+    (1, selected_taxid, best_accession)
+}
+
+/// Port of Python `_call_hits_m8_work` hit-calling for one read's hits.
+///
+/// - Only best-bitscore (and exact ties) participate
+/// - Level / taxid / accession from `call_hit_level_v2` (species majority)
+/// - Summary lineage from the chosen accession
+/// - Dedup m8 = best-bitscore row whose accession matches the choice
 pub fn summarize_m8_hits<F>(
     seq: u64,
     read_id: String,
@@ -1385,97 +1430,159 @@ pub fn summarize_m8_hits<F>(
     acc2taxid_map: &Map<Vec<u8>>,
     should_keep_filter: &F,
     min_aln_len: u64,
+    log_misses: bool,
 ) -> Option<ReducedRead>
 where
     F: Fn(&[i32]) -> bool + Send + Sync,
 {
-    // Preserve existing semantics: ignore short hits, invalid accessions, invalid lineages,
-    // and only keep hits that pass should_keep_filter.
-    let mut valid_hits: Vec<&M8Record> = Vec::with_capacity(hits.len().min(64));
+    // ── 1. Resolve accession → taxid → lineage; drop short / unknown ──────
+    let mut resolved: Vec<(&M8Record, i32, Lineage)> = Vec::with_capacity(hits.len().min(64));
 
     for hit in hits {
         if hit.alen < min_aln_len {
             continue;
         }
 
-        if let Some(taxid_u64) = acc2taxid_map.get(hit.tname.as_bytes()) {
-            let taxid = taxid_u64 as i32;
-            if taxid <= 0 {
+        let taxid_u64 = match acc2taxid_map.get(hit.tname.as_bytes()) {
+            Some(t) => t,
+            None => {
+                if log_misses {
+                    static LOGGED: AtomicU64 = AtomicU64::new(0);
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 20 {
+                        warn!(
+                            "[summarize_m8_hits] acc2taxid miss: q={} t={:?}",
+                            hit.qname, hit.tname
+                        );
+                    }
+                }
                 continue;
             }
+        };
 
-            let lineage = lineage_map.get(&taxid).cloned().unwrap_or([-1i32; 3]);
-            if !should_keep_filter(&lineage) {
-                continue;
-            }
-
-            valid_hits.push(hit);
+        let taxid = taxid_u64 as i32;
+        if taxid <= 0 {
+            continue;
         }
+
+        let lineage = lineage_map
+            .get(&taxid)
+            .cloned()
+            .unwrap_or([-1i32; 3]);
+
+        resolved.push((hit, taxid, lineage));
     }
 
-    if valid_hits.is_empty() {
+    if resolved.is_empty() {
         return None;
     }
 
-    // Best hit = max bitscore, first seen wins on ties.
-    let mut best: Option<&M8Record> = None;
-    let mut max_bitscore = f64::NEG_INFINITY;
+    // ── 2. Best bitscore only (Python restarts accumulate on higher score) ─
+    let max_bitscore = resolved
+        .iter()
+        .map(|(h, _, _)| h.bitscore)
+        .fold(f64::NEG_INFINITY, f64::max);
 
-    for &h in &valid_hits {
-        if h.bitscore > max_bitscore {
-            max_bitscore = h.bitscore;
-            best = Some(h);
+    let best_hits: Vec<(&M8Record, i32, Lineage)> = resolved
+        .into_iter()
+        .filter(|(h, _, _)| (h.bitscore - max_bitscore).abs() < 1e-12)
+        .collect();
+
+    // ── 3. Species-level taxid → [accession, ...] (skip negative species) ─
+    // In summarize_m8_hits, when building species_hits:
+    let mut species_hits: AHashMap<i32, Vec<String>> = AHashMap::new();
+    let mut taxid_order: Vec<i32> = Vec::new(); // first-seen order
+
+    for (hit, _taxid, lineage) in &best_hits {
+        let species_taxid = lineage[0];
+        if species_taxid < 0 {
+            continue;
+        }
+        use std::collections::hash_map::Entry;
+        match species_hits.entry(species_taxid) {
+            Entry::Vacant(v) => {
+                taxid_order.push(species_taxid);
+                v.insert(vec![hit.tname.clone()]);
+            }
+            Entry::Occupied(mut o) => {
+                o.get_mut().push(hit.tname.clone());
+            }
         }
     }
 
-    let best = best?;
+
+
+    // ── 4. call_hit_level_v2 ──────────────────────────────────────────────
+    let (hit_level, hit_taxid, best_accession) =
+        call_hit_level_v2(&species_hits, &taxid_order);
+
+    if hit_level < 0 {
+        return None;
+    }
+    let best_accession = match best_accession {
+        Some(a) => a,
+        None => return None,
+    };
+
+    if hit_taxid > 0 && !should_keep_filter(&[hit_taxid]) {
+        return None;
+    }
+
+    // ── 5. Lineage columns from chosen accession (Python get_lineage) ─────
+    let (species_taxid, genus_taxid, family_taxid) = {
+        let t = acc2taxid_map
+            .get(best_accession.as_bytes())
+            .map(|x| x as i32)
+            .unwrap_or(-1);
+        if t > 0 {
+            let lin = lineage_map.get(&t).cloned().unwrap_or([-1i32; 3]);
+            (lin[0], lin[1], lin[2])
+        } else {
+            (-1, -1, -1)
+        }
+    };
+
+    // ── 6. Dedup m8: best-bitscore row with tname == best_accession ───────
+    let m8_src = best_hits
+        .iter()
+        .find(|(h, _, _)| h.tname == best_accession)
+        .map(|(h, _, _)| *h)
+        .or_else(|| best_hits.first().map(|(h, _, _)| *h))?;
 
     let dedup_line = format!(
         "{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3e}\t{:.3}\n",
-        best.qname,
-        best.tname,
-        best.pident,
-        best.alen,
-        best.mismatch,
-        best.gapopen,
-        best.qstart,
-        best.qend,
-        best.tstart,
-        best.tend,
-        best.evalue,
-        best.bitscore
+        m8_src.qname,
+        m8_src.tname,
+        m8_src.pident,
+        m8_src.alen,
+        m8_src.mismatch,
+        m8_src.gapopen,
+        m8_src.qstart,
+        m8_src.qend,
+        m8_src.tstart,
+        m8_src.tend,
+        m8_src.evalue,
+        m8_src.bitscore
     )
-    .into_bytes();
+        .into_bytes();
 
-    // Keep the same consensus logic as the current code.
-    let valid_owned: Vec<M8Record> = valid_hits.into_iter().cloned().collect();
-    let wrapped_filter = Arc::new(|l: &[i32]| should_keep_filter(l));
-
-    let (tax_level, _cons_taxid, consensus_hits) =
-        consensus_level(&valid_owned, lineage_map, acc2taxid_map, &wrapped_filter).unwrap_or((
-            0,
-            0,
-            Vec::new(),
-        ));
-
-    let first_lineage = consensus_hits
-        .first()
-        .and_then(|h| acc2taxid_map.get(h.tname.as_bytes()))
-        .map(|taxid_u64| taxid_u64 as i32)
-        .and_then(|taxid| lineage_map.get(&taxid).cloned())
-        .unwrap_or([-1i32; 3]);
-
+    // ── 7. HitSummary 7-col ───────────────────────────────────────────────
     let summary_line = format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\n",
-        read_id, best.tname, first_lineage[0], first_lineage[1], first_lineage[2], tax_level
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        read_id,
+        hit_level,
+        hit_taxid,
+        best_accession,
+        species_taxid,
+        genus_taxid,
+        family_taxid
     )
-    .into_bytes();
+        .into_bytes();
 
     Some(ReducedRead {
         seq,
         dedup: dedup_line,
         summary: summary_line,
-        accession: best.tname.clone(),
+        accession: best_accession,
     })
 }
 
@@ -1598,214 +1705,244 @@ fn parse_read_taxid_from_hitsummary(line: &str) -> Option<(String, i32)> {
 ///
 /// Result<()>: success or error
 pub async fn generate_taxon_count_json_from_m8(
-    m8_stream_rx: ReceiverStream<ParseOutput>,
-    hit_summary_stream_rx: ReceiverStream<ParseOutput>,
+    mut m8_stream_rx: ReceiverStream<ParseOutput>,
+    mut hit_summary_stream_rx: ReceiverStream<ParseOutput>,
     db_type: &str,
     lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    output_tx: mpsc::Sender<ParseOutput>,
-    concurrency: usize,
-    batch_size_lines: usize,
+    output_tx: mpsc::UnboundedSender<ParseOutput>,
+    _concurrency: usize,      // call-site compat; global agg is sequential
+    _batch_size_lines: usize, // call-site compat
 ) -> Result<()> {
-    if concurrency == 0 {
-        return Err(anyhow::anyhow!("concurrency must be > 0"));
-    }
+    // Python: zip HitSummary × m8, assert same read_id, global aggregation tree.
+    const MIN_HIT_FIELDS: usize = 7;
+    const MIN_NORMAL_POSITIVE_DOUBLE: f64 = 2.2250738585072014e-308; // ~2^-1022
+    const NUM_RANKS: usize = 3;
 
-    let db_type = db_type.to_string();
+    let count_type = db_type.to_string();
+    let count_type_upper = count_type.to_uppercase();
 
-    // Bounded mpsc channel — hard concurrency cap + backpressure
-    let (job_tx, job_rx) = mpsc::channel::<(Vec<String>, Vec<String>)>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+    // agg_key = cleaned lineage suffix (species,genus,family) → chomp lowest rank
+    let mut aggregation: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
+    let mut pairs = 0u64;
+    let mut skipped = 0u64;
 
-    // Producer: build batches and send to bounded channel (exact same loop as before)
-    let producer_handle = tokio::spawn({
-        let mut m8_stream = m8_stream_rx;
-        let mut hit_stream = hit_summary_stream_rx;
-        async move {
-            let mut batch_m8 = Vec::with_capacity(batch_size_lines);
-            let mut batch_hit = Vec::with_capacity(batch_size_lines);
+    loop {
+        let m8_item = m8_stream_rx.next().await;
+        let hit_item = hit_summary_stream_rx.next().await;
 
-            loop {
-                let m8_item = m8_stream.next().await;
-                let hit_item = hit_stream.next().await;
-
-                match (m8_item, hit_item) {
-                    (Some(m8), Some(hit)) => {
-                        if let Ok(bytes) = m8.to_bytes() {
-                            let line = String::from_utf8_lossy(&bytes);
-                            let trimmed = line.trim_end().to_string();
-                            if !trimmed.is_empty() {
-                                batch_m8.push(trimmed);
-                            }
-                        }
-                        if let Ok(bytes) = hit.to_bytes() {
-                            let line = String::from_utf8_lossy(&bytes);
-                            let trimmed = line.trim_end().to_string();
-                            if !trimmed.is_empty() {
-                                batch_hit.push(trimmed);
-                            }
-                        }
-
-                        if batch_m8.len() >= batch_size_lines && batch_hit.len() >= batch_size_lines
-                        {
-                            if job_tx
-                                .send((
-                                    std::mem::take(&mut batch_m8),
-                                    std::mem::take(&mut batch_hit),
-                                ))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {
-                        // final partial batch
-                        if !batch_m8.is_empty() || !batch_hit.is_empty() {
-                            let _ = job_tx.send((batch_m8, batch_hit)).await;
-                        }
-                        break;
-                    }
-                }
+        match (m8_item, hit_item) {
+            (None, None) => break,
+            (None, Some(_)) | (Some(_), None) => {
+                return Err(anyhow!(
+                    "[generate_taxon_count_json_from_m8:{}] m8/hit streams ended at different lengths (pairs so far={})",
+                    count_type,
+                    pairs
+                ));
             }
-            drop(job_tx);
-            Ok::<(), anyhow::Error>(())
-        }
-    });
-
-    // Fixed worker pool — exactly `concurrency` workers (hard cap)
-    let mut workers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let rx = shared_rx.clone();
-        let output_tx = output_tx.clone();
-        let lineage_map = lineage_map.clone();
-        let should_keep_filter = should_keep_filter.clone();
-        let duplicate_clusters = duplicate_clusters.clone();
-        let db_type = db_type.clone();
-
-        let worker = tokio::spawn(async move {
-            loop {
-                let job = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
+            (Some(m8_item), Some(hit_item)) => {
+                let m8_bytes = match m8_item.to_bytes() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                let hit_bytes = match hit_item.to_bytes() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
                 };
 
-                if let Some((batch_m8, batch_hit)) = job {
-                    let mut buckets: AHashMap<Taxid, AggBucket> = AHashMap::new();
+                let m8_line = String::from_utf8_lossy(&m8_bytes);
+                let m8_line = m8_line.trim_end();
+                let hit_line = String::from_utf8_lossy(&hit_bytes);
+                let hit_line = hit_line.trim_end();
+                if m8_line.is_empty() || hit_line.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
 
-                    for (m8_line, hit_line) in batch_m8.into_iter().zip(batch_hit) {
-                        let hit_fields: Vec<&str> = hit_line.split('\t').collect();
-                        if hit_fields.len() < 10 {
-                            continue;
-                        }
+                let hit_fields: Vec<&str> = hit_line.split('\t').collect();
+                if hit_fields.len() < MIN_HIT_FIELDS {
+                    skipped += 1;
+                    continue;
+                }
 
-                        let read_id = hit_fields[0].to_string();
-                        let level = hit_fields
-                            .get(1)
-                            .and_then(|s| s.parse::<u8>().ok())
-                            .unwrap_or(0);
-                        let taxid = hit_fields
-                            .get(2)
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(0);
+                // 7-col: read_id, level, taxid, accession, species, genus, family
+                // optional [7] = source_count_type (merged path only)
+                let read_id = hit_fields[0];
+                let hit_level: i32 = hit_fields[1].parse().unwrap_or(-1);
+                let hit_taxid: i32 = hit_fields[2].parse().unwrap_or(-1);
+                let hit_source_count_type = hit_fields
+                    .get(7)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
 
-                        if taxid <= 0 || level == 0 {
-                            continue;
-                        }
+                let m8 = match M8Record::parse_line_nt(m8_line)
+                    .or_else(|_| M8Record::parse_line_nr(m8_line))
+                {
+                    Ok(m) => m,
+                    Err(_) => {
+                        skipped += 1;
+                        continue;
+                    }
+                };
 
-                        if let Ok(m8) = M8Record::parse_line_nt(&m8_line)
-                            .or_else(|_| M8Record::parse_line_nr(&m8_line))
-                        {
-                            let bucket = buckets.entry(taxid).or_default();
+                // Python: assert blastn_6_row["qseqid"] == read_id
+                if m8.qname != read_id {
+                    return Err(anyhow!(
+                        "[generate_taxon_count_json_from_m8:{}] read_ids do not match: m8={} hit={}",
+                        count_type,
+                        m8.qname,
+                        read_id
+                    ));
+                }
 
-                            bucket.nonunique_count += 1;
-                            bucket.unique_count += duplicate_clusters
-                                .get(&read_id)
-                                .map(|entry| entry.value().size)
-                                .unwrap_or(1);
+                if hit_taxid <= 0 {
+                    skipped += 1;
+                    continue;
+                }
 
-                            bucket.base_count += 1;
-                            bucket.sum_percent_identity += m8.pident;
-                            bucket.sum_alignment_length += m8.alen as f64;
-                            bucket.sum_e_value += m8.evalue;
-                            bucket.source_count_type.insert(db_type.clone());
-                        }
+                let mut alignment_length = m8.alen as f64;
+                // Python: merged_NT_NR + NR → ×3 (not used in per-db blast_contigs path)
+                if count_type_upper == "MERGED_NT_NR"
+                    && hit_source_count_type.as_deref() == Some("NR")
+                {
+                    alignment_length *= 3.0;
+                }
+
+                let percent_identity = m8.pident;
+                let mut e_value = m8.evalue;
+                if e_value <= MIN_NORMAL_POSITIVE_DOUBLE {
+                    e_value = MIN_NORMAL_POSITIVE_DOUBLE;
+                }
+                let e_value_log10 = e_value.log10();
+
+                let raw_lineage = lineage_map
+                    .get(&hit_taxid)
+                    .cloned()
+                    .unwrap_or([-1i32; 3]);
+                let cleaned = validate_taxid_lineage(&raw_lineage, hit_taxid, hit_level as u8);
+
+                if !should_keep_filter(&cleaned) {
+                    skipped += 1;
+                    continue;
+                }
+
+                let cluster_size = duplicate_clusters
+                    .get(read_id)
+                    .map(|e| e.value().size)
+                    .unwrap_or(1);
+
+                // Aggregate up the tree (chomp lowest rank each step)
+                let mut agg_key: Vec<i32> = cleaned.to_vec();
+                while !agg_key.is_empty() {
+                    let bucket = aggregation.entry(agg_key.clone()).or_default();
+                    bucket.nonunique_count += cluster_size;
+                    bucket.unique_count += 1;
+                    // Python default read_to_base_count={} → base_count stays 0 here
+                    bucket.base_count += 0;
+                    bucket.sum_percent_identity += percent_identity;
+                    bucket.sum_alignment_length += alignment_length;
+                    bucket.sum_e_value += e_value_log10;
+                    if let Some(ref src) = hit_source_count_type {
+                        bucket.source_count_type.insert(src.clone());
                     }
 
-                    // Emit results
-                    for (taxid, bucket) in buckets {
-                        if let Some(lineage) = lineage_map.get(&taxid) {
-                            if !should_keep_filter(lineage) {
-                                continue;
-                            }
+                    agg_key = agg_key[1..].to_vec();
+                }
 
-                            let dcr = if bucket.nonunique_count > 0 {
-                                bucket.unique_count as f64 / bucket.nonunique_count as f64
-                            } else {
-                                0.0
-                            };
-
-                            let percent_identity = if bucket.base_count > 0 {
-                                bucket.sum_percent_identity / bucket.base_count as f64
-                            } else {
-                                0.0
-                            };
-
-                            let alignment_length = if bucket.base_count > 0 {
-                                bucket.sum_alignment_length / bucket.base_count as f64
-                            } else {
-                                0.0
-                            };
-
-                            let e_value = if bucket.base_count > 0 {
-                                bucket.sum_e_value / bucket.base_count as f64
-                            } else {
-                                0.0
-                            };
-
-                            let count = TaxonCount {
-                                tax_id: taxid,
-                                tax_level: 1,
-                                genus_taxid: lineage[1],
-                                family_taxid: lineage[2],
-                                count: bucket.unique_count,
-                                nonunique_count: bucket.nonunique_count,
-                                unique_count: bucket.unique_count,
-                                dcr,
-                                percent_identity,
-                                alignment_length,
-                                e_value,
-                                count_type: db_type.clone(),
-                                base_count: bucket.base_count,
-                                source_count_type: Some(
-                                    bucket.source_count_type.into_iter().collect(),
-                                ),
-                            };
-
-                            let json = serde_json::to_string(&count)? + "\n";
-                            let _ = output_tx.send(ParseOutput::Bytes(Bytes::from(json))).await;
-                        }
-                    }
-                } else {
-                    break;
+                pairs += 1;
+                if pairs % 100_000 == 0 {
+                    info!(
+                        "[generate_taxon_count_json_from_m8:{}] pairs={} taxa_keys={}",
+                        count_type,
+                        pairs,
+                        aggregation.len()
+                    );
                 }
             }
-            Ok::<(), anyhow::Error>(())
-        });
-        workers.push(worker);
-    }
-
-    // Wait for producer + all workers
-    producer_handle.await??;
-    for w in workers {
-        w.await??;
+        }
     }
 
     info!(
-        "Finished taxon count JSON generation for {} (bounded channel, {} workers)",
-        db_type, concurrency
+        "[generate_taxon_count_json_from_m8:{}] loop done: pairs={} skipped={} keys={}",
+        count_type,
+        pairs,
+        skipped,
+        aggregation.len()
+    );
+
+    // Python loop 2 — one row per agg_key
+    let mut emitted = 0usize;
+    for (agg_key, bucket) in aggregation {
+        let unique_count = bucket.unique_count;
+        let nonunique_count = bucket.nonunique_count;
+        if unique_count == 0 {
+            continue;
+        }
+
+        let tax_level = (NUM_RANKS - agg_key.len() + 1) as i32;
+        let tax_id = agg_key[0];
+
+        let genus_taxid = if tax_level <= 2 {
+            agg_key[2 - tax_level as usize]
+        } else {
+            -200
+        };
+        let family_taxid = if tax_level <= 3 {
+            agg_key
+                .get(3 - tax_level as usize)
+                .copied()
+                .unwrap_or(-300)
+        } else {
+            -300
+        };
+
+        // omit / null when no source was present on any contributing hit
+        let source_vec = {
+            let mut v: Vec<String> = bucket.source_count_type.into_iter().collect();
+            if v.is_empty() {
+                None
+            } else {
+                v.sort_unstable();
+                Some(v)
+            }
+        };
+
+        let n = unique_count as f64;
+        let count = TaxonCount {
+            tax_id,
+            tax_level: tax_level as u8,
+            genus_taxid,
+            family_taxid,
+            count: nonunique_count as u64,
+            nonunique_count: nonunique_count as u64,
+            unique_count: unique_count as u64,
+            dcr: nonunique_count as f64 / n,
+            percent_identity: bucket.sum_percent_identity / n,
+            alignment_length: bucket.sum_alignment_length / n,
+            e_value: bucket.sum_e_value / n,
+            count_type: count_type_upper.clone(),
+            base_count: bucket.base_count as u64,
+            source_count_type: source_vec,
+        };
+
+        let json = serde_json::to_string(&count)? + "\n";
+        output_tx
+            .send(ParseOutput::Bytes(Bytes::from(json)))
+            .map_err(|_| anyhow!("refined_counts output closed"))?;
+        emitted += 1;
+    }
+
+    info!(
+        "Finished taxon count JSON generation for {} ({} taxa, {} pairs)",
+        count_type_upper, emitted, pairs
     );
     Ok(())
 }
@@ -1827,26 +1964,27 @@ pub async fn generate_taxon_count_json_from_m8(
 /// Result containing a vector of taxon counts
 pub async fn generate_taxon_counts(
     config: Arc<RunConfig>,
-    m8_stream: ReceiverStream<ParseOutput>,
-    summary_stream: ReceiverStream<ParseOutput>,
+    mut pairs: impl Stream<Item = ReducedRead> + Unpin + Send,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     count_type: String,
-    source_count_type: Option<String>, // kept for exact call-site compatibility
+    source_count_type: Option<String>,
 ) -> Result<Vec<TaxonCount>, PipelineError> {
     use std::time::Duration;
+    use tokio::time::Instant;
 
     let num_workers = compute_phase_concurrency(
         &config,
         "generate_taxon_counts",
-        0.6, // ~600 MB transient per worker (lineage cache + agg map)
+        0.6,
         2.5,
-        128, // EPYC 84c sweet spot
-        8,   // still useful on MacBook Air
-    );
+        128,
+        8,
+    )
+        .max(1);
 
     info!(
-        "generate_taxon_counts({}) — {} workers, per-worker local AHashMap + lineage cache (exact Python semantics)",
+        "generate_taxon_counts({}) — {} workers (ReducedRead pairs, no cross-stream zip)",
         count_type, num_workers
     );
 
@@ -1854,8 +1992,6 @@ pub async fn generate_taxon_counts(
         .map(|_| mpsc::channel::<(Vec<Bytes>, Vec<Bytes>)>(64))
         .unzip();
 
-    // Spawn workers — each owns a completely private aggregation map + cache.
-    // We also time each recv() so we can see whether workers are starved or blocked.
     let worker_handles: Vec<_> = worker_rxs
         .into_iter()
         .enumerate()
@@ -1868,27 +2004,13 @@ pub async fn generate_taxon_counts(
             tokio::spawn(async move {
                 let mut agg: AHashMap<Vec<i32>, AggBucket> = AHashMap::new();
                 let mut lineage_cache: AHashMap<i32, Vec<i32>> = AHashMap::new();
-
                 let mut batches = 0usize;
                 let mut total_pairs = 0usize;
-                let mut max_recv_wait = Duration::from_secs(0);
-                let mut max_batch_process = Duration::from_secs(0);
                 let start = Instant::now();
 
-                loop {
-                    let recv_start = Instant::now();
-                    let maybe_batch = rx.recv().await;
-                    let recv_wait = recv_start.elapsed();
-                    if recv_wait > max_recv_wait {
-                        max_recv_wait = recv_wait;
-                    }
-
-                    let Some((m8_batch, hit_batch)) = maybe_batch else {
-                        break;
-                    };
-
+                while let Some((m8_batch, hit_batch)) = rx.recv().await {
+                    debug_assert_eq!(m8_batch.len(), hit_batch.len());
                     batches += 1;
-                    let batch_start = Instant::now();
 
                     for (m8_bytes, hit_bytes) in m8_batch.into_iter().zip(hit_batch) {
                         total_pairs += 1;
@@ -1903,182 +2025,73 @@ pub async fn generate_taxon_counts(
                             src.as_deref(),
                         )?;
                     }
-
-                    let batch_elapsed = batch_start.elapsed();
-                    if batch_elapsed > max_batch_process {
-                        max_batch_process = batch_elapsed;
-                    }
-
-                    // if recv_wait >= Duration::from_millis(100)
-                    //     || batch_elapsed >= Duration::from_millis(100)
-                    // {
-                    //     debug!(
-                    //         "[generate_taxon_counts:{}] worker {} recv_wait={:?} batch_time={:?} batches={} pairs={} agg={} cache={}",
-                    //         ct,
-                    //         worker_idx,
-                    //         recv_wait,
-                    //         batch_elapsed,
-                    //         batches,
-                    //         total_pairs,
-                    //         agg.len(),
-                    //         lineage_cache.len(),
-                    //     );
-                    // }
-
-                    // if last_log.elapsed() >= Duration::from_secs(10) {
-                    //     info!(
-                    //         "[generate_taxon_counts:{}] worker {} progress: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} agg={} cache={} elapsed={:?}",
-                    //         ct,
-                    //         worker_idx,
-                    //         batches,
-                    //         total_pairs,
-                    //         max_recv_wait,
-                    //         max_batch_process,
-                    //         agg.len(),
-                    //         lineage_cache.len(),
-                    //         start.elapsed(),
-                    //     );
-                    //     last_log = Instant::now();
-                    // }
                 }
 
                 info!(
-                    "[generate_taxon_counts:{}] worker {} done: batches={} pairs={} max_recv_wait={:?} max_batch_time={:?} elapsed={:?}",
+                    "[generate_taxon_counts:{}] worker {} done: batches={} pairs={} elapsed={:?}",
                     ct,
                     worker_idx,
                     batches,
                     total_pairs,
-                    max_recv_wait,
-                    max_batch_process,
-                    start.elapsed(),
+                    start.elapsed()
                 );
-
                 Ok::<AHashMap<Vec<i32>, AggBucket>, anyhow::Error>(agg)
             })
         })
         .collect();
 
-    // Producer: pair the two streams and round-robin to workers.
-    // Keep the original lockstep semantics, but add visibility at each await boundary.
-    let mut m8_batch: Vec<Bytes> = Vec::with_capacity(8192);
-    let mut hit_batch: Vec<Bytes> = Vec::with_capacity(8192);
+    const BATCH_SIZE: usize = 8192;
+    let mut m8_batch: Vec<Bytes> = Vec::with_capacity(BATCH_SIZE);
+    let mut hit_batch: Vec<Bytes> = Vec::with_capacity(BATCH_SIZE);
     let mut batch_idx = 0usize;
-    let mut total_pairs = 0usize;
-    let mut m8_items_seen = 0usize;
-    let mut hit_items_seen = 0usize;
-
-    let mut m8_iter = m8_stream;
-    let mut hit_iter = summary_stream;
-
-    let mut max_m8_wait = Duration::from_secs(0);
-    let mut max_hit_wait = Duration::from_secs(0);
-    let mut max_send_wait = Duration::from_secs(0);
-    let mut last_log = Instant::now();
+    let mut total_pairs = 0u64;
+    let mut skipped_empty = 0u64;
     let producer_start = Instant::now();
+    let mut last_log = Instant::now();
 
-    let mut m8_closed = false;
-    let mut hit_closed = false;
+    while let Some(pair) = pairs.next().await {
+        let m8_bytes = Bytes::from(pair.dedup);
+        let hit_bytes = Bytes::from(pair.summary);
 
-    loop {
-        let (m8_res, hit_res) = tokio::join!(
-            async {
-                let start = Instant::now();
-                let item = m8_iter.next().await;
-                (item, start.elapsed())
-            },
-            async {
-                let start = Instant::now();
-                let item = hit_iter.next().await;
-                (item, start.elapsed())
-            }
-        );
-
-        let (m8_item, m8_wait) = m8_res;
-        let (hit_item, hit_wait) = hit_res;
-
-        if m8_wait > max_m8_wait {
-            max_m8_wait = m8_wait;
+        if m8_bytes.is_empty() && hit_bytes.is_empty() {
+            skipped_empty += 1;
+            continue;
         }
-        if hit_wait > max_hit_wait {
-            max_hit_wait = hit_wait;
-        }
-
-        if m8_wait >= Duration::from_millis(50) || hit_wait >= Duration::from_millis(50) {
-            let ratio = if hit_wait.as_nanos() > 0 {
-                m8_wait.as_secs_f64() / hit_wait.as_secs_f64()
-            } else {
-                0.0
-            };
-
-            let classification = if m8_wait > hit_wait * 5 {
-                "STARVING_ON_M8"
-            } else if hit_wait > m8_wait * 5 {
-                "STARVING_ON_SUMMARY"
-            } else {
-                "BOTH_SLOW"
-            };
-
-            warn!(
-                "[generate_taxon_counts:{}] WAIT: m8={:?} hit={:?} ratio={:.2} class={} total_pairs={} batches={}",
+        if m8_bytes.is_empty() || hit_bytes.is_empty() {
+            return Err(PipelineError::Other(anyhow!(
+                "generate_taxon_counts({}): empty dedup or summary inside ReducedRead at pairs={}",
                 count_type,
-                m8_wait,
-                hit_wait,
-                ratio,
-                classification,
-                total_pairs,
-                batch_idx,
-            );
+                total_pairs
+            )));
         }
 
-        let m8_present = m8_item.is_some();
-        let hit_present = hit_item.is_some();
-
-        let (Some(m8_item), Some(hit_item)) = (m8_item, hit_item) else {
-            if !m8_present && !m8_closed {
-                m8_closed = true;
-                warn!(
-                    "[generate_taxon_counts:{}] m8 stream closed at pairs={} batches={}",
-                    count_type, total_pairs, batch_idx
-                );
-            }
-            if !hit_present && !hit_closed {
-                hit_closed = true;
-                warn!(
-                    "[generate_taxon_counts:{}] summary stream closed at pairs={} batches={}",
-                    count_type, total_pairs, batch_idx
-                );
-            }
-
-            warn!(
-                "[generate_taxon_counts:{}] STREAM CLOSED: m8_present={} hit_present={} total_pairs={} batches={}",
-                count_type,
-                m8_present,
-                hit_present,
-                total_pairs,
-                batch_idx
-            );
-            break;
-        };
-
-        if let ParseOutput::Bytes(b) = m8_item {
-            if !b.is_empty() {
-                m8_items_seen += 1;
-                m8_batch.push(b);
-                total_pairs += 1;
+        // Integrity check inside the struct (should never fire if call_hits is correct)
+        {
+            let m8_id = m8_bytes
+                .split(|&b| b == b'\t')
+                .next()
+                .unwrap_or_default();
+            let hit_id = hit_bytes
+                .split(|&b| b == b'\t')
+                .next()
+                .unwrap_or_default();
+            if m8_id != hit_id {
+                return Err(PipelineError::Other(anyhow!(
+                    "generate_taxon_counts({}): ReducedRead internal mismatch m8={:?} hit={:?} at pairs={}",
+                    count_type,
+                    String::from_utf8_lossy(m8_id),
+                    String::from_utf8_lossy(hit_id),
+                    total_pairs
+                )));
             }
         }
 
-        if let ParseOutput::Bytes(b) = hit_item {
-            if !b.is_empty() {
-                hit_items_seen += 1;
-                hit_batch.push(b);
-            }
-        }
+        m8_batch.push(m8_bytes);
+        hit_batch.push(hit_bytes);
+        total_pairs += 1;
 
-        if m8_batch.len() >= 8192 && hit_batch.len() >= 8192 {
+        if m8_batch.len() >= BATCH_SIZE {
             let worker_idx = batch_idx % num_workers;
-
-            let send_start = Instant::now();
             worker_txs[worker_idx]
                 .send((
                     std::mem::take(&mut m8_batch),
@@ -2087,104 +2100,70 @@ pub async fn generate_taxon_counts(
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                        "generate_taxon_counts({}) worker send failed: {}",
+                        "generate_taxon_counts({}): worker {} send failed: {}",
                         count_type,
+                        worker_idx,
                         e
                     ))
                 })?;
-            let send_wait = send_start.elapsed();
-
-            if send_wait > max_send_wait {
-                max_send_wait = send_wait;
-            }
-
-            if m8_wait >= Duration::from_millis(100)
-                || hit_wait >= Duration::from_millis(100)
-                || send_wait >= Duration::from_millis(100)
-            {
-                info!(
-                    "[generate_taxon_counts:{}] batch {} waits: m8={:?} hit={:?} send={:?} total_pairs={} worker={}",
-                    count_type,
-                    batch_idx,
-                    m8_wait,
-                    hit_wait,
-                    send_wait,
-                    total_pairs,
-                    worker_idx,
-                );
-            }
-
             batch_idx += 1;
+            m8_batch = Vec::with_capacity(BATCH_SIZE);
+            hit_batch = Vec::with_capacity(BATCH_SIZE);
         }
 
         if last_log.elapsed() >= Duration::from_secs(10) {
             info!(
-                "[generate_taxon_counts:{}] producer progress: pairs={} batches={} max_waits(m8={:?}, hit={:?}, send={:?}) elapsed={:?}",
+                "[generate_taxon_counts:{}] producer: pairs={} batches={} skipped_empty={} elapsed={:?}",
                 count_type,
                 total_pairs,
                 batch_idx,
-                max_m8_wait,
-                max_hit_wait,
-                max_send_wait,
-                producer_start.elapsed(),
+                skipped_empty,
+                producer_start.elapsed()
             );
             last_log = Instant::now();
         }
     }
 
-    // Final partial batch
-    if !m8_batch.is_empty() || !hit_batch.is_empty() {
+    if !m8_batch.is_empty() {
         let worker_idx = batch_idx % num_workers;
-        let send_start = Instant::now();
         worker_txs[worker_idx]
             .send((m8_batch, hit_batch))
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "generate_taxon_counts({}) final worker send failed: {}",
+                    "generate_taxon_counts({}): final send failed: {}",
                     count_type,
                     e
                 ))
             })?;
-        let send_wait = send_start.elapsed();
-        if send_wait > max_send_wait {
-            max_send_wait = send_wait;
-        }
-
-        info!(
-            "[generate_taxon_counts:{}] final batch sent to worker {} in {:?}",
-            count_type, worker_idx, send_wait
-        );
+        batch_idx += 1;
     }
 
-    drop(worker_txs); // close all workers
+    drop(worker_txs);
 
-    // Merge the tiny partial maps from each worker.
     let partials: Vec<AHashMap<Vec<i32>, AggBucket>> = try_join_all(worker_handles)
         .await
         .map_err(|e| PipelineError::Other(e.into()))?
         .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PipelineError::Other(e))?;
 
     let global_agg = merge_aggregations(partials);
-
-    // Final Python Loop 2 — identical output shape
     let result = build_taxon_counts_list(global_agg, &count_type);
 
     info!(
-        "generate_taxon_counts({}) complete — {} taxa (max waits: m8={:?}, hit={:?}, send={:?})",
+        "generate_taxon_counts({}) complete — {} taxa from {} pairs ({} batches, {} empty pairs skipped)",
         count_type,
         result.len(),
-        max_m8_wait,
-        max_hit_wait,
-        max_send_wait,
+        total_pairs,
+        batch_idx,
+        skipped_empty
     );
 
     Ok(result)
 }
 
-/// Computes merged taxonomic counts from both NT and NR databases.
-///
+
 /// # Arguments
 ///
 /// * `config`: the run configuration
@@ -2208,247 +2187,250 @@ pub async fn generate_taxon_counts(
 /// Result containing a vector of cleanup tasks
 pub async fn compute_merged_taxon_counts(
     config: Arc<RunConfig>,
-    nt_m8_stream: mpsc::Receiver<ParseOutput>,
-    nt_hit_summary_stream: mpsc::Receiver<ParseOutput>,
+    mut nt_pairs: impl Stream<Item = ReducedRead> + Unpin + Send,
     nt_contig_summary: Vec<ContigSummaryEntry>,
-
-    nr_m8_stream: mpsc::Receiver<ParseOutput>,
-    nr_hit_summary_stream: mpsc::Receiver<ParseOutput>,
+    mut nr_pairs: impl Stream<Item = ReducedRead> + Unpin + Send,
     nr_contig_summary: Vec<ContigSummaryEntry>,
-
     _lineage_map: Arc<AHashMap<Taxid, Lineage>>,
     should_keep_filter: Arc<impl Fn(&[i32]) -> bool + Send + Sync + 'static>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-
     merged_m8_path: PathBuf,
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-    _nr_alignment_per_read: Arc<DashMap<String, SpeciesAlignmentResults, AHashRandomState>>,
-) -> Result<Vec<JoinHandle<Result<(), anyhow::Error>>>, PipelineError> {
+) -> Result<(Vec<TaxonCount>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
-    // 1. Parallel NR preload
-    let (nr_alignment_map, nr_hit_lines) = tokio::task::spawn_blocking(move || {
-        let mut alignment_map: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
-        let mut hit_lines: AHashMap<String, Bytes> = AHashMap::new();
-
-        let mut nr_hit_stream = ReceiverStream::new(nr_hit_summary_stream);
-
-        while let Some(item) = futures::executor::block_on(nr_hit_stream.next()) {
-            let bytes = match item.to_bytes() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let line = String::from_utf8_lossy(&bytes);
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let fields: Vec<&str> = trimmed.split('\t').collect();
-            if fields.len() < 10 {
-                continue;
-            }
-
-            let read_id = fields[0].to_string();
-            let contig_species = fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-            let read_species = fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
-
-            alignment_map.insert(
-                read_id.clone(),
-                SpeciesAlignmentResults {
-                    contig: contig_species,
-                    read: read_species,
-                },
-            );
-            hit_lines.insert(read_id, bytes);
+    // Refined HitSummary (7+ cols) in pair.summary:
+    //   [0] read_id  [1] level  [2] taxid  [3] accession
+    //   [4] species  [5] genus  [6] family
+    //   optional contig fields from update_read_dict
+    fn parse_alignment(fields: &[&str]) -> Option<(String, SpeciesAlignmentResults)> {
+        if fields.len() < 7 {
+            return None;
         }
-        (alignment_map, hit_lines)
-    })
-    .await
-    .map_err(|e| PipelineError::Other(e.into()))?;
+        let read_id = fields[0].to_string();
+        let species = fields[4].parse::<Taxid>().ok().filter(|&t| t > 0);
+        let contig = if fields.len() >= 10 {
+            fields[9].parse::<Taxid>().ok().filter(|&t| t > 0)
+        } else {
+            None
+        };
+        Some((
+            read_id,
+            SpeciesAlignmentResults {
+                contig,
+                read: species,
+            },
+        ))
+    }
 
-    // 2. Parallel file writers (background cleanup)
+    fn hit_line_for_counts(fields: &[&str], source: &str) -> Option<Bytes> {
+        if fields.len() < 7 {
+            return None;
+        }
+        Some(Bytes::from(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], source
+        )))
+    }
+
+    fn summary_fields(pair: &ReducedRead) -> Option<Vec<String>> {
+        let line = String::from_utf8_lossy(&pair.summary);
+        let line = line.trim_end();
+        if line.is_empty() {
+            return None;
+        }
+        Some(line.split('\t').map(|s| s.to_string()).collect())
+    }
+
+    // ── step 1: index NR pairs (Python opens NR hitsummary first) ─────────
+    let mut nr_alignment_per_read: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
+    let mut nr_pair_by_read: AHashMap<String, ReducedRead> = AHashMap::new();
+    let mut nr_hit_order: Vec<String> = Vec::new();
+
+    while let Some(pair) = nr_pairs.next().await {
+        let Some(fields) = summary_fields(&pair) else {
+            continue;
+        };
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let Some((read_id, align)) = parse_alignment(&field_refs) else {
+            continue;
+        };
+        nr_hit_order.push(read_id.clone());
+        nr_alignment_per_read.insert(read_id.clone(), align);
+        nr_pair_by_read.insert(read_id, pair);
+    }
+    info!(
+        "[merged] NR index: {} alignment entries",
+        nr_alignment_per_read.len()
+    );
+
+    // Disk writers
     let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
     let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
-
-    let (m8_write_tx, mut m8_write_rx) = mpsc::channel::<Bytes>(4096);
-    let (hit_write_tx, mut hit_write_rx) = mpsc::channel::<Bytes>(4096);
+    let (m8_write_tx, mut m8_write_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (hit_write_tx, mut hit_write_rx) = mpsc::unbounded_channel::<Bytes>();
 
     cleanup_tasks.push(tokio::spawn(async move {
-        while let Some(bytes) = m8_write_rx.recv().await {
-            let _ = merged_m8_file.write_all(&bytes).await;
-            let _ = merged_m8_file.write_all(b"\n").await;
+        while let Some(b) = m8_write_rx.recv().await {
+            merged_m8_file.write_all(&b).await?;
+            if !b.ends_with(b"\n") {
+                merged_m8_file.write_all(b"\n").await?;
+            }
         }
-        let _ = merged_m8_file.flush().await;
+        merged_m8_file.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    }));
+    cleanup_tasks.push(tokio::spawn(async move {
+        while let Some(b) = hit_write_rx.recv().await {
+            merged_hit_file.write_all(&b).await?;
+            if !b.ends_with(b"\n") {
+                merged_hit_file.write_all(b"\n").await?;
+            }
+        }
+        merged_hit_file.flush().await?;
         Ok::<(), anyhow::Error>(())
     }));
 
-    cleanup_tasks.push(tokio::spawn(async move {
-        while let Some(bytes) = hit_write_rx.recv().await {
-            let _ = merged_hit_file.write_all(&bytes).await;
-            let _ = merged_hit_file.write_all(b"\n").await;
+    let (merged_pair_tx, merged_pair_rx) = mpsc::unbounded_channel::<ReducedRead>();
+
+    // ── step 2: NT pairs ──────────────────────────────────────────────────
+    let mut nt_kept = 0u64;
+    let mut nt_deferred_to_nr = 0u64;
+    let mut seq = 0u64;
+
+    while let Some(pair) = nt_pairs.next().await {
+        let Some(fields) = summary_fields(&pair) else {
+            continue;
+        };
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let Some((read_id, nt_align)) = parse_alignment(&field_refs) else {
+            continue;
+        };
+
+        let nr_align = nr_alignment_per_read.get(&read_id);
+        let has_nt_contig = nt_align.contig.is_some();
+        let has_nr_contig = nr_align.and_then(|a| a.contig).is_some();
+        let has_nt_read = nt_align.read.is_some();
+        let has_nr_read = nr_align.and_then(|a| a.read).is_some();
+
+        // Exact Python predicate
+        if has_nt_contig || (!has_nr_contig && has_nt_read) {
+            let Some(hit_out) = hit_line_for_counts(&field_refs, "NT") else {
+                continue;
+            };
+            let m8_bytes = Bytes::from(pair.dedup.clone());
+            let _ = m8_write_tx.send(m8_bytes);
+            let _ = hit_write_tx.send(hit_out.clone());
+
+            seq += 1;
+            let _ = merged_pair_tx.send(ReducedRead {
+                seq,
+                dedup: pair.dedup,
+                summary: hit_out.to_vec(),
+                accession: pair.accession,
+            });
+            nr_alignment_per_read.remove(&read_id);
+            nt_kept += 1;
+        } else if has_nr_contig || has_nr_read {
+            nt_deferred_to_nr += 1;
+        } else {
+            warn!(
+                "[merged] NT read {} has no NT/NR alignment flags — skipping",
+                read_id
+            );
         }
-        let _ = merged_hit_file.flush().await;
-        Ok::<(), anyhow::Error>(())
-    }));
+    }
+    info!(
+        "[merged] NT pass kept={} deferred_to_nr={}",
+        nt_kept, nt_deferred_to_nr
+    );
 
-    // 3. Parallel selection passes (NT first, then NR)
-    let (merged_m8_tx, merged_m8_rx) = mpsc::channel::<ParseOutput>(4096);
-    let (merged_hit_tx, merged_hit_rx) = mpsc::channel::<ParseOutput>(4096);
-
-    // NT pass
-    let nt_m8_write_tx = m8_write_tx.clone();
-    let nt_hit_write_tx = hit_write_tx.clone();
-    let merged_m8_tx_nt = merged_m8_tx.clone();
-    let merged_hit_tx_nt = merged_hit_tx.clone();
-
-    let nt_task = tokio::spawn({
-        let nr_alignment_map = nr_alignment_map.clone();
-        async move {
-            let mut nt_m8 = ReceiverStream::new(nt_m8_stream);
-            let mut nt_hit = ReceiverStream::new(nt_hit_summary_stream);
-
-            while let (Some(m8_item), Some(hit_item)) = (nt_m8.next().await, nt_hit.next().await) {
-                let m8_bytes = match m8_item {
-                    ParseOutput::Bytes(b) => b,
-                    _ => continue,
-                };
-                let hit_bytes = hit_item.to_bytes()?;
-
-                let hit_line = String::from_utf8_lossy(&hit_bytes);
-                let trimmed = hit_line.trim_end();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let hit_fields: Vec<&str> = trimmed.split('\t').collect();
-                if hit_fields.len() < 10 {
-                    continue;
-                }
-
-                let read_id = hit_fields[0];
-
-                let nt_contig = hit_fields.get(9).and_then(|s| s.parse::<Taxid>().ok());
-                let nt_read = hit_fields.get(3).and_then(|s| s.parse::<Taxid>().ok());
-
-                let nr_align = nr_alignment_map.get(read_id);
-                let has_nr_contig = nr_align.map_or(false, |a| a.contig.is_some());
-                let _has_nr_read = nr_align.map_or(false, |a| a.read.is_some());
-
-                if nt_contig.is_some() || (!has_nr_contig && nt_read.is_some()) {
-                    let _ = nt_m8_write_tx.send(m8_bytes.clone()).await;
-                    let mut hit_with_source = hit_fields.to_vec();
-                    hit_with_source.push(NT_TAG);
-                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
-                    let _ = nt_hit_write_tx.send(hit_bytes_out.clone()).await;
-
-                    let _ = merged_m8_tx_nt.send(ParseOutput::Bytes(m8_bytes)).await;
-                    let _ = merged_hit_tx_nt
-                        .send(ParseOutput::Bytes(hit_bytes_out))
-                        .await;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
+    // ── step 3: NR remaining in NR hit order ──────────────────────────────
+    let mut nr_kept = 0u64;
+    for read_id in &nr_hit_order {
+        if !nr_alignment_per_read.contains_key(read_id) {
+            continue;
         }
-    });
-    cleanup_tasks.push(nt_task);
+        let Some(pair) = nr_pair_by_read.remove(read_id) else {
+            warn!("[merged] NR hit {} missing pair — skip", read_id);
+            continue;
+        };
+        let Some(fields) = summary_fields(&pair) else {
+            continue;
+        };
+        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let Some(hit_out) = hit_line_for_counts(&field_refs, "NR") else {
+            continue;
+        };
 
-    // NR pass (remaining reads)
-    let nr_m8_write_tx = m8_write_tx;
-    let nr_hit_write_tx = hit_write_tx;
-    let merged_m8_tx_nr = merged_m8_tx;
-    let merged_hit_tx_nr = merged_hit_tx;
+        let m8_bytes = Bytes::from(pair.dedup.clone());
+        let _ = m8_write_tx.send(m8_bytes);
+        let _ = hit_write_tx.send(hit_out.clone());
 
-    let nr_task = tokio::spawn({
-        let nr_hit_lines = nr_hit_lines.clone();
-        async move {
-            let mut nr_m8 = ReceiverStream::new(nr_m8_stream);
+        seq += 1;
+        let _ = merged_pair_tx.send(ReducedRead {
+            seq,
+            dedup: pair.dedup,
+            summary: hit_out.to_vec(),
+            accession: pair.accession,
+        });
+        nr_alignment_per_read.remove(read_id);
+        nr_kept += 1;
+    }
+    drop(m8_write_tx);
+    drop(hit_write_tx);
+    drop(merged_pair_tx);
+    info!("[merged] NR pass kept={}", nr_kept);
 
-            while let Some(m8_item) = nr_m8.next().await {
-                let m8_bytes = match m8_item {
-                    ParseOutput::Bytes(b) => b,
-                    _ => continue,
-                };
-
-                let m8_str = String::from_utf8_lossy(&m8_bytes);
-                let trimmed_m8 = m8_str.trim_end();
-                if trimmed_m8.is_empty() {
-                    continue;
-                }
-
-                let m8_fields: Vec<&str> = trimmed_m8.split('\t').collect();
-                let read_id = m8_fields[0];
-
-                if let Some(hit_bytes) = nr_hit_lines.get(read_id) {
-                    let _ = nr_m8_write_tx.send(m8_bytes.clone()).await;
-
-                    let mut hit_with_source = String::from_utf8_lossy(hit_bytes)
-                        .trim_end()
-                        .split('\t')
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>();
-                    hit_with_source.push(NR_TAG.to_string());
-
-                    let hit_bytes_out = Bytes::from(hit_with_source.join("\t"));
-                    let _ = nr_hit_write_tx.send(hit_bytes_out.clone()).await;
-
-                    let _ = merged_m8_tx_nr.send(ParseOutput::Bytes(m8_bytes)).await;
-                    let _ = merged_hit_tx_nr
-                        .send(ParseOutput::Bytes(hit_bytes_out))
-                        .await;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    });
-    cleanup_tasks.push(nr_task);
-
-    // 4. Taxon counting (already highly parallel from earlier work)
+    // ── taxon counts on merged pairs ─────────────────────────────────────
     let merged_taxon_counts = generate_taxon_counts(
         config.clone(),
-        ReceiverStream::new(merged_m8_rx),
-        ReceiverStream::new(merged_hit_rx),
-        duplicate_clusters.clone(),
-        should_keep_filter.clone(),
+        UnboundedReceiverStream::new(merged_pair_rx),
+        duplicate_clusters,
+        should_keep_filter,
         "merged_NT_NR".to_string(),
         None,
     )
-    .await?;
+        .await?;
 
     let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
     tokio::fs::write(&merged_taxon_counts_path, json).await?;
-    info!("Merged taxon counts generated (fully streaming)");
+    info!(
+        "Merged taxon counts generated ({} taxa) → {}",
+        merged_taxon_counts.len(),
+        merged_taxon_counts_path.display()
+    );
 
-    // 5. Parallel contig merge (exact Python _merge_contigs)
+    // ── merge_contigs ────────────────────────────────────────────────────
     let final_contigs = tokio::task::spawn_blocking(move || {
-        let mut merged_contigs: HashMap<Taxid, Vec<ContigSummaryEntry>> = HashMap::new();
         let mut nt_contig_names: HashSet<String> = HashSet::new();
+        let mut out: Vec<ContigSummaryEntry> =
+            Vec::with_capacity(nt_contig_summary.len() + nr_contig_summary.len());
 
-        for mut entry in nt_contig_summary {
-            entry.db_type = "merged_NT_NR".to_string();
-            nt_contig_names.insert(entry.contig_name.clone());
-            merged_contigs
-                .entry(entry.species_taxid)
-                .or_default()
-                .push(entry);
-        }
-
-        for mut entry in nr_contig_summary {
-            if !nt_contig_names.contains(&entry.contig_name) {
-                entry.db_type = "merged_NT_NR".to_string();
-                merged_contigs
-                    .entry(entry.species_taxid)
-                    .or_default()
-                    .push(entry);
+        for mut e in nt_contig_summary {
+            for name in e.contig_counts.keys() {
+                nt_contig_names.insert(name.clone());
             }
+            e.count_type = "merged_NT_NR".to_string();
+            out.push(e);
         }
 
-        merged_contigs.into_values().flatten().collect::<Vec<_>>()
+        for mut e in nr_contig_summary {
+            e.contig_counts
+                .retain(|name, _| !nt_contig_names.contains(name));
+            if e.contig_counts.is_empty() {
+                continue;
+            }
+            e.count_type = "merged_NT_NR".to_string();
+            out.push(e);
+        }
+
+        out
     })
-    .await
-    .map_err(|e| PipelineError::Other(e.into()))?;
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
     let json = serde_json::to_string_pretty(&final_contigs)?;
     tokio::fs::write(&merged_contig_summary_path, json).await?;
@@ -2457,8 +2439,8 @@ pub async fn compute_merged_taxon_counts(
         final_contigs.len()
     );
 
-    info!("compute_merged_taxon_counts complete — exact Python logic, fully streaming");
-    Ok(cleanup_tasks)
+    info!("compute_merged_taxon_counts complete");
+    Ok((merged_taxon_counts, cleanup_tasks))
 }
 
 #[cfg(test)]
@@ -2846,58 +2828,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_consensus_level_single_hit_returns_family_level() {
-        let hits = vec![nr_record("read1", "ACC1", 100, 200.0)];
-        let lineage_map = build_lineage_map();
-        let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
-        let should_keep = Arc::new(|_: &[i32]| true);
-
-        let (level, taxid, kept) =
-            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-                .expect("consensus_level should succeed");
-
-        assert_eq!(level, 3);
-        assert_eq!(taxid, 100);
-        assert_eq!(kept.len(), 1);
-    }
-
-    #[test]
-    fn test_consensus_level_species_and_genus_agree() {
-        let mut lineage_map = AHashMap::default();
-        lineage_map.insert(1 as Taxid, lineage(1, 10, 100));
-        lineage_map.insert(2 as Taxid, lineage(1, 10, 200));
-
-        let hits = vec![
-            nr_record("read1", "ACC1", 100, 200.0),
-            nr_record("read1", "ACC2", 100, 199.0),
-        ];
-        let acc2taxid_map = build_acc_map(&[("ACC1", 1), ("ACC2", 2)]);
-        let should_keep = Arc::new(|_: &[i32]| true);
-
-        let (level, taxid, kept) =
-            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-                .expect("consensus_level should succeed");
-
-        assert_eq!(level, 2);
-        assert_eq!(taxid, 10);
-        assert_eq!(kept.len(), 2);
-    }
-
-    #[test]
-    fn test_consensus_level_rejected_by_filter() {
-        let hits = vec![nr_record("read1", "ACC1", 100, 200.0)];
-        let lineage_map = build_lineage_map();
-        let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
-        let should_keep = Arc::new(|_: &[i32]| false);
-
-        let (level, taxid, kept) =
-            consensus_level(&hits, &lineage_map, &acc2taxid_map, &should_keep)
-                .expect("consensus_level should return ok");
-
-        assert_eq!((level, taxid), (0, 0));
-        assert!(kept.is_empty());
-    }
 
     #[test]
     fn test_merge_aggregations_is_additive() {
@@ -2936,6 +2866,67 @@ mod tests {
         assert_eq!(bucket.sum_e_value, -120.0);
         assert!(bucket.source_count_type.contains("NT"));
         assert!(bucket.source_count_type.contains("NR"));
+    }
+
+    #[test]
+    fn call_hit_level_v2_majority_species() {
+        let mut species = AHashMap::new();
+        species.insert(1, vec!["A".into(), "A".into(), "B".into()]); // taxid 1 wins
+        species.insert(2, vec!["C".into()]);
+        // first-seen order: 1 then 2
+        let taxid_order = vec![1, 2];
+        let (level, taxid, acc) = call_hit_level_v2(&species, &taxid_order);
+        assert_eq!(level, 1);
+        assert_eq!(taxid, 1);
+        assert_eq!(acc.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn call_hit_level_v2_empty_is_minus_one() {
+        let species = AHashMap::new();
+        let taxid_order: Vec<i32> = vec![];
+        let (level, taxid, acc) = call_hit_level_v2(&species, &taxid_order);
+        assert_eq!(level, -1);
+        assert_eq!(taxid, -1);
+        assert!(acc.is_none());
+    }
+
+    #[test]
+    fn summarize_emits_seven_cols_level_one() {
+        let lineage_map = build_lineage_map(); // taxid 1 → [1, 10, 100]
+        let acc2taxid_map = build_acc_map(&[("ACC1", 1)]);
+        let should_keep = |_: &[i32]| true;
+
+        let hits = vec![nr_record("read1", "ACC1", 100, 200.0)];
+
+        let reduced = summarize_m8_hits(
+            0,
+            "read1".to_string(),
+            &hits,
+            &lineage_map,
+            &acc2taxid_map,
+            &should_keep,
+            50,
+            false,
+        )
+            .expect("one valid hit must produce a ReducedRead");
+
+        assert_eq!(reduced.accession, "ACC1");
+
+        let summary = std::str::from_utf8(&reduced.summary).unwrap();
+        let fields: Vec<&str> = summary.trim_end().split('\t').collect();
+
+        assert_eq!(fields.len(), 7, "summary must be 7 columns, got: {summary}");
+        assert_eq!(fields[0], "read1");
+        assert_eq!(fields[1], "1");    // call_hit_level_v2 → always species level
+        assert_eq!(fields[2], "1");    // species taxid
+        assert_eq!(fields[3], "ACC1"); // accession
+        assert_eq!(fields[4], "1");    // species_taxid from lineage
+        assert_eq!(fields[5], "10");   // genus
+        assert_eq!(fields[6], "100");  // family
+
+        let dedup = std::str::from_utf8(&reduced.dedup).unwrap();
+        assert!(dedup.starts_with("read1\tACC1\t"), "dedup m8: {dedup}");
     }
 
     #[test]
@@ -3062,7 +3053,7 @@ mod tests {
         let should_keep = |_: &[i32]| true;
 
         let hits = vec![
-            nr_record("read1", "SHORT", 20, 500.0),
+            nr_record("read1", "SHORT", 20, 500.0), // alen < 50 → drop
             nr_record("read1", "ACC2", 100, 150.0),
             nr_record("read1", "ACC1", 100, 150.0),
         ];
@@ -3075,17 +3066,29 @@ mod tests {
             &acc2taxid_map,
             &should_keep,
             50,
+            false,
         )
-        .expect("expected a reduced read");
+            .expect("expected a reduced read");
 
         assert_eq!(reduced.seq, 7);
+        // SHORT gone; ACC2 first among best-bitscore → first-wins on accession tie
         assert_eq!(reduced.accession, "ACC2");
+
         assert!(std::str::from_utf8(&reduced.dedup)
             .unwrap()
             .starts_with("read1\tACC2\t"));
-        assert!(std::str::from_utf8(&reduced.summary)
-            .unwrap()
-            .starts_with("read1\tACC2\t"));
+
+        // call_hit_level_v2: always level 1, species taxid 1
+        let summary = std::str::from_utf8(&reduced.summary).unwrap();
+        let fields: Vec<&str> = summary.trim_end().split('\t').collect();
+        assert_eq!(fields.len(), 7, "summary must be 7 columns: {summary}");
+        assert_eq!(fields[0], "read1");
+        assert_eq!(fields[1], "1");    // level (species)
+        assert_eq!(fields[2], "1");    // taxid
+        assert_eq!(fields[3], "ACC2"); // accession
+        assert_eq!(fields[4], "1");    // species_taxid
+        assert_eq!(fields[5], "10");   // genus
+        assert_eq!(fields[6], "100");  // family
     }
 
     #[test]
@@ -3104,6 +3107,7 @@ mod tests {
             &acc2taxid_map,
             &should_keep,
             50,
+            false,
         );
 
         assert!(reduced.is_none());

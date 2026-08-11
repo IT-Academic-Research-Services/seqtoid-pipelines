@@ -68,7 +68,7 @@ fn anyhow_to_io(e: anyhow::Error) -> io::Error {
 pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
     duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
-    min_contig_size: usize,
+    min_contig_size: u64,
     concurrency: usize,
 ) -> Result<(
     HashMap<String, String>, // read2contig
@@ -227,10 +227,7 @@ pub async fn generate_info_from_bam_stream(
         .map(|r| (r.key().clone(), *r.value()))
         .collect();
 
-    // Apply min unique read filter
-    contig_stats.retain(|contig_name, _| {
-        contig_unique_counts.get(contig_name).copied().unwrap_or(0) >= min_contig_size
-    });
+    contig_stats.retain(|_, count| *count >= min_contig_size);
 
     contig_unique_counts.retain(|contig_name, _| contig_stats.contains_key(contig_name));
 

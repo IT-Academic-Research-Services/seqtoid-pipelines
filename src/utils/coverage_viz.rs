@@ -8,18 +8,18 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{self, warn};
+use log::{self, warn, info, debug};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::fs::create_dir_all;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
 use crate::utils::blast::M8Record;
 use crate::utils::streams::{ParseOutput, ToBytes};
 
 const MAX_NUM_BINS_COVERAGE: usize = 500;
 const NUM_ACCESSIONS_PER_TAXON: usize = 10;
-const MIN_CONTIG_SIZE: u64 = 500;
+const MIN_CONTIG_SIZE: u64 = 4;
 
 #[derive(Debug, Clone, Default)]
 struct TaxonData {
@@ -39,21 +39,32 @@ struct AccessionData {
 
 #[derive(Debug, Clone)]
 struct ContigHit {
+    accession: String,
     subject_start: u64,
     subject_end: u64,
     query_start: u64,
     query_end: u64,
-    total_length: u64,
+    alignment_length: u64,
+    percent_id: f64,
+    num_mismatches: u64,
+    num_gaps: u64,
+    total_length: u64,       // bp — set in augment_contig_data_with_coverage
     coverage: Vec<f64>,
     prop_mismatch: f64,
+    num_reads: u64,          // from valid_contigs
+    byterange: Option<(u64, u64)>, // [offset, length] in contigs.fasta; set by byterange augment
 }
 
 #[derive(Debug, Clone)]
 struct ReadHit {
+    accession: String,
     subject_start: u64,
     subject_end: u64,
+    alignment_length: u64,
+    percent_id: f64,
+    num_mismatches: u64,
+    num_gaps: u64,
     prop_mismatch: f64,
-    accession: String,
 }
 
 // Output JSON structures
@@ -103,9 +114,10 @@ struct CoverageBin {
 
 pub async fn generate_coverage_viz(
     refined_gsnap_hitsummary2_tab: ReceiverStream<ParseOutput>,
-    refined_gsnap_blast_top_m8: ReceiverStream<ParseOutput>,
+    refined_gsnap_blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     contig_coverage_json: PathBuf,
     contig_stats_json: PathBuf,
+    contigs_fasta: PathBuf,
     gsnap_deduped_m8: ReceiverStream<ParseOutput>,
     nt_info_db: PathBuf,
     output_dir: PathBuf,
@@ -125,6 +137,7 @@ pub async fn generate_coverage_viz(
         refined_gsnap_blast_top_m8,
         &contig_coverage_json,
         &contig_stats_json,
+        &contigs_fasta,
         gsnap_deduped_m8,
         info_dict,
         min_size,
@@ -168,9 +181,10 @@ pub async fn generate_coverage_viz(
 
 async fn prepare_data(
     hit_summary: ReceiverStream<ParseOutput>,
-    blast_top_m8: ReceiverStream<ParseOutput>,
+    blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     contig_coverage_json: &Path,
     contig_stats_json: &Path,
+    contigs_fasta: &Path,
     gsnap_deduped_m8: ReceiverStream<ParseOutput>,
     info_dict: HashMap<String, (String, u64)>,
     min_contig_size: u64,
@@ -200,27 +214,66 @@ async fn prepare_data(
     let read_data = generate_read_data(gsnap_deduped_m8, &assigned_reads).await?;
 
     augment_contig_data_with_coverage(contig_coverage_json, &mut contig_data)?;
+    augment_contig_data_with_byteranges(contigs_fasta, &mut contig_data)?;
 
-    let (taxon_data, accession_data) =
-        select_best_accessions_per_taxon(taxon_data, accession_data, num_accessions_per_taxon);
+    let (taxon_data, accession_data) = select_best_accessions_per_taxon(
+        taxon_data,
+        accession_data,
+        &contig_data,
+        num_accessions_per_taxon,
+    );
+
+    info!(
+  "[coverage prepare] valid_contigs={} accession_data={} taxon_data={} contig_data={} read_data={}",
+  valid_contigs.len(),
+  accession_data.len(),
+  taxon_data.len(),
+  contig_data.len(),
+  read_data.len()
+);
+    let n_contig_acc = accession_data.values().filter(|a| !a.contigs.is_empty()).count();
+    info!("[coverage prepare] accessions_with_contigs={}", n_contig_acc);
 
     Ok((taxon_data, accession_data, contig_data, read_data))
 }
 
 fn load_nt_info_db(path: &Path) -> Result<HashMap<String, (String, u64)>> {
-    let file = File::open(path)?;
+    let file = File::open(path)
+        .with_context(|| format!("open nt_info {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut map = HashMap::new();
+    let mut bad = 0u64;
+
     for line in reader.lines() {
         let line = line?;
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            let acc = parts[0].to_string();
-            let name = parts[1].to_string();
-            let len: u64 = parts[2].parse()?;
-            map.insert(acc, (name, len));
+        if parts.len() < 3 {
+            bad += 1;
+            continue;
         }
+        let len_str = parts[parts.len() - 1];
+        let Ok(len) = len_str.parse::<u64>() else {
+            bad += 1;
+            continue;
+        };
+        let acc_raw = parts[0];
+        let name = if parts.len() == 3 {
+            parts[1].to_string()
+        } else {
+            parts[1..parts.len() - 1].join(" ")
+        };
+
+        // Prefer file already unversioned; still accept versioned keys.
+        let acc = acc_raw.split('.').next().unwrap_or(acc_raw).to_string();
+        map.entry(acc).or_insert((name, len));
     }
+
+    info!(
+        "[load_nt_info_db] path={} entries={} bad_lines={}",
+        path.display(),
+        map.len(),
+        bad
+    );
     Ok(map)
 }
 
@@ -241,8 +294,10 @@ async fn generate_accession_data(
 ) -> Result<(HashMap<String, AccessionData>, HashMap<String, TaxonData>)> {
     let mut accession_data: HashMap<String, AccessionData> = HashMap::new();
     let mut taxon_data: HashMap<String, TaxonData> = HashMap::new();
+    // Contigs deduped per accession (Python uses a set)
+    let mut contig_sets: HashMap<String, HashSet<String>> = HashMap::new();
 
-    let mut line_count = 0;
+    let mut line_count = 0u64;
 
     while let Some(item) = hit_summary.next().await {
         line_count += 1;
@@ -254,6 +309,10 @@ async fn generate_accession_data(
         let line = String::from_utf8_lossy(&bytes);
         let fields: Vec<&str> = line.trim().split('\t').collect();
 
+        if fields.is_empty() || (fields.len() == 1 && fields[0].is_empty()) {
+            continue;
+        }
+
         if fields.len() >= 12 && valid_contigs.contains_key(fields[7]) {
             let taxon = fields[9].to_string();
             let acc = fields[8].to_string();
@@ -264,8 +323,10 @@ async fn generate_accession_data(
                 .or_default()
                 .accessions
                 .insert(acc.clone());
-            accession_data.entry(acc).or_default().contigs.push(contig);
+            contig_sets.entry(acc.clone()).or_default().insert(contig);
+            accession_data.entry(acc).or_default();
         } else if fields.len() >= 5 {
+            // Includes 12-col rows whose contig is not in valid_contigs (Python else branch)
             let taxon = fields[4].to_string();
             let acc = fields[3].to_string();
             let read = fields[0].to_string();
@@ -276,6 +337,12 @@ async fn generate_accession_data(
                 .accessions
                 .insert(acc.clone());
             accession_data.entry(acc).or_default().reads.push(read);
+        }
+    }
+
+    for (acc, set) in contig_sets {
+        if let Some(ad) = accession_data.get_mut(&acc) {
+            ad.contigs = set.into_iter().collect();
         }
     }
 
@@ -335,17 +402,17 @@ fn get_unassigned_reads_set(accession_data: &HashMap<String, AccessionData>) -> 
 }
 
 async fn generate_contig_data(
-    mut blast_top_m8: ReceiverStream<ParseOutput>,
+    mut blast_top_m8: UnboundedReceiverStream<ParseOutput>,
     valid_contigs: &HashMap<String, u64>,
 ) -> Result<HashMap<String, Vec<ContigHit>>> {
     let mut contig_data: HashMap<String, Vec<ContigHit>> = HashMap::new();
-
-    let mut line_count = 0;
+    let mut line_count = 0u64;
+    let mut parse_err = 0u64;
 
     while let Some(item) = blast_top_m8.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
-            log::info!("Processed {} blast_top_m8 lines", line_count);
+            info!("Processed {} blast_top_m8 lines", line_count);
         }
 
         let bytes = item.to_bytes()?;
@@ -355,10 +422,15 @@ async fn generate_contig_data(
             continue;
         }
 
-        let m8 = match M8Record::parse_line_nt(line_trim) {
+        let m8 = match M8Record::parse_line_nt(line_trim)
+            .or_else(|_| M8Record::parse_line_nr(line_trim))
+        {
             Ok(record) => record,
             Err(e) => {
-                warn!("Failed to parse m8 line: {} - {}", line_trim, e);
+                parse_err += 1;
+                if parse_err <= 20 {
+                    warn!("Failed to parse blast_top_m8 line: {} — {}", line_trim, e);
+                }
                 continue;
             }
         };
@@ -368,22 +440,38 @@ async fn generate_contig_data(
             continue;
         }
 
-        let total_length = *valid_contigs.get(&contig_name).unwrap_or(&0);
-        let prop_mismatch = m8.mismatch as f64 / m8.alen as f64;
+        // total_length is contig length in bp — filled later from coverage JSON
+        // (valid_contigs values are read counts, not lengths)
+        let prop_mismatch = if m8.alen > 0 {
+            m8.mismatch as f64 / m8.alen as f64
+        } else {
+            0.0
+        };
 
-        let hit = ContigHit {
+        contig_data.entry(contig_name.clone()).or_default().push(ContigHit {
+            accession: m8.tname.clone(),
             subject_start: m8.tstart,
             subject_end: m8.tend,
             query_start: m8.qstart,
             query_end: m8.qend,
-            total_length,
+            alignment_length: m8.alen,
+            percent_id: m8.pident,
+            num_mismatches: m8.mismatch,
+            num_gaps: m8.gapopen,
+            total_length: 0, // bp — set in augment_contig_data_with_coverage
             coverage: vec![],
             prop_mismatch,
-        };
-
-        contig_data.entry(contig_name).or_default().push(hit);
+            num_reads: *valid_contigs.get(&contig_name).unwrap_or(&0),
+            byterange: None, // set in augment_contig_data_with_byteranges
+        });
     }
 
+    info!(
+        "[generate_contig_data] done: lines={} parse_err={} contigs={}",
+        line_count,
+        parse_err,
+        contig_data.len()
+    );
     Ok(contig_data)
 }
 
@@ -392,13 +480,13 @@ async fn generate_read_data(
     assigned_reads: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<ReadHit>>> {
     let mut read_data: HashMap<String, Vec<ReadHit>> = HashMap::new();
-
-    let mut line_count = 0;
+    let mut line_count = 0u64;
+    let mut parse_err = 0u64;
 
     while let Some(item) = gsnap_deduped_m8.next().await {
         line_count += 1;
         if line_count % 100_000 == 0 {
-            log::info!("Processed {} gsnap_deduped_m8 lines", line_count);
+            info!("Processed {} gsnap_deduped_m8 lines", line_count);
         }
 
         let bytes = item.to_bytes()?;
@@ -407,82 +495,204 @@ async fn generate_read_data(
         if line_trim.is_empty() {
             continue;
         }
-
-        let m8 = match M8Record::parse_line_nt(line_trim) {
+        
+        let m8 = match M8Record::parse_line_nt(line_trim)
+            .or_else(|_| M8Record::parse_line_nr(line_trim))
+        {
             Ok(record) => record,
             Err(e) => {
-                warn!("Failed to parse m8 line: {} - {}", line_trim, e);
+                parse_err += 1;
+                if parse_err <= 20 {
+                    warn!("Failed to parse deduped m8 line: {} — {}", line_trim, e);
+                }
                 continue;
             }
         };
 
         let read_name = m8.qname.clone();
-        if assigned_reads.contains(&read_name) {
-            continue;
+        if !assigned_reads.contains(&read_name) {
+            continue; // not a loose/unassigned read for coverage viz
         }
 
-        let accession_id = m8.tname.clone();
-        let prop_mismatch = m8.mismatch as f64 / m8.alen as f64;
-
-        let hit = ReadHit {
-            subject_start: m8.tstart,
-            subject_end: m8.tend,
-            prop_mismatch,
-            accession: accession_id,
+        let prop_mismatch = if m8.alen > 0 {
+            m8.mismatch as f64 / m8.alen as f64
+        } else {
+            0.0
         };
 
-        read_data.entry(read_name).or_default().push(hit);
+        read_data.entry(read_name).or_default().push(ReadHit {
+            accession: m8.tname.clone(),
+            subject_start: m8.tstart,
+            subject_end: m8.tend,
+            alignment_length: m8.alen,
+            percent_id: m8.pident,
+            num_mismatches: m8.mismatch,
+            num_gaps: m8.gapopen,
+            prop_mismatch,
+        });
     }
 
+    info!(
+        "[generate_read_data] done: lines={} parse_err={} reads={}",
+        line_count,
+        parse_err,
+        read_data.len()
+    );
     Ok(read_data)
 }
-
 fn augment_contig_data_with_coverage(
     path: &Path,
     contig_data: &mut HashMap<String, Vec<ContigHit>>,
 ) -> Result<()> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let contig_coverage: HashMap<String, Vec<f64>> = serde_json::from_reader(&mut reader)
+    let root: Value = serde_json::from_reader(BufReader::new(file))
         .map_err(|e| anyhow!("Failed to parse contig_coverage_json: {}", e))?;
 
-    for (contig_name, hits) in contig_data.iter_mut() {
-        if let Some(cov) = contig_coverage.get(contig_name) {
-            for hit in hits.iter_mut() {
-                hit.coverage = cov.clone();
+    let obj = root
+        .as_object()
+        .ok_or_else(|| anyhow!("contig_coverage_json root is not an object"))?;
+
+    for (name, v) in obj {
+        let (depths, contig_len) = match v {
+            Value::Array(a) => {
+                let depths: Vec<f64> = a.iter().filter_map(|x| x.as_f64()).collect();
+                let len = depths.len() as u64; // 1 depth per base
+                (depths, len)
             }
-        } else {
-            warn!("No coverage data for contig: {}", contig_name);
+            Value::Object(o) => {
+                let arr = o
+                    .get("coverage")
+                    .or_else(|| o.get("depths"))
+                    .or_else(|| o.get("depth"))
+                    .and_then(|x| x.as_array())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "contig_coverage entry '{}' missing coverage[]",
+                            name
+                        )
+                    })?;
+                let depths: Vec<f64> = arr.iter().filter_map(|x| x.as_f64()).collect();
+                // Prefer explicit contig_len; fall back to coverage array length
+                let len = o
+                    .get("contig_len")
+                    .or_else(|| o.get("total_length"))
+                    .or_else(|| o.get("length"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(depths.len() as u64);
+                (depths, len)
+            }
+            _ => {
+                warn!("Skipping contig_coverage entry '{}': unexpected JSON type", name);
+                continue;
+            }
+        };
+
+        if let Some(hits) = contig_data.get_mut(name) {
+            for hit in hits.iter_mut() {
+                hit.coverage = depths.clone();
+                hit.total_length = contig_len;
+            }
         }
+        // contigs present only in coverage JSON (no blast hit) are intentionally ignored
     }
 
+    // Contigs that had blast hits but no coverage entry stay at total_length=0;
+    // calculate_accession_coverage already guards on empty coverage / zero length.
     Ok(())
 }
 
 fn select_best_accessions_per_taxon(
     mut taxon_data: HashMap<String, TaxonData>,
     mut accession_data: HashMap<String, AccessionData>,
+    contig_data: &HashMap<String, Vec<ContigHit>>,
     num_per_taxon: usize,
 ) -> (HashMap<String, TaxonData>, HashMap<String, AccessionData>) {
+    // Score = max_contig_alen + sum_contig_alen + num_reads  (Python get_score)
+    // Do not zero out score when total_length == 0 — contig accessions still rank by alen.
     for ad in accession_data.values_mut() {
-        ad.score = ad.contigs.len() as f64 * 1000.0 + ad.reads.len() as f64;
+        let mut max_alen = 0u64;
+        let mut sum_alen = 0u64;
+        for cname in &ad.contigs {
+            if let Some(hits) = contig_data.get(cname) {
+                for h in hits {
+                    max_alen = max_alen.max(h.alignment_length);
+                    sum_alen += h.alignment_length;
+                }
+            }
+        }
+        ad.score = max_alen as f64 + sum_alen as f64 + ad.reads.len() as f64;
     }
+
+    let mut filtered_accessions: HashMap<String, AccessionData> = HashMap::new();
 
     for td in taxon_data.values_mut() {
-        let mut scored: Vec<_> = td
-            .accessions
+        let mut sorted: Vec<String> = td.accessions.iter().cloned().collect();
+        sorted.sort_by(|a, b| {
+            let sa = accession_data
+                .get(a)
+                .map(|x| x.score)
+                .unwrap_or(f64::NEG_INFINITY);
+            let sb = accession_data
+                .get(b)
+                .map(|x| x.score)
+                .unwrap_or(f64::NEG_INFINITY);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Python: len(contigs) >= 1 — no total_length check
+        let with_contigs: Vec<String> = sorted
             .iter()
-            .filter_map(|acc| accession_data.get(acc).map(|ad| (acc.clone(), ad.score)))
+            .filter(|a| {
+                accession_data
+                    .get(*a)
+                    .map(|x| !x.contigs.is_empty())
+                    .unwrap_or(false)
+            })
+            .cloned()
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        td.best_accessions = scored
-            .into_iter()
-            .take(num_per_taxon)
-            .map(|(acc, _)| acc)
-            .collect();
+
+        let best = if with_contigs.len() >= num_per_taxon {
+            with_contigs
+        } else {
+            // Python: fill with accessions that have zero contigs
+            let without: Vec<String> = sorted
+                .iter()
+                .filter(|a| {
+                    accession_data
+                        .get(*a)
+                        .map(|x| x.contigs.is_empty())
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            let need = num_per_taxon - with_contigs.len();
+            let mut v = with_contigs;
+            v.extend(without.into_iter().take(need));
+            v.sort_by(|a, b| {
+                let sa = accession_data
+                    .get(a)
+                    .map(|x| x.score)
+                    .unwrap_or(f64::NEG_INFINITY);
+                let sb = accession_data
+                    .get(b)
+                    .map(|x| x.score)
+                    .unwrap_or(f64::NEG_INFINITY);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            v
+        };
+
+        for a in &best {
+            if let Some(ad) = accession_data.remove(a) {
+                filtered_accessions.insert(a.clone(), ad);
+            }
+        }
+        td.best_accessions = best;
     }
 
-    (taxon_data, accession_data)
+    taxon_data.retain(|_, td| !td.best_accessions.is_empty());
+
+    (taxon_data, filtered_accessions)
 }
 
 async fn generate_coverage_viz_data(
@@ -502,11 +712,16 @@ async fn generate_coverage_viz_data(
         let contig_data = Arc::clone(&contig_data);
         let read_data = Arc::clone(&read_data);
 
+        if acc_obj.total_length == 0 {
+            warn!(
+            "Skipping zero-length / unknown accession {} (no nt_info entry)",
+            acc_id
+        );
+            continue;
+        }
+
         tasks.push(tokio::task::spawn_blocking(move || {
             let total_len = acc_obj.total_length as f64;
-            if total_len == 0.0 {
-                return Err(anyhow!("Zero length accession: {}", acc_id));
-            }
 
             let num_bins = max_num_bins.min(total_len as usize);
             let bin_size = total_len / num_bins as f64;
@@ -522,10 +737,18 @@ async fn generate_coverage_viz_data(
 
             let stats = calculate_accession_stats(&acc_obj, &contig_data, &read_data, total_len)?;
 
+            let hit_groups = generate_hit_group_json(
+                &acc_obj,
+                &acc_id,
+                &contig_data,
+                &read_data,
+                num_bins,
+            );
+
             let viz = CoverageVizData {
                 total_length: acc_obj.total_length,
                 name: acc_obj.name.clone(),
-                hit_groups: json!([]),
+                hit_groups: hit_groups,
                 coverage,
                 coverage_bin_size: bin_size,
                 max_aligned_length: stats.max_aligned_length,
@@ -562,6 +785,9 @@ fn calculate_accession_coverage(
     for contig_name in &acc_obj.contigs {
         if let Some(hits) = contig_data.get(contig_name) {
             for hit in hits {
+                if hit.accession != acc_id {
+                    continue;
+                }
                 let (s_start, s_end) =
                     decrement_lower_bound(hit.subject_start as f64, hit.subject_end as f64);
                 let (bin_start, bin_end) = align_interval(s_start / bin_size, s_end / bin_size);
@@ -699,7 +925,6 @@ fn calculate_accession_stats(
     let mut max_len = 0u64;
     let mut cov_sum = 0.0;
     let mut mismatch_sum = 0.0;
-    let mut hit_count = 0usize;
     let mut endpoints = Vec::new();
 
     for contig in &acc_obj.contigs {
@@ -714,13 +939,13 @@ fn calculate_accession_stats(
                 let (q_dec_start, q_dec_end) =
                     decrement_lower_bound(hit.query_start as f64, hit.query_end as f64);
                 let (q_start, q_end) = align_interval(q_dec_start, q_dec_end);
-                cov_sum += hit.coverage[q_start as usize..q_end as usize]
-                    .iter()
-                    .sum::<f64>();
+                if !hit.coverage.is_empty() {
+                    let lo = (q_start as usize).min(hit.coverage.len());
+                    let hi = (q_end as usize).min(hit.coverage.len()).max(lo);
+                    cov_sum += hit.coverage[lo..hi].iter().sum::<f64>();
+                }
 
                 mismatch_sum += hit.prop_mismatch;
-                hit_count += 1;
-
                 endpoints.push((s_start, 1));
                 endpoints.push((s_end, -1));
             }
@@ -737,10 +962,7 @@ fn calculate_accession_stats(
                 max_len = max_len.max(aligned_len);
 
                 cov_sum += aligned_len as f64;
-
                 mismatch_sum += hit.prop_mismatch;
-                hit_count += 1;
-
                 endpoints.push((s_start, 1));
                 endpoints.push((s_end, -1));
             }
@@ -753,6 +975,9 @@ fn calculate_accession_stats(
         0.0
     };
 
+    //prop_total_mismatch / (len(contigs) + len(reads))
+    let n_names = acc_obj.contigs.len() + acc_obj.reads.len();
+
     Ok(AccessionStats {
         max_aligned_length: max_len,
         coverage_depth: if total_len > 0.0 {
@@ -761,8 +986,8 @@ fn calculate_accession_stats(
             0.0
         },
         coverage_breadth: breadth,
-        avg_prop_mismatch: if hit_count > 0 {
-            mismatch_sum / hit_count as f64
+        avg_prop_mismatch: if n_names > 0 {
+            mismatch_sum / n_names as f64
         } else {
             0.0
         },
@@ -780,10 +1005,10 @@ fn generate_coverage_viz_summary_data(
         let best_acc: Vec<AccessionSummary> = td
             .best_accessions
             .iter()
-            .map(|acc_id| {
-                let ad = &accession_data[acc_id];
-                let cv = &coverage_viz[acc_id];
-                AccessionSummary {
+            .filter_map(|acc_id| {
+                let ad = accession_data.get(acc_id)?;
+                let cv = coverage_viz.get(acc_id)?;
+                Some(AccessionSummary {
                     id: acc_id.clone(),
                     name: ad.name.clone(),
                     num_contigs: ad.contigs.len(),
@@ -791,7 +1016,7 @@ fn generate_coverage_viz_summary_data(
                     score: format_number(ad.score),
                     coverage_breadth: cv.coverage_breadth,
                     coverage_depth: cv.coverage_depth,
-                }
+                })
             })
             .collect();
 
@@ -805,6 +1030,254 @@ fn generate_coverage_viz_summary_data(
     }
 
     CoverageVizSummary { taxons }
+}
+
+/// Aggregate reads/contigs into hit groups for one accession.
+/// Layout of each group matches Python get_hit_group_json:
+/// [num_contigs, num_reads, contig_r, start, end, avg_alen, avg_pident,
+///  avg_mismatch, avg_gaps, bin_index, contig_byteranges]
+fn generate_hit_group_json(
+    accession_obj: &AccessionData,
+    accession_id: &str,
+    contig_data: &HashMap<String, Vec<ContigHit>>,
+    read_data: &HashMap<String, Vec<ReadHit>>,
+    num_bins: usize,
+) -> Value {
+    if accession_obj.total_length == 0 || num_bins == 0 {
+        return json!([]);
+    }
+
+    let bin_size = accession_obj.total_length as f64 / num_bins as f64;
+
+    // Individual hits (span >= bin_size) vs binned small hits
+    let mut individual_reads: Vec<(String, usize)> = Vec::new();
+    let mut individual_contigs: Vec<(String, usize)> = Vec::new();
+    let mut read_bins: Vec<Vec<(String, usize)>> = vec![Vec::new(); num_bins];
+    let mut contig_bins: Vec<Vec<(String, usize)>> = vec![Vec::new(); num_bins];
+
+    // ── process one hit ──────────────────────────────────────────────
+    let mut process_contig = |name: &str| {
+        let Some(hits) = contig_data.get(name) else {
+            warn!("Could not find contig in map: {}", name);
+            return;
+        };
+        for (ind, hit) in hits.iter().enumerate() {
+            if hit.accession != accession_id {
+                warn!(
+                    "Mismatched accession for {}: {} (hit) versus {} (hitsummary)",
+                    name, hit.accession, accession_id
+                );
+                continue;
+            }
+            let (start, end) =
+                align_interval_u64(hit.subject_start, hit.subject_end);
+            let (dec_s, dec_e) = decrement_lower_bound(start as f64, end as f64);
+            let (acc_s, acc_e) = align_interval(dec_s, dec_e);
+            let span = acc_e - acc_s;
+
+            if span >= bin_size {
+                individual_contigs.push((name.to_string(), ind));
+            } else {
+                let mid = (acc_s + acc_e) / 2.0;
+                let bin_idx = floor_with_min(mid / bin_size, 0) as usize;
+                let bin_idx = bin_idx.min(num_bins.saturating_sub(1));
+                contig_bins[bin_idx].push((name.to_string(), ind));
+            }
+        }
+    };
+
+    let mut process_read = |name: &str| {
+        let Some(hits) = read_data.get(name) else {
+            warn!("Could not find read in map: {}", name);
+            return;
+        };
+        for (ind, hit) in hits.iter().enumerate() {
+            if hit.accession != accession_id {
+                continue;
+            }
+            let (start, end) =
+                align_interval_u64(hit.subject_start, hit.subject_end);
+            let (dec_s, dec_e) = decrement_lower_bound(start as f64, end as f64);
+            let (acc_s, acc_e) = align_interval(dec_s, dec_e);
+            let span = acc_e - acc_s;
+
+            if span >= bin_size {
+                individual_reads.push((name.to_string(), ind));
+            } else {
+                let mid = (acc_s + acc_e) / 2.0;
+                let bin_idx = floor_with_min(mid / bin_size, 0) as usize;
+                let bin_idx = bin_idx.min(num_bins.saturating_sub(1));
+                read_bins[bin_idx].push((name.to_string(), ind));
+            }
+        }
+    };
+
+    for r in &accession_obj.reads {
+        process_read(r);
+    }
+    for c in &accession_obj.contigs {
+        process_contig(c);
+    }
+
+    // ── emit groups ──────────────────────────────────────────────────
+    let mut hit_groups: Vec<Value> = Vec::new();
+
+    for (name, ind) in &individual_reads {
+        if let Some(hits) = read_data.get(name) {
+            if let Some(h) = hits.get(*ind) {
+                hit_groups.push(get_hit_group_json(&[], &[h], bin_size));
+            }
+        }
+    }
+    for (name, ind) in &individual_contigs {
+        if let Some(hits) = contig_data.get(name) {
+            if let Some(h) = hits.get(*ind) {
+                hit_groups.push(get_hit_group_json(&[h], &[], bin_size));
+            }
+        }
+    }
+
+    for i in 0..num_bins {
+        let read_refs: Vec<&ReadHit> = read_bins[i]
+            .iter()
+            .filter_map(|(n, ind)| read_data.get(n).and_then(|v| v.get(*ind)))
+            .collect();
+        let contig_refs: Vec<&ContigHit> = contig_bins[i]
+            .iter()
+            .filter_map(|(n, ind)| contig_data.get(n).and_then(|v| v.get(*ind)))
+            .collect();
+
+        if read_refs.is_empty() && contig_refs.is_empty() {
+            continue;
+        }
+        hit_groups.push(get_hit_group_json(&contig_refs, &read_refs, bin_size));
+    }
+
+    json!(hit_groups)
+}
+
+/// One hit-group array
+fn get_hit_group_json(
+    contig_objs: &[&ContigHit],
+    read_objs: &[&ReadHit],
+    bin_size: f64,
+) -> Value {
+    let num_contigs = contig_objs.len();
+    let num_reads = read_objs.len();
+    let num_hits = num_contigs + num_reads;
+    if num_hits == 0 {
+        return json!([]);
+    }
+
+    // Unique byteranges → sum num_reads once per contig sequence
+    let mut seen = HashSet::new();
+    let mut contig_r: u64 = 0;
+    let mut contig_byteranges: Vec<Value> = Vec::new();
+    for c in contig_objs {
+        let key = c.byterange.unwrap_or((0, 0));
+        if seen.insert(key) {
+            contig_r += c.num_reads;
+            if let Some((off, len)) = c.byterange {
+                contig_byteranges.push(json!([off, len]));
+            }
+        }
+    }
+
+    // Bounds + averages over all hits
+    let mut endpoints: Vec<u64> = Vec::with_capacity(num_hits * 2);
+    let mut sum_alen = 0.0;
+    let mut sum_pident = 0.0;
+    let mut sum_mismatch = 0.0;
+    let mut sum_gaps = 0.0;
+
+    for c in contig_objs {
+        endpoints.push(c.subject_start);
+        endpoints.push(c.subject_end);
+        sum_alen += c.alignment_length as f64;
+        sum_pident += c.percent_id;
+        sum_mismatch += c.num_mismatches as f64;
+        sum_gaps += c.num_gaps as f64;
+    }
+    for r in read_objs {
+        endpoints.push(r.subject_start);
+        endpoints.push(r.subject_end);
+        sum_alen += r.alignment_length as f64;
+        sum_pident += r.percent_id;
+        sum_mismatch += r.num_mismatches as f64;
+        sum_gaps += r.num_gaps as f64;
+    }
+
+    let hit_group_start = *endpoints.iter().min().unwrap_or(&0);
+    let hit_group_end = *endpoints.iter().max().unwrap_or(&0);
+    let mid = ((hit_group_start as f64 - 1.0) + hit_group_end as f64) / 2.0;
+    let bin_index = floor_with_min(mid / bin_size, 0);
+
+    let n = num_hits as f64;
+    json!([
+        num_contigs,
+        num_reads,
+        contig_r,
+        hit_group_start,
+        hit_group_end,
+        format_number(sum_alen / n),
+        format_percent(sum_pident / n / 100.0), //  avg(percent_id)/100
+        format_number(sum_mismatch / n),
+        format_number(sum_gaps / n),
+        bin_index,
+        contig_byteranges,
+    ])
+}
+
+fn align_interval_u64(a: u64, b: u64) -> (u64, u64) {
+    (a.min(b), a.max(b))
+}
+
+
+
+fn augment_contig_data_with_byteranges(
+    contigs_fasta: &Path,
+    contig_data: &mut HashMap<String, Vec<ContigHit>>,
+) -> Result<()> {
+    let file = File::open(contigs_fasta)
+        .with_context(|| format!("open contigs_fasta {}", contigs_fasta.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut seq_offset: u64 = 0;
+    let mut seq_len: u64 = 0;
+    let mut contig_name = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        // Re-add the newline that lines() strips — file offsets must match on-disk bytes.
+        let line_bytes = (line.len() + 1) as u64; // +1 for '\n'
+
+        if line.starts_with('>') {
+            // Finalize previous record
+            if seq_len > 0 {
+                if let Some(hits) = contig_data.get_mut(&contig_name) {
+                    for hit in hits.iter_mut() {
+                        hit.byterange = Some((seq_offset, seq_len));
+                    }
+                }
+                seq_offset += seq_len;
+            }
+            seq_len = line_bytes;
+            contig_name = line[1..].trim().to_string();
+        } else {
+            seq_len += line_bytes;
+        }
+    }
+
+    // Last contig in the file
+    if seq_len > 0 {
+        if let Some(hits) = contig_data.get_mut(&contig_name) {
+            for hit in hits.iter_mut() {
+                hit.byterange = Some((seq_offset, seq_len));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // Interval utilities — exact ports from Python

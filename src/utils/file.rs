@@ -705,10 +705,11 @@ pub async fn write_byte_stream_to_file(
     stream: ReceiverStream<ParseOutput>,
     config: Arc<RunConfig>,
     data_type: StreamDataType,
-    label: &str, // still &str here
+    label: &str,
+    append_newline: bool,         
 ) -> Result<JoinHandle<Result<()>>> {
     let dest_path_clone = dest_path.clone();
-    let label = label.to_string(); // ← clone to owned String
+    let label = label.to_string();
 
     let write_handle = tokio::spawn(async move {
         let file = TokioFile::create(&dest_path_clone)
@@ -723,9 +724,10 @@ pub async fn write_byte_stream_to_file(
         );
 
         let mut writer = tokio::io::BufWriter::with_capacity(effective_buffer, file);
-
         let mut stream = stream;
         let mut batch: Vec<u8> = Vec::with_capacity(effective_buffer / 4);
+        let mut items: u64 = 0;
+        let mut bytes_written: u64 = 0;
 
         while let Some(item) = stream.next().await {
             let bytes = item
@@ -733,6 +735,12 @@ pub async fn write_byte_stream_to_file(
                 .map_err(|e| anyhow!("Failed to convert to bytes: {}", e))?;
 
             batch.extend_from_slice(&bytes);
+            if append_newline && bytes.last() != Some(&b'\n') {
+                batch.push(b'\n');
+            }
+
+            items += 1;
+            bytes_written += bytes.len() as u64 + if append_newline { 1 } else { 0 };
 
             if batch.len() >= effective_buffer / 4 {
                 writer
@@ -754,12 +762,13 @@ pub async fn write_byte_stream_to_file(
             .await
             .map_err(|e| anyhow!("Flush error to {}: {}", dest_path_clone.display(), e))?;
 
-        let final_size = writer.stream_position().await.unwrap_or(0);
         info!(
-            "{} written to {} ({} bytes, buffer {} MiB)",
+            "{} written to {} ({} items, {} bytes, append_newline={}, buffer {} MiB)",
             label,
             dest_path_clone.display(),
-            final_size,
+            items,
+            bytes_written,
+            append_newline,
             effective_buffer / (1024 * 1024)
         );
 
