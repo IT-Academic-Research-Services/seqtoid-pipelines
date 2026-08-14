@@ -51,7 +51,7 @@ use crate::config::defs::{
     NRAlignmentBackend, PairingMode, PipelineError, ReadCountingMode, ReadStats, RunConfig,
     SamtoolsSubcommand, StreamDataType, Taxid, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, DIAMOND_TAG,
     FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, NR_TAG, NT_TAG,
-    READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG, ReducedRead
+    READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG, ReducedRead, ExecutionMode
 };
 use crate::utils::blast::{
     build_taxon_counts_list, call_hits_m8, compute_merged_taxon_counts,
@@ -3156,6 +3156,57 @@ async fn run_diamond_single_file(
         .map_err(|e| PipelineError::Other(anyhow!("write_task panicked: {}", e)))??;
 
     Ok(m8_path)
+}
+
+async fn non_host_align(
+    config: Arc<RunConfig>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+) -> Result<
+    (
+        mpsc::Receiver<ParseOutput>,                       // m8 stream
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,        // cleanup tasks
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, // cleanup receivers
+        Vec<TempDir>,                                      // temp dirs
+    ),
+    PipelineError,
+> {
+    match config.execution_mode {
+        ExecutionMode::Single => match config.alignment_backend {
+            NRAlignmentBackend::Diamond => {
+                diamond_non_host_align(config, r1_path, r2_path_opt).await
+            }
+            NRAlignmentBackend::MmseqsCpu => {
+                mmseqs_non_host_align(config, r1_path, r2_path_opt, MmseqsBackend::Cpu).await
+            }
+            NRAlignmentBackend::MmseqsGpu => {
+                mmseqs_non_host_align(config, r1_path, r2_path_opt, MmseqsBackend::Gpu).await
+            }
+        },
+        ExecutionMode::Distributed => {
+            distributed_non_host_align(config, r1_path, r2_path_opt).await
+        }
+    }
+}
+
+/// Placeholder — not implemented yet.
+/// Returns a clear error so accidental `--distributed` is obvious.
+async fn distributed_non_host_align(
+    _config: Arc<RunConfig>,
+    _r1_path: PathBuf,
+    _r2_path_opt: Option<PathBuf>,
+) -> Result<
+    (
+        mpsc::Receiver<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<TempDir>,
+    ),
+    PipelineError,
+> {
+    Err(PipelineError::Other(anyhow!(
+        "Distributed non-host alignment is not implemented yet"
+    )))
 }
 
 /// Aligns unmapped reads against NR database using Diamond.
@@ -7539,44 +7590,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     });
 
-    // Diamond or MMseqs2 non_host alignment
+
+    // Non-host-alignment
     let (
         non_host_m8_stream,
         mut non_host_cleanup_tasks,
         mut non_host_cleanup_receivers,
         non_host_align_temp_dirs,
-    ) = match config.alignment_backend {
-        NRAlignmentBackend::Diamond => {
-            diamond_non_host_align(
-                config.clone(),
-                non_host_r1_path.clone(),
-                non_host_r2_path_opt.clone(),
-            )
-            .await?
-        }
-        NRAlignmentBackend::MmseqsCpu => {
-            mmseqs_non_host_align(
-                config.clone(),
-                non_host_r1_path.clone(),
-                non_host_r2_path_opt.clone(),
-                MmseqsBackend::Cpu,
-            )
-            .await?
-        }
-        NRAlignmentBackend::MmseqsGpu => {
-            mmseqs_non_host_align(
-                config.clone(),
-                non_host_r1_path.clone(),
-                non_host_r2_path_opt.clone(),
-                MmseqsBackend::Gpu,
-            )
-            .await?
-        }
-    };
+    ) = non_host_align(
+        config.clone(),
+        non_host_r1_path.clone(),
+        non_host_r2_path_opt.clone(),
+    )
+        .await?;
 
     cleanup_tasks.append(&mut non_host_cleanup_tasks);
     cleanup_receivers.append(&mut non_host_cleanup_receivers);
     final_temp_dirs.extend(non_host_align_temp_dirs);
+
 
     let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
         ReceiverStream::new(non_host_m8_stream),

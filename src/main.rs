@@ -33,6 +33,7 @@ use crate::cli::args::Technology;
 use crate::cli::parse;
 use crate::config::defs::{
     GpuDetection, GpuInfo, NRAlignmentBackend, PipelineError, RunConfig, StreamDataType,
+    ExecutionMode
 };
 use crate::utils::file::{derive_sample_base_from_file1, resolve_existing_input_path};
 use crate::utils::system::{
@@ -163,6 +164,14 @@ async fn main() -> Result<()> {
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
+
+    let execution_mode = if args.distributed {
+        ExecutionMode::Distributed
+    } else {
+        ExecutionMode::Single
+    };
+
+
     let run_config = Arc::new(RunConfig {
         cwd: dir,
         ram_temp_dir,
@@ -178,10 +187,11 @@ async fn main() -> Result<()> {
         rng,
         log_level,
         base_backpressure_pause: 1000, // NB: hardcoded for testing
-        simd: simd,
-        gpu_info: gpu_info,
-        has_gpu: has_gpu,
+        simd,
+        gpu_info,
+        has_gpu,
         alignment_backend: backend,
+        execution_mode
     });
 
     if let Err(e) = ensure_transparent_hugepages(&run_config).await {

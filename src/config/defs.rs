@@ -236,6 +236,18 @@ pub enum NRAlignmentBackend {
     MmseqsGpu,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Single,
+    Distributed,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        ExecutionMode::Single
+    }
+}
+
 
 #[derive(Clone, Debug)]
 pub struct RunConfig {
@@ -257,6 +269,7 @@ pub struct RunConfig {
     pub gpu_info: GpuDetection,
     pub has_gpu: bool,
     pub alignment_backend: NRAlignmentBackend,
+    pub execution_mode: ExecutionMode,
 }
 
 /// Internal structure for grouped batch processing of read hits.
