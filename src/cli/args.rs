@@ -228,4 +228,10 @@ pub struct Arguments {
     #[arg(long = "distributed", action)]
     pub distributed: bool,
 
+    #[arg(long, default_value = "/efs")]
+    pub efs_base_dir: String,
+
+    #[arg(long, default_value = "/efs/runs")]
+    pub efs_runs_dir: String,
+
 }

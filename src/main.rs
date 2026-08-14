@@ -171,6 +171,17 @@ async fn main() -> Result<()> {
         ExecutionMode::Single
     };
 
+    let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
+
+    let run_id = out_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            // fallback if out_dir is weird
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            format!("run_{ts}")
+        });
+
 
     let run_config = Arc::new(RunConfig {
         cwd: dir,
@@ -191,7 +202,9 @@ async fn main() -> Result<()> {
         gpu_info,
         has_gpu,
         alignment_backend: backend,
-        execution_mode
+        execution_mode,
+        efs_runs_dir,
+        run_id,
     });
 
     if let Err(e) = ensure_transparent_hugepages(&run_config).await {
@@ -282,7 +295,7 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             let sample_base = derive_sample_base_from_file1(&file1)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-            let timestamp = chrono::Local::now().format("%Y%m%d").to_string();
+            let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
             cwd.join(format!("{}_{}", sample_base.display(), timestamp))
         }
     };

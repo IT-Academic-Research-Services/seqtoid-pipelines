@@ -270,6 +270,8 @@ pub struct RunConfig {
     pub has_gpu: bool,
     pub alignment_backend: NRAlignmentBackend,
     pub execution_mode: ExecutionMode,
+    pub efs_runs_dir: PathBuf,
+    pub run_id: String,
 }
 
 /// Internal structure for grouped batch processing of read hits.

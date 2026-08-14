@@ -84,7 +84,7 @@ use crate::utils::fastx::{
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
     validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
-    write_vecu8_to_file,
+    write_vecu8_to_file, copy_file_streaming,
 };
 use crate::utils::paf::paf_to_m8;
 use crate::utils::plotting::plot_insert_sizes;
@@ -3192,9 +3192,9 @@ async fn non_host_align(
 /// Placeholder — not implemented yet.
 /// Returns a clear error so accidental `--distributed` is obvious.
 async fn distributed_non_host_align(
-    _config: Arc<RunConfig>,
-    _r1_path: PathBuf,
-    _r2_path_opt: Option<PathBuf>,
+    config: Arc<RunConfig>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
 ) -> Result<
     (
         mpsc::Receiver<ParseOutput>,
@@ -3204,11 +3204,87 @@ async fn distributed_non_host_align(
     ),
     PipelineError,
 > {
+    let efs_base = config.efs_runs_dir.join(&config.run_id);
+    info!(
+        "Distributed non-host align: preparing EFS run dir {}",
+        efs_base.display()
+    );
+
+    tokio::fs::create_dir_all(&efs_base)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to create EFS run dir {}: {}",
+                efs_base.display(),
+                e
+            ))
+        })?;
+
+    let non_host_r1_efs = efs_base.join("nonhost_R1.fastq");
+    let non_host_r2_efs = r2_path_opt
+        .as_ref()
+        .map(|_| efs_base.join("nonhost_R2.fastq"));
+
+    // ── Copy local checkpoint → EFS (must finish before any worker starts) ──
+    info!("Copying non-host R1 to EFS: {}", non_host_r1_efs.display());
+    copy_file_streaming(
+        &r1_path,
+        &non_host_r1_efs,
+        Some(config.clone()),
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e))?
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("R1 copy task join failed: {e}")))?
+        .map_err(|e| PipelineError::Other(anyhow!("R1 EFS copy failed: {e}")))?;
+
+    if let (Some(local_r2), Some(efs_r2)) = (&r2_path_opt, &non_host_r2_efs) {
+        info!("Copying non-host R2 to EFS: {}", efs_r2.display());
+        copy_file_streaming(local_r2, efs_r2, Some(config.clone()), None)
+            .await
+            .map_err(|e| PipelineError::Other(e))?
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("R2 copy task join failed: {e}")))?
+            .map_err(|e| PipelineError::Other(anyhow!("R2 EFS copy failed: {e}")))?;
+    }
+
+    info!("Non-host FASTQs on EFS under {}", efs_base.display());
+
+    // ── TODO: chunk, launch workers, wait, streaming-merge shard m8s ──
+    // When implemented, build the real m8 stream here, then:
+    //
+    // let efs_cleanup = tokio::spawn({
+    //     let efs_base = efs_base.clone();
+    //     async move {
+    //         if tokio::fs::try_exists(&efs_base).await.unwrap_or(false) {
+    //             if let Err(e) = tokio::fs::remove_dir_all(&efs_base).await {
+    //                 warn!("Failed to remove EFS run dir {}: {}", efs_base.display(), e);
+    //             } else {
+    //                 debug!("Removed EFS run dir {}", efs_base.display());
+    //             }
+    //         }
+    //         Ok(())
+    //     }
+    // });
+    // cleanup_tasks.push(efs_cleanup);
+    // return Ok((m8_rx, cleanup_tasks, cleanup_receivers, temp_dirs));
+
+    // Stub: clean up what we just wrote so failed --distributed runs leave no junk
+    if let Err(e) = tokio::fs::remove_dir_all(&efs_base).await {
+        warn!(
+            "Failed to remove EFS run dir {} after stub exit: {}",
+            efs_base.display(),
+            e
+        );
+    } else {
+        debug!("Removed EFS run dir after stub: {}", efs_base.display());
+    }
+
     Err(PipelineError::Other(anyhow!(
-        "Distributed non-host alignment is not implemented yet"
+        "Distributed non-host alignment is not implemented yet (EFS copy/teardown path is wired)"
     )))
 }
-
 /// Aligns unmapped reads against NR database using Diamond.
 ///
 /// # Arguments
