@@ -16,7 +16,7 @@ use tempfile::Builder as TempfileBuilder;
 use tempfile::TempDir;
 use tokio::fs::File as TokioFile;
 use tokio::io::AsyncSeekExt;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufReader as AsyncBufReader, BufWriter as AsyncBufWriter};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -335,7 +335,7 @@ pub async fn write_parse_output_to_fifo(
         let writer_file = TokioFile::create(&fifo_path)
             .await
             .map_err(|e| anyhow!("Failed to open FIFO at {}: {}", fifo_path.display(), e))?;
-        let mut writer = BufWriter::with_capacity(buffer_capacity, writer_file);
+        let mut writer = AsyncBufWriter::with_capacity(buffer_capacity, writer_file);
         let mut byte_count = 0;
         while let Some(item) = input_stream.next().await {
             match item {
@@ -470,7 +470,7 @@ pub async fn write_vecu8_to_file<P: AsRef<Path>>(
         let file = TokioFile::create(&temp_path)
             .await
             .map_err(|e| anyhow!("Failed to create file at {}: {}", temp_path.display(), e))?;
-        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
+        let mut writer = AsyncBufWriter::with_capacity(buffer_capacity, file);
 
         let byte_count = if data.len() <= 4 * 1024 * 1024 {
             // Write small data in one go
@@ -529,7 +529,7 @@ pub async fn write_parse_output_to_file(
                 e
             )
         })?;
-        let mut writer = BufWriter::with_capacity(buffer_capacity, file);
+        let mut writer = AsyncBufWriter::with_capacity(buffer_capacity, file);
         let mut total_bytes = 0u64;
 
         while let Some(item) = input_stream.next().await {
@@ -931,6 +931,73 @@ pub async fn choose_temp_dir(
     let _ = tokio::fs::remove_dir(fallback.path().join("probe")).await;
 
     Ok(fallback)
+}
+
+/// Streams src → dst with large, smart buffers.
+/// Uses compute_buffer_size when a config is provided (recommended).
+/// Falls back to a sensible 16 MiB default otherwise.
+pub async fn copy_file_streaming(
+    src: impl AsRef<Path>,
+    dst: impl AsRef<Path>,
+    config: Option<Arc<RunConfig>>,
+    buffer_size: Option<usize>,
+) -> Result<JoinHandle<Result<()>>> {
+    let src = src.as_ref().to_path_buf();
+    let dst = dst.as_ref().to_path_buf();
+
+    let buffer_capacity = if let Some(size) = buffer_size {
+        size
+    } else if let Some(cfg) = &config {
+        crate::utils::system::compute_buffer_size(
+            cfg,
+            "copy_file_streaming",
+            StreamDataType::JustBytes,
+            1.8,                     // write-heavy boost
+        )
+    } else {
+        16 * 1024 * 1024
+    };
+
+    let task = tokio::spawn(async move {
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| anyhow!("Failed to create parent dir for {}: {}", dst.display(), e))?;
+        }
+
+        let tmp_path = dst.with_extension(
+            dst.extension()
+                .map(|e| format!("{}.tmp", e.to_string_lossy()))
+                .unwrap_or_else(|| "tmp".to_string()),
+        );
+
+        let src_file = TokioFile::open(&src)
+            .await
+            .map_err(|e| anyhow!("Failed to open source {}: {}", src.display(), e))?;
+        let mut reader = AsyncBufReader::with_capacity(buffer_capacity, src_file);
+
+        let dst_file = TokioFile::create(&tmp_path)
+            .await
+            .map_err(|e| anyhow!("Failed to create temp dest {}: {}", tmp_path.display(), e))?;
+
+        let mut writer = AsyncBufWriter::with_capacity(buffer_capacity, dst_file);
+
+        let bytes_copied = tokio::io::copy(&mut reader, &mut writer)
+            .await
+            .map_err(|e| anyhow!("Streaming copy failed from {} to {}: {}", src.display(), tmp_path.display(), e))?;
+
+        writer.flush().await
+            .map_err(|e| anyhow!("Flush failed on {}: {}", tmp_path.display(), e))?;
+        writer.shutdown().await
+            .map_err(|e| anyhow!("Shutdown failed on {}: {}", tmp_path.display(), e))?;
+
+        tokio::fs::rename(&tmp_path, &dst).await
+            .map_err(|e| anyhow!("Atomic rename failed from {} to {}: {}", tmp_path.display(), dst.display(), e))?;
+
+        debug!("Copied {} bytes from {} → {}", bytes_copied, src.display(), dst.display());
+        Ok(())
+    });
+
+    Ok(task)
 }
 
 #[cfg(test)]
