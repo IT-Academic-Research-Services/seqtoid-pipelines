@@ -228,6 +228,13 @@ pub struct Arguments {
     #[arg(long = "distributed", action)]
     pub distributed: bool,
 
+    #[arg(
+        long = "distributed-workers",
+        value_name = "N",
+        help = "Number of READY distributed MMseqs/diamond CPU workers to use"
+    )]
+    pub distributed_workers: Option<usize>,
+
     #[arg(long, default_value = "/efs")]
     pub efs_base_dir: String,
 
