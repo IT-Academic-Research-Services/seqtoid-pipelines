@@ -1867,13 +1867,13 @@ where
 mod tests {
     use super::*;
     use crate::cli::Arguments;
-    use crate::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType};
+    use crate::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType, ExecutionMode, resolve_distributed_workers};
     use crate::utils::fastx::fastx_generator;
     use crate::utils::fastx::SequenceRecord;
     use crate::utils::system::{detect_ram, generate_rng};
     use log::{self, debug, error, LevelFilter};
     use rayon::ThreadPoolBuilder;
-    use std::fs;
+    use std::{env, fs};
     use std::io::Read;
     use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
@@ -1889,7 +1889,6 @@ mod tests {
     use tokio::task;
     use tokio::time::{self, Duration};
 
-
     /// Helper function to create a `RunConfig` for tests.
     fn create_test_run_config() -> Arc<RunConfig> {
         let args = Arguments {
@@ -1901,6 +1900,14 @@ mod tests {
             .unwrap_or((16u64 << 30, 8u64 << 30));
 
         let rng = generate_rng(Some(42));
+        
+        let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
+
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let run_id = format!("run_streams_test_{ts}");
+        
+        let distributed_workers =
+            resolve_distributed_workers(args.distributed, args.distributed_workers).unwrap();
 
         let mut run_config = RunConfig {
             cwd: PathBuf::from("."),
@@ -1921,6 +1928,10 @@ mod tests {
             gpu_info: GpuDetection { count: 0, gpus: vec![] },
             has_gpu: false,
             alignment_backend: NRAlignmentBackend::Diamond,
+            execution_mode: ExecutionMode::Single,
+            efs_runs_dir,
+            run_id,
+            distributed_workers
         };
 
         // Compute proper buffer size exactly like main.rs

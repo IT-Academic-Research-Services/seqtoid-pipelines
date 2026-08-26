@@ -33,7 +33,7 @@ use crate::cli::args::Technology;
 use crate::cli::parse;
 use crate::config::defs::{
     GpuDetection, GpuInfo, NRAlignmentBackend, PipelineError, RunConfig, StreamDataType,
-    ExecutionMode
+    ExecutionMode, resolve_distributed_workers
 };
 use crate::utils::file::{derive_sample_base_from_file1, resolve_existing_input_path};
 use crate::utils::system::{
@@ -182,6 +182,8 @@ async fn main() -> Result<()> {
             format!("run_{ts}")
         });
 
+    let distributed_workers =
+        resolve_distributed_workers(args.distributed, args.distributed_workers)?;
 
     let run_config = Arc::new(RunConfig {
         cwd: dir,
@@ -205,6 +207,7 @@ async fn main() -> Result<()> {
         execution_mode,
         efs_runs_dir,
         run_id,
+        distributed_workers,
     });
 
     if let Err(e) = ensure_transparent_hugepages(&run_config).await {

@@ -272,6 +272,30 @@ pub struct RunConfig {
     pub execution_mode: ExecutionMode,
     pub efs_runs_dir: PathBuf,
     pub run_id: String,
+    pub distributed_workers: usize,
+}
+
+pub fn resolve_distributed_workers(
+    distributed: bool,
+    requested_workers: Option<usize>,
+) -> Result<usize, PipelineError> {
+    match (distributed, requested_workers) {
+        (false, Some(_)) => Err(PipelineError::InvalidConfig(
+            "--distributed-workers requires --distributed".to_string(),
+        )),
+
+        (true, Some(n)) if n > 0 => Ok(n),
+
+        (true, Some(_)) => Err(PipelineError::InvalidConfig(
+            "--distributed-workers must be greater than zero".to_string(),
+        )),
+
+        (true, None) => Err(PipelineError::InvalidConfig(
+            "--distributed requires --distributed-workers N".to_string(),
+        )),
+
+        (false, None) => Ok(0),
+    }
 }
 
 /// Internal structure for grouped batch processing of read hits.

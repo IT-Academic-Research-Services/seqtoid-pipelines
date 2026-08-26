@@ -5,7 +5,7 @@ use futures::StreamExt;
 use log::{self, debug, error, info, warn, LevelFilter};
 use rayon::ThreadPoolBuilder;
 use seqtoid_pipelines::cli::Arguments;
-use seqtoid_pipelines::config::defs::SimdLevel;
+use seqtoid_pipelines::config::defs::{resolve_distributed_workers, ExecutionMode, SimdLevel};
 use seqtoid_pipelines::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, StreamDataType};
 use seqtoid_pipelines::utils::fastx::{fastx_generator, SequenceRecord};
 use seqtoid_pipelines::utils::streams::{deinterleave_fastq_stream_to_fifos, fanout_to_channels, parse_child_output, read_child_output_to_vec, stream_to_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
@@ -153,6 +153,14 @@ fn create_test_run_config() -> Arc<RunConfig> {
 
     let rng = generate_rng(Some(42));
 
+    let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
+
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let run_id = format!("run_stress_test_{ts}");
+
+    let distributed_workers =
+        resolve_distributed_workers(args.distributed, args.distributed_workers).unwrap();
+
     let mut run_config = RunConfig {
         cwd: PathBuf::from("."),
         ram_temp_dir: std::env::temp_dir(),
@@ -172,6 +180,10 @@ fn create_test_run_config() -> Arc<RunConfig> {
         gpu_info: GpuDetection { count: 0, gpus: vec![] },
         has_gpu: false,
         alignment_backend: NRAlignmentBackend::Diamond,
+        execution_mode: ExecutionMode::Single,
+        efs_runs_dir,
+        run_id,
+        distributed_workers
     };
 
     // Compute proper buffer size exactly like main.rs
