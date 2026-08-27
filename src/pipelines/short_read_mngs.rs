@@ -3189,7 +3189,20 @@ async fn non_host_align(
     }
 }
 
-
+/// Runs the distributed non-host alignment path.
+///
+/// Discovers currently running tagged workers, selects the requested number,
+/// and prepares the existing EFS checkpoint for distributed NR processing.
+/// Remote alignment execution is not implemented yet.
+///
+/// # Arguments
+///
+/// * `config` - RunConfig struct
+/// * `r1_path` - Path to the non-host R1 FASTQ file
+/// * `r2_path_opt` - Optional path to the non-host R2 FASTQ file
+///
+/// # Returns
+/// Distributed NR m8 stream, cleanup tasks, cleanup receivers, and temporary directories
 async fn distributed_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3203,9 +3216,10 @@ async fn distributed_non_host_align(
     ),
     PipelineError,
 > {
-
     let worker_manager =
-        crate::utils::workers::WorkerManager::new(config.efs_runs_dir.join("workers"))
+        crate::utils::workers::WorkerManager::new(
+            config.efs_runs_dir.join("workers")
+        )
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
@@ -3216,28 +3230,60 @@ async fn distributed_non_host_align(
 
     let requested_workers = config.distributed_workers;
 
+    // ec2 discovery
+
+    let running_workers = worker_manager
+        .discover_running_workers()
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to discover running distributed workers: {}",
+                e
+            ))
+        })?;
+
+    info!(
+        "Distributed NR: discovered {} running tagged workers for requested {}",
+        running_workers.len(),
+        requested_workers
+    );
+
+    let workers = crate::utils::workers::select_workers(
+        running_workers,
+        requested_workers,
+    )?;
+
+    info!(
+        "Distributed NR: selected {} running workers",
+        workers.len()
+    );
+
+    for worker in &workers {
+        info!(
+            "Distributed NR worker: instance_id={}, private_ip={}, instance_type={}, az={:?}",
+            worker.instance_id,
+            worker.private_ip,
+            worker.instance_type,
+            worker.availability_zone,
+        );
+    }
+
+
+    /*
     let workers = worker_manager
         .require_ready_workers(requested_workers)
         .await
-        .map_err(|e| PipelineError::Other(e))?;
+        .map_err(PipelineError::Other)?;
 
     info!(
         "Distributed NR: discovered {} READY workers for requested {}",
         workers.len(),
         requested_workers
     );
-
-    for worker in &workers {
-        info!(
-        "Distributed NR worker: instance_id={}, private_ip={}, instance_type={}, az={:?}",
-        worker.instance_id,
-        worker.private_ip,
-        worker.instance_type,
-        worker.availability_zone,
-        );
-    }
+    */
 
     let efs_base = config.efs_runs_dir.join(&config.run_id);
+
     info!(
         "Distributed non-host align: preparing EFS run dir {}",
         efs_base.display()
@@ -3254,12 +3300,16 @@ async fn distributed_non_host_align(
         })?;
 
     let non_host_r1_efs = efs_base.join("nonhost_R1.fastq");
+
     let non_host_r2_efs = r2_path_opt
         .as_ref()
         .map(|_| efs_base.join("nonhost_R2.fastq"));
 
-    // ── Copy local checkpoint → EFS (must finish before any worker starts) ──
-    info!("Copying non-host R1 to EFS: {}", non_host_r1_efs.display());
+    info!(
+        "Copying non-host R1 to EFS: {}",
+        non_host_r1_efs.display()
+    );
+
     copy_file_streaming(
         &r1_path,
         &non_host_r1_efs,
@@ -3267,43 +3317,69 @@ async fn distributed_non_host_align(
         None,
     )
         .await
-        .map_err(|e| PipelineError::Other(e))?
+        .map_err(PipelineError::Other)?
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("R1 copy task join failed: {e}")))?
-        .map_err(|e| PipelineError::Other(anyhow!("R1 EFS copy failed: {e}")))?;
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "R1 copy task join failed: {e}"
+        ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "R1 EFS copy failed: {e}"
+        ))
+        })?;
 
-    if let (Some(local_r2), Some(efs_r2)) = (&r2_path_opt, &non_host_r2_efs) {
-        info!("Copying non-host R2 to EFS: {}", efs_r2.display());
-        copy_file_streaming(local_r2, efs_r2, Some(config.clone()), None)
+    if let (Some(local_r2), Some(efs_r2)) =
+        (&r2_path_opt, &non_host_r2_efs)
+    {
+        info!(
+            "Copying non-host R2 to EFS: {}",
+            efs_r2.display()
+        );
+
+        copy_file_streaming(
+            local_r2,
+            efs_r2,
+            Some(config.clone()),
+            None,
+        )
             .await
-            .map_err(|e| PipelineError::Other(e))?
+            .map_err(PipelineError::Other)?
             .await
-            .map_err(|e| PipelineError::Other(anyhow!("R2 copy task join failed: {e}")))?
-            .map_err(|e| PipelineError::Other(anyhow!("R2 EFS copy failed: {e}")))?;
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "R2 copy task join failed: {e}"
+            ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "R2 EFS copy failed: {e}"
+            ))
+            })?;
     }
 
-    info!("Non-host FASTQs on EFS under {}", efs_base.display());
+    info!(
+        "Non-host FASTQs on EFS under {}",
+        efs_base.display()
+    );
 
-    // ── TODO: chunk, launch workers, wait, streaming-merge shard m8s ──
-    // When implemented, build the real m8 stream here, then:
-    //
-    // let efs_cleanup = tokio::spawn({
-    //     let efs_base = efs_base.clone();
-    //     async move {
-    //         if tokio::fs::try_exists(&efs_base).await.unwrap_or(false) {
-    //             if let Err(e) = tokio::fs::remove_dir_all(&efs_base).await {
-    //                 warn!("Failed to remove EFS run dir {}: {}", efs_base.display(), e);
-    //             } else {
-    //                 debug!("Removed EFS run dir {}", efs_base.display());
-    //             }
-    //         }
-    //         Ok(())
-    //     }
-    // });
-    // cleanup_tasks.push(efs_cleanup);
-    // return Ok((m8_rx, cleanup_tasks, cleanup_receivers, temp_dirs));
 
-    // Stub: clean up what we just wrote so failed --distributed runs leave no junk
+    /*
+    match config.alignment_backend {
+        NRAlignmentBackend::MmseqsCpu => {
+        }
+
+        NRAlignmentBackend::Diamond => {
+            // later
+        }
+
+        NRAlignmentBackend::MmseqsGpu => {
+            // later
+        }
+    }
+    */
+
     if let Err(e) = tokio::fs::remove_dir_all(&efs_base).await {
         warn!(
             "Failed to remove EFS run dir {} after stub exit: {}",
@@ -3311,11 +3387,15 @@ async fn distributed_non_host_align(
             e
         );
     } else {
-        debug!("Removed EFS run dir after stub: {}", efs_base.display());
+        debug!(
+            "Removed EFS run dir after stub: {}",
+            efs_base.display()
+        );
     }
 
     Err(PipelineError::Other(anyhow!(
-        "Distributed non-host alignment is not implemented yet (EFS copy/teardown path is wired)"
+        "Distributed non-host alignment is not implemented yet \
+         (EC2 worker discovery and EFS copy/teardown are wired)"
     )))
 }
 
