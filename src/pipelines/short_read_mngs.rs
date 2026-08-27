@@ -3189,8 +3189,7 @@ async fn non_host_align(
     }
 }
 
-/// Placeholder — not implemented yet.
-/// Returns a clear error so accidental `--distributed` is obvious.
+
 async fn distributed_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3204,6 +3203,40 @@ async fn distributed_non_host_align(
     ),
     PipelineError,
 > {
+
+    let worker_manager =
+        crate::utils::workers::WorkerManager::new(config.efs_runs_dir.join("workers"))
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to initialize distributed worker manager: {}",
+                e
+            ))
+            })?;
+
+    let requested_workers = config.distributed_workers;
+
+    let workers = worker_manager
+        .require_ready_workers(requested_workers)
+        .await
+        .map_err(|e| PipelineError::Other(e))?;
+
+    info!(
+        "Distributed NR: discovered {} READY workers for requested {}",
+        workers.len(),
+        requested_workers
+    );
+
+    for worker in &workers {
+        info!(
+        "Distributed NR worker: instance_id={}, private_ip={}, instance_type={}, az={:?}",
+        worker.instance_id,
+        worker.private_ip,
+        worker.instance_type,
+        worker.availability_zone,
+        );
+    }
+
     let efs_base = config.efs_runs_dir.join(&config.run_id);
     info!(
         "Distributed non-host align: preparing EFS run dir {}",
@@ -3285,6 +3318,8 @@ async fn distributed_non_host_align(
         "Distributed non-host alignment is not implemented yet (EFS copy/teardown path is wired)"
     )))
 }
+
+
 /// Aligns unmapped reads against NR database using Diamond.
 ///
 /// # Arguments
