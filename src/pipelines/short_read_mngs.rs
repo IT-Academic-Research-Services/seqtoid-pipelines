@@ -79,7 +79,7 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{
     generate_taxid_fasta, generate_taxid_locator, parse_byte_stream_to_fastq, raw_read_count,
     read_fasta, read_fastq, stream_record_counter, write_combined_fastq,
-    write_fasta_stream_to_file, SequenceRecord,
+    write_fasta_stream_to_file, SequenceRecord, chunk_paired_fastq
 };
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
@@ -3223,9 +3223,9 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "Failed to initialize distributed worker manager: {}",
-                e
-            ))
+                    "Failed to initialize distributed worker manager: {}",
+                    e
+                ))
             })?;
 
     let requested_workers = config.distributed_workers;
@@ -3267,7 +3267,6 @@ async fn distributed_non_host_align(
             worker.availability_zone,
         );
     }
-
 
     /*
     let workers = worker_manager
@@ -3321,13 +3320,13 @@ async fn distributed_non_host_align(
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-            "R1 copy task join failed: {e}"
-        ))
+                "R1 copy task join failed: {e}"
+            ))
         })?
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-            "R1 EFS copy failed: {e}"
-        ))
+                "R1 EFS copy failed: {e}"
+            ))
         })?;
 
     if let (Some(local_r2), Some(efs_r2)) =
@@ -3349,13 +3348,13 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "R2 copy task join failed: {e}"
-            ))
+                    "R2 copy task join failed: {e}"
+                ))
             })?
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "R2 EFS copy failed: {e}"
-            ))
+                    "R2 EFS copy failed: {e}"
+                ))
             })?;
     }
 
@@ -3364,6 +3363,101 @@ async fn distributed_non_host_align(
         efs_base.display()
     );
 
+    // Distributed paired-end chunking.
+    const CHUNKS_PER_WORKER: usize = 4;
+
+    let non_host_r2_efs = non_host_r2_efs
+        .as_ref()
+        .ok_or_else(|| {
+            PipelineError::InvalidConfig(
+                "Distributed non-host alignment currently requires paired-end input"
+                    .to_string()
+            )
+        })?;
+
+    let total_records = raw_read_count(
+        non_host_r1_efs.clone(),
+        Some(non_host_r2_efs.clone()),
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Non-host FASTQ count task join failed: {e}"
+            ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to count non-host FASTQ records: {e}"
+            ))
+        })?;
+
+    if total_records == 0 {
+        return Err(PipelineError::EmptyStream);
+    }
+
+    if total_records % 2 != 0 {
+        return Err(PipelineError::Other(anyhow!(
+            "Paired non-host FASTQ record count is not even: {}",
+            total_records
+        )));
+    }
+
+    let total_pairs = total_records / 2;
+
+    let target_chunks = requested_workers
+        .checked_mul(CHUNKS_PER_WORKER)
+        .ok_or_else(|| {
+            PipelineError::InvalidConfig(
+                "Distributed chunk count overflow".to_string()
+            )
+        })?;
+
+    let target_chunks = (target_chunks as u64)
+        .min(total_pairs)
+        .max(1);
+
+    // Ceiling division ensures every pair is assigned to a chunk.
+    let pairs_per_chunk =
+        (total_pairs + target_chunks - 1) / target_chunks;
+
+    let chunks_dir = efs_base.join("chunks");
+
+    info!(
+        "Distributed NR chunking: {} pairs, {} requested workers, target {} chunks, {} pairs/chunk",
+        total_pairs,
+        requested_workers,
+        target_chunks,
+        pairs_per_chunk
+    );
+
+    let chunk_summary = chunk_paired_fastq(
+        non_host_r1_efs.clone(),
+        non_host_r2_efs.clone(),
+        chunks_dir,
+        pairs_per_chunk,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to chunk paired non-host FASTQs: {e}"
+            ))
+        })?;
+
+    info!(
+        "Distributed NR chunking complete: {} pairs, {} R1 records, {} R2 records, {} chunks",
+        chunk_summary.total_pairs,
+        chunk_summary.total_r1_records,
+        chunk_summary.total_r2_records,
+        chunk_summary.chunks.len()
+    );
+
+    if chunk_summary.total_pairs != total_pairs {
+        return Err(PipelineError::Other(anyhow!(
+            "Distributed chunk reconciliation failed: source pairs={}, chunked pairs={}",
+            total_pairs,
+            chunk_summary.total_pairs
+        )));
+    }
 
     /*
     match config.alignment_backend {
@@ -3380,22 +3474,9 @@ async fn distributed_non_host_align(
     }
     */
 
-    if let Err(e) = tokio::fs::remove_dir_all(&efs_base).await {
-        warn!(
-            "Failed to remove EFS run dir {} after stub exit: {}",
-            efs_base.display(),
-            e
-        );
-    } else {
-        debug!(
-            "Removed EFS run dir after stub: {}",
-            efs_base.display()
-        );
-    }
-
     Err(PipelineError::Other(anyhow!(
         "Distributed non-host alignment is not implemented yet \
-         (EC2 worker discovery and EFS copy/teardown are wired)"
+         (EC2 worker discovery, EFS checkpointing, and paired FASTQ chunking are wired)"
     )))
 }
 
