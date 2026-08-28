@@ -43,6 +43,44 @@ use crate::utils::system::compute_phase_concurrency;
 use crate::utils::taxonomy::get_taxid;
 use crate::utils::taxonomy::{combine_taxon_loc_json, get_valid_lineage};
 
+
+// Metadata describing one completed paired-end FASTQ chunk.
+///
+/// # Arguments
+///
+/// * `chunk_id` - Deterministic zero-based chunk identifier.
+/// * `r1_path` - Path to the chunk R1 FASTQ.
+/// * `r2_path` - Path to the chunk R2 FASTQ.
+/// * `pair_count` - Number of logical read pairs in the chunk.
+///
+/// # Returns
+/// Metadata for a complete FASTQ chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedFastqChunk {
+    pub chunk_id: u64,
+    pub r1_path: PathBuf,
+    pub r2_path: PathBuf,
+    pub pair_count: u64,
+}
+
+/// Metadata describing the result of a complete paired-end FASTQ chunking run.
+///
+/// # Arguments
+///
+/// * `chunks` - Deterministically ordered completed chunks.
+/// * `total_pairs` - Total number of read pairs consumed from the source.
+///
+/// # Returns
+/// Complete chunking summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedFastqChunkingSummary {
+    pub chunks: Vec<PairedFastqChunk>,
+    pub total_pairs: u64,
+    pub total_r1_records: u64,
+    pub total_r2_records: u64,
+}
+
+
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
         let mut m = HashMap::new();
@@ -2129,6 +2167,451 @@ pub async fn write_combined_fastq(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     Ok(())
+}
+
+
+/// Splits paired-end FASTQ files into deterministic, complete chunks without
+/// loading the input files into memory.
+///
+/// R1 and R2 are read synchronously one record at a time. Each pair is
+/// validated by read ID before either record is written, so a mate pair can
+/// never be split across chunks. A pair is the indivisible unit of chunking.
+///
+/// Chunk files are first written to temporary paths and atomically renamed
+/// only after the complete chunk has been written successfully. Any malformed
+/// record, read-ID mismatch, uneven input length, or other I/O error fails the
+/// operation rather than silently discarding data.
+///
+/// # Arguments
+///
+/// * `r1_path` - Source R1 FASTQ file.
+/// * `r2_path` - Source R2 FASTQ file.
+/// * `output_dir` - Directory where deterministic chunk files are written.
+/// * `pairs_per_chunk` - Maximum number of read pairs in each chunk.
+///
+/// # Returns
+/// Complete chunking summary containing every successfully written chunk and
+/// the reconciled total pair/record counts.
+pub async fn chunk_paired_fastq(
+    r1_path: PathBuf,
+    r2_path: PathBuf,
+    output_dir: PathBuf,
+    pairs_per_chunk: u64,
+) -> Result<PairedFastqChunkingSummary> {
+    if pairs_per_chunk == 0 {
+        return Err(anyhow!("pairs_per_chunk must be greater than zero"));
+    }
+
+    if !r1_path.is_file() {
+        return Err(anyhow!(
+            "R1 FASTQ does not exist or is not a file: {}",
+            r1_path.display()
+        ));
+    }
+
+    if !r2_path.is_file() {
+        return Err(anyhow!(
+            "R2 FASTQ does not exist or is not a file: {}",
+            r2_path.display()
+        ));
+    }
+
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to create FASTQ chunk output directory: {}",
+                output_dir.display()
+            )
+        })?;
+
+    tokio::task::spawn_blocking(move || -> Result<PairedFastqChunkingSummary> {
+        let mut reader1 = parse_fastx_file(&r1_path).map_err(|e| {
+            anyhow!(
+                "Failed to open R1 FASTQ {}: {}",
+                r1_path.display(),
+                e
+            )
+        })?;
+
+        let mut reader2 = parse_fastx_file(&r2_path).map_err(|e| {
+            anyhow!(
+                "Failed to open R2 FASTQ {}: {}",
+                r2_path.display(),
+                e
+            )
+        })?;
+
+        let mut chunks = Vec::new();
+
+        let mut chunk_id: u64 = 0;
+        let mut chunk_pairs: u64 = 0;
+        let mut total_pairs: u64 = 0;
+        let mut total_r1_records: u64 = 0;
+        let mut total_r2_records: u64 = 0;
+
+        let mut r1_writer: Option<StdBufWriter<File>> = None;
+        let mut r2_writer: Option<StdBufWriter<File>> = None;
+
+        let mut r1_tmp_path: Option<PathBuf> = None;
+        let mut r2_tmp_path: Option<PathBuf> = None;
+
+        let mut r1_final_path: Option<PathBuf> = None;
+        let mut r2_final_path: Option<PathBuf> = None;
+
+        let open_chunk = |chunk_id: u64,
+                          output_dir: &PathBuf|
+                          -> Result<(
+                              StdBufWriter<File>,
+                              StdBufWriter<File>,
+                              PathBuf,
+                              PathBuf,
+                              PathBuf,
+                              PathBuf,
+                          )> {
+            let r1_final = output_dir.join(format!("chunk_{:08}_R1.fastq", chunk_id));
+            let r2_final = output_dir.join(format!("chunk_{:08}_R2.fastq", chunk_id));
+
+            let r1_tmp = output_dir.join(format!("chunk_{:08}_R1.fastq.tmp", chunk_id));
+            let r2_tmp = output_dir.join(format!("chunk_{:08}_R2.fastq.tmp", chunk_id));
+
+            let r1_file = File::create(&r1_tmp).with_context(|| {
+                format!(
+                    "Failed to create temporary R1 chunk: {}",
+                    r1_tmp.display()
+                )
+            })?;
+
+            let r2_file = File::create(&r2_tmp).with_context(|| {
+                format!(
+                    "Failed to create temporary R2 chunk: {}",
+                    r2_tmp.display()
+                )
+            })?;
+
+            Ok((
+                StdBufWriter::new(r1_file),
+                StdBufWriter::new(r2_file),
+                r1_tmp,
+                r2_tmp,
+                r1_final,
+                r2_final,
+            ))
+        };
+
+        let finish_chunk = |chunk_id: u64,
+                            pair_count: u64,
+                            r1_writer: &mut Option<StdBufWriter<File>>,
+                            r2_writer: &mut Option<StdBufWriter<File>>,
+                            r1_tmp_path: &mut Option<PathBuf>,
+                            r2_tmp_path: &mut Option<PathBuf>,
+                            r1_final_path: &mut Option<PathBuf>,
+                            r2_final_path: &mut Option<PathBuf>|
+                            -> Result<PairedFastqChunk> {
+            let r1_tmp = r1_tmp_path
+                .take()
+                .ok_or_else(|| anyhow!("R1 temporary chunk path missing"))?;
+
+            let r2_tmp = r2_tmp_path
+                .take()
+                .ok_or_else(|| anyhow!("R2 temporary chunk path missing"))?;
+
+            let r1_final = r1_final_path
+                .take()
+                .ok_or_else(|| anyhow!("R1 final chunk path missing"))?;
+
+            let r2_final = r2_final_path
+                .take()
+                .ok_or_else(|| anyhow!("R2 final chunk path missing"))?;
+
+            if let Some(writer) = r1_writer.as_mut() {
+                writer.flush().with_context(|| {
+                    format!(
+                        "Failed to flush R1 chunk {}",
+                        r1_tmp.display()
+                    )
+                })?;
+            }
+
+            if let Some(writer) = r2_writer.as_mut() {
+                writer.flush().with_context(|| {
+                    format!(
+                        "Failed to flush R2 chunk {}",
+                        r2_tmp.display()
+                    )
+                })?;
+            }
+
+            drop(r1_writer.take());
+            drop(r2_writer.take());
+
+            std::fs::rename(&r1_tmp, &r1_final).with_context(|| {
+                format!(
+                    "Failed to promote R1 chunk {} -> {}",
+                    r1_tmp.display(),
+                    r1_final.display()
+                )
+            })?;
+
+            if let Err(e) = std::fs::rename(&r2_tmp, &r2_final) {
+                let _ = std::fs::remove_file(&r1_final);
+
+                return Err(anyhow!(
+                    "Failed to promote R2 chunk {} -> {}: {}",
+                    r2_tmp.display(),
+                    r2_final.display(),
+                    e
+                ));
+            }
+
+            debug!(
+                "Completed paired FASTQ chunk {}: {} pairs -> {} / {}",
+                chunk_id,
+                pair_count,
+                r1_final.display(),
+                r2_final.display()
+            );
+
+            Ok(PairedFastqChunk {
+                chunk_id,
+                r1_path: r1_final,
+                r2_path: r2_final,
+                pair_count,
+            })
+        };
+
+        loop {
+            let r1_result = reader1.next();
+            let r2_result = reader2.next();
+
+            match (r1_result, r2_result) {
+                (None, None) => break,
+
+                (None, Some(Ok(_))) => {
+                    return Err(anyhow!(
+                        "Paired FASTQ length mismatch: R1 ended before R2 after {} pairs",
+                        total_pairs
+                    ));
+                }
+
+                (Some(Ok(_)), None) => {
+                    return Err(anyhow!(
+                        "Paired FASTQ length mismatch: R2 ended before R1 after {} pairs",
+                        total_pairs
+                    ));
+                }
+
+                (Some(Err(e)), _) => {
+                    return Err(anyhow!(
+                        "R1 FASTQ parse error after {} pairs: {}",
+                        total_pairs,
+                        e
+                    ));
+                }
+
+                (_, Some(Err(e))) => {
+                    return Err(anyhow!(
+                        "R2 FASTQ parse error after {} pairs: {}",
+                        total_pairs,
+                        e
+                    ));
+                }
+
+                (Some(Ok(r1)), Some(Ok(r2))) => {
+                    let r1_qual = r1.qual().ok_or_else(|| {
+                        anyhow!(
+                            "R1 input is not FASTQ at pair {}",
+                            total_pairs + 1
+                        )
+                    })?;
+
+                    let r2_qual = r2.qual().ok_or_else(|| {
+                        anyhow!(
+                            "R2 input is not FASTQ at pair {}",
+                            total_pairs + 1
+                        )
+                    })?;
+
+                    if r1.seq().len() != r1_qual.len() {
+                        return Err(anyhow!(
+                            "R1 sequence/quality length mismatch at pair {}: seq={}, qual={}",
+                            total_pairs + 1,
+                            r1.seq().len(),
+                            r1_qual.len()
+                        ));
+                    }
+
+                    if r2.seq().len() != r2_qual.len() {
+                        return Err(anyhow!(
+                            "R2 sequence/quality length mismatch at pair {}: seq={}, qual={}",
+                            total_pairs + 1,
+                            r2.seq().len(),
+                            r2_qual.len()
+                        ));
+                    }
+
+                    if !compare_read_ids_bytes(r1.id(), r2.id()) {
+                        return Err(anyhow!(
+                            "Paired FASTQ read-ID mismatch at pair {}: R1={} R2={}",
+                            total_pairs + 1,
+                            String::from_utf8_lossy(r1.id()),
+                            String::from_utf8_lossy(r2.id())
+                        ));
+                    }
+
+                    if r1_writer.is_none() {
+                        let (
+                            new_r1_writer,
+                            new_r2_writer,
+                            new_r1_tmp,
+                            new_r2_tmp,
+                            new_r1_final,
+                            new_r2_final,
+                        ) = open_chunk(chunk_id, &output_dir)?;
+
+                        r1_writer = Some(new_r1_writer);
+                        r2_writer = Some(new_r2_writer);
+
+                        r1_tmp_path = Some(new_r1_tmp);
+                        r2_tmp_path = Some(new_r2_tmp);
+
+                        r1_final_path = Some(new_r1_final);
+                        r2_final_path = Some(new_r2_final);
+                    }
+
+                    let r1_bytes = {
+                        let seq = r1.seq();
+
+                        let mut record = Vec::with_capacity(
+                            r1.id().len() + seq.len() + r1_qual.len() + 8,
+                        );
+
+                        record.extend_from_slice(b"@");
+                        record.extend_from_slice(r1.id());
+                        record.extend_from_slice(b"\n");
+                        record.extend_from_slice(&seq);
+                        record.extend_from_slice(b"\n+\n");
+                        record.extend_from_slice(r1_qual);
+                        record.extend_from_slice(b"\n");
+
+                        record
+                    };
+
+                    let r2_bytes = {
+                        let seq = r2.seq();
+
+                        let mut record = Vec::with_capacity(
+                            r2.id().len() + seq.len() + r2_qual.len() + 8,
+                        );
+
+                        record.extend_from_slice(b"@");
+                        record.extend_from_slice(r2.id());
+                        record.extend_from_slice(b"\n");
+                        record.extend_from_slice(&seq);
+                        record.extend_from_slice(b"\n+\n");
+                        record.extend_from_slice(r2_qual);
+                        record.extend_from_slice(b"\n");
+
+                        record
+                    };
+
+                    r1_writer
+                        .as_mut()
+                        .expect("R1 writer must exist")
+                        .write_all(&r1_bytes)
+                        .with_context(|| {
+                            format!(
+                                "Failed writing R1 chunk {}",
+                                chunk_id
+                            )
+                        })?;
+
+                    r2_writer
+                        .as_mut()
+                        .expect("R2 writer must exist")
+                        .write_all(&r2_bytes)
+                        .with_context(|| {
+                            format!(
+                                "Failed writing R2 chunk {}",
+                                chunk_id
+                            )
+                        })?;
+
+                    chunk_pairs += 1;
+                    total_pairs += 1;
+                    total_r1_records += 1;
+                    total_r2_records += 1;
+
+                    if chunk_pairs == pairs_per_chunk {
+                        let completed = finish_chunk(
+                            chunk_id,
+                            chunk_pairs,
+                            &mut r1_writer,
+                            &mut r2_writer,
+                            &mut r1_tmp_path,
+                            &mut r2_tmp_path,
+                            &mut r1_final_path,
+                            &mut r2_final_path,
+                        )?;
+
+                        chunks.push(completed);
+
+                        chunk_id += 1;
+                        chunk_pairs = 0;
+                    }
+                }
+            }
+        }
+
+        if chunk_pairs > 0 {
+            let completed = finish_chunk(
+                chunk_id,
+                chunk_pairs,
+                &mut r1_writer,
+                &mut r2_writer,
+                &mut r1_tmp_path,
+                &mut r2_tmp_path,
+                &mut r1_final_path,
+                &mut r2_final_path,
+            )?;
+
+            chunks.push(completed);
+        }
+
+        if total_r1_records != total_pairs || total_r2_records != total_pairs {
+            return Err(anyhow!(
+                "Internal chunk accounting error: pairs={}, R1={}, R2={}",
+                total_pairs,
+                total_r1_records,
+                total_r2_records
+            ));
+        }
+
+        let chunk_pair_sum: u64 = chunks.iter().map(|chunk| chunk.pair_count).sum();
+
+        if chunk_pair_sum != total_pairs {
+            return Err(anyhow!(
+                "Chunk accounting mismatch: source pairs={}, chunk pairs={}",
+                total_pairs,
+                chunk_pair_sum
+            ));
+        }
+
+        info!(
+            "Paired FASTQ chunking complete: {} pairs -> {} chunks",
+            total_pairs,
+            chunks.len()
+        );
+
+        Ok(PairedFastqChunkingSummary {
+            chunks,
+            total_pairs,
+            total_r1_records,
+            total_r2_records,
+        })
+    })
+        .await
+        .map_err(|e| anyhow!("Paired FASTQ chunking task failed: {}", e))?
 }
 
 #[cfg(test)]
