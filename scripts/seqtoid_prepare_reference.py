@@ -434,6 +434,17 @@ def local_cache_is_current(
     return True
 
 
+
+def set_reference_permissions(reference_dir: Path) -> None:
+    """Make the validated reference readable by worker processes."""
+    reference_dir.chmod(0o755)
+
+    for path in reference_dir.iterdir():
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            path.chmod(0o644)
+
 def stage_reference(spec: ReferenceSpec, inventory: dict[str, object], version: str) -> None:
     """Stage, validate, and atomically promote a complete reference cache."""
     spec.local_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -487,6 +498,7 @@ def stage_reference(spec: ReferenceSpec, inventory: dict[str, object], version: 
         LOG.info("Validating staged %s database", spec.backend)
         validate_local_reference(staged_spec, staged_inventory)
         write_metadata(stage_dir, staged_inventory, version)
+        set_reference_permissions(stage_dir)
 
         LOG.info("Promoting validated reference to %s", spec.local_dir)
         if previous_dir.exists():
