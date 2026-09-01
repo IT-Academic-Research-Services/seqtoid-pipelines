@@ -622,7 +622,7 @@ set_worker_state \
   "false" \
   "preparing"
 
-REFERENCE_PREPARER="/usr/local/bin/seqtoid_prepare_reference.py"
+REFERENCE_PREPARER="/usr/local/bin/seqtoid_prepare_reference_cpu.py"
 
 if [ ! -f "$REFERENCE_PREPARER" ]; then
   set_worker_state \

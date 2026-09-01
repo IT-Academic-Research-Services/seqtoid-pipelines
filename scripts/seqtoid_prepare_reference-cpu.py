@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Prepare and validate a SeqToID worker reference on local scratch NVMe.
+"""Prepare and validate a SeqToID CPU-worker reference on local scratch NVMe.
 
-The worker bootstrap is responsible for OS setup (/scratch, EFS, s5cmd, etc.).
+The CPU worker bootstrap is responsible for OS setup (/scratch, EFS, s5cmd, etc.).
 This utility owns reference inventory, staging, validation, and atomic promotion.
+
+Supported backends:
+    mmseqs-cpu
+    diamond
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-LOG = logging.getLogger("seqtoid-prepare-reference")
+LOG = logging.getLogger("seqtoid-prepare-reference-cpu")
 DEFAULT_LOCAL_ROOT = Path("/scratch/refs")
 
 S5CMD_NUMWORKERS = "16"
@@ -31,12 +35,9 @@ MMSEQS_CPU_S3_PREFIX = (
     "s3://seqtoid-public-references/phase2/refs/nr_clean/cpu"
 )
 
-MMSEQS_GPU_S3_PREFIX = (
-    "s3://seqtoid-public-references/phase2/refs/nr_clean/gpu"
-)
-
 DIAMOND_S3_OBJECT = (
-    "s3://seqtoid-public-references/phase2/refs/diamond/diamond_07_22_2026.dmnd"
+    "s3://seqtoid-public-references/phase2/refs/diamond/"
+    "diamond_07_22_2026.dmnd"
 )
 
 
@@ -70,15 +71,12 @@ def run_command(
             stdout=stdout,
             stderr=subprocess.PIPE if capture_stderr else None,
         )
-
     except FileNotFoundError as exc:
         raise ReferencePreparationError(
             f"Required executable is missing: {args[0]}"
         ) from exc
-
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip() if capture_stderr else ""
-
         raise ReferencePreparationError(
             f"Command failed with exit {exc.returncode}: {' '.join(args)}"
             + (f"; stderr: {stderr}" if stderr else "")
@@ -130,7 +128,6 @@ def parse_s5cmd_inventory(
         item = payload
 
         key = item.get("key")
-
         if isinstance(key, dict):
             key = key.get("url") or key.get("key")
 
@@ -185,7 +182,6 @@ def build_inventory(
 
     if spec.backend == "diamond":
         objects = build_diamond_inventory(spec)
-
     else:
         output = subprocess.run(
             [
@@ -219,7 +215,10 @@ def build_inventory(
         "objects": objects,
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     output_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -270,7 +269,6 @@ def build_diamond_inventory(
         item = payload
 
         key = item.get("key")
-
         if isinstance(key, dict):
             key = key.get("url") or key.get("key")
 
@@ -281,8 +279,7 @@ def build_diamond_inventory(
 
         if not isinstance(size, int) or size < 0:
             raise ReferencePreparationError(
-                f"Missing or invalid size for Diamond reference: "
-                f"{spec.s3_source}"
+                f"Missing or invalid size for Diamond reference: {spec.s3_source}"
             )
 
         return [
@@ -294,8 +291,7 @@ def build_diamond_inventory(
         ]
 
     raise ReferencePreparationError(
-        f"No usable S3 metadata found for Diamond reference: "
-        f"{spec.s3_source}"
+        f"No usable S3 metadata found for Diamond reference: {spec.s3_source}"
     )
 
 
@@ -313,7 +309,6 @@ def load_inventory(path: Path) -> dict[str, object]:
         payload = json.loads(
             path.read_text(encoding="utf-8")
         )
-
     except (OSError, json.JSONDecodeError) as exc:
         raise ReferencePreparationError(
             f"Unable to read reference inventory {path}: {exc}"
@@ -388,8 +383,7 @@ def validate_local_inventory(
 
         if not path.is_file():
             raise ReferencePreparationError(
-                f"Unexpected non-file entry in reference directory: "
-                f"{path.name}"
+                f"Unexpected non-file entry in reference directory: {path.name}"
             )
 
         actual[path.name] = path.stat().st_size
@@ -397,8 +391,13 @@ def validate_local_inventory(
     expected_names = set(expected)
     actual_names = set(actual)
 
-    missing = sorted(expected_names - actual_names)
-    extra = sorted(actual_names - expected_names)
+    missing = sorted(
+        expected_names - actual_names
+    )
+
+    extra = sorted(
+        actual_names - expected_names
+    )
 
     wrong_size = sorted(
         name
@@ -430,10 +429,14 @@ def validate_local_inventory(
         )
 
 
-def validate_mmseqs(spec: ReferenceSpec) -> None:
-    """Validate that MMseqs can open the expected database."""
+def validate_mmseqs(
+        spec: ReferenceSpec,
+) -> None:
+    """Validate that MMseqs can open the expected CPU NR database."""
 
-    db_prefix = spec.local_dir / spec.db_name
+    db_prefix = (
+            spec.local_dir / spec.db_name
+    )
 
     if not db_prefix.is_file():
         raise ReferencePreparationError(
@@ -471,10 +474,17 @@ def validate_diamond(
 ) -> None:
     """Validate that the expected Diamond database is present and usable."""
 
-    db_path = spec.local_dir / spec.db_name
+    db_path = (
+            spec.local_dir / spec.db_name
+    )
 
-    expected = inventory_object_map(inventory)
-    expected_meta = expected.get(spec.db_name)
+    expected = inventory_object_map(
+        inventory
+    )
+
+    expected_meta = expected.get(
+        spec.db_name
+    )
 
     if not db_path.is_file():
         raise ReferencePreparationError(
@@ -583,7 +593,7 @@ def local_cache_is_current(
         inventory: dict[str, object],
         version: str,
 ) -> bool:
-    """Return true only when local metadata, inventory, and DB validation pass."""
+    """Return true only when local metadata, file inventory, and DB validation pass."""
 
     version_path = (
             spec.local_dir / ".reference_version"
@@ -717,7 +727,9 @@ def stage_reference(
             "Validating staged file inventory"
         )
 
-        staged_inventory = dict(inventory)
+        staged_inventory = dict(
+            inventory
+        )
 
         validate_local_inventory(
             stage_dir,
@@ -759,7 +771,9 @@ def stage_reference(
         )
 
         if previous_dir.exists():
-            shutil.rmtree(previous_dir)
+            shutil.rmtree(
+                previous_dir
+            )
 
         if spec.local_dir.exists():
             os.replace(
@@ -786,7 +800,9 @@ def stage_reference(
             raise
 
         if previous_dir.exists():
-            shutil.rmtree(previous_dir)
+            shutil.rmtree(
+                previous_dir
+            )
 
     except Exception:
         if stage_dir.exists():
@@ -804,6 +820,7 @@ def stage_reference(
                     previous_dir,
                     spec.local_dir,
                 )
+
             except OSError:
                 LOG.exception(
                     "Failed to restore previous reference cache"
@@ -817,6 +834,8 @@ def make_spec(
         reference_set: str,
         local_root: Path,
 ) -> ReferenceSpec:
+    """Build the reference specification for a supported CPU backend."""
+
     if reference_set != "phase2":
         raise ReferencePreparationError(
             f"Unsupported reference set: {reference_set}"
@@ -832,16 +851,6 @@ def make_spec(
             db_name="nrcleanDB",
         )
 
-    if backend == "mmseqs-gpu":
-        return ReferenceSpec(
-            backend=backend,
-            reference_set=reference_set,
-            s3_source=MMSEQS_GPU_S3_PREFIX,
-            local_dir=local_root / "mmseqs-gpu",
-            validator="mmseqs",
-            db_name="nrcleanDB_gpu",
-        )
-
     if backend == "diamond":
         return ReferenceSpec(
             backend=backend,
@@ -855,7 +864,7 @@ def make_spec(
         )
 
     raise ReferencePreparationError(
-        f"Unsupported backend: {backend}"
+        f"Unsupported CPU worker backend: {backend}"
     )
 
 
@@ -865,7 +874,7 @@ def prepare_reference(
         local_root: Path,
         inventory_only: bool = False,
 ) -> str:
-    """Prepare requested reference and return its canonical inventory version."""
+    """Prepare the requested reference and return its canonical inventory version."""
 
     require_mountpoint(
         Path("/scratch")
@@ -877,7 +886,9 @@ def prepare_reference(
         local_root,
     )
 
-    validate_tools(spec)
+    validate_tools(
+        spec
+    )
 
     with tempfile.TemporaryDirectory(
             prefix="seqtoid-reference-"
@@ -894,7 +905,7 @@ def prepare_reference(
         )
 
         inventory = load_inventory(
-            inventory_path,
+            inventory_path
         )
 
         if objects != inventory["objects"]:
@@ -979,7 +990,7 @@ def prepare_reference(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare and validate a SeqToID worker reference."
+            "Prepare and validate a SeqToID CPU-worker reference."
         )
     )
 
@@ -988,10 +999,9 @@ def parse_args() -> argparse.Namespace:
         required=True,
         choices=[
             "mmseqs-cpu",
-            "mmseqs-gpu",
             "diamond",
         ],
-        help="Reference backend to prepare.",
+        help="CPU worker reference backend to prepare.",
     )
 
     parser.add_argument(
