@@ -40,6 +40,25 @@ DIAMOND_S3_OBJECT = (
     "diamond_07_22_2026.dmnd"
 )
 
+# The qualified CPU MMseqs reference contains ten split index shards.
+# Requiring all ten prevents an incomplete S3 inventory from being treated
+# as a complete CPU reference.
+MMSEQS_CPU_REQUIRED_INDEX_SHARDS = tuple(
+    f"nrcleanDB.idx.{i}" for i in range(10)
+)
+
+MMSEQS_CPU_REQUIRED_FILES = (
+    "nrcleanDB",
+    "nrcleanDB.dbtype",
+    "nrcleanDB.index",
+    "nrcleanDB.lookup",
+    "nrcleanDB.source",
+    "nrcleanDB_h",
+    "nrcleanDB_h.dbtype",
+    "nrcleanDB_h.index",
+    *MMSEQS_CPU_REQUIRED_INDEX_SHARDS,
+)
+
 
 @dataclass(frozen=True)
 class ReferenceSpec:
@@ -103,6 +122,36 @@ def validate_tools(spec: ReferenceSpec) -> None:
             )
 
 
+def extract_s5cmd_object(
+        payload: dict[str, object],
+        *,
+        context: str,
+) -> dict[str, object] | None:
+    """Extract the object record from one s5cmd --json response line.
+
+    s5cmd JSON output wraps successful object metadata in an "object" field.
+    Lines without an object record are ignored unless they contain an error.
+    """
+
+    error = payload.get("error")
+    if error:
+        raise ReferencePreparationError(
+            f"s5cmd reported an error while {context}: {error}"
+        )
+
+    item = payload.get("object")
+
+    if item is None:
+        return None
+
+    if not isinstance(item, dict):
+        raise ReferencePreparationError(
+            f"Invalid s5cmd object record while {context}: {item!r}"
+        )
+
+    return item
+
+
 def parse_s5cmd_inventory(
         raw: Iterable[str],
         prefix: str,
@@ -125,14 +174,28 @@ def parse_s5cmd_inventory(
                 f"Invalid JSON from s5cmd on line {line_number}: {exc}"
             ) from exc
 
-        item = payload
+        if not isinstance(payload, dict):
+            raise ReferencePreparationError(
+                f"Invalid JSON record from s5cmd on line {line_number}"
+            )
+
+        item = extract_s5cmd_object(
+            payload,
+            context=f"listing {prefix}",
+        )
+
+        if item is None:
+            continue
 
         key = item.get("key")
+
         if isinstance(key, dict):
             key = key.get("url") or key.get("key")
 
         if not isinstance(key, str):
-            continue
+            raise ReferencePreparationError(
+                f"Missing object key from s5cmd on line {line_number}"
+            )
 
         if not key.startswith(prefix):
             continue
@@ -174,6 +237,33 @@ def parse_s5cmd_inventory(
     return objects
 
 
+def validate_mmseqs_cpu_inventory(
+        objects: list[dict[str, object]],
+) -> None:
+    """Require the known structural components of the qualified CPU DB."""
+
+    names = {
+        str(item["key"])
+        for item in objects
+    }
+
+    missing = sorted(
+        set(MMSEQS_CPU_REQUIRED_FILES) - names
+    )
+
+    if missing:
+        raise ReferencePreparationError(
+            "CPU MMseqs S3 inventory is incomplete; "
+            f"missing required objects: {missing}"
+        )
+
+    LOG.info(
+        "CPU MMseqs S3 inventory contains all required database components "
+        "(%d objects total)",
+        len(objects),
+    )
+
+
 def build_inventory(
         spec: ReferenceSpec,
         output_path: Path,
@@ -207,6 +297,9 @@ def build_inventory(
             output.stdout.splitlines(),
             spec.s3_source,
         )
+
+        if spec.backend == "mmseqs-cpu":
+            validate_mmseqs_cpu_inventory(objects)
 
     payload = {
         "backend": spec.backend,
@@ -253,7 +346,10 @@ def build_diamond_inventory(
             + (f"; stderr: {stderr}" if stderr else "")
         )
 
-    for raw_line in output.stdout.splitlines():
+    for line_number, raw_line in enumerate(
+            output.stdout.splitlines(),
+            start=1,
+    ):
         line = raw_line.strip()
 
         if not line:
@@ -263,12 +359,26 @@ def build_diamond_inventory(
             payload = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ReferencePreparationError(
-                f"Invalid JSON from s5cmd for Diamond reference: {exc}"
+                f"Invalid JSON from s5cmd for Diamond reference "
+                f"on line {line_number}: {exc}"
             ) from exc
 
-        item = payload
+        if not isinstance(payload, dict):
+            raise ReferencePreparationError(
+                f"Invalid JSON record from s5cmd for Diamond reference "
+                f"on line {line_number}"
+            )
+
+        item = extract_s5cmd_object(
+            payload,
+            context=f"inspecting {spec.s3_source}",
+        )
+
+        if item is None:
+            continue
 
         key = item.get("key")
+
         if isinstance(key, dict):
             key = key.get("url") or key.get("key")
 
@@ -279,7 +389,8 @@ def build_diamond_inventory(
 
         if not isinstance(size, int) or size < 0:
             raise ReferencePreparationError(
-                f"Missing or invalid size for Diamond reference: {spec.s3_source}"
+                f"Missing or invalid size for Diamond reference: "
+                f"{spec.s3_source}"
             )
 
         return [
@@ -291,7 +402,8 @@ def build_diamond_inventory(
         ]
 
     raise ReferencePreparationError(
-        f"No usable S3 metadata found for Diamond reference: {spec.s3_source}"
+        f"No usable S3 metadata found for Diamond reference: "
+        f"{spec.s3_source}"
     )
 
 
@@ -383,7 +495,8 @@ def validate_local_inventory(
 
         if not path.is_file():
             raise ReferencePreparationError(
-                f"Unexpected non-file entry in reference directory: {path.name}"
+                f"Unexpected non-file entry in reference directory: "
+                f"{path.name}"
             )
 
         actual[path.name] = path.stat().st_size
@@ -410,17 +523,17 @@ def validate_local_inventory(
 
         if missing:
             problems.append(
-                f"missing={missing[:10]}"
+                f"missing={missing[:20]}"
             )
 
         if extra:
             problems.append(
-                f"extra={extra[:10]}"
+                f"extra={extra[:20]}"
             )
 
         if wrong_size:
             problems.append(
-                f"wrong_size={wrong_size[:10]}"
+                f"wrong_size={wrong_size[:20]}"
             )
 
         raise ReferencePreparationError(
@@ -572,6 +685,16 @@ def validate_local_reference(
         spec.local_dir,
         inventory,
     )
+
+    if spec.backend == "mmseqs-cpu":
+        objects = inventory.get("objects")
+
+        if not isinstance(objects, list):
+            raise ReferencePreparationError(
+                "CPU MMseqs reference inventory has no object list"
+            )
+
+        validate_mmseqs_cpu_inventory(objects)
 
     if spec.validator == "mmseqs":
         validate_mmseqs(spec)
