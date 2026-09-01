@@ -4,16 +4,25 @@ set -uo pipefail
 LOG=/var/log/userdata-sandbox.log
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=== AL2023 user-data started at $(date -Is) ==="
+echo "=== AL2023 CPU worker bootstrap started at $(date -Is) ==="
 log() { echo "[$(date -Is)] $*"; }
 
 # ============================================================
-# Worker identity / registration metadata
+# CPU worker identity / registration metadata
 # ============================================================
-# These describe what this instance is intended to be.
-# They are registration metadata, not AWS EC2 tags.
-WORKER_ROLE="${WORKER_ROLE:-seqtoid-nr-cpu-worker}"
-WORKER_BACKEND="${WORKER_BACKEND:-cpu}"
+#
+# This bootstrap is for CPU NR workers only.
+#
+# Supported backends:
+#   mmseqs-cpu
+#   diamond
+#
+# WORKER_BACKEND must be supplied by the launch wrapper.
+#
+# These values are registration metadata written to status.json.
+# They are not AWS EC2 tags.
+WORKER_ROLE="seqtoid-nr-cpu-worker"
+WORKER_BACKEND="${WORKER_BACKEND:-}"
 WORKER_REFERENCE_SET="${WORKER_REFERENCE_SET:-phase2}"
 WORKER_ENVIRONMENT="${WORKER_ENVIRONMENT:-dev}"
 
@@ -23,13 +32,16 @@ WORKER_STATUS_DIR="/efs/workers"
 dnf_retry() {
   local tries=10
   local i
+
   for i in $(seq 1 "$tries"); do
     if dnf -y install "$@"; then
       return 0
     fi
+
     log "dnf failed (try $i/$tries) - waiting for RPM lock"
     sleep 15
   done
+
   log "ERROR: dnf still failing after $tries tries: $*"
   return 1
 }
@@ -80,8 +92,9 @@ install_packages() {
 }
 
 # ---------- s5cmd ----------
-# Pin the worker image to a known s5cmd release. s5cmd is the reference
-# staging tool for large S3 -> NVMe transfers; do not fall back to aws s3 cp.
+# Pin the worker image to a known s5cmd release.
+# s5cmd is the reference staging tool for large S3 -> NVMe transfers.
+# Do not fall back to aws s3 cp.
 install_s5cmd() {
   local version="2.3.0"
   local url="https://github.com/peak/s5cmd/releases/download/v${version}/s5cmd_${version}_Linux-64bit.tar.gz"
@@ -118,12 +131,15 @@ install_s5cmd() {
   return 0
 }
 
-# ---------- /scratch helper (runs on every boot via systemd) ----------
+# ---------- /scratch helper ----------
+#
+# Runs on every boot via systemd.
+#
 # The RAID is built ONLY from EC2 instance-store NVMe devices.
 # There is no EBS RAID setup here.
 #
-# NEVER put /dev/md0 in fstab. Instance-store dies on stop/start;
-# fstab would risk an emergency boot.
+# NEVER put /dev/md0 in fstab.
+# Instance-store dies on stop/start; fstab would risk an emergency boot.
 install_scratch_helper() {
   log "Installing /usr/local/sbin/setup-scratch.sh + systemd unit"
 
@@ -146,13 +162,13 @@ if mountpoint -q "$MOUNT"; then
   exit 0
 fi
 
-# Let NVMe nodes appear
+# Let NVMe nodes appear.
 sleep 8
 
-# 1) Try assemble anything with existing superblocks (plain reboot)
+# 1) Try assemble anything with existing superblocks (plain reboot).
 mdadm --assemble --scan 2>/dev/null || true
 
-# 2) Prefer an existing unmounted RAID0
+# 2) Prefer an existing unmounted RAID0.
 EXISTING=$(lsblk -nr -o NAME,TYPE,MOUNTPOINT \
   | awk '$2=="raid0" && $3=="" {print "/dev/"$1; exit}')
 
@@ -176,14 +192,15 @@ else
 
   echo "Instance-store devices: ${DEVS[*]}"
 
-  # 3) Assemble by member list if superblocks exist (reboot)
+  # 3) Assemble by member list if superblocks exist (reboot).
   if mdadm --assemble "$RAID" "${DEVS[@]}" 2>/dev/null; then
     echo "Assembled $RAID from members"
   else
-    # 4) Stop/start wiped store -> create fresh RAID0
+    # 4) Stop/start wiped store -> create fresh RAID0.
     mdadm --stop "$RAID" 2>/dev/null || true
 
     echo "Creating RAID0 $RAID (${#DEVS[@]} devices, chunk 256k)"
+
     mdadm --create --verbose --force "$RAID" \
       --level=0 \
       --chunk=256 \
@@ -192,11 +209,10 @@ else
   fi
 fi
 
-# Wait for array to go clean
+# Wait for array to go clean.
 sleep 2
 
 if [ ! -b "$RAID" ]; then
-  # Fallback: first unmounted raid0
   RAID=$(lsblk -nr -o NAME,TYPE,MOUNTPOINT \
     | awk '$2=="raid0" && $3=="" {print "/dev/"$1; exit}')
 
@@ -207,7 +223,7 @@ if [ ! -b "$RAID" ]; then
   fi
 fi
 
-# Format only if no filesystem (new array after stop/start)
+# Format only if no filesystem exists.
 if ! blkid "$RAID" 2>/dev/null | grep -q 'TYPE='; then
   N=$(mdadm --detail "$RAID" 2>/dev/null \
     | awk '/Raid Devices/ {print $4}')
@@ -240,7 +256,7 @@ SCRIPTEOF
 
   chmod 755 /usr/local/sbin/setup-scratch.sh
 
-  # Remove any stale fstab line that would break boot
+  # Remove any stale fstab line that would break boot.
   if grep -qsE '[[:space:]]/scratch[[:space:]]' /etc/fstab; then
     log "Removing /scratch from fstab (unsafe for instance-store RAID)"
     sed -i '\#[[:space:]]/scratch[[:space:]]#d' /etc/fstab
@@ -509,76 +525,86 @@ set_worker_state() {
       "$worker_ready" \
       "$reference_status" \
       "$reason"; then
+
     log "WARNING: failed to publish worker state=${state}"
   fi
 }
 
+# ---------- CPU worker configuration validation ----------
+validate_worker_configuration() {
+  if [ -z "$WORKER_BACKEND" ]; then
+    log "ERROR: WORKER_BACKEND was not supplied by the launch wrapper"
+    return 1
+  fi
+
+  case "$WORKER_BACKEND" in
+    mmseqs-cpu|diamond)
+      return 0
+      ;;
+
+    mmseqs-gpu)
+      log "ERROR: mmseqs-gpu cannot be launched using the CPU worker bootstrap"
+      return 1
+      ;;
+
+    *)
+      log "ERROR: unsupported CPU worker backend=$WORKER_BACKEND"
+      return 1
+      ;;
+  esac
+}
+
 # ---------- main ----------
-# A worker is not READY merely because EC2 reports it as running.
+#
+# A CPU worker is not READY merely because EC2 reports it as running.
 # Reference preparation and validation must complete before READY.
 
 setup_thp
 
+if ! validate_worker_configuration; then
+  log "ERROR: invalid CPU worker configuration"
+  exit 1
+fi
+
 if ! install_packages; then
   log "ERROR: critical package installation failed; worker cannot be used"
-  set_worker_state \
-    "FAILED" \
-    "false" \
-    "not_checked" \
-    "critical package installation failed"
   exit 1
 fi
 
 if ! install_scratch_helper; then
   log "ERROR: failed to install scratch setup helper; worker cannot be used"
-  set_worker_state \
-    "FAILED" \
-    "false" \
-    "not_checked" \
-    "failed to install scratch setup helper"
   exit 1
 fi
 
 # Let systemd be the authoritative mechanism for preparing /scratch.
 # This reconstructs the filesystem/mount; it does NOT preserve instance-store data.
 # EC2 instance-store NVMe contents are ephemeral and may disappear on stop/start.
-
 if ! systemctl start scratch-setup.service; then
-  set_worker_state \
-    "FAILED" \
-    "false" \
-    "not_checked" \
-    "instance-store /scratch setup service failed"
-
   log "ERROR: scratch-setup.service failed; worker cannot be used"
   exit 1
 fi
 
-# A successful Type=oneshot + RemainAfterExit service should remain active.
+# A successful Type=oneshot + RemainAfterExit service should remain active (exited).
 if ! systemctl is-active --quiet scratch-setup.service; then
-  set_worker_state \
-    "FAILED" \
-    "false" \
-    "not_checked" \
-    "scratch-setup.service did not become active"
-
   log "ERROR: scratch-setup.service is not active after start"
   systemctl status scratch-setup.service --no-pager || true
   exit 1
 fi
 
 if ! setup_efs; then
-  set_worker_state \
-    "FAILED" \
-    "false" \
-    "not_checked" \
-    "EFS setup failed"
-
   log "ERROR: EFS setup failed; worker cannot be used"
   exit 1
 fi
 
 mkdir -p /efs/workers
+
+# From this point onward EFS is available, so failures can be published
+# through the worker status file.
+
+set_worker_state \
+  "BOOTING" \
+  "false" \
+  "not_checked"
 
 if ! install_s5cmd; then
   set_worker_state \
@@ -590,11 +616,6 @@ if ! install_s5cmd; then
   log "ERROR: s5cmd installation failed; worker cannot be used"
   exit 1
 fi
-
-set_worker_state \
-  "BOOTING" \
-  "false" \
-  "not_checked"
 
 set_worker_state \
   "PREPARING_REFERENCE" \
@@ -615,65 +636,49 @@ if [ ! -f "$REFERENCE_PREPARER" ]; then
 fi
 
 case "$WORKER_BACKEND" in
-  cpu)
-    REFERENCE_BACKEND="mmseqs-cpu"
-    ;;
-
   mmseqs-cpu)
     REFERENCE_BACKEND="mmseqs-cpu"
-    ;;
-
-  mmseqs-gpu)
-    REFERENCE_BACKEND="mmseqs-gpu"
-    ;;
-
-  diamond)
-    REFERENCE_BACKEND="diamond"
-    ;;
-
-  *)
-    set_worker_state \
-      "FAILED" \
-      "false" \
-      "failed" \
-      "unsupported worker backend=$WORKER_BACKEND"
-
-    log "ERROR: unsupported worker backend=$WORKER_BACKEND"
-    exit 1
-    ;;
-esac
-
-log "Preparing reference for backend=$REFERENCE_BACKEND"
-
-REFERENCE_VERSION=$(python3 "$REFERENCE_PREPARER" \
-  --backend "$REFERENCE_BACKEND" \
-  --reference-set "$WORKER_REFERENCE_SET") || {
-    set_worker_state \
-      "FAILED" \
-      "false" \
-      "failed" \
-      "reference preparation failed for backend=$REFERENCE_BACKEND"
-
-    log "ERROR: reference preparation failed for backend=$REFERENCE_BACKEND"
-    exit 1
-  }
-
-case "$REFERENCE_BACKEND" in
-  mmseqs-cpu)
     REFERENCE_DIR="/scratch/refs/mmseqs"
     REFERENCE_DB="$REFERENCE_DIR/nrcleanDB"
     ;;
 
-  mmseqs-gpu)
-    REFERENCE_DIR="/scratch/refs/mmseqs-gpu"
-    REFERENCE_DB="$REFERENCE_DIR/nrcleanDB_gpu"
-    ;;
-
   diamond)
+    REFERENCE_BACKEND="diamond"
     REFERENCE_DIR="/scratch/refs/diamond"
     REFERENCE_DB="$REFERENCE_DIR/diamond_07_22_2026.dmnd"
     ;;
+
+  *)
+    # validate_worker_configuration() should make this unreachable.
+    set_worker_state \
+      "FAILED" \
+      "false" \
+      "failed" \
+      "unsupported CPU worker backend=$WORKER_BACKEND"
+
+    log "ERROR: unsupported CPU worker backend=$WORKER_BACKEND"
+    exit 1
+    ;;
 esac
+
+log "Preparing CPU worker reference:"
+log "  worker_role=$WORKER_ROLE"
+log "  backend=$REFERENCE_BACKEND"
+log "  reference_set=$WORKER_REFERENCE_SET"
+
+REFERENCE_VERSION=$(python3 "$REFERENCE_PREPARER" \
+  --backend "$REFERENCE_BACKEND" \
+  --reference-set "$WORKER_REFERENCE_SET") || {
+
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "failed" \
+    "reference preparation failed for backend=$REFERENCE_BACKEND"
+
+  log "ERROR: reference preparation failed for backend=$REFERENCE_BACKEND"
+  exit 1
+}
 
 if [ -z "$REFERENCE_VERSION" ] || \
    [ ! -f "$REFERENCE_DIR/.reference_version" ] || \
@@ -704,6 +709,7 @@ if [ "$REFERENCE_VERSION" != "$RECORDED_VERSION" ]; then
 fi
 
 log "Reference prepared and validated:"
+log "  worker_role=$WORKER_ROLE"
 log "  backend=$REFERENCE_BACKEND"
 log "  reference_set=$WORKER_REFERENCE_SET"
 log "  version=$REFERENCE_VERSION"
@@ -722,12 +728,14 @@ chown -R ec2-user:ec2-user \
   /home/ec2-user/venv \
   || true
 
-log "=== user-data finished at $(date -Is) ==="
+log "=== CPU worker bootstrap finished at $(date -Is) ==="
 
 log "Verify:"
 log "  df -h /scratch /efs"
 log "  systemctl is-enabled scratch-setup.service"
 log "  cat /proc/mdstat"
+log "  worker backend: $WORKER_BACKEND"
+log "  reference DB: $REFERENCE_DB"
 
 log "Worker status files:"
 find /efs/workers \
