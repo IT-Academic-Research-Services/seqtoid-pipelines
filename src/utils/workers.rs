@@ -12,7 +12,7 @@ use tokio::fs;
 use crate::config::defs::{PipelineError};
 
 
-                          pub const WORKER_ROLE_TAG: &str = "Role";
+pub const WORKER_ROLE_TAG: &str = "Role";
 pub const WORKER_ROLE_VALUE: &str = "seqtoid-nr-cpu-worker";
 pub const WORKER_BACKEND_TAG: &str = "Backend";
 pub const WORKER_BACKEND_VALUE: &str = "cpu";
