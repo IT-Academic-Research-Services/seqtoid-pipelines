@@ -25,6 +25,7 @@ from typing import Iterable
 
 
 LOG = logging.getLogger("seqtoid-prepare-reference-cpu")
+
 DEFAULT_LOCAL_ROOT = Path("/scratch/refs")
 
 S5CMD_NUMWORKERS = "16"
@@ -40,23 +41,30 @@ DIAMOND_S3_OBJECT = (
     "diamond_07_22_2026.dmnd"
 )
 
-# The qualified CPU MMseqs reference contains ten split index shards.
-# Requiring all ten prevents an incomplete S3 inventory from being treated
-# as a complete CPU reference.
-MMSEQS_CPU_REQUIRED_INDEX_SHARDS = tuple(
-    f"nrcleanDB.idx.{i}" for i in range(10)
-)
 
+# The qualified CPU MMseqs reference contains exactly these database
+# components in the canonical S3 prefix.
 MMSEQS_CPU_REQUIRED_FILES = (
     "nrcleanDB",
     "nrcleanDB.dbtype",
+    "nrcleanDB.idx.0",
+    "nrcleanDB.idx.1",
+    "nrcleanDB.idx.2",
+    "nrcleanDB.idx.3",
+    "nrcleanDB.idx.4",
+    "nrcleanDB.idx.5",
+    "nrcleanDB.idx.6",
+    "nrcleanDB.idx.7",
+    "nrcleanDB.idx.8",
+    "nrcleanDB.idx.9",
+    "nrcleanDB.idx.dbtype",
+    "nrcleanDB.idx.index",
     "nrcleanDB.index",
     "nrcleanDB.lookup",
     "nrcleanDB.source",
     "nrcleanDB_h",
     "nrcleanDB_h.dbtype",
     "nrcleanDB_h.index",
-    *MMSEQS_CPU_REQUIRED_INDEX_SHARDS,
 )
 
 
@@ -96,6 +104,7 @@ def run_command(
         ) from exc
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip() if capture_stderr else ""
+
         raise ReferencePreparationError(
             f"Command failed with exit {exc.returncode}: {' '.join(args)}"
             + (f"; stderr: {stderr}" if stderr else "")
@@ -111,7 +120,9 @@ def require_mountpoint(path: Path) -> None:
     )
 
     if result.returncode != 0:
-        raise ReferencePreparationError(f"{path} is not mounted")
+        raise ReferencePreparationError(
+            f"{path} is not mounted"
+        )
 
 
 def validate_tools(spec: ReferenceSpec) -> None:
@@ -122,41 +133,22 @@ def validate_tools(spec: ReferenceSpec) -> None:
             )
 
 
-def extract_s5cmd_object(
-        payload: dict[str, object],
-        *,
-        context: str,
-) -> dict[str, object] | None:
-    """Extract the object record from one s5cmd --json response line.
-
-    s5cmd JSON output wraps successful object metadata in an "object" field.
-    Lines without an object record are ignored unless they contain an error.
-    """
-
-    error = payload.get("error")
-    if error:
-        raise ReferencePreparationError(
-            f"s5cmd reported an error while {context}: {error}"
-        )
-
-    item = payload.get("object")
-
-    if item is None:
-        return None
-
-    if not isinstance(item, dict):
-        raise ReferencePreparationError(
-            f"Invalid s5cmd object record while {context}: {item!r}"
-        )
-
-    return item
-
-
 def parse_s5cmd_inventory(
         raw: Iterable[str],
         prefix: str,
 ) -> list[dict[str, object]]:
-    """Parse s5cmd --json ls output into a deterministic object inventory."""
+    """Parse s5cmd --json ls output into a deterministic object inventory.
+
+    s5cmd 2.3.0 emits object metadata as a top-level JSON object, e.g.:
+
+        {
+            "key": "s3://bucket/path/file",
+            "etag": "...",
+            "size": 123
+        }
+
+    The parser intentionally does not expect an outer "object" wrapper.
+    """
 
     prefix = prefix.rstrip("/") + "/"
     objects: list[dict[str, object]] = []
@@ -179,23 +171,16 @@ def parse_s5cmd_inventory(
                 f"Invalid JSON record from s5cmd on line {line_number}"
             )
 
-        item = extract_s5cmd_object(
-            payload,
-            context=f"listing {prefix}",
-        )
+        if payload.get("error"):
+            raise ReferencePreparationError(
+                f"s5cmd reported an error on line {line_number}: "
+                f"{payload['error']}"
+            )
 
-        if item is None:
-            continue
-
-        key = item.get("key")
-
-        if isinstance(key, dict):
-            key = key.get("url") or key.get("key")
+        key = payload.get("key")
 
         if not isinstance(key, str):
-            raise ReferencePreparationError(
-                f"Missing object key from s5cmd on line {line_number}"
-            )
+            continue
 
         if not key.startswith(prefix):
             continue
@@ -210,14 +195,14 @@ def parse_s5cmd_inventory(
                 f"Unexpected nested reference object below {prefix}: {relative}"
             )
 
-        size = item.get("size")
+        size = payload.get("size")
 
         if not isinstance(size, int) or size < 0:
             raise ReferencePreparationError(
                 f"Missing or invalid size for reference object: {relative}"
             )
 
-        etag = item.get("etag") or ""
+        etag = payload.get("etag") or ""
 
         objects.append(
             {
@@ -232,7 +217,9 @@ def parse_s5cmd_inventory(
             f"No reference objects found below {prefix.rstrip('/')}"
         )
 
-    objects.sort(key=lambda obj: str(obj["key"]))
+    objects.sort(
+        key=lambda obj: str(obj["key"])
+    )
 
     return objects
 
@@ -240,15 +227,19 @@ def parse_s5cmd_inventory(
 def validate_mmseqs_cpu_inventory(
         objects: list[dict[str, object]],
 ) -> None:
-    """Require the known structural components of the qualified CPU DB."""
+    """Ensure the canonical CPU MMseqs inventory is complete."""
 
     names = {
         str(item["key"])
         for item in objects
     }
 
+    expected = set(
+        MMSEQS_CPU_REQUIRED_FILES
+    )
+
     missing = sorted(
-        set(MMSEQS_CPU_REQUIRED_FILES) - names
+        expected - names
     )
 
     if missing:
@@ -258,9 +249,9 @@ def validate_mmseqs_cpu_inventory(
         )
 
     LOG.info(
-        "CPU MMseqs S3 inventory contains all required database components "
-        "(%d objects total)",
-        len(objects),
+        "CPU MMseqs S3 inventory is complete: "
+        "%d required objects found",
+        len(MMSEQS_CPU_REQUIRED_FILES),
     )
 
 
@@ -272,6 +263,7 @@ def build_inventory(
 
     if spec.backend == "diamond":
         objects = build_diamond_inventory(spec)
+
     else:
         output = subprocess.run(
             [
@@ -299,7 +291,9 @@ def build_inventory(
         )
 
         if spec.backend == "mmseqs-cpu":
-            validate_mmseqs_cpu_inventory(objects)
+            validate_mmseqs_cpu_inventory(
+                objects
+            )
 
     payload = {
         "backend": spec.backend,
@@ -314,7 +308,12 @@ def build_inventory(
     )
 
     output_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
         )
 
@@ -369,23 +368,18 @@ def build_diamond_inventory(
                 f"on line {line_number}"
             )
 
-        item = extract_s5cmd_object(
-            payload,
-            context=f"inspecting {spec.s3_source}",
-        )
+        if payload.get("error"):
+            raise ReferencePreparationError(
+                f"s5cmd reported an error while inspecting Diamond reference: "
+                f"{payload['error']}"
+            )
 
-        if item is None:
-            continue
-
-        key = item.get("key")
-
-        if isinstance(key, dict):
-            key = key.get("url") or key.get("key")
+        key = payload.get("key")
 
         if key != spec.s3_source:
             continue
 
-        size = item.get("size")
+        size = payload.get("size")
 
         if not isinstance(size, int) or size < 0:
             raise ReferencePreparationError(
@@ -395,9 +389,13 @@ def build_diamond_inventory(
 
         return [
             {
-                "key": Path(spec.s3_source).name,
+                "key": Path(
+                    spec.s3_source
+                ).name,
                 "size": size,
-                "etag": str(item.get("etag") or ""),
+                "etag": str(
+                    payload.get("etag") or ""
+                ),
             }
         ]
 
@@ -407,21 +405,34 @@ def build_diamond_inventory(
     )
 
 
-def inventory_version(inventory_path: Path) -> str:
+def inventory_version(
+        inventory_path: Path,
+) -> str:
     """Return the SHA256 fingerprint of the canonical inventory JSON."""
 
     digest = hashlib.sha256()
-    digest.update(inventory_path.read_bytes())
+
+    digest.update(
+        inventory_path.read_bytes()
+    )
 
     return digest.hexdigest()
 
 
-def load_inventory(path: Path) -> dict[str, object]:
+def load_inventory(
+        path: Path,
+) -> dict[str, object]:
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8")
+            path.read_text(
+                encoding="utf-8"
+            )
         )
-    except (OSError, json.JSONDecodeError) as exc:
+
+    except (
+            OSError,
+            json.JSONDecodeError,
+    ) as exc:
         raise ReferencePreparationError(
             f"Unable to read reference inventory {path}: {exc}"
         ) from exc
@@ -481,7 +492,10 @@ def validate_local_inventory(
 ) -> None:
     """Ensure local files exactly match the expected S3 names and sizes."""
 
-    expected = inventory_object_map(inventory)
+    expected = inventory_object_map(
+        inventory
+    )
+
     actual: dict[str, int] = {}
 
     if not local_dir.is_dir():
@@ -501,8 +515,13 @@ def validate_local_inventory(
 
         actual[path.name] = path.stat().st_size
 
-    expected_names = set(expected)
-    actual_names = set(actual)
+    expected_names = set(
+        expected
+    )
+
+    actual_names = set(
+        actual
+    )
 
     missing = sorted(
         expected_names - actual_names
@@ -548,7 +567,8 @@ def validate_mmseqs(
     """Validate that MMseqs can open the expected CPU NR database."""
 
     db_prefix = (
-            spec.local_dir / spec.db_name
+            spec.local_dir
+            / spec.db_name
     )
 
     if not db_prefix.is_file():
@@ -588,7 +608,8 @@ def validate_diamond(
     """Validate that the expected Diamond database is present and usable."""
 
     db_path = (
-            spec.local_dir / spec.db_name
+            spec.local_dir
+            / spec.db_name
     )
 
     expected = inventory_object_map(
@@ -658,14 +679,16 @@ def write_metadata(
     """Write local reference metadata only after successful validation."""
 
     (
-            reference_dir / ".reference_version"
+            reference_dir
+            / ".reference_version"
     ).write_text(
         version + "\n",
         encoding="utf-8",
         )
 
     (
-            reference_dir / ".reference_manifest.json"
+            reference_dir
+            / ".reference_manifest.json"
     ).write_text(
         json.dumps(
             inventory,
@@ -694,10 +717,14 @@ def validate_local_reference(
                 "CPU MMseqs reference inventory has no object list"
             )
 
-        validate_mmseqs_cpu_inventory(objects)
+        validate_mmseqs_cpu_inventory(
+            objects
+        )
 
     if spec.validator == "mmseqs":
-        validate_mmseqs(spec)
+        validate_mmseqs(
+            spec
+        )
 
     elif spec.validator == "diamond":
         validate_diamond(
@@ -716,14 +743,16 @@ def local_cache_is_current(
         inventory: dict[str, object],
         version: str,
 ) -> bool:
-    """Return true only when local metadata, file inventory, and DB validation pass."""
+    """Return true only when local metadata, inventory, and DB validation pass."""
 
     version_path = (
-            spec.local_dir / ".reference_version"
+            spec.local_dir
+            / ".reference_version"
     )
 
     manifest_path = (
-            spec.local_dir / ".reference_manifest.json"
+            spec.local_dir
+            / ".reference_manifest.json"
     )
 
     if (
@@ -734,9 +763,11 @@ def local_cache_is_current(
 
     try:
         recorded_version = (
-            version_path.read_text(
+            version_path
+            .read_text(
                 encoding="utf-8"
-            ).strip()
+            )
+            .strip()
         )
 
         recorded_inventory = load_inventory(
@@ -757,6 +788,7 @@ def local_cache_is_current(
             spec,
             inventory,
         )
+
     except ReferencePreparationError:
         return False
 
@@ -791,7 +823,8 @@ def stage_reference(
     )
 
     staging_root = (
-            spec.local_dir.parent / ".staging"
+            spec.local_dir.parent
+            / ".staging"
     )
 
     staging_root.mkdir(
