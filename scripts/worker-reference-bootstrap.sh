@@ -67,10 +67,12 @@ setup_thp() {
 # ---------- packages ----------
 install_packages() {
   log "Packages - critical"
+
   if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic; then
     log "ERROR: critical package installation failed"
     return 1
   fi
+
   systemctl enable --now amazon-ssm-agent || true
 
   log "Packages - secondary"
@@ -78,7 +80,7 @@ install_packages() {
 }
 
 # ---------- s5cmd ----------
-# Pin the worker image to a known s5cmd release.  s5cmd is the reference
+# Pin the worker image to a known s5cmd release. s5cmd is the reference
 # staging tool for large S3 -> NVMe transfers; do not fall back to aws s3 cp.
 install_s5cmd() {
   local version="2.3.0"
@@ -87,6 +89,7 @@ install_s5cmd() {
   local archive="${tmpdir}/s5cmd.tar.gz"
 
   log "Installing s5cmd ${version}"
+
   rm -rf "$tmpdir"
   mkdir -p "$tmpdir"
 
@@ -269,7 +272,6 @@ EOF
 
   log "scratch-setup.service enabled"
 }
-
 
 # ---------- EFS ----------
 setup_efs() {
@@ -489,6 +491,7 @@ PYEOF
   log "Worker backend: ${WORKER_BACKEND}"
   log "Reference set: ${WORKER_REFERENCE_SET} (${reference_status})"
   log "Environment: ${WORKER_ENVIRONMENT}"
+
   if [ -n "$reason" ]; then
     log "Worker reason: ${reason}"
   fi
@@ -501,7 +504,11 @@ set_worker_state() {
   local reference_status="$3"
   local reason="${4:-}"
 
-  if ! write_worker_status "$state" "$worker_ready" "$reference_status" "$reason"; then
+  if ! write_worker_status \
+      "$state" \
+      "$worker_ready" \
+      "$reference_status" \
+      "$reason"; then
     log "WARNING: failed to publish worker state=${state}"
   fi
 }
@@ -509,38 +516,64 @@ set_worker_state() {
 # ---------- main ----------
 # A worker is not READY merely because EC2 reports it as running.
 # Reference preparation and validation must complete before READY.
+
 setup_thp
+
 if ! install_packages; then
   log "ERROR: critical package installation failed; worker cannot be used"
-  set_worker_state "FAILED" "false" "not_checked" "critical package installation failed"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "not_checked" \
+    "critical package installation failed"
   exit 1
 fi
 
 if ! install_scratch_helper; then
   log "ERROR: failed to install scratch setup helper; worker cannot be used"
-  set_worker_state "FAILED" "false" "not_checked" "failed to install scratch setup helper"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "not_checked" \
+    "failed to install scratch setup helper"
   exit 1
 fi
 
 # Let systemd be the authoritative mechanism for preparing /scratch.
 # This reconstructs the filesystem/mount; it does NOT preserve instance-store data.
 # EC2 instance-store NVMe contents are ephemeral and may disappear on stop/start.
+
 if ! systemctl start scratch-setup.service; then
-  set_worker_state "FAILED" "false" "not_checked" "instance-store /scratch setup service failed"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "not_checked" \
+    "instance-store /scratch setup service failed"
+
   log "ERROR: scratch-setup.service failed; worker cannot be used"
   exit 1
 fi
 
-# A successful Type=oneshot + RemainAfterExit service should remain active (exited).
+# A successful Type=oneshot + RemainAfterExit service should remain active.
 if ! systemctl is-active --quiet scratch-setup.service; then
-  set_worker_state "FAILED" "false" "not_checked" "scratch-setup.service did not become active"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "not_checked" \
+    "scratch-setup.service did not become active"
+
   log "ERROR: scratch-setup.service is not active after start"
   systemctl status scratch-setup.service --no-pager || true
   exit 1
 fi
 
 if ! setup_efs; then
-  set_worker_state "FAILED" "false" "not_checked" "EFS setup failed"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "not_checked" \
+    "EFS setup failed"
+
   log "ERROR: EFS setup failed; worker cannot be used"
   exit 1
 fi
@@ -548,17 +581,35 @@ fi
 mkdir -p /efs/workers
 
 if ! install_s5cmd; then
-  set_worker_state "FAILED" "false" "not_checked" "s5cmd installation failed"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "not_checked" \
+    "s5cmd installation failed"
+
   log "ERROR: s5cmd installation failed; worker cannot be used"
   exit 1
 fi
 
-set_worker_state "BOOTING" "false" "not_checked"
-set_worker_state "PREPARING_REFERENCE" "false" "preparing"
+set_worker_state \
+  "BOOTING" \
+  "false" \
+  "not_checked"
+
+set_worker_state \
+  "PREPARING_REFERENCE" \
+  "false" \
+  "preparing"
 
 REFERENCE_PREPARER="/usr/local/bin/seqtoid_prepare_reference.py"
+
 if [ ! -f "$REFERENCE_PREPARER" ]; then
-  set_worker_state "FAILED" "false" "failed" "reference preparation utility not found: $REFERENCE_PREPARER"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "failed" \
+    "reference preparation utility not found: $REFERENCE_PREPARER"
+
   log "ERROR: reference preparation utility not found: $REFERENCE_PREPARER"
   exit 1
 fi
@@ -567,54 +618,105 @@ case "$WORKER_BACKEND" in
   cpu)
     REFERENCE_BACKEND="mmseqs-cpu"
     ;;
-  mmseqs-cpu|diamond)
-    REFERENCE_BACKEND="$WORKER_BACKEND"
+
+  mmseqs-cpu)
+    REFERENCE_BACKEND="mmseqs-cpu"
     ;;
+
+  mmseqs-gpu)
+    REFERENCE_BACKEND="mmseqs-gpu"
+    ;;
+
+  diamond)
+    REFERENCE_BACKEND="diamond"
+    ;;
+
   *)
-    set_worker_state "FAILED" "false" "failed" "unsupported worker backend=$WORKER_BACKEND"
+    set_worker_state \
+      "FAILED" \
+      "false" \
+      "failed" \
+      "unsupported worker backend=$WORKER_BACKEND"
+
     log "ERROR: unsupported worker backend=$WORKER_BACKEND"
     exit 1
     ;;
 esac
 
+log "Preparing reference for backend=$REFERENCE_BACKEND"
+
 REFERENCE_VERSION=$(python3 "$REFERENCE_PREPARER" \
   --backend "$REFERENCE_BACKEND" \
   --reference-set "$WORKER_REFERENCE_SET") || {
-  set_worker_state "FAILED" "false" "failed" "reference preparation failed for backend=$REFERENCE_BACKEND"
-  log "ERROR: reference preparation failed for backend=$REFERENCE_BACKEND"
-  exit 1
-}
+    set_worker_state \
+      "FAILED" \
+      "false" \
+      "failed" \
+      "reference preparation failed for backend=$REFERENCE_BACKEND"
+
+    log "ERROR: reference preparation failed for backend=$REFERENCE_BACKEND"
+    exit 1
+  }
 
 case "$REFERENCE_BACKEND" in
   mmseqs-cpu)
     REFERENCE_DIR="/scratch/refs/mmseqs"
     REFERENCE_DB="$REFERENCE_DIR/nrcleanDB"
     ;;
+
+  mmseqs-gpu)
+    REFERENCE_DIR="/scratch/refs/mmseqs-gpu"
+    REFERENCE_DB="$REFERENCE_DIR/nrcleanDB_gpu"
+    ;;
+
   diamond)
     REFERENCE_DIR="/scratch/refs/diamond"
     REFERENCE_DB="$REFERENCE_DIR/diamond_07_22_2026.dmnd"
     ;;
 esac
 
-if [ -z "$REFERENCE_VERSION" ] || [ ! -f "$REFERENCE_DIR/.reference_version" ] || \
+if [ -z "$REFERENCE_VERSION" ] || \
+   [ ! -f "$REFERENCE_DIR/.reference_version" ] || \
    [ ! -f "$REFERENCE_DIR/.reference_manifest.json" ] || \
    [ ! -f "$REFERENCE_DB" ]; then
-  set_worker_state "FAILED" "false" "failed" "reference validation outputs missing"
+
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "failed" \
+    "reference validation outputs missing"
+
   log "ERROR: reference validation outputs missing under $REFERENCE_DIR"
   exit 1
 fi
 
 RECORDED_VERSION=$(tr -d '[:space:]' < "$REFERENCE_DIR/.reference_version")
+
 if [ "$REFERENCE_VERSION" != "$RECORDED_VERSION" ]; then
-  set_worker_state "FAILED" "false" "failed" "reference version verification failed"
+  set_worker_state \
+    "FAILED" \
+    "false" \
+    "failed" \
+    "reference version verification failed"
+
   log "ERROR: reference version mismatch: preparer=$REFERENCE_VERSION local=$RECORDED_VERSION"
   exit 1
 fi
 
-log "Reference prepared and validated: backend=$REFERENCE_BACKEND version=$REFERENCE_VERSION"
-set_worker_state "READY" "true" "validated"
+log "Reference prepared and validated:"
+log "  backend=$REFERENCE_BACKEND"
+log "  reference_set=$WORKER_REFERENCE_SET"
+log "  version=$REFERENCE_VERSION"
+log "  directory=$REFERENCE_DIR"
+log "  database=$REFERENCE_DB"
+
+set_worker_state \
+  "READY" \
+  "true" \
+  "validated"
 
 mkdir -p /home/ec2-user/{programs,venv} /dev/shm/workspace
+
 chown -R ec2-user:ec2-user \
   /home/ec2-user/programs \
   /home/ec2-user/venv \
@@ -628,4 +730,8 @@ log "  systemctl is-enabled scratch-setup.service"
 log "  cat /proc/mdstat"
 
 log "Worker status files:"
-find /efs/workers -maxdepth 2 -type f -name 'status.json' -print
+find /efs/workers \
+  -maxdepth 2 \
+  -type f \
+  -name 'status.json' \
+  -print
