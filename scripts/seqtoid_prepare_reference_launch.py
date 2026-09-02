@@ -221,13 +221,7 @@ def get_s5cmd_object_size(
         "size": <integer>
 
     However, for a legitimate zero-byte S3 object it may omit the
-    size field entirely, for example:
-
-        {
-            "key": ".../library.fna.masked",
-            "etag": "d41d8cd98f00b204e9800998ecf8427e",
-            "type": "file"
-        }
+    size field entirely.
 
     A missing size is interpreted as zero ONLY when:
 
@@ -283,14 +277,7 @@ def parse_s5cmd_inventory(
     """
     Parse s5cmd --json ls output.
 
-    s5cmd 2.3.0 emits each object as a top-level JSON record:
-
-        {
-            "key": "...",
-            "etag": "...",
-            "size": 123,
-            ...
-        }
+    s5cmd 2.3.0 emits each object as a top-level JSON record.
 
     Nested directory structure is intentional here and is preserved.
     """
@@ -586,8 +573,8 @@ def validate_inventory_policy(
         inventory: dict[str, object],
 ) -> None:
     """
-    Ensure the inventory encodes exactly the intended inclusion and
-    exclusion policy.
+    Ensure the inventory encodes exactly the intended inclusion
+    and exclusion policy.
     """
 
     if inventory.get("backend") != "launch-node":
@@ -755,12 +742,21 @@ def set_reference_permissions(
         reference_dir: Path,
 ) -> None:
     """
-    Make the complete validated reference tree readable by pipeline
-    processes.
+    Set permissions for the validated reference tree.
 
-    The reference root itself remains owned/managed by the launch
-    bootstrap. Reference files are read-only to ordinary users.
+    The launch-node cache root itself is owned by ec2-user so that
+    the launch-node can manage/replace the cache.
+
+    Nested reference directories and files remain root-owned and
+    are readable but not writable by ordinary users.
     """
+
+    # The cache root must be writable by ec2-user.
+    shutil.chown(
+        reference_dir,
+        user="ec2-user",
+        group="ec2-user",
+    )
 
     reference_dir.chmod(0o755)
 
@@ -1186,6 +1182,72 @@ def prepare_reference(
             "match canonical S3 inventory"
         )
 
+    # Critical post-promotion ownership check.
+    try:
+        owner_uid = local_root.stat().st_uid
+        owner_gid = local_root.stat().st_gid
+
+        ec2_user = shutil._get_uid("ec2-user")
+        ec2_group = shutil._get_gid("ec2-user")
+
+    except AttributeError:
+        # Python 3.9 does not expose these private helpers on every
+        # platform. Fall back to id(1) rather than weakening the
+        # ownership requirement.
+        owner = subprocess.run(
+            [
+                "stat",
+                "-c",
+                "%u:%g",
+                str(local_root),
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+        expected_owner = subprocess.run(
+            [
+                "id",
+                "-u",
+                "ec2-user",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+        expected_group = subprocess.run(
+            [
+                "id",
+                "-g",
+                "ec2-user",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+        expected = (
+            f"{expected_owner}:{expected_group}"
+        )
+
+        if owner != expected:
+            raise ReferencePreparationError(
+                "Promoted launch-node reference root has incorrect "
+                f"ownership: expected {expected}, found {owner}"
+            )
+
+    else:
+        if (
+                owner_uid != ec2_user
+                or owner_gid != ec2_group
+        ):
+            raise ReferencePreparationError(
+                "Promoted launch-node reference root has incorrect "
+                "ownership: expected ec2-user:ec2-user"
+            )
+
     LOG.info(
         "Launch-node reference installed and validated"
     )
@@ -1212,6 +1274,10 @@ def prepare_reference(
                 promoted_inventory
             )
         ),
+    )
+
+    LOG.info(
+        "  Root ownership: ec2-user:ec2-user"
     )
 
     return promoted_version
