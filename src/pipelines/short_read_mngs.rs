@@ -4188,9 +4188,75 @@ async fn process_assembly(
                 PipelineError::Other(anyhow!("contigs -> contigs_all writer task failed: {}", e))
             })?;
 
-        tokio::fs::copy(&contigs_path, &final_contigs_path).await?;
-        tokio::fs::copy(&contigs_all_path, &final_contigs_all_path).await?;
-        tokio::fs::copy(&scaffolds_path, &final_scaffolds_path).await?;
+        info!(
+    "[spades] final-copy preflight: \
+     temp_dir={} exists={} \
+     contigs={} exists={} \
+     contigs_all={} exists={} \
+     scaffolds={} exists={} \
+     assembly_out_dir={} exists={}",
+    temp_dir.path().display(),
+    temp_dir.path().exists(),
+    contigs_path.display(),
+    contigs_path.exists(),
+    contigs_all_path.display(),
+    contigs_all_path.exists(),
+    scaffolds_path.display(),
+    scaffolds_path.exists(),
+    assembly_out_dir.display(),
+    assembly_out_dir.exists(),
+);
+
+        tokio::fs::copy(&contigs_path, &final_contigs_path)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+            "SPAdes final copy FAILED: {} -> {}: {}",
+            contigs_path.display(),
+            final_contigs_path.display(),
+            e
+        ))
+            })?;
+
+        info!(
+    "[spades] copied {} -> {}",
+    contigs_path.display(),
+    final_contigs_path.display()
+);
+
+        tokio::fs::copy(&contigs_all_path, &final_contigs_all_path)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+            "SPAdes final copy FAILED: {} -> {}: {}",
+            contigs_all_path.display(),
+            final_contigs_all_path.display(),
+            e
+        ))
+            })?;
+
+        info!(
+    "[spades] copied {} -> {}",
+    contigs_all_path.display(),
+    final_contigs_all_path.display()
+);
+
+        tokio::fs::copy(&scaffolds_path, &final_scaffolds_path)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+            "SPAdes final copy FAILED: {} -> {}: {}",
+            scaffolds_path.display(),
+            final_scaffolds_path.display(),
+            e
+        ))
+            })?;
+
+        info!(
+    "[spades] copied {} -> {}",
+    scaffolds_path.display(),
+    final_scaffolds_path.display()
+);
     } else {
         error!("SPAdes failed with exit: {:?}", spades_exit);
 
