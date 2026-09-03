@@ -3140,4 +3140,243 @@ mod tests {
             );
         }
     }
+
+
+    #[tokio::test]
+    async fn test_chunk_paired_fastq_lossless_and_deterministic() -> Result<()> {
+        let input_dir = tempdir()?;
+        let output_dir_1 = tempdir()?;
+        let output_dir_2 = tempdir()?;
+
+        let r1_path = input_dir.path().join("R1.fastq");
+        let r2_path = input_dir.path().join("R2.fastq");
+
+        // 10 paired-end reads. Chunk size of 3 pairs should produce
+        // 4 chunks: 3, 3, 3, 1.
+        let r1 = b"\
+@read1/1
+ACGT
++
+IIII
+@read2/1
+TGCA
++
+HHHH
+@read3/1
+AAAA
++
+JJJJ
+@read4/1
+CCCC
++
+KKKK
+@read5/1
+GGGG
++
+LLLL
+@read6/1
+TTTT
++
+MMMM
+@read7/1
+ACAC
++
+NNNN
+@read8/1
+GTGT
++
+OOOO
+@read9/1
+AGAG
++
+PPPP
+@read10/1
+CTCT
++
+QQQQ
+";
+
+        let r2 = b"\
+@read1/2
+TGCA
++
+HHHH
+@read2/2
+ACGT
++
+IIII
+@read3/2
+TTTT
++
+MMMM
+@read4/2
+GGGG
++
+LLLL
+@read5/2
+CCCC
++
+KKKK
+@read6/2
+AAAA
++
+JJJJ
+@read7/2
+GTGT
++
+OOOO
+@read8/2
+ACAC
++
+NNNN
+@read9/2
+CTCT
++
+QQQQ
+@read10/2
+AGAG
++
+PPPP
+";
+
+        fs::write(&r1_path, r1)?;
+        fs::write(&r2_path, r2)?;
+
+        // First run.
+        let summary_1 = chunk_paired_fastq(
+            r1_path.clone(),
+            r2_path.clone(),
+            output_dir_1.path().to_path_buf(),
+            3,
+        )
+            .await?;
+
+        // Basic summary checks.
+        assert_eq!(summary_1.total_pairs, 10);
+        assert_eq!(summary_1.total_r1_records, 10);
+        assert_eq!(summary_1.total_r2_records, 10);
+        assert_eq!(summary_1.chunks.len(), 4);
+
+        let pair_counts: Vec<u64> = summary_1
+            .chunks
+            .iter()
+            .map(|chunk| chunk.pair_count)
+            .collect();
+
+        assert_eq!(pair_counts, vec![3, 3, 3, 1]);
+
+        // Verify deterministic chunk IDs and filenames.
+        for (expected_id, chunk) in summary_1.chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_id, expected_id as u64);
+
+            assert_eq!(
+                chunk.r1_path,
+                output_dir_1
+                    .path()
+                    .join(format!("chunk_{:08}_R1.fastq", expected_id))
+            );
+
+            assert_eq!(
+                chunk.r2_path,
+                output_dir_1
+                    .path()
+                    .join(format!("chunk_{:08}_R2.fastq", expected_id))
+            );
+        }
+
+        // Read every generated chunk and verify:
+        //   - valid FASTQ
+        //   - R1/R2 counts agree
+        //   - every pair remains correctly paired
+        //   - all original reads occur exactly once
+        let mut observed_ids = Vec::new();
+
+        for chunk in &summary_1.chunks {
+            let mut r1_reader = parse_fastx_file(&chunk.r1_path)?;
+            let mut r2_reader = parse_fastx_file(&chunk.r2_path)?;
+
+            let mut chunk_pairs = 0u64;
+
+            loop {
+                let r1_record = r1_reader.next();
+                let r2_record = r2_reader.next();
+
+                match (r1_record, r2_record) {
+                    (None, None) => break,
+
+                    (Some(Ok(_)), None) | (None, Some(Ok(_))) => {
+                        panic!("R1/R2 length mismatch inside chunk {}", chunk.chunk_id);
+                    }
+
+                    (Some(Err(e)), _) => {
+                        panic!("R1 parse error in chunk {}: {}", chunk.chunk_id, e);
+                    }
+
+                    (_, Some(Err(e))) => {
+                        panic!("R2 parse error in chunk {}: {}", chunk.chunk_id, e);
+                    }
+
+                    (Some(Ok(r1)), Some(Ok(r2))) => {
+                        assert!(r1.qual().is_some());
+                        assert!(r2.qual().is_some());
+
+                        assert!(
+                            compare_read_ids_bytes(r1.id(), r2.id()),
+                            "Mate mismatch in chunk {}: R1={} R2={}",
+                            chunk.chunk_id,
+                            String::from_utf8_lossy(r1.id()),
+                            String::from_utf8_lossy(r2.id()),
+                        );
+
+                        observed_ids.push(String::from_utf8_lossy(r1.id()).to_string());
+                        chunk_pairs += 1;
+                    }
+                }
+            }
+
+            assert_eq!(chunk_pairs, chunk.pair_count);
+        }
+
+        // Every original R1 read appears exactly once.
+        let expected_ids: Vec<String> = (1..=10)
+            .map(|i| format!("read{}/1", i))
+            .collect();
+
+        assert_eq!(observed_ids, expected_ids);
+
+        let mut unique_ids = observed_ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+
+        assert_eq!(unique_ids.len(), 10);
+
+        // Second run with identical input must produce identical files.
+        let summary_2 = chunk_paired_fastq(
+            r1_path,
+            r2_path,
+            output_dir_2.path().to_path_buf(),
+            3,
+        )
+            .await?;
+
+        assert_eq!(summary_2.total_pairs, summary_1.total_pairs);
+        assert_eq!(summary_2.total_r1_records, summary_1.total_r1_records);
+        assert_eq!(summary_2.total_r2_records, summary_1.total_r2_records);
+        assert_eq!(summary_2.chunks.len(), summary_1.chunks.len());
+
+        for (chunk_1, chunk_2) in summary_1.chunks.iter().zip(summary_2.chunks.iter()) {
+            assert_eq!(chunk_1.chunk_id, chunk_2.chunk_id);
+            assert_eq!(chunk_1.pair_count, chunk_2.pair_count);
+
+            let r1_bytes_1 = fs::read(&chunk_1.r1_path)?;
+            let r1_bytes_2 = fs::read(&chunk_2.r1_path)?;
+            assert_eq!(r1_bytes_1, r1_bytes_2);
+
+            let r2_bytes_1 = fs::read(&chunk_1.r2_path)?;
+            let r2_bytes_2 = fs::read(&chunk_2.r2_path)?;
+            assert_eq!(r2_bytes_1, r2_bytes_2);
+        }
+
+        Ok(())
+    }
 }
