@@ -4016,17 +4016,33 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
     Ok(())
 }
 
-/// Runs spades assembler
+/// Runs SPAdes assembly and generates read-to-contig mapping.
+///
+/// This intentionally matches the failure semantics of the original Python
+/// RunAssembly implementation:
+///
+/// - SPAdes failure is non-fatal to the overall pipeline.
+/// - Missing expected SPAdes outputs are assembly failures.
+/// - Contig filtering failures are assembly failures.
+/// - Bowtie2/read-to-contig mapping failures are assembly failures.
+/// - Contig-stat generation failures are assembly failures.
+/// - On ANY such assembly failure, the assembly outputs are replaced with
+///   dummy files and the overall pipeline continues.
 ///
 /// # Arguments
 ///
 /// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream
+/// * `assembly_out_dir` - Final <out_dir>/assembly directory.
+/// * `r1_path` - Non-host R1 FASTQ.
+/// * `r2_path_opt` - Optional non-host R2 FASTQ.
+/// * `duplicate_clusters` - Duplicate cluster metadata.
+/// * `paired` - Whether input is paired-end.
+/// * `assembly_headroom` - Temp-space headroom multiplier.
 ///
 /// # Returns
 async fn process_assembly(
     config: Arc<RunConfig>,
-    assembly_out_dir: &PathBuf, // to make clear this is <out_dir>/assembly
+    assembly_out_dir: &PathBuf,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
@@ -4045,9 +4061,10 @@ async fn process_assembly(
 > {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
-    let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let temp_files: Vec<NamedTempFile> = Vec::new();
 
     let est_temp_bytes = config.input_size + MAX_SPADES_WORK_DIR;
+
     let temp_dir = choose_temp_dir(
         est_temp_bytes,
         &config.ram_temp_dir,
@@ -4055,16 +4072,144 @@ async fn process_assembly(
         assembly_headroom,
         true,
     )
-    .await?;
+        .await?;
 
+    // ---------------------------------------------------------------------
+    // Temp paths used internally by the Rust implementation
+    // ---------------------------------------------------------------------
+
+    let contigs_path = temp_dir.path().join("contigs.fasta");
+    let contigs_all_path = temp_dir.path().join("contigs_all.fasta");
+    let scaffolds_path = temp_dir.path().join("scaffolds.fasta");
+    let bam_path = temp_dir.path().join("read-contig.bam");
+    let stats_json_path = temp_dir.path().join("contig_stats.json");
+
+    // ---------------------------------------------------------------------
+    // Durable assembly outputs
+    // ---------------------------------------------------------------------
+
+    let final_contigs_path = assembly_out_dir.join("contigs.fasta");
+    let final_contigs_all_path = assembly_out_dir.join("contigs_all.fasta");
+    let final_scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
+    let final_bam_path = assembly_out_dir.join("read-contig.bam");
+    let final_stats_json_path = assembly_out_dir.join("contig_stats.json");
     let stdout_log_path = assembly_out_dir.join("spades_stdout.log");
 
+    // ---------------------------------------------------------------------
+    // Helper result for the assembly-failure path.
+    //
+    // This is the Rust equivalent of the original Python except: block:
+    //
+    //   ;ASSEMBLY FAILED
+    //   ;ASSEMBLY FAILED
+    //   ;ASSEMBLY FAILED
+    //   @NO INFO
+    //   {}
+    //
+    // ---------------------------------------------------------------------
+
+    macro_rules! return_assembly_failure {
+        ($reason:expr) => {{
+            let reason = $reason;
+
+            error!(
+                "[assembly] assembly failed; writing compatibility dummy outputs: {}",
+                reason
+            );
+
+            let failed_marker = b";ASSEMBLY FAILED\n";
+            let no_info = b"@NO INFO\n";
+            let empty_json = b"{}";
+
+            tokio::fs::write(&final_contigs_path, failed_marker)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy contigs.fasta after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_contigs_all_path, failed_marker)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy contigs_all.fasta after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_scaffolds_path, failed_marker)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy scaffolds.fasta after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_bam_path, no_info)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy read-contig.bam after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_stats_json_path, empty_json)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy contig_stats.json after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            info!(
+                "[assembly] compatibility dummy outputs written: \
+                 contigs={}, contigs_all={}, scaffolds={}, bam={}, stats={}",
+                final_contigs_path.display(),
+                final_contigs_all_path.display(),
+                final_scaffolds_path.display(),
+                final_bam_path.display(),
+                final_stats_json_path.display(),
+            );
+
+            let (empty_tx, empty_rx) = mpsc::channel(1);
+            drop(empty_tx);
+
+            return Ok((
+                CoverageOutputs {
+                    contigs_fasta: final_contigs_path,
+                    contigs_all_fasta: final_contigs_all_path,
+                    scaffolds_fasta: final_scaffolds_path,
+                    bam_path: final_bam_path,
+                    contig_stats_json: final_stats_json_path,
+                    contig_stats: Arc::new(HashMap::new()),
+                    read2contig: Arc::new(HashMap::new()),
+                },
+                ReceiverStream::new(empty_rx),
+                cleanup_tasks,
+                cleanup_receivers,
+                temp_files,
+                temp_dir,
+            ));
+        }};
+    }
+
+    // =====================================================================
+    // SPAdes
+    // =====================================================================
+
     info!(
-        "[spades] starting: r1={}, r2={:?}, final_assembly_dir={},  temp_dir={}",
+        "[spades] starting: r1={}, r2={:?}, final_assembly_dir={}, temp_dir={}",
         r1_path.display(),
-        r2_path_opt.as_ref().map(|p| p.display().to_string()),
+        r2_path_opt
+            .as_ref()
+            .map(|p| p.display().to_string()),
         assembly_out_dir.display(),
-        temp_dir.path().to_path_buf().display(),
+        temp_dir.path().display(),
     );
 
     let mut options = HashMap::new();
@@ -4078,18 +4223,39 @@ async fn process_assembly(
         option_fields: options,
     };
 
-    let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))?;
+    let spades_args = match generate_cli(
+        SPADES_TAG,
+        &config,
+        Some(&spades_config),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to generate SPAdes command: {}",
+                e
+            ));
+        }
+    };
 
     info!("[spades] command args: {:?}", spades_args);
 
-    let (mut spades_child, spades_stderr_task) = spawn_cmd(
+    let (mut spades_child, spades_stderr_task) = match spawn_cmd(
         config.clone(),
         SPADES_TAG,
         spades_args,
         config.args.verbose,
         None,
     )
-    .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to spawn SPAdes: {}",
+                e
+            ));
+        }
+    };
 
     info!(
         "[spades] child spawned: stdout_present={}, stderr_present={}",
@@ -4097,30 +4263,58 @@ async fn process_assembly(
         spades_child.stderr.is_some()
     );
 
-    let spades_out_stream = parse_child_output(
+    let spades_out_stream = match parse_child_output(
         &mut spades_child,
         ChildStream::Stdout,
         ParseMode::Lines,
         &config,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SPADES_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to capture SPAdes stdout: {}",
+                e
+            ));
+        }
+    };
 
     let spades_write_task =
         tokio::spawn(stream_to_file(spades_out_stream, stdout_log_path.clone()));
+
     cleanup_tasks.push(spades_write_task);
 
-    // stderr is drained and logged by spawn_cmd's internal stderr task
-    spades_stderr_task.await??;
+    // Match the original broad assembly exception behavior:
+    // stderr handling problems also classify the assembly as failed.
+    match spades_stderr_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return_assembly_failure!(format!(
+                "SPAdes stderr task failed: {}",
+                e
+            ));
+        }
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "SPAdes stderr task panicked: {}",
+                e
+            ));
+        }
+    }
 
-    // Check SPAdes exit
-    let spades_exit = spades_child.wait().await?;
+    let spades_exit = match spades_child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed waiting for SPAdes: {}",
+                e
+            ));
+        }
+    };
 
     info!(
-        "[spades] exit status={:?} success={}  stdout_log={}",
+        "[spades] exit status={:?} success={} stdout_log={}",
         spades_exit.code(),
         spades_exit.success(),
         stdout_log_path.display()
@@ -4139,188 +4333,179 @@ async fn process_assembly(
         ),
     }
 
-    let contigs_path = temp_dir.path().to_path_buf().join("contigs.fasta");
-    let contigs_all_path = temp_dir.path().to_path_buf().join("contigs_all.fasta");
-    let scaffolds_path = temp_dir.path().to_path_buf().join("scaffolds.fasta");
-    let bam_path = temp_dir.path().to_path_buf().join("read-contig.bam");
-    let stats_json_path = temp_dir.path().to_path_buf().join("contig_stats.json");
-
-    let final_contigs_path = assembly_out_dir.join("contigs.fasta");
-    let final_contigs_all_path = assembly_out_dir.join("contigs_all.fasta");
-    let final_scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
-    let final_bam_path = assembly_out_dir.join("read-contig.bam");
-    let final_stats_json_path = assembly_out_dir.join("contig_stats.json");
-
-    if spades_exit.success() {
-        // on success path, just start the copy of the real spades output files async
-        info!("[spades] completed successfully");
-
-        // Copy the contigs file to contigs_all to reserve the original
-        fs::copy(&contigs_path, &contigs_all_path).await?;
-
-        // Contig length filtering and copy the result back over contigs.fasta
-        let rx = read_fasta(
-            contigs_all_path.clone(),
-            u64::MAX,
-            Some(config.args.min_contig_length),
-            None,
-            &config,
-        )
-        .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
-
-        let write_handle = write_fasta_stream_to_file(
-            ReceiverStream::new(rx),
-            contigs_path.clone(),
-            config.clone(),
-            StreamDataType::JustBytes,
-            "process_assembly_contigs_filtering",
-        );
-
-        write_handle
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "contigs -> contigs_all writer task panicked: {}",
-                    e
-                ))
-            })?
-            .map_err(|e| {
-                PipelineError::Other(anyhow!("contigs -> contigs_all writer task failed: {}", e))
-            })?;
-
-        info!(
-    "[spades] final-copy preflight: \
-     temp_dir={} exists={} \
-     contigs={} exists={} \
-     contigs_all={} exists={} \
-     scaffolds={} exists={} \
-     assembly_out_dir={} exists={}",
-    temp_dir.path().display(),
-    temp_dir.path().exists(),
-    contigs_path.display(),
-    contigs_path.exists(),
-    contigs_all_path.display(),
-    contigs_all_path.exists(),
-    scaffolds_path.display(),
-    scaffolds_path.exists(),
-    assembly_out_dir.display(),
-    assembly_out_dir.exists(),
-);
-
-        tokio::fs::copy(&contigs_path, &final_contigs_path)
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-            "SPAdes final copy FAILED: {} -> {}: {}",
-            contigs_path.display(),
-            final_contigs_path.display(),
-            e
-        ))
-            })?;
-
-        info!(
-    "[spades] copied {} -> {}",
-    contigs_path.display(),
-    final_contigs_path.display()
-);
-
-        tokio::fs::copy(&contigs_all_path, &final_contigs_all_path)
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-            "SPAdes final copy FAILED: {} -> {}: {}",
-            contigs_all_path.display(),
-            final_contigs_all_path.display(),
-            e
-        ))
-            })?;
-
-        info!(
-    "[spades] copied {} -> {}",
-    contigs_all_path.display(),
-    final_contigs_all_path.display()
-);
-
-        tokio::fs::copy(&scaffolds_path, &final_scaffolds_path)
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-            "SPAdes final copy FAILED: {} -> {}: {}",
-            scaffolds_path.display(),
-            final_scaffolds_path.display(),
-            e
-        ))
-            })?;
-
-        info!(
-    "[spades] copied {} -> {}",
-    scaffolds_path.display(),
-    final_scaffolds_path.display()
-
-            let spades_nested_scaffolds =
-    temp_dir.path().join("K77").join("scaffolds.fasta");
-
-info!(
-    "[spades] scaffold diagnostics: top_level={} exists={} nested_k77={} exists={}",
-    scaffolds_path.display(),
-    scaffolds_path.exists(),
-    spades_nested_scaffolds.display(),
-    spades_nested_scaffolds.exists(),
-);
-
-);
-    } else {
-        error!("SPAdes failed with exit: {:?}", spades_exit);
-
-        let failed_marker = b";ASSEMBLY FAILED\n";
-        let empty_scaffolds = b";NO SCAFFOLDS\n";
-        let empty_bam = b"@NO INFO\n";
-        let empty_json = b"{}";
-
-        // Here we sync write the final output files to disk (fast)
-        // and pass those back as the "temp" files for the pipeline to use
-
-        tokio::fs::write(&final_contigs_path, failed_marker).await?;
-        tokio::fs::write(&final_scaffolds_path, empty_scaffolds).await?;
-        tokio::fs::write(&final_contigs_all_path, failed_marker).await?;
-        tokio::fs::write(&final_bam_path, empty_bam).await?;
-        tokio::fs::write(&final_stats_json_path, empty_json).await?;
-
-        info!(
-            "[spades] wrote dummy outputs after failure: contigs={}, scaffolds={}",
-            final_contigs_path.display(),
-            final_scaffolds_path.display(),
-        );
-
-        return Ok((
-            CoverageOutputs {
-                contigs_fasta: final_contigs_path,
-                contigs_all_fasta: final_contigs_all_path,
-                scaffolds_fasta: final_scaffolds_path,
-                bam_path: final_bam_path,
-                contig_stats_json: final_stats_json_path,
-                contig_stats: Arc::new(HashMap::new()),
-                read2contig: Arc::new(HashMap::new()),
-            },
-            ReceiverStream::new({
-                let (tx, rx) = mpsc::channel(1);
-                drop(tx);
-                rx
-            }),
-            cleanup_tasks,
-            cleanup_receivers,
-            temp_files,
-            temp_dir,
+    if !spades_exit.success() {
+        return_assembly_failure!(format!(
+            "SPAdes exited with status {:?}",
+            spades_exit.code()
         ));
     }
 
-    info!("SPAdes completed successfully");
+    info!("[spades] process exited successfully");
 
-    let index_dir = temp_dir.path().to_path_buf().join("bowtie_index");
-    fs::create_dir_all(&index_dir).await?;
-    let index_prefix = index_dir.join("contigs"); // will create contigs.1.bt2, etc.
+    // =====================================================================
+    // Validate required SPAdes outputs.
+    //
+    // IMPORTANT:
+    // The original Python pipeline required BOTH contigs.fasta and
+    // scaffolds.fasta. If either was missing, its broad except block marked
+    // the entire assembly as failed.
+    //
+    // Therefore scaffolds.fasta is intentionally NOT optional here.
+    // =====================================================================
 
-    let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
+    if !contigs_path.is_file() {
+        return_assembly_failure!(format!(
+            "SPAdes exited successfully but required output is missing: {}",
+            contigs_path.display()
+        ));
+    }
+
+    if !scaffolds_path.is_file() {
+        return_assembly_failure!(format!(
+            "SPAdes exited successfully but required output is missing: {}",
+            scaffolds_path.display()
+        ));
+    }
+
+    info!(
+        "[spades] required outputs present: contigs={}, scaffolds={}",
+        contigs_path.display(),
+        scaffolds_path.display()
+    );
+
+    // =====================================================================
+    // Preserve original contigs
+    // =====================================================================
+
+    if let Err(e) = fs::copy(&contigs_path, &contigs_all_path).await {
+        return_assembly_failure!(format!(
+            "failed to preserve SPAdes contigs {} -> {}: {}",
+            contigs_path.display(),
+            contigs_all_path.display(),
+            e
+        ));
+    }
+
+    // =====================================================================
+    // Contig length filtering
+    // =====================================================================
+
+    let rx = match read_fasta(
+        contigs_all_path.clone(),
+        u64::MAX,
+        Some(config.args.min_contig_length),
+        None,
+        &config,
+    ) {
+        Ok(rx) => rx,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed reading SPAdes contigs for length filtering: {}",
+                e
+            ));
+        }
+    };
+
+    let write_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(rx),
+        contigs_path.clone(),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "process_assembly_contigs_filtering",
+    );
+
+    match write_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return_assembly_failure!(format!(
+                "contig filtering writer failed: {}",
+                e
+            ));
+        }
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "contig filtering writer task panicked: {}",
+                e
+            ));
+        }
+    }
+
+    // =====================================================================
+    // Durable copies
+    // =====================================================================
+
+    if let Err(e) = tokio::fs::copy(
+        &contigs_path,
+        &final_contigs_path,
+    )
+        .await
+    {
+        return_assembly_failure!(format!(
+            "failed copying filtered contigs {} -> {}: {}",
+            contigs_path.display(),
+            final_contigs_path.display(),
+            e
+        ));
+    }
+
+    if let Err(e) = tokio::fs::copy(
+        &contigs_all_path,
+        &final_contigs_all_path,
+    )
+        .await
+    {
+        return_assembly_failure!(format!(
+            "failed copying original contigs {} -> {}: {}",
+            contigs_all_path.display(),
+            final_contigs_all_path.display(),
+            e
+        ));
+    }
+
+    if let Err(e) = tokio::fs::copy(
+        &scaffolds_path,
+        &final_scaffolds_path,
+    )
+        .await
+    {
+        return_assembly_failure!(format!(
+            "failed copying scaffolds {} -> {}: {}",
+            scaffolds_path.display(),
+            final_scaffolds_path.display(),
+            e
+        ));
+    }
+
+    info!(
+        "[spades] assembly FASTA outputs copied successfully: \
+         contigs={}, contigs_all={}, scaffolds={}",
+        final_contigs_path.display(),
+        final_contigs_all_path.display(),
+        final_scaffolds_path.display()
+    );
+
+    // =====================================================================
+    // Bowtie2 index
+    //
+    // This is ALSO inside the original Python try/except.
+    // Failure here must therefore become ASSEMBLY FAILED rather than killing
+    // the entire short-read pipeline.
+    // =====================================================================
+
+    let index_dir = temp_dir.path().join("bowtie_index");
+
+    if let Err(e) = fs::create_dir_all(&index_dir).await {
+        return_assembly_failure!(format!(
+            "failed creating Bowtie2 index directory {}: {}",
+            index_dir.display(),
+            e
+        ));
+    }
+
+    let index_prefix = index_dir.join("contigs");
+
+    let num_index_cores =
+        RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
 
     info!(
         "[assembly] building bowtie2 index: prefix={}, threads={}",
@@ -4328,68 +4513,131 @@ info!(
         num_index_cores
     );
 
-    let build_status = Command::new("bowtie2-build")
+    let threads_string = num_index_cores.to_string();
+
+    let contigs_str = match contigs_path.to_str() {
+        Some(v) => v,
+        None => {
+            return_assembly_failure!(format!(
+                "contigs path is not valid UTF-8: {}",
+                contigs_path.display()
+            ));
+        }
+    };
+
+    let index_prefix_str = match index_prefix.to_str() {
+        Some(v) => v,
+        None => {
+            return_assembly_failure!(format!(
+                "Bowtie2 index path is not valid UTF-8: {}",
+                index_prefix.display()
+            ));
+        }
+    };
+
+    let build_status = match Command::new("bowtie2-build")
         .args([
             "--threads",
-            &num_index_cores.to_string(),
+            threads_string.as_str(),
             "--quiet",
-            contigs_path.clone().to_str().unwrap(),
-            index_prefix.to_str().unwrap(),
+            contigs_str,
+            index_prefix_str,
         ])
         .status()
         .await
-        .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
+    {
+        Ok(status) => status,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to spawn bowtie2-build: {}",
+                e
+            ));
+        }
+    };
 
     if !build_status.success() {
-        return Err(PipelineError::ToolExecution {
-            tool: BOWTIE2_TAG.to_string(),
-            error: build_status.to_string(),
-        });
+        return_assembly_failure!(format!(
+            "bowtie2-build exited with status {}",
+            build_status
+        ));
     }
 
     info!("[assembly] bowtie2-build completed successfully");
 
-    let bt2_options = HashMap::from([("--very-sensitive".to_string(), None)]);
+    // =====================================================================
+    // Bowtie2 read-to-contig alignment
+    // =====================================================================
+
+    let bt2_options =
+        HashMap::from([("--very-sensitive".to_string(), None)]);
 
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: index_prefix,
         r1_path: Some(r1_path.clone()),
         r2_path: r2_path_opt.clone(),
-        paired: paired,
+        paired,
         option_fields: bt2_options,
     };
 
-    let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view)).map_err(|e| {
-        PipelineError::ToolExecution {
-            tool: BOWTIE2_TAG.to_string(),
-            error: e.to_string(),
+    let bt2_args = match generate_cli(
+        BOWTIE2_TAG,
+        &config,
+        Some(&bt2_config_view),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed generating Bowtie2 arguments: {}",
+                e
+            ));
         }
-    })?;
+    };
 
-    info!("[assembly] bowtie2 args generated: {:?}", bt2_args);
+    info!(
+        "[assembly] bowtie2 args generated: {:?}",
+        bt2_args
+    );
 
-    let (mut bt2_child, bt2_err_task) = spawn_cmd(
+    let (mut bt2_child, bt2_err_task) = match spawn_cmd(
         config.clone(),
         BOWTIE2_TAG,
         bt2_args,
         config.args.verbose,
         None,
     )
-    .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed spawning Bowtie2: {}",
+                e
+            ));
+        }
+    };
 
     cleanup_tasks.push(bt2_err_task);
 
-    let bt2_out_stream = parse_child_output(
+    let bt2_out_stream = match parse_child_output(
         &mut bt2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
         &config,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: BOWTIE2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed reading Bowtie2 output: {}",
+                e
+            ));
+        }
+    };
+
+    // =====================================================================
+    // samtools name-sort
+    // =====================================================================
 
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -4405,18 +4653,30 @@ info!(
         ]),
     };
 
-    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_sort_args = match generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&samtools_sort_config),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed generating samtools sort arguments: {}",
+                e
+            ));
+        }
+    };
 
     info!(
         "[assembly] samtools sort args generated: {:?}",
         samtools_sort_args
     );
 
-    let (samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+    let (
+        samtools_sort_child,
+        samtools_sort_task,
+        samtools_sort_err_task,
+    ) = match stream_to_cmd(
         config.clone(),
         bt2_out_stream,
         SAMTOOLS_TAG,
@@ -4425,85 +4685,159 @@ info!(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed starting samtools sort: {}",
+                e
+            ));
+        }
+    };
 
     cleanup_tasks.push(samtools_sort_task);
     cleanup_tasks.push(samtools_sort_err_task);
 
     let samtools_sort_out_stream = {
         let mut guard = samtools_sort_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config)
+
+        match parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
             .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed reading samtools sort output: {}",
+                    e
+                ));
+            }
+        }
     };
 
-    use tokio_stream::wrappers::ReceiverStream;
+    // =====================================================================
+    // Fan out BAM:
+    //
+    // 1. durable BAM
+    // 2. contig statistics
+    // 3. downstream assembly coverage
+    // =====================================================================
 
-    let (non_host_streams, non_host_done_rx) = fanout_to_channels(
-        ReceiverStream::new(samtools_sort_out_stream),
-        3,
-        "process_assembly_bam",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+    let (non_host_streams, non_host_done_rx) =
+        match fanout_to_channels(
+            ReceiverStream::new(samtools_sort_out_stream),
+            3,
+            "process_assembly_bam",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed splitting assembly BAM stream: {}",
+                    e
+                ));
+            }
+        };
 
-    // track task
     cleanup_receivers.push(non_host_done_rx);
 
     let mut non_host_streams_iter = non_host_streams.into_iter();
 
-    let bam_for_file = ReceiverStream::new(
-        non_host_streams_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let bam_for_file = match non_host_streams_iter.next() {
+        Some(rx) => ReceiverStream::new(rx),
+        None => {
+            return_assembly_failure!(
+                "assembly BAM file branch was not created".to_string()
+            );
+        }
+    };
 
-    let bam_for_stats = ReceiverStream::new(
-        non_host_streams_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let bam_for_stats = match non_host_streams_iter.next() {
+        Some(rx) => ReceiverStream::new(rx),
+        None => {
+            return_assembly_failure!(
+                "assembly BAM statistics branch was not created".to_string()
+            );
+        }
+    };
 
-    let bam_for_output = ReceiverStream::new(
-        non_host_streams_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let bam_for_output = match non_host_streams_iter.next() {
+        Some(rx) => ReceiverStream::new(rx),
+        None => {
+            return_assembly_failure!(
+                "assembly BAM output branch was not created".to_string()
+            );
+        }
+    };
 
-    let write_bam_task = write_byte_stream_to_file(
+    // =====================================================================
+    // Durable BAM write
+    // =====================================================================
+
+    let write_bam_task = match write_byte_stream_to_file(
         &final_bam_path,
         bam_for_file,
         config.clone(),
         StreamDataType::JustBytes,
         "process_assembly",
-        false
+        false,
     )
-    .await?;
+        .await
+    {
+        Ok(task) => task,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed starting assembly BAM writer: {}",
+                e
+            ));
+        }
+    };
+
     cleanup_tasks.push(write_bam_task);
 
-    let bam_concurrency = compute_phase_concurrency(
-        &config, "bam_info", 0.5, // ~500 MB per thread (local maps + record chunk)
-        1.0, 128, // high cap for large clusters
-        4,   // min for small machines like M5 Air
-    );
-    info!("BAM info concurrency {}", bam_concurrency);
+    // =====================================================================
+    // Contig statistics
+    // =====================================================================
 
-    let (read2contig, contig_stats, _contig_uniques) = generate_info_from_bam_stream(
-        bam_for_stats.into_inner(),
-        &duplicate_clusters,
-        MIN_CONTIG_SIZE,
-        bam_concurrency,
-    )
-    .await?;
+    let bam_concurrency = compute_phase_concurrency(
+        &config,
+        "bam_info",
+        0.5,
+        1.0,
+        128,
+        4,
+    );
+
+    info!(
+        "BAM info concurrency {}",
+        bam_concurrency
+    );
+
+    let (read2contig, contig_stats, _contig_uniques) =
+        match generate_info_from_bam_stream(
+            bam_for_stats.into_inner(),
+            &duplicate_clusters,
+            MIN_CONTIG_SIZE,
+            bam_concurrency,
+        )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed generating read-to-contig mapping/statistics: {}",
+                    e
+                ));
+            }
+        };
 
     info!(
         "[assembly] contig statistics generated: contigs={}, read2contig={}",
@@ -4511,24 +4845,50 @@ info!(
         read2contig.len()
     );
 
-    let stats_json = serde_json::to_string_pretty(&contig_stats)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to serialize contig_stats: {}", e)))?;
+    let stats_json = match serde_json::to_string_pretty(&contig_stats) {
+        Ok(json) => json,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed serializing contig statistics: {}",
+                e
+            ));
+        }
+    };
 
-    std::fs::write(&stats_json_path, &stats_json)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to write contig_stats.json: {}", e)))?;
+    if let Err(e) = std::fs::write(
+        &stats_json_path,
+        &stats_json,
+    ) {
+        return_assembly_failure!(format!(
+            "failed writing temporary contig_stats.json {}: {}",
+            stats_json_path.display(),
+            e
+        ));
+    }
 
-    tokio::fs::write(&final_stats_json_path, &stats_json)
+    if let Err(e) = tokio::fs::write(
+        &final_stats_json_path,
+        &stats_json,
+    )
         .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!("Failed to write final contig_stats.json: {}", e))
-        })?;
+    {
+        return_assembly_failure!(format!(
+            "failed writing final contig_stats.json {}: {}",
+            final_stats_json_path.display(),
+            e
+        ));
+    }
+
+    info!(
+        "[assembly] completed successfully"
+    );
 
     Ok((
         CoverageOutputs {
             contigs_fasta: contigs_path,
             contigs_all_fasta: contigs_all_path,
             scaffolds_fasta: scaffolds_path,
-            bam_path: bam_path,
+            bam_path,
             contig_stats_json: stats_json_path,
             contig_stats: Arc::new(contig_stats),
             read2contig: Arc::new(read2contig),
