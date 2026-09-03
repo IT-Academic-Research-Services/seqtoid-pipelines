@@ -4256,6 +4256,18 @@ async fn process_assembly(
     "[spades] copied {} -> {}",
     scaffolds_path.display(),
     final_scaffolds_path.display()
+
+            let spades_nested_scaffolds =
+    temp_dir.path().join("K77").join("scaffolds.fasta");
+
+info!(
+    "[spades] scaffold diagnostics: top_level={} exists={} nested_k77={} exists={}",
+    scaffolds_path.display(),
+    scaffolds_path.exists(),
+    spades_nested_scaffolds.display(),
+    spades_nested_scaffolds.exists(),
+);
+
 );
     } else {
         error!("SPAdes failed with exit: {:?}", spades_exit);
