@@ -2321,20 +2321,25 @@ pub mod czid_dedup {
 }
 
 pub mod diamond {
-    use crate::config::defs::{DiamondSubcommand, PipelineError, RunConfig, DIAMOND_TAG};
+    use std::any::Any;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use anyhow::{anyhow, Result};
+    use log::{debug, info, warn};
+    use regex::Regex;
+    use tokio::process::Command;
+    use tokio::task::JoinHandle;
+
+    use crate::config::defs::{
+        DiamondSubcommand, PipelineError, RunConfig, DIAMOND_TAG,
+    };
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::file::available_space_for_path;
     use crate::utils::streams::ChildStream;
     use crate::utils::system::detect_ram;
-    use anyhow::{anyhow, Result as AnyhowResult};
-    use log::{debug, info, warn};
-    use regex::Regex;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use tokio::process::Command;
-    use tokio::task::JoinHandle;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct DiamondConfig {
         pub subcommand: DiamondSubcommand,
         pub db: PathBuf,
@@ -2343,18 +2348,18 @@ pub mod diamond {
         pub subcommand_fields: HashMap<String, Option<String>>,
     }
 
+    /// Runtime information needed to construct a Diamond command.
+    ///
+    /// This deliberately does not depend on the full pipeline RunConfig.
+    #[derive(Debug, Clone)]
+    pub struct DiamondExecutionConfig {
+        /// Number of threads available to this Diamond process.
+        pub threads: usize,
+    }
+
     pub struct DiamondArgGenerator;
 
     /// Checks if `diamond` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    /// * `version_file`: optional path to a file containing the version
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the diamond version
     pub async fn diamond_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
@@ -2368,26 +2373,20 @@ pub mod diamond {
             version_file,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     /// Prepares the Diamond index for a reference sequence.
     ///
-    /// # Arguments
-    ///
-    /// * `index_path`: optional path to the Diamond index file
-    /// * `ref_type`: type of reference (e.g., "non_host")
-    ///
-    /// # Returns
-    ///
-    /// Result containing the database prefix path and a vector of preparation tasks
+    /// Returns the database prefix path without `.dmnd`.
     pub async fn diamond_index_prep(
         index_path: Option<String>,
         ref_type: &str,
     ) -> Result<
         (
-            PathBuf, // DB prefix path (without .dmnd)
+            PathBuf,
             Vec<JoinHandle<Result<(), anyhow::Error>>>,
         ),
         PipelineError,
@@ -2404,6 +2403,7 @@ pub mod diamond {
         if !path.exists() {
             return Err(PipelineError::FileNotFound(path));
         }
+
         if path.extension() != Some(std::ffi::OsStr::new("dmnd")) {
             return Err(PipelineError::InvalidConfig(format!(
                 "{} index must be a .dmnd file: {}",
@@ -2412,64 +2412,84 @@ pub mod diamond {
             )));
         }
 
-        // Return the prefix without .dmnd
-        let prefix = path.with_extension("");
-
-        Ok((prefix, vec![]))
+        Ok((path.with_extension(""), vec![]))
     }
 
+    /// Generates Diamond command-line arguments without requiring RunConfig.
+    ///
+    /// Worker code should call this directly.
+    pub fn generate_diamond_args(
+        execution: &DiamondExecutionConfig,
+        config: &DiamondConfig,
+    ) -> Result<Vec<String>> {
+        let mut args_vec = Vec::new();
+
+        match config.subcommand {
+            DiamondSubcommand::Blastx => {
+                args_vec.push("blastx".to_string());
+            }
+        }
+
+        args_vec.push("-d".to_string());
+        args_vec.push(config.db.to_string_lossy().to_string());
+
+        args_vec.push("--threads".to_string());
+        args_vec.push(execution.threads.to_string());
+
+        for (key, value) in &config.subcommand_fields {
+            args_vec.push(key.clone());
+
+            if let Some(v) = value {
+                args_vec.push(v.clone());
+            }
+        }
+
+        Ok(args_vec)
+    }
+
+    /// Existing pipeline adapter.
+    ///
+    /// This preserves the current generate_cli(...) API while internally
+    /// using the RunConfig-independent command generator.
     impl ArgGenerator for DiamondArgGenerator {
         fn generate_args(
             &self,
             run_config: &RunConfig,
-            extra: Option<&dyn std::any::Any>,
-        ) -> AnyhowResult<Vec<String>> {
+            extra: Option<&dyn Any>,
+        ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<DiamondConfig>())
-                .ok_or_else(|| anyhow!("Diamond requires DiamondConfig in extra"))?;
+                .ok_or_else(|| {
+                    anyhow!("Diamond requires DiamondConfig in extra")
+                })?;
 
-            let mut args_vec = vec![];
+            let execution = DiamondExecutionConfig {
+                threads: run_config.thread_allocation(DIAMOND_TAG, None),
+            };
 
-            match config.subcommand {
-                DiamondSubcommand::Blastx => args_vec.push("blastx".to_string()),
-            }
-
-            args_vec.push("-d".to_string());
-            args_vec.push(config.db.to_string_lossy().to_string());
-
-            let threads = run_config.thread_allocation(DIAMOND_TAG, None);
-            args_vec.push("--threads".to_string());
-            args_vec.push(threads.to_string());
-
-            for (key, value) in &config.subcommand_fields {
-                args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
-                }
-            }
-
-            Ok(args_vec)
+            generate_diamond_args(&execution, config)
         }
     }
 
-    /// Computes the optimal block size for Diamond based on available RAM and database size.
+    /// Computes the optimal Diamond block size based on available RAM,
+    /// database size, and available scratch space.
     ///
-    /// # Arguments
-    ///
-    /// * `run_config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f64>: the optimal block size in billions of letters
-    pub async fn compute_optimal_block_size(run_config: &RunConfig) -> AnyhowResult<f64> {
+    /// This remains a pipeline-level resource-planning helper because it
+    /// currently inspects system RAM, scratch space, and the configured
+    /// pipeline database.
+    pub async fn compute_optimal_block_size(
+        run_config: &RunConfig,
+    ) -> Result<f64> {
         let (_, available_ram) = detect_ram()?;
-        let available_ram_gb = available_ram as f64 / 1_073_741_824.0;
+        let available_ram_gb =
+            available_ram as f64 / 1_073_741_824.0;
 
         let db_path = run_config
             .args
             .diamond_db
             .as_deref()
             .ok_or_else(|| anyhow!("--diamond-db required"))?;
+
         let db_path = if db_path.ends_with(".dmnd") {
             db_path.to_string()
         } else {
@@ -2478,7 +2498,7 @@ pub mod diamond {
 
         let db_stats = get_diamond_db_stats(&db_path)
             .await
-            .unwrap_or((0, 300_000_000_000)); // fallback NR size
+            .unwrap_or((0, 300_000_000_000));
 
         let total_letters_billions = db_stats.1 as f64 / 1e9;
 
@@ -2492,39 +2512,53 @@ pub mod diamond {
             15.0
         };
 
-        let mut block_size = available_ram_gb / ram_factor;
+        let mut block_size =
+            available_ram_gb / ram_factor;
 
         block_size = block_size.min(total_letters_billions);
-
         block_size = block_size.max(6.0);
         block_size = block_size.min(200.0);
 
-        let scratch_path = PathBuf::from(run_config.args.nvme_scratch.as_deref().unwrap_or("."));
-        let scratch_avail = available_space_for_path(&scratch_path).await.unwrap_or(0);
-        // let db_size_gb = std::fs::metadata(&db_path)
-        //     .map(|m| m.len() as f64 / 1_073_741_824.0)
-        //     .unwrap_or(50.0);
+        let scratch_path = PathBuf::from(
+            run_config
+                .args
+                .nvme_scratch
+                .as_deref()
+                .unwrap_or("."),
+        );
 
-        let scratch_avail_gib = scratch_avail as f64 / 1_073_741_824.0;
+        let scratch_avail =
+            available_space_for_path(&scratch_path)
+                .await
+                .unwrap_or(0);
 
-        let estimated_scratch_gib = block_size * 3.0 + 20.0;
+        let scratch_avail_gib =
+            scratch_avail as f64 / 1_073_741_824.0;
+
+        let estimated_scratch_gib =
+            block_size * 3.0 + 20.0;
 
         if scratch_avail_gib < estimated_scratch_gib * 1.2 {
             warn!(
-                "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 50%",
-                estimated_scratch_gib, scratch_avail_gib
+                "Low scratch space — need {:.1} GiB, have {:.1} GiB; \
+                 reducing block size by 50%",
+                estimated_scratch_gib,
+                scratch_avail_gib
             );
             block_size *= 0.5;
         } else if scratch_avail_gib < estimated_scratch_gib * 1.5 {
             warn!(
-                "Low scratch space — need {:.1} GiB, have {:.1} GiB; reducing block size by 30%",
-                estimated_scratch_gib, scratch_avail_gib
+                "Low scratch space — need {:.1} GiB, have {:.1} GiB; \
+                 reducing block size by 30%",
+                estimated_scratch_gib,
+                scratch_avail_gib
             );
             block_size *= 0.7;
         }
 
         info!(
-            "Diamond block size: {:.1} (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
+            "Diamond block size: {:.1} \
+             (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
             block_size,
             available_ram_gb,
             total_letters_billions,
@@ -2534,12 +2568,19 @@ pub mod diamond {
         Ok(block_size)
     }
 
-    async fn get_diamond_db_stats(db_path: &str) -> AnyhowResult<(u64, u64)> {
+    async fn get_diamond_db_stats(
+        db_path: &str,
+    ) -> Result<(u64, u64)> {
         let output = Command::new("diamond")
             .args(["dbinfo", "--db", db_path])
             .output()
             .await
-            .map_err(|e| anyhow!("Failed to spawn diamond dbinfo: {}", e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to spawn diamond dbinfo: {}",
+                    e
+                )
+            })?;
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -2548,7 +2589,9 @@ pub mod diamond {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout =
+            String::from_utf8_lossy(&output.stdout);
+
         debug!("Diamond dbinfo output: {}", stdout);
 
         let seq_re = Regex::new(r"Sequences\s+(\d+)")?;
@@ -2558,13 +2601,23 @@ pub mod diamond {
             .captures(&stdout)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<u64>().ok())
-            .ok_or_else(|| anyhow!("Failed to parse sequences from: {}", stdout))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to parse sequences from: {}",
+                    stdout
+                )
+            })?;
 
         let letters = letters_re
             .captures(&stdout)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<u64>().ok())
-            .ok_or_else(|| anyhow!("Failed to parse letters from: {}", stdout))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Failed to parse letters from: {}",
+                    stdout
+                )
+            })?;
 
         Ok((sequences, letters))
     }
@@ -3245,6 +3298,7 @@ pub mod mmseqs {
             return;
         }
 
+        args.push("--gpu".to_string());
         args.push("--gpu".to_string());
         args.push("1".to_string());
 
