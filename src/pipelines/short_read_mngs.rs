@@ -3216,70 +3216,7 @@ async fn distributed_non_host_align(
     ),
     PipelineError,
 > {
-    let worker_manager =
-        crate::utils::workers::WorkerManager::new(
-            config.efs_runs_dir.join("workers")
-        )
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "Failed to initialize distributed worker manager: {}",
-                    e
-                ))
-            })?;
-
     let requested_workers = config.distributed_workers;
-
-    // ec2 discovery
-
-    let running_workers = worker_manager
-        .discover_running_workers()
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-                "Failed to discover running distributed workers: {}",
-                e
-            ))
-        })?;
-
-    info!(
-        "Distributed NR: discovered {} running tagged workers for requested {}",
-        running_workers.len(),
-        requested_workers
-    );
-
-    let workers = crate::utils::workers::select_workers(
-        running_workers,
-        requested_workers,
-    )?;
-
-    info!(
-        "Distributed NR: selected {} running workers",
-        workers.len()
-    );
-
-    for worker in &workers {
-        info!(
-            "Distributed NR worker: instance_id={}, private_ip={}, instance_type={}, az={:?}",
-            worker.instance_id,
-            worker.private_ip,
-            worker.instance_type,
-            worker.availability_zone,
-        );
-    }
-
-    /*
-    let workers = worker_manager
-        .require_ready_workers(requested_workers)
-        .await
-        .map_err(PipelineError::Other)?;
-
-    info!(
-        "Distributed NR: discovered {} READY workers for requested {}",
-        workers.len(),
-        requested_workers
-    );
-    */
 
     let efs_base = config.efs_runs_dir.join(&config.run_id);
 
@@ -3304,6 +3241,10 @@ async fn distributed_non_host_align(
         .as_ref()
         .map(|_| efs_base.join("nonhost_R2.fastq"));
 
+    // ------------------------------------------------------------------
+    // 1. Copy the non-host FASTQs to EFS.
+    // ------------------------------------------------------------------
+
     info!(
         "Copying non-host R1 to EFS: {}",
         non_host_r1_efs.display()
@@ -3320,13 +3261,13 @@ async fn distributed_non_host_align(
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "R1 copy task join failed: {e}"
-            ))
+            "R1 copy task join failed: {e}"
+        ))
         })?
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "R1 EFS copy failed: {e}"
-            ))
+            "R1 EFS copy failed: {e}"
+        ))
         })?;
 
     if let (Some(local_r2), Some(efs_r2)) =
@@ -3348,13 +3289,13 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "R2 copy task join failed: {e}"
-                ))
+                "R2 copy task join failed: {e}"
+            ))
             })?
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "R2 EFS copy failed: {e}"
-                ))
+                "R2 EFS copy failed: {e}"
+            ))
             })?;
     }
 
@@ -3363,7 +3304,14 @@ async fn distributed_non_host_align(
         efs_base.display()
     );
 
-    // Distributed paired-end chunking.
+    // ------------------------------------------------------------------
+    // 2. Distributed paired-end chunking.
+    //
+    // Worker discovery is intentionally NOT required for this step.
+    // This allows us to prepare and inspect distributed work even when
+    // zero worker instances are currently available.
+    // ------------------------------------------------------------------
+
     const CHUNKS_PER_WORKER: usize = 4;
 
     let non_host_r2_efs = non_host_r2_efs
@@ -3371,7 +3319,7 @@ async fn distributed_non_host_align(
         .ok_or_else(|| {
             PipelineError::InvalidConfig(
                 "Distributed non-host alignment currently requires paired-end input"
-                    .to_string()
+                    .to_string(),
             )
         })?;
 
@@ -3382,13 +3330,13 @@ async fn distributed_non_host_align(
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "Non-host FASTQ count task join failed: {e}"
-            ))
+            "Non-host FASTQ count task join failed: {e}"
+        ))
         })?
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "Failed to count non-host FASTQ records: {e}"
-            ))
+            "Failed to count non-host FASTQ records: {e}"
+        ))
         })?;
 
     if total_records == 0 {
@@ -3408,7 +3356,7 @@ async fn distributed_non_host_align(
         .checked_mul(CHUNKS_PER_WORKER)
         .ok_or_else(|| {
             PipelineError::InvalidConfig(
-                "Distributed chunk count overflow".to_string()
+                "Distributed chunk count overflow".to_string(),
             )
         })?;
 
@@ -3416,7 +3364,6 @@ async fn distributed_non_host_align(
         .min(total_pairs)
         .max(1);
 
-    // Ceiling division ensures every pair is assigned to a chunk.
     let pairs_per_chunk =
         (total_pairs + target_chunks - 1) / target_chunks;
 
@@ -3433,14 +3380,14 @@ async fn distributed_non_host_align(
     let chunk_summary = chunk_paired_fastq(
         non_host_r1_efs.clone(),
         non_host_r2_efs.clone(),
-        chunks_dir,
+        chunks_dir.clone(),
         pairs_per_chunk,
     )
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "Failed to chunk paired non-host FASTQs: {e}"
-            ))
+            "Failed to chunk paired non-host FASTQs: {e}"
+        ))
         })?;
 
     info!(
@@ -3459,25 +3406,120 @@ async fn distributed_non_host_align(
         )));
     }
 
-    /*
-    match config.alignment_backend {
-        NRAlignmentBackend::MmseqsCpu => {
+    info!(
+        "Distributed NR chunks are ready at {}",
+        chunks_dir.display()
+    );
+
+    // ------------------------------------------------------------------
+    // 3. Worker discovery is now best-effort.
+    //
+    // If AWS discovery succeeds, report what is available.
+    // If it fails, leave the chunks in place and continue.
+    // ------------------------------------------------------------------
+
+    let worker_manager = match crate::utils::workers::WorkerManager::new(
+        config.efs_runs_dir.join("workers"),
+    )
+        .await
+    {
+        Ok(manager) => manager,
+        Err(e) => {
+            warn!(
+                "Distributed NR: could not initialize worker manager after chunking: {}",
+                e
+            );
+
+            let (_tx, rx) = mpsc::channel(1);
+            return Ok((
+                rx,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+    };
+
+    match worker_manager.discover_running_workers().await {
+        Ok(running_workers) => {
+            info!(
+                "Distributed NR: discovered {} running tagged workers for requested {}",
+                running_workers.len(),
+                requested_workers
+            );
+
+            match crate::utils::workers::select_workers(
+                running_workers,
+                requested_workers,
+            ) {
+                Ok(workers) => {
+                    info!(
+                        "Distributed NR: selected {} running workers",
+                        workers.len()
+                    );
+
+                    for worker in &workers {
+                        info!(
+                            "Distributed NR worker: instance_id={}, private_ip={}, instance_type={}, az={:?}",
+                            worker.instance_id,
+                            worker.private_ip,
+                            worker.instance_type,
+                            worker.availability_zone,
+                        );
+                    }
+
+                    if workers.is_empty() {
+                        info!(
+                            "Distributed NR: no workers available; leaving {} chunks on EFS",
+                            chunk_summary.chunks.len()
+                        );
+                    } else {
+                        info!(
+                            "Distributed NR: {} workers available, but worker dispatch is not implemented yet; leaving {} chunks on EFS",
+                            workers.len(),
+                            chunk_summary.chunks.len()
+                        );
+                    }
+                }
+
+                Err(e) => {
+                    warn!(
+                        "Distributed NR: worker selection failed after chunking: {}",
+                        e
+                    );
+                }
+            }
         }
 
-        NRAlignmentBackend::Diamond => {
-            // later
-        }
-
-        NRAlignmentBackend::MmseqsGpu => {
-            // later
+        Err(e) => {
+            warn!(
+                "Distributed NR: worker discovery failed after chunking; chunks remain available on EFS: {}",
+                e
+            );
         }
     }
-    */
 
-    Err(PipelineError::Other(anyhow!(
-        "Distributed non-host alignment is not implemented yet \
-         (EC2 worker discovery, EFS checkpointing, and paired FASTQ chunking are wired)"
-    )))
+    // ------------------------------------------------------------------
+    // 4. Distributed execution is not wired yet.
+    //
+    // Return an empty m8 stream so the pipeline can finish this stage
+    // without destroying the generated chunks.
+    // ------------------------------------------------------------------
+
+    let (_tx, rx) = mpsc::channel(1);
+
+    info!(
+        "Distributed NR preparation complete; returning empty alignment stream. \
+         Chunks remain available at {}",
+        chunks_dir.display()
+    );
+
+    Ok((
+        rx,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
 }
 
 
