@@ -63,6 +63,10 @@ codegen-units = 1
 name = "seqtoid-pipelines"
 path = "src/main.rs"
 
+[[bin]]
+name = "seqtoid-worker"
+path = "src/bin/seqtoid_worker.rs"
+
 [lib]
 name = "seqtoid_pipelines"
 path = "src/lib.rs"
