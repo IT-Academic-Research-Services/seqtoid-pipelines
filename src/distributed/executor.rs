@@ -91,33 +91,47 @@ impl WorkerExecutor {
         &self.config.worker_id
     }
 
-    /// Claims and executes one work unit.
-    ///
-    /// The WorkUnit state transitions occur in memory here. Durable queue
-    /// persistence/atomic claim coordination is handled by the caller.
+    /// Claims and executes one work unit, persisting every lifecycle
+    /// transition to the WorkUnit JSON on EFS.
     pub async fn claim_and_execute(
         &self,
+        work_unit_path: &Path,
         work_unit: &mut WorkUnit,
     ) -> Result<WorkUnitResult> {
         let attempt = work_unit
             .claim(self.worker_id())
-            .map_err(|e| {
-                anyhow!(
-                    "failed to claim work unit {}: {}",
-                    work_unit.id(),
-                    e
-                )
-            })?;
+            .map_err(|e| anyhow!(
+                "failed to claim work unit {}: {}",
+                work_unit.id(),
+                e
+            ))?;
+
+        self.persist_work_unit(work_unit_path, work_unit).await?;
+
+        if let Err(err) = self.validate_backend_reference(work_unit).await {
+            let reason = err.to_string();
+            work_unit
+                .fail(self.worker_id(), attempt, reason.clone(), true)
+                .map_err(|state_err| anyhow!(
+                    "work unit {} reference validation failed with '{}', and FAILED transition also failed: {}",
+                    work_unit.id(), reason, state_err
+                ))?;
+            self.persist_work_unit(work_unit_path, work_unit).await?;
+            return Err(anyhow!(
+                "work unit {} attempt {} failed: {}",
+                work_unit.id(), attempt, reason
+            ));
+        }
 
         work_unit
             .start(self.worker_id(), attempt)
-            .map_err(|e| {
-                anyhow!(
-                    "failed to start work unit {}: {}",
-                    work_unit.id(),
-                    e
-                )
-            })?;
+            .map_err(|e| anyhow!(
+                "failed to start work unit {}: {}",
+                work_unit.id(),
+                e
+            ))?;
+
+        self.persist_work_unit(work_unit_path, work_unit).await?;
 
         info!(
             "[worker:{}] START work unit={} attempt={} backend={:?}",
@@ -130,68 +144,72 @@ impl WorkerExecutor {
         match self.execute_attempt(work_unit, attempt).await {
             Ok(result) => {
                 work_unit
-                    .complete(
-                        self.worker_id(),
-                        attempt,
-                        result.clone(),
-                    )
-                    .map_err(|e| {
-                        anyhow!(
-                            "execution succeeded but completion transition failed \
-                             for {}: {}",
-                            work_unit.id(),
-                            e
-                        )
-                    })?;
+                    .complete(self.worker_id(), attempt, result.clone())
+                    .map_err(|e| anyhow!(
+                        "execution succeeded but completion transition failed for {}: {}",
+                        work_unit.id(), e
+                    ))?;
 
-                self.publish_completion_metadata(work_unit)
-                    .await?;
+                self.persist_work_unit(work_unit_path, work_unit).await?;
+                self.publish_completion_metadata(work_unit).await?;
 
                 info!(
                     "[worker:{}] DONE work unit={} attempt={} result={} bytes={} rows={}",
-                    self.worker_id(),
-                    work_unit.id(),
-                    attempt,
-                    result.result_path.display(),
-                    result.result_bytes,
-                    result.result_rows
+                    self.worker_id(), work_unit.id(), attempt,
+                    result.result_path.display(), result.result_bytes, result.result_rows
                 );
-
                 Ok(result)
             }
 
             Err(err) => {
                 let reason = err.to_string();
-
                 work_unit
-                    .fail(
-                        self.worker_id(),
-                        attempt,
-                        reason.clone(),
-                        true,
-                    )
-                    .map_err(|state_err| {
-                        anyhow!(
-                            "work unit {} failed with '{}', \
-                             and FAILED transition also failed: {}",
-                            work_unit.id(),
-                            reason,
-                            state_err
-                        )
-                    })?;
+                    .fail(self.worker_id(), attempt, reason.clone(), true)
+                    .map_err(|state_err| anyhow!(
+                        "work unit {} failed with '{}', and FAILED transition also failed: {}",
+                        work_unit.id(), reason, state_err
+                    ))?;
 
-                let _ = self
-                    .publish_completion_metadata(work_unit)
-                    .await;
+                self.persist_work_unit(work_unit_path, work_unit).await?;
+                let _ = self.publish_completion_metadata(work_unit).await;
 
                 Err(anyhow!(
                     "work unit {} attempt {} failed: {}",
-                    work_unit.id(),
-                    attempt,
-                    reason
+                    work_unit.id(), attempt, reason
                 ))
             }
         }
+    }
+
+    /// Persist the current WorkUnit state atomically: write a complete JSON
+    /// document beside the original file, then rename it over the original.
+    async fn persist_work_unit(
+        &self,
+        work_unit_path: &Path,
+        work_unit: &WorkUnit,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(work_unit)
+            .context("failed to serialize WorkUnit")?;
+
+        let parent = work_unit_path.parent().ok_or_else(|| {
+            anyhow!("work unit path has no parent: {}", work_unit_path.display())
+        })?;
+
+        fs::create_dir_all(parent).await?;
+
+        let temp_path = work_unit_path.with_extension("json.tmp");
+        fs::write(&temp_path, payload).await.with_context(|| {
+            format!("failed to write temporary WorkUnit {}", temp_path.display())
+        })?;
+
+        fs::rename(&temp_path, work_unit_path).await.with_context(|| {
+            format!(
+                "failed to publish WorkUnit state {} -> {}",
+                temp_path.display(), work_unit_path.display()
+            )
+        })?;
+
+        Ok(())
     }
 
     async fn execute_attempt(
@@ -200,7 +218,6 @@ impl WorkerExecutor {
         attempt: u32,
     ) -> Result<WorkUnitResult> {
         self.validate_input(work_unit).await?;
-        self.validate_backend_reference()?;
 
         let attempt_dir = self
             .config
@@ -715,47 +732,64 @@ impl WorkerExecutor {
         Ok(())
     }
 
-    fn validate_backend_reference(&self) -> Result<()> {
-        match self.backend {
-            WorkerBackend::MmseqsCpu
-            | WorkerBackend::MmseqsGpu => {
-                let db = self
-                    .config
-                    .mmseqs_db
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "MMseqs backend selected without MMseqs DB"
-                        )
-                    })?;
+    async fn validate_backend_reference(&self, work_unit: &WorkUnit) -> Result<()> {
+        let (db, version_path) = match self.backend {
+            WorkerBackend::MmseqsCpu => (
+                self.config.mmseqs_db.as_ref().ok_or_else(|| {
+                    anyhow!("MMseqs CPU backend selected without worker-local MMseqs DB")
+                })?,
+                self.config.scratch_dir.join("refs/mmseqs/.reference_version"),
+            ),
+            WorkerBackend::MmseqsGpu => (
+                self.config.mmseqs_db.as_ref().ok_or_else(|| {
+                    anyhow!("MMseqs GPU backend selected without worker-local MMseqs DB")
+                })?,
+                self.config.scratch_dir.join("refs/mmseqs-gpu/.reference_version"),
+            ),
+            WorkerBackend::Diamond => (
+                self.config.diamond_db.as_ref().ok_or_else(|| {
+                    anyhow!("Diamond backend selected without worker-local Diamond DB")
+                })?,
+                self.config.scratch_dir.join("refs/diamond/.reference_version"),
+            ),
+        };
 
-                if !db.exists() {
-                    return Err(anyhow!(
-                        "worker-local MMseqs DB does not exist: {}",
-                        db.display()
-                    ));
-                }
-            }
-
-            WorkerBackend::Diamond => {
-                let db = self
-                    .config
-                    .diamond_db
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Diamond backend selected without Diamond DB"
-                        )
-                    })?;
-
-                if !db.exists() {
-                    return Err(anyhow!(
-                        "worker-local Diamond DB does not exist: {}",
-                        db.display()
-                    ));
-                }
-            }
+        if !db.exists() {
+            return Err(anyhow!(
+                "worker-local reference DB does not exist: {}",
+                db.display()
+            ));
         }
+
+        let local_version = fs::read_to_string(&version_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read worker-local reference version {}",
+                    version_path.display()
+                )
+            })?
+            .trim()
+            .to_string();
+
+        if local_version.is_empty() {
+            return Err(anyhow!(
+                "worker-local reference version is empty: {}",
+                version_path.display()
+            ));
+        }
+
+        if local_version != work_unit.reference_version {
+            return Err(anyhow!(
+                "reference version mismatch for {}: work unit requires {}, worker has {}",
+                work_unit.id(), work_unit.reference_version, local_version
+            ));
+        }
+
+        info!(
+            "[worker:{}] reference version validated: {}",
+            self.worker_id(), local_version
+        );
 
         Ok(())
     }

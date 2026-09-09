@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
     let mut work_unit = work_unit;
 
     executor
-        .claim_and_execute(&mut work_unit)
+        .claim_and_execute(&args.work_unit, &mut work_unit)
         .await
         .context("worker execution failed")?;
 
