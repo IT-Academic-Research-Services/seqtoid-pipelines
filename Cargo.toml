@@ -48,6 +48,7 @@ oneshot = "0.2.1"
 aws-config = "1"
 aws-sdk-ec2 = "1"
 sha2 = "0.10.9"
+aws-sdk-s3 = "1.146.0"
 
 [dev-dependencies]
 sysinfo = "0.37.0"

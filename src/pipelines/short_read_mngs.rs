@@ -110,6 +110,10 @@ const MIN_CONTIG_SIZE: u64 = 4;
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
 
+const REFERENCE_METADATA_BUCKET: &str = "seqtoid-public-references";
+
+const REFERENCE_METADATA_PREFIX: &str = "phase2/refs/metadata";
+
 /// Holds the results from a Kallisto quantification run.
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -3211,6 +3215,7 @@ async fn run_diamond_single_file(
 }
 
 
+
 async fn non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3269,6 +3274,92 @@ async fn non_host_align(
     }
 }
 
+
+
+async fn get_reference_version(
+    backend: NRAlignmentBackend,
+) -> Result<String, PipelineError> {
+    let key = match backend {
+        NRAlignmentBackend::MmseqsCpu => {
+            format!("{}/mmseqs-cpu.version", REFERENCE_METADATA_PREFIX)
+        }
+
+        NRAlignmentBackend::MmseqsGpu => {
+            format!("{}/mmseqs-gpu.version", REFERENCE_METADATA_PREFIX)
+        }
+
+        NRAlignmentBackend::Diamond => {
+            format!("{}/diamond.version", REFERENCE_METADATA_PREFIX)
+        }
+    };
+
+    let sdk_config =
+        aws_config::load_defaults(
+            aws_config::BehaviorVersion::latest(),
+        )
+            .await;
+
+    let s3_client =
+        aws_sdk_s3::Client::new(&sdk_config);
+
+    let response = s3_client
+        .get_object()
+        .bucket(REFERENCE_METADATA_BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to retrieve reference version from s3://{}/{}: {}",
+                REFERENCE_METADATA_BUCKET,
+                key,
+                e
+            ))
+        })?;
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to read reference version object s3://{}/{}: {}",
+                REFERENCE_METADATA_BUCKET,
+                key,
+                e
+            ))
+        })?
+        .into_bytes();
+
+    let version = String::from_utf8(bytes.to_vec())
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Reference version object s3://{}/{} is not valid UTF-8: {}",
+                REFERENCE_METADATA_BUCKET,
+                key,
+                e
+            ))
+        })?
+        .trim()
+        .to_string();
+
+    if version.is_empty() {
+        return Err(PipelineError::Other(anyhow!(
+            "Reference version object s3://{}/{} is empty",
+            REFERENCE_METADATA_BUCKET,
+            key
+        )));
+    }
+
+    info!(
+        "Distributed NR reference version: backend={:?}, version={}",
+        backend,
+        version
+    );
+
+    Ok(version)
+}
+
 /// Runs the distributed non-host alignment preparation path.
 ///
 /// Copies the non-host FASTQs to EFS, creates paired FASTQ chunks, creates
@@ -3290,7 +3381,8 @@ async fn distributed_non_host_align(
     ),
     PipelineError,
 > {
-    let requested_workers = config.distributed_workers;
+    let requested_workers =
+        config.distributed_workers;
 
     let efs_base =
         config.efs_runs_dir.join(&config.run_id);
@@ -3300,14 +3392,16 @@ async fn distributed_non_host_align(
         efs_base.display()
     );
 
-    tokio::fs::create_dir_all(&efs_base)
+    tokio::fs::create_dir_all(
+        &efs_base,
+    )
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "Failed to create EFS run dir {}: {}",
-                efs_base.display(),
-                e
-            ))
+            "Failed to create EFS run dir {}: {}",
+            efs_base.display(),
+            e
+        ))
         })?;
 
     let non_host_r1_efs =
@@ -3316,7 +3410,9 @@ async fn distributed_non_host_align(
     let non_host_r2_efs =
         r2_path_opt
             .as_ref()
-            .map(|_| efs_base.join("nonhost_R2.fastq"));
+            .map(|_| {
+                efs_base.join("nonhost_R2.fastq")
+            });
 
     // ------------------------------------------------------------------
     // 1. Copy non-host FASTQs to EFS.
@@ -3347,9 +3443,13 @@ async fn distributed_non_host_align(
         ))
         })?;
 
-    if let (Some(local_r2), Some(efs_r2)) =
-        (&r2_path_opt, &non_host_r2_efs)
-    {
+    if let (
+        Some(local_r2),
+        Some(efs_r2),
+    ) = (
+        &r2_path_opt,
+        &non_host_r2_efs,
+    ) {
         info!(
             "Copying non-host R2 to EFS: {}",
             efs_r2.display()
@@ -3388,49 +3488,63 @@ async fn distributed_non_host_align(
     const CHUNKS_PER_WORKER: usize = 4;
 
     let non_host_r2_efs =
-        non_host_r2_efs.as_ref().ok_or_else(|| {
-            PipelineError::InvalidConfig(
-                "Distributed non-host alignment currently requires paired-end input"
-                    .to_string(),
-            )
-        })?;
+        non_host_r2_efs
+            .as_ref()
+            .ok_or_else(|| {
+                PipelineError::InvalidConfig(
+                    "Distributed non-host alignment currently requires paired-end input"
+                        .to_string(),
+                )
+            })?;
 
-    let total_records = raw_read_count(
-        non_host_r1_efs.clone(),
-        Some(non_host_r2_efs.clone()),
-    )
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Non-host FASTQ count task join failed: {e}"
-        ))
-        })?
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Failed to count non-host FASTQ records: {e}"
-        ))
-        })?;
+    let total_records =
+        raw_read_count(
+            non_host_r1_efs.clone(),
+            Some(
+                non_host_r2_efs.clone(),
+            ),
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Non-host FASTQ count task join failed: {e}"
+            ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to count non-host FASTQ records: {e}"
+            ))
+            })?;
 
     if total_records == 0 {
-        return Err(PipelineError::EmptyStream);
+        return Err(
+            PipelineError::EmptyStream
+        );
     }
 
     if total_records % 2 != 0 {
-        return Err(PipelineError::Other(anyhow!(
-            "Paired non-host FASTQ record count is not even: {}",
-            total_records
-        )));
+        return Err(
+            PipelineError::Other(anyhow!(
+                "Paired non-host FASTQ record count is not even: {}",
+                total_records
+            )),
+        );
     }
 
-    let total_pairs = total_records / 2;
+    let total_pairs =
+        total_records / 2;
 
-    let target_chunks = requested_workers
-        .checked_mul(CHUNKS_PER_WORKER)
-        .ok_or_else(|| {
-            PipelineError::InvalidConfig(
-                "Distributed chunk count overflow".to_string(),
+    let target_chunks =
+        requested_workers
+            .checked_mul(
+                CHUNKS_PER_WORKER,
             )
-        })?;
+            .ok_or_else(|| {
+                PipelineError::InvalidConfig(
+                    "Distributed chunk count overflow"
+                        .to_string(),
+                )
+            })?;
 
     let target_chunks =
         (target_chunks as u64)
@@ -3438,7 +3552,9 @@ async fn distributed_non_host_align(
             .max(1);
 
     let pairs_per_chunk =
-        (total_pairs + target_chunks - 1)
+        (total_pairs
+            + target_chunks
+            - 1)
             / target_chunks;
 
     let chunks_dir =
@@ -3476,48 +3592,52 @@ async fn distributed_non_host_align(
         chunk_summary.chunks.len()
     );
 
-    if chunk_summary.total_pairs != total_pairs {
-        return Err(PipelineError::Other(anyhow!(
-            "Distributed chunk reconciliation failed: \
-             source pairs={}, chunked pairs={}",
-            total_pairs,
-            chunk_summary.total_pairs
-        )));
+    if chunk_summary.total_pairs
+        != total_pairs
+    {
+        return Err(
+            PipelineError::Other(anyhow!(
+                "Distributed chunk reconciliation failed: \
+                 source pairs={}, chunked pairs={}",
+                total_pairs,
+                chunk_summary.total_pairs
+            )),
+        );
     }
 
     // ------------------------------------------------------------------
-    // 3. Create one AVAILABLE WorkUnit per chunk.
+    // 3. Retrieve the required backend-specific reference version
+    //    from the canonical S3 metadata object.
+    // ------------------------------------------------------------------
+
+    let reference_version =
+        get_reference_version(
+            config.alignment_backend,
+        )
+            .await?;
+
+    // ------------------------------------------------------------------
+    // 4. Create one AVAILABLE WorkUnit per chunk.
     // ------------------------------------------------------------------
 
     let work_dir =
         efs_base.join("work");
 
-    tokio::fs::create_dir_all(&work_dir)
+    tokio::fs::create_dir_all(
+        &work_dir,
+    )
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "Failed to create distributed work directory {}: {}",
-                work_dir.display(),
-                e
-            ))
+            "Failed to create distributed work directory {}: {}",
+            work_dir.display(),
+            e
+        ))
         })?;
 
-    // The WorkUnit contract currently requires a reference_version field.
-    // Reference identity will be formalized separately; no worker-local
-    // reference files are consulted by the launch node.
-    let reference_version =
-        match config.alignment_backend {
-            NRAlignmentBackend::MmseqsCpu =>
-                "mmseqs-cpu".to_string(),
-
-            NRAlignmentBackend::MmseqsGpu =>
-                "mmseqs-gpu".to_string(),
-
-            NRAlignmentBackend::Diamond =>
-                "diamond".to_string(),
-        };
-
-    for chunk in &chunk_summary.chunks {
+    for chunk in
+        &chunk_summary.chunks
+    {
         let work_unit =
             crate::utils::work_units::WorkUnit::new(
                 config.run_id.clone(),
@@ -3531,27 +3651,35 @@ async fn distributed_non_host_align(
             );
 
         let payload =
-            serde_json::to_vec_pretty(&work_unit)
+            serde_json::to_vec_pretty(
+                &work_unit,
+            )
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                        "Failed to serialize work unit {}: {}",
-                        work_unit.id(),
-                        e
-                    ))
+                    "Failed to serialize work unit {}: {}",
+                    work_unit.id(),
+                    e
+                ))
                 })?;
 
         let final_path =
-            work_dir.join(format!(
-                "work_{:08}.json",
-                chunk.chunk_id
-            ));
+            work_dir.join(
+                format!(
+                    "work_{:08}.json",
+                    chunk.chunk_id
+                ),
+            );
 
         let tmp_path =
-            work_dir.join(format!(
-                "work_{:08}.json.tmp",
-                chunk.chunk_id
-            ));
+            work_dir.join(
+                format!(
+                    "work_{:08}.json.tmp",
+                    chunk.chunk_id
+                ),
+            );
 
+        // Write the complete WorkUnit before making its
+        // final filename visible to workers.
         tokio::fs::write(
             &tmp_path,
             payload,
@@ -3594,7 +3722,7 @@ async fn distributed_non_host_align(
     );
 
     // ------------------------------------------------------------------
-    // 4. Worker discovery remains best-effort.
+    // 5. Worker discovery remains best-effort.
     // ------------------------------------------------------------------
 
     let worker_manager =
@@ -3655,6 +3783,12 @@ async fn distributed_non_host_align(
                             worker.availability_zone,
                         );
                     }
+
+                    info!(
+                        "Distributed NR: execution not wired yet; \
+                         {} work units remain AVAILABLE",
+                        chunk_summary.chunks.len()
+                    );
                 }
 
                 Err(e) => {
@@ -3669,7 +3803,8 @@ async fn distributed_non_host_align(
         Err(e) => {
             warn!(
                 "Distributed NR: worker discovery failed; \
-                 work units remain AVAILABLE under {}: {}",
+                 {} work units remain AVAILABLE under {}: {}",
+                chunk_summary.chunks.len(),
                 work_dir.display(),
                 e
             );
@@ -3677,15 +3812,15 @@ async fn distributed_non_host_align(
     }
 
     // ------------------------------------------------------------------
-    // 5. Distributed execution/result collection not wired yet.
+    // 6. Result collection is not wired yet.
     // ------------------------------------------------------------------
 
     let (_tx, rx) =
         mpsc::channel(1);
 
     info!(
-        "Distributed NR preparation complete: {} chunks and {} AVAILABLE \
-         work units under {}",
+        "Distributed NR preparation complete: {} chunks and \
+         {} AVAILABLE work units under {}",
         chunk_summary.chunks.len(),
         chunk_summary.chunks.len(),
         efs_base.display()
@@ -3698,6 +3833,7 @@ async fn distributed_non_host_align(
         Vec::new(),
     ))
 }
+
 
 /// Aligns unmapped reads against NR database using Diamond.
 ///
