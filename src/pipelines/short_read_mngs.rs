@@ -3214,12 +3214,13 @@ async fn non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
+    sample_id: String,
 ) -> Result<
     (
-        mpsc::Receiver<ParseOutput>,                       // m8 stream
-        Vec<JoinHandle<Result<(), anyhow::Error>>>,        // cleanup tasks
-        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, // cleanup receivers
-        Vec<TempDir>,                                      // temp dirs
+        mpsc::Receiver<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<TempDir>,
     ),
     PipelineError,
 > {
@@ -3228,15 +3229,36 @@ async fn non_host_align(
             NRAlignmentBackend::Diamond => {
                 diamond_non_host_align(config, r1_path, r2_path_opt).await
             }
+
             NRAlignmentBackend::MmseqsCpu => {
-                mmseqs_non_host_align(config, r1_path, r2_path_opt, MmseqsBackend::Cpu).await
+                mmseqs_non_host_align(
+                    config,
+                    r1_path,
+                    r2_path_opt,
+                    MmseqsBackend::Cpu,
+                )
+                    .await
             }
+
             NRAlignmentBackend::MmseqsGpu => {
-                mmseqs_non_host_align(config, r1_path, r2_path_opt, MmseqsBackend::Gpu).await
+                mmseqs_non_host_align(
+                    config,
+                    r1_path,
+                    r2_path_opt,
+                    MmseqsBackend::Gpu,
+                )
+                    .await
             }
         },
+
         ExecutionMode::Distributed => {
-            distributed_non_host_align(config, r1_path, r2_path_opt).await
+            distributed_non_host_align(
+                config,
+                r1_path,
+                r2_path_opt,
+                sample_id,
+            )
+                .await
         }
     }
 }
@@ -3259,6 +3281,7 @@ async fn distributed_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
+    sample_id: String,
 ) -> Result<
     (
         mpsc::Receiver<ParseOutput>,
@@ -3287,14 +3310,15 @@ async fn distributed_non_host_align(
             ))
         })?;
 
-    let non_host_r1_efs = efs_base.join("nonhost_R1.fastq");
+    let non_host_r1_efs =
+        efs_base.join("nonhost_R1.fastq");
 
     let non_host_r2_efs = r2_path_opt
         .as_ref()
         .map(|_| efs_base.join("nonhost_R2.fastq"));
 
     // ------------------------------------------------------------------
-    // 1. Copy the non-host FASTQs to EFS.
+    // 1. Copy non-host FASTQs to EFS.
     // ------------------------------------------------------------------
 
     info!(
@@ -3357,11 +3381,7 @@ async fn distributed_non_host_align(
     );
 
     // ------------------------------------------------------------------
-    // 2. Distributed paired-end chunking.
-    //
-    // Worker discovery is intentionally NOT required for this step.
-    // This allows us to prepare and inspect distributed work even when
-    // zero worker instances are currently available.
+    // 2. Chunk paired FASTQs.
     // ------------------------------------------------------------------
 
     const CHUNKS_PER_WORKER: usize = 4;
@@ -3422,7 +3442,8 @@ async fn distributed_non_host_align(
     let chunks_dir = efs_base.join("chunks");
 
     info!(
-        "Distributed NR chunking: {} pairs, {} requested workers, target {} chunks, {} pairs/chunk",
+        "Distributed NR chunking: {} pairs, {} requested workers, \
+         target {} chunks, {} pairs/chunk",
         total_pairs,
         requested_workers,
         target_chunks,
@@ -3443,7 +3464,8 @@ async fn distributed_non_host_align(
         })?;
 
     info!(
-        "Distributed NR chunking complete: {} pairs, {} R1 records, {} R2 records, {} chunks",
+        "Distributed NR chunking complete: {} pairs, {} R1 records, \
+         {} R2 records, {} chunks",
         chunk_summary.total_pairs,
         chunk_summary.total_r1_records,
         chunk_summary.total_r2_records,
@@ -3452,50 +3474,170 @@ async fn distributed_non_host_align(
 
     if chunk_summary.total_pairs != total_pairs {
         return Err(PipelineError::Other(anyhow!(
-            "Distributed chunk reconciliation failed: source pairs={}, chunked pairs={}",
+            "Distributed chunk reconciliation failed: \
+             source pairs={}, chunked pairs={}",
             total_pairs,
             chunk_summary.total_pairs
         )));
     }
 
+    // ------------------------------------------------------------------
+    // 3. Obtain the reference version.
+    //
+    // Workers already stage the reference inventory alongside the DB.
+    // For now the distributed run uses the canonical inventory fingerprint
+    // as the WorkUnit reference identifier.
+    // ------------------------------------------------------------------
+
+    let reference_version = match config.alignment_backend {
+        NRAlignmentBackend::MmseqsCpu => {
+            reference_version_from_inventory(
+                "/scratch/refs/mmseqs/reference_inventory.json"
+            )
+                .await?
+        }
+
+        NRAlignmentBackend::MmseqsGpu => {
+            reference_version_from_inventory(
+                "/scratch/refs/mmseqs/reference_inventory.json"
+            )
+                .await?
+        }
+
+        NRAlignmentBackend::Diamond => {
+            reference_version_from_inventory(
+                "/scratch/refs/diamond/reference_inventory.json"
+            )
+                .await?
+        }
+    };
+
     info!(
-        "Distributed NR chunks are ready at {}",
-        chunks_dir.display()
+        "Distributed NR reference version: {}",
+        reference_version
     );
 
     // ------------------------------------------------------------------
-    // 3. Worker discovery is now best-effort.
-    //
-    // If AWS discovery succeeds, report what is available.
-    // If it fails, leave the chunks in place and continue.
+    // 4. Create one AVAILABLE WorkUnit per chunk.
     // ------------------------------------------------------------------
 
-    let worker_manager = match crate::utils::workers::WorkerManager::new(
-        config.efs_runs_dir.join("workers"),
-    )
+    let work_dir = efs_base.join("work");
+
+    tokio::fs::create_dir_all(&work_dir)
         .await
-    {
-        Ok(manager) => manager,
-        Err(e) => {
-            warn!(
-                "Distributed NR: could not initialize worker manager after chunking: {}",
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to create distributed work directory {}: {}",
+                work_dir.display(),
                 e
+            ))
+        })?;
+
+    for chunk in &chunk_summary.chunks {
+        let work_unit =
+            crate::utils::work_units::WorkUnit::new(
+                config.run_id.clone(),
+                sample_id.clone(),
+                chunk.chunk_id,
+                true,
+                chunk.pair_count,
+                reference_version.clone(),
+                chunk.r1_path.clone(),
+                Some(chunk.r2_path.clone()),
             );
 
-            let (_tx, rx) = mpsc::channel(1);
-            return Ok((
-                rx,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
-        }
-    };
+        let payload =
+            serde_json::to_vec_pretty(&work_unit)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to serialize work unit {}: {}",
+                        work_unit.id(),
+                        e
+                    ))
+                })?;
+
+        let final_path = work_dir.join(format!(
+            "work_{:08}.json",
+            chunk.chunk_id
+        ));
+
+        let tmp_path = work_dir.join(format!(
+            "work_{:08}.json.tmp",
+            chunk.chunk_id
+        ));
+
+        tokio::fs::write(&tmp_path, payload)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to write work unit {}: {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+
+        tokio::fs::rename(
+            &tmp_path,
+            &final_path,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to publish work unit {} -> {}: {}",
+                tmp_path.display(),
+                final_path.display(),
+                e
+            ))
+            })?;
+
+        info!(
+            "Published work unit {}: {} pairs -> {}",
+            work_unit.id(),
+            chunk.pair_count,
+            final_path.display()
+        );
+    }
+
+    info!(
+        "Distributed NR: {} AVAILABLE work units created under {}",
+        chunk_summary.chunks.len(),
+        work_dir.display()
+    );
+
+    // ------------------------------------------------------------------
+    // 5. Worker discovery remains best-effort for now.
+    // ------------------------------------------------------------------
+
+    let worker_manager =
+        match crate::utils::workers::WorkerManager::new(
+            config.efs_runs_dir.join("workers"),
+        )
+            .await
+        {
+            Ok(manager) => manager,
+
+            Err(e) => {
+                warn!(
+                    "Distributed NR: could not initialize worker manager: {}",
+                    e
+                );
+
+                let (_tx, rx) = mpsc::channel(1);
+
+                return Ok((
+                    rx,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        };
 
     match worker_manager.discover_running_workers().await {
         Ok(running_workers) => {
             info!(
-                "Distributed NR: discovered {} running tagged workers for requested {}",
+                "Distributed NR: discovered {} running tagged workers \
+                 for requested {}",
                 running_workers.len(),
                 requested_workers
             );
@@ -3512,7 +3654,8 @@ async fn distributed_non_host_align(
 
                     for worker in &workers {
                         info!(
-                            "Distributed NR worker: instance_id={}, private_ip={}, instance_type={}, az={:?}",
+                            "Distributed NR worker: instance_id={}, \
+                             private_ip={}, instance_type={}, az={:?}",
                             worker.instance_id,
                             worker.private_ip,
                             worker.instance_type,
@@ -3520,23 +3663,16 @@ async fn distributed_non_host_align(
                         );
                     }
 
-                    if workers.is_empty() {
-                        info!(
-                            "Distributed NR: no workers available; leaving {} chunks on EFS",
-                            chunk_summary.chunks.len()
-                        );
-                    } else {
-                        info!(
-                            "Distributed NR: {} workers available, but worker dispatch is not implemented yet; leaving {} chunks on EFS",
-                            workers.len(),
-                            chunk_summary.chunks.len()
-                        );
-                    }
+                    info!(
+                        "Distributed NR: execution not wired yet; \
+                         {} work units remain AVAILABLE",
+                        chunk_summary.chunks.len()
+                    );
                 }
 
                 Err(e) => {
                     warn!(
-                        "Distributed NR: worker selection failed after chunking: {}",
+                        "Distributed NR: worker selection failed: {}",
                         e
                     );
                 }
@@ -3545,25 +3681,27 @@ async fn distributed_non_host_align(
 
         Err(e) => {
             warn!(
-                "Distributed NR: worker discovery failed after chunking; chunks remain available on EFS: {}",
+                "Distributed NR: worker discovery failed; \
+                 {} work units remain AVAILABLE under {}: {}",
+                chunk_summary.chunks.len(),
+                work_dir.display(),
                 e
             );
         }
     }
 
     // ------------------------------------------------------------------
-    // 4. Distributed execution is not wired yet.
-    //
-    // Return an empty m8 stream so the pipeline can finish this stage
-    // without destroying the generated chunks.
+    // 6. Result collection is not wired yet.
     // ------------------------------------------------------------------
 
     let (_tx, rx) = mpsc::channel(1);
 
     info!(
-        "Distributed NR preparation complete; returning empty alignment stream. \
-         Chunks remain available at {}",
-        chunks_dir.display()
+        "Distributed NR preparation complete: {} chunks and \
+         {} AVAILABLE work units under {}",
+        chunk_summary.chunks.len(),
+        chunk_summary.chunks.len(),
+        efs_base.display()
     );
 
     Ok((
@@ -3572,6 +3710,27 @@ async fn distributed_non_host_align(
         Vec::new(),
         Vec::new(),
     ))
+}
+
+
+async fn reference_version_from_inventory(
+    inventory_path: &str,
+) -> Result<String, PipelineError> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = tokio::fs::read(inventory_path)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to read reference inventory {}: {}",
+                inventory_path,
+                e
+            ))
+        })?;
+
+    let digest = Sha256::digest(&bytes);
+
+    Ok(format!("{:x}", digest))
 }
 
 
@@ -8405,6 +8564,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
+        sample_base.clone(),
     )
         .await?;
 
