@@ -3210,6 +3210,7 @@ async fn run_diamond_single_file(
     Ok(m8_path)
 }
 
+
 async fn non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3227,7 +3228,12 @@ async fn non_host_align(
     match config.execution_mode {
         ExecutionMode::Single => match config.alignment_backend {
             NRAlignmentBackend::Diamond => {
-                diamond_non_host_align(config, r1_path, r2_path_opt).await
+                diamond_non_host_align(
+                    config,
+                    r1_path,
+                    r2_path_opt,
+                )
+                    .await
             }
 
             NRAlignmentBackend::MmseqsCpu => {
@@ -3263,20 +3269,13 @@ async fn non_host_align(
     }
 }
 
-/// Runs the distributed non-host alignment path.
+/// Runs the distributed non-host alignment preparation path.
 ///
-/// Discovers currently running tagged workers, selects the requested number,
-/// and prepares the existing EFS checkpoint for distributed NR processing.
-/// Remote alignment execution is not implemented yet.
+/// Copies the non-host FASTQs to EFS, creates paired FASTQ chunks, creates
+/// one AVAILABLE WorkUnit per chunk, and leaves those work units on EFS for
+/// workers to claim.
 ///
-/// # Arguments
-///
-/// * `config` - RunConfig struct
-/// * `r1_path` - Path to the non-host R1 FASTQ file
-/// * `r2_path_opt` - Optional path to the non-host R2 FASTQ file
-///
-/// # Returns
-/// Distributed NR m8 stream, cleanup tasks, cleanup receivers, and temporary directories
+/// Worker discovery is best-effort and does not prevent work-unit creation.
 async fn distributed_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -3293,7 +3292,8 @@ async fn distributed_non_host_align(
 > {
     let requested_workers = config.distributed_workers;
 
-    let efs_base = config.efs_runs_dir.join(&config.run_id);
+    let efs_base =
+        config.efs_runs_dir.join(&config.run_id);
 
     info!(
         "Distributed non-host align: preparing EFS run dir {}",
@@ -3313,9 +3313,10 @@ async fn distributed_non_host_align(
     let non_host_r1_efs =
         efs_base.join("nonhost_R1.fastq");
 
-    let non_host_r2_efs = r2_path_opt
-        .as_ref()
-        .map(|_| efs_base.join("nonhost_R2.fastq"));
+    let non_host_r2_efs =
+        r2_path_opt
+            .as_ref()
+            .map(|_| efs_base.join("nonhost_R2.fastq"));
 
     // ------------------------------------------------------------------
     // 1. Copy non-host FASTQs to EFS.
@@ -3386,9 +3387,8 @@ async fn distributed_non_host_align(
 
     const CHUNKS_PER_WORKER: usize = 4;
 
-    let non_host_r2_efs = non_host_r2_efs
-        .as_ref()
-        .ok_or_else(|| {
+    let non_host_r2_efs =
+        non_host_r2_efs.as_ref().ok_or_else(|| {
             PipelineError::InvalidConfig(
                 "Distributed non-host alignment currently requires paired-end input"
                     .to_string(),
@@ -3432,14 +3432,17 @@ async fn distributed_non_host_align(
             )
         })?;
 
-    let target_chunks = (target_chunks as u64)
-        .min(total_pairs)
-        .max(1);
+    let target_chunks =
+        (target_chunks as u64)
+            .min(total_pairs)
+            .max(1);
 
     let pairs_per_chunk =
-        (total_pairs + target_chunks - 1) / target_chunks;
+        (total_pairs + target_chunks - 1)
+            / target_chunks;
 
-    let chunks_dir = efs_base.join("chunks");
+    let chunks_dir =
+        efs_base.join("chunks");
 
     info!(
         "Distributed NR chunking: {} pairs, {} requested workers, \
@@ -3450,18 +3453,19 @@ async fn distributed_non_host_align(
         pairs_per_chunk
     );
 
-    let chunk_summary = chunk_paired_fastq(
-        non_host_r1_efs.clone(),
-        non_host_r2_efs.clone(),
-        chunks_dir.clone(),
-        pairs_per_chunk,
-    )
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Failed to chunk paired non-host FASTQs: {e}"
-        ))
-        })?;
+    let chunk_summary =
+        chunk_paired_fastq(
+            non_host_r1_efs.clone(),
+            non_host_r2_efs.clone(),
+            chunks_dir.clone(),
+            pairs_per_chunk,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to chunk paired non-host FASTQs: {e}"
+            ))
+            })?;
 
     info!(
         "Distributed NR chunking complete: {} pairs, {} R1 records, \
@@ -3482,46 +3486,11 @@ async fn distributed_non_host_align(
     }
 
     // ------------------------------------------------------------------
-    // 3. Obtain the reference version.
-    //
-    // Workers already stage the reference inventory alongside the DB.
-    // For now the distributed run uses the canonical inventory fingerprint
-    // as the WorkUnit reference identifier.
+    // 3. Create one AVAILABLE WorkUnit per chunk.
     // ------------------------------------------------------------------
 
-    let reference_version = match config.alignment_backend {
-        NRAlignmentBackend::MmseqsCpu => {
-            reference_version_from_inventory(
-                "/scratch/refs/mmseqs/reference_inventory.json"
-            )
-                .await?
-        }
-
-        NRAlignmentBackend::MmseqsGpu => {
-            reference_version_from_inventory(
-                "/scratch/refs/mmseqs/reference_inventory.json"
-            )
-                .await?
-        }
-
-        NRAlignmentBackend::Diamond => {
-            reference_version_from_inventory(
-                "/scratch/refs/diamond/reference_inventory.json"
-            )
-                .await?
-        }
-    };
-
-    info!(
-        "Distributed NR reference version: {}",
-        reference_version
-    );
-
-    // ------------------------------------------------------------------
-    // 4. Create one AVAILABLE WorkUnit per chunk.
-    // ------------------------------------------------------------------
-
-    let work_dir = efs_base.join("work");
+    let work_dir =
+        efs_base.join("work");
 
     tokio::fs::create_dir_all(&work_dir)
         .await
@@ -3532,6 +3501,21 @@ async fn distributed_non_host_align(
                 e
             ))
         })?;
+
+    // The WorkUnit contract currently requires a reference_version field.
+    // Reference identity will be formalized separately; no worker-local
+    // reference files are consulted by the launch node.
+    let reference_version =
+        match config.alignment_backend {
+            NRAlignmentBackend::MmseqsCpu =>
+                "mmseqs-cpu".to_string(),
+
+            NRAlignmentBackend::MmseqsGpu =>
+                "mmseqs-gpu".to_string(),
+
+            NRAlignmentBackend::Diamond =>
+                "diamond".to_string(),
+        };
 
     for chunk in &chunk_summary.chunks {
         let work_unit =
@@ -3556,24 +3540,29 @@ async fn distributed_non_host_align(
                     ))
                 })?;
 
-        let final_path = work_dir.join(format!(
-            "work_{:08}.json",
-            chunk.chunk_id
-        ));
+        let final_path =
+            work_dir.join(format!(
+                "work_{:08}.json",
+                chunk.chunk_id
+            ));
 
-        let tmp_path = work_dir.join(format!(
-            "work_{:08}.json.tmp",
-            chunk.chunk_id
-        ));
+        let tmp_path =
+            work_dir.join(format!(
+                "work_{:08}.json.tmp",
+                chunk.chunk_id
+            ));
 
-        tokio::fs::write(&tmp_path, payload)
+        tokio::fs::write(
+            &tmp_path,
+            payload,
+        )
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Failed to write work unit {}: {}",
-                    tmp_path.display(),
-                    e
-                ))
+                "Failed to write work unit {}: {}",
+                tmp_path.display(),
+                e
+            ))
             })?;
 
         tokio::fs::rename(
@@ -3591,7 +3580,7 @@ async fn distributed_non_host_align(
             })?;
 
         info!(
-            "Published work unit {}: {} pairs -> {}",
+            "Published distributed work unit {}: {} pairs -> {}",
             work_unit.id(),
             chunk.pair_count,
             final_path.display()
@@ -3605,7 +3594,7 @@ async fn distributed_non_host_align(
     );
 
     // ------------------------------------------------------------------
-    // 5. Worker discovery remains best-effort for now.
+    // 4. Worker discovery remains best-effort.
     // ------------------------------------------------------------------
 
     let worker_manager =
@@ -3622,7 +3611,8 @@ async fn distributed_non_host_align(
                     e
                 );
 
-                let (_tx, rx) = mpsc::channel(1);
+                let (_tx, rx) =
+                    mpsc::channel(1);
 
                 return Ok((
                     rx,
@@ -3633,7 +3623,10 @@ async fn distributed_non_host_align(
             }
         };
 
-    match worker_manager.discover_running_workers().await {
+    match worker_manager
+        .discover_running_workers()
+        .await
+    {
         Ok(running_workers) => {
             info!(
                 "Distributed NR: discovered {} running tagged workers \
@@ -3662,12 +3655,6 @@ async fn distributed_non_host_align(
                             worker.availability_zone,
                         );
                     }
-
-                    info!(
-                        "Distributed NR: execution not wired yet; \
-                         {} work units remain AVAILABLE",
-                        chunk_summary.chunks.len()
-                    );
                 }
 
                 Err(e) => {
@@ -3682,8 +3669,7 @@ async fn distributed_non_host_align(
         Err(e) => {
             warn!(
                 "Distributed NR: worker discovery failed; \
-                 {} work units remain AVAILABLE under {}: {}",
-                chunk_summary.chunks.len(),
+                 work units remain AVAILABLE under {}: {}",
                 work_dir.display(),
                 e
             );
@@ -3691,14 +3677,15 @@ async fn distributed_non_host_align(
     }
 
     // ------------------------------------------------------------------
-    // 6. Result collection is not wired yet.
+    // 5. Distributed execution/result collection not wired yet.
     // ------------------------------------------------------------------
 
-    let (_tx, rx) = mpsc::channel(1);
+    let (_tx, rx) =
+        mpsc::channel(1);
 
     info!(
-        "Distributed NR preparation complete: {} chunks and \
-         {} AVAILABLE work units under {}",
+        "Distributed NR preparation complete: {} chunks and {} AVAILABLE \
+         work units under {}",
         chunk_summary.chunks.len(),
         chunk_summary.chunks.len(),
         efs_base.display()
@@ -3711,28 +3698,6 @@ async fn distributed_non_host_align(
         Vec::new(),
     ))
 }
-
-
-async fn reference_version_from_inventory(
-    inventory_path: &str,
-) -> Result<String, PipelineError> {
-    use sha2::{Digest, Sha256};
-
-    let bytes = tokio::fs::read(inventory_path)
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-                "Failed to read reference inventory {}: {}",
-                inventory_path,
-                e
-            ))
-        })?;
-
-    let digest = Sha256::digest(&bytes);
-
-    Ok(format!("{:x}", digest))
-}
-
 
 /// Aligns unmapped reads against NR database using Diamond.
 ///
