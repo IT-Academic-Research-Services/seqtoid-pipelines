@@ -2221,17 +2221,20 @@ async fn dedup(
         config.max_cores,
         4, // min 4 workers
     );
-    let num_shards = (num_workers * 16).max(1024); // Good contention balance
+    let num_shards = (num_workers * 16).max(1024);
 
-    let shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>> = (0..num_shards)
-        .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
-        .collect();
+    let shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>> =
+        (0..num_shards)
+            .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
+            .collect();
 
     let total_count = Arc::new(AtomicU64::new(0));
     let unique_count_atomic = Arc::new(AtomicU64::new(0));
 
     // Channel for writing clusters.csv incrementally
-    let (csv_tx, csv_rx) = mpsc::channel::<(String, String)>(config.base_buffer_size * num_workers);
+    let (csv_tx, csv_rx) =
+        mpsc::channel::<(String, String)>(config.base_buffer_size * num_workers);
+
     let csv_path = out_dir.join("clusters.csv");
     let csv_task = tokio::spawn(async move {
         let mut file = BufWriter::new(
@@ -2239,21 +2242,27 @@ async fn dedup(
                 .await
                 .context("Failed to create clusters.csv")?,
         );
+
         file.write_all(b"representative read id,read id\n")
             .await
             .context("CSV header write failed")?;
+
         let mut rx = csv_rx;
         while let Some((rep, member)) = rx.recv().await {
             file.write_all(format!("{},{}\n", rep, member).as_bytes())
                 .await
                 .context("CSV write failed")?;
         }
+
         file.flush().await.context("CSV flush failed")?;
         Ok(())
     });
     cleanup_tasks.push(csv_task);
 
-    let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size * num_workers);
+    let (uniques_tx, uniques_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size * num_workers);
+
+    let uniques_tx = Arc::new(tokio::sync::Mutex::new(uniques_tx));
 
     let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> =
         Vec::with_capacity(num_workers);
@@ -2261,69 +2270,92 @@ async fn dedup(
     let worker_txs: Vec<mpsc::Sender<ParseOutput>> = (0..num_workers)
         .map(|_| {
             let (tx, rx) = mpsc::channel(config.base_buffer_size);
+
             let csv_tx_clone = csv_tx.clone();
+            let uniques_tx_clone = uniques_tx.clone();
+
             let handle = tokio::spawn(dedup_worker(
                 rx,
                 shards.clone(),
-                uniques_tx.clone(),
+                uniques_tx_clone,
                 csv_tx_clone,
                 paired,
                 prefix_len,
                 total_count.clone(),
                 unique_count_atomic.clone(),
             ));
+
             worker_handles.push(handle);
             tx
         })
         .collect();
 
-    // Distributor: round-robin to workers
+    // Distributor: round-robin complete pairs to workers.
+    //
+    // The input remains interleaved:
+    //   R1, R2, R1, R2, ...
+    //
+    // We validate the pair before sending either record to a worker.
     let mut stream = ReceiverStream::new(input_stream);
     let mut i = 0usize;
+
     if paired {
         while let Some(r1_item) = stream.next().await {
             let r1 = match r1_item {
                 ParseOutput::Fastq(rec) => rec,
-                _ => continue,
+                _ => {
+                    return Err(PipelineError::InvalidFastqFormat(
+                        "Unexpected non-FASTQ item in paired dedup input".to_string(),
+                    ));
+                }
             };
 
-            if let Some(r2_item) = stream.next().await {
-                let r2 = match r2_item {
-                    ParseOutput::Fastq(rec) => rec,
-                    _ => continue,
-                };
-
-                if r1.id() != r2.id() {
-                    return Err(PipelineError::InvalidFastqFormat(format!(
-                        "Mismatched pair IDs: R1={}, R2={}",
-                        r1.id(),
-                        r2.id()
-                    )));
-                }
-
-                let worker_tx = &worker_txs[i % num_workers];
-                worker_tx
-                    .send(ParseOutput::Fastq(r1))
-                    .await
-                    .map_err(|e| PipelineError::Other(anyhow!("Send R1 failed: {}", e)))?;
-                worker_tx
-                    .send(ParseOutput::Fastq(r2))
-                    .await
-                    .map_err(|e| PipelineError::Other(anyhow!("Send R2 failed: {}", e)))?;
-                i += 1;
-            } else {
-                return Err(PipelineError::InvalidFastqFormat(
+            let r2_item = stream.next().await.ok_or_else(|| {
+                PipelineError::InvalidFastqFormat(
                     "Missing R2 in paired stream".to_string(),
-                ));
+                )
+            })?;
+
+            let r2 = match r2_item {
+                ParseOutput::Fastq(rec) => rec,
+                _ => {
+                    return Err(PipelineError::InvalidFastqFormat(
+                        "Unexpected non-FASTQ R2 item in paired dedup input".to_string(),
+                    ));
+                }
+            };
+
+            if r1.id() != r2.id() {
+                return Err(PipelineError::InvalidFastqFormat(format!(
+                    "Mismatched pair IDs: R1={}, R2={}",
+                    r1.id(),
+                    r2.id()
+                )));
             }
+
+            let worker_tx = &worker_txs[i % num_workers];
+
+            worker_tx
+                .send(ParseOutput::Fastq(r1))
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("Send R1 failed: {}", e)))?;
+
+            worker_tx
+                .send(ParseOutput::Fastq(r2))
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("Send R2 failed: {}", e)))?;
+
+            i += 1;
         }
     } else {
         while let Some(item) = stream.next().await {
             let worker_tx = &worker_txs[i % num_workers];
+
             worker_tx
                 .send(item)
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("Send failed: {}", e)))?;
+
             i += 1;
         }
     }
@@ -2337,15 +2369,17 @@ async fn dedup(
             .context("Worker error")?;
     }
 
-    // Drop csv_tx to close csv_rx
+    // Drop csv_tx to close csv_rx.
     drop(csv_tx);
 
     // Build duplicate_clusters from shards (rep_id -> ClusterInfo)
     let duplicate_clusters = Arc::new(DashMap::with_capacity(num_shards));
+
     for shard in &shards {
         let guard = shard
             .lock()
             .map_err(|e| PipelineError::Other(anyhow!("Shard lock poisoned: {}", e)))?;
+
         for (_, (rep_id, size, members)) in guard.iter() {
             duplicate_clusters.insert(
                 rep_id.clone(),
@@ -2360,27 +2394,33 @@ async fn dedup(
     // Write duplicate_cluster_sizes.tsv
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
     let duplicate_clusters_clone = duplicate_clusters.clone();
+
     let tsv_task = tokio::spawn(async move {
         let mut file = BufWriter::new(
             TokioFile::create(&tsv_path)
                 .await
-                .context("Failed to create TSV file")?,
+                .context("Failed to create duplicate_cluster_sizes.tsv")?,
         );
+
         file.write_all(b"representative read id\tcluster size\n")
             .await
             .context("TSV header write failed")?;
+
         for entry in duplicate_clusters_clone.iter() {
             let (rep_id, info) = entry.pair();
+
             file.write_all(format!("{}\t{}\n", rep_id, info.size).as_bytes())
                 .await
                 .context("TSV write failed")?;
         }
+
         file.flush().await.context("TSV flush failed")?;
         Ok(())
     });
     cleanup_tasks.push(tsv_task);
 
     let unique_count = unique_count_atomic.load(AtomicOrdering::Relaxed);
+
     let (count_tx, count_rx) = oneshot::channel();
     count_tx
         .send(unique_count)
@@ -2401,26 +2441,20 @@ async fn dedup(
     ))
 }
 
+
 /// Internal worker for deduplication, processing a shard of reads.
 ///
-/// # Arguments
+/// For paired-end input, this worker always treats two consecutive records
+/// as one logical pair. Unique pairs are emitted while holding the shared
+/// output-sender mutex across BOTH sends, guaranteeing:
 ///
-/// * `rx`: receiver for FASTQ records to process
-/// * `shards`: shared maps of read hashes to cluster information
-/// * `uniques_tx`: sender for unique sequence records
-/// * `csv_tx`: sender for cluster membership information (representative, member)
-/// * `paired`: whether the input is paired-end
-/// * `prefix_len`: optional prefix length for deduplication
-/// * `total_count`: atomic counter for total reads processed
-/// * `unique_count`: atomic counter for unique reads found
+///     R1(pair A), R2(pair A), R1(pair B), R2(pair B), ...
 ///
-/// # Returns
-///
-/// Result<()>: success or error
+/// even when multiple dedup workers are running concurrently.
 async fn dedup_worker(
     mut rx: mpsc::Receiver<ParseOutput>,
     shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>>,
-    uniques_tx: mpsc::Sender<ParseOutput>,
+    uniques_tx: Arc<tokio::sync::Mutex<mpsc::Sender<ParseOutput>>>,
     csv_tx: mpsc::Sender<(String, String)>,
     paired: bool,
     prefix_len: Option<usize>,
@@ -2432,7 +2466,11 @@ async fn dedup_worker(
     while let Some(item) = rx.recv().await {
         let record = match item {
             ParseOutput::Fastq(rec) => rec,
-            _ => continue,
+            _ => {
+                return Err(anyhow!(
+                    "dedup_worker received unexpected non-FASTQ item"
+                ));
+            }
         };
 
         if paired {
@@ -2454,20 +2492,23 @@ async fn dedup_worker(
 
             let id = r1.id().to_string();
 
-            let r1_prefix =
-                &r1.seq()[0..prefix_len.map_or(r1.seq().len(), |l| l.min(r1.seq().len()))];
-            let r2_prefix =
-                &r2.seq()[0..prefix_len.map_or(r2.seq().len(), |l| l.min(r2.seq().len()))];
+            let r1_prefix_len = prefix_len
+                .map_or(r1.seq().len(), |l| l.min(r1.seq().len()));
+            let r2_prefix_len = prefix_len
+                .map_or(r2.seq().len(), |l| l.min(r2.seq().len()));
+
+            let r1_prefix = &r1.seq()[..r1_prefix_len];
+            let r2_prefix = &r2.seq()[..r2_prefix_len];
 
             let mut hasher = XxHash64::default();
             hasher.write(r1_prefix);
             hasher.write_u8(0);
             hasher.write(r2_prefix);
-            let hash_key = hasher.finish();
 
+            let hash_key = hasher.finish();
             let shard_idx = (hash_key as usize) % shards.len();
 
-            // ─── Critical: only hold lock for the minimal time ───
+            // Only hold the shard lock for the map operation.
             let (rep_id, is_new) = {
                 let mut shard = shards[shard_idx]
                     .lock()
@@ -2485,34 +2526,43 @@ async fn dedup_worker(
                 let is_new = entry.1 == 1;
 
                 (rep_id, is_new)
-            }; // ← guard dropped here
+            };
 
             total_count.fetch_add(1, AtomicOrdering::Relaxed);
 
-            // Now safe to await
-            csv_tx.send((rep_id, id)).await.context("CSV send failed")?;
+            csv_tx
+                .send((rep_id, id))
+                .await
+                .context("CSV send failed")?;
 
             if is_new {
-                uniques_tx
-                    .send(ParseOutput::Fastq(r1))
+                // CRITICAL:
+                // Hold the sender lock across BOTH sends. This makes the pair
+                // atomic at the logical output-stream level.
+                let tx = uniques_tx.lock().await;
+
+                tx.send(ParseOutput::Fastq(r1))
                     .await
                     .context("Send R1 unique failed")?;
-                uniques_tx
-                    .send(ParseOutput::Fastq(r2))
+
+                tx.send(ParseOutput::Fastq(r2))
                     .await
                     .context("Send R2 unique failed")?;
+
+                // tx is dropped here, allowing another worker to emit.
             }
         } else {
-            let prefix = &record.seq()
-                [0..prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()))];
+            let prefix_len =
+                prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()));
+
+            let prefix = &record.seq()[..prefix_len];
 
             let mut hasher = XxHash64::default();
             hasher.write(prefix);
-            let hash_key = hasher.finish();
 
+            let hash_key = hasher.finish();
             let shard_idx = (hash_key as usize) % shards.len();
 
-            // Same pattern: minimal lock scope
             let (rep_id, is_new) = {
                 let mut shard = shards[shard_idx]
                     .lock()
@@ -2542,8 +2592,9 @@ async fn dedup_worker(
                 .context("CSV send failed")?;
 
             if is_new {
-                uniques_tx
-                    .send(ParseOutput::Fastq(record))
+                let tx = uniques_tx.lock().await;
+
+                tx.send(ParseOutput::Fastq(record))
                     .await
                     .context("Send unique failed")?;
             }
@@ -2556,6 +2607,7 @@ async fn dedup_worker(
 
     Ok(())
 }
+
 
 #[allow(dead_code)]
 /// Subsamples the input FASTQ stream using weights from deduplication clusters.
