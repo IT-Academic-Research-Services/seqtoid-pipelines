@@ -21,7 +21,7 @@ log() { echo "[$(date -Is)] $*"; }
 #
 # These values are registration metadata written to status.json.
 # They are not AWS EC2 tags.
-WORKER_ROLE="seqtoid-nr-cpu-worker"
+WORKER_ROLE="${WORKER_ROLE:-seqtoid-nr-cpu-worker}"
 WORKER_BACKEND="${WORKER_BACKEND:-}"
 WORKER_REFERENCE_SET="${WORKER_REFERENCE_SET:-phase2}"
 WORKER_ENVIRONMENT="${WORKER_ENVIRONMENT:-dev}"
@@ -80,7 +80,7 @@ setup_thp() {
 install_packages() {
   log "Packages - critical"
 
-  if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic; then
+  if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic fontconfig-devel pkgconf-pkg-config; then
     log "ERROR: critical package installation failed"
     return 1
   fi

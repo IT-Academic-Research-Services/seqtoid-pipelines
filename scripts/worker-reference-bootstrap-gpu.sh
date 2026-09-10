@@ -67,7 +67,7 @@ setup_thp() {
 
 install_packages() {
   log "Packages - critical"
-  if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic python3; then
+  if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic python3 fontconfig-devel pkgconf-pkg-config; then
     log "ERROR: critical package installation failed"
     return 1
   fi
