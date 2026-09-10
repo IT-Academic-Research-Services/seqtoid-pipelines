@@ -347,7 +347,7 @@ impl WorkerExecutor {
         )
             .await?;
 
-        self.require_path(
+        self.require_mmseqs_db(
             &query_db,
             "MMseqs query database",
         )
@@ -403,7 +403,7 @@ impl WorkerExecutor {
         )
             .await?;
 
-        self.require_path(
+        self.require_mmseqs_db(
             &result_db,
             "MMseqs search result database",
         )
@@ -808,6 +808,57 @@ impl WorkerExecutor {
         }
 
         Ok(())
+    }
+
+    /// Validate an MMseqs database prefix.
+    ///
+    /// MMseqs databases may be represented by a prefix plus sidecar files and
+    /// split parts, so the prefix itself does not necessarily exist as a file.
+    async fn require_mmseqs_db(
+        &self,
+        path: &Path,
+        description: &str,
+    ) -> Result<()> {
+        if path.is_file() {
+            return Ok(());
+        }
+
+        let dbtype = path.with_extension("dbtype");
+        if !dbtype.is_file() {
+            return Err(anyhow!(
+                "{} was not produced: missing MMseqs dbtype file {}",
+                description,
+                dbtype.display()
+            ));
+        }
+
+        if path.with_extension("index").is_file() {
+            return Ok(());
+        }
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let prefix = path.file_name().and_then(|v| v.to_str()).unwrap_or_default();
+        let numbered_prefix = format!("{}.", prefix);
+
+        let mut entries = fs::read_dir(parent).await.with_context(|| {
+            format!("failed to inspect MMseqs database directory {}", parent.display())
+        })?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(suffix) = name.strip_prefix(&numbered_prefix) {
+                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "{} was not produced: MMseqs database prefix {} has no .index or numbered split parts",
+            description,
+            path.display()
+        ))
     }
 
     /// Validates and atomically publishes a completed m8 result.
