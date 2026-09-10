@@ -868,11 +868,9 @@ impl WorkerExecutor {
         attempt: u32,
         temporary_m8: &Path,
     ) -> Result<WorkUnitResult> {
-        let validation =
-            validate_m8(temporary_m8).await?;
+        let validation = validate_m8(temporary_m8).await?;
 
-        fs::create_dir_all(&self.config.results_dir)
-            .await?;
+        fs::create_dir_all(&self.config.results_dir).await?;
 
         let final_name = format!(
             "chunk_{:08}_attempt_{:03}.m8",
@@ -880,24 +878,38 @@ impl WorkerExecutor {
             attempt
         );
 
-        let final_path =
-            self.config.results_dir.join(final_name);
+        let final_path = self.config.results_dir.join(final_name);
 
-        fs::rename(
-            temporary_m8,
-            &final_path,
-        )
+        let temp_name = format!(
+            "chunk_{:08}_attempt_{:03}.m8.tmp",
+            work_unit.chunk_id,
+            attempt
+        );
+
+        let temp_path = self.config.results_dir.join(temp_name);
+
+        fs::copy(temporary_m8, &temp_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to copy m8 {} -> {}",
+                    temporary_m8.display(),
+                    temp_path.display()
+                )
+            })?;
+
+        // Publication is now atomic because both paths are on EFS.
+        fs::rename(&temp_path, &final_path)
             .await
             .with_context(|| {
                 format!(
                     "failed to publish m8 {} -> {}",
-                    temporary_m8.display(),
+                    temp_path.display(),
                     final_path.display()
                 )
             })?;
 
-        let metadata =
-            fs::metadata(&final_path).await?;
+        let metadata = fs::metadata(&final_path).await?;
 
         Ok(WorkUnitResult {
             worker_id: self.worker_id().to_string(),
