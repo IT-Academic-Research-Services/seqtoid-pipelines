@@ -3752,7 +3752,7 @@ async fn distributed_non_host_align(
         };
 
     match worker_manager
-        .discover_running_workers()
+        .discover_running_workers(config.alignment_backend)
         .await
     {
         Ok(running_workers) => {

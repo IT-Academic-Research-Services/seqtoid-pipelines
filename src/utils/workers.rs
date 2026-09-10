@@ -9,14 +9,18 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use crate::config::defs::{PipelineError};
+use crate::config::defs::{NRAlignmentBackend, PipelineError};
 
 
 pub const WORKER_ROLE_TAG: &str = "Role";
-pub const WORKER_ROLE_VALUE: &str = "seqtoid-nr-mmseqs-cpu-worker";
+pub const WORKER_ROLE_VALUE_CPU: &str = "seqtoid-nr-mmseqs-cpu-worker";
+pub const WORKER_ROLE_VALUE_GPU: &str = "seqtoid-nr-mmseqs-gpu-worker";
+pub const WORKER_ROLE_VALUE_DIAMOND: &str = "seqtoid-nr-diamond-worker";
 
 pub const WORKER_BACKEND_TAG: &str = "Backend";
-pub const WORKER_BACKEND_VALUE: &str = "mmseqs-cpu";
+pub const WORKER_BACKEND_VALUE_CPU: &str = "mmseqs-cpu";
+pub const WORKER_BACKEND_VALUE_GPU: &str = "mmseqs-gpu";
+pub const WORKER_BACKEND_VALUE_DIAMOND: &str = "diamond";
 
 pub const WORKER_REFERENCE_SET_TAG: &str = "ReferenceSet";
 pub const WORKER_REFERENCE_SET_VALUE: &str = "phase2";
@@ -64,10 +68,29 @@ impl WorkerManager {
     /// # Arguments
     ///
     /// * `self` - Worker manager containing the configured EC2 client
+    /// * `backend` - NR backend whose worker role/backend tags should be matched
     ///
     /// # Returns
     /// Vector of running, correctly tagged workers
-    pub async fn discover_running_workers(&self) -> Result<Vec<Worker>> {
+    pub async fn discover_running_workers(
+        &self,
+        backend: NRAlignmentBackend,
+    ) -> Result<Vec<Worker>> {
+        let (role_value, backend_value) = match backend {
+            NRAlignmentBackend::MmseqsCpu => (
+                WORKER_ROLE_VALUE_CPU,
+                WORKER_BACKEND_VALUE_CPU,
+            ),
+            NRAlignmentBackend::MmseqsGpu => (
+                WORKER_ROLE_VALUE_GPU,
+                WORKER_BACKEND_VALUE_GPU,
+            ),
+            NRAlignmentBackend::Diamond => (
+                WORKER_ROLE_VALUE_DIAMOND,
+                WORKER_BACKEND_VALUE_DIAMOND,
+            ),
+        };
+
         let filters = vec![
             Filter::builder()
                 .name("instance-state-name")
@@ -75,11 +98,11 @@ impl WorkerManager {
                 .build(),
             Filter::builder()
                 .name(format!("tag:{}", WORKER_ROLE_TAG))
-                .values(WORKER_ROLE_VALUE)
+                .values(role_value)
                 .build(),
             Filter::builder()
                 .name(format!("tag:{}", WORKER_BACKEND_TAG))
-                .values(WORKER_BACKEND_VALUE)
+                .values(backend_value)
                 .build(),
             Filter::builder()
                 .name(format!("tag:{}", WORKER_REFERENCE_SET_TAG))
@@ -138,8 +161,11 @@ impl WorkerManager {
     ///
     /// # Returns
     /// Vector of running workers currently reporting READY
-    pub async fn discover_ready_workers(&self) -> Result<Vec<Worker>> {
-        let running = self.discover_running_workers().await?;
+    pub async fn discover_ready_workers(
+        &self,
+        backend: NRAlignmentBackend,
+    ) -> Result<Vec<Worker>> {
+        let running = self.discover_running_workers(backend).await?;
         let mut ready = Vec::with_capacity(running.len());
 
         for worker in running {
@@ -185,17 +211,21 @@ impl WorkerManager {
     ///
     /// # Returns
     /// Vector containing the requested number of READY workers
-    pub async fn require_ready_workers(&self, requested: usize) -> Result<Vec<Worker>> {
+    pub async fn require_ready_workers(
+        &self,
+        backend: NRAlignmentBackend,
+        requested: usize,
+    ) -> Result<Vec<Worker>> {
         if requested == 0 {
             return Err(anyhow!(
                 "--distributed-workers must be greater than zero"
             ));
         }
 
-        let workers = self.discover_ready_workers().await?;
+        let workers = self.discover_ready_workers(backend).await?;
 
         if workers.len() < requested {
-            let running = self.discover_running_workers().await?;
+            let running = self.discover_running_workers(backend).await?;
 
             return Err(anyhow!(
                 "Insufficient READY MMseqs workers: requested {}, found {} READY, {} running tagged workers",
