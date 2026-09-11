@@ -92,26 +92,32 @@ install_s5cmd() {
     rm -rf "$tmpdir"
     return 1
   fi
+
   if ! tar -xzf "$archive" -C "$tmpdir" s5cmd; then
     log "ERROR: failed to extract s5cmd ${version}"
     rm -rf "$tmpdir"
     return 1
   fi
+
   install -m 0755 "$tmpdir/s5cmd" /usr/local/bin/s5cmd
   rm -rf "$tmpdir"
+
   /usr/local/bin/s5cmd version >/dev/null || {
     log "ERROR: s5cmd verification failed"
     return 1
   }
+
   log "s5cmd installed: $(/usr/local/bin/s5cmd version | head -n 1)"
 }
 
 validate_gpu_runtime() {
   log "Validating NVIDIA GPU runtime"
+
   if ! command -v nvidia-smi >/dev/null 2>&1; then
     log "ERROR: nvidia-smi not found; install the NVIDIA compute driver before running this bootstrap"
     return 1
   fi
+
   nvidia-smi
 
   if ! nvidia-smi -L >/dev/null 2>&1; then
@@ -141,21 +147,29 @@ install_scratch_helper() {
   cat > /usr/local/sbin/setup-scratch.sh << 'SCRIPTEOF'
 #!/bin/bash
 set -uo pipefail
+
 MOUNT=/scratch
 RAID=/dev/md0
 LOG=/var/log/setup-scratch.log
 exec >> "$LOG" 2>&1
 
 echo "=== setup-scratch $(date -Is) ==="
+
 mkdir -p "$MOUNT"
+
 if mountpoint -q "$MOUNT"; then
   echo "/scratch already mounted"
   df -h "$MOUNT" | tail -1
   exit 0
 fi
+
 sleep 8
+
 mdadm --assemble --scan 2>/dev/null || true
-EXISTING=$(lsblk -nr -o NAME,TYPE,MOUNTPOINT | awk '$2=="raid0" && $3=="" {print "/dev/"$1; exit}')
+
+EXISTING=$(lsblk -nr -o NAME,TYPE,MOUNTPOINT \
+  | awk '$2=="raid0" && $3=="" {print "/dev/"$1; exit}')
+
 if [ -n "${EXISTING:-}" ]; then
   RAID="$EXISTING"
   echo "Using existing RAID $RAID"
@@ -165,39 +179,63 @@ else
       | awk 'tolower($0) ~ /instance storage/ {print "/dev/"$1}' \
       | sort
   )
+
   if [ ${#DEVS[@]} -eq 0 ]; then
     echo "ERROR: no instance-store NVMe found"
     lsblk -d -o NAME,SIZE,TYPE,MODEL
     exit 1
   fi
+
   echo "Instance-store devices: ${DEVS[*]}"
+
   if mdadm --assemble "$RAID" "${DEVS[@]}" 2>/dev/null; then
     echo "Assembled $RAID from members"
   else
     mdadm --stop "$RAID" 2>/dev/null || true
+
     echo "Creating RAID0 $RAID (${#DEVS[@]} devices, chunk 256k)"
+
     mdadm --create --verbose --force "$RAID" \
-      --level=0 --chunk=256 --raid-devices="${#DEVS[@]}" "${DEVS[@]}"
+      --level=0 \
+      --chunk=256 \
+      --raid-devices="${#DEVS[@]}" \
+      "${DEVS[@]}"
   fi
 fi
+
 sleep 2
+
 if [ ! -b "$RAID" ]; then
   RAID=$(lsblk -nr -o NAME,TYPE,MOUNTPOINT \
     | awk '$2=="raid0" && $3=="" {print "/dev/"$1; exit}')
+
   if [ -z "${RAID:-}" ]; then
     echo "ERROR: no RAID block device available"
     cat /proc/mdstat || true
     exit 1
   fi
 fi
+
 if ! blkid "$RAID" 2>/dev/null | grep -q 'TYPE='; then
   N=$(mdadm --detail "$RAID" 2>/dev/null | awk '/Raid Devices/ {print $4}')
   N=${N:-4}
-  mkfs.xfs -f -L scratch -d su=256k,sw="$N" -l size=128m "$RAID"
+
+  mkfs.xfs -f \
+    -L scratch \
+    -d su=256k,sw="$N" \
+    -l size=128m \
+    "$RAID"
 fi
-mount -o noatime,nodiratime,logbufs=8,logbsize=256k,largeio,inode64,swalloc "$RAID" "$MOUNT"
+
+mount \
+  -o noatime,nodiratime,logbufs=8,logbsize=256k,largeio,inode64,swalloc \
+  "$RAID" \
+  "$MOUNT"
+
 chmod 1777 "$MOUNT"
+
 echo 8192 > /sys/block/$(basename "$RAID")/queue/read_ahead_kb 2>/dev/null || true
+
 echo "/scratch ready: $(df -h "$MOUNT" | tail -1)"
 cat /proc/mdstat || true
 SCRIPTEOF
@@ -239,21 +277,29 @@ setup_efs() {
   local AWS_REGION="${AWS_REGION:-us-west-2}"
   local EFS_DNS="${EFS_ID}.efs.${AWS_REGION}.amazonaws.com"
   local MOUNT=/efs
+
   log "EFS ${EFS_ID} (${EFS_DNS}) -> ${MOUNT}"
+
   mkdir -p "$MOUNT"
+
   if mountpoint -q "$MOUNT"; then
     log "EFS already mounted"
     return 0
   fi
-  if mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev "${EFS_DNS}:/" "$MOUNT"; then
+
+  if mount -t nfs4 \
+    -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev \
+    "${EFS_DNS}:/" "$MOUNT"; then
     log "EFS mounted"
   else
     log "ERROR: EFS mount failed"
     return 1
   fi
+
   if ! grep -qs "$EFS_DNS" /etc/fstab; then
     echo "${EFS_DNS}:/ $MOUNT nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev 0 0" >> /etc/fstab
   fi
+
   chmod 1777 "$MOUNT"
 }
 
@@ -262,10 +308,21 @@ write_worker_status() {
   local worker_ready="$2"
   local reference_status="$3"
   local reason="${4:-}"
+
+  token=""
+  instance_id=""
+  instance_type=""
+  private_ip=""
+  availability_zone=""
+  ami_id=""
+  hostname=""
+
   local token instance_id instance_type private_ip availability_zone ami_id hostname
-  local scratch_size scratch_used scratch_available scratch_device efs_status status_dir status_file tmp_file now
+  local scratch_size scratch_used scratch_available scratch_device
+  local efs_status status_dir status_file tmp_file now
 
   token=$(get_imds_token)
+
   instance_id=$(imds_get "$token" instance-id)
   instance_type=$(imds_get "$token" instance-type)
   private_ip=$(imds_get "$token" local-ipv4)
@@ -285,15 +342,24 @@ write_worker_status() {
     scratch_available=$(df -B1 --output=avail /scratch | tail -1 | tr -d ' ')
     scratch_device=$(findmnt -n -o SOURCE /scratch || echo unknown)
   else
-    scratch_size=0; scratch_used=0; scratch_available=0; scratch_device=not-mounted
+    scratch_size=0
+    scratch_used=0
+    scratch_available=0
+    scratch_device=not-mounted
   fi
 
-  if mountpoint -q /efs; then efs_status=mounted; else efs_status=not-mounted; fi
+  if mountpoint -q /efs; then
+    efs_status=mounted
+  else
+    efs_status=not-mounted
+  fi
 
   status_dir="${WORKER_STATUS_DIR}/${instance_id}"
   status_file="${status_dir}/status.json"
   tmp_file="${status_file}.tmp"
+
   mkdir -p "$status_dir"
+
   now=$(date -Is)
 
   python3 - "$tmp_file" "$now" "$state" "$worker_ready" "$reason" \
@@ -302,15 +368,35 @@ write_worker_status() {
     "$scratch_size" "$scratch_used" "$scratch_available" "$scratch_device" "$efs_status" "$reference_status" << 'PYEOF'
 import json
 import sys
+
 (
-    output_path, timestamp, state, worker_ready, reason,
-    instance_id, instance_type, private_ip, availability_zone, ami_id, hostname,
-    worker_role, backend, reference_set, environment,
-    scratch_size, scratch_used, scratch_available, scratch_device, efs_status, reference_status,
+    output_path,
+    timestamp,
+    state,
+    worker_ready,
+    reason,
+    instance_id,
+    instance_type,
+    private_ip,
+    availability_zone,
+    ami_id,
+    hostname,
+    worker_role,
+    backend,
+    reference_set,
+    environment,
+    scratch_size,
+    scratch_used,
+    scratch_available,
+    scratch_device,
+    efs_status,
+    reference_status,
 ) = sys.argv[1:]
+
 status = {
     "state": state,
     "worker_ready": worker_ready.lower() == "true",
+
     "instance": {
         "instance_id": instance_id,
         "instance_type": instance_type,
@@ -319,12 +405,14 @@ status = {
         "ami_id": ami_id,
         "hostname": hostname,
     },
+
     "worker": {
         "role": worker_role,
         "backend": backend,
         "reference_set": reference_set,
         "environment": environment,
     },
+
     "storage": {
         "scratch": {
             "mounted": scratch_device != "not-mounted",
@@ -333,27 +421,48 @@ status = {
             "used_bytes": int(scratch_used),
             "available_bytes": int(scratch_available),
         },
-        "efs": {"status": efs_status},
+        "efs": {
+            "status": efs_status,
+        },
     },
-    "reference": {"status": reference_status, "reference_set": reference_set},
+
+    "reference": {
+        "status": reference_status,
+        "reference_set": reference_set,
+    },
+
     "registered_at": timestamp,
     "last_update": timestamp,
 }
+
 if reason:
     status["reason"] = reason
+
 with open(output_path, "w", encoding="utf-8") as fh:
     json.dump(status, fh, indent=2, sort_keys=True)
     fh.write("\n")
 PYEOF
 
+  if [ ! -f "$tmp_file" ]; then
+    log "ERROR: failed to create worker status file"
+    return 1
+  fi
+
   chmod 644 "$tmp_file"
   mv -f "$tmp_file" "$status_file"
+
   log "Wrote worker status: $status_file"
   log "Worker state: ${state}"
   log "Worker ready: ${worker_ready}"
   log "Worker backend: ${WORKER_BACKEND}"
   log "Reference: ${reference_status} (${WORKER_REFERENCE_SET})"
-  [ -n "$reason" ] && log "Worker reason: ${reason}"
+
+  # IMPORTANT: keep this conditional in an if block.
+  # A bare "[ ... ] && ..." would return 1 when reason is empty
+  # and falsely make write_worker_status() appear to have failed.
+  if [ -n "$reason" ]; then
+    log "Worker reason: ${reason}"
+  fi
 }
 
 set_worker_state() {
@@ -364,12 +473,25 @@ set_worker_state() {
 
 # Main
 setup_thp
+
 validate_worker_configuration || exit 1
+
 install_packages || exit 1
+
 install_scratch_helper || exit 1
-systemctl start scratch-setup.service || { log "ERROR: scratch setup failed"; exit 1; }
-systemctl is-active --quiet scratch-setup.service || { log "ERROR: scratch setup inactive"; exit 1; }
+
+systemctl start scratch-setup.service || {
+  log "ERROR: scratch setup failed"
+  exit 1
+}
+
+systemctl is-active --quiet scratch-setup.service || {
+  log "ERROR: scratch setup inactive"
+  exit 1
+}
+
 setup_efs || exit 1
+
 mkdir -p /efs/workers
 
 set_worker_state BOOTING false not_checked
@@ -391,36 +513,49 @@ REFERENCE_DIR="/scratch/refs/mmseqs-gpu"
 REFERENCE_DB="${REFERENCE_DIR}/nrcleanDB_gpu"
 
 if [ ! -f "$REFERENCE_PREPARER" ]; then
-  set_worker_state FAILED false failed "reference preparation utility not found: $REFERENCE_PREPARER"
+  set_worker_state FAILED false failed \
+    "reference preparation utility not found: $REFERENCE_PREPARER"
   log "ERROR: reference preparation utility not found: $REFERENCE_PREPARER"
   exit 1
 fi
 
-REFERENCE_VERSION=$(python3 "$REFERENCE_PREPARER" --backend mmseqs-gpu --reference-set "$WORKER_REFERENCE_SET") || {
-  set_worker_state FAILED false failed "GPU reference preparation failed"
-  exit 1
-}
+REFERENCE_VERSION=$(python3 "$REFERENCE_PREPARER" \
+  --backend mmseqs-gpu \
+  --reference-set "$WORKER_REFERENCE_SET") || {
+    set_worker_state FAILED false failed "GPU reference preparation failed"
+    exit 1
+  }
 
 if [ -z "$REFERENCE_VERSION" ] || \
    [ ! -f "${REFERENCE_DIR}/.reference_version" ] || \
    [ ! -f "${REFERENCE_DIR}/.reference_manifest.json" ] || \
    [ ! -f "$REFERENCE_DB" ]; then
-  set_worker_state FAILED false failed "GPU reference validation outputs missing"
+
+  set_worker_state FAILED false failed \
+    "GPU reference validation outputs missing"
+
   log "ERROR: reference validation outputs missing under $REFERENCE_DIR"
   exit 1
 fi
 
 RECORDED_VERSION=$(tr -d '[:space:]' < "${REFERENCE_DIR}/.reference_version")
+
 if [ "$REFERENCE_VERSION" != "$RECORDED_VERSION" ]; then
-  set_worker_state FAILED false failed "GPU reference version verification failed"
+  set_worker_state FAILED false failed \
+    "GPU reference version verification failed"
   exit 1
 fi
 
 log "GPU reference prepared and validated: version=${REFERENCE_VERSION} db=${REFERENCE_DB}"
+
 set_worker_state READY true validated
 
 mkdir -p /home/ec2-user/{programs,venv} /dev/shm/workspace
-chown -R ec2-user:ec2-user /home/ec2-user/programs /home/ec2-user/venv || true
+
+chown -R ec2-user:ec2-user \
+  /home/ec2-user/programs \
+  /home/ec2-user/venv \
+  || true
 
 log "=== MMseqs GPU worker bootstrap finished at $(date -Is) ==="
 log "Verify: df -h /scratch /efs"
