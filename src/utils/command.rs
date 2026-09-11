@@ -3297,8 +3297,7 @@ pub mod mmseqs {
         if config.backend != MmseqsBackend::Gpu {
             return;
         }
-
-        args.push("--gpu".to_string());
+        
         args.push("--gpu".to_string());
         args.push("1".to_string());
 
