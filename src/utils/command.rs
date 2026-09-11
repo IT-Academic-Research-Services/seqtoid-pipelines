@@ -3297,16 +3297,23 @@ pub mod mmseqs {
         if config.backend != MmseqsBackend::Gpu {
             return;
         }
-        
+
+        // All GPU searches require GPU execution.
         args.push("--gpu".to_string());
         args.push("1".to_string());
 
         debug!("MMseqs2: GPU client mode enabled (--gpu 1)");
 
+        // When using gpuserver, this function is the single owner of the
+        // GPU-server-specific client flags. Callers must not append these
+        // flags separately.
         if config.gpu_server {
             args.push("--gpu-server".to_string());
             args.push("1".to_string());
 
+            // GPU-server searches require the target DB to be loaded using
+            // the GPU-server-compatible mode. Respect an explicit override,
+            // otherwise use the established default of 2.
             args.push("--db-load-mode".to_string());
             args.push(
                 config
@@ -3315,15 +3322,28 @@ pub mod mmseqs {
                     .unwrap_or_else(|| "2".to_string()),
             );
 
+            // GPU-server searches use prefilter mode 1 by default.
+            //
+            // If the caller explicitly supplied prefilter_mode, do not emit
+            // it here; the Search/EasySearch argument construction will emit
+            // that explicit value exactly once later.
             if config.prefilter_mode.is_none() {
                 args.push("--prefilter-mode".to_string());
                 args.push("1".to_string());
             }
 
             debug!(
-                "MMseqs2: GPU server client mode enabled \
-                 (--gpu-server 1 --db-load-mode 2)"
-            );
+            "MMseqs2: GPU server client mode enabled \
+             (--gpu-server 1 --db-load-mode {} --prefilter-mode {})",
+            config
+                .db_load_mode
+                .as_deref()
+                .unwrap_or("2"),
+            config
+                .prefilter_mode
+                .as_deref()
+                .unwrap_or("1"),
+        );
         }
     }
 
