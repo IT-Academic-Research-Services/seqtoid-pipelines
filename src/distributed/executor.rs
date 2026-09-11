@@ -10,14 +10,16 @@
 //! Queue discovery and durable claim coordination are intentionally outside
 //! this module.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Child;
 
-use crate::config::defs::{DiamondSubcommand, MMSEQS_TAG, DIAMOND_TAG};
+use crate::config::defs::{DiamondSubcommand, DIAMOND_TAG, MMSEQS_TAG};
 use crate::utils::command::diamond::{
     generate_diamond_args,
     DiamondConfig,
@@ -25,6 +27,8 @@ use crate::utils::command::diamond::{
 };
 use crate::utils::command::mmseqs::{
     generate_mmseqs_args,
+    spawn_gpuserver,
+    stop_gpuserver,
     MmseqsBackend,
     MmseqsConfig,
     MmseqsExecutionConfig,
@@ -59,16 +63,16 @@ pub struct WorkerExecutorConfig {
     /// Durable EFS result directory.
     pub results_dir: PathBuf,
 
-    /// Number of threads assigned to the execution.
+    /// Number of threads assigned to the worker execution.
     pub threads: usize,
 
-    /// Maximum worker cores, used by the shared NUMA policy.
+    /// Maximum worker cores used by the shared NUMA/process-launch policy.
     pub max_cores: usize,
 
     /// Worker-local MMseqs database.
     pub mmseqs_db: Option<PathBuf>,
 
-    /// Worker-local Diamond database prefix.
+    /// Worker-local Diamond database prefix/path.
     pub diamond_db: Option<PathBuf>,
 }
 
@@ -100,38 +104,91 @@ impl WorkerExecutor {
     ) -> Result<WorkUnitResult> {
         let attempt = work_unit
             .claim(self.worker_id())
-            .map_err(|e| anyhow!(
-                "failed to claim work unit {}: {}",
-                work_unit.id(),
-                e
-            ))?;
+            .map_err(|e| {
+                anyhow!(
+                    "failed to claim work unit {}: {}",
+                    work_unit.id(),
+                    e
+                )
+            })?;
 
-        self.persist_work_unit(work_unit_path, work_unit).await?;
+        self.persist_work_unit(work_unit_path, work_unit)
+            .await?;
+
+        if let Err(err) = self.validate_input(work_unit).await {
+            let reason = err.to_string();
+
+            work_unit
+                .fail(
+                    self.worker_id(),
+                    attempt,
+                    reason.clone(),
+                    false,
+                )
+                .map_err(|state_err| {
+                    anyhow!(
+                        "work unit {} input validation failed with '{}', \
+                         and FAILED transition also failed: {}",
+                        work_unit.id(),
+                        reason,
+                        state_err
+                    )
+                })?;
+
+            self.persist_work_unit(work_unit_path, work_unit)
+                .await?;
+
+            return Err(anyhow!(
+                "work unit {} attempt {} failed validation: {}",
+                work_unit.id(),
+                attempt,
+                reason
+            ));
+        }
 
         if let Err(err) = self.validate_backend_reference(work_unit).await {
             let reason = err.to_string();
+
             work_unit
-                .fail(self.worker_id(), attempt, reason.clone(), true)
-                .map_err(|state_err| anyhow!(
-                    "work unit {} reference validation failed with '{}', and FAILED transition also failed: {}",
-                    work_unit.id(), reason, state_err
-                ))?;
-            self.persist_work_unit(work_unit_path, work_unit).await?;
+                .fail(
+                    self.worker_id(),
+                    attempt,
+                    reason.clone(),
+                    true,
+                )
+                .map_err(|state_err| {
+                    anyhow!(
+                        "work unit {} reference validation failed with '{}', \
+                         and FAILED transition also failed: {}",
+                        work_unit.id(),
+                        reason,
+                        state_err
+                    )
+                })?;
+
+            self.persist_work_unit(work_unit_path, work_unit)
+                .await?;
+
             return Err(anyhow!(
-                "work unit {} attempt {} failed: {}",
-                work_unit.id(), attempt, reason
+                "work unit {} attempt {} failed reference validation: {}",
+                work_unit.id(),
+                attempt,
+                reason
             ));
         }
 
         work_unit
             .start(self.worker_id(), attempt)
-            .map_err(|e| anyhow!(
-                "failed to start work unit {}: {}",
-                work_unit.id(),
-                e
-            ))?;
+            .map_err(|e| {
+                anyhow!(
+                    "failed to start work unit {}: {}",
+                    work_unit.id(),
+                    e
+                )
+            })?;
 
-        self.persist_work_unit(work_unit_path, work_unit).await?;
+        self.persist_work_unit(work_unit_path, work_unit)
+            .await?;
 
         info!(
             "[worker:{}] START work unit={} attempt={} backend={:?}",
@@ -144,45 +201,77 @@ impl WorkerExecutor {
         match self.execute_attempt(work_unit, attempt).await {
             Ok(result) => {
                 work_unit
-                    .complete(self.worker_id(), attempt, result.clone())
-                    .map_err(|e| anyhow!(
-                        "execution succeeded but completion transition failed for {}: {}",
-                        work_unit.id(), e
-                    ))?;
+                    .complete(
+                        self.worker_id(),
+                        attempt,
+                        result.clone(),
+                    )
+                    .map_err(|e| {
+                        anyhow!(
+                            "execution succeeded but completion transition \
+                             failed for {}: {}",
+                            work_unit.id(),
+                            e
+                        )
+                    })?;
 
-                self.persist_work_unit(work_unit_path, work_unit).await?;
-                self.publish_completion_metadata(work_unit).await?;
+                self.persist_work_unit(work_unit_path, work_unit)
+                    .await?;
+
+                self.publish_completion_metadata(work_unit)
+                    .await?;
 
                 info!(
                     "[worker:{}] DONE work unit={} attempt={} result={} bytes={} rows={}",
-                    self.worker_id(), work_unit.id(), attempt,
-                    result.result_path.display(), result.result_bytes, result.result_rows
+                    self.worker_id(),
+                    work_unit.id(),
+                    attempt,
+                    result.result_path.display(),
+                    result.result_bytes,
+                    result.result_rows
                 );
+
                 Ok(result)
             }
 
             Err(err) => {
                 let reason = err.to_string();
-                work_unit
-                    .fail(self.worker_id(), attempt, reason.clone(), true)
-                    .map_err(|state_err| anyhow!(
-                        "work unit {} failed with '{}', and FAILED transition also failed: {}",
-                        work_unit.id(), reason, state_err
-                    ))?;
 
-                self.persist_work_unit(work_unit_path, work_unit).await?;
-                let _ = self.publish_completion_metadata(work_unit).await;
+                work_unit
+                    .fail(
+                        self.worker_id(),
+                        attempt,
+                        reason.clone(),
+                        true,
+                    )
+                    .map_err(|state_err| {
+                        anyhow!(
+                            "work unit {} failed with '{}', \
+                             and FAILED transition also failed: {}",
+                            work_unit.id(),
+                            reason,
+                            state_err
+                        )
+                    })?;
+
+                self.persist_work_unit(work_unit_path, work_unit)
+                    .await?;
+
+                let _ = self
+                    .publish_completion_metadata(work_unit)
+                    .await;
 
                 Err(anyhow!(
                     "work unit {} attempt {} failed: {}",
-                    work_unit.id(), attempt, reason
+                    work_unit.id(),
+                    attempt,
+                    reason
                 ))
             }
         }
     }
 
-    /// Persist the current WorkUnit state atomically: write a complete JSON
-    /// document beside the original file, then rename it over the original.
+    /// Persist the current WorkUnit state atomically.
     async fn persist_work_unit(
         &self,
         work_unit_path: &Path,
@@ -191,23 +280,37 @@ impl WorkerExecutor {
         let payload = serde_json::to_vec_pretty(work_unit)
             .context("failed to serialize WorkUnit")?;
 
-        let parent = work_unit_path.parent().ok_or_else(|| {
-            anyhow!("work unit path has no parent: {}", work_unit_path.display())
-        })?;
+        let parent = work_unit_path
+            .parent()
+            .ok_or_else(|| {
+                anyhow!(
+                    "work unit path has no parent: {}",
+                    work_unit_path.display()
+                )
+            })?;
 
         fs::create_dir_all(parent).await?;
 
         let temp_path = work_unit_path.with_extension("json.tmp");
-        fs::write(&temp_path, payload).await.with_context(|| {
-            format!("failed to write temporary WorkUnit {}", temp_path.display())
-        })?;
 
-        fs::rename(&temp_path, work_unit_path).await.with_context(|| {
-            format!(
-                "failed to publish WorkUnit state {} -> {}",
-                temp_path.display(), work_unit_path.display()
-            )
-        })?;
+        fs::write(&temp_path, payload)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to write temporary WorkUnit {}",
+                    temp_path.display()
+                )
+            })?;
+
+        fs::rename(&temp_path, work_unit_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to publish WorkUnit state {} -> {}",
+                    temp_path.display(),
+                    work_unit_path.display()
+                )
+            })?;
 
         Ok(())
     }
@@ -217,8 +320,6 @@ impl WorkerExecutor {
         work_unit: &WorkUnit,
         attempt: u32,
     ) -> Result<WorkUnitResult> {
-        self.validate_input(work_unit).await?;
-
         let attempt_dir = self
             .config
             .scratch_dir
@@ -294,8 +395,8 @@ impl WorkerExecutor {
 
         fs::create_dir_all(&tmp_dir).await?;
 
-        // Preserve the existing pipeline boundary:
-        // paired R1/R2 -> combined FASTQ -> MMseqs createdb.
+        // Work units carry separate R1/R2 chunk paths. Preserve the same
+        // combined-FASTQ boundary used by the existing single-node MMseqs path.
         write_combined_fastq(
             work_unit.r1_path.clone(),
             work_unit.r2_path.clone(),
@@ -310,7 +411,7 @@ impl WorkerExecutor {
         };
 
         // ------------------------------------------------------------
-        // createdb
+        // 1. FASTQ -> query DB
         // ------------------------------------------------------------
         let createdb_config = MmseqsConfig {
             subcommand: MmseqsSubcommand::Createdb,
@@ -330,18 +431,27 @@ impl WorkerExecutor {
             index_subset: None,
             format_output: None,
             cuda_visible_devices: None,
-            option_fields: std::collections::HashMap::new(),
+            option_fields: HashMap::from([
+                (
+                    "--dbtype".to_string(),
+                    Some("2".to_string()),
+                ),
+            ]),
             gpu_server: false,
         };
 
-        let args = generate_mmseqs_args(
-            &execution,
-            &createdb_config,
-        )?;
+        let createdb_args =
+            generate_mmseqs_args(&execution, &createdb_config)?;
+
+        info!(
+            "[worker:{}] MMseqs createdb args: {:?}",
+            self.worker_id(),
+            createdb_args
+        );
 
         self.run_external(
             MMSEQS_TAG,
-            args,
+            createdb_args,
             attempt_dir,
             "createdb",
         )
@@ -354,30 +464,124 @@ impl WorkerExecutor {
             .await?;
 
         // ------------------------------------------------------------
-        // search
+        // 2. Start gpuserver for GPU backend
         // ------------------------------------------------------------
+        let mut gpu_server: Option<Child> = None;
+
+        if backend == MmseqsBackend::Gpu {
+            info!(
+                "[worker:{}] Starting MMseqs GPU server for {}",
+                self.worker_id(),
+                target_db.display()
+            );
+
+            let server = spawn_gpuserver(
+                &target_db,
+                None,
+            )
+                .await
+                .context("failed to start MMseqs GPU server")?;
+
+            gpu_server = Some(server);
+
+            // Give gpuserver a bounded warm-up period while verifying that it
+            // has not exited prematurely.
+            for second in 1..=20 {
+                if let Some(server) = gpu_server.as_mut() {
+                    match server.try_wait() {
+                        Ok(Some(status)) => {
+                            return Err(anyhow!(
+                                "MMseqs GPU server exited during warmup after {}s \
+                                 with status {:?}",
+                                second,
+                                status
+                            ));
+                        }
+
+                        Ok(None) => {}
+
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "failed checking MMseqs GPU server during warmup: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+
+                tokio::time::sleep(
+                    tokio::time::Duration::from_secs(1)
+                )
+                    .await;
+            }
+
+            info!(
+                "[worker:{}] MMseqs GPU server remained running through warmup",
+                self.worker_id()
+            );
+        }
+
+        // ------------------------------------------------------------
+        // 3. Search
+        // ------------------------------------------------------------
+        //
+        // IMPORTANT:
+        // Do not manually append GPU flags here.
+        //
+        // command.rs owns MMseqs CLI construction. For GPU + gpu_server=true,
+        // it supplies:
+        //
+        //   --gpu 1
+        //   --gpu-server 1
+        //   --db-load-mode 2
+        //   --prefilter-mode 1 (when not explicitly overridden)
+        //
+        // The worker therefore only expresses the configuration.
         let search_config = MmseqsConfig {
             subcommand: MmseqsSubcommand::Search,
             backend,
+
             input: Some(query_db.clone()),
             target_db: Some(target_db.clone()),
             result_db: Some(result_db.clone()),
             output: None,
             tmp_dir: Some(tmp_dir.clone()),
+
             threads: Some(self.config.threads),
 
-            // Same production MMseqs parameters used by the existing
-            // single-machine implementation.
-            sensitivity: Some("5.7".to_string()),
+            // CPU retains the established production sensitivity.
+            // GPU leaves sensitivity unset because the GPU command path
+            // does not use the CPU -s setting here.
+            sensitivity: match backend {
+                MmseqsBackend::Cpu => Some("5.7".to_string()),
+                MmseqsBackend::Gpu => None,
+            },
+
+            // Preserve the established distributed search parameters.
             search_type: Some("3".to_string()),
-            max_seqs: Some("1000".to_string()),
-            prefilter_mode: Some("0".to_string()),
+
+            max_seqs: Some(match backend {
+                MmseqsBackend::Cpu => "1000".to_string(),
+                MmseqsBackend::Gpu => "3000".to_string(),
+            }),
+
+            // IMPORTANT:
+            // Leave GPU prefilter_mode as None so command.rs applies the
+            // GPU-server default of 1. CPU retains the existing 0.
+            prefilter_mode: match backend {
+                MmseqsBackend::Cpu => Some("0".to_string()),
+                MmseqsBackend::Gpu => None,
+            },
+
             db_load_mode: Some("2".to_string()),
+
             alignment_mode: Some("3".to_string()),
+
             index_subset: None,
             format_output: None,
             cuda_visible_devices: None,
-            option_fields: std::collections::HashMap::from([
+
+            option_fields: HashMap::from([
                 (
                     "-e".to_string(),
                     Some("0.001".to_string()),
@@ -387,21 +591,57 @@ impl WorkerExecutor {
                     Some("0.25".to_string()),
                 ),
             ]),
-            gpu_server: false,
+
+            gpu_server: backend == MmseqsBackend::Gpu,
         };
 
-        let args = generate_mmseqs_args(
-            &execution,
-            &search_config,
-        )?;
+        let search_args =
+            generate_mmseqs_args(&execution, &search_config)?;
 
-        self.run_external(
-            MMSEQS_TAG,
-            args,
-            attempt_dir,
-            "search",
-        )
-            .await?;
+        info!(
+            "[worker:{}] MMseqs {:?} search args: {:?}",
+            self.worker_id(),
+            backend,
+            search_args
+        );
+
+        let search_result = self
+            .run_external(
+                MMSEQS_TAG,
+                search_args,
+                attempt_dir,
+                "search",
+            )
+            .await;
+
+        // Always shut down the per-attempt GPU server after search, whether
+        // search succeeded or failed.
+        if let Some(mut server) = gpu_server {
+            info!(
+                "[worker:{}] Stopping MMseqs GPU server",
+                self.worker_id()
+            );
+
+            let stop_result =
+                stop_gpuserver(&mut server).await;
+
+            if let Err(stop_err) = stop_result {
+                warn!(
+                    "[worker:{}] MMseqs GPU server shutdown failed: {}",
+                    self.worker_id(),
+                    stop_err
+                );
+
+                if search_result.is_ok() {
+                    return Err(anyhow!(
+                        "MMseqs search completed but GPU server shutdown failed: {}",
+                        stop_err
+                    ));
+                }
+            }
+        }
+
+        search_result?;
 
         self.require_mmseqs_db(
             &result_db,
@@ -410,16 +650,18 @@ impl WorkerExecutor {
             .await?;
 
         // ------------------------------------------------------------
-        // convertalis
+        // 4. convertalis -> m8
         // ------------------------------------------------------------
         let convert_config = MmseqsConfig {
             subcommand: MmseqsSubcommand::ConvertAlis,
             backend: MmseqsBackend::Cpu,
+
             input: Some(query_db),
             target_db: Some(target_db),
             result_db: Some(result_db),
             output: Some(output_m8.clone()),
             tmp_dir: None,
+
             threads: None,
             sensitivity: None,
             search_type: None,
@@ -428,33 +670,50 @@ impl WorkerExecutor {
             db_load_mode: None,
             alignment_mode: None,
             index_subset: None,
+
             format_output: Some(
                 "query,target,pident,alnlen,mismatch,gapopen,\
                  qstart,qend,tstart,tend,evalue,bits"
                     .replace(' ', ""),
             ),
+
             cuda_visible_devices: None,
-            option_fields: std::collections::HashMap::new(),
+            option_fields: HashMap::new(),
             gpu_server: false,
         };
 
-        let args = generate_mmseqs_args(
-            &execution,
-            &convert_config,
-        )?;
+        let convert_args =
+            generate_mmseqs_args(&execution, &convert_config)?;
+
+        info!(
+            "[worker:{}] MMseqs convertalis args: {:?}",
+            self.worker_id(),
+            convert_args
+        );
 
         self.run_external(
             MMSEQS_TAG,
-            args,
+            convert_args,
             attempt_dir,
             "convertalis",
         )
             .await?;
 
+        let m8_validation =
+            validate_m8(&output_m8).await?;
+
+        info!(
+            "[worker:{}] MMseqs result validated: rows={} path={}",
+            self.worker_id(),
+            m8_validation.rows,
+            output_m8.display()
+        );
+
         self.publish_result(
             work_unit,
             attempt,
             &output_m8,
+            m8_validation.rows,
         )
             .await
     }
@@ -481,17 +740,16 @@ impl WorkerExecutor {
 
         let mut output_parts = Vec::new();
 
-        // Diamond operates independently on R1 and R2 when paired-end input
-        // is provided. The resulting m8 files are concatenated into the
-        // durable per-chunk result.
-        let r1_out = attempt_dir.join("diamond_R1.m8");
+        // R1
+        let r1_out =
+            attempt_dir.join("diamond_R1.m8");
 
         let r1_config = DiamondConfig {
             subcommand: DiamondSubcommand::Blastx,
             db: diamond_db.clone(),
             r1_path: Some(work_unit.r1_path.clone()),
             r2_path: None,
-            subcommand_fields: std::collections::HashMap::from([
+            subcommand_fields: HashMap::from([
                 (
                     "--query".to_string(),
                     Some(
@@ -516,10 +774,8 @@ impl WorkerExecutor {
             ]),
         };
 
-        let args = generate_diamond_args(
-            &execution,
-            &r1_config,
-        )?;
+        let args =
+            generate_diamond_args(&execution, &r1_config)?;
 
         self.run_external(
             DIAMOND_TAG,
@@ -537,19 +793,22 @@ impl WorkerExecutor {
 
         output_parts.push(r1_out);
 
+        // R2
         if let Some(r2) = &work_unit.r2_path {
-            let r2_out = attempt_dir.join("diamond_R2.m8");
+            let r2_out =
+                attempt_dir.join("diamond_R2.m8");
 
             let r2_config = DiamondConfig {
                 subcommand: DiamondSubcommand::Blastx,
                 db: diamond_db,
                 r1_path: Some(r2.clone()),
                 r2_path: None,
-                subcommand_fields: std::collections::HashMap::from([
+                subcommand_fields: HashMap::from([
                     (
                         "--query".to_string(),
                         Some(
-                            r2.to_string_lossy().to_string(),
+                            r2.to_string_lossy()
+                                .to_string(),
                         ),
                     ),
                     (
@@ -567,10 +826,11 @@ impl WorkerExecutor {
                 ]),
             };
 
-            let args = generate_diamond_args(
-                &execution,
-                &r2_config,
-            )?;
+            let args =
+                generate_diamond_args(
+                    &execution,
+                    &r2_config,
+                )?;
 
             self.run_external(
                 DIAMOND_TAG,
@@ -589,12 +849,16 @@ impl WorkerExecutor {
             output_parts.push(r2_out);
         }
 
-        let merged_m8 = attempt_dir.join("result.m8");
+        // Merge R1/R2 result files.
+        let merged_m8 =
+            attempt_dir.join("result.m8");
 
         let mut merged =
             fs::File::create(&merged_m8)
                 .await
-                .context("failed to create merged Diamond m8")?;
+                .context(
+                    "failed to create merged Diamond m8",
+                )?;
 
         for part in output_parts {
             let mut input =
@@ -609,19 +873,22 @@ impl WorkerExecutor {
 
         drop(merged);
 
+        let m8_validation =
+            validate_m8(&merged_m8).await?;
+
         self.publish_result(
             work_unit,
             attempt,
             &merged_m8,
+            m8_validation.rows,
         )
             .await
     }
 
     /// Shared external command execution.
     ///
-    /// Uses the repository-wide spawn_external_cmd() implementation so the
-    /// worker and launch-node pipeline share the same process-launching and
-    /// NUMA behavior.
+    /// The repository-wide spawn_external_cmd implementation is used so the
+    /// worker follows the same process-launching / NUMA policy as the pipeline.
     async fn run_external(
         &self,
         cmd_tag: &str,
@@ -629,9 +896,11 @@ impl WorkerExecutor {
         work_dir: &Path,
         label: &str,
     ) -> Result<()> {
-        let stderr_log = work_dir.join(
-            format!("{}.stderr.log", label),
-        );
+        let stderr_log =
+            work_dir.join(format!(
+                "{}.stderr.log",
+                label
+            ));
 
         debug!(
             "[worker:{}] spawning {}: {:?}",
@@ -652,21 +921,25 @@ impl WorkerExecutor {
                 .with_context(|| {
                     format!(
                         "failed to spawn {} for {}",
-                        cmd_tag, label
+                        cmd_tag,
+                        label
                     )
                 })?;
 
-        let status = child.wait().await
-            .with_context(|| {
+        let status =
+            child.wait().await.with_context(|| {
                 format!(
                     "failed waiting for {} {}",
-                    cmd_tag, label
+                    cmd_tag,
+                    label
                 )
             })?;
 
         stderr_task
             .await
-            .context("stderr handler task failed")??;
+            .context(
+                "stderr handler task failed",
+            )??;
 
         if !status.success() {
             return Err(anyhow!(
@@ -732,25 +1005,58 @@ impl WorkerExecutor {
         Ok(())
     }
 
-    async fn validate_backend_reference(&self, work_unit: &WorkUnit) -> Result<()> {
+    async fn validate_backend_reference(
+        &self,
+        work_unit: &WorkUnit,
+    ) -> Result<()> {
         let (db, version_path) = match self.backend {
             WorkerBackend::MmseqsCpu => (
-                self.config.mmseqs_db.as_ref().ok_or_else(|| {
-                    anyhow!("MMseqs CPU backend selected without worker-local MMseqs DB")
-                })?,
-                self.config.scratch_dir.join("refs/mmseqs/.reference_version"),
+                self.config
+                    .mmseqs_db
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "MMseqs CPU backend selected without \
+                             worker-local MMseqs DB"
+                        )
+                    })?,
+                self.config
+                    .scratch_dir
+                    .join("refs/mmseqs/.reference_version"),
             ),
+
             WorkerBackend::MmseqsGpu => (
-                self.config.mmseqs_db.as_ref().ok_or_else(|| {
-                    anyhow!("MMseqs GPU backend selected without worker-local MMseqs DB")
-                })?,
-                self.config.scratch_dir.join("refs/mmseqs-gpu/.reference_version"),
+                self.config
+                    .mmseqs_db
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "MMseqs GPU backend selected without \
+                             worker-local MMseqs DB"
+                        )
+                    })?,
+                self.config
+                    .scratch_dir
+                    .join(
+                        "refs/mmseqs-gpu/.reference_version"
+                    ),
             ),
+
             WorkerBackend::Diamond => (
-                self.config.diamond_db.as_ref().ok_or_else(|| {
-                    anyhow!("Diamond backend selected without worker-local Diamond DB")
-                })?,
-                self.config.scratch_dir.join("refs/diamond/.reference_version"),
+                self.config
+                    .diamond_db
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Diamond backend selected without \
+                             worker-local Diamond DB"
+                        )
+                    })?,
+                self.config
+                    .scratch_dir
+                    .join(
+                        "refs/diamond/.reference_version"
+                    ),
             ),
         };
 
@@ -761,16 +1067,18 @@ impl WorkerExecutor {
             ));
         }
 
-        let local_version = fs::read_to_string(&version_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to read worker-local reference version {}",
-                    version_path.display()
-                )
-            })?
-            .trim()
-            .to_string();
+        let local_version =
+            fs::read_to_string(&version_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to read worker-local reference \
+                         version {}",
+                        version_path.display()
+                    )
+                })?
+                .trim()
+                .to_string();
 
         if local_version.is_empty() {
             return Err(anyhow!(
@@ -781,14 +1089,18 @@ impl WorkerExecutor {
 
         if local_version != work_unit.reference_version {
             return Err(anyhow!(
-                "reference version mismatch for {}: work unit requires {}, worker has {}",
-                work_unit.id(), work_unit.reference_version, local_version
+                "reference version mismatch for {}: \
+                 work unit requires {}, worker has {}",
+                work_unit.id(),
+                work_unit.reference_version,
+                local_version
             ));
         }
 
         info!(
             "[worker:{}] reference version validated: {}",
-            self.worker_id(), local_version
+            self.worker_id(),
+            local_version
         );
 
         Ok(())
@@ -812,8 +1124,8 @@ impl WorkerExecutor {
 
     /// Validate an MMseqs database prefix.
     ///
-    /// MMseqs databases may be represented by a prefix plus sidecar files and
-    /// split parts, so the prefix itself does not necessarily exist as a file.
+    /// MMseqs databases consist of a prefix plus sidecar files, so the
+    /// prefix itself does not necessarily exist as a normal file.
     async fn require_mmseqs_db(
         &self,
         path: &Path,
@@ -823,72 +1135,116 @@ impl WorkerExecutor {
             return Ok(());
         }
 
-        let dbtype = path.with_extension("dbtype");
+        let dbtype =
+            path.with_extension("dbtype");
+
         if !dbtype.is_file() {
             return Err(anyhow!(
-                "{} was not produced: missing MMseqs dbtype file {}",
+                "{} was not produced: missing MMseqs \
+                 dbtype file {}",
                 description,
                 dbtype.display()
             ));
         }
 
-        if path.with_extension("index").is_file() {
+        if path
+            .with_extension("index")
+            .is_file()
+        {
             return Ok(());
         }
 
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let prefix = path.file_name().and_then(|v| v.to_str()).unwrap_or_default();
-        let numbered_prefix = format!("{}.", prefix);
+        let parent =
+            path.parent().unwrap_or_else(|| Path::new("."));
 
-        let mut entries = fs::read_dir(parent).await.with_context(|| {
-            format!("failed to inspect MMseqs database directory {}", parent.display())
-        })?;
+        let prefix =
+            path.file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default();
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(suffix) = name.strip_prefix(&numbered_prefix) {
-                if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+        let numbered_prefix =
+            format!("{}.", prefix);
+
+        let mut entries =
+            fs::read_dir(parent)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to inspect MMseqs database \
+                         directory {}",
+                        parent.display()
+                    )
+                })?;
+
+        while let Some(entry) =
+            entries.next_entry().await?
+        {
+            let name =
+                entry.file_name();
+
+            let name =
+                name.to_string_lossy();
+
+            if let Some(suffix) =
+                name.strip_prefix(&numbered_prefix)
+            {
+                if !suffix.is_empty()
+                    && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                {
                     return Ok(());
                 }
             }
         }
 
         Err(anyhow!(
-            "{} was not produced: MMseqs database prefix {} has no .index or numbered split parts",
+            "{} was not produced: MMseqs database \
+             prefix {} has no .index or numbered split parts",
             description,
             path.display()
         ))
     }
 
-    /// Validates and atomically publishes a completed m8 result.
+    /// Publish a validated m8 result to durable EFS storage.
     async fn publish_result(
         &self,
         work_unit: &WorkUnit,
         attempt: u32,
         temporary_m8: &Path,
+        result_rows: u64,
     ) -> Result<WorkUnitResult> {
-        let validation = validate_m8(temporary_m8).await?;
+        fs::create_dir_all(
+            &self.config.results_dir
+        )
+            .await?;
 
-        fs::create_dir_all(&self.config.results_dir).await?;
+        let final_name =
+            format!(
+                "chunk_{:08}_attempt_{:03}.m8",
+                work_unit.chunk_id,
+                attempt
+            );
 
-        let final_name = format!(
-            "chunk_{:08}_attempt_{:03}.m8",
-            work_unit.chunk_id,
-            attempt
-        );
+        let final_path =
+            self.config.results_dir
+                .join(final_name);
 
-        let final_path = self.config.results_dir.join(final_name);
+        let temp_name =
+            format!(
+                "chunk_{:08}_attempt_{:03}.m8.tmp",
+                work_unit.chunk_id,
+                attempt
+            );
 
-        let temp_name = format!(
-            "chunk_{:08}_attempt_{:03}.m8.tmp",
-            work_unit.chunk_id,
-            attempt
-        );
+        let temp_path =
+            self.config.results_dir
+                .join(temp_name);
 
-        let temp_path = self.config.results_dir.join(temp_name);
-
-        fs::copy(temporary_m8, &temp_path)
+        fs::copy(
+            temporary_m8,
+            &temp_path,
+        )
             .await
             .with_context(|| {
                 format!(
@@ -898,8 +1254,10 @@ impl WorkerExecutor {
                 )
             })?;
 
-        // Publication is now atomic because both paths are on EFS.
-        fs::rename(&temp_path, &final_path)
+        fs::rename(
+            &temp_path,
+            &final_path,
+        )
             .await
             .with_context(|| {
                 format!(
@@ -909,14 +1267,15 @@ impl WorkerExecutor {
                 )
             })?;
 
-        let metadata = fs::metadata(&final_path).await?;
+        let metadata =
+            fs::metadata(&final_path).await?;
 
         Ok(WorkUnitResult {
             worker_id: self.worker_id().to_string(),
             attempt,
             result_path: final_path,
             result_bytes: metadata.len(),
-            result_rows: validation.rows,
+            result_rows,
             checksum: None,
         })
     }
@@ -925,17 +1284,21 @@ impl WorkerExecutor {
         &self,
         work_unit: &WorkUnit,
     ) -> Result<()> {
-        fs::create_dir_all(&self.config.results_dir)
+        fs::create_dir_all(
+            &self.config.results_dir
+        )
             .await?;
 
-        let metadata_name = format!(
-            "chunk_{:08}_attempt_{:03}.json",
-            work_unit.chunk_id,
-            work_unit.attempt
-        );
+        let metadata_name =
+            format!(
+                "chunk_{:08}_attempt_{:03}.json",
+                work_unit.chunk_id,
+                work_unit.attempt
+            );
 
         let metadata_path =
-            self.config.results_dir.join(metadata_name);
+            self.config.results_dir
+                .join(metadata_name);
 
         let temporary_path =
             metadata_path.with_extension("json.tmp");
@@ -959,7 +1322,8 @@ impl WorkerExecutor {
             .await
             .with_context(|| {
                 format!(
-                    "failed to publish completion metadata {} -> {}",
+                    "failed to publish completion metadata \
+                 {} -> {}",
                     temporary_path.display(),
                     metadata_path.display()
                 )
@@ -974,18 +1338,22 @@ struct M8Validation {
     rows: u64,
 }
 
-/// Validate the generated 12-column tabular m8.
+/// Validate generated 12-column tabular m8.
 ///
-/// A zero-row result is valid.
-async fn validate_m8(path: &Path) -> Result<M8Validation> {
-    let file = fs::File::open(path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to open generated m8 {}",
-                path.display()
-            )
-        })?;
+/// A zero-row result is valid; an m8 file containing no alignments is not
+/// itself an execution failure.
+async fn validate_m8(
+    path: &Path,
+) -> Result<M8Validation> {
+    let file =
+        fs::File::open(path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open generated m8 {}",
+                    path.display()
+                )
+            })?;
 
     let mut reader =
         BufReader::new(file).lines();
@@ -995,13 +1363,17 @@ async fn validate_m8(path: &Path) -> Result<M8Validation> {
     while let Some(line) =
         reader.next_line().await?
     {
-        let line = line.trim();
+        let line =
+            line.trim();
 
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty()
+            || line.starts_with('#')
+        {
             continue;
         }
 
-        let fields: Vec<&str> =
+        let fields:
+            Vec<&str> =
             line.split('\t').collect();
 
         if fields.len() != 12 {
