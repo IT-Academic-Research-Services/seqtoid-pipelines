@@ -3519,13 +3519,6 @@ pub mod mmseqs {
                     args_vec.push(pm.clone());
                 }
 
-                if config.gpu_server && config.backend == MmseqsBackend::Gpu {
-                    if config.prefilter_mode.is_none() {
-                        args_vec.push("--prefilter-mode".to_string());
-                        args_vec.push("1".to_string());
-                    }
-                }
-
                 args_vec.push(query.to_string_lossy().to_string());
                 args_vec.push(target_db.to_string_lossy().to_string());
                 args_vec.push(result_db.to_string_lossy().to_string());
