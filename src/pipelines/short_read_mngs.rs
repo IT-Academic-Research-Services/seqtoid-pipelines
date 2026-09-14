@@ -9,6 +9,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ahash::AHashMap;
 use ahash::RandomState as AHashRandomState;
@@ -113,6 +114,8 @@ const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
 const REFERENCE_METADATA_BUCKET: &str = "seqtoid-public-references";
 
 const REFERENCE_METADATA_PREFIX: &str = "phase2/refs/metadata";
+
+const DISTRIBUTED_WORKER_STALE_SECS: u64 = 30;
 
 /// Holds the results from a Kallisto quantification run.
 #[derive(Debug)]
@@ -3784,12 +3787,24 @@ async fn distributed_non_host_align(
     }
 
     // ------------------------------------------------------------------
-    // 6. Wait for all WorkUnits to reach a terminal state.
+    // 6. Monitor WorkUnits, detect stale workers, and retry failed work.
     //
-    // Workers consume the shared work directory themselves. The launch
-    // node does not assign individual chunks.
+    // The scheduler loop remains the component that drives progress.
     //
-    // Retry/failure recovery is intentionally not implemented here.
+    // CLAIMED:
+    //   A worker may die after claiming but before RUNNING. Because no
+    //   heartbeat exists yet, use the WorkUnit JSON mtime as the claim age.
+    //
+    // RUNNING:
+    //   Use last_heartbeat to determine whether the worker is still alive.
+    //
+    // FAILED:
+    //   Retry only when failure.retryable=true.
+    //
+    // DONE:
+    //   Never modify.
+    //
+    // Recovery uses the same per-work-unit lock used by workers.
     // ------------------------------------------------------------------
 
     loop {
@@ -3798,6 +3813,7 @@ async fn distributed_non_host_align(
         let mut running = 0usize;
         let mut done = 0usize;
         let mut failed = 0usize;
+        let mut recovered = 0usize;
 
         let mut entries =
             tokio::fs::read_dir(&work_dir)
@@ -3865,12 +3881,430 @@ async fn distributed_non_host_align(
                     available += 1;
                 }
 
-                crate::utils::work_units::WorkUnitState::Claimed => {
-                    claimed += 1;
-                }
+                crate::utils::work_units::WorkUnitState::Claimed
+                | crate::utils::work_units::WorkUnitState::Running => {
+                    let now =
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "System clock error while checking work-unit {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?
+                            .as_secs();
 
-                crate::utils::work_units::WorkUnitState::Running => {
-                    running += 1;
+                    let stale =
+                        match work_unit.state {
+                            crate::utils::work_units::WorkUnitState::Claimed => {
+                                let metadata =
+                                    tokio::fs::metadata(&path)
+                                        .await
+                                        .map_err(|e| {
+                                            PipelineError::Other(anyhow!(
+                                                "Failed to stat claimed work unit {}: {}",
+                                                path.display(),
+                                                e
+                                            ))
+                                        })?;
+
+                                let modified =
+                                    metadata
+                                        .modified()
+                                        .map_err(|e| {
+                                            PipelineError::Other(anyhow!(
+                                                "Failed to read mtime for claimed work unit {}: {}",
+                                                path.display(),
+                                                e
+                                            ))
+                                        })?;
+
+                                let modified_secs =
+                                    modified
+                                        .duration_since(UNIX_EPOCH)
+                                        .map_err(|e| {
+                                            PipelineError::Other(anyhow!(
+                                                "Invalid mtime for claimed work unit {}: {}",
+                                                path.display(),
+                                                e
+                                            ))
+                                        })?
+                                        .as_secs();
+
+                                now.saturating_sub(modified_secs)
+                                    > DISTRIBUTED_WORKER_STALE_SECS
+                            }
+
+                            crate::utils::work_units::WorkUnitState::Running => {
+                                match work_unit.last_heartbeat {
+                                    Some(last_heartbeat) => {
+                                        now.saturating_sub(last_heartbeat)
+                                            > DISTRIBUTED_WORKER_STALE_SECS
+                                    }
+
+                                    None => {
+                                        let metadata =
+                                            tokio::fs::metadata(&path)
+                                                .await
+                                                .map_err(|e| {
+                                                    PipelineError::Other(anyhow!(
+                                                        "Failed to stat running work unit {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ))
+                                                })?;
+
+                                        let modified =
+                                            metadata
+                                                .modified()
+                                                .map_err(|e| {
+                                                    PipelineError::Other(anyhow!(
+                                                        "Failed to read mtime for running work unit {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ))
+                                                })?;
+
+                                        let modified_secs =
+                                            modified
+                                                .duration_since(UNIX_EPOCH)
+                                                .map_err(|e| {
+                                                    PipelineError::Other(anyhow!(
+                                                        "Invalid mtime for running work unit {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ))
+                                                })?
+                                                .as_secs();
+
+                                        now.saturating_sub(modified_secs)
+                                            > DISTRIBUTED_WORKER_STALE_SECS
+                                    }
+                                }
+                            }
+
+                            _ => false,
+                        };
+
+                    if !stale {
+                        match work_unit.state {
+                            crate::utils::work_units::WorkUnitState::Claimed => {
+                                claimed += 1;
+                            }
+
+                            crate::utils::work_units::WorkUnitState::Running => {
+                                running += 1;
+                            }
+
+                            _ => {}
+                        }
+
+                        continue;
+                    }
+
+                    // Acquire the same lock used by workers before modifying
+                    // the work unit. Re-read the WorkUnit after acquiring the
+                    // lock because the state may have changed since the first
+                    // read above.
+                    let lock_path =
+                        path.with_extension("json.lock");
+
+                    let lock_file =
+                        match tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&lock_path)
+                            .await
+                        {
+                            Ok(file) => file,
+
+                            Err(err)
+                            if err.kind()
+                                == std::io::ErrorKind::AlreadyExists =>
+                                {
+                                    match work_unit.state {
+                                        crate::utils::work_units::WorkUnitState::Claimed => {
+                                            claimed += 1;
+                                        }
+
+                                        crate::utils::work_units::WorkUnitState::Running => {
+                                            running += 1;
+                                        }
+
+                                        _ => {}
+                                    }
+
+                                    continue;
+                                }
+
+                            Err(err) => {
+                                return Err(
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to acquire recovery lock {}: {}",
+                                        lock_path.display(),
+                                        err
+                                    ))
+                                );
+                            }
+                        };
+
+                    let recovery_result: Result<bool, PipelineError> = async {
+                        let current_bytes =
+                            tokio::fs::read(&path)
+                                .await
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to reread work unit {} during recovery: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                        let mut current_work_unit:
+                            crate::utils::work_units::WorkUnit =
+                            serde_json::from_slice(&current_bytes)
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to parse work unit {} during recovery: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                        let now =
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "System clock error during recovery: {}",
+                                        e
+                                    ))
+                                })?
+                                .as_secs();
+
+                        let current_stale =
+                            match current_work_unit.state {
+                                crate::utils::work_units::WorkUnitState::Claimed => {
+                                    let metadata =
+                                        tokio::fs::metadata(&path)
+                                            .await
+                                            .map_err(|e| {
+                                                PipelineError::Other(anyhow!(
+                                                    "Failed to stat claimed work unit {} during recovery: {}",
+                                                    path.display(),
+                                                    e
+                                                ))
+                                            })?;
+
+                                    let modified =
+                                        metadata
+                                            .modified()
+                                            .map_err(|e| {
+                                                PipelineError::Other(anyhow!(
+                                                    "Failed to read claimed work-unit mtime {}: {}",
+                                                    path.display(),
+                                                    e
+                                                ))
+                                            })?;
+
+                                    let modified_secs =
+                                        modified
+                                            .duration_since(UNIX_EPOCH)
+                                            .map_err(|e| {
+                                                PipelineError::Other(anyhow!(
+                                                    "Invalid claimed work-unit mtime {}: {}",
+                                                    path.display(),
+                                                    e
+                                                ))
+                                            })?
+                                            .as_secs();
+
+                                    now.saturating_sub(modified_secs)
+                                        > DISTRIBUTED_WORKER_STALE_SECS
+                                }
+
+                                crate::utils::work_units::WorkUnitState::Running => {
+                                    match current_work_unit.last_heartbeat {
+                                        Some(last_heartbeat) => {
+                                            now.saturating_sub(last_heartbeat)
+                                                > DISTRIBUTED_WORKER_STALE_SECS
+                                        }
+
+                                        None => false,
+                                    }
+                                }
+
+                                _ => false,
+                            };
+
+                        if !current_stale {
+                            return Ok(false);
+                        }
+
+                        let worker_id =
+                            current_work_unit
+                                .claimed_by
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    "unknown-worker".to_string()
+                                });
+
+                        let attempt =
+                            current_work_unit.attempt;
+
+                        let state =
+                            current_work_unit.state;
+
+                        let reason =
+                            match state {
+                                crate::utils::work_units::WorkUnitState::Claimed => {
+                                    format!(
+                                        "worker {} became stale while CLAIMED; \
+                                         no RUNNING transition within {} seconds",
+                                        worker_id,
+                                        DISTRIBUTED_WORKER_STALE_SECS
+                                    )
+                                }
+
+                                crate::utils::work_units::WorkUnitState::Running => {
+                                    match current_work_unit.last_heartbeat {
+                                        Some(last_heartbeat) => format!(
+                                            "worker {} became stale while RUNNING; \
+                                             last heartbeat was {} seconds ago",
+                                            worker_id,
+                                            now.saturating_sub(last_heartbeat)
+                                        ),
+
+                                        None => format!(
+                                            "worker {} became stale while RUNNING; \
+                                             no heartbeat recorded",
+                                            worker_id
+                                        ),
+                                    }
+                                }
+
+                                _ => {
+                                    return Ok(false);
+                                }
+                            };
+
+                        warn!(
+                            "Distributed NR: worker failure detected: \
+                             work unit={} worker={} attempt={} state={:?}: {}",
+                            current_work_unit.id(),
+                            worker_id,
+                            attempt,
+                            state,
+                            reason
+                        );
+
+                        current_work_unit
+                            .fail(
+                                &worker_id,
+                                attempt,
+                                reason,
+                                true,
+                            )
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to mark stale work unit {} as FAILED: {}",
+                                    current_work_unit.id(),
+                                    e
+                                ))
+                            })?;
+
+                        current_work_unit
+                            .retry()
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to requeue stale work unit {}: {}",
+                                    current_work_unit.id(),
+                                    e
+                                ))
+                            })?;
+
+                        let payload =
+                            serde_json::to_vec_pretty(
+                                &current_work_unit,
+                            )
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to serialize requeued work unit {}: {}",
+                                        current_work_unit.id(),
+                                        e
+                                    ))
+                                })?;
+
+                        let tmp_path =
+                            path.with_extension("json.tmp");
+
+                        tokio::fs::write(
+                            &tmp_path,
+                            payload,
+                        )
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to write requeued work unit {}: {}",
+                                    tmp_path.display(),
+                                    e
+                                ))
+                            })?;
+
+                        tokio::fs::rename(
+                            &tmp_path,
+                            &path,
+                        )
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to publish requeued work unit {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?;
+
+                        info!(
+                            "Distributed NR: requeued work unit {} \
+                             after stale worker {} attempt {}",
+                            current_work_unit.id(),
+                            worker_id,
+                            attempt
+                        );
+
+                        Ok(true)
+                    }
+                        .await;
+
+                    drop(lock_file);
+
+                    if let Err(err) =
+                        tokio::fs::remove_file(&lock_path).await
+                    {
+                        warn!(
+                            "Distributed NR: failed to remove recovery lock {}: {}",
+                            lock_path.display(),
+                            err
+                        );
+                    }
+
+                    if recovery_result? {
+                        recovered += 1;
+                        available += 1;
+                    } else {
+                        match work_unit.state {
+                            crate::utils::work_units::WorkUnitState::Claimed => {
+                                claimed += 1;
+                            }
+
+                            crate::utils::work_units::WorkUnitState::Running => {
+                                running += 1;
+                            }
+
+                            _ => {}
+                        }
+                    }
                 }
 
                 crate::utils::work_units::WorkUnitState::Done => {
@@ -3878,20 +4312,184 @@ async fn distributed_non_host_align(
                 }
 
                 crate::utils::work_units::WorkUnitState::Failed => {
-                    failed += 1;
+                    if work_unit
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.retryable)
+                        .unwrap_or(false)
+                    {
+                        let lock_path =
+                            path.with_extension("json.lock");
+
+                        let lock_file =
+                            match tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&lock_path)
+                                .await
+                            {
+                                Ok(file) => file,
+
+                                Err(err)
+                                if err.kind()
+                                    == std::io::ErrorKind::AlreadyExists =>
+                                    {
+                                        failed += 1;
+                                        continue;
+                                    }
+
+                                Err(err) => {
+                                    return Err(
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to acquire retry lock {}: {}",
+                                            lock_path.display(),
+                                            err
+                                        ))
+                                    );
+                                }
+                            };
+
+                        let retry_result: Result<bool, PipelineError> = async {
+                            let current_bytes =
+                                tokio::fs::read(&path)
+                                    .await
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to reread FAILED work unit {}: {}",
+                                            path.display(),
+                                            e
+                                        ))
+                                    })?;
+
+                            let mut current_work_unit:
+                                crate::utils::work_units::WorkUnit =
+                                serde_json::from_slice(&current_bytes)
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to parse FAILED work unit {}: {}",
+                                            path.display(),
+                                            e
+                                        ))
+                                    })?;
+
+                            if current_work_unit.state
+                                != crate::utils::work_units::WorkUnitState::Failed
+                            {
+                                return Ok(false);
+                            }
+
+                            let retryable =
+                                current_work_unit
+                                    .failure
+                                    .as_ref()
+                                    .map(|failure| failure.retryable)
+                                    .unwrap_or(false);
+
+                            if !retryable {
+                                return Ok(false);
+                            }
+
+                            let previous_attempt =
+                                current_work_unit.attempt;
+
+                            current_work_unit
+                                .retry()
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to retry work unit {}: {}",
+                                        current_work_unit.id(),
+                                        e
+                                    ))
+                                })?;
+
+                            let payload =
+                                serde_json::to_vec_pretty(
+                                    &current_work_unit,
+                                )
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to serialize requeued work unit {}: {}",
+                                            current_work_unit.id(),
+                                            e
+                                        ))
+                                    })?;
+
+                            let tmp_path =
+                                path.with_extension("json.tmp");
+
+                            tokio::fs::write(
+                                &tmp_path,
+                                payload,
+                            )
+                                .await
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to write requeued work unit {}: {}",
+                                        tmp_path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                            tokio::fs::rename(
+                                &tmp_path,
+                                &path,
+                            )
+                                .await
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to publish requeued work unit {}: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                            info!(
+                                "Distributed NR: requeued retryable FAILED work unit {} \
+                                 from attempt {}",
+                                current_work_unit.id(),
+                                previous_attempt
+                            );
+
+                            Ok(true)
+                        }
+                            .await;
+
+                        drop(lock_file);
+
+                        if let Err(err) =
+                            tokio::fs::remove_file(&lock_path).await
+                        {
+                            warn!(
+                                "Distributed NR: failed to remove retry lock {}: {}",
+                                lock_path.display(),
+                                err
+                            );
+                        }
+
+                        if retry_result? {
+                            recovered += 1;
+                            available += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    } else {
+                        failed += 1;
+                    }
                 }
             }
         }
 
         info!(
-            "Distributed NR scheduler: AVAILABLE={} CLAIMED={} RUNNING={} DONE={} FAILED={}",
+            "Distributed NR scheduler: AVAILABLE={} CLAIMED={} RUNNING={} DONE={} FAILED={} RECOVERED={}",
             available,
             claimed,
             running,
             done,
-            failed
+            failed,
+            recovered
         );
 
+        // Only non-retryable FAILED work units are terminal failures.
         if failed > 0 {
             return Err(
                 PipelineError::Other(anyhow!(
