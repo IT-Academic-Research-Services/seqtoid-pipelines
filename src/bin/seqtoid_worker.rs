@@ -154,12 +154,26 @@ async fn main() -> Result<()> {
             }
 
             None => {
+                if has_work_in_progress(&work_unit_paths).await? {
+                    log::debug!(
+            "No AVAILABLE work units currently available; other workers are still processing"
+        );
+
+                    tokio::time::sleep(
+                        tokio::time::Duration::from_secs(2)
+                    )
+                        .await;
+
+                    continue;
+                }
+
                 log::info!(
-                "No AVAILABLE work units found under {}",
-                args.work_dir.display()
-            );
+        "No AVAILABLE, CLAIMED, or RUNNING work units remain"
+    );
                 break;
             }
+
+
         }
     }
 
@@ -243,6 +257,24 @@ async fn find_first_available_work_unit(
     }
 
     Ok(None)
+}
+
+/// Determine whether any work units are still in progress.
+async fn has_work_in_progress(
+    work_unit_paths: &[PathBuf],
+) -> Result<bool> {
+    for path in work_unit_paths {
+        let work_unit = load_work_unit(path).await?;
+
+        if matches!(
+            work_unit.state,
+            WorkUnitState::Claimed | WorkUnitState::Running
+        ) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Determine the EC2 instance ID using IMDSv2.
