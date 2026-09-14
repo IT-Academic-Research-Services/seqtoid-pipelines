@@ -456,78 +456,213 @@ impl WorkerExecutor {
         heartbeat_handle.abort();
         let _ = heartbeat_handle.await;
 
-        match execution_result {
-            Ok(result) => {
-                work_unit
-                    .complete(
-                        self.worker_id(),
-                        attempt,
-                        result.clone(),
-                    )
-                    .map_err(|e| {
-                        anyhow!(
-                        "execution succeeded but completion transition \
-                         failed for {}: {}",
-                        work_unit.id(),
-                        e
-                    )
-                    })?;
+        // The execution is finished. Now acquire the same lock used by the
+        // heartbeat and by scheduler recovery before accepting the terminal
+        // result. Re-read the durable WorkUnit while holding the lock so that
+        // this worker cannot complete a stale attempt after it has been requeued.
+        let lock_path =
+            work_unit_path.with_extension("json.lock");
 
-                self.persist_work_unit(work_unit_path, work_unit)
-                    .await?;
+        let lock_file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .await
+        {
+            Ok(file) => file,
 
-                self.publish_completion_metadata(work_unit)
-                    .await?;
-
-                info!(
-                "[worker:{}] DONE work unit={} attempt={} result={} bytes={} rows={}",
-                self.worker_id(),
+            Err(err)
+            if err.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    return Err(anyhow!(
+                "work unit {} attempt {} could not acquire terminal-state lock: \
+                 another worker or the scheduler currently holds {}",
                 work_unit.id(),
                 attempt,
-                result.result_path.display(),
-                result.result_bytes,
-                result.result_rows
-            );
-
-                Ok(result)
-            }
+                lock_path.display()
+            ));
+                }
 
             Err(err) => {
-                let reason = err.to_string();
+                return Err(anyhow!(
+                "failed to acquire terminal-state lock {} for work unit {}: {}",
+                lock_path.display(),
+                work_unit.id(),
+                err
+            ));
+            }
+        };
 
-                work_unit
-                    .fail(
-                        self.worker_id(),
-                        attempt,
-                        reason.clone(),
-                        true,
+        let terminal_result = async {
+            let bytes = fs::read(work_unit_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reread work unit {} before terminal transition",
+                        work_unit_path.display()
                     )
-                    .map_err(|state_err| {
-                        anyhow!(
-                        "work unit {} failed with '{}', \
-                         and FAILED transition also failed: {}",
-                        work_unit.id(),
-                        reason,
-                        state_err
-                    )
+                })?;
+
+            let mut current_work_unit: WorkUnit =
+                serde_json::from_slice(&bytes)
+                    .with_context(|| {
+                        format!(
+                            "invalid WorkUnit JSON in {}",
+                            work_unit_path.display()
+                        )
                     })?;
 
-                self.persist_work_unit(work_unit_path, work_unit)
-                    .await?;
-
-                let _ = self
-                    .publish_completion_metadata(work_unit)
-                    .await;
-
-                Err(anyhow!(
-                "work unit {} attempt {} failed: {}",
-                work_unit.id(),
+            // The scheduler may have detected this worker as stale and requeued
+            // the work unit while execution was finishing. In that case the
+            // durable state/attempt/owner no longer match this worker's attempt,
+            // so this attempt must not publish DONE or FAILED.
+            if current_work_unit.state != WorkUnitState::Running {
+                return Err(anyhow!(
+                "work unit {} attempt {} is no longer RUNNING when terminal \
+                 transition was attempted: current_state={:?}, current_attempt={}, \
+                 current_owner={:?}",
+                current_work_unit.id(),
                 attempt,
-                reason
-            ))
+                current_work_unit.state,
+                current_work_unit.attempt,
+                current_work_unit.claimed_by
+            ));
+            }
+
+            if current_work_unit.attempt != attempt {
+                return Err(anyhow!(
+                "work unit {} terminal transition rejected: \
+                 stale attempt {}; durable attempt is {}",
+                current_work_unit.id(),
+                attempt,
+                current_work_unit.attempt
+            ));
+            }
+
+            if current_work_unit.claimed_by.as_deref()
+                != Some(self.worker_id())
+            {
+                return Err(anyhow!(
+                "work unit {} terminal transition rejected: \
+                 stale worker {}; durable owner is {:?}",
+                current_work_unit.id(),
+                self.worker_id(),
+                current_work_unit.claimed_by
+            ));
+            }
+
+            match execution_result {
+                Ok(result) => {
+                    current_work_unit
+                        .complete(
+                            self.worker_id(),
+                            attempt,
+                            result.clone(),
+                        )
+                        .map_err(|e| {
+                            anyhow!(
+                            "execution succeeded but completion transition \
+                             failed for {}: {}",
+                            current_work_unit.id(),
+                            e
+                        )
+                        })?;
+
+                    self.persist_work_unit(
+                        work_unit_path,
+                        &current_work_unit,
+                    )
+                        .await?;
+
+                    *work_unit = current_work_unit;
+
+                    self.publish_completion_metadata(work_unit)
+                        .await?;
+
+                    info!(
+                    "[worker:{}] DONE work unit={} attempt={} result={} bytes={} rows={}",
+                    self.worker_id(),
+                    work_unit.id(),
+                    attempt,
+                    result.result_path.display(),
+                    result.result_bytes,
+                    result.result_rows
+                );
+
+                    Ok(result)
+                }
+
+                Err(err) => {
+                    let reason = err.to_string();
+
+                    current_work_unit
+                        .fail(
+                            self.worker_id(),
+                            attempt,
+                            reason.clone(),
+                            true,
+                        )
+                        .map_err(|state_err| {
+                            anyhow!(
+                            "work unit {} failed with '{}', \
+                             and FAILED transition also failed: {}",
+                            current_work_unit.id(),
+                            reason,
+                            state_err
+                        )
+                        })?;
+
+                    self.persist_work_unit(
+                        work_unit_path,
+                        &current_work_unit,
+                    )
+                        .await?;
+
+                    *work_unit = current_work_unit;
+
+                    let _ = self
+                        .publish_completion_metadata(work_unit)
+                        .await;
+
+                    Err(anyhow!(
+                    "work unit {} attempt {} failed: {}",
+                    work_unit.id(),
+                    attempt,
+                    reason
+                ))
+                }
             }
         }
+            .await;
+
+        drop(lock_file);
+
+        if let Err(err) =
+            fs::remove_file(&lock_path).await
+        {
+            if terminal_result.is_ok() {
+                return Err(anyhow!(
+                "work unit {} terminal transition succeeded, \
+                 but failed to remove terminal-state lock {}: {}",
+                work_unit.id(),
+                lock_path.display(),
+                err
+            ));
+            }
+
+            warn!(
+            "[worker:{}] failed to remove terminal-state lock {} \
+             after terminal transition failure: {}",
+            self.worker_id(),
+            lock_path.display(),
+            err
+        );
+        }
+
+        terminal_result
     }
+
+
     /// Persist the current WorkUnit state atomically.
     async fn persist_work_unit(
         &self,
