@@ -9,7 +9,11 @@ use seqtoid_pipelines::distributed::executor::{
     WorkerExecutor,
     WorkerExecutorConfig,
 };
-use seqtoid_pipelines::utils::work_units::WorkUnit;
+
+use seqtoid_pipelines::utils::work_units::{
+    WorkUnit,
+    WorkUnitState,
+};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Backend {
@@ -106,8 +110,24 @@ async fn main() -> Result<()> {
         args.work_dir.display()
     );
 
-    for path in &work_unit_paths {
-        log::info!("Work unit: {}", path.display());
+    match find_first_available_work_unit(&work_unit_paths).await? {
+        Some((path, work_unit)) => {
+            log::info!(
+            "Found AVAILABLE work unit: {} \
+             sample={}, chunk={}, attempt={}",
+            path.display(),
+            work_unit.sample_id,
+            work_unit.chunk_id,
+            work_unit.attempt,
+        );
+        }
+
+        None => {
+            log::info!(
+            "No AVAILABLE work units found under {}",
+            args.work_dir.display()
+        );
+        }
     }
 
     let executor_config = WorkerExecutorConfig {
@@ -189,6 +209,21 @@ async fn list_work_unit_paths(work_dir: &PathBuf) -> Result<Vec<PathBuf>> {
     paths.sort();
 
     Ok(paths)
+}
+
+/// Find the first AVAILABLE WorkUnit in deterministic filename order.
+async fn find_first_available_work_unit(
+    work_unit_paths: &[PathBuf],
+) -> Result<Option<(PathBuf, WorkUnit)>> {
+    for path in work_unit_paths {
+        let work_unit = load_work_unit(path).await?;
+
+        if work_unit.state == WorkUnitState::Available {
+            return Ok(Some((path.clone(), work_unit)));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Determine the EC2 instance ID using IMDSv2.
