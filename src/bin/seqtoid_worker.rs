@@ -39,9 +39,9 @@ struct WorkerArguments {
     #[arg(long, value_enum)]
     backend: Backend,
 
-    /// JSON file containing one WorkUnit.
+    /// Directory containing WorkUnit JSON files for this run.
     #[arg(long)]
-    work_unit: PathBuf,
+    work_dir: PathBuf,
 
     /// Worker-local scratch directory.
     #[arg(long, default_value = "/scratch")]
@@ -92,23 +92,23 @@ async fn main() -> Result<()> {
     };
 
     log::info!(
-        "Starting seqtoid-worker: worker_id={}, backend={:?}, work_unit={}",
+        "Starting seqtoid-worker: worker_id={}, backend={:?}, work_dir={}",
         worker_id,
         args.backend,
-        args.work_unit.display()
+        args.work_dir.display()
     );
 
-    let work_unit = load_work_unit(&args.work_unit).await?;
+    let work_unit_paths = list_work_unit_paths(&args.work_dir).await?;
 
     log::info!(
-        "Loaded work unit {}: sample={}, chunk={}, paired_end={}, state={:?}, attempt={}",
-        work_unit.id(),
-        work_unit.sample_id,
-        work_unit.chunk_id,
-        work_unit.paired_end,
-        work_unit.state,
-        work_unit.attempt
+        "Found {} work units under {}",
+        work_unit_paths.len(),
+        args.work_dir.display()
     );
+
+    for path in &work_unit_paths {
+        log::info!("Work unit: {}", path.display());
+    }
 
     let executor_config = WorkerExecutorConfig {
         worker_id,
@@ -120,17 +120,10 @@ async fn main() -> Result<()> {
         diamond_db: args.diamond_db,
     };
 
-    let executor = WorkerExecutor::new(
+    let _executor = WorkerExecutor::new(
         executor_config,
         args.backend.into(),
     );
-
-    let mut work_unit = work_unit;
-
-    executor
-        .claim_and_execute(&args.work_unit, &mut work_unit)
-        .await
-        .context("worker execution failed")?;
 
     Ok(())
 }
@@ -153,6 +146,49 @@ async fn load_work_unit(path: &PathBuf) -> Result<WorkUnit> {
                 path.display()
             )
         })
+}
+
+
+/// Find serialized WorkUnit files in a run's work directory.
+async fn list_work_unit_paths(work_dir: &PathBuf) -> Result<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(work_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read work directory {}",
+                work_dir.display()
+            )
+        })?;
+
+    let mut paths = Vec::new();
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| {
+            format!(
+                "failed while reading work directory {}",
+                work_dir.display()
+            )
+        })?
+    {
+        let path = entry.path();
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if path.is_file()
+            && file_name.starts_with("work_")
+            && file_name.ends_with(".json")
+        {
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+
+    Ok(paths)
 }
 
 /// Determine the EC2 instance ID using IMDSv2.
