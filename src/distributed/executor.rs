@@ -7,8 +7,8 @@
 //!   MMseqs GPU
 //!   Diamond
 //!
-//! Queue discovery and durable claim coordination are intentionally outside
-//! this module.
+//! Queue discovery is outside this module. Durable claim coordination is
+//! handled here when a worker claims an individual WorkUnit.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -210,9 +210,6 @@ impl WorkerExecutor {
         let attempt = self
             .claim_work_unit(work_unit_path, work_unit)
             .await?;
-        
-        self.persist_work_unit(work_unit_path, work_unit)
-            .await?;
 
         if let Err(err) = self.validate_input(work_unit).await {
             let reason = err.to_string();
@@ -226,23 +223,23 @@ impl WorkerExecutor {
                 )
                 .map_err(|state_err| {
                     anyhow!(
-                        "work unit {} input validation failed with '{}', \
-                         and FAILED transition also failed: {}",
-                        work_unit.id(),
-                        reason,
-                        state_err
-                    )
+                    "work unit {} input validation failed with '{}', \
+                     and FAILED transition also failed: {}",
+                    work_unit.id(),
+                    reason,
+                    state_err
+                )
                 })?;
 
             self.persist_work_unit(work_unit_path, work_unit)
                 .await?;
 
             return Err(anyhow!(
-                "work unit {} attempt {} failed validation: {}",
-                work_unit.id(),
-                attempt,
-                reason
-            ));
+            "work unit {} attempt {} failed validation: {}",
+            work_unit.id(),
+            attempt,
+            reason
+        ));
         }
 
         if let Err(err) = self.validate_backend_reference(work_unit).await {
@@ -257,45 +254,45 @@ impl WorkerExecutor {
                 )
                 .map_err(|state_err| {
                     anyhow!(
-                        "work unit {} reference validation failed with '{}', \
-                         and FAILED transition also failed: {}",
-                        work_unit.id(),
-                        reason,
-                        state_err
-                    )
+                    "work unit {} reference validation failed with '{}', \
+                     and FAILED transition also failed: {}",
+                    work_unit.id(),
+                    reason,
+                    state_err
+                )
                 })?;
 
             self.persist_work_unit(work_unit_path, work_unit)
                 .await?;
 
             return Err(anyhow!(
-                "work unit {} attempt {} failed reference validation: {}",
-                work_unit.id(),
-                attempt,
-                reason
-            ));
+            "work unit {} attempt {} failed reference validation: {}",
+            work_unit.id(),
+            attempt,
+            reason
+        ));
         }
 
         work_unit
             .start(self.worker_id(), attempt)
             .map_err(|e| {
                 anyhow!(
-                    "failed to start work unit {}: {}",
-                    work_unit.id(),
-                    e
-                )
+                "failed to start work unit {}: {}",
+                work_unit.id(),
+                e
+            )
             })?;
 
         self.persist_work_unit(work_unit_path, work_unit)
             .await?;
 
         info!(
-            "[worker:{}] START work unit={} attempt={} backend={:?}",
-            self.worker_id(),
-            work_unit.id(),
-            attempt,
-            self.backend
-        );
+        "[worker:{}] START work unit={} attempt={} backend={:?}",
+        self.worker_id(),
+        work_unit.id(),
+        attempt,
+        self.backend
+    );
 
         match self.execute_attempt(work_unit, attempt).await {
             Ok(result) => {
@@ -307,11 +304,11 @@ impl WorkerExecutor {
                     )
                     .map_err(|e| {
                         anyhow!(
-                            "execution succeeded but completion transition \
-                             failed for {}: {}",
-                            work_unit.id(),
-                            e
-                        )
+                        "execution succeeded but completion transition \
+                         failed for {}: {}",
+                        work_unit.id(),
+                        e
+                    )
                     })?;
 
                 self.persist_work_unit(work_unit_path, work_unit)
@@ -321,14 +318,14 @@ impl WorkerExecutor {
                     .await?;
 
                 info!(
-                    "[worker:{}] DONE work unit={} attempt={} result={} bytes={} rows={}",
-                    self.worker_id(),
-                    work_unit.id(),
-                    attempt,
-                    result.result_path.display(),
-                    result.result_bytes,
-                    result.result_rows
-                );
+                "[worker:{}] DONE work unit={} attempt={} result={} bytes={} rows={}",
+                self.worker_id(),
+                work_unit.id(),
+                attempt,
+                result.result_path.display(),
+                result.result_bytes,
+                result.result_rows
+            );
 
                 Ok(result)
             }
@@ -345,12 +342,12 @@ impl WorkerExecutor {
                     )
                     .map_err(|state_err| {
                         anyhow!(
-                            "work unit {} failed with '{}', \
-                             and FAILED transition also failed: {}",
-                            work_unit.id(),
-                            reason,
-                            state_err
-                        )
+                        "work unit {} failed with '{}', \
+                         and FAILED transition also failed: {}",
+                        work_unit.id(),
+                        reason,
+                        state_err
+                    )
                     })?;
 
                 self.persist_work_unit(work_unit_path, work_unit)
@@ -361,15 +358,14 @@ impl WorkerExecutor {
                     .await;
 
                 Err(anyhow!(
-                    "work unit {} attempt {} failed: {}",
-                    work_unit.id(),
-                    attempt,
-                    reason
-                ))
+                "work unit {} attempt {} failed: {}",
+                work_unit.id(),
+                attempt,
+                reason
+            ))
             }
         }
     }
-
     /// Persist the current WorkUnit state atomically.
     async fn persist_work_unit(
         &self,
