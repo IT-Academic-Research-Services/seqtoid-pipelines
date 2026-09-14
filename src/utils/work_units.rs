@@ -122,6 +122,15 @@ pub struct WorkUnit {
     /// Worker currently owning the claimed/running attempt.
     pub claimed_by: Option<String>,
 
+    /// Unix timestamp (seconds) of the most recent worker heartbeat.
+    ///
+    /// This is populated while a work unit is actively being executed.
+    /// `None` means that no heartbeat has been recorded yet.
+    ///
+    /// The serde default keeps older WorkUnit JSON files readable.
+    #[serde(default)]
+    pub last_heartbeat: Option<u64>,
+
     /// Successful result metadata, present only when state is DONE.
     pub result: Option<WorkUnitResult>,
 
@@ -167,6 +176,7 @@ impl WorkUnit {
             attempt: 0,
             state: WorkUnitState::Available,
             claimed_by: None,
+            last_heartbeat: None,
             result: None,
             failure: None,
         }
@@ -211,6 +221,7 @@ impl WorkUnit {
         self.attempt = next_attempt;
         self.state = WorkUnitState::Claimed;
         self.claimed_by = Some(worker_id.into());
+        self.last_heartbeat = None;
         self.result = None;
         self.failure = None;
 
@@ -289,6 +300,7 @@ impl WorkUnit {
         }
 
         self.state = WorkUnitState::Done;
+        self.last_heartbeat = None;
         self.result = Some(result);
         self.failure = None;
 
@@ -326,6 +338,7 @@ impl WorkUnit {
         }
 
         self.state = WorkUnitState::Failed;
+        self.last_heartbeat = None;
         self.result = None;
         self.failure = Some(WorkUnitFailure {
             worker_id: worker_id.to_string(),
@@ -363,6 +376,7 @@ impl WorkUnit {
 
         self.state = WorkUnitState::Available;
         self.claimed_by = None;
+        self.last_heartbeat = None;
         self.result = None;
 
         Ok(())
@@ -444,6 +458,7 @@ mod tests {
         assert_eq!(unit.state, WorkUnitState::Available);
         assert_eq!(unit.attempt, 0);
         assert!(unit.claimed_by.is_none());
+        assert!(unit.last_heartbeat.is_none());
         assert!(unit.result.is_none());
         assert!(unit.failure.is_none());
     }
@@ -619,5 +634,6 @@ mod tests {
         assert_eq!(json["attempt"], 1);
         assert_eq!(json["state"], "RUNNING");
         assert_eq!(json["claimed_by"], "i-worker-001");
+        assert_eq!(json["last_heartbeat"], serde_json::Value::Null);
     }
 }
