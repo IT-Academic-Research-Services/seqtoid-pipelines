@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
@@ -41,6 +42,8 @@ use crate::utils::work_units::{
     WorkUnitResult,
     WorkUnitState,
 };
+
+const WORKER_HEARTBEAT_INTERVAL_SECS: u64 = 10;
 
 /// Backend selected for one worker execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +101,143 @@ impl WorkerExecutor {
 
     pub fn worker_id(&self) -> &str {
         &self.config.worker_id
+    }
+
+
+    /// Periodically updates the heartbeat timestamp for a running attempt.
+    ///
+    /// The heartbeat is only accepted while this worker still owns the
+    /// current attempt. The same per-work-unit lock used by claiming is
+    /// used here to serialize the heartbeat update with other state changes.
+    async fn heartbeat_loop(
+        &self,
+        work_unit_path: PathBuf,
+        worker_id: String,
+        attempt: u32,
+    ) {
+        let lock_path = work_unit_path.with_extension("json.lock");
+
+        let mut interval = tokio::time::interval(
+            tokio::time::Duration::from_secs(
+                WORKER_HEARTBEAT_INTERVAL_SECS,
+            ),
+        );
+
+        loop {
+            interval.tick().await;
+
+            let lock_file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .await
+            {
+                Ok(file) => file,
+
+                Err(err)
+                if err.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        continue;
+                    }
+
+                Err(err) => {
+                    warn!(
+                        "[worker:{}] heartbeat could not acquire lock {}: {}",
+                        worker_id,
+                        lock_path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            let result = async {
+                let bytes = fs::read(&work_unit_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to read work unit {} for heartbeat",
+                            work_unit_path.display()
+                        )
+                    })?;
+
+                let mut current_work_unit: WorkUnit =
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| {
+                            format!(
+                                "invalid WorkUnit JSON in {}",
+                                work_unit_path.display()
+                            )
+                        })?;
+
+                if current_work_unit.state != WorkUnitState::Running {
+                    return Ok::<bool, anyhow::Error>(false);
+                }
+
+                if current_work_unit.claimed_by.as_deref()
+                    != Some(worker_id.as_str())
+                {
+                    return Ok(false);
+                }
+
+                if current_work_unit.attempt != attempt {
+                    return Ok(false);
+                }
+
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock is before UNIX epoch")?
+                    .as_secs();
+
+                current_work_unit.last_heartbeat = Some(timestamp);
+
+                self.persist_work_unit(
+                    &work_unit_path,
+                    &current_work_unit,
+                )
+                    .await?;
+
+                debug!(
+                    "[worker:{}] heartbeat work unit={} attempt={} timestamp={}",
+                    worker_id,
+                    current_work_unit.id(),
+                    attempt,
+                    timestamp
+                );
+
+                Ok(true)
+            }
+                .await;
+
+            drop(lock_file);
+
+            if let Err(err) = fs::remove_file(&lock_path).await {
+                warn!(
+                    "[worker:{}] failed to remove heartbeat lock {}: {}",
+                    worker_id,
+                    lock_path.display(),
+                    err
+                );
+            }
+
+            match result {
+                Ok(true) => {}
+
+                Ok(false) => {
+                    break;
+                }
+
+                Err(err) => {
+                    warn!(
+                        "[worker:{}] heartbeat failed for {} attempt {}: {}",
+                        worker_id,
+                        work_unit_path.display(),
+                        attempt,
+                        err
+                    );
+                }
+            }
+        }
     }
 
     /// Atomically claim one AVAILABLE work unit.
@@ -294,7 +434,29 @@ impl WorkerExecutor {
         self.backend
     );
 
-        match self.execute_attempt(work_unit, attempt).await {
+        let heartbeat_handle = tokio::spawn({
+            let executor = self.clone();
+            let work_unit_path = work_unit_path.to_path_buf();
+            let worker_id = self.worker_id().to_string();
+
+            async move {
+                executor
+                    .heartbeat_loop(
+                        work_unit_path,
+                        worker_id,
+                        attempt,
+                    )
+                    .await;
+            }
+        });
+
+        let execution_result =
+            self.execute_attempt(work_unit, attempt).await;
+
+        heartbeat_handle.abort();
+        let _ = heartbeat_handle.await;
+
+        match execution_result {
             Ok(result) => {
                 work_unit
                     .complete(
