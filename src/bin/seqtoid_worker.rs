@@ -110,26 +110,6 @@ async fn main() -> Result<()> {
         args.work_dir.display()
     );
 
-    match find_first_available_work_unit(&work_unit_paths).await? {
-        Some((path, work_unit)) => {
-            log::info!(
-            "Found AVAILABLE work unit: {} \
-             sample={}, chunk={}, attempt={}",
-            path.display(),
-            work_unit.sample_id,
-            work_unit.chunk_id,
-            work_unit.attempt,
-        );
-        }
-
-        None => {
-            log::info!(
-            "No AVAILABLE work units found under {}",
-            args.work_dir.display()
-        );
-        }
-    }
-
     let executor_config = WorkerExecutorConfig {
         worker_id,
         scratch_dir: args.scratch_dir,
@@ -140,10 +120,35 @@ async fn main() -> Result<()> {
         diamond_db: args.diamond_db,
     };
 
-    let _executor = WorkerExecutor::new(
+    let executor = WorkerExecutor::new(
         executor_config,
         args.backend.into(),
     );
+
+    match find_first_available_work_unit(&work_unit_paths).await? {
+        Some((path, mut work_unit)) => {
+            log::info!(
+            "Found AVAILABLE work unit: {} \
+             sample={}, chunk={}, attempt={}",
+            path.display(),
+            work_unit.sample_id,
+            work_unit.chunk_id,
+            work_unit.attempt,
+        );
+
+            executor
+                .claim_and_execute(&path, &mut work_unit)
+                .await
+                .context("worker execution failed")?;
+        }
+
+        None => {
+            log::info!(
+            "No AVAILABLE work units found under {}",
+            args.work_dir.display()
+        );
+        }
+    }
 
     Ok(())
 }
