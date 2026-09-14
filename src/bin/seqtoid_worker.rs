@@ -102,13 +102,7 @@ async fn main() -> Result<()> {
         args.work_dir.display()
     );
 
-    let work_unit_paths = list_work_unit_paths(&args.work_dir).await?;
 
-    log::info!(
-        "Found {} work units under {}",
-        work_unit_paths.len(),
-        args.work_dir.display()
-    );
 
     let executor_config = WorkerExecutorConfig {
         worker_id,
@@ -125,30 +119,36 @@ async fn main() -> Result<()> {
         args.backend.into(),
     );
 
-    match find_first_available_work_unit(&work_unit_paths).await? {
-        Some((path, mut work_unit)) => {
-            log::info!(
-            "Found AVAILABLE work unit: {} \
-             sample={}, chunk={}, attempt={}",
-            path.display(),
-            work_unit.sample_id,
-            work_unit.chunk_id,
-            work_unit.attempt,
-        );
+    loop {
+        let work_unit_paths = list_work_unit_paths(&args.work_dir).await?;
 
-            executor
-                .claim_and_execute(&path, &mut work_unit)
-                .await
-                .context("worker execution failed")?;
-        }
+        match find_first_available_work_unit(&work_unit_paths).await? {
+            Some((path, mut work_unit)) => {
+                log::info!(
+                "Found AVAILABLE work unit: {} \
+                 sample={}, chunk={}, attempt={}",
+                path.display(),
+                work_unit.sample_id,
+                work_unit.chunk_id,
+                work_unit.attempt,
+            );
 
-        None => {
-            log::info!(
-            "No AVAILABLE work units found under {}",
-            args.work_dir.display()
-        );
+                executor
+                    .claim_and_execute(&path, &mut work_unit)
+                    .await
+                    .context("worker execution failed")?;
+            }
+
+            None => {
+                log::info!(
+                "No AVAILABLE work units found under {}",
+                args.work_dir.display()
+            );
+                break;
+            }
         }
     }
+
 
     Ok(())
 }
