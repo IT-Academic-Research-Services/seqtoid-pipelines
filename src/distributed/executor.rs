@@ -39,6 +39,7 @@ use crate::utils::streams::spawn_external_cmd;
 use crate::utils::work_units::{
     WorkUnit,
     WorkUnitResult,
+    WorkUnitState,
 };
 
 /// Backend selected for one worker execution.
@@ -76,6 +77,10 @@ pub struct WorkerExecutorConfig {
     pub diamond_db: Option<PathBuf>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("work unit is already being claimed by another worker")]
+pub struct WorkUnitClaimed;
+
 /// Executes one distributed work unit.
 #[derive(Debug, Clone)]
 pub struct WorkerExecutor {
@@ -95,6 +100,106 @@ impl WorkerExecutor {
         &self.config.worker_id
     }
 
+    /// Atomically claim one AVAILABLE work unit.
+    ///
+    /// A per-work-unit lock file provides the serialization point. The WorkUnit
+    /// is reread after the lock is acquired so the claim is based on current
+    /// durable state rather than a stale copy observed by the caller.
+    async fn claim_work_unit(
+        &self,
+        work_unit_path: &Path,
+        work_unit: &mut WorkUnit,
+    ) -> Result<u32> {
+        let lock_path = work_unit_path.with_extension("json.lock");
+
+        let lock_file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .await
+        {
+            Ok(file) => file,
+
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(WorkUnitClaimed.into());
+            }
+
+            Err(err) => {
+                return Err(anyhow!(
+                "failed to acquire claim lock {}: {}",
+                lock_path.display(),
+                err
+            ));
+            }
+        };
+
+        let result = async {
+            let bytes = fs::read(work_unit_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to reread work unit {} after acquiring claim lock",
+                        work_unit_path.display()
+                    )
+                })?;
+
+            let mut current_work_unit: WorkUnit =
+                serde_json::from_slice(&bytes)
+                    .with_context(|| {
+                        format!(
+                            "invalid WorkUnit JSON in {}",
+                            work_unit_path.display()
+                        )
+                    })?;
+
+            if current_work_unit.state != WorkUnitState::Available {
+                return Err(WorkUnitClaimed.into());
+            }
+
+            let attempt = current_work_unit
+                .claim(self.worker_id())
+                .map_err(|e| {
+                    anyhow!(
+                    "failed to claim work unit {}: {}",
+                    current_work_unit.id(),
+                    e
+                )
+                })?;
+
+            self.persist_work_unit(
+                work_unit_path,
+                &current_work_unit,
+            )
+                .await?;
+
+            *work_unit = current_work_unit;
+
+            Ok(attempt)
+        }
+            .await;
+
+        drop(lock_file);
+
+        if let Err(err) = fs::remove_file(&lock_path).await {
+            if result.is_ok() {
+                return Err(anyhow!(
+                "work unit was claimed, but failed to remove claim lock {}: {}",
+                lock_path.display(),
+                err
+            ));
+            }
+
+            warn!(
+            "[worker:{}] failed to remove claim lock {} after claim failure: {}",
+            self.worker_id(),
+            lock_path.display(),
+            err
+        );
+        }
+
+        result
+    }
+
     /// Claims and executes one work unit, persisting every lifecycle
     /// transition to the WorkUnit JSON on EFS.
     pub async fn claim_and_execute(
@@ -102,16 +207,10 @@ impl WorkerExecutor {
         work_unit_path: &Path,
         work_unit: &mut WorkUnit,
     ) -> Result<WorkUnitResult> {
-        let attempt = work_unit
-            .claim(self.worker_id())
-            .map_err(|e| {
-                anyhow!(
-                    "failed to claim work unit {}: {}",
-                    work_unit.id(),
-                    e
-                )
-            })?;
-
+        let attempt = self
+            .claim_work_unit(work_unit_path, work_unit)
+            .await?;
+        
         self.persist_work_unit(work_unit_path, work_unit)
             .await?;
 

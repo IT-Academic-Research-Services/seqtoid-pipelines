@@ -5,6 +5,7 @@ use clap::{Parser, ValueEnum};
 use tokio::fs;
 
 use seqtoid_pipelines::distributed::executor::{
+    WorkUnitClaimed,
     WorkerBackend,
     WorkerExecutor,
     WorkerExecutorConfig,
@@ -133,10 +134,23 @@ async fn main() -> Result<()> {
                 work_unit.attempt,
             );
 
-                executor
+                match executor
                     .claim_and_execute(&path, &mut work_unit)
                     .await
-                    .context("worker execution failed")?;
+                {
+                    Ok(_) => {}
+
+                    Err(err) if err.downcast_ref::<WorkUnitClaimed>().is_some() => {
+                        log::debug!(
+            "Work unit {} was claimed by another worker; trying another",
+            path.display()
+        );
+                    }
+
+                    Err(err) => {
+                        return Err(err).context("worker execution failed");
+                    }
+                }
             }
 
             None => {
