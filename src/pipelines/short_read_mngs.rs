@@ -3398,10 +3398,10 @@ async fn distributed_non_host_align(
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-            "Failed to create EFS run dir {}: {}",
-            efs_base.display(),
-            e
-        ))
+                "Failed to create EFS run dir {}: {}",
+                efs_base.display(),
+                e
+            ))
         })?;
 
     let non_host_r1_efs =
@@ -3434,13 +3434,13 @@ async fn distributed_non_host_align(
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-            "R1 copy task join failed: {e}"
-        ))
+                "R1 copy task join failed: {e}"
+            ))
         })?
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-            "R1 EFS copy failed: {e}"
-        ))
+                "R1 EFS copy failed: {e}"
+            ))
         })?;
 
     if let (
@@ -3466,13 +3466,13 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "R2 copy task join failed: {e}"
-            ))
+                    "R2 copy task join failed: {e}"
+                ))
             })?
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "R2 EFS copy failed: {e}"
-            ))
+                    "R2 EFS copy failed: {e}"
+                ))
             })?;
     }
 
@@ -3507,13 +3507,13 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "Non-host FASTQ count task join failed: {e}"
-            ))
+                    "Non-host FASTQ count task join failed: {e}"
+                ))
             })?
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "Failed to count non-host FASTQ records: {e}"
-            ))
+                    "Failed to count non-host FASTQ records: {e}"
+                ))
             })?;
 
     if total_records == 0 {
@@ -3579,8 +3579,8 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "Failed to chunk paired non-host FASTQs: {e}"
-            ))
+                    "Failed to chunk paired non-host FASTQs: {e}"
+                ))
             })?;
 
     info!(
@@ -3629,10 +3629,10 @@ async fn distributed_non_host_align(
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-            "Failed to create distributed work directory {}: {}",
-            work_dir.display(),
-            e
-        ))
+                "Failed to create distributed work directory {}: {}",
+                work_dir.display(),
+                e
+            ))
         })?;
 
     for chunk in
@@ -3656,10 +3656,10 @@ async fn distributed_non_host_align(
             )
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                    "Failed to serialize work unit {}: {}",
-                    work_unit.id(),
-                    e
-                ))
+                        "Failed to serialize work unit {}: {}",
+                        work_unit.id(),
+                        e
+                    ))
                 })?;
 
         let final_path =
@@ -3687,10 +3687,10 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "Failed to write work unit {}: {}",
-                tmp_path.display(),
-                e
-            ))
+                    "Failed to write work unit {}: {}",
+                    tmp_path.display(),
+                    e
+                ))
             })?;
 
         tokio::fs::rename(
@@ -3700,11 +3700,11 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                "Failed to publish work unit {} -> {}: {}",
-                tmp_path.display(),
-                final_path.display(),
-                e
-            ))
+                    "Failed to publish work unit {} -> {}: {}",
+                    tmp_path.display(),
+                    final_path.display(),
+                    e
+                ))
             })?;
 
         info!(
@@ -3722,108 +3722,191 @@ async fn distributed_non_host_align(
     );
 
     // ------------------------------------------------------------------
-    // 5. Worker discovery remains best-effort.
+    // 5. Discover the requested number of READY workers.
+    //
+    // Workers are assumed to have already been started externally.
+    // Each worker polls this run's shared work directory independently.
     // ------------------------------------------------------------------
 
     let worker_manager =
-        match crate::utils::workers::WorkerManager::new(
+        crate::utils::workers::WorkerManager::new(
             config.efs_runs_dir.join("workers"),
         )
             .await
-        {
-            Ok(manager) => manager,
-
-            Err(e) => {
-                warn!(
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
                     "Distributed NR: could not initialize worker manager: {}",
                     e
-                );
+                ))
+            })?;
 
-                let (_tx, rx) =
-                    mpsc::channel(1);
-
-                return Ok((
-                    rx,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-        };
-
-    match worker_manager
-        .discover_running_workers(config.alignment_backend)
-        .await
-    {
-        Ok(running_workers) => {
-            info!(
-                "Distributed NR: discovered {} running tagged workers \
-                 for requested {}",
-                running_workers.len(),
-                requested_workers
-            );
-
-            match crate::utils::workers::select_workers(
-                running_workers,
+    let workers =
+        worker_manager
+            .require_ready_workers(
+                config.alignment_backend,
                 requested_workers,
-            ) {
-                Ok(workers) => {
-                    info!(
-                        "Distributed NR: selected {} running workers",
-                        workers.len()
-                    );
+            )
+            .await
+            .map_err(PipelineError::Other)?;
 
-                    for worker in &workers {
-                        info!(
-                            "Distributed NR worker: instance_id={}, \
-                             private_ip={}, instance_type={}, az={:?}",
-                            worker.instance_id,
-                            worker.private_ip,
-                            worker.instance_type,
-                            worker.availability_zone,
-                        );
-                    }
+    info!(
+        "Distributed NR: confirmed {} READY workers",
+        workers.len()
+    );
 
-                    info!(
-                        "Distributed NR: execution not wired yet; \
-                         {} work units remain AVAILABLE",
-                        chunk_summary.chunks.len()
-                    );
-                }
-
-                Err(e) => {
-                    warn!(
-                        "Distributed NR: worker selection failed: {}",
-                        e
-                    );
-                }
-            }
-        }
-
-        Err(e) => {
-            warn!(
-                "Distributed NR: worker discovery failed; \
-                 {} work units remain AVAILABLE under {}: {}",
-                chunk_summary.chunks.len(),
-                work_dir.display(),
-                e
-            );
-        }
+    for worker in &workers {
+        info!(
+            "Distributed NR worker: instance_id={}, \
+             private_ip={}, instance_type={}, az={:?}",
+            worker.instance_id,
+            worker.private_ip,
+            worker.instance_type,
+            worker.availability_zone,
+        );
     }
 
     // ------------------------------------------------------------------
-    // 6. Result collection is not wired yet.
+    // 6. Wait for all WorkUnits to reach a terminal state.
+    //
+    // Workers consume the shared work directory themselves. The launch
+    // node does not assign individual chunks.
+    //
+    // Retry/failure recovery is intentionally not implemented here.
+    // ------------------------------------------------------------------
+
+    loop {
+        let mut available = 0usize;
+        let mut claimed = 0usize;
+        let mut running = 0usize;
+        let mut done = 0usize;
+        let mut failed = 0usize;
+
+        let mut entries =
+            tokio::fs::read_dir(&work_dir)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to read distributed work directory {}: {}",
+                        work_dir.display(),
+                        e
+                    ))
+                })?;
+
+        while let Some(entry) =
+            entries
+                .next_entry()
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed reading distributed work directory {}: {}",
+                        work_dir.display(),
+                        e
+                    ))
+                })?
+        {
+            let path =
+                entry.path();
+
+            let Some(name) =
+                path.file_name()
+                    .and_then(|v| v.to_str())
+            else {
+                continue;
+            };
+
+            if !name.starts_with("work_")
+                || !name.ends_with(".json")
+            {
+                continue;
+            }
+
+            let bytes =
+                tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "Failed to read distributed work unit {}: {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+
+            let work_unit:
+                crate::utils::work_units::WorkUnit =
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "Failed to parse distributed work unit {}: {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+
+            match work_unit.state {
+                crate::utils::work_units::WorkUnitState::Available => {
+                    available += 1;
+                }
+
+                crate::utils::work_units::WorkUnitState::Claimed => {
+                    claimed += 1;
+                }
+
+                crate::utils::work_units::WorkUnitState::Running => {
+                    running += 1;
+                }
+
+                crate::utils::work_units::WorkUnitState::Done => {
+                    done += 1;
+                }
+
+                crate::utils::work_units::WorkUnitState::Failed => {
+                    failed += 1;
+                }
+            }
+        }
+
+        info!(
+            "Distributed NR scheduler: AVAILABLE={} CLAIMED={} RUNNING={} DONE={} FAILED={}",
+            available,
+            claimed,
+            running,
+            done,
+            failed
+        );
+
+        if failed > 0 {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed NR execution failed: {} work units are FAILED",
+                    failed
+                ))
+            );
+        }
+
+        if done == chunk_summary.chunks.len() {
+            info!(
+                "Distributed NR scheduling complete: all {} work units DONE",
+                done
+            );
+            break;
+        }
+
+        tokio::time::sleep(
+            tokio::time::Duration::from_secs(2)
+        )
+            .await;
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Result collection is not wired yet.
     // ------------------------------------------------------------------
 
     let (_tx, rx) =
         mpsc::channel(1);
 
     info!(
-        "Distributed NR preparation complete: {} chunks and \
-         {} AVAILABLE work units under {}",
-        chunk_summary.chunks.len(),
-        chunk_summary.chunks.len(),
-        efs_base.display()
+        "Distributed NR execution complete: {} chunks processed",
+        chunk_summary.chunks.len()
     );
 
     Ok((
