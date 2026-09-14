@@ -3722,10 +3722,10 @@ async fn distributed_non_host_align(
     );
 
     // ------------------------------------------------------------------
-    // 5. Discover the requested number of READY workers.
+    // 5. Wait for the requested number of READY workers.
     //
-    // Workers are assumed to have already been started externally.
-    // Each worker polls this run's shared work directory independently.
+    // Workers are started externally for now. Each worker is launched with
+    // this run's work_dir and polls the shared EFS work directory.
     // ------------------------------------------------------------------
 
     let worker_manager =
@@ -3740,14 +3740,32 @@ async fn distributed_non_host_align(
                 ))
             })?;
 
-    let workers =
-        worker_manager
+    let workers = loop {
+        match worker_manager
             .require_ready_workers(
                 config.alignment_backend,
                 requested_workers,
             )
             .await
-            .map_err(PipelineError::Other)?;
+        {
+            Ok(workers) => {
+                break workers;
+            }
+
+            Err(e) => {
+                info!(
+                    "Distributed NR: waiting for {} READY workers: {}",
+                    requested_workers,
+                    e
+                );
+
+                tokio::time::sleep(
+                    tokio::time::Duration::from_secs(2)
+                )
+                    .await;
+            }
+        }
+    };
 
     info!(
         "Distributed NR: confirmed {} READY workers",
