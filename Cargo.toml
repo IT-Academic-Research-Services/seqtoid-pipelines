@@ -48,6 +48,8 @@ oneshot = "0.2.1"
 aws-config = "=1.11.0"
 aws-sdk-ec2 = "=1.257.0"
 aws-sdk-s3 = "=1.146.0"
+# Keep aws-smithy-json 0.63.x compatible with its pre-1.7 Document API.
+aws-smithy-types = "=1.6.2"
 
 [dev-dependencies]
 sysinfo = "0.37.0"
