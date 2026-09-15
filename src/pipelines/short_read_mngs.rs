@@ -3485,27 +3485,19 @@ async fn distributed_non_host_align(
     );
 
     // ------------------------------------------------------------------
-    // 2. Chunk paired FASTQs.
+    // 2. Chunk FASTQs.
+    //
+    // Paired-end keeps the existing chunk_paired_fastq() path.
+    // Single-end reads R1 records and writes complete FASTQ records
+    // into deterministic R1-only chunk files.
     // ------------------------------------------------------------------
 
     const CHUNKS_PER_WORKER: usize = 4;
 
-    let non_host_r2_efs =
-        non_host_r2_efs
-            .as_ref()
-            .ok_or_else(|| {
-                PipelineError::InvalidConfig(
-                    "Distributed non-host alignment currently requires paired-end input"
-                        .to_string(),
-                )
-            })?;
-
     let total_records =
         raw_read_count(
             non_host_r1_efs.clone(),
-            Some(
-                non_host_r2_efs.clone(),
-            ),
+            non_host_r2_efs.clone(),
         )
             .await
             .map_err(|e| {
@@ -3525,18 +3517,6 @@ async fn distributed_non_host_align(
         );
     }
 
-    if total_records % 2 != 0 {
-        return Err(
-            PipelineError::Other(anyhow!(
-                "Paired non-host FASTQ record count is not even: {}",
-                total_records
-            )),
-        );
-    }
-
-    let total_pairs =
-        total_records / 2;
-
     let target_chunks =
         requested_workers
             .checked_mul(
@@ -3549,62 +3529,387 @@ async fn distributed_non_host_align(
                 )
             })?;
 
-    let target_chunks =
-        (target_chunks as u64)
-            .min(total_pairs)
-            .max(1);
-
-    let pairs_per_chunk =
-        (total_pairs
-            + target_chunks
-            - 1)
-            / target_chunks;
-
     let chunks_dir =
         efs_base.join("chunks");
 
-    info!(
-        "Distributed NR chunking: {} pairs, {} requested workers, \
-         target {} chunks, {} pairs/chunk",
-        total_pairs,
-        requested_workers,
-        target_chunks,
-        pairs_per_chunk
-    );
+    let chunk_work_units:
+        Vec<(
+            u64,
+            u64,
+            PathBuf,
+            Option<PathBuf>,
+        )>;
 
-    let chunk_summary =
-        chunk_paired_fastq(
-            non_host_r1_efs.clone(),
-            non_host_r2_efs.clone(),
-            chunks_dir.clone(),
-            pairs_per_chunk,
+    if let Some(non_host_r2_efs) =
+        non_host_r2_efs.clone()
+    {
+        // --------------------------------------------------------------
+        // PAIRED-END
+        // --------------------------------------------------------------
+
+        if total_records % 2 != 0 {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Paired non-host FASTQ record count is not even: {}",
+                    total_records
+                )),
+            );
+        }
+
+        let total_pairs =
+            total_records / 2;
+
+        let target_chunks =
+            (target_chunks as u64)
+                .min(total_pairs)
+                .max(1);
+
+        let pairs_per_chunk =
+            (total_pairs
+                + target_chunks
+                - 1)
+                / target_chunks;
+
+        info!(
+            "Distributed NR chunking: {} pairs, {} requested workers, \
+             target {} chunks, {} pairs/chunk",
+            total_pairs,
+            requested_workers,
+            target_chunks,
+            pairs_per_chunk
+        );
+
+        let chunk_summary =
+            chunk_paired_fastq(
+                non_host_r1_efs.clone(),
+                non_host_r2_efs,
+                chunks_dir.clone(),
+                pairs_per_chunk,
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to chunk paired non-host FASTQs: {e}"
+                    ))
+                })?;
+
+        info!(
+            "Distributed NR chunking complete: {} pairs, {} R1 records, \
+             {} R2 records, {} chunks",
+            chunk_summary.total_pairs,
+            chunk_summary.total_r1_records,
+            chunk_summary.total_r2_records,
+            chunk_summary.chunks.len()
+        );
+
+        if chunk_summary.total_pairs
+            != total_pairs
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed chunk reconciliation failed: \
+                     source pairs={}, chunked pairs={}",
+                    total_pairs,
+                    chunk_summary.total_pairs
+                )),
+            );
+        }
+
+        chunk_work_units =
+            chunk_summary
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.chunk_id,
+                        chunk.pair_count,
+                        chunk.r1_path.clone(),
+                        Some(chunk.r2_path.clone()),
+                    )
+                })
+                .collect();
+    } else {
+        // --------------------------------------------------------------
+        // SINGLE-END
+        // --------------------------------------------------------------
+
+        let total_reads =
+            total_records;
+
+        let target_chunks =
+            (target_chunks as u64)
+                .min(total_reads)
+                .max(1);
+
+        let reads_per_chunk =
+            (total_reads
+                + target_chunks
+                - 1)
+                / target_chunks;
+
+        info!(
+            "Distributed NR single-end chunking: {} reads, {} requested workers, \
+             target {} chunks, {} reads/chunk",
+            total_reads,
+            requested_workers,
+            target_chunks,
+            reads_per_chunk
+        );
+
+        tokio::fs::create_dir_all(
+            &chunks_dir,
         )
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Failed to chunk paired non-host FASTQs: {e}"
+                    "Failed to create distributed chunks directory {}: {}",
+                    chunks_dir.display(),
+                    e
                 ))
             })?;
 
-    info!(
-        "Distributed NR chunking complete: {} pairs, {} R1 records, \
-         {} R2 records, {} chunks",
-        chunk_summary.total_pairs,
-        chunk_summary.total_r1_records,
-        chunk_summary.total_r2_records,
-        chunk_summary.chunks.len()
-    );
+        let (rx, read_task) =
+            read_fastq(
+                non_host_r1_efs.clone(),
+                None,
+                PairingMode::Strict,
+                None,
+                u64::MAX,
+                None,
+                None,
+                "distributed_non_host_align_single_end_chunking",
+                &config,
+            )
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                    "Failed to start single-end FASTQ reader: {e}"
+                ))
+                })?;
 
-    if chunk_summary.total_pairs
-        != total_pairs
-    {
-        return Err(
-            PipelineError::Other(anyhow!(
-                "Distributed chunk reconciliation failed: \
-                 source pairs={}, chunked pairs={}",
-                total_pairs,
-                chunk_summary.total_pairs
-            )),
+        let mut stream =
+            ReceiverStream::new(rx);
+
+        let mut chunks =
+            Vec::<(
+                u64,
+                u64,
+                PathBuf,
+            )>::new();
+
+        let mut chunk_id =
+            0u64;
+
+        let mut chunk_reads =
+            0u64;
+
+        let mut total_reads_written =
+            0u64;
+
+        let mut current_chunk_path =
+            chunks_dir.join(format!(
+                "chunk_{:08}_R1.fastq",
+                chunk_id
+            ));
+
+        let mut writer =
+            Some(
+                BufWriter::new(
+                    tokio::fs::File::create(
+                        &current_chunk_path
+                    )
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(anyhow!(
+                            "Failed to create single-end chunk {}: {}",
+                            current_chunk_path.display(),
+                            e
+                        ))
+                        })?,
+                )
+            );
+
+        while let Some(item) =
+            stream.next().await
+        {
+            let record =
+                match item {
+                    ParseOutput::Fastq(record) => record,
+
+                    ParseOutput::Fasta(_) => {
+                        return Err(
+                            PipelineError::InvalidFastqFormat(
+                                "Single-end distributed chunking received FASTA output"
+                                    .to_string(),
+                            )
+                        );
+                    }
+
+                    ParseOutput::Bytes(_) => {
+                        return Err(
+                            PipelineError::InvalidFastqFormat(
+                                "Single-end distributed chunking received byte output"
+                                    .to_string(),
+                            )
+                        );
+                    }
+                };
+
+            let bytes =
+                record
+                    .to_bytes()
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "Failed to serialize single-end FASTQ record: {e}"
+                        ))
+                    })?;
+
+            writer
+                .as_mut()
+                .expect("single-end chunk writer missing")
+                .write_all(&bytes)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed writing single-end chunk {}: {}",
+                        current_chunk_path.display(),
+                        e
+                    ))
+                })?;
+
+            chunk_reads += 1;
+            total_reads_written += 1;
+
+            if chunk_reads == reads_per_chunk {
+                let mut completed_writer =
+                    writer
+                        .take()
+                        .expect("single-end chunk writer missing");
+
+                completed_writer
+                    .flush()
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "Failed flushing single-end chunk {}: {}",
+                            current_chunk_path.display(),
+                            e
+                        ))
+                    })?;
+
+                drop(completed_writer);
+
+                chunks.push((
+                    chunk_id,
+                    chunk_reads,
+                    current_chunk_path.clone(),
+                ));
+
+                chunk_id += 1;
+                chunk_reads = 0;
+
+                if total_reads_written < total_reads {
+                    current_chunk_path =
+                        chunks_dir.join(format!(
+                            "chunk_{:08}_R1.fastq",
+                            chunk_id
+                        ));
+
+                    writer =
+                        Some(
+                            BufWriter::new(
+                                tokio::fs::File::create(
+                                    &current_chunk_path
+                                )
+                                    .await
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                        "Failed to create single-end chunk {}: {}",
+                                        current_chunk_path.display(),
+                                        e
+                                    ))
+                                    })?,
+                            )
+                        );
+                }
+            }
+        }
+
+        if chunk_reads > 0 {
+            let mut completed_writer =
+                writer
+                    .take()
+                    .expect("single-end chunk writer missing");
+
+            completed_writer
+                .flush()
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed flushing final single-end chunk {}: {}",
+                        current_chunk_path.display(),
+                        e
+                    ))
+                })?;
+
+            drop(completed_writer);
+
+            chunks.push((
+                chunk_id,
+                chunk_reads,
+                current_chunk_path.clone(),
+            ));
+        } else {
+            // The last exact-size chunk already closed its writer.
+            drop(writer.take());
+        }
+
+        read_task
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Single-end FASTQ reader task join failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Single-end FASTQ reader failed during chunking: {e}"
+                ))
+            })?;
+
+        if total_reads_written
+            != total_reads
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed single-end chunk reconciliation failed: \
+                     source reads={}, chunked reads={}",
+                    total_reads,
+                    total_reads_written
+                )),
+            );
+        }
+
+        chunk_work_units =
+            chunks
+                .into_iter()
+                .map(|(
+                          chunk_id,
+                          read_count,
+                          r1_path,
+                      )| {
+                    (
+                        chunk_id,
+                        read_count,
+                        r1_path,
+                        None,
+                    )
+                })
+                .collect();
+
+        info!(
+            "Distributed NR single-end chunking complete: {} reads, {} chunks",
+            total_reads_written,
+            chunk_work_units.len()
         );
     }
 
@@ -3638,19 +3943,23 @@ async fn distributed_non_host_align(
             ))
         })?;
 
-    for chunk in
-        &chunk_summary.chunks
+    for (
+        chunk_id,
+        expected_input_count,
+        r1_chunk_path,
+        r2_chunk_path,
+    ) in &chunk_work_units
     {
         let work_unit =
             crate::utils::work_units::WorkUnit::new(
                 config.run_id.clone(),
                 sample_id.clone(),
-                chunk.chunk_id,
-                true,
-                chunk.pair_count,
+                *chunk_id,
+                r2_chunk_path.is_some(),
+                *expected_input_count,
                 reference_version.clone(),
-                chunk.r1_path.clone(),
-                Some(chunk.r2_path.clone()),
+                r1_chunk_path.clone(),
+                r2_chunk_path.clone(),
             );
 
         let payload =
@@ -3669,7 +3978,7 @@ async fn distributed_non_host_align(
             work_dir.join(
                 format!(
                     "work_{:08}.json",
-                    chunk.chunk_id
+                    chunk_id
                 ),
             );
 
@@ -3677,7 +3986,7 @@ async fn distributed_non_host_align(
             work_dir.join(
                 format!(
                     "work_{:08}.json.tmp",
-                    chunk.chunk_id
+                    chunk_id
                 ),
             );
 
@@ -3711,16 +4020,21 @@ async fn distributed_non_host_align(
             })?;
 
         info!(
-            "Published distributed work unit {}: {} pairs -> {}",
+            "Published distributed work unit {}: {} {} -> {}",
             work_unit.id(),
-            chunk.pair_count,
+            expected_input_count,
+            if r2_chunk_path.is_some() {
+                "pairs"
+            } else {
+                "reads"
+            },
             final_path.display()
         );
     }
 
     info!(
         "Distributed NR: {} AVAILABLE work units created under {}",
-        chunk_summary.chunks.len(),
+        chunk_work_units.len(),
         work_dir.display()
     );
 
@@ -4424,7 +4738,7 @@ async fn distributed_non_host_align(
 
                             tokio::fs::rename(
                                 &tmp_path,
-                                &path,
+                                &path
                             )
                                 .await
                                 .map_err(|e| {
@@ -4473,12 +4787,7 @@ async fn distributed_non_host_align(
 
         info!(
             "Distributed NR scheduler: AVAILABLE={} CLAIMED={} RUNNING={} DONE={} FAILED={} RECOVERED={}",
-            available,
-            claimed,
-            running,
-            done,
-            failed,
-            recovered
+            available, claimed, running, done, failed, recovered
         );
 
         // Only non-retryable FAILED work units are terminal failures.
@@ -4491,7 +4800,7 @@ async fn distributed_non_host_align(
             );
         }
 
-        if done == chunk_summary.chunks.len() {
+        if done == chunk_work_units.len() {
             info!(
                 "Distributed NR scheduling complete: all {} work units DONE",
                 done
@@ -4514,7 +4823,7 @@ async fn distributed_non_host_align(
 
     info!(
         "Distributed NR execution complete: {} chunks processed",
-        chunk_summary.chunks.len()
+        chunk_work_units.len()
     );
 
     Ok((
