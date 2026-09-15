@@ -171,6 +171,7 @@ async fn main() -> Result<()> {
         ExecutionMode::Single
     };
 
+    let efs_base_dir = PathBuf::from(&args.efs_base_dir);
     let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
 
     let run_id = out_dir
@@ -205,6 +206,7 @@ async fn main() -> Result<()> {
         has_gpu,
         alignment_backend: backend,
         execution_mode,
+        efs_base_dir,
         efs_runs_dir,
         run_id,
         distributed_workers,

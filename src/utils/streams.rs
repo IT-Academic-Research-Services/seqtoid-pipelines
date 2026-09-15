@@ -1975,7 +1975,8 @@ mod tests {
             .unwrap_or((16u64 << 30, 8u64 << 30));
 
         let rng = generate_rng(Some(42));
-        
+
+        let efs_base_dir = PathBuf::from(&args.efs_base_dir);
         let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
 
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -2004,6 +2005,7 @@ mod tests {
             has_gpu: false,
             alignment_backend: NRAlignmentBackend::Diamond,
             execution_mode: ExecutionMode::Single,
+            efs_base_dir,
             efs_runs_dir,
             run_id,
             distributed_workers

@@ -270,6 +270,7 @@ pub struct RunConfig {
     pub has_gpu: bool,
     pub alignment_backend: NRAlignmentBackend,
     pub execution_mode: ExecutionMode,
+    pub efs_base_dir: PathBuf,
     pub efs_runs_dir: PathBuf,
     pub run_id: String,
     pub distributed_workers: usize,

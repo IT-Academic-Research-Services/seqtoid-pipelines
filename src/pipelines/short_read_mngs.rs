@@ -3733,57 +3733,49 @@ async fn distributed_non_host_align(
 
     let worker_manager =
         crate::utils::workers::WorkerManager::new(
-            config.efs_runs_dir.join("workers"),
+            config.efs_base_dir.clone().into(),
         )
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Distributed NR: could not initialize worker manager: {}",
-                    e
-                ))
+                "Distributed NR: could not initialize worker manager: {}",
+                e
+            ))
             })?;
 
-    let workers = loop {
-        match worker_manager
-            .require_ready_workers(
-                config.alignment_backend,
-                requested_workers,
-            )
-            .await
-        {
-            Ok(workers) => {
-                break workers;
-            }
+    match worker_manager
+        .discover_ready_workers(
+            config.alignment_backend,
+        )
+        .await
+    {
+        Ok(workers) => {
+            info!(
+            "Distributed NR: discovered {} READY workers; \
+             {} requested",
+            workers.len(),
+            requested_workers
+        );
 
-            Err(e) => {
+            for worker in &workers {
                 info!(
-                    "Distributed NR: waiting for {} READY workers: {}",
-                    requested_workers,
-                    e
-                );
-
-                tokio::time::sleep(
-                    tokio::time::Duration::from_secs(2)
-                )
-                    .await;
+                "Distributed NR worker: instance_id={}, \
+                 private_ip={}, instance_type={}, az={:?}",
+                worker.instance_id,
+                worker.private_ip,
+                worker.instance_type,
+                worker.availability_zone,
+            );
             }
         }
-    };
 
-    info!(
-        "Distributed NR: confirmed {} READY workers",
-        workers.len()
-    );
-
-    for worker in &workers {
-        info!(
-            "Distributed NR worker: instance_id={}, \
-             private_ip={}, instance_type={}, az={:?}",
-            worker.instance_id,
-            worker.private_ip,
-            worker.instance_type,
-            worker.availability_zone,
+        Err(e) => {
+            warn!(
+            "Distributed NR: READY worker discovery failed: {}; \
+             continuing to scheduler",
+            e
         );
+        }
     }
 
     // ------------------------------------------------------------------
