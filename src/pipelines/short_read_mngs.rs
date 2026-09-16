@@ -9300,15 +9300,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
-        post_filter_stream.into_inner(),
-        config.base_buffer_size,
-        config.args.stall_threshold,
-    )
-    .await?;
-
-    cleanup_tasks.push(parse_task);
-
     let (
         dedup_stream,
         dedup_count_rx,
@@ -9317,14 +9308,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut dedup_cleanup_receivers,
     ) = dedup(
         config.clone(),
-        pre_dedup_parsed_stream,
+        post_filter_stream.into_inner(),
         paired,
-        Some(70), // Prefix length for deduplication. Hardcoded for now
+        Some(70),
         out_dir.clone(),
     )
-    .await?;
+        .await?;
+
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
+
 
     let uniques_count = dedup_count_rx.await?;
     let unique_reads = uniques_count * if paired { 2 } else { 1 };
