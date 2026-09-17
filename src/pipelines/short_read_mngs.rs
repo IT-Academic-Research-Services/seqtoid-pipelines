@@ -9680,14 +9680,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
-        post_filter_stream.into_inner(),
-        config.base_buffer_size,
-        config.args.stall_threshold,
-    )
-        .await?;
+    let pre_dedup_parsed_stream =
+        if paired {
+            let (stream, parse_task) =
+                parse_byte_stream_to_fastq(
+                    post_filter_stream.into_inner(),
+                    config.base_buffer_size,
+                    config.args.stall_threshold,
+                )
+                    .await?;
 
-    cleanup_tasks.push(parse_task);
+            cleanup_tasks.push(parse_task);
+
+            stream
+        } else {
+            post_filter_stream.into_inner()
+        };
 
     let (
         dedup_stream,
