@@ -4842,7 +4842,7 @@ async fn distributed_non_host_align(
     // metadata rather than discovering result files by filename alone,
     // because retries may leave multiple attempt files in results/.
     // ------------------------------------------------------------------
-    
+
     let mut completed_work_units:
         Vec<crate::utils::work_units::WorkUnit> =
         Vec::with_capacity(
@@ -9680,6 +9680,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
+    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
+        post_filter_stream.into_inner(),
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    )
+        .await?;
+
+    cleanup_tasks.push(parse_task);
+
     let (
         dedup_stream,
         dedup_count_rx,
@@ -9688,7 +9697,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         mut dedup_cleanup_receivers,
     ) = dedup(
         config.clone(),
-        post_filter_stream.into_inner(),
+        pre_dedup_parsed_stream,
         paired,
         Some(70),
         out_dir.clone(),
