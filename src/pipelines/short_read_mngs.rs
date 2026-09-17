@@ -3648,13 +3648,13 @@ async fn distributed_non_host_align(
                 / target_chunks;
 
         info!(
-            "Distributed NR single-end chunking: {} reads, {} requested workers, \
-             target {} chunks, {} reads/chunk",
-            total_reads,
-            requested_workers,
-            target_chunks,
-            reads_per_chunk
-        );
+        "Distributed NR single-end chunking: {} reads, {} requested workers, \
+         target {} chunks, {} reads/chunk",
+        total_reads,
+        requested_workers,
+        target_chunks,
+        reads_per_chunk
+    );
 
         tokio::fs::create_dir_all(
             &chunks_dir,
@@ -3662,10 +3662,10 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Failed to create distributed chunks directory {}: {}",
-                    chunks_dir.display(),
-                    e
-                ))
+                "Failed to create distributed chunks directory {}: {}",
+                chunks_dir.display(),
+                e
+            ))
             })?;
 
         let (rx, read_task) =
@@ -3682,12 +3682,32 @@ async fn distributed_non_host_align(
             )
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                    "Failed to start single-end FASTQ reader: {e}"
+                "Failed to start single-end FASTQ reader: {e}"
+            ))
+                })?;
+
+        let byte_reader =
+            ChannelReader::new(
+                rx
+            );
+
+        let fastq_rx =
+            parse_fastq(
+                byte_reader,
+                &config,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                    "Failed to start single-end FASTQ parser: {e}"
                 ))
                 })?;
 
         let mut stream =
-            ReceiverStream::new(rx);
+            ReceiverStream::new(
+                fastq_rx
+            );
 
         let mut chunks =
             Vec::<(
@@ -3720,10 +3740,10 @@ async fn distributed_non_host_align(
                         .await
                         .map_err(|e| {
                             PipelineError::Other(anyhow!(
-                            "Failed to create single-end chunk {}: {}",
-                            current_chunk_path.display(),
-                            e
-                        ))
+                        "Failed to create single-end chunk {}: {}",
+                        current_chunk_path.display(),
+                        e
+                    ))
                         })?,
                 )
             );
@@ -3759,8 +3779,8 @@ async fn distributed_non_host_align(
                     .to_bytes()
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                            "Failed to serialize single-end FASTQ record: {e}"
-                        ))
+                        "Failed to serialize single-end FASTQ record: {e}"
+                    ))
                     })?;
 
             writer
@@ -3770,10 +3790,10 @@ async fn distributed_non_host_align(
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                        "Failed writing single-end chunk {}: {}",
-                        current_chunk_path.display(),
-                        e
-                    ))
+                    "Failed writing single-end chunk {}: {}",
+                    current_chunk_path.display(),
+                    e
+                ))
                 })?;
 
             chunk_reads += 1;
@@ -3790,10 +3810,10 @@ async fn distributed_non_host_align(
                     .await
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                            "Failed flushing single-end chunk {}: {}",
-                            current_chunk_path.display(),
-                            e
-                        ))
+                        "Failed flushing single-end chunk {}: {}",
+                        current_chunk_path.display(),
+                        e
+                    ))
                     })?;
 
                 drop(completed_writer);
@@ -3823,10 +3843,10 @@ async fn distributed_non_host_align(
                                     .await
                                     .map_err(|e| {
                                         PipelineError::Other(anyhow!(
-                                        "Failed to create single-end chunk {}: {}",
-                                        current_chunk_path.display(),
-                                        e
-                                    ))
+                                    "Failed to create single-end chunk {}: {}",
+                                    current_chunk_path.display(),
+                                    e
+                                ))
                                     })?,
                             )
                         );
@@ -3845,10 +3865,10 @@ async fn distributed_non_host_align(
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-                        "Failed flushing final single-end chunk {}: {}",
-                        current_chunk_path.display(),
-                        e
-                    ))
+                    "Failed flushing final single-end chunk {}: {}",
+                    current_chunk_path.display(),
+                    e
+                ))
                 })?;
 
             drop(completed_writer);
@@ -3867,13 +3887,13 @@ async fn distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Single-end FASTQ reader task join failed: {e}"
-                ))
+                "Single-end FASTQ reader task join failed: {e}"
+            ))
             })?
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Single-end FASTQ reader failed during chunking: {e}"
-                ))
+                "Single-end FASTQ reader failed during chunking: {e}"
+            ))
             })?;
 
         if total_reads_written
@@ -3881,11 +3901,11 @@ async fn distributed_non_host_align(
         {
             return Err(
                 PipelineError::Other(anyhow!(
-                    "Distributed single-end chunk reconciliation failed: \
-                     source reads={}, chunked reads={}",
-                    total_reads,
-                    total_reads_written
-                )),
+                "Distributed single-end chunk reconciliation failed: \
+                 source reads={}, chunked reads={}",
+                total_reads,
+                total_reads_written
+            )),
             );
         }
 
@@ -4833,6 +4853,9 @@ async fn distributed_non_host_align(
         Vec::new(),
     ))
 }
+
+
+
 
 
 /// Aligns unmapped reads against NR database using Diamond.
