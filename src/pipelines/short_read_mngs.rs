@@ -4835,11 +4835,368 @@ async fn distributed_non_host_align(
     }
 
     // ------------------------------------------------------------------
-    // 7. Result collection is not wired yet.
+    // 7. Collect completed result m8 files in deterministic chunk order.
+    //
+    // Each DONE WorkUnit contains the authoritative result metadata,
+    // including the attempt number and durable result_path. Use that
+    // metadata rather than discovering result files by filename alone,
+    // because retries may leave multiple attempt files in results/.
     // ------------------------------------------------------------------
+    
+    let mut completed_work_units:
+        Vec<crate::utils::work_units::WorkUnit> =
+        Vec::with_capacity(
+            chunk_work_units.len()
+        );
 
-    let (_tx, rx) =
-        mpsc::channel(1);
+    let mut entries =
+        tokio::fs::read_dir(
+            &work_dir
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to read distributed work directory {}: {}",
+                    work_dir.display(),
+                    e
+                ))
+            })?;
+
+    while let Some(entry) =
+        entries
+            .next_entry()
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed reading distributed work directory {}: {}",
+                    work_dir.display(),
+                    e
+                ))
+            })?
+    {
+        let path =
+            entry.path();
+
+        let Some(name) =
+            path.file_name()
+                .and_then(|v| v.to_str())
+        else {
+            continue;
+        };
+
+        if !name.starts_with("work_")
+            || !name.ends_with(".json")
+        {
+            continue;
+        }
+
+        let bytes =
+            tokio::fs::read(&path)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to read completed work unit {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+        let work_unit:
+            crate::utils::work_units::WorkUnit =
+            serde_json::from_slice(&bytes)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to parse completed work unit {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+        if work_unit.state
+            != crate::utils::work_units::WorkUnitState::Done
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Expected work unit {} to be DONE after scheduler completion, found {:?}",
+                    work_unit.id(),
+                    work_unit.state
+                ))
+            );
+        }
+
+        let result =
+            work_unit
+                .result
+                .as_ref()
+                .ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "DONE work unit {} has no result metadata",
+                        work_unit.id()
+                    ))
+                })?;
+
+        if result.attempt
+            != work_unit.attempt
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Result attempt mismatch for {}: work unit attempt={}, result attempt={}",
+                    work_unit.id(),
+                    work_unit.attempt,
+                    result.attempt
+                ))
+            );
+        }
+
+        let result_path =
+            &result.result_path;
+
+        let metadata =
+            tokio::fs::metadata(
+                result_path
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to stat result for {}: {}: {}",
+                        work_unit.id(),
+                        result_path.display(),
+                        e
+                    ))
+                })?;
+
+        if metadata.len()
+            != result.result_bytes
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Result size mismatch for {} attempt {}: \
+                     metadata says {} bytes, work unit records {} bytes",
+                    work_unit.id(),
+                    result.attempt,
+                    metadata.len(),
+                    result.result_bytes
+                ))
+            );
+        }
+
+        completed_work_units.push(
+            work_unit
+        );
+    }
+
+    completed_work_units.sort_by_key(
+        |work_unit| work_unit.chunk_id
+    );
+
+    if completed_work_units.len()
+        != chunk_work_units.len()
+    {
+        return Err(
+            PipelineError::Other(anyhow!(
+                "Distributed NR result collection found {} DONE work units, expected {}",
+                completed_work_units.len(),
+                chunk_work_units.len()
+            ))
+        );
+    }
+
+    for (expected_idx, work_unit)
+    in completed_work_units.iter().enumerate()
+    {
+        let expected_chunk_id =
+            chunk_work_units[expected_idx].0;
+
+        if work_unit.chunk_id
+            != expected_chunk_id
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed NR result collection chunk mismatch: \
+                     expected chunk {}, found {}",
+                    expected_chunk_id,
+                    work_unit.chunk_id
+                ))
+            );
+        }
+    }
+
+    let result_temp_dir =
+        choose_temp_dir(
+            config.input_size,
+            &config.ram_temp_dir,
+            &config.args.nvme_scratch,
+            2,
+            false,
+        )
+            .await?;
+
+    let merged_m8 =
+        result_temp_dir
+            .path()
+            .join(
+                "distributed_nr_merged.m8"
+            );
+
+    let mut merged =
+        TokioFile::create(
+            &merged_m8
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to create merged distributed NR m8 {}: {}",
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?;
+
+    let mut total_result_rows =
+        0u64;
+
+    let mut total_result_bytes =
+        0u64;
+
+    for work_unit
+    in &completed_work_units
+    {
+        let result =
+            work_unit
+                .result
+                .as_ref()
+                .expect(
+                    "DONE work unit result checked above"
+                );
+
+        info!(
+            "Distributed NR result collection: chunk={} attempt={} rows={} bytes={} path={}",
+            work_unit.chunk_id,
+            result.attempt,
+            result.result_rows,
+            result.result_bytes,
+            result.result_path.display()
+        );
+
+        let mut input =
+            TokioFile::open(
+                &result.result_path
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(
+                        format!(
+                            "Failed to open distributed NR result {}: {}",
+                            result.result_path.display(),
+                            e
+                        )
+                    )
+                })?;
+
+        tokio::io::copy(
+            &mut input,
+            &mut merged,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to append distributed NR result {} to {}: {}",
+                        result.result_path.display(),
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?;
+
+        total_result_rows +=
+            result.result_rows;
+
+        total_result_bytes +=
+            result.result_bytes;
+    }
+
+    merged
+        .flush()
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(
+                format!(
+                    "Failed to flush merged distributed NR m8 {}: {}",
+                    merged_m8.display(),
+                    e
+                )
+            )
+        })?;
+
+    drop(merged);
+
+    let merged_metadata =
+        TokioFile::open(
+            &merged_m8
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to reopen merged distributed NR m8 {}: {}",
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?;
+
+    let merged_size =
+        tokio::fs::metadata(
+            &merged_m8
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to stat merged distributed NR m8 {}: {}",
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?
+            .len();
+
+    if merged_size
+        != total_result_bytes
+    {
+        return Err(
+            PipelineError::Other(anyhow!(
+                "Distributed NR merged result size mismatch: \
+                 merged={} bytes, sum of chunk results={} bytes",
+                merged_size,
+                total_result_bytes
+            ))
+        );
+    }
+
+    info!(
+        "Distributed NR result collection complete: \
+         {} chunks, {} rows, {} bytes -> {}",
+        completed_work_units.len(),
+        total_result_rows,
+        total_result_bytes,
+        merged_m8.display()
+    );
+
+    let rx =
+        parse_lines(
+            merged_metadata,
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(
+                    e.into()
+                )
+            })?;
 
     info!(
         "Distributed NR execution complete: {} chunks processed",
@@ -4850,7 +5207,7 @@ async fn distributed_non_host_align(
         rx,
         Vec::new(),
         Vec::new(),
-        Vec::new(),
+        vec![result_temp_dir],
     ))
 }
 
