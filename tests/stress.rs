@@ -153,6 +153,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
 
     let rng = generate_rng(Some(42));
 
+    let efs_base_dir = PathBuf::from(&args.efs_base_dir);
     let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -181,6 +182,7 @@ fn create_test_run_config() -> Arc<RunConfig> {
         has_gpu: false,
         alignment_backend: NRAlignmentBackend::Diamond,
         execution_mode: ExecutionMode::Single,
+        efs_base_dir,
         efs_runs_dir,
         run_id,
         distributed_workers
