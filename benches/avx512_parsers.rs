@@ -13,9 +13,9 @@ use needletail::FastxReader;
 
 use tokio::sync::Semaphore;
 
-use seqtoid_pipelines::config::defs::{GpuDetection, Lineage, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType, Taxid};
+use seqtoid_pipelines::config::defs::{resolve_distributed_workers, GpuDetection, Lineage, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType, Taxid, ExecutionMode};
 use seqtoid_pipelines::utils::blast::{
-    consensus_level, merge_aggregations, process_record_pair, summarize_m8_hits, AggBucket, M8Record
+    merge_aggregations, process_record_pair, summarize_m8_hits, AggBucket, M8Record
 };
 use seqtoid_pipelines::utils::fastx::{parse_header, SequenceRecord};
 use seqtoid_pipelines::utils::paf::PafRecord;
@@ -494,57 +494,6 @@ fn bench_generate_taxid_locator_core(c: &mut Criterion) {
     group.finish();
 }
 
-// ── consensus_level under high load ──────────────────────────────────────
-
-// ── consensus_level under high hit counts ─────────────────────────────────
-
-fn bench_consensus_level_high_load(c: &mut Criterion) {
-    let num_hits = 200;
-    let mut hits = Vec::with_capacity(num_hits);
-
-    for i in 0..num_hits {
-        hits.push(M8Record {
-            qname: "read1".to_string(),
-            tname: format!("QIK02963.{}", i), // realistic accession style
-            pident: 85.0 + (i as f64 % 10.0),
-            alen: 120,
-            mismatch: 10,
-            gapopen: 1,
-            qstart: 1,
-            qend: 120,
-            tstart: 1,
-            tend: 120,
-            evalue: 1e-30,
-            bitscore: 250.0,
-            qlen: 150,
-            slen: 300,
-        });
-    }
-
-    let lineage_map = build_lineage_map();
-    let acc2taxid_map = build_acc_map(&[("QIK02963", 1)]);
-
-    // Required 4th argument
-    let should_keep = Arc::new(|_: &[i32]| true);
-
-    let mut group = c.benchmark_group("consensus_level_high_load");
-    group.throughput(Throughput::Elements(num_hits as u64));
-    group.sample_size(10);
-
-    group.bench_function("200_hits", |b| {
-        b.iter(|| {
-            let _ = black_box(consensus_level(
-                black_box(&hits),
-                black_box(&lineage_map),
-                black_box(&acc2taxid_map),
-                black_box(&should_keep),
-            ));
-        })
-    });
-
-    group.finish();
-}
-
 
 // ── Buffer & Concurrency Tuning Functions ────────────────────────────────
 
@@ -557,6 +506,15 @@ fn bench_compute_buffer_and_concurrency(c: &mut Criterion) {
         .unwrap_or((16u64 << 30, 8u64 << 30));
 
     let rng = generate_rng(Some(42));
+
+    let efs_base_dir = PathBuf::from(&args.efs_base_dir);
+    let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
+
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let run_id = format!("run_stress_test_{ts}");
+
+    let distributed_workers =
+        resolve_distributed_workers(args.distributed, args.distributed_workers).unwrap();
 
     let mut config = RunConfig {
         cwd: PathBuf::from("."),
@@ -577,6 +535,14 @@ fn bench_compute_buffer_and_concurrency(c: &mut Criterion) {
         gpu_info: GpuDetection { count: 0, gpus: vec![] },
         has_gpu: false,
         alignment_backend: NRAlignmentBackend::Diamond,
+        execution_mode: ExecutionMode::Single,
+        efs_base_dir,
+        efs_runs_dir,
+        run_id,
+        distributed_workers
+
+
+        
     };
 
     let mut group = c.benchmark_group("compute_buffer_concurrency");
@@ -624,7 +590,6 @@ criterion_group!(
     bench_parse_paf_batch_to_m8,
     bench_generate_taxid_fasta_core,
     bench_generate_taxid_locator_core,
-    bench_consensus_level_high_load,
     bench_compute_buffer_and_concurrency
 );
 
