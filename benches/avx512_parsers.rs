@@ -430,10 +430,12 @@ fn bench_generate_taxid_fasta_core(c: &mut Criterion) {
         });
     }
 
-    // Wrap maps in Arc to match the real function signature
-    let lineage_map: Arc<AHashMap<Taxid, Lineage>> = Arc::new(build_lineage_map());
-    let nt_hits: Arc<AHashMap<String, (Taxid, u8)>> = Arc::new(AHashMap::default());
-    let nr_hits: Arc<AHashMap<String, (Taxid, u8)>> = Arc::new(AHashMap::default());
+    // get_valid_lineage expects plain AHashMaps:
+    //   hits_by_read_id: AHashMap<String, (Taxid, i32)>
+    //   lineage_map:    AHashMap<Taxid, Lineage>
+    let lineage_map: AHashMap<Taxid, Lineage> = build_lineage_map();
+    let nt_hits: AHashMap<String, (Taxid, i32)> = AHashMap::default();
+    let nr_hits: AHashMap<String, (Taxid, i32)> = AHashMap::default();
 
     let mut group = c.benchmark_group("generate_taxid_fasta_core");
     group.throughput(Throughput::Elements(num_records as u64));
@@ -446,14 +448,23 @@ fn bench_generate_taxid_fasta_core(c: &mut Criterion) {
                 let parts: Vec<&str> = annotated_id.split(':').collect();
                 let contig_id = parts.last().unwrap_or(&"").to_string();
 
-                // Now passing &Arc<...> as expected by get_valid_lineage
-                let _nr_lineage = get_valid_lineage(&nr_hits, &lineage_map, &contig_id);
-                let _nt_lineage = get_valid_lineage(&nt_hits, &lineage_map, &contig_id);
+                let _nr_lineage = get_valid_lineage(
+                    &nr_hits,
+                    &lineage_map,
+                    &contig_id,
+                );
+
+                let _nt_lineage = get_valid_lineage(
+                    &nt_hits,
+                    &lineage_map,
+                    &contig_id,
+                );
 
                 let new_header = format!(
                     "family_nr:1:family_nt:2:genus_nr:10:genus_nt:20:species_nr:100:species_nt:200:{}",
                     annotated_id
                 );
+
                 let _ = black_box(parse_header(new_header.as_bytes(), '>'));
             }
         })
