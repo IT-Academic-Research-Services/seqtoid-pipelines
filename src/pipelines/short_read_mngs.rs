@@ -9883,55 +9883,359 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         cleanup_tasks.push(r2_copy_task);
     }
 
-    let (
-        non_host_nt_out_stream,
-        mut non_host_nt_cleanup_tasks,
-        mut non_host_nt_cleanup_receivers,
-    ) = nt_non_host_align(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-    )
-    .await?;
 
-    cleanup_tasks.append(&mut non_host_nt_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_nt_cleanup_receivers);
+    // =====================================================================
+    // Non-host Alignment
+    //
+    // The non-host FASTQ files are now fully materialized above, so NT and
+    // NR have independent, stable inputs.
+    //
+    // Execution topology:
+    //
+    // Single:
+    //     NT non-host alignment
+    //       -> paf_to_m8
+    //       -> sort NT m8
+    //       -> NT call_hits / fanout
+    //       -> NR non-host alignment
+    //       -> sort NR m8
+    //       -> NR call_hits / fanout
+    //
+    // Distributed:
+    //     NT non-host alignment
+    //       -> paf_to_m8
+    //       -> sort NT m8
+    //
+    //                 || concurrent ||
+    //
+    //     NR distributed alignment
+    //       -> NR m8
+    //       -> sort NR m8
+    //
+    // We intentionally overlap ONLY the two non-host alignment branches.
+    // Downstream NT/NR hit processing remains unchanged.
+    // =====================================================================
 
-    let nt_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nt.m8"), "."));
+    // ---------------------------------------------------------------------
+    // NT non-host alignment future
+    //
+    // This includes:
+    //   nt_non_host_align
+    //   paf_to_m8
+    //   sort_m8_by_read_id(nt)
+    //
+    // The future does not execute until awaited below. That lets distributed
+    // mode start this branch concurrently with the NR branch.
+    // ---------------------------------------------------------------------
 
-    let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) =
-        paf_to_m8(config.clone(), non_host_nt_out_stream, nt_m8_file_path).await?;
-    cleanup_tasks.append(&mut m8_cleanup_tasks);
+    let nt_non_host_align_fut = async {
+        info!("[run] NT non-host alignment phase started");
 
-    // ────────────────────────────────────────────────────────────────
-    // Sort m8 by read ID before call_hits_m8
-    // This guarantees consecutive lines per read → streaming group-by
-    // ────────────────────────────────────────────────────────────────
-    let m8_sorted_start = Instant::now();
-    let m8_sorted = sort_m8_by_read_id(
-        config.clone(),
-        m8_stream,
-        "nt", // label for logging + temp files
-    )
-    .await?;
-    info!(
-        "[run] sort_m8_by_read_id(nt) completed after {:?}",
-        m8_sorted_start.elapsed()
+        let (
+            non_host_nt_out_stream,
+            mut non_host_nt_cleanup_tasks,
+            mut non_host_nt_cleanup_receivers,
+        ) = nt_non_host_align(
+            config.clone(),
+            non_host_r1_path.clone(),
+            non_host_r2_path_opt.clone(),
+        )
+            .await?;
+
+        let nt_m8_file_path = out_dir.join(
+            rename_file_path(
+                &sample_base_buf,
+                None,
+                Some("nt.m8"),
+                ".",
+            ),
+        );
+
+        let (
+            m8_stream,
+            mut m8_cleanup_tasks,
+            m8_cleanup_receivers,
+        ) = paf_to_m8(
+            config.clone(),
+            non_host_nt_out_stream,
+            nt_m8_file_path,
+        )
+            .await?;
+
+        // PAF -> m8 tasks belong to the NT branch.
+        non_host_nt_cleanup_tasks.append(&mut m8_cleanup_tasks);
+        non_host_nt_cleanup_receivers.extend(m8_cleanup_receivers);
+
+        // -------------------------------------------------------------
+        // Sort NT m8 by read ID before call_hits_m8.
+        //
+        // This guarantees consecutive lines per read and therefore
+        // preserves the streaming group-by requirement downstream.
+        // -------------------------------------------------------------
+
+        let m8_sorted_start = Instant::now();
+
+        let m8_sorted = sort_m8_by_read_id(
+            config.clone(),
+            m8_stream,
+            "nt",
+        )
+            .await?;
+
+        info!(
+            "[run] sort_m8_by_read_id(nt) completed after {:?}",
+            m8_sorted_start.elapsed()
+        );
+
+        // The NT branch
+        // does not complete until its PAF -> m8 completion receivers have
+        // completed successfully.
+        for rx in non_host_nt_cleanup_receivers.iter_mut() {
+            rx.await??;
+        }
+
+        info!("[run] NT non-host alignment phase complete");
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+                Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+            ),
+            PipelineError,
+        >((
+            m8_sorted,
+            non_host_nt_cleanup_tasks,
+            non_host_nt_cleanup_receivers,
+        ))
+    };
+
+    let distributed_nr_run_dir =
+        config.efs_runs_dir.join(&config.run_id);
+
+    if matches!(config.execution_mode, ExecutionMode::Distributed) {
+        info!(
+        "[run] Distributed NR EFS run directory: {}",
+        distributed_nr_run_dir.display()
     );
-
-    for rx in m8_cleanup_receivers {
-        rx.await??;
     }
+    
+    // ---------------------------------------------------------------------
+    // NR non-host alignment future
+    //
+    // This includes:
+    //   nr_non_host_align
+    //   NR m8 fanout
+    //   NR m8 file writer
+    //   sort_m8_by_read_id(nr)
+    //
+    // In distributed mode, nr_non_host_align() contains the distributed
+    // scheduler / worker execution, so this future remains pending while
+    // that remote work proceeds.
+    // ---------------------------------------------------------------------
+
+    let nr_non_host_align_fut = async {
+        info!("[run] NR non-host alignment phase started");
+
+        let (
+            nr_non_host_m8_stream,
+            mut nr_non_host_cleanup_tasks,
+            nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ) = nr_non_host_align(
+            config.clone(),
+            non_host_r1_path.clone(),
+            non_host_r2_path_opt.clone(),
+            sample_base.clone(),
+        )
+            .await?;
+
+        // Fan out the completed/streaming NR m8:
+        //
+        //   branch 0 -> sort -> call_hits_m8
+        //   branch 1 -> durable nr.m8 file
+        //
+        let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
+            ReceiverStream::new(nr_non_host_m8_stream),
+            2,
+            "nr_m8_stream",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+
+        let mut nr_m8_streams_it = nr_m8_streams.into_iter();
+
+        let nr_m8_stream = ReceiverStream::new(
+            nr_m8_streams_it
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+        let nr_m8_file_stream = ReceiverStream::new(
+            nr_m8_streams_it
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+        let nr_m8_file_path = out_dir.join(
+            rename_file_path(
+                &sample_base_buf,
+                None,
+                Some("nr.m8"),
+                ".",
+            ),
+        );
+
+        let write_task = write_byte_stream_to_file(
+            &nr_m8_file_path,
+            nr_m8_file_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "nr_m8_file",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+        nr_non_host_cleanup_tasks.push(write_task);
+
+        // The fanout completion receiver is also owned by this branch.
+        let mut nr_non_host_cleanup_receivers = nr_non_host_cleanup_receivers;
+        nr_non_host_cleanup_receivers.push(paf_to_m8_stream_done_rx);
+
+        // -------------------------------------------------------------
+        // Sort NR m8 by read ID before call_hits_m8.
+        //
+        // Guarantees consecutive lines per read and therefore enables
+        // the downstream streaming group-by.
+        // -------------------------------------------------------------
+
+        let nr_sort_start = Instant::now();
+
+        let nr_m8_sorted = sort_m8_by_read_id(
+            config.clone(),
+            nr_m8_stream,
+            "nr",
+        )
+            .await?;
+
+        info!(
+            "[run] sort_m8_by_read_id(nr) completed after {:?}",
+            nr_sort_start.elapsed()
+        );
+
+        info!("[run] NR non-host alignment phase complete");
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+                Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+                Vec<TempDir>,
+            ),
+            PipelineError,
+        >((
+            nr_m8_sorted,
+            nr_non_host_cleanup_tasks,
+            nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ))
+    };
+
+    // ---------------------------------------------------------------------
+    //
+    // SINGLE:
+    //     Await NT completely before starting NR.
+    //
+    // DISTRIBUTED:
+    //     Drive both futures concurrently.
+    //
+    // ---------------------------------------------------------------------
+
+    let (
+        (
+            m8_sorted,
+            mut nt_non_host_cleanup_tasks,
+            mut nt_non_host_cleanup_receivers,
+        ),
+        (
+            nr_m8_sorted,
+            mut nr_non_host_cleanup_tasks,
+            mut nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ),
+    ) = match config.execution_mode {
+        ExecutionMode::Single => {
+            info!(
+                "[run] Non-host alignment mode=single: \
+                 running NT then NR serially"
+            );
+
+            let nt_result = nt_non_host_align_fut.await?;
+
+            let nr_result = nr_non_host_align_fut.await?;
+
+            (nt_result, nr_result)
+        }
+
+        ExecutionMode::Distributed => {
+            info!(
+                "[run] Non-host alignment mode=distributed: \
+                 running NT and NR concurrently"
+            );
+
+            tokio::try_join!(
+                nt_non_host_align_fut,
+                nr_non_host_align_fut,
+            )?
+        }
+    };
+
+    // ---------------------------------------------------------------------
+    // Transfer branch-owned cleanup resources into the run-level cleanup
+    // collections.
+    // ---------------------------------------------------------------------
+
+    cleanup_tasks.append(&mut nt_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nt_non_host_cleanup_receivers);
+
+    cleanup_tasks.append(&mut nr_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
+
+    final_temp_dirs.extend(nr_non_host_align_temp_dirs);
+
+    // =====================================================================
+    // NT downstream processing
+    // =====================================================================
 
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
-    let nt_concurrency = compute_phase_concurrency(&config, "call_hits_nt", 1.0, 3.5, 64, 16);
-    info!("call hits nt concurrency {}", nt_concurrency);
+    let nt_concurrency =
+        compute_phase_concurrency(
+            &config,
+            "call_hits_nt",
+            1.0,
+            3.5,
+            64,
+            16,
+        );
+
+    info!(
+        "call hits nt concurrency {}",
+        nt_concurrency
+    );
 
     let nt_call_hits_start = Instant::now();
-    let (nt_pairs, mut nt_call_cleanup_tasks, mut nt_call_cleanup_receivers) = call_hits_m8(
+
+    let (
+        nt_pairs,
+        mut nt_call_cleanup_tasks,
+        mut nt_call_cleanup_receivers,
+    ) = call_hits_m8(
         config.clone(),
-        m8_sorted, // sorted by read id
+        m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -9941,32 +10245,40 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "nt".to_string(),
     )
         .await?;
+
     info!(
-    "[run] call_hits_m8(nt) returned after {:?}",
-    nt_call_hits_start.elapsed()
-);
+        "[run] call_hits_m8(nt) returned after {:?}",
+        nt_call_hits_start.elapsed()
+    );
 
     cleanup_tasks.append(&mut nt_call_cleanup_tasks);
     cleanup_receivers.append(&mut nt_call_cleanup_receivers);
 
-    // One fanout of paired hits — no separate m8 / summary graphs.
+    // ---------------------------------------------------------------------
+    // One fanout of paired NT hits.
+    // ---------------------------------------------------------------------
+
     let nt_split_start = Instant::now();
-    info!("[run] fanout_to_channels(nt_pairs) ×5 ReducedRead");
+
+    info!(
+        "[run] fanout_to_channels(nt_pairs) x5 ReducedRead"
+    );
 
     let (nt_pair_rxs, nt_pairs_done_rx) = fanout_to_channels(
         nt_pairs,
         5,
         "nt_pairs",
         &config,
-        StreamDataType::JustBytes, // buffer-size hint only
+        StreamDataType::JustBytes,
     )
         .await?;
+
     cleanup_receivers.push(nt_pairs_done_rx);
 
     info!(
-    "[run] fanout_to_channels(nt_pairs) ready after {:?}",
-    nt_split_start.elapsed()
-);
+        "[run] fanout_to_channels(nt_pairs) ready after {:?}",
+        nt_split_start.elapsed()
+    );
 
     let mut nt_pair_rxs = nt_pair_rxs.into_iter();
     let nt_pairs_taxon = ReceiverStream::new(
@@ -10006,15 +10318,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let nt_pairs_summarize = nt_pairs_summarize;
         let duplicate_clusters = duplicate_clusters.clone();
+
         async move {
             let start = Instant::now();
+
             info!("[run] summarize_hits(nt) started");
-            let res =
-                summarize_hits(config.clone(), nt_pairs_summarize, duplicate_clusters, 0).await;
+
+            let res = summarize_hits(
+                config.clone(),
+                nt_pairs_summarize,
+                duplicate_clusters,
+                0,
+            )
+                .await;
+
             info!(
-            "[run] summarize_hits(nt) finished after {:?}",
-            start.elapsed()
-        );
+                "[run] summarize_hits(nt) finished after {:?}",
+                start.elapsed()
+            );
+
             res
         }
     });
@@ -10024,9 +10346,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
         let nt_pairs_taxon = nt_pairs_taxon;
+
         async move {
             let start = Instant::now();
-            info!("[run] generate_taxon_counts(NT) started");
+
+            info!(
+                "[run] generate_taxon_counts(NT) started"
+            );
+
             let res = generate_taxon_counts(
                 config,
                 nt_pairs_taxon,
@@ -10036,83 +10363,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 None,
             )
                 .await;
+
             info!(
-            "[run] generate_taxon_counts(NT) finished after {:?}",
-            start.elapsed()
-        );
+                "[run] generate_taxon_counts(NT) finished after {:?}",
+                start.elapsed()
+            );
+
             res
         }
     });
 
-
-    // NR Non-host-alignment
-    let (
-        nr_non_host_m8_stream,
-        mut nr_non_host_cleanup_tasks,
-        mut nr_non_host_cleanup_receivers,
-        nr_non_host_align_temp_dirs,
-    ) = nr_non_host_align(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-        sample_base.clone(),
-    )
-        .await?;
-
-    cleanup_tasks.append(&mut nr_non_host_cleanup_tasks);
-    cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
-    final_temp_dirs.extend(nr_non_host_align_temp_dirs);
-
-
-    let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
-        ReceiverStream::new(nr_non_host_m8_stream),
-        2,
-        "nr_m8_stream",
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(paf_to_m8_stream_done_rx);
-
-    let mut nr_m8_streams_it = nr_m8_streams.into_iter();
-    let nr_m8_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
-    let nr_m8_file_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
-
-    let nr_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nr.m8"), "."));
-
-    let write_task = write_byte_stream_to_file(
-        &nr_m8_file_path,
-        nr_m8_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "nr_m8_file",
-        true
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(write_task);
-
-
-
-    // ────────────────────────────────────────────────────────────────
-    // Sort NR m8 by read ID before call_hits_m8
-    // Guarantees consecutive lines per read → enables true streaming group-by
-    // ────────────────────────────────────────────────────────────────
-    let nr_sort_start = Instant::now();
-
-    let nr_m8_sorted = sort_m8_by_read_id(
-        config.clone(),
-        nr_m8_stream,
-        "nr",
-    )
-        .await?;
-
-    info!(
-        "[run] sort_m8_by_read_id(nr) completed after {:?}",
-        nr_sort_start.elapsed()
-    );
-
+    // =====================================================================
+    // NR downstream processing
+    // =====================================================================
 
     let nr_concurrency = compute_phase_concurrency(
         &config,
@@ -10123,9 +10386,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         16, // min for meaningful parallelism
     );
 
-    info!("call hits nr concurrency {}", nr_concurrency);
+    info!(
+        "call hits nr concurrency {}",
+        nr_concurrency
+    );
 
     let nr_call_hits_start = Instant::now();
+
     let (
         nr_pairs,
         mut nr_call_cleanup_tasks,
@@ -10142,17 +10409,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "nr".to_string(),
     )
         .await?;
+
     info!(
-    "[run] call_hits_m8(nr) returned after {:?}",
-    nr_call_hits_start.elapsed()
-);
+        "[run] call_hits_m8(nr) returned after {:?}",
+        nr_call_hits_start.elapsed()
+    );
 
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
-    // Single 5-way fanout of ReducedRead — pair stays together for every consumer
+    // ---------------------------------------------------------------------
+    // Single 5-way fanout of ReducedRead.
+    //
+    // Each logical pair remains together for every downstream consumer.
+    // ---------------------------------------------------------------------
+
     let nr_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NR pairs (5 private channels)");
+
+    info!(
+        "[run] starting fanout_to_channels for NR pairs (5 private channels)"
+    );
 
     let (nr_pair_rxs, nr_pairs_done_rx) = fanout_to_channels(
         nr_pairs,
@@ -10162,12 +10438,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes,
     )
         .await?;
+
     cleanup_receivers.push(nr_pairs_done_rx);
 
     info!(
-    "[run] fanout_to_channels(nr_pairs) ready after {:?} with 5 private channels",
-    nr_split_start.elapsed()
-);
+        "[run] fanout_to_channels(nr_pairs) ready after {:?} with 5 private channels",
+        nr_split_start.elapsed()
+    );
 
     let mut nr_pair_rxs_iter = nr_pair_rxs.into_iter();
     let nr_pairs_taxon =
