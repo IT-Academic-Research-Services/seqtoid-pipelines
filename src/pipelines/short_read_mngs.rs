@@ -3219,7 +3219,7 @@ async fn run_diamond_single_file(
 
 
 
-async fn non_host_align(
+async fn nr_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
@@ -3266,7 +3266,7 @@ async fn non_host_align(
         },
 
         ExecutionMode::Distributed => {
-            distributed_non_host_align(
+            nr_distributed_non_host_align(
                 config,
                 r1_path,
                 r2_path_opt,
@@ -3370,7 +3370,7 @@ async fn get_reference_version(
 /// workers to claim.
 ///
 /// Worker discovery is best-effort and does not prevent work-unit creation.
-async fn distributed_non_host_align(
+async fn nr_distributed_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
@@ -10045,13 +10045,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     });
 
 
-    // Non-host-alignment
+    // NR Non-host-alignment
     let (
-        non_host_m8_stream,
-        mut non_host_cleanup_tasks,
-        mut non_host_cleanup_receivers,
-        non_host_align_temp_dirs,
-    ) = non_host_align(
+        nr_non_host_m8_stream,
+        mut nr_non_host_cleanup_tasks,
+        mut nr_non_host_cleanup_receivers,
+        nr_non_host_align_temp_dirs,
+    ) = nr_non_host_align(
         config.clone(),
         non_host_r1_path.clone(),
         non_host_r2_path_opt.clone(),
@@ -10059,13 +10059,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await?;
 
-    cleanup_tasks.append(&mut non_host_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_cleanup_receivers);
-    final_temp_dirs.extend(non_host_align_temp_dirs);
+    cleanup_tasks.append(&mut nr_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
+    final_temp_dirs.extend(nr_non_host_align_temp_dirs);
 
 
     let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
-        ReceiverStream::new(non_host_m8_stream),
+        ReceiverStream::new(nr_non_host_m8_stream),
         2,
         "nr_m8_stream",
         &config,
