@@ -9990,7 +9990,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         // The NT branch
         // does not complete until its PAF -> m8 completion receivers have
         // completed successfully.
-        for rx in non_host_nt_cleanup_receivers.iter_mut() {
+        for rx in non_host_nt_cleanup_receivers.drain(..) {
             rx.await??;
         }
 
@@ -10019,7 +10019,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         distributed_nr_run_dir.display()
     );
     }
-    
+
     // ---------------------------------------------------------------------
     // NR non-host alignment future
     //
