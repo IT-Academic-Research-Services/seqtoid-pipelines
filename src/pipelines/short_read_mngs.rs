@@ -9423,9 +9423,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
 
-    check_versions(versions_vec, &out_dir.clone(), &config)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    if !config.args.no_version_check {
+        check_versions(versions_vec, &out_dir.clone(), &config)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?;
+    }
 
     // Check required files
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone().ok_or_else(|| {

@@ -241,4 +241,7 @@ pub struct Arguments {
     #[arg(long, default_value = "/efs/runs")]
     pub efs_runs_dir: String,
 
+    #[arg(long, default_value_t = false)]
+    pub no_version_check: bool,
+
 }
