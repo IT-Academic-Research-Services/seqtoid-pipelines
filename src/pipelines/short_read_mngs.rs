@@ -2449,13 +2449,13 @@ async fn dedup(
 }
 
 
-/// Internal worker for deduplication, processing a shard of reads.
-///
 /// For paired-end input, this worker always treats two consecutive records
 /// as one logical pair. Unique pairs are emitted while holding the shared
 /// output-sender mutex across BOTH sends, guaranteeing:
 ///
-///     R1(pair A), R2(pair A), R1(pair B), R2(pair B), ...
+/// ```text
+/// R1(pair A), R2(pair A), R1(pair B), R2(pair B), ...
+/// ```
 ///
 /// even when multiple dedup workers are running concurrently.
 async fn dedup_worker(
