@@ -430,35 +430,48 @@ pub async fn stream_to_cmd(
     Ok((child, stdin_task, stderr_task))
 }
 
-/// Spawns an external command with specified arguments and captures its output.
+
+/// Spawns an external command without requiring the full RunConfig.
 ///
-/// # Arguments
+/// This is the common command-launching layer used by both the main pipeline
+/// and the distributed worker.
 ///
-/// * `config` - Shared run configuration
-/// * `cmd_tag` - Identifier for the command
-/// * `args` - Command line arguments
-/// * `verbose` - Whether to enable verbose output
-/// * `stderr_log_path` - Optional path to log stderr output
-///
-/// # Returns
-/// A result containing the child process and its stderr handling task.
-pub async fn spawn_cmd(
-    config: Arc<RunConfig>,
+/// `max_cores` is used only for the shared NUMA policy.
+pub async fn spawn_external_cmd(
     cmd_tag: &str,
     args: Vec<String>,
+    max_cores: usize,
     verbose: bool,
     stderr_log_path: Option<PathBuf>,
 ) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
-    let core_allocation = config.get_core_allocation(cmd_tag, None);
-    let _permit = if core_allocation == CoreAllocation::Maximal {
-        Some(config.maximal_semaphore.clone().acquire_owned().await?)
-    } else {
-        None
-    };
-
     let cmd_tag_owned = cmd_tag.to_string();
 
-    let (binary, final_args) = build_command_with_numa(config.as_ref(), cmd_tag, args);
+    // Preserve the repository's existing NUMA policy without requiring
+    // RunConfig.
+    let should_use_numa = cfg!(target_os = "linux")
+        && max_cores >= 64
+        && matches!(cmd_tag, MMSEQS_TAG | DIAMOND_TAG | SPADES_TAG);
+
+    let (binary, final_args) = if should_use_numa {
+        if which::which("numactl").is_ok() {
+            let mut final_args =
+                vec!["--interleave=all".to_string(), cmd_tag.to_string()];
+            final_args.extend(args);
+
+            debug!("Using numactl --interleave=all for {}", cmd_tag);
+
+            ("numactl".to_string(), final_args)
+        } else {
+            warn!(
+                "numactl not found — running {} without NUMA interleave",
+                cmd_tag
+            );
+
+            (cmd_tag.to_string(), args)
+        }
+    } else {
+        (cmd_tag.to_string(), args)
+    };
 
     let mut child = Command::new(&binary)
         .args(&final_args)
@@ -478,24 +491,37 @@ pub async fn spawn_cmd(
         let cmd_tag_clone = cmd_tag_owned.clone();
 
         tokio::spawn(async move {
-            let mut reader = BufReader::with_capacity(1024 * 1024, stderr);
+            let mut reader =
+                BufReader::with_capacity(1024 * 1024, stderr);
+
             let mut buffer = vec![0u8; 8192];
 
             let mut stderr_file = if let Some(path) = stderr_log_path_clone {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).await.map_err(|e| {
-                        anyhow!("Failed to create stderr log dir {}: {}", parent.display(), e)
+                        anyhow!(
+                            "Failed to create stderr log dir {}: {}",
+                            parent.display(),
+                            e
+                        )
                     })?;
                 }
+
                 Some(TokioFile::create(&path).await.map_err(|e| {
-                    anyhow!("Failed to create stderr log file {}: {}", path.display(), e)
+                    anyhow!(
+                        "Failed to create stderr log file {}: {}",
+                        path.display(),
+                        e
+                    )
                 })?)
             } else {
                 None
             };
 
             loop {
-                let n = reader.read(&mut buffer).await
+                let n = reader
+                    .read(&mut buffer)
+                    .await
                     .map_err(|e| anyhow!("Failed to read stderr: {}", e))?;
 
                 if n == 0 {
@@ -504,13 +530,23 @@ pub async fn spawn_cmd(
 
                 if let Some(file) = stderr_file.as_mut() {
                     file.write_all(&buffer[..n]).await.map_err(|e| {
-                        anyhow!("Failed to write stderr log for {}: {}", cmd_tag_clone, e)
+                        anyhow!(
+                            "Failed to write stderr log for {}: {}",
+                            cmd_tag_clone,
+                            e
+                        )
                     })?;
                 }
 
                 if verbose || stderr_log_path.is_some() {
                     let chunk = String::from_utf8_lossy(&buffer[..n]);
-                    eprint!("[{} stderr]: {}", cmd_tag_clone, chunk);
+
+                    eprint!(
+                        "[{} stderr]: {}",
+                        cmd_tag_clone,
+                        chunk
+                    );
+
                     if !chunk.ends_with('\n') {
                         eprintln!();
                     }
@@ -519,7 +555,11 @@ pub async fn spawn_cmd(
 
             if let Some(file) = stderr_file.as_mut() {
                 file.flush().await.map_err(|e| {
-                    anyhow!("Failed to flush stderr log for {}: {}", cmd_tag_clone, e)
+                    anyhow!(
+                        "Failed to flush stderr log for {}: {}",
+                        cmd_tag_clone,
+                        e
+                    )
                 })?;
             }
 
@@ -528,6 +568,41 @@ pub async fn spawn_cmd(
     };
 
     Ok((child, stderr_task))
+}
+
+/// Existing pipeline-facing command launcher.
+///
+/// Keeps the RunConfig-specific resource/semaphore behavior while delegating
+/// actual process spawning to the shared RunConfig-independent launcher.
+pub async fn spawn_cmd(
+    config: Arc<RunConfig>,
+    cmd_tag: &str,
+    args: Vec<String>,
+    verbose: bool,
+    stderr_log_path: Option<PathBuf>,
+) -> Result<(Child, JoinHandle<Result<(), anyhow::Error>>)> {
+    let core_allocation = config.get_core_allocation(cmd_tag, None);
+
+    let _permit = if core_allocation == CoreAllocation::Maximal {
+        Some(
+            config
+                .maximal_semaphore
+                .clone()
+                .acquire_owned()
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    spawn_external_cmd(
+        cmd_tag,
+        args,
+        config.max_cores,
+        verbose,
+        stderr_log_path,
+    )
+        .await
 }
 
 
@@ -1867,13 +1942,13 @@ where
 mod tests {
     use super::*;
     use crate::cli::Arguments;
-    use crate::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType};
+    use crate::config::defs::{GpuDetection, NRAlignmentBackend, RunConfig, SimdLevel, StreamDataType, ExecutionMode, resolve_distributed_workers};
     use crate::utils::fastx::fastx_generator;
     use crate::utils::fastx::SequenceRecord;
     use crate::utils::system::{detect_ram, generate_rng};
     use log::{self, debug, error, LevelFilter};
     use rayon::ThreadPoolBuilder;
-    use std::fs;
+    use std::{env, fs};
     use std::io::Read;
     use std::os::unix::fs::FileTypeExt;
     use std::path::Path;
@@ -1889,7 +1964,6 @@ mod tests {
     use tokio::task;
     use tokio::time::{self, Duration};
 
-
     /// Helper function to create a `RunConfig` for tests.
     fn create_test_run_config() -> Arc<RunConfig> {
         let args = Arguments {
@@ -1901,6 +1975,15 @@ mod tests {
             .unwrap_or((16u64 << 30, 8u64 << 30));
 
         let rng = generate_rng(Some(42));
+
+        let efs_base_dir = PathBuf::from(&args.efs_base_dir);
+        let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
+
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let run_id = format!("run_streams_test_{ts}");
+        
+        let distributed_workers =
+            resolve_distributed_workers(args.distributed, args.distributed_workers).unwrap();
 
         let mut run_config = RunConfig {
             cwd: PathBuf::from("."),
@@ -1921,6 +2004,11 @@ mod tests {
             gpu_info: GpuDetection { count: 0, gpus: vec![] },
             has_gpu: false,
             alignment_backend: NRAlignmentBackend::Diamond,
+            execution_mode: ExecutionMode::Single,
+            efs_base_dir,
+            efs_runs_dir,
+            run_id,
+            distributed_workers
         };
 
         // Compute proper buffer size exactly like main.rs

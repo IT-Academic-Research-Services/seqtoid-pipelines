@@ -236,6 +236,18 @@ pub enum NRAlignmentBackend {
     MmseqsGpu,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Single,
+    Distributed,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        ExecutionMode::Single
+    }
+}
+
 
 #[derive(Clone, Debug)]
 pub struct RunConfig {
@@ -257,6 +269,34 @@ pub struct RunConfig {
     pub gpu_info: GpuDetection,
     pub has_gpu: bool,
     pub alignment_backend: NRAlignmentBackend,
+    pub execution_mode: ExecutionMode,
+    pub efs_base_dir: PathBuf,
+    pub efs_runs_dir: PathBuf,
+    pub run_id: String,
+    pub distributed_workers: usize,
+}
+
+pub fn resolve_distributed_workers(
+    distributed: bool,
+    requested_workers: Option<usize>,
+) -> Result<usize, PipelineError> {
+    match (distributed, requested_workers) {
+        (false, Some(_)) => Err(PipelineError::InvalidConfig(
+            "--distributed-workers requires --distributed".to_string(),
+        )),
+
+        (true, Some(n)) if n > 0 => Ok(n),
+
+        (true, Some(_)) => Err(PipelineError::InvalidConfig(
+            "--distributed-workers must be greater than zero".to_string(),
+        )),
+
+        (true, None) => Err(PipelineError::InvalidConfig(
+            "--distributed requires --distributed-workers N".to_string(),
+        )),
+
+        (false, None) => Ok(0),
+    }
 }
 
 /// Internal structure for grouped batch processing of read hits.

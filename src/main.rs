@@ -33,6 +33,7 @@ use crate::cli::args::Technology;
 use crate::cli::parse;
 use crate::config::defs::{
     GpuDetection, GpuInfo, NRAlignmentBackend, PipelineError, RunConfig, StreamDataType,
+    ExecutionMode, resolve_distributed_workers
 };
 use crate::utils::file::{derive_sample_base_from_file1, resolve_existing_input_path};
 use crate::utils::system::{
@@ -163,6 +164,28 @@ async fn main() -> Result<()> {
 
     let out_dir = setup_output_dir(&args, &dir)?;
     let module = args.module.clone();
+
+    let execution_mode = if args.distributed {
+        ExecutionMode::Distributed
+    } else {
+        ExecutionMode::Single
+    };
+
+    let efs_base_dir = PathBuf::from(&args.efs_base_dir);
+    let efs_runs_dir = PathBuf::from(&args.efs_runs_dir);
+
+    let run_id = out_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            // fallback if out_dir is weird
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            format!("run_{ts}")
+        });
+
+    let distributed_workers =
+        resolve_distributed_workers(args.distributed, args.distributed_workers)?;
+
     let run_config = Arc::new(RunConfig {
         cwd: dir,
         ram_temp_dir,
@@ -178,10 +201,15 @@ async fn main() -> Result<()> {
         rng,
         log_level,
         base_backpressure_pause: 1000, // NB: hardcoded for testing
-        simd: simd,
-        gpu_info: gpu_info,
-        has_gpu: has_gpu,
+        simd,
+        gpu_info,
+        has_gpu,
         alignment_backend: backend,
+        execution_mode,
+        efs_base_dir,
+        efs_runs_dir,
+        run_id,
+        distributed_workers,
     });
 
     if let Err(e) = ensure_transparent_hugepages(&run_config).await {
@@ -272,7 +300,7 @@ fn setup_output_dir(args: &cli::args::Arguments, cwd: &PathBuf) -> Result<PathBu
             let sample_base = derive_sample_base_from_file1(&file1)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-            let timestamp = chrono::Local::now().format("%Y%m%d").to_string();
+            let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
             cwd.join(format!("{}_{}", sample_base.display(), timestamp))
         }
     };

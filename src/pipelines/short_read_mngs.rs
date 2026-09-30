@@ -9,6 +9,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ahash::AHashMap;
 use ahash::RandomState as AHashRandomState;
@@ -51,7 +52,7 @@ use crate::config::defs::{
     NRAlignmentBackend, PairingMode, PipelineError, ReadCountingMode, ReadStats, RunConfig,
     SamtoolsSubcommand, StreamDataType, Taxid, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, DIAMOND_TAG,
     FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, NR_TAG, NT_TAG,
-    READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG, ReducedRead
+    READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG, ReducedRead, ExecutionMode
 };
 use crate::utils::blast::{
     build_taxon_counts_list, call_hits_m8, compute_merged_taxon_counts,
@@ -79,12 +80,12 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{
     generate_taxid_fasta, generate_taxid_locator, parse_byte_stream_to_fastq, raw_read_count,
     read_fasta, read_fastq, stream_record_counter, write_combined_fastq,
-    write_fasta_stream_to_file, SequenceRecord,
+    write_fasta_stream_to_file, SequenceRecord, chunk_paired_fastq
 };
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
     validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
-    write_vecu8_to_file,
+    write_vecu8_to_file, copy_file_streaming,
 };
 use crate::utils::paf::paf_to_m8;
 use crate::utils::plotting::plot_insert_sizes;
@@ -109,6 +110,12 @@ const MIN_CONTIG_SIZE: u64 = 4;
 
 const MIN_REF_FASTA_SIZE: u64 = 25;
 const MIN_ASSEMBLED_CONTIG_SIZE: u64 = 25;
+
+const REFERENCE_METADATA_BUCKET: &str = "seqtoid-public-references";
+
+const REFERENCE_METADATA_PREFIX: &str = "phase2/refs/metadata";
+
+const DISTRIBUTED_WORKER_STALE_SECS: u64 = 30;
 
 /// Holds the results from a Kallisto quantification run.
 #[derive(Debug)]
@@ -2221,17 +2228,20 @@ async fn dedup(
         config.max_cores,
         4, // min 4 workers
     );
-    let num_shards = (num_workers * 16).max(1024); // Good contention balance
+    let num_shards = (num_workers * 16).max(1024);
 
-    let shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>> = (0..num_shards)
-        .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
-        .collect();
+    let shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>> =
+        (0..num_shards)
+            .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
+            .collect();
 
     let total_count = Arc::new(AtomicU64::new(0));
     let unique_count_atomic = Arc::new(AtomicU64::new(0));
 
     // Channel for writing clusters.csv incrementally
-    let (csv_tx, csv_rx) = mpsc::channel::<(String, String)>(config.base_buffer_size * num_workers);
+    let (csv_tx, csv_rx) =
+        mpsc::channel::<(String, String)>(config.base_buffer_size * num_workers);
+
     let csv_path = out_dir.join("clusters.csv");
     let csv_task = tokio::spawn(async move {
         let mut file = BufWriter::new(
@@ -2239,21 +2249,27 @@ async fn dedup(
                 .await
                 .context("Failed to create clusters.csv")?,
         );
+
         file.write_all(b"representative read id,read id\n")
             .await
             .context("CSV header write failed")?;
+
         let mut rx = csv_rx;
         while let Some((rep, member)) = rx.recv().await {
             file.write_all(format!("{},{}\n", rep, member).as_bytes())
                 .await
                 .context("CSV write failed")?;
         }
+
         file.flush().await.context("CSV flush failed")?;
         Ok(())
     });
     cleanup_tasks.push(csv_task);
 
-    let (uniques_tx, uniques_rx) = mpsc::channel(config.base_buffer_size * num_workers);
+    let (uniques_tx, uniques_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size * num_workers);
+
+    let uniques_tx = Arc::new(tokio::sync::Mutex::new(uniques_tx));
 
     let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> =
         Vec::with_capacity(num_workers);
@@ -2261,69 +2277,92 @@ async fn dedup(
     let worker_txs: Vec<mpsc::Sender<ParseOutput>> = (0..num_workers)
         .map(|_| {
             let (tx, rx) = mpsc::channel(config.base_buffer_size);
+
             let csv_tx_clone = csv_tx.clone();
+            let uniques_tx_clone = uniques_tx.clone();
+
             let handle = tokio::spawn(dedup_worker(
                 rx,
                 shards.clone(),
-                uniques_tx.clone(),
+                uniques_tx_clone,
                 csv_tx_clone,
                 paired,
                 prefix_len,
                 total_count.clone(),
                 unique_count_atomic.clone(),
             ));
+
             worker_handles.push(handle);
             tx
         })
         .collect();
 
-    // Distributor: round-robin to workers
+    // Distributor: round-robin complete pairs to workers.
+    //
+    // The input remains interleaved:
+    //   R1, R2, R1, R2, ...
+    //
+    // We validate the pair before sending either record to a worker.
     let mut stream = ReceiverStream::new(input_stream);
     let mut i = 0usize;
+
     if paired {
         while let Some(r1_item) = stream.next().await {
             let r1 = match r1_item {
                 ParseOutput::Fastq(rec) => rec,
-                _ => continue,
+                _ => {
+                    return Err(PipelineError::InvalidFastqFormat(
+                        "Unexpected non-FASTQ item in paired dedup input".to_string(),
+                    ));
+                }
             };
 
-            if let Some(r2_item) = stream.next().await {
-                let r2 = match r2_item {
-                    ParseOutput::Fastq(rec) => rec,
-                    _ => continue,
-                };
-
-                if r1.id() != r2.id() {
-                    return Err(PipelineError::InvalidFastqFormat(format!(
-                        "Mismatched pair IDs: R1={}, R2={}",
-                        r1.id(),
-                        r2.id()
-                    )));
-                }
-
-                let worker_tx = &worker_txs[i % num_workers];
-                worker_tx
-                    .send(ParseOutput::Fastq(r1))
-                    .await
-                    .map_err(|e| PipelineError::Other(anyhow!("Send R1 failed: {}", e)))?;
-                worker_tx
-                    .send(ParseOutput::Fastq(r2))
-                    .await
-                    .map_err(|e| PipelineError::Other(anyhow!("Send R2 failed: {}", e)))?;
-                i += 1;
-            } else {
-                return Err(PipelineError::InvalidFastqFormat(
+            let r2_item = stream.next().await.ok_or_else(|| {
+                PipelineError::InvalidFastqFormat(
                     "Missing R2 in paired stream".to_string(),
-                ));
+                )
+            })?;
+
+            let r2 = match r2_item {
+                ParseOutput::Fastq(rec) => rec,
+                _ => {
+                    return Err(PipelineError::InvalidFastqFormat(
+                        "Unexpected non-FASTQ R2 item in paired dedup input".to_string(),
+                    ));
+                }
+            };
+
+            if r1.id() != r2.id() {
+                return Err(PipelineError::InvalidFastqFormat(format!(
+                    "Mismatched pair IDs: R1={}, R2={}",
+                    r1.id(),
+                    r2.id()
+                )));
             }
+
+            let worker_tx = &worker_txs[i % num_workers];
+
+            worker_tx
+                .send(ParseOutput::Fastq(r1))
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("Send R1 failed: {}", e)))?;
+
+            worker_tx
+                .send(ParseOutput::Fastq(r2))
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("Send R2 failed: {}", e)))?;
+
+            i += 1;
         }
     } else {
         while let Some(item) = stream.next().await {
             let worker_tx = &worker_txs[i % num_workers];
+
             worker_tx
                 .send(item)
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("Send failed: {}", e)))?;
+
             i += 1;
         }
     }
@@ -2337,15 +2376,17 @@ async fn dedup(
             .context("Worker error")?;
     }
 
-    // Drop csv_tx to close csv_rx
+    // Drop csv_tx to close csv_rx.
     drop(csv_tx);
 
     // Build duplicate_clusters from shards (rep_id -> ClusterInfo)
     let duplicate_clusters = Arc::new(DashMap::with_capacity(num_shards));
+
     for shard in &shards {
         let guard = shard
             .lock()
             .map_err(|e| PipelineError::Other(anyhow!("Shard lock poisoned: {}", e)))?;
+
         for (_, (rep_id, size, members)) in guard.iter() {
             duplicate_clusters.insert(
                 rep_id.clone(),
@@ -2360,27 +2401,33 @@ async fn dedup(
     // Write duplicate_cluster_sizes.tsv
     let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
     let duplicate_clusters_clone = duplicate_clusters.clone();
+
     let tsv_task = tokio::spawn(async move {
         let mut file = BufWriter::new(
             TokioFile::create(&tsv_path)
                 .await
-                .context("Failed to create TSV file")?,
+                .context("Failed to create duplicate_cluster_sizes.tsv")?,
         );
+
         file.write_all(b"representative read id\tcluster size\n")
             .await
             .context("TSV header write failed")?;
+
         for entry in duplicate_clusters_clone.iter() {
             let (rep_id, info) = entry.pair();
+
             file.write_all(format!("{}\t{}\n", rep_id, info.size).as_bytes())
                 .await
                 .context("TSV write failed")?;
         }
+
         file.flush().await.context("TSV flush failed")?;
         Ok(())
     });
     cleanup_tasks.push(tsv_task);
 
     let unique_count = unique_count_atomic.load(AtomicOrdering::Relaxed);
+
     let (count_tx, count_rx) = oneshot::channel();
     count_tx
         .send(unique_count)
@@ -2401,26 +2448,20 @@ async fn dedup(
     ))
 }
 
-/// Internal worker for deduplication, processing a shard of reads.
+
+/// For paired-end input, this worker always treats two consecutive records
+/// as one logical pair. Unique pairs are emitted while holding the shared
+/// output-sender mutex across BOTH sends, guaranteeing:
 ///
-/// # Arguments
+/// ```text
+/// R1(pair A), R2(pair A), R1(pair B), R2(pair B), ...
+/// ```
 ///
-/// * `rx`: receiver for FASTQ records to process
-/// * `shards`: shared maps of read hashes to cluster information
-/// * `uniques_tx`: sender for unique sequence records
-/// * `csv_tx`: sender for cluster membership information (representative, member)
-/// * `paired`: whether the input is paired-end
-/// * `prefix_len`: optional prefix length for deduplication
-/// * `total_count`: atomic counter for total reads processed
-/// * `unique_count`: atomic counter for unique reads found
-///
-/// # Returns
-///
-/// Result<()>: success or error
+/// even when multiple dedup workers are running concurrently.
 async fn dedup_worker(
     mut rx: mpsc::Receiver<ParseOutput>,
     shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>>,
-    uniques_tx: mpsc::Sender<ParseOutput>,
+    uniques_tx: Arc<tokio::sync::Mutex<mpsc::Sender<ParseOutput>>>,
     csv_tx: mpsc::Sender<(String, String)>,
     paired: bool,
     prefix_len: Option<usize>,
@@ -2432,7 +2473,11 @@ async fn dedup_worker(
     while let Some(item) = rx.recv().await {
         let record = match item {
             ParseOutput::Fastq(rec) => rec,
-            _ => continue,
+            _ => {
+                return Err(anyhow!(
+                    "dedup_worker received unexpected non-FASTQ item"
+                ));
+            }
         };
 
         if paired {
@@ -2454,20 +2499,23 @@ async fn dedup_worker(
 
             let id = r1.id().to_string();
 
-            let r1_prefix =
-                &r1.seq()[0..prefix_len.map_or(r1.seq().len(), |l| l.min(r1.seq().len()))];
-            let r2_prefix =
-                &r2.seq()[0..prefix_len.map_or(r2.seq().len(), |l| l.min(r2.seq().len()))];
+            let r1_prefix_len = prefix_len
+                .map_or(r1.seq().len(), |l| l.min(r1.seq().len()));
+            let r2_prefix_len = prefix_len
+                .map_or(r2.seq().len(), |l| l.min(r2.seq().len()));
+
+            let r1_prefix = &r1.seq()[..r1_prefix_len];
+            let r2_prefix = &r2.seq()[..r2_prefix_len];
 
             let mut hasher = XxHash64::default();
             hasher.write(r1_prefix);
             hasher.write_u8(0);
             hasher.write(r2_prefix);
-            let hash_key = hasher.finish();
 
+            let hash_key = hasher.finish();
             let shard_idx = (hash_key as usize) % shards.len();
 
-            // ─── Critical: only hold lock for the minimal time ───
+            // Only hold the shard lock for the map operation.
             let (rep_id, is_new) = {
                 let mut shard = shards[shard_idx]
                     .lock()
@@ -2485,34 +2533,43 @@ async fn dedup_worker(
                 let is_new = entry.1 == 1;
 
                 (rep_id, is_new)
-            }; // ← guard dropped here
+            };
 
             total_count.fetch_add(1, AtomicOrdering::Relaxed);
 
-            // Now safe to await
-            csv_tx.send((rep_id, id)).await.context("CSV send failed")?;
+            csv_tx
+                .send((rep_id, id))
+                .await
+                .context("CSV send failed")?;
 
             if is_new {
-                uniques_tx
-                    .send(ParseOutput::Fastq(r1))
+                // CRITICAL:
+                // Hold the sender lock across BOTH sends. This makes the pair
+                // atomic at the logical output-stream level.
+                let tx = uniques_tx.lock().await;
+
+                tx.send(ParseOutput::Fastq(r1))
                     .await
                     .context("Send R1 unique failed")?;
-                uniques_tx
-                    .send(ParseOutput::Fastq(r2))
+
+                tx.send(ParseOutput::Fastq(r2))
                     .await
                     .context("Send R2 unique failed")?;
+
+                // tx is dropped here, allowing another worker to emit.
             }
         } else {
-            let prefix = &record.seq()
-                [0..prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()))];
+            let prefix_len =
+                prefix_len.map_or(record.seq().len(), |l| l.min(record.seq().len()));
+
+            let prefix = &record.seq()[..prefix_len];
 
             let mut hasher = XxHash64::default();
             hasher.write(prefix);
-            let hash_key = hasher.finish();
 
+            let hash_key = hasher.finish();
             let shard_idx = (hash_key as usize) % shards.len();
 
-            // Same pattern: minimal lock scope
             let (rep_id, is_new) = {
                 let mut shard = shards[shard_idx]
                     .lock()
@@ -2542,8 +2599,9 @@ async fn dedup_worker(
                 .context("CSV send failed")?;
 
             if is_new {
-                uniques_tx
-                    .send(ParseOutput::Fastq(record))
+                let tx = uniques_tx.lock().await;
+
+                tx.send(ParseOutput::Fastq(record))
                     .await
                     .context("Send unique failed")?;
             }
@@ -2556,6 +2614,7 @@ async fn dedup_worker(
 
     Ok(())
 }
+
 
 #[allow(dead_code)]
 /// Subsamples the input FASTQ stream using weights from deduplication clusters.
@@ -2801,7 +2860,7 @@ async fn subsample_uniform(
 /// - stream of alignment results (PAF format)
 /// - vector of cleanup tasks
 /// - vector of cleanup receivers
-async fn minimap2_non_host_align(
+async fn nt_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
@@ -3031,7 +3090,7 @@ async fn minimap2_non_host_align(
     cleanup_tasks.extend(worker_handles);
 
     info!(
-        "[minimap2_non_host_align] Launched {} minimap2 workers — PAF stream now feeding paf_to_m8",
+        "[nt_non_host_align] Launched {} minimap2 workers — PAF stream now feeding paf_to_m8",
         concurrency
     );
 
@@ -3157,6 +3216,2004 @@ async fn run_diamond_single_file(
 
     Ok(m8_path)
 }
+
+
+
+async fn nr_non_host_align(
+    config: Arc<RunConfig>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+    sample_id: String,
+) -> Result<
+    (
+        mpsc::Receiver<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<TempDir>,
+    ),
+    PipelineError,
+> {
+    match config.execution_mode {
+        ExecutionMode::Single => match config.alignment_backend {
+            NRAlignmentBackend::Diamond => {
+                diamond_non_host_align(
+                    config,
+                    r1_path,
+                    r2_path_opt,
+                )
+                    .await
+            }
+
+            NRAlignmentBackend::MmseqsCpu => {
+                mmseqs_non_host_align(
+                    config,
+                    r1_path,
+                    r2_path_opt,
+                    MmseqsBackend::Cpu,
+                )
+                    .await
+            }
+
+            NRAlignmentBackend::MmseqsGpu => {
+                mmseqs_non_host_align(
+                    config,
+                    r1_path,
+                    r2_path_opt,
+                    MmseqsBackend::Gpu,
+                )
+                    .await
+            }
+        },
+
+        ExecutionMode::Distributed => {
+            nr_distributed_non_host_align(
+                config,
+                r1_path,
+                r2_path_opt,
+                sample_id,
+            )
+                .await
+        }
+    }
+}
+
+
+
+async fn get_reference_version(
+    backend: NRAlignmentBackend,
+) -> Result<String, PipelineError> {
+    let key = match backend {
+        NRAlignmentBackend::MmseqsCpu => {
+            format!("{}/mmseqs-cpu.version", REFERENCE_METADATA_PREFIX)
+        }
+
+        NRAlignmentBackend::MmseqsGpu => {
+            format!("{}/mmseqs-gpu.version", REFERENCE_METADATA_PREFIX)
+        }
+
+        NRAlignmentBackend::Diamond => {
+            format!("{}/diamond.version", REFERENCE_METADATA_PREFIX)
+        }
+    };
+
+    let sdk_config =
+        aws_config::load_defaults(
+            aws_config::BehaviorVersion::latest(),
+        )
+            .await;
+
+    let s3_client =
+        aws_sdk_s3::Client::new(&sdk_config);
+
+    let response = s3_client
+        .get_object()
+        .bucket(REFERENCE_METADATA_BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to retrieve reference version from s3://{}/{}: {}",
+                REFERENCE_METADATA_BUCKET,
+                key,
+                e
+            ))
+        })?;
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to read reference version object s3://{}/{}: {}",
+                REFERENCE_METADATA_BUCKET,
+                key,
+                e
+            ))
+        })?
+        .into_bytes();
+
+    let version = String::from_utf8(bytes.to_vec())
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Reference version object s3://{}/{} is not valid UTF-8: {}",
+                REFERENCE_METADATA_BUCKET,
+                key,
+                e
+            ))
+        })?
+        .trim()
+        .to_string();
+
+    if version.is_empty() {
+        return Err(PipelineError::Other(anyhow!(
+            "Reference version object s3://{}/{} is empty",
+            REFERENCE_METADATA_BUCKET,
+            key
+        )));
+    }
+
+    info!(
+        "Distributed NR reference version: backend={:?}, version={}",
+        backend,
+        version
+    );
+
+    Ok(version)
+}
+
+/// Runs the distributed non-host alignment preparation path.
+///
+/// Copies the non-host FASTQs to EFS, creates paired FASTQ chunks, creates
+/// one AVAILABLE WorkUnit per chunk, and leaves those work units on EFS for
+/// workers to claim.
+///
+/// Worker discovery is best-effort and does not prevent work-unit creation.
+async fn nr_distributed_non_host_align(
+    config: Arc<RunConfig>,
+    r1_path: PathBuf,
+    r2_path_opt: Option<PathBuf>,
+    sample_id: String,
+) -> Result<
+    (
+        mpsc::Receiver<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<TempDir>,
+    ),
+    PipelineError,
+> {
+    let requested_workers =
+        config.distributed_workers;
+
+    let efs_base =
+        config.efs_runs_dir.join(&config.run_id);
+
+    info!(
+        "Distributed non-host align: preparing EFS run dir {}",
+        efs_base.display()
+    );
+
+    tokio::fs::create_dir_all(
+        &efs_base,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to create EFS run dir {}: {}",
+                efs_base.display(),
+                e
+            ))
+        })?;
+
+    let non_host_r1_efs =
+        efs_base.join("nonhost_R1.fastq");
+
+    let non_host_r2_efs =
+        r2_path_opt
+            .as_ref()
+            .map(|_| {
+                efs_base.join("nonhost_R2.fastq")
+            });
+
+    // ------------------------------------------------------------------
+    // 1. Copy non-host FASTQs to EFS.
+    // ------------------------------------------------------------------
+
+    info!(
+        "Copying non-host R1 to EFS: {}",
+        non_host_r1_efs.display()
+    );
+
+    copy_file_streaming(
+        &r1_path,
+        &non_host_r1_efs,
+        Some(config.clone()),
+        None,
+    )
+        .await
+        .map_err(PipelineError::Other)?
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "R1 copy task join failed: {e}"
+            ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "R1 EFS copy failed: {e}"
+            ))
+        })?;
+
+    if let (
+        Some(local_r2),
+        Some(efs_r2),
+    ) = (
+        &r2_path_opt,
+        &non_host_r2_efs,
+    ) {
+        info!(
+            "Copying non-host R2 to EFS: {}",
+            efs_r2.display()
+        );
+
+        copy_file_streaming(
+            local_r2,
+            efs_r2,
+            Some(config.clone()),
+            None,
+        )
+            .await
+            .map_err(PipelineError::Other)?
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "R2 copy task join failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "R2 EFS copy failed: {e}"
+                ))
+            })?;
+    }
+
+    info!(
+        "Non-host FASTQs on EFS under {}",
+        efs_base.display()
+    );
+
+    // ------------------------------------------------------------------
+    // 2. Chunk FASTQs.
+    //
+    // Paired-end keeps the existing chunk_paired_fastq() path.
+    // Single-end reads R1 records and writes complete FASTQ records
+    // into deterministic R1-only chunk files.
+    // ------------------------------------------------------------------
+
+    const CHUNKS_PER_WORKER: usize = 4;
+
+    let total_records =
+        raw_read_count(
+            non_host_r1_efs.clone(),
+            non_host_r2_efs.clone(),
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Non-host FASTQ count task join failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to count non-host FASTQ records: {e}"
+                ))
+            })?;
+
+    if total_records == 0 {
+        return Err(
+            PipelineError::EmptyStream
+        );
+    }
+
+    let target_chunks =
+        requested_workers
+            .checked_mul(
+                CHUNKS_PER_WORKER,
+            )
+            .ok_or_else(|| {
+                PipelineError::InvalidConfig(
+                    "Distributed chunk count overflow"
+                        .to_string(),
+                )
+            })?;
+
+    let chunks_dir =
+        efs_base.join("chunks");
+
+    let chunk_work_units:
+        Vec<(
+            u64,
+            u64,
+            PathBuf,
+            Option<PathBuf>,
+        )>;
+
+    if let Some(non_host_r2_efs) =
+        non_host_r2_efs.clone()
+    {
+        // --------------------------------------------------------------
+        // PAIRED-END
+        // --------------------------------------------------------------
+
+        if total_records % 2 != 0 {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Paired non-host FASTQ record count is not even: {}",
+                    total_records
+                )),
+            );
+        }
+
+        let total_pairs =
+            total_records / 2;
+
+        let target_chunks =
+            (target_chunks as u64)
+                .min(total_pairs)
+                .max(1);
+
+        let pairs_per_chunk =
+            (total_pairs
+                + target_chunks
+                - 1)
+                / target_chunks;
+
+        info!(
+            "Distributed NR chunking: {} pairs, {} requested workers, \
+             target {} chunks, {} pairs/chunk",
+            total_pairs,
+            requested_workers,
+            target_chunks,
+            pairs_per_chunk
+        );
+
+        let chunk_summary =
+            chunk_paired_fastq(
+                non_host_r1_efs.clone(),
+                non_host_r2_efs,
+                chunks_dir.clone(),
+                pairs_per_chunk,
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to chunk paired non-host FASTQs: {e}"
+                    ))
+                })?;
+
+        info!(
+            "Distributed NR chunking complete: {} pairs, {} R1 records, \
+             {} R2 records, {} chunks",
+            chunk_summary.total_pairs,
+            chunk_summary.total_r1_records,
+            chunk_summary.total_r2_records,
+            chunk_summary.chunks.len()
+        );
+
+        if chunk_summary.total_pairs
+            != total_pairs
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed chunk reconciliation failed: \
+                     source pairs={}, chunked pairs={}",
+                    total_pairs,
+                    chunk_summary.total_pairs
+                )),
+            );
+        }
+
+        chunk_work_units =
+            chunk_summary
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.chunk_id,
+                        chunk.pair_count,
+                        chunk.r1_path.clone(),
+                        Some(chunk.r2_path.clone()),
+                    )
+                })
+                .collect();
+    } else {
+        // --------------------------------------------------------------
+        // SINGLE-END
+        // --------------------------------------------------------------
+
+        let total_reads =
+            total_records;
+
+        let target_chunks =
+            (target_chunks as u64)
+                .min(total_reads)
+                .max(1);
+
+        let reads_per_chunk =
+            (total_reads
+                + target_chunks
+                - 1)
+                / target_chunks;
+
+        info!(
+        "Distributed NR single-end chunking: {} reads, {} requested workers, \
+         target {} chunks, {} reads/chunk",
+        total_reads,
+        requested_workers,
+        target_chunks,
+        reads_per_chunk
+    );
+
+        tokio::fs::create_dir_all(
+            &chunks_dir,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to create distributed chunks directory {}: {}",
+                chunks_dir.display(),
+                e
+            ))
+            })?;
+
+        let (rx, read_task) =
+            read_fastq(
+                non_host_r1_efs.clone(),
+                None,
+                PairingMode::Strict,
+                None,
+                u64::MAX,
+                None,
+                None,
+                "distributed_non_host_align_single_end_chunking",
+                &config,
+            )
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                "Failed to start single-end FASTQ reader: {e}"
+            ))
+                })?;
+
+        let byte_reader =
+            ChannelReader::new(
+                rx
+            );
+
+        let fastq_rx =
+            parse_fastq(
+                byte_reader,
+                &config,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                    "Failed to start single-end FASTQ parser: {e}"
+                ))
+                })?;
+
+        let mut stream =
+            ReceiverStream::new(
+                fastq_rx
+            );
+
+        let mut chunks =
+            Vec::<(
+                u64,
+                u64,
+                PathBuf,
+            )>::new();
+
+        let mut chunk_id =
+            0u64;
+
+        let mut chunk_reads =
+            0u64;
+
+        let mut total_reads_written =
+            0u64;
+
+        let mut current_chunk_path =
+            chunks_dir.join(format!(
+                "chunk_{:08}_R1.fastq",
+                chunk_id
+            ));
+
+        let mut writer =
+            Some(
+                BufWriter::new(
+                    tokio::fs::File::create(
+                        &current_chunk_path
+                    )
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(anyhow!(
+                        "Failed to create single-end chunk {}: {}",
+                        current_chunk_path.display(),
+                        e
+                    ))
+                        })?,
+                )
+            );
+
+        while let Some(item) =
+            stream.next().await
+        {
+            let record =
+                match item {
+                    ParseOutput::Fastq(record) => record,
+
+                    ParseOutput::Fasta(_) => {
+                        return Err(
+                            PipelineError::InvalidFastqFormat(
+                                "Single-end distributed chunking received FASTA output"
+                                    .to_string(),
+                            )
+                        );
+                    }
+
+                    ParseOutput::Bytes(_) => {
+                        return Err(
+                            PipelineError::InvalidFastqFormat(
+                                "Single-end distributed chunking received byte output"
+                                    .to_string(),
+                            )
+                        );
+                    }
+                };
+
+            let bytes =
+                record
+                    .to_bytes()
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                        "Failed to serialize single-end FASTQ record: {e}"
+                    ))
+                    })?;
+
+            writer
+                .as_mut()
+                .expect("single-end chunk writer missing")
+                .write_all(&bytes)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                    "Failed writing single-end chunk {}: {}",
+                    current_chunk_path.display(),
+                    e
+                ))
+                })?;
+
+            chunk_reads += 1;
+            total_reads_written += 1;
+
+            if chunk_reads == reads_per_chunk {
+                let mut completed_writer =
+                    writer
+                        .take()
+                        .expect("single-end chunk writer missing");
+
+                completed_writer
+                    .flush()
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                        "Failed flushing single-end chunk {}: {}",
+                        current_chunk_path.display(),
+                        e
+                    ))
+                    })?;
+
+                drop(completed_writer);
+
+                chunks.push((
+                    chunk_id,
+                    chunk_reads,
+                    current_chunk_path.clone(),
+                ));
+
+                chunk_id += 1;
+                chunk_reads = 0;
+
+                if total_reads_written < total_reads {
+                    current_chunk_path =
+                        chunks_dir.join(format!(
+                            "chunk_{:08}_R1.fastq",
+                            chunk_id
+                        ));
+
+                    writer =
+                        Some(
+                            BufWriter::new(
+                                tokio::fs::File::create(
+                                    &current_chunk_path
+                                )
+                                    .await
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                    "Failed to create single-end chunk {}: {}",
+                                    current_chunk_path.display(),
+                                    e
+                                ))
+                                    })?,
+                            )
+                        );
+                }
+            }
+        }
+
+        if chunk_reads > 0 {
+            let mut completed_writer =
+                writer
+                    .take()
+                    .expect("single-end chunk writer missing");
+
+            completed_writer
+                .flush()
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                    "Failed flushing final single-end chunk {}: {}",
+                    current_chunk_path.display(),
+                    e
+                ))
+                })?;
+
+            drop(completed_writer);
+
+            chunks.push((
+                chunk_id,
+                chunk_reads,
+                current_chunk_path.clone(),
+            ));
+        } else {
+            // The last exact-size chunk already closed its writer.
+            drop(writer.take());
+        }
+
+        read_task
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Single-end FASTQ reader task join failed: {e}"
+            ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Single-end FASTQ reader failed during chunking: {e}"
+            ))
+            })?;
+
+        if total_reads_written
+            != total_reads
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                "Distributed single-end chunk reconciliation failed: \
+                 source reads={}, chunked reads={}",
+                total_reads,
+                total_reads_written
+            )),
+            );
+        }
+
+        chunk_work_units =
+            chunks
+                .into_iter()
+                .map(|(
+                          chunk_id,
+                          read_count,
+                          r1_path,
+                      )| {
+                    (
+                        chunk_id,
+                        read_count,
+                        r1_path,
+                        None,
+                    )
+                })
+                .collect();
+
+        info!(
+            "Distributed NR single-end chunking complete: {} reads, {} chunks",
+            total_reads_written,
+            chunk_work_units.len()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Retrieve the required backend-specific reference version
+    //    from the canonical S3 metadata object.
+    // ------------------------------------------------------------------
+
+    let reference_version =
+        get_reference_version(
+            config.alignment_backend,
+        )
+            .await?;
+
+    // ------------------------------------------------------------------
+    // 4. Create one AVAILABLE WorkUnit per chunk.
+    // ------------------------------------------------------------------
+
+    let work_dir =
+        efs_base.join("work");
+
+    tokio::fs::create_dir_all(
+        &work_dir,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to create distributed work directory {}: {}",
+                work_dir.display(),
+                e
+            ))
+        })?;
+
+    for (
+        chunk_id,
+        expected_input_count,
+        r1_chunk_path,
+        r2_chunk_path,
+    ) in &chunk_work_units
+    {
+        let work_unit =
+            crate::utils::work_units::WorkUnit::new(
+                config.run_id.clone(),
+                sample_id.clone(),
+                *chunk_id,
+                r2_chunk_path.is_some(),
+                *expected_input_count,
+                reference_version.clone(),
+                r1_chunk_path.clone(),
+                r2_chunk_path.clone(),
+            );
+
+        let payload =
+            serde_json::to_vec_pretty(
+                &work_unit,
+            )
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to serialize work unit {}: {}",
+                        work_unit.id(),
+                        e
+                    ))
+                })?;
+
+        let final_path =
+            work_dir.join(
+                format!(
+                    "work_{:08}.json",
+                    chunk_id
+                ),
+            );
+
+        let tmp_path =
+            work_dir.join(
+                format!(
+                    "work_{:08}.json.tmp",
+                    chunk_id
+                ),
+            );
+
+        // Write the complete WorkUnit before making its
+        // final filename visible to workers.
+        tokio::fs::write(
+            &tmp_path,
+            payload,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to write work unit {}: {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+
+        tokio::fs::rename(
+            &tmp_path,
+            &final_path,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to publish work unit {} -> {}: {}",
+                    tmp_path.display(),
+                    final_path.display(),
+                    e
+                ))
+            })?;
+
+        info!(
+            "Published distributed work unit {}: {} {} -> {}",
+            work_unit.id(),
+            expected_input_count,
+            if r2_chunk_path.is_some() {
+                "pairs"
+            } else {
+                "reads"
+            },
+            final_path.display()
+        );
+    }
+
+    info!(
+        "Distributed NR: {} AVAILABLE work units created under {}",
+        chunk_work_units.len(),
+        work_dir.display()
+    );
+
+    // ------------------------------------------------------------------
+    // 5. Wait for the requested number of READY workers.
+    //
+    // Workers are started externally for now. Each worker is launched with
+    // this run's work_dir and polls the shared EFS work directory.
+    // ------------------------------------------------------------------
+
+    let worker_manager =
+        crate::utils::workers::WorkerManager::new(
+            config.efs_base_dir.clone().into(),
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Distributed NR: could not initialize worker manager: {}",
+                e
+            ))
+            })?;
+
+    match worker_manager
+        .discover_ready_workers(
+            config.alignment_backend,
+        )
+        .await
+    {
+        Ok(workers) => {
+            info!(
+            "Distributed NR: discovered {} READY workers; \
+             {} requested",
+            workers.len(),
+            requested_workers
+        );
+
+            for worker in &workers {
+                info!(
+                "Distributed NR worker: instance_id={}, \
+                 private_ip={}, instance_type={}, az={:?}",
+                worker.instance_id,
+                worker.private_ip,
+                worker.instance_type,
+                worker.availability_zone,
+            );
+            }
+        }
+
+        Err(e) => {
+            warn!(
+            "Distributed NR: READY worker discovery failed: {}; \
+             continuing to scheduler",
+            e
+        );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Monitor WorkUnits, detect stale workers, and retry failed work.
+    //
+    // The scheduler loop remains the component that drives progress.
+    //
+    // CLAIMED:
+    //   A worker may die after claiming but before RUNNING. Because no
+    //   heartbeat exists yet, use the WorkUnit JSON mtime as the claim age.
+    //
+    // RUNNING:
+    //   Use last_heartbeat to determine whether the worker is still alive.
+    //
+    // FAILED:
+    //   Retry only when failure.retryable=true.
+    //
+    // DONE:
+    //   Never modify.
+    //
+    // Recovery uses the same per-work-unit lock used by workers.
+    // ------------------------------------------------------------------
+
+    loop {
+        let mut available = 0usize;
+        let mut claimed = 0usize;
+        let mut running = 0usize;
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        let mut recovered = 0usize;
+
+        let mut entries =
+            tokio::fs::read_dir(&work_dir)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to read distributed work directory {}: {}",
+                        work_dir.display(),
+                        e
+                    ))
+                })?;
+
+        while let Some(entry) =
+            entries
+                .next_entry()
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed reading distributed work directory {}: {}",
+                        work_dir.display(),
+                        e
+                    ))
+                })?
+        {
+            let path =
+                entry.path();
+
+            let Some(name) =
+                path.file_name()
+                    .and_then(|v| v.to_str())
+            else {
+                continue;
+            };
+
+            if !name.starts_with("work_")
+                || !name.ends_with(".json")
+            {
+                continue;
+            }
+
+            let bytes =
+                tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "Failed to read distributed work unit {}: {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+
+            let work_unit:
+                crate::utils::work_units::WorkUnit =
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "Failed to parse distributed work unit {}: {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+
+            match work_unit.state {
+                crate::utils::work_units::WorkUnitState::Available => {
+                    available += 1;
+                }
+
+                crate::utils::work_units::WorkUnitState::Claimed
+                | crate::utils::work_units::WorkUnitState::Running => {
+                    let now =
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "System clock error while checking work-unit {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?
+                            .as_secs();
+
+                    let stale =
+                        match work_unit.state {
+                            crate::utils::work_units::WorkUnitState::Claimed => {
+                                let metadata =
+                                    tokio::fs::metadata(&path)
+                                        .await
+                                        .map_err(|e| {
+                                            PipelineError::Other(anyhow!(
+                                                "Failed to stat claimed work unit {}: {}",
+                                                path.display(),
+                                                e
+                                            ))
+                                        })?;
+
+                                let modified =
+                                    metadata
+                                        .modified()
+                                        .map_err(|e| {
+                                            PipelineError::Other(anyhow!(
+                                                "Failed to read mtime for claimed work unit {}: {}",
+                                                path.display(),
+                                                e
+                                            ))
+                                        })?;
+
+                                let modified_secs =
+                                    modified
+                                        .duration_since(UNIX_EPOCH)
+                                        .map_err(|e| {
+                                            PipelineError::Other(anyhow!(
+                                                "Invalid mtime for claimed work unit {}: {}",
+                                                path.display(),
+                                                e
+                                            ))
+                                        })?
+                                        .as_secs();
+
+                                now.saturating_sub(modified_secs)
+                                    > DISTRIBUTED_WORKER_STALE_SECS
+                            }
+
+                            crate::utils::work_units::WorkUnitState::Running => {
+                                match work_unit.last_heartbeat {
+                                    Some(last_heartbeat) => {
+                                        now.saturating_sub(last_heartbeat)
+                                            > DISTRIBUTED_WORKER_STALE_SECS
+                                    }
+
+                                    None => {
+                                        let metadata =
+                                            tokio::fs::metadata(&path)
+                                                .await
+                                                .map_err(|e| {
+                                                    PipelineError::Other(anyhow!(
+                                                        "Failed to stat running work unit {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ))
+                                                })?;
+
+                                        let modified =
+                                            metadata
+                                                .modified()
+                                                .map_err(|e| {
+                                                    PipelineError::Other(anyhow!(
+                                                        "Failed to read mtime for running work unit {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ))
+                                                })?;
+
+                                        let modified_secs =
+                                            modified
+                                                .duration_since(UNIX_EPOCH)
+                                                .map_err(|e| {
+                                                    PipelineError::Other(anyhow!(
+                                                        "Invalid mtime for running work unit {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ))
+                                                })?
+                                                .as_secs();
+
+                                        now.saturating_sub(modified_secs)
+                                            > DISTRIBUTED_WORKER_STALE_SECS
+                                    }
+                                }
+                            }
+
+                            _ => false,
+                        };
+
+                    if !stale {
+                        match work_unit.state {
+                            crate::utils::work_units::WorkUnitState::Claimed => {
+                                claimed += 1;
+                            }
+
+                            crate::utils::work_units::WorkUnitState::Running => {
+                                running += 1;
+                            }
+
+                            _ => {}
+                        }
+
+                        continue;
+                    }
+
+                    // Acquire the same lock used by workers before modifying
+                    // the work unit. Re-read the WorkUnit after acquiring the
+                    // lock because the state may have changed since the first
+                    // read above.
+                    let lock_path =
+                        path.with_extension("json.lock");
+
+                    let lock_file =
+                        match tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&lock_path)
+                            .await
+                        {
+                            Ok(file) => file,
+
+                            Err(err)
+                            if err.kind()
+                                == std::io::ErrorKind::AlreadyExists =>
+                                {
+                                    match work_unit.state {
+                                        crate::utils::work_units::WorkUnitState::Claimed => {
+                                            claimed += 1;
+                                        }
+
+                                        crate::utils::work_units::WorkUnitState::Running => {
+                                            running += 1;
+                                        }
+
+                                        _ => {}
+                                    }
+
+                                    continue;
+                                }
+
+                            Err(err) => {
+                                return Err(
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to acquire recovery lock {}: {}",
+                                        lock_path.display(),
+                                        err
+                                    ))
+                                );
+                            }
+                        };
+
+                    let recovery_result: Result<bool, PipelineError> = async {
+                        let current_bytes =
+                            tokio::fs::read(&path)
+                                .await
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to reread work unit {} during recovery: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                        let mut current_work_unit:
+                            crate::utils::work_units::WorkUnit =
+                            serde_json::from_slice(&current_bytes)
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to parse work unit {} during recovery: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                        let now =
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "System clock error during recovery: {}",
+                                        e
+                                    ))
+                                })?
+                                .as_secs();
+
+                        let current_stale =
+                            match current_work_unit.state {
+                                crate::utils::work_units::WorkUnitState::Claimed => {
+                                    let metadata =
+                                        tokio::fs::metadata(&path)
+                                            .await
+                                            .map_err(|e| {
+                                                PipelineError::Other(anyhow!(
+                                                    "Failed to stat claimed work unit {} during recovery: {}",
+                                                    path.display(),
+                                                    e
+                                                ))
+                                            })?;
+
+                                    let modified =
+                                        metadata
+                                            .modified()
+                                            .map_err(|e| {
+                                                PipelineError::Other(anyhow!(
+                                                    "Failed to read claimed work-unit mtime {}: {}",
+                                                    path.display(),
+                                                    e
+                                                ))
+                                            })?;
+
+                                    let modified_secs =
+                                        modified
+                                            .duration_since(UNIX_EPOCH)
+                                            .map_err(|e| {
+                                                PipelineError::Other(anyhow!(
+                                                    "Invalid claimed work-unit mtime {}: {}",
+                                                    path.display(),
+                                                    e
+                                                ))
+                                            })?
+                                            .as_secs();
+
+                                    now.saturating_sub(modified_secs)
+                                        > DISTRIBUTED_WORKER_STALE_SECS
+                                }
+
+                                crate::utils::work_units::WorkUnitState::Running => {
+                                    match current_work_unit.last_heartbeat {
+                                        Some(last_heartbeat) => {
+                                            now.saturating_sub(last_heartbeat)
+                                                > DISTRIBUTED_WORKER_STALE_SECS
+                                        }
+
+                                        None => false,
+                                    }
+                                }
+
+                                _ => false,
+                            };
+
+                        if !current_stale {
+                            return Ok(false);
+                        }
+
+                        let worker_id =
+                            current_work_unit
+                                .claimed_by
+                                .clone()
+                                .unwrap_or_else(|| {
+                                    "unknown-worker".to_string()
+                                });
+
+                        let attempt =
+                            current_work_unit.attempt;
+
+                        let state =
+                            current_work_unit.state;
+
+                        let reason =
+                            match state {
+                                crate::utils::work_units::WorkUnitState::Claimed => {
+                                    format!(
+                                        "worker {} became stale while CLAIMED; \
+                                         no RUNNING transition within {} seconds",
+                                        worker_id,
+                                        DISTRIBUTED_WORKER_STALE_SECS
+                                    )
+                                }
+
+                                crate::utils::work_units::WorkUnitState::Running => {
+                                    match current_work_unit.last_heartbeat {
+                                        Some(last_heartbeat) => format!(
+                                            "worker {} became stale while RUNNING; \
+                                             last heartbeat was {} seconds ago",
+                                            worker_id,
+                                            now.saturating_sub(last_heartbeat)
+                                        ),
+
+                                        None => format!(
+                                            "worker {} became stale while RUNNING; \
+                                             no heartbeat recorded",
+                                            worker_id
+                                        ),
+                                    }
+                                }
+
+                                _ => {
+                                    return Ok(false);
+                                }
+                            };
+
+                        warn!(
+                            "Distributed NR: worker failure detected: \
+                             work unit={} worker={} attempt={} state={:?}: {}",
+                            current_work_unit.id(),
+                            worker_id,
+                            attempt,
+                            state,
+                            reason
+                        );
+
+                        current_work_unit
+                            .fail(
+                                &worker_id,
+                                attempt,
+                                reason,
+                                true,
+                            )
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to mark stale work unit {} as FAILED: {}",
+                                    current_work_unit.id(),
+                                    e
+                                ))
+                            })?;
+
+                        current_work_unit
+                            .retry()
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to requeue stale work unit {}: {}",
+                                    current_work_unit.id(),
+                                    e
+                                ))
+                            })?;
+
+                        let payload =
+                            serde_json::to_vec_pretty(
+                                &current_work_unit,
+                            )
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to serialize requeued work unit {}: {}",
+                                        current_work_unit.id(),
+                                        e
+                                    ))
+                                })?;
+
+                        let tmp_path =
+                            path.with_extension("json.tmp");
+
+                        tokio::fs::write(
+                            &tmp_path,
+                            payload,
+                        )
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to write requeued work unit {}: {}",
+                                    tmp_path.display(),
+                                    e
+                                ))
+                            })?;
+
+                        tokio::fs::rename(
+                            &tmp_path,
+                            &path,
+                        )
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Failed to publish requeued work unit {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?;
+
+                        info!(
+                            "Distributed NR: requeued work unit {} \
+                             after stale worker {} attempt {}",
+                            current_work_unit.id(),
+                            worker_id,
+                            attempt
+                        );
+
+                        Ok(true)
+                    }
+                        .await;
+
+                    drop(lock_file);
+
+                    if let Err(err) =
+                        tokio::fs::remove_file(&lock_path).await
+                    {
+                        warn!(
+                            "Distributed NR: failed to remove recovery lock {}: {}",
+                            lock_path.display(),
+                            err
+                        );
+                    }
+
+                    if recovery_result? {
+                        recovered += 1;
+                        available += 1;
+                    } else {
+                        match work_unit.state {
+                            crate::utils::work_units::WorkUnitState::Claimed => {
+                                claimed += 1;
+                            }
+
+                            crate::utils::work_units::WorkUnitState::Running => {
+                                running += 1;
+                            }
+
+                            _ => {}
+                        }
+                    }
+                }
+
+                crate::utils::work_units::WorkUnitState::Done => {
+                    done += 1;
+                }
+
+                crate::utils::work_units::WorkUnitState::Failed => {
+                    if work_unit
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.retryable)
+                        .unwrap_or(false)
+                    {
+                        let lock_path =
+                            path.with_extension("json.lock");
+
+                        let lock_file =
+                            match tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&lock_path)
+                                .await
+                            {
+                                Ok(file) => file,
+
+                                Err(err)
+                                if err.kind()
+                                    == std::io::ErrorKind::AlreadyExists =>
+                                    {
+                                        failed += 1;
+                                        continue;
+                                    }
+
+                                Err(err) => {
+                                    return Err(
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to acquire retry lock {}: {}",
+                                            lock_path.display(),
+                                            err
+                                        ))
+                                    );
+                                }
+                            };
+
+                        let retry_result: Result<bool, PipelineError> = async {
+                            let current_bytes =
+                                tokio::fs::read(&path)
+                                    .await
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to reread FAILED work unit {}: {}",
+                                            path.display(),
+                                            e
+                                        ))
+                                    })?;
+
+                            let mut current_work_unit:
+                                crate::utils::work_units::WorkUnit =
+                                serde_json::from_slice(&current_bytes)
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to parse FAILED work unit {}: {}",
+                                            path.display(),
+                                            e
+                                        ))
+                                    })?;
+
+                            if current_work_unit.state
+                                != crate::utils::work_units::WorkUnitState::Failed
+                            {
+                                return Ok(false);
+                            }
+
+                            let retryable =
+                                current_work_unit
+                                    .failure
+                                    .as_ref()
+                                    .map(|failure| failure.retryable)
+                                    .unwrap_or(false);
+
+                            if !retryable {
+                                return Ok(false);
+                            }
+
+                            let previous_attempt =
+                                current_work_unit.attempt;
+
+                            current_work_unit
+                                .retry()
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to retry work unit {}: {}",
+                                        current_work_unit.id(),
+                                        e
+                                    ))
+                                })?;
+
+                            let payload =
+                                serde_json::to_vec_pretty(
+                                    &current_work_unit,
+                                )
+                                    .map_err(|e| {
+                                        PipelineError::Other(anyhow!(
+                                            "Failed to serialize requeued work unit {}: {}",
+                                            current_work_unit.id(),
+                                            e
+                                        ))
+                                    })?;
+
+                            let tmp_path =
+                                path.with_extension("json.tmp");
+
+                            tokio::fs::write(
+                                &tmp_path,
+                                payload,
+                            )
+                                .await
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to write requeued work unit {}: {}",
+                                        tmp_path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                            tokio::fs::rename(
+                                &tmp_path,
+                                &path
+                            )
+                                .await
+                                .map_err(|e| {
+                                    PipelineError::Other(anyhow!(
+                                        "Failed to publish requeued work unit {}: {}",
+                                        path.display(),
+                                        e
+                                    ))
+                                })?;
+
+                            info!(
+                                "Distributed NR: requeued retryable FAILED work unit {} \
+                                 from attempt {}",
+                                current_work_unit.id(),
+                                previous_attempt
+                            );
+
+                            Ok(true)
+                        }
+                            .await;
+
+                        drop(lock_file);
+
+                        if let Err(err) =
+                            tokio::fs::remove_file(&lock_path).await
+                        {
+                            warn!(
+                                "Distributed NR: failed to remove retry lock {}: {}",
+                                lock_path.display(),
+                                err
+                            );
+                        }
+
+                        if retry_result? {
+                            recovered += 1;
+                            available += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    } else {
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Distributed NR scheduler: AVAILABLE={} CLAIMED={} RUNNING={} DONE={} FAILED={} RECOVERED={}",
+            available, claimed, running, done, failed, recovered
+        );
+
+        // Only non-retryable FAILED work units are terminal failures.
+        if failed > 0 {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed NR execution failed: {} work units are FAILED",
+                    failed
+                ))
+            );
+        }
+
+        if done == chunk_work_units.len() {
+            info!(
+                "Distributed NR scheduling complete: all {} work units DONE",
+                done
+            );
+            break;
+        }
+
+        tokio::time::sleep(
+            tokio::time::Duration::from_secs(2)
+        )
+            .await;
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Collect completed result m8 files in deterministic chunk order.
+    //
+    // Each DONE WorkUnit contains the authoritative result metadata,
+    // including the attempt number and durable result_path. Use that
+    // metadata rather than discovering result files by filename alone,
+    // because retries may leave multiple attempt files in results/.
+    // ------------------------------------------------------------------
+
+    let mut completed_work_units:
+        Vec<crate::utils::work_units::WorkUnit> =
+        Vec::with_capacity(
+            chunk_work_units.len()
+        );
+
+    let mut entries =
+        tokio::fs::read_dir(
+            &work_dir
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to read distributed work directory {}: {}",
+                    work_dir.display(),
+                    e
+                ))
+            })?;
+
+    while let Some(entry) =
+        entries
+            .next_entry()
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed reading distributed work directory {}: {}",
+                    work_dir.display(),
+                    e
+                ))
+            })?
+    {
+        let path =
+            entry.path();
+
+        let Some(name) =
+            path.file_name()
+                .and_then(|v| v.to_str())
+        else {
+            continue;
+        };
+
+        if !name.starts_with("work_")
+            || !name.ends_with(".json")
+        {
+            continue;
+        }
+
+        let bytes =
+            tokio::fs::read(&path)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to read completed work unit {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+        let work_unit:
+            crate::utils::work_units::WorkUnit =
+            serde_json::from_slice(&bytes)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to parse completed work unit {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+
+        if work_unit.state
+            != crate::utils::work_units::WorkUnitState::Done
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Expected work unit {} to be DONE after scheduler completion, found {:?}",
+                    work_unit.id(),
+                    work_unit.state
+                ))
+            );
+        }
+
+        let result =
+            work_unit
+                .result
+                .as_ref()
+                .ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "DONE work unit {} has no result metadata",
+                        work_unit.id()
+                    ))
+                })?;
+
+        if result.attempt
+            != work_unit.attempt
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Result attempt mismatch for {}: work unit attempt={}, result attempt={}",
+                    work_unit.id(),
+                    work_unit.attempt,
+                    result.attempt
+                ))
+            );
+        }
+
+        let result_path =
+            &result.result_path;
+
+        let metadata =
+            tokio::fs::metadata(
+                result_path
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to stat result for {}: {}: {}",
+                        work_unit.id(),
+                        result_path.display(),
+                        e
+                    ))
+                })?;
+
+        if metadata.len()
+            != result.result_bytes
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Result size mismatch for {} attempt {}: \
+                     metadata says {} bytes, work unit records {} bytes",
+                    work_unit.id(),
+                    result.attempt,
+                    metadata.len(),
+                    result.result_bytes
+                ))
+            );
+        }
+
+        completed_work_units.push(
+            work_unit
+        );
+    }
+
+    completed_work_units.sort_by_key(
+        |work_unit| work_unit.chunk_id
+    );
+
+    if completed_work_units.len()
+        != chunk_work_units.len()
+    {
+        return Err(
+            PipelineError::Other(anyhow!(
+                "Distributed NR result collection found {} DONE work units, expected {}",
+                completed_work_units.len(),
+                chunk_work_units.len()
+            ))
+        );
+    }
+
+    for (expected_idx, work_unit)
+    in completed_work_units.iter().enumerate()
+    {
+        let expected_chunk_id =
+            chunk_work_units[expected_idx].0;
+
+        if work_unit.chunk_id
+            != expected_chunk_id
+        {
+            return Err(
+                PipelineError::Other(anyhow!(
+                    "Distributed NR result collection chunk mismatch: \
+                     expected chunk {}, found {}",
+                    expected_chunk_id,
+                    work_unit.chunk_id
+                ))
+            );
+        }
+    }
+
+    let result_temp_dir =
+        choose_temp_dir(
+            config.input_size,
+            &config.ram_temp_dir,
+            &config.args.nvme_scratch,
+            2,
+            false,
+        )
+            .await?;
+
+    let merged_m8 =
+        result_temp_dir
+            .path()
+            .join(
+                "distributed_nr_merged.m8"
+            );
+
+    let mut merged =
+        TokioFile::create(
+            &merged_m8
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to create merged distributed NR m8 {}: {}",
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?;
+
+    let mut total_result_rows =
+        0u64;
+
+    let mut total_result_bytes =
+        0u64;
+
+    for work_unit
+    in &completed_work_units
+    {
+        let result =
+            work_unit
+                .result
+                .as_ref()
+                .expect(
+                    "DONE work unit result checked above"
+                );
+
+        info!(
+            "Distributed NR result collection: chunk={} attempt={} rows={} bytes={} path={}",
+            work_unit.chunk_id,
+            result.attempt,
+            result.result_rows,
+            result.result_bytes,
+            result.result_path.display()
+        );
+
+        let mut input =
+            TokioFile::open(
+                &result.result_path
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(
+                        format!(
+                            "Failed to open distributed NR result {}: {}",
+                            result.result_path.display(),
+                            e
+                        )
+                    )
+                })?;
+
+        tokio::io::copy(
+            &mut input,
+            &mut merged,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to append distributed NR result {} to {}: {}",
+                        result.result_path.display(),
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?;
+
+        total_result_rows +=
+            result.result_rows;
+
+        total_result_bytes +=
+            result.result_bytes;
+    }
+
+    merged
+        .flush()
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(
+                format!(
+                    "Failed to flush merged distributed NR m8 {}: {}",
+                    merged_m8.display(),
+                    e
+                )
+            )
+        })?;
+
+    drop(merged);
+
+    let merged_metadata =
+        TokioFile::open(
+            &merged_m8
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to reopen merged distributed NR m8 {}: {}",
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?;
+
+    let merged_size =
+        tokio::fs::metadata(
+            &merged_m8
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(
+                    format!(
+                        "Failed to stat merged distributed NR m8 {}: {}",
+                        merged_m8.display(),
+                        e
+                    )
+                )
+            })?
+            .len();
+
+    if merged_size
+        != total_result_bytes
+    {
+        return Err(
+            PipelineError::Other(anyhow!(
+                "Distributed NR merged result size mismatch: \
+                 merged={} bytes, sum of chunk results={} bytes",
+                merged_size,
+                total_result_bytes
+            ))
+        );
+    }
+
+    info!(
+        "Distributed NR result collection complete: \
+         {} chunks, {} rows, {} bytes -> {}",
+        completed_work_units.len(),
+        total_result_rows,
+        total_result_bytes,
+        merged_m8.display()
+    );
+
+    let rx =
+        parse_lines(
+            merged_metadata,
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(
+                    e.into()
+                )
+            })?;
+
+    info!(
+        "Distributed NR execution complete: {} chunks processed",
+        chunk_work_units.len()
+    );
+
+    Ok((
+        rx,
+        Vec::new(),
+        Vec::new(),
+        vec![result_temp_dir],
+    ))
+}
+
+
+
+
 
 /// Aligns unmapped reads against NR database using Diamond.
 ///
@@ -3693,17 +5750,33 @@ async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow
     Ok(())
 }
 
-/// Runs spades assembler
+/// Runs SPAdes assembly and generates read-to-contig mapping.
+///
+/// This intentionally matches the failure semantics of the original Python
+/// RunAssembly implementation:
+///
+/// - SPAdes failure is non-fatal to the overall pipeline.
+/// - Missing expected SPAdes outputs are assembly failures.
+/// - Contig filtering failures are assembly failures.
+/// - Bowtie2/read-to-contig mapping failures are assembly failures.
+/// - Contig-stat generation failures are assembly failures.
+/// - On ANY such assembly failure, the assembly outputs are replaced with
+///   dummy files and the overall pipeline continues.
 ///
 /// # Arguments
 ///
 /// * `config` - RunConfig struct from main.
-/// * `input_stream` - Raw byte FASTQ stream
+/// * `assembly_out_dir` - Final <out_dir>/assembly directory.
+/// * `r1_path` - Non-host R1 FASTQ.
+/// * `r2_path_opt` - Optional non-host R2 FASTQ.
+/// * `duplicate_clusters` - Duplicate cluster metadata.
+/// * `paired` - Whether input is paired-end.
+/// * `assembly_headroom` - Temp-space headroom multiplier.
 ///
 /// # Returns
 async fn process_assembly(
     config: Arc<RunConfig>,
-    assembly_out_dir: &PathBuf, // to make clear this is <out_dir>/assembly
+    assembly_out_dir: &PathBuf,
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
@@ -3722,9 +5795,10 @@ async fn process_assembly(
 > {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
-    let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let temp_files: Vec<NamedTempFile> = Vec::new();
 
     let est_temp_bytes = config.input_size + MAX_SPADES_WORK_DIR;
+
     let temp_dir = choose_temp_dir(
         est_temp_bytes,
         &config.ram_temp_dir,
@@ -3732,16 +5806,144 @@ async fn process_assembly(
         assembly_headroom,
         true,
     )
-    .await?;
+        .await?;
 
+    // ---------------------------------------------------------------------
+    // Temp paths used internally by the Rust implementation
+    // ---------------------------------------------------------------------
+
+    let contigs_path = temp_dir.path().join("contigs.fasta");
+    let contigs_all_path = temp_dir.path().join("contigs_all.fasta");
+    let scaffolds_path = temp_dir.path().join("scaffolds.fasta");
+    let bam_path = temp_dir.path().join("read-contig.bam");
+    let stats_json_path = temp_dir.path().join("contig_stats.json");
+
+    // ---------------------------------------------------------------------
+    // Durable assembly outputs
+    // ---------------------------------------------------------------------
+
+    let final_contigs_path = assembly_out_dir.join("contigs.fasta");
+    let final_contigs_all_path = assembly_out_dir.join("contigs_all.fasta");
+    let final_scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
+    let final_bam_path = assembly_out_dir.join("read-contig.bam");
+    let final_stats_json_path = assembly_out_dir.join("contig_stats.json");
     let stdout_log_path = assembly_out_dir.join("spades_stdout.log");
 
+    // ---------------------------------------------------------------------
+    // Helper result for the assembly-failure path.
+    //
+    // This is the Rust equivalent of the original Python except: block:
+    //
+    //   ;ASSEMBLY FAILED
+    //   ;ASSEMBLY FAILED
+    //   ;ASSEMBLY FAILED
+    //   @NO INFO
+    //   {}
+    //
+    // ---------------------------------------------------------------------
+
+    macro_rules! return_assembly_failure {
+        ($reason:expr) => {{
+            let reason = $reason;
+
+            error!(
+                "[assembly] assembly failed; writing compatibility dummy outputs: {}",
+                reason
+            );
+
+            let failed_marker = b";ASSEMBLY FAILED\n";
+            let no_info = b"@NO INFO\n";
+            let empty_json = b"{}";
+
+            tokio::fs::write(&final_contigs_path, failed_marker)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy contigs.fasta after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_contigs_all_path, failed_marker)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy contigs_all.fasta after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_scaffolds_path, failed_marker)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy scaffolds.fasta after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_bam_path, no_info)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy read-contig.bam after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            tokio::fs::write(&final_stats_json_path, empty_json)
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to write dummy contig_stats.json after assembly failure: {}",
+                        e
+                    ))
+                })?;
+
+            info!(
+                "[assembly] compatibility dummy outputs written: \
+                 contigs={}, contigs_all={}, scaffolds={}, bam={}, stats={}",
+                final_contigs_path.display(),
+                final_contigs_all_path.display(),
+                final_scaffolds_path.display(),
+                final_bam_path.display(),
+                final_stats_json_path.display(),
+            );
+
+            let (empty_tx, empty_rx) = mpsc::channel(1);
+            drop(empty_tx);
+
+            return Ok((
+                CoverageOutputs {
+                    contigs_fasta: final_contigs_path,
+                    contigs_all_fasta: final_contigs_all_path,
+                    scaffolds_fasta: final_scaffolds_path,
+                    bam_path: final_bam_path,
+                    contig_stats_json: final_stats_json_path,
+                    contig_stats: Arc::new(HashMap::new()),
+                    read2contig: Arc::new(HashMap::new()),
+                },
+                ReceiverStream::new(empty_rx),
+                cleanup_tasks,
+                cleanup_receivers,
+                temp_files,
+                temp_dir,
+            ));
+        }};
+    }
+
+    // =====================================================================
+    // SPAdes
+    // =====================================================================
+
     info!(
-        "[spades] starting: r1={}, r2={:?}, final_assembly_dir={},  temp_dir={}",
+        "[spades] starting: r1={}, r2={:?}, final_assembly_dir={}, temp_dir={}",
         r1_path.display(),
-        r2_path_opt.as_ref().map(|p| p.display().to_string()),
+        r2_path_opt
+            .as_ref()
+            .map(|p| p.display().to_string()),
         assembly_out_dir.display(),
-        temp_dir.path().to_path_buf().display(),
+        temp_dir.path().display(),
     );
 
     let mut options = HashMap::new();
@@ -3755,18 +5957,39 @@ async fn process_assembly(
         option_fields: options,
     };
 
-    let spades_args = generate_cli(SPADES_TAG, &config, Some(&spades_config))?;
+    let spades_args = match generate_cli(
+        SPADES_TAG,
+        &config,
+        Some(&spades_config),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to generate SPAdes command: {}",
+                e
+            ));
+        }
+    };
 
     info!("[spades] command args: {:?}", spades_args);
 
-    let (mut spades_child, spades_stderr_task) = spawn_cmd(
+    let (mut spades_child, spades_stderr_task) = match spawn_cmd(
         config.clone(),
         SPADES_TAG,
         spades_args,
         config.args.verbose,
         None,
     )
-    .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to spawn SPAdes: {}",
+                e
+            ));
+        }
+    };
 
     info!(
         "[spades] child spawned: stdout_present={}, stderr_present={}",
@@ -3774,30 +5997,58 @@ async fn process_assembly(
         spades_child.stderr.is_some()
     );
 
-    let spades_out_stream = parse_child_output(
+    let spades_out_stream = match parse_child_output(
         &mut spades_child,
         ChildStream::Stdout,
         ParseMode::Lines,
         &config,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SPADES_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to capture SPAdes stdout: {}",
+                e
+            ));
+        }
+    };
 
     let spades_write_task =
         tokio::spawn(stream_to_file(spades_out_stream, stdout_log_path.clone()));
+
     cleanup_tasks.push(spades_write_task);
 
-    // stderr is drained and logged by spawn_cmd's internal stderr task
-    spades_stderr_task.await??;
+    // Match the original broad assembly exception behavior:
+    // stderr handling problems also classify the assembly as failed.
+    match spades_stderr_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return_assembly_failure!(format!(
+                "SPAdes stderr task failed: {}",
+                e
+            ));
+        }
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "SPAdes stderr task panicked: {}",
+                e
+            ));
+        }
+    }
 
-    // Check SPAdes exit
-    let spades_exit = spades_child.wait().await?;
+    let spades_exit = match spades_child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed waiting for SPAdes: {}",
+                e
+            ));
+        }
+    };
 
     info!(
-        "[spades] exit status={:?} success={}  stdout_log={}",
+        "[spades] exit status={:?} success={} stdout_log={}",
         spades_exit.code(),
         spades_exit.success(),
         stdout_log_path.display()
@@ -3816,110 +6067,179 @@ async fn process_assembly(
         ),
     }
 
-    let contigs_path = temp_dir.path().to_path_buf().join("contigs.fasta");
-    let contigs_all_path = temp_dir.path().to_path_buf().join("contigs_all.fasta");
-    let scaffolds_path = temp_dir.path().to_path_buf().join("scaffolds.fasta");
-    let bam_path = temp_dir.path().to_path_buf().join("read-contig.bam");
-    let stats_json_path = temp_dir.path().to_path_buf().join("contig_stats.json");
-
-    let final_contigs_path = assembly_out_dir.join("contigs.fasta");
-    let final_contigs_all_path = assembly_out_dir.join("contigs_all.fasta");
-    let final_scaffolds_path = assembly_out_dir.join("scaffolds.fasta");
-    let final_bam_path = assembly_out_dir.join("read-contig.bam");
-    let final_stats_json_path = assembly_out_dir.join("contig_stats.json");
-
-    if spades_exit.success() {
-        // on success path, just start the copy of the real spades output files async
-        info!("[spades] completed successfully");
-
-        // Copy the contigs file to contigs_all to reserve the original
-        fs::copy(&contigs_path, &contigs_all_path).await?;
-
-        // Contig length filtering and copy the result back over contigs.fasta
-        let rx = read_fasta(
-            contigs_all_path.clone(),
-            u64::MAX,
-            Some(config.args.min_contig_length),
-            None,
-            &config,
-        )
-        .map_err(|e| PipelineError::InvalidFastaFormat(e.to_string()))?;
-
-        let write_handle = write_fasta_stream_to_file(
-            ReceiverStream::new(rx),
-            contigs_path.clone(),
-            config.clone(),
-            StreamDataType::JustBytes,
-            "process_assembly_contigs_filtering",
-        );
-
-        write_handle
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "contigs -> contigs_all writer task panicked: {}",
-                    e
-                ))
-            })?
-            .map_err(|e| {
-                PipelineError::Other(anyhow!("contigs -> contigs_all writer task failed: {}", e))
-            })?;
-
-        tokio::fs::copy(&contigs_path, &final_contigs_path).await?;
-        tokio::fs::copy(&contigs_all_path, &final_contigs_all_path).await?;
-        tokio::fs::copy(&scaffolds_path, &final_scaffolds_path).await?;
-    } else {
-        error!("SPAdes failed with exit: {:?}", spades_exit);
-
-        let failed_marker = b";ASSEMBLY FAILED\n";
-        let empty_scaffolds = b";NO SCAFFOLDS\n";
-        let empty_bam = b"@NO INFO\n";
-        let empty_json = b"{}";
-
-        // Here we sync write the final output files to disk (fast)
-        // and pass those back as the "temp" files for the pipeline to use
-
-        tokio::fs::write(&final_contigs_path, failed_marker).await?;
-        tokio::fs::write(&final_scaffolds_path, empty_scaffolds).await?;
-        tokio::fs::write(&final_contigs_all_path, failed_marker).await?;
-        tokio::fs::write(&final_bam_path, empty_bam).await?;
-        tokio::fs::write(&final_stats_json_path, empty_json).await?;
-
-        info!(
-            "[spades] wrote dummy outputs after failure: contigs={}, scaffolds={}",
-            final_contigs_path.display(),
-            final_scaffolds_path.display(),
-        );
-
-        return Ok((
-            CoverageOutputs {
-                contigs_fasta: final_contigs_path,
-                contigs_all_fasta: final_contigs_all_path,
-                scaffolds_fasta: final_scaffolds_path,
-                bam_path: final_bam_path,
-                contig_stats_json: final_stats_json_path,
-                contig_stats: Arc::new(HashMap::new()),
-                read2contig: Arc::new(HashMap::new()),
-            },
-            ReceiverStream::new({
-                let (tx, rx) = mpsc::channel(1);
-                drop(tx);
-                rx
-            }),
-            cleanup_tasks,
-            cleanup_receivers,
-            temp_files,
-            temp_dir,
+    if !spades_exit.success() {
+        return_assembly_failure!(format!(
+            "SPAdes exited with status {:?}",
+            spades_exit.code()
         ));
     }
 
-    info!("SPAdes completed successfully");
+    info!("[spades] process exited successfully");
 
-    let index_dir = temp_dir.path().to_path_buf().join("bowtie_index");
-    fs::create_dir_all(&index_dir).await?;
-    let index_prefix = index_dir.join("contigs"); // will create contigs.1.bt2, etc.
+    // =====================================================================
+    // Validate required SPAdes outputs.
+    //
+    // IMPORTANT:
+    // The original Python pipeline required BOTH contigs.fasta and
+    // scaffolds.fasta. If either was missing, its broad except block marked
+    // the entire assembly as failed.
+    //
+    // Therefore scaffolds.fasta is intentionally NOT optional here.
+    // =====================================================================
 
-    let num_index_cores: usize = RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
+    if !contigs_path.is_file() {
+        return_assembly_failure!(format!(
+            "SPAdes exited successfully but required output is missing: {}",
+            contigs_path.display()
+        ));
+    }
+
+    if !scaffolds_path.is_file() {
+        return_assembly_failure!(format!(
+            "SPAdes exited successfully but required output is missing: {}",
+            scaffolds_path.display()
+        ));
+    }
+
+    info!(
+        "[spades] required outputs present: contigs={}, scaffolds={}",
+        contigs_path.display(),
+        scaffolds_path.display()
+    );
+
+    // =====================================================================
+    // Preserve original contigs
+    // =====================================================================
+
+    if let Err(e) = fs::copy(&contigs_path, &contigs_all_path).await {
+        return_assembly_failure!(format!(
+            "failed to preserve SPAdes contigs {} -> {}: {}",
+            contigs_path.display(),
+            contigs_all_path.display(),
+            e
+        ));
+    }
+
+    // =====================================================================
+    // Contig length filtering
+    // =====================================================================
+
+    let rx = match read_fasta(
+        contigs_all_path.clone(),
+        u64::MAX,
+        Some(config.args.min_contig_length),
+        None,
+        &config,
+    ) {
+        Ok(rx) => rx,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed reading SPAdes contigs for length filtering: {}",
+                e
+            ));
+        }
+    };
+
+    let write_handle = write_fasta_stream_to_file(
+        ReceiverStream::new(rx),
+        contigs_path.clone(),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "process_assembly_contigs_filtering",
+    );
+
+    match write_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return_assembly_failure!(format!(
+                "contig filtering writer failed: {}",
+                e
+            ));
+        }
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "contig filtering writer task panicked: {}",
+                e
+            ));
+        }
+    }
+
+    // =====================================================================
+    // Durable copies
+    // =====================================================================
+
+    if let Err(e) = tokio::fs::copy(
+        &contigs_path,
+        &final_contigs_path,
+    )
+        .await
+    {
+        return_assembly_failure!(format!(
+            "failed copying filtered contigs {} -> {}: {}",
+            contigs_path.display(),
+            final_contigs_path.display(),
+            e
+        ));
+    }
+
+    if let Err(e) = tokio::fs::copy(
+        &contigs_all_path,
+        &final_contigs_all_path,
+    )
+        .await
+    {
+        return_assembly_failure!(format!(
+            "failed copying original contigs {} -> {}: {}",
+            contigs_all_path.display(),
+            final_contigs_all_path.display(),
+            e
+        ));
+    }
+
+    if let Err(e) = tokio::fs::copy(
+        &scaffolds_path,
+        &final_scaffolds_path,
+    )
+        .await
+    {
+        return_assembly_failure!(format!(
+            "failed copying scaffolds {} -> {}: {}",
+            scaffolds_path.display(),
+            final_scaffolds_path.display(),
+            e
+        ));
+    }
+
+    info!(
+        "[spades] assembly FASTA outputs copied successfully: \
+         contigs={}, contigs_all={}, scaffolds={}",
+        final_contigs_path.display(),
+        final_contigs_all_path.display(),
+        final_scaffolds_path.display()
+    );
+
+    // =====================================================================
+    // Bowtie2 index
+    //
+    // This is ALSO inside the original Python try/except.
+    // Failure here must therefore become ASSEMBLY FAILED rather than killing
+    // the entire short-read pipeline.
+    // =====================================================================
+
+    let index_dir = temp_dir.path().join("bowtie_index");
+
+    if let Err(e) = fs::create_dir_all(&index_dir).await {
+        return_assembly_failure!(format!(
+            "failed creating Bowtie2 index directory {}: {}",
+            index_dir.display(),
+            e
+        ));
+    }
+
+    let index_prefix = index_dir.join("contigs");
+
+    let num_index_cores =
+        RunConfig::thread_allocation(&*config, BOWTIE2_TAG, None);
 
     info!(
         "[assembly] building bowtie2 index: prefix={}, threads={}",
@@ -3927,68 +6247,131 @@ async fn process_assembly(
         num_index_cores
     );
 
-    let build_status = Command::new("bowtie2-build")
+    let threads_string = num_index_cores.to_string();
+
+    let contigs_str = match contigs_path.to_str() {
+        Some(v) => v,
+        None => {
+            return_assembly_failure!(format!(
+                "contigs path is not valid UTF-8: {}",
+                contigs_path.display()
+            ));
+        }
+    };
+
+    let index_prefix_str = match index_prefix.to_str() {
+        Some(v) => v,
+        None => {
+            return_assembly_failure!(format!(
+                "Bowtie2 index path is not valid UTF-8: {}",
+                index_prefix.display()
+            ));
+        }
+    };
+
+    let build_status = match Command::new("bowtie2-build")
         .args([
             "--threads",
-            &num_index_cores.to_string(),
+            threads_string.as_str(),
             "--quiet",
-            contigs_path.clone().to_str().unwrap(),
-            index_prefix.to_str().unwrap(),
+            contigs_str,
+            index_prefix_str,
         ])
         .status()
         .await
-        .map_err(|e| anyhow!("Failed to spawn bowtie2-build: {}", e))?;
+    {
+        Ok(status) => status,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed to spawn bowtie2-build: {}",
+                e
+            ));
+        }
+    };
 
     if !build_status.success() {
-        return Err(PipelineError::ToolExecution {
-            tool: BOWTIE2_TAG.to_string(),
-            error: build_status.to_string(),
-        });
+        return_assembly_failure!(format!(
+            "bowtie2-build exited with status {}",
+            build_status
+        ));
     }
 
     info!("[assembly] bowtie2-build completed successfully");
 
-    let bt2_options = HashMap::from([("--very-sensitive".to_string(), None)]);
+    // =====================================================================
+    // Bowtie2 read-to-contig alignment
+    // =====================================================================
+
+    let bt2_options =
+        HashMap::from([("--very-sensitive".to_string(), None)]);
 
     let bt2_config_view = Bowtie2Config {
         bt2_index_path: index_prefix,
         r1_path: Some(r1_path.clone()),
         r2_path: r2_path_opt.clone(),
-        paired: paired,
+        paired,
         option_fields: bt2_options,
     };
 
-    let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config_view)).map_err(|e| {
-        PipelineError::ToolExecution {
-            tool: BOWTIE2_TAG.to_string(),
-            error: e.to_string(),
+    let bt2_args = match generate_cli(
+        BOWTIE2_TAG,
+        &config,
+        Some(&bt2_config_view),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed generating Bowtie2 arguments: {}",
+                e
+            ));
         }
-    })?;
+    };
 
-    info!("[assembly] bowtie2 args generated: {:?}", bt2_args);
+    info!(
+        "[assembly] bowtie2 args generated: {:?}",
+        bt2_args
+    );
 
-    let (mut bt2_child, bt2_err_task) = spawn_cmd(
+    let (mut bt2_child, bt2_err_task) = match spawn_cmd(
         config.clone(),
         BOWTIE2_TAG,
         bt2_args,
         config.args.verbose,
         None,
     )
-    .await?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed spawning Bowtie2: {}",
+                e
+            ));
+        }
+    };
 
     cleanup_tasks.push(bt2_err_task);
 
-    let bt2_out_stream = parse_child_output(
+    let bt2_out_stream = match parse_child_output(
         &mut bt2_child,
         ChildStream::Stdout,
         ParseMode::Bytes,
         &config,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: BOWTIE2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed reading Bowtie2 output: {}",
+                e
+            ));
+        }
+    };
+
+    // =====================================================================
+    // samtools name-sort
+    // =====================================================================
 
     let samtools_sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -4004,18 +6387,30 @@ async fn process_assembly(
         ]),
     };
 
-    let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let samtools_sort_args = match generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&samtools_sort_config),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed generating samtools sort arguments: {}",
+                e
+            ));
+        }
+    };
 
     info!(
         "[assembly] samtools sort args generated: {:?}",
         samtools_sort_args
     );
 
-    let (samtools_sort_child, samtools_sort_task, samtools_sort_err_task) = stream_to_cmd(
+    let (
+        samtools_sort_child,
+        samtools_sort_task,
+        samtools_sort_err_task,
+    ) = match stream_to_cmd(
         config.clone(),
         bt2_out_stream,
         SAMTOOLS_TAG,
@@ -4024,85 +6419,159 @@ async fn process_assembly(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed starting samtools sort: {}",
+                e
+            ));
+        }
+    };
 
     cleanup_tasks.push(samtools_sort_task);
     cleanup_tasks.push(samtools_sort_err_task);
 
     let samtools_sort_out_stream = {
         let mut guard = samtools_sort_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config)
+
+        match parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
             .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed reading samtools sort output: {}",
+                    e
+                ));
+            }
+        }
     };
 
-    use tokio_stream::wrappers::ReceiverStream;
+    // =====================================================================
+    // Fan out BAM:
+    //
+    // 1. durable BAM
+    // 2. contig statistics
+    // 3. downstream assembly coverage
+    // =====================================================================
 
-    let (non_host_streams, non_host_done_rx) = fanout_to_channels(
-        ReceiverStream::new(samtools_sort_out_stream),
-        3,
-        "process_assembly_bam",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+    let (non_host_streams, non_host_done_rx) =
+        match fanout_to_channels(
+            ReceiverStream::new(samtools_sort_out_stream),
+            3,
+            "process_assembly_bam",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed splitting assembly BAM stream: {}",
+                    e
+                ));
+            }
+        };
 
-    // track task
     cleanup_receivers.push(non_host_done_rx);
 
     let mut non_host_streams_iter = non_host_streams.into_iter();
 
-    let bam_for_file = ReceiverStream::new(
-        non_host_streams_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let bam_for_file = match non_host_streams_iter.next() {
+        Some(rx) => ReceiverStream::new(rx),
+        None => {
+            return_assembly_failure!(
+                "assembly BAM file branch was not created".to_string()
+            );
+        }
+    };
 
-    let bam_for_stats = ReceiverStream::new(
-        non_host_streams_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let bam_for_stats = match non_host_streams_iter.next() {
+        Some(rx) => ReceiverStream::new(rx),
+        None => {
+            return_assembly_failure!(
+                "assembly BAM statistics branch was not created".to_string()
+            );
+        }
+    };
 
-    let bam_for_output = ReceiverStream::new(
-        non_host_streams_iter
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let bam_for_output = match non_host_streams_iter.next() {
+        Some(rx) => ReceiverStream::new(rx),
+        None => {
+            return_assembly_failure!(
+                "assembly BAM output branch was not created".to_string()
+            );
+        }
+    };
 
-    let write_bam_task = write_byte_stream_to_file(
+    // =====================================================================
+    // Durable BAM write
+    // =====================================================================
+
+    let write_bam_task = match write_byte_stream_to_file(
         &final_bam_path,
         bam_for_file,
         config.clone(),
         StreamDataType::JustBytes,
         "process_assembly",
-        false
+        false,
     )
-    .await?;
+        .await
+    {
+        Ok(task) => task,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed starting assembly BAM writer: {}",
+                e
+            ));
+        }
+    };
+
     cleanup_tasks.push(write_bam_task);
 
-    let bam_concurrency = compute_phase_concurrency(
-        &config, "bam_info", 0.5, // ~500 MB per thread (local maps + record chunk)
-        1.0, 128, // high cap for large clusters
-        4,   // min for small machines like M5 Air
-    );
-    info!("BAM info concurrency {}", bam_concurrency);
+    // =====================================================================
+    // Contig statistics
+    // =====================================================================
 
-    let (read2contig, contig_stats, _contig_uniques) = generate_info_from_bam_stream(
-        bam_for_stats.into_inner(),
-        &duplicate_clusters,
-        MIN_CONTIG_SIZE,
-        bam_concurrency,
-    )
-    .await?;
+    let bam_concurrency = compute_phase_concurrency(
+        &config,
+        "bam_info",
+        0.5,
+        1.0,
+        128,
+        4,
+    );
+
+    info!(
+        "BAM info concurrency {}",
+        bam_concurrency
+    );
+
+    let (read2contig, contig_stats, _contig_uniques) =
+        match generate_info_from_bam_stream(
+            bam_for_stats.into_inner(),
+            &duplicate_clusters,
+            MIN_CONTIG_SIZE,
+            bam_concurrency,
+        )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed generating read-to-contig mapping/statistics: {}",
+                    e
+                ));
+            }
+        };
 
     info!(
         "[assembly] contig statistics generated: contigs={}, read2contig={}",
@@ -4110,24 +6579,50 @@ async fn process_assembly(
         read2contig.len()
     );
 
-    let stats_json = serde_json::to_string_pretty(&contig_stats)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to serialize contig_stats: {}", e)))?;
+    let stats_json = match serde_json::to_string_pretty(&contig_stats) {
+        Ok(json) => json,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed serializing contig statistics: {}",
+                e
+            ));
+        }
+    };
 
-    std::fs::write(&stats_json_path, &stats_json)
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to write contig_stats.json: {}", e)))?;
+    if let Err(e) = std::fs::write(
+        &stats_json_path,
+        &stats_json,
+    ) {
+        return_assembly_failure!(format!(
+            "failed writing temporary contig_stats.json {}: {}",
+            stats_json_path.display(),
+            e
+        ));
+    }
 
-    tokio::fs::write(&final_stats_json_path, &stats_json)
+    if let Err(e) = tokio::fs::write(
+        &final_stats_json_path,
+        &stats_json,
+    )
         .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!("Failed to write final contig_stats.json: {}", e))
-        })?;
+    {
+        return_assembly_failure!(format!(
+            "failed writing final contig_stats.json {}: {}",
+            final_stats_json_path.display(),
+            e
+        ));
+    }
+
+    info!(
+        "[assembly] completed successfully"
+    );
 
     Ok((
         CoverageOutputs {
             contigs_fasta: contigs_path,
             contigs_all_fasta: contigs_all_path,
             scaffolds_fasta: scaffolds_path,
-            bam_path: bam_path,
+            bam_path,
             contig_stats_json: stats_json_path,
             contig_stats: Arc::new(contig_stats),
             read2contig: Arc::new(read2contig),
@@ -6928,9 +9423,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
 
-    check_versions(versions_vec, &out_dir.clone(), &config)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+    if !config.args.no_version_check {
+        check_versions(versions_vec, &out_dir.clone(), &config)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?;
+    }
 
     // Check required files
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone().ok_or_else(|| {
@@ -7185,14 +9682,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-    let (pre_dedup_parsed_stream, parse_task) = parse_byte_stream_to_fastq(
-        post_filter_stream.into_inner(),
-        config.base_buffer_size,
-        config.args.stall_threshold,
-    )
-    .await?;
+    let pre_dedup_parsed_stream =
+        if paired {
+            let (stream, parse_task) =
+                parse_byte_stream_to_fastq(
+                    post_filter_stream.into_inner(),
+                    config.base_buffer_size,
+                    config.args.stall_threshold,
+                )
+                    .await?;
 
-    cleanup_tasks.push(parse_task);
+            cleanup_tasks.push(parse_task);
+
+            stream
+        } else {
+            post_filter_stream.into_inner()
+        };
 
     let (
         dedup_stream,
@@ -7204,12 +9709,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         pre_dedup_parsed_stream,
         paired,
-        Some(70), // Prefix length for deduplication. Hardcoded for now
+        Some(70),
         out_dir.clone(),
     )
-    .await?;
+        .await?;
+
     cleanup_tasks.append(&mut dedup_cleanup_tasks);
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
+
 
     let uniques_count = dedup_count_rx.await?;
     let unique_reads = uniques_count * if paired { 2 } else { 1 };
@@ -7378,55 +9885,359 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         cleanup_tasks.push(r2_copy_task);
     }
 
-    let (
-        non_host_mm2_out_stream,
-        mut non_host_mm2_cleanup_tasks,
-        mut non_host_mm2_cleanup_receivers,
-    ) = minimap2_non_host_align(
-        config.clone(),
-        non_host_r1_path.clone(),
-        non_host_r2_path_opt.clone(),
-    )
-    .await?;
 
-    cleanup_tasks.append(&mut non_host_mm2_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_mm2_cleanup_receivers);
+    // =====================================================================
+    // Non-host Alignment
+    //
+    // The non-host FASTQ files are now fully materialized above, so NT and
+    // NR have independent, stable inputs.
+    //
+    // Execution topology:
+    //
+    // Single:
+    //     NT non-host alignment
+    //       -> paf_to_m8
+    //       -> sort NT m8
+    //       -> NT call_hits / fanout
+    //       -> NR non-host alignment
+    //       -> sort NR m8
+    //       -> NR call_hits / fanout
+    //
+    // Distributed:
+    //     NT non-host alignment
+    //       -> paf_to_m8
+    //       -> sort NT m8
+    //
+    //                 || concurrent ||
+    //
+    //     NR distributed alignment
+    //       -> NR m8
+    //       -> sort NR m8
+    //
+    // We intentionally overlap ONLY the two non-host alignment branches.
+    // Downstream NT/NR hit processing remains unchanged.
+    // =====================================================================
 
-    let nt_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nt.m8"), "."));
+    // ---------------------------------------------------------------------
+    // NT non-host alignment future
+    //
+    // This includes:
+    //   nt_non_host_align
+    //   paf_to_m8
+    //   sort_m8_by_read_id(nt)
+    //
+    // The future does not execute until awaited below. That lets distributed
+    // mode start this branch concurrently with the NR branch.
+    // ---------------------------------------------------------------------
 
-    let (m8_stream, mut m8_cleanup_tasks, mut m8_cleanup_receivers) =
-        paf_to_m8(config.clone(), non_host_mm2_out_stream, nt_m8_file_path).await?;
-    cleanup_tasks.append(&mut m8_cleanup_tasks);
+    let nt_non_host_align_fut = async {
+        info!("[run] NT non-host alignment phase started");
 
-    // ────────────────────────────────────────────────────────────────
-    // Sort m8 by read ID before call_hits_m8
-    // This guarantees consecutive lines per read → streaming group-by
-    // ────────────────────────────────────────────────────────────────
-    let m8_sorted_start = Instant::now();
-    let m8_sorted = sort_m8_by_read_id(
-        config.clone(),
-        m8_stream,
-        "nt", // label for logging + temp files
-    )
-    .await?;
-    info!(
-        "[run] sort_m8_by_read_id(nt) completed after {:?}",
-        m8_sorted_start.elapsed()
+        let (
+            non_host_nt_out_stream,
+            mut non_host_nt_cleanup_tasks,
+            mut non_host_nt_cleanup_receivers,
+        ) = nt_non_host_align(
+            config.clone(),
+            non_host_r1_path.clone(),
+            non_host_r2_path_opt.clone(),
+        )
+            .await?;
+
+        let nt_m8_file_path = out_dir.join(
+            rename_file_path(
+                &sample_base_buf,
+                None,
+                Some("nt.m8"),
+                ".",
+            ),
+        );
+
+        let (
+            m8_stream,
+            mut m8_cleanup_tasks,
+            m8_cleanup_receivers,
+        ) = paf_to_m8(
+            config.clone(),
+            non_host_nt_out_stream,
+            nt_m8_file_path,
+        )
+            .await?;
+
+        // PAF -> m8 tasks belong to the NT branch.
+        non_host_nt_cleanup_tasks.append(&mut m8_cleanup_tasks);
+        non_host_nt_cleanup_receivers.extend(m8_cleanup_receivers);
+
+        // -------------------------------------------------------------
+        // Sort NT m8 by read ID before call_hits_m8.
+        //
+        // This guarantees consecutive lines per read and therefore
+        // preserves the streaming group-by requirement downstream.
+        // -------------------------------------------------------------
+
+        let m8_sorted_start = Instant::now();
+
+        let m8_sorted = sort_m8_by_read_id(
+            config.clone(),
+            m8_stream,
+            "nt",
+        )
+            .await?;
+
+        info!(
+            "[run] sort_m8_by_read_id(nt) completed after {:?}",
+            m8_sorted_start.elapsed()
+        );
+
+        // The NT branch
+        // does not complete until its PAF -> m8 completion receivers have
+        // completed successfully.
+        for rx in non_host_nt_cleanup_receivers.drain(..) {
+            rx.await??;
+        }
+
+        info!("[run] NT non-host alignment phase complete");
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+                Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+            ),
+            PipelineError,
+        >((
+            m8_sorted,
+            non_host_nt_cleanup_tasks,
+            non_host_nt_cleanup_receivers,
+        ))
+    };
+
+    let distributed_nr_run_dir =
+        config.efs_runs_dir.join(&config.run_id);
+
+    if matches!(config.execution_mode, ExecutionMode::Distributed) {
+        info!(
+        "[run] Distributed NR EFS run directory: {}",
+        distributed_nr_run_dir.display()
     );
-
-    for rx in m8_cleanup_receivers {
-        rx.await??;
     }
+
+    // ---------------------------------------------------------------------
+    // NR non-host alignment future
+    //
+    // This includes:
+    //   nr_non_host_align
+    //   NR m8 fanout
+    //   NR m8 file writer
+    //   sort_m8_by_read_id(nr)
+    //
+    // In distributed mode, nr_non_host_align() contains the distributed
+    // scheduler / worker execution, so this future remains pending while
+    // that remote work proceeds.
+    // ---------------------------------------------------------------------
+
+    let nr_non_host_align_fut = async {
+        info!("[run] NR non-host alignment phase started");
+
+        let (
+            nr_non_host_m8_stream,
+            mut nr_non_host_cleanup_tasks,
+            nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ) = nr_non_host_align(
+            config.clone(),
+            non_host_r1_path.clone(),
+            non_host_r2_path_opt.clone(),
+            sample_base.clone(),
+        )
+            .await?;
+
+        // Fan out the completed/streaming NR m8:
+        //
+        //   branch 0 -> sort -> call_hits_m8
+        //   branch 1 -> durable nr.m8 file
+        //
+        let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
+            ReceiverStream::new(nr_non_host_m8_stream),
+            2,
+            "nr_m8_stream",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+
+        let mut nr_m8_streams_it = nr_m8_streams.into_iter();
+
+        let nr_m8_stream = ReceiverStream::new(
+            nr_m8_streams_it
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+        let nr_m8_file_stream = ReceiverStream::new(
+            nr_m8_streams_it
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+        let nr_m8_file_path = out_dir.join(
+            rename_file_path(
+                &sample_base_buf,
+                None,
+                Some("nr.m8"),
+                ".",
+            ),
+        );
+
+        let write_task = write_byte_stream_to_file(
+            &nr_m8_file_path,
+            nr_m8_file_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "nr_m8_file",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+        nr_non_host_cleanup_tasks.push(write_task);
+
+        // The fanout completion receiver is also owned by this branch.
+        let mut nr_non_host_cleanup_receivers = nr_non_host_cleanup_receivers;
+        nr_non_host_cleanup_receivers.push(paf_to_m8_stream_done_rx);
+
+        // -------------------------------------------------------------
+        // Sort NR m8 by read ID before call_hits_m8.
+        //
+        // Guarantees consecutive lines per read and therefore enables
+        // the downstream streaming group-by.
+        // -------------------------------------------------------------
+
+        let nr_sort_start = Instant::now();
+
+        let nr_m8_sorted = sort_m8_by_read_id(
+            config.clone(),
+            nr_m8_stream,
+            "nr",
+        )
+            .await?;
+
+        info!(
+            "[run] sort_m8_by_read_id(nr) completed after {:?}",
+            nr_sort_start.elapsed()
+        );
+
+        info!("[run] NR non-host alignment phase complete");
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+                Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+                Vec<TempDir>,
+            ),
+            PipelineError,
+        >((
+            nr_m8_sorted,
+            nr_non_host_cleanup_tasks,
+            nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ))
+    };
+
+    // ---------------------------------------------------------------------
+    //
+    // SINGLE:
+    //     Await NT completely before starting NR.
+    //
+    // DISTRIBUTED:
+    //     Drive both futures concurrently.
+    //
+    // ---------------------------------------------------------------------
+
+    let (
+        (
+            m8_sorted,
+            mut nt_non_host_cleanup_tasks,
+            mut nt_non_host_cleanup_receivers,
+        ),
+        (
+            nr_m8_sorted,
+            mut nr_non_host_cleanup_tasks,
+            mut nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ),
+    ) = match config.execution_mode {
+        ExecutionMode::Single => {
+            info!(
+                "[run] Non-host alignment mode=single: \
+                 running NT then NR serially"
+            );
+
+            let nt_result = nt_non_host_align_fut.await?;
+
+            let nr_result = nr_non_host_align_fut.await?;
+
+            (nt_result, nr_result)
+        }
+
+        ExecutionMode::Distributed => {
+            info!(
+                "[run] Non-host alignment mode=distributed: \
+                 running NT and NR concurrently"
+            );
+
+            tokio::try_join!(
+                nt_non_host_align_fut,
+                nr_non_host_align_fut,
+            )?
+        }
+    };
+
+    // ---------------------------------------------------------------------
+    // Transfer branch-owned cleanup resources into the run-level cleanup
+    // collections.
+    // ---------------------------------------------------------------------
+
+    cleanup_tasks.append(&mut nt_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nt_non_host_cleanup_receivers);
+
+    cleanup_tasks.append(&mut nr_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
+
+    final_temp_dirs.extend(nr_non_host_align_temp_dirs);
+
+    // =====================================================================
+    // NT downstream processing
+    // =====================================================================
 
     let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
 
-    let nt_concurrency = compute_phase_concurrency(&config, "call_hits_nt", 1.0, 3.5, 64, 16);
-    info!("call hits nt concurrency {}", nt_concurrency);
+    let nt_concurrency =
+        compute_phase_concurrency(
+            &config,
+            "call_hits_nt",
+            1.0,
+            3.5,
+            64,
+            16,
+        );
+
+    info!(
+        "call hits nt concurrency {}",
+        nt_concurrency
+    );
 
     let nt_call_hits_start = Instant::now();
-    let (nt_pairs, mut nt_call_cleanup_tasks, mut nt_call_cleanup_receivers) = call_hits_m8(
+
+    let (
+        nt_pairs,
+        mut nt_call_cleanup_tasks,
+        mut nt_call_cleanup_receivers,
+    ) = call_hits_m8(
         config.clone(),
-        m8_sorted, // sorted by read id
+        m8_sorted,
         sample_base_buf.clone(),
         lineage_map.clone(),
         acc2taxid_map.clone(),
@@ -7436,32 +10247,40 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "nt".to_string(),
     )
         .await?;
+
     info!(
-    "[run] call_hits_m8(nt) returned after {:?}",
-    nt_call_hits_start.elapsed()
-);
+        "[run] call_hits_m8(nt) returned after {:?}",
+        nt_call_hits_start.elapsed()
+    );
 
     cleanup_tasks.append(&mut nt_call_cleanup_tasks);
     cleanup_receivers.append(&mut nt_call_cleanup_receivers);
 
-    // One fanout of paired hits — no separate m8 / summary graphs.
+    // ---------------------------------------------------------------------
+    // One fanout of paired NT hits.
+    // ---------------------------------------------------------------------
+
     let nt_split_start = Instant::now();
-    info!("[run] fanout_to_channels(nt_pairs) ×5 ReducedRead");
+
+    info!(
+        "[run] fanout_to_channels(nt_pairs) x5 ReducedRead"
+    );
 
     let (nt_pair_rxs, nt_pairs_done_rx) = fanout_to_channels(
         nt_pairs,
         5,
         "nt_pairs",
         &config,
-        StreamDataType::JustBytes, // buffer-size hint only
+        StreamDataType::JustBytes,
     )
         .await?;
+
     cleanup_receivers.push(nt_pairs_done_rx);
 
     info!(
-    "[run] fanout_to_channels(nt_pairs) ready after {:?}",
-    nt_split_start.elapsed()
-);
+        "[run] fanout_to_channels(nt_pairs) ready after {:?}",
+        nt_split_start.elapsed()
+    );
 
     let mut nt_pair_rxs = nt_pair_rxs.into_iter();
     let nt_pairs_taxon = ReceiverStream::new(
@@ -7501,15 +10320,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let config = config.clone();
         let nt_pairs_summarize = nt_pairs_summarize;
         let duplicate_clusters = duplicate_clusters.clone();
+
         async move {
             let start = Instant::now();
+
             info!("[run] summarize_hits(nt) started");
-            let res =
-                summarize_hits(config.clone(), nt_pairs_summarize, duplicate_clusters, 0).await;
+
+            let res = summarize_hits(
+                config.clone(),
+                nt_pairs_summarize,
+                duplicate_clusters,
+                0,
+            )
+                .await;
+
             info!(
-            "[run] summarize_hits(nt) finished after {:?}",
-            start.elapsed()
-        );
+                "[run] summarize_hits(nt) finished after {:?}",
+                start.elapsed()
+            );
+
             res
         }
     });
@@ -7519,9 +10348,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let should_keep_filter = should_keep_filter.clone();
         let duplicate_clusters = duplicate_clusters.clone();
         let nt_pairs_taxon = nt_pairs_taxon;
+
         async move {
             let start = Instant::now();
-            info!("[run] generate_taxon_counts(NT) started");
+
+            info!(
+                "[run] generate_taxon_counts(NT) started"
+            );
+
             let res = generate_taxon_counts(
                 config,
                 nt_pairs_taxon,
@@ -7531,102 +10365,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 None,
             )
                 .await;
+
             info!(
-            "[run] generate_taxon_counts(NT) finished after {:?}",
-            start.elapsed()
-        );
+                "[run] generate_taxon_counts(NT) finished after {:?}",
+                start.elapsed()
+            );
+
             res
         }
     });
 
-    // Diamond or MMseqs2 non_host alignment
-    let (
-        non_host_m8_stream,
-        mut non_host_cleanup_tasks,
-        mut non_host_cleanup_receivers,
-        non_host_align_temp_dirs,
-    ) = match config.alignment_backend {
-        NRAlignmentBackend::Diamond => {
-            diamond_non_host_align(
-                config.clone(),
-                non_host_r1_path.clone(),
-                non_host_r2_path_opt.clone(),
-            )
-            .await?
-        }
-        NRAlignmentBackend::MmseqsCpu => {
-            mmseqs_non_host_align(
-                config.clone(),
-                non_host_r1_path.clone(),
-                non_host_r2_path_opt.clone(),
-                MmseqsBackend::Cpu,
-            )
-            .await?
-        }
-        NRAlignmentBackend::MmseqsGpu => {
-            mmseqs_non_host_align(
-                config.clone(),
-                non_host_r1_path.clone(),
-                non_host_r2_path_opt.clone(),
-                MmseqsBackend::Gpu,
-            )
-            .await?
-        }
-    };
-
-    cleanup_tasks.append(&mut non_host_cleanup_tasks);
-    cleanup_receivers.append(&mut non_host_cleanup_receivers);
-    final_temp_dirs.extend(non_host_align_temp_dirs);
-
-    let (nr_m8_streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
-        ReceiverStream::new(non_host_m8_stream),
-        2,
-        "nr_m8_stream",
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await
-        .map_err(|_| PipelineError::StreamDataDropped)?;
-    cleanup_receivers.push(paf_to_m8_stream_done_rx);
-
-    let mut nr_m8_streams_it = nr_m8_streams.into_iter();
-    let nr_m8_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
-    let nr_m8_file_stream = ReceiverStream::new(nr_m8_streams_it.next().ok_or(PipelineError::EmptyStream)?);
-
-    let nr_m8_file_path = out_dir.join(rename_file_path(&sample_base_buf, None, Some("nr.m8"), "."));
-
-    let write_task = write_byte_stream_to_file(
-        &nr_m8_file_path,
-        nr_m8_file_stream,
-        config.clone(),
-        StreamDataType::JustBytes,
-        "nr_m8_file",
-        true
-    )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(write_task);
-
-
-
-    // ────────────────────────────────────────────────────────────────
-    // Sort NR m8 by read ID before call_hits_m8
-    // Guarantees consecutive lines per read → enables true streaming group-by
-    // ────────────────────────────────────────────────────────────────
-    let nr_sort_start = Instant::now();
-
-    let nr_m8_sorted = sort_m8_by_read_id(
-        config.clone(),
-        nr_m8_stream,
-        "nr",
-    )
-        .await?;
-
-    info!(
-        "[run] sort_m8_by_read_id(nr) completed after {:?}",
-        nr_sort_start.elapsed()
-    );
-
+    // =====================================================================
+    // NR downstream processing
+    // =====================================================================
 
     let nr_concurrency = compute_phase_concurrency(
         &config,
@@ -7637,9 +10388,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         16, // min for meaningful parallelism
     );
 
-    info!("call hits nr concurrency {}", nr_concurrency);
+    info!(
+        "call hits nr concurrency {}",
+        nr_concurrency
+    );
 
     let nr_call_hits_start = Instant::now();
+
     let (
         nr_pairs,
         mut nr_call_cleanup_tasks,
@@ -7656,17 +10411,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "nr".to_string(),
     )
         .await?;
+
     info!(
-    "[run] call_hits_m8(nr) returned after {:?}",
-    nr_call_hits_start.elapsed()
-);
+        "[run] call_hits_m8(nr) returned after {:?}",
+        nr_call_hits_start.elapsed()
+    );
 
     cleanup_tasks.append(&mut nr_call_cleanup_tasks);
     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
-    // Single 5-way fanout of ReducedRead — pair stays together for every consumer
+    // ---------------------------------------------------------------------
+    // Single 5-way fanout of ReducedRead.
+    //
+    // Each logical pair remains together for every downstream consumer.
+    // ---------------------------------------------------------------------
+
     let nr_split_start = Instant::now();
-    info!("[run] starting fanout_to_channels for NR pairs (5 private channels)");
+
+    info!(
+        "[run] starting fanout_to_channels for NR pairs (5 private channels)"
+    );
 
     let (nr_pair_rxs, nr_pairs_done_rx) = fanout_to_channels(
         nr_pairs,
@@ -7676,12 +10440,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes,
     )
         .await?;
+
     cleanup_receivers.push(nr_pairs_done_rx);
 
     info!(
-    "[run] fanout_to_channels(nr_pairs) ready after {:?} with 5 private channels",
-    nr_split_start.elapsed()
-);
+        "[run] fanout_to_channels(nr_pairs) ready after {:?} with 5 private channels",
+        nr_split_start.elapsed()
+    );
 
     let mut nr_pair_rxs_iter = nr_pair_rxs.into_iter();
     let nr_pairs_taxon =
