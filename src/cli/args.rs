@@ -225,4 +225,23 @@ pub struct Arguments {
     #[arg(long, default_value = "nrDB")]
     pub mmseqs_db: Option<String>,
 
+    #[arg(long = "distributed", action)]
+    pub distributed: bool,
+
+    #[arg(
+        long = "distributed-workers",
+        value_name = "N",
+        help = "Number of READY distributed MMseqs/diamond CPU workers to use"
+    )]
+    pub distributed_workers: Option<usize>,
+
+    #[arg(long, default_value = "/efs")]
+    pub efs_base_dir: String,
+
+    #[arg(long, default_value = "/efs/runs")]
+    pub efs_runs_dir: String,
+
+    #[arg(long, default_value_t = false)]
+    pub no_version_check: bool,
+
 }

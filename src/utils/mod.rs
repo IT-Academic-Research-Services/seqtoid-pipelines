@@ -13,3 +13,5 @@ pub mod paf;
 pub mod blast;
 pub mod taxonomy;
 pub mod coverage_viz;
+pub mod workers;
+pub mod work_units;
