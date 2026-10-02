@@ -36,7 +36,8 @@ Backends
     mmseqs-gpu
 
 Reference paths are hard-coded from the SeqToID phase2 reference-preparation
-scripts:
+scripts. The benchmark assumes the references have already been built and validated
+using the canonical CPU/GPU DB preparation workflows; it does not rebuild them:
     Diamond:    /scratch/refs/diamond/diamond_07_22_2026.dmnd
     MMseqs CPU: /scratch/refs/mmseqs/nrcleanDB
     MMseqs GPU: /scratch/refs/mmseqs-gpu/nrcleanDB_gpu
@@ -54,6 +55,7 @@ MMseqs follows the current Rust implementation:
     GPU only: mmseqs gpuserver + 20 second warm-up
     mmseqs search ...
     GPU only: stop gpuserver immediately after search
+    GPU search uses --gpu 1 --gpu-server 1 --db-load-mode 2 --prefilter-mode 1
     mmseqs convertalis ... --format-output ...
 
 No extractorfs step is included because it is not in the current Rust
@@ -667,7 +669,13 @@ def run_mmseqs(
 
     search = ["mmseqs", "search"]
     if backend == "mmseqs-gpu":
-        search += ["--gpu", "1", "--gpu-server", "1", "--db-load-mode", "2"]
+        # Match the current Rust MMseqs GPU-server client construction:
+        # --gpu 1 --gpu-server 1 --db-load-mode 2 --prefilter-mode 1
+        search += [
+            "--gpu", "1",
+            "--gpu-server", "1",
+            "--db-load-mode", "2",
+        ]
     search += ["--threads", str(threads)]
     if backend == "mmseqs-cpu":
         search += ["-s", "5.7"]
@@ -675,14 +683,16 @@ def run_mmseqs(
         "--alignment-mode", "3",
         "--search-type", "3",
         "--max-seqs", "1000" if backend == "mmseqs-cpu" else "3000",
-        "--prefilter-mode", "0",
-        str(query_db),
-        str(db),
-        str(result_db),
-        str(tmp_dir),
-        "-e", "0.001",
-        "--min-seq-id", "0.25",
     ]
+    # CPU benchmark preserves the established production-mode prefilter.
+    # GPU gpuserver requires prefilter mode 1 for the GPU-indexed database.
+    search += ["--prefilter-mode", "0" if backend == "mmseqs-cpu" else "1", str(query_db),
+               str(db),
+               str(result_db),
+               str(tmp_dir),
+               "-e", "0.001",
+               "--min-seq-id", "0.25",
+               ]
     results.append(
         run_capture(
             search,
