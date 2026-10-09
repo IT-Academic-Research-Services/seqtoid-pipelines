@@ -103,8 +103,6 @@ async fn main() -> Result<()> {
         args.work_dir.display()
     );
 
-
-
     let executor_config = WorkerExecutorConfig {
         worker_id,
         scratch_dir: args.scratch_dir,
@@ -126,13 +124,13 @@ async fn main() -> Result<()> {
         match find_first_available_work_unit(&work_unit_paths).await? {
             Some((path, mut work_unit)) => {
                 log::info!(
-                "Found AVAILABLE work unit: {} \
-                 sample={}, chunk={}, attempt={}",
-                path.display(),
-                work_unit.sample_id,
-                work_unit.chunk_id,
-                work_unit.attempt,
-            );
+                    "Found AVAILABLE work unit: {} \
+                     sample={}, chunk={}, attempt={}",
+                    path.display(),
+                    work_unit.sample_id,
+                    work_unit.chunk_id,
+                    work_unit.attempt,
+                );
 
                 match executor
                     .claim_and_execute(&path, &mut work_unit)
@@ -142,9 +140,9 @@ async fn main() -> Result<()> {
 
                     Err(err) if err.downcast_ref::<WorkUnitClaimed>().is_some() => {
                         log::debug!(
-            "Work unit {} was claimed by another worker; trying another",
-            path.display()
-        );
+                            "Work unit {} was claimed by another worker; trying another",
+                            path.display()
+                        );
                     }
 
                     Err(err) => {
@@ -154,10 +152,24 @@ async fn main() -> Result<()> {
             }
 
             None => {
+                if work_unit_paths.is_empty() {
+                    log::debug!(
+                        "No work units published yet; waiting for work directory {}",
+                        args.work_dir.display()
+                    );
+
+                    tokio::time::sleep(
+                        tokio::time::Duration::from_secs(2)
+                    )
+                        .await;
+
+                    continue;
+                }
+
                 if has_work_in_progress(&work_unit_paths).await? {
                     log::debug!(
-            "No AVAILABLE work units currently available; other workers are still processing"
-        );
+                        "No AVAILABLE work units currently available; other workers are still processing"
+                    );
 
                     tokio::time::sleep(
                         tokio::time::Duration::from_secs(2)
@@ -168,15 +180,12 @@ async fn main() -> Result<()> {
                 }
 
                 log::info!(
-        "No AVAILABLE, CLAIMED, or RUNNING work units remain"
-    );
+                    "No AVAILABLE, CLAIMED, or RUNNING work units remain"
+                );
                 break;
             }
-
-
         }
     }
-
 
     Ok(())
 }
@@ -204,14 +213,20 @@ async fn load_work_unit(path: &PathBuf) -> Result<WorkUnit> {
 
 /// Find serialized WorkUnit files in a run's work directory.
 async fn list_work_unit_paths(work_dir: &PathBuf) -> Result<Vec<PathBuf>> {
-    let mut entries = fs::read_dir(work_dir)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to read work directory {}",
-                work_dir.display()
-            )
-        })?;
+    let mut entries = match fs::read_dir(work_dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to read work directory {}",
+                    work_dir.display()
+                )
+            });
+        }
+    };
 
     let mut paths = Vec::new();
 

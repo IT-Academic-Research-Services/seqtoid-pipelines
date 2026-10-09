@@ -3390,23 +3390,6 @@ async fn nr_distributed_non_host_align(
     let efs_base =
         config.efs_runs_dir.join(&config.run_id);
 
-    info!(
-        "Distributed non-host align: preparing EFS run dir {}",
-        efs_base.display()
-    );
-
-    tokio::fs::create_dir_all(
-        &efs_base,
-    )
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-                "Failed to create EFS run dir {}: {}",
-                efs_base.display(),
-                e
-            ))
-        })?;
-
     let non_host_r1_efs =
         efs_base.join("nonhost_R1.fastq");
 
@@ -3949,19 +3932,9 @@ async fn nr_distributed_non_host_align(
     // ------------------------------------------------------------------
 
     let work_dir =
-        efs_base.join("work");
-
-    tokio::fs::create_dir_all(
-        &work_dir,
-    )
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-                "Failed to create distributed work directory {}: {}",
-                work_dir.display(),
-                e
-            ))
-        })?;
+        config.efs_runs_dir
+            .join(&config.run_id)
+            .join("work");
 
     for (
         chunk_id,
@@ -9384,6 +9357,27 @@ async fn collect_m8_accession_map(
 pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
     let out_dir = config.out_dir.clone();
+
+    let efs_run_dir = config.efs_runs_dir.join(&config.run_id);
+    let efs_work_dir = efs_run_dir.join("work");
+
+    if matches!(config.execution_mode, ExecutionMode::Distributed) {
+        tokio::fs::create_dir_all(&efs_work_dir)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to create distributed EFS work directory {}: {}",
+                efs_work_dir.display(),
+                e
+            ))
+            })?;
+
+        info!(
+        "[run] Distributed NR EFS work directory: {}",
+        efs_work_dir.display()
+    );
+    }
+
     let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
     let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> =
         Vec::new();
