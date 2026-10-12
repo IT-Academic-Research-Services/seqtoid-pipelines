@@ -29,6 +29,7 @@ use rand::SeedableRng;
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use serde_json::json;
 use tokio::fs::File as TokioFile;
 use tokio::io::BufWriter;
 use tokio::sync::oneshot;
@@ -43,7 +44,7 @@ use crate::config::defs::{
     ReducedRead
 };
 use crate::utils::command::generate_cli;
-use crate::utils::file::{choose_temp_dir, rename_file_path, write_byte_stream_to_file};
+use crate::utils::file::{choose_temp_dir, rename_file_path, write_byte_stream_to_file, write_vecu8_to_file};
 use crate::utils::streams::{fanout_to_channels, parse_lines, spawn_cmd, ParseOutput, ToBytes};
 use crate::utils::system::compute_phase_concurrency;
 use crate::utils::taxonomy::validate_taxid_lineage;
@@ -2441,6 +2442,66 @@ pub async fn compute_merged_taxon_counts(
 
     info!("compute_merged_taxon_counts complete");
     Ok((merged_taxon_counts, cleanup_tasks))
+}
+
+
+/// Combines NT and NR taxon counts into a single JSON file.
+///
+/// # Arguments
+///
+/// * `nt_counts`: list of NT taxon counts
+/// * `nr_counts`: list of NR taxon counts
+/// * `output_path`: path for the output JSON file
+///
+/// # Returns
+///
+/// Result containing:
+/// - path to the output JSON file
+/// - handle for the write task
+pub async fn combine_taxon_counts(
+    nt_counts: &[TaxonCount],
+    nr_counts: &[TaxonCount],
+    merged_counts: &[TaxonCount],
+    output_path: PathBuf,
+) -> Result<(PathBuf, JoinHandle<Result<()>>)> {
+    let nt_len = nt_counts.len();
+    let nr_len = nr_counts.len();
+    let merged_len = merged_counts.len();
+    let total = nt_len + nr_len + merged_len;
+
+    let mut all_counts = Vec::with_capacity(total);
+    all_counts.extend_from_slice(nt_counts);
+    all_counts.extend_from_slice(nr_counts);
+    all_counts.extend_from_slice(merged_counts);
+
+    let output_json = json!({
+        "pipeline_output": {
+            "taxon_counts_attributes": all_counts
+        }
+    });
+
+    let payload = serde_json::to_vec_pretty(&output_json)
+        .map_err(|e| anyhow!("JSON serialization failed: {}", e))?;
+
+    if payload.is_empty() {
+        return Err(anyhow!("Empty JSON payload for {}", output_path.display()));
+    }
+
+    let data_arc = Arc::new(payload);
+    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20)
+        .await
+        .map_err(|e| anyhow!("Failed to spawn JSON write: {}", e))?;
+
+    info!(
+        "Combined {} taxon count entries ({} NT + {} NR + {} merged); write → {}",
+        total,
+        nt_len,
+        nr_len,
+        merged_len,
+        output_path.display()
+    );
+
+    Ok((output_path, write_task))
 }
 
 #[cfg(test)]

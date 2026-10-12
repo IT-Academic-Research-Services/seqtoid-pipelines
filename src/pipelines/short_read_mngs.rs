@@ -58,8 +58,8 @@ use crate::utils::blast::{
     build_taxon_counts_list, call_hits_m8, compute_merged_taxon_counts,
     generate_taxon_count_json_from_m8, generate_taxon_counts, merge_aggregations,
     process_record_pair, read_id_from_m8_line, shard_for_read_id, sort_m8_by_read_id,
-    summarize_m8_hits, AggBucket, ContigSummaryEntry, M8Record, SpeciesAlignmentResults,
-    TaxonCount,
+    summarize_m8_hits, combine_taxon_counts, AggBucket, ContigSummaryEntry, M8Record, SpeciesAlignmentResults,
+    TaxonCount, 
 };
 use crate::utils::command::blastn::BlastnConfig;
 use crate::utils::command::blastx::BlastxConfig;
@@ -5325,64 +5325,7 @@ async fn diamond_non_host_align(
     Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
 
-/// Combines NT and NR taxon counts into a single JSON file.
-///
-/// # Arguments
-///
-/// * `nt_counts`: list of NT taxon counts
-/// * `nr_counts`: list of NR taxon counts
-/// * `output_path`: path for the output JSON file
-///
-/// # Returns
-///
-/// Result containing:
-/// - path to the output JSON file
-/// - handle for the write task
-async fn combine_taxon_counts(
-    nt_counts: &[TaxonCount],
-    nr_counts: &[TaxonCount],
-    merged_counts: &[TaxonCount],
-    output_path: PathBuf,
-) -> Result<(PathBuf, JoinHandle<Result<()>>)> {
-    let nt_len = nt_counts.len();
-    let nr_len = nr_counts.len();
-    let merged_len = merged_counts.len();
-    let total = nt_len + nr_len + merged_len;
 
-    let mut all_counts = Vec::with_capacity(total);
-    all_counts.extend_from_slice(nt_counts);
-    all_counts.extend_from_slice(nr_counts);
-    all_counts.extend_from_slice(merged_counts);
-
-    let output_json = json!({
-        "pipeline_output": {
-            "taxon_counts_attributes": all_counts
-        }
-    });
-
-    let payload = serde_json::to_vec_pretty(&output_json)
-        .map_err(|e| anyhow!("JSON serialization failed: {}", e))?;
-
-    if payload.is_empty() {
-        return Err(anyhow!("Empty JSON payload for {}", output_path.display()));
-    }
-
-    let data_arc = Arc::new(payload);
-    let write_task = write_vecu8_to_file(data_arc, &output_path, 1 << 20)
-        .await
-        .map_err(|e| anyhow!("Failed to spawn JSON write: {}", e))?;
-
-    info!(
-        "Combined {} taxon count entries ({} NT + {} NR + {} merged); write → {}",
-        total,
-        nt_len,
-        nr_len,
-        merged_len,
-        output_path.display()
-    );
-
-    Ok((output_path, write_task))
-}
 
 /// Collects hit summary information into a map from contig ID to best accession.
 ///
