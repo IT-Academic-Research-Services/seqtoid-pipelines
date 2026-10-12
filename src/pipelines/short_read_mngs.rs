@@ -59,7 +59,7 @@ use crate::utils::blast::{
     generate_taxon_count_json_from_m8, generate_taxon_counts, merge_aggregations,
     process_record_pair, read_id_from_m8_line, shard_for_read_id, sort_m8_by_read_id,
     summarize_m8_hits, combine_taxon_counts, AggBucket, ContigSummaryEntry, M8Record, SpeciesAlignmentResults,
-    TaxonCount, 
+    TaxonCount,
 };
 use crate::utils::command::blastn::BlastnConfig;
 use crate::utils::command::blastx::BlastxConfig;
@@ -80,7 +80,8 @@ use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::fastx::{
     generate_taxid_fasta, generate_taxid_locator, parse_byte_stream_to_fastq, raw_read_count,
     read_fasta, read_fastq, stream_record_counter, write_combined_fastq,
-    write_fasta_stream_to_file, SequenceRecord, chunk_paired_fastq
+    write_fasta_stream_to_file, SequenceRecord, chunk_paired_fastq, generate_annotated_fasta_stream,
+    UNMAPPED_HEADER_PREFIX
 };
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
@@ -5537,112 +5538,160 @@ fn parse_fasta_batch_to_annotated_streaming(
     results
 }
 
-async fn generate_annotated_fasta_stream(
+
+/// Short-read-specific annotated FASTA generation.
+///
+/// The pipeline-independent work is performed by
+/// `utils::fastx::generate_annotated_fasta_stream`.
+///
+/// Existing short-read Rust behavior is preserved:
+///
+///   mapped:
+///       NR:<nr_accessession>:NT:<nt_accession>:<read_id>
+///
+///   unidentified:
+///       <read_id>
+///
+/// For each unidentified deduplicated representative:
+///
+///   - `unique_rx` receives the representative once.
+///   - `expanded_rx` receives the representative `ClusterInfo.size` times.
+///
+///
+/// The only behavioral change from the previous Rust implementation is that
+/// an unidentified representative missing from `duplicate_clusters` is now
+/// treated as an invariant violation instead of silently being treated as a
+/// singleton.
+///
+async fn generate_annotated_fasta(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // contig FASTA
+    input_stream: ReceiverStream<ParseOutput>,
     duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    nt_map: AHashMap<String, String>, // tiny contig → NT accession
-    nr_map: AHashMap<String, String>, // tiny contig → NR accession
+    nt_map: AHashMap<String, String>,
+    nr_map: AHashMap<String, String>,
     _concurrency: usize,
 ) -> Result<(
-    mpsc::Receiver<ParseOutput>, // annotated mapped contigs
-    mpsc::Receiver<ParseOutput>, // unidentified (expanded)
-    mpsc::Receiver<ParseOutput>, // unique unidentified (reps only)
+    mpsc::Receiver<ParseOutput>, // mapped, accession-annotated
+    mpsc::Receiver<ParseOutput>, // unidentified, duplicate-expanded
+    mpsc::Receiver<ParseOutput>, // unidentified, unique representatives
     Vec<JoinHandle<Result<()>>>,
     Vec<oneshot::Receiver<Result<()>>>,
 )> {
-    let channel_cap = (config.base_buffer_size / 4).max(10_000);
-    let (mapped_tx, mapped_rx) = mpsc::channel(channel_cap);
-    let (unid_tx, unid_rx) = mpsc::channel(channel_cap);
-    let (uniq_tx, uniq_rx) = mpsc::channel(channel_cap);
-
-    let (done_tx, done_rx) = oneshot::channel();
-    let cleanup_receivers = vec![done_rx];
-
-    // Wrap the tiny maps for the rayon closure
-    let nt_map_arc = Arc::new(nt_map);
-    let nr_map_arc = Arc::new(nr_map);
-
-    let batched_stream = batch_rayon_process(
+    // Generic portion shared by short- and long-read pipelines.
+    //
+    // For short reads this preserves the previous behavior:
+    //   mapped       -> accession-annotated ID
+    //   unidentified -> original representative ID
+    let (
+        mapped_rx,
+        generic_unidentified_rx,
+        mut cleanup_tasks,
+        mut cleanup_receivers,
+    ) = generate_annotated_fasta_stream(
         config.clone(),
         input_stream,
-        move |batch: Vec<u8>| {
-            parse_fasta_batch_to_annotated_streaming(
-                // ← new streaming parser
-                batch,
-                &duplicate_clusters,
-                &nt_map_arc,
-                &nr_map_arc,
-            )
-        },
-        "generate_annotated_fasta_streaming",
-        16 * 1024 * 1024,
-    );
+        nt_map,
+        nr_map,
+    )
+        .await?;
 
-    let demux_handle = tokio::spawn(async move {
-        let mut stream = batched_stream;
-        while let Some(item) = stream.next().await {
-            if let ParseOutput::Bytes(b) = item {
-                if b.is_empty() {
-                    continue;
+    let channel_cap = (config.base_buffer_size / 4).max(10_000);
+
+    let (expanded_tx, expanded_rx) = mpsc::channel(channel_cap);
+    let (unique_tx, unique_rx) = mpsc::channel(channel_cap);
+
+    // This is tokio::sync::oneshot because `oneshot` is already imported
+    // from tokio::sync at the top of short_read_mngs.rs.
+    let (done_tx, done_rx) = oneshot::channel::<Result<()>>();
+
+    let expansion_task = tokio::spawn(async move {
+        let mut unidentified_stream =
+            ReceiverStream::new(generic_unidentified_rx);
+
+        while let Some(item) = unidentified_stream.next().await {
+            let record = match item {
+                ParseOutput::Fasta(record) => record,
+                other => {
+                    return Err(anyhow!(
+                        "generate_annotated_fasta: expected FASTA record in \
+                         unidentified stream, got {:?}",
+                        other
+                    ));
                 }
-                let tag = b[0];
-                let data = &b[1..];
+            };
 
-                let mut reader = needletail::parse_fastx_reader(std::io::Cursor::new(data))
-                    .map_err(|e| anyhow!("Failed to parse demuxed record: {}", e))?;
+            let rep_id = record.id().to_string();
 
-                if let Some(record) = reader.next() {
-                    let rec = record.map_err(|e| anyhow!("Needletail error: {}", e))?;
-                    let seq_rec: SequenceRecord = rec.into();
-                    let out_item = ParseOutput::Fasta(seq_rec);
+            // Every record reaching this point is a deduplicated
+            // representative, so it must exist in duplicate_clusters.
+            //
+            // Copy the size out before any await so the DashMap guard
+            // is not held across an asynchronous send.
+            let dup_count = {
+                let cluster = duplicate_clusters
+                    .get(&rep_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "generate_annotated_fasta: invariant violation: \
+                             unidentified representative '{}' is missing \
+                             from duplicate_clusters",
+                            rep_id
+                        )
+                    })?;
 
-                    match tag {
-                        0 => {
-                            mapped_tx
-                                .send(out_item)
-                                .await
-                                .map_err(|_| anyhow!(
-                                "generate_annotated_fasta_stream: mapped_tx closed (consumer dropped)"
-                            ))?;
-                        }
-                        1 => {
-                            unid_tx
-                                .send(out_item)
-                                .await
-                                .map_err(|_| anyhow!(
-                                "generate_annotated_fasta_stream: unid_tx closed (consumer dropped)"
-                            ))?;
-                        }
-                        2 => {
-                            uniq_tx
-                                .send(out_item)
-                                .await
-                                .map_err(|_| anyhow!(
-                                "generate_annotated_fasta_stream: uniq_tx closed (consumer dropped)"
-                            ))?;
-                        }
-                        _ => warn!(
-                        "Unknown tag in generate_annotated_fasta_stream: {}",
-                        tag
-                    ),
-                    }
-                }
+                cluster.size
+            };
+
+            // One copy of each deduplicated representative goes to the
+            // unique-unidentified output.
+            unique_tx
+                .send(ParseOutput::Fasta(record.clone()))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "generate_annotated_fasta: unique unidentified \
+                         receiver dropped"
+                    )
+                })?;
+
+            // Preserve the previous Rust behavior exactly: expand the
+            // unidentified representative according to its duplicate-cluster
+            // size, retaining the representative ID for every copy.
+            for _ in 0..dup_count {
+                expanded_tx
+                    .send(ParseOutput::Fasta(record.clone()))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "generate_annotated_fasta: expanded unidentified \
+                             receiver dropped"
+                        )
+                    })?;
             }
         }
+
         let _ = done_tx.send(Ok(()));
-        info!("generate_annotated_fasta_stream completed");
+
+        info!(
+            "Short-read unidentified duplicate expansion completed"
+        );
+
         Ok::<(), anyhow::Error>(())
     });
 
+    cleanup_tasks.push(expansion_task);
+    cleanup_receivers.push(done_rx);
+
     Ok((
         mapped_rx,
-        unid_rx,
-        uniq_rx,
-        vec![demux_handle],
+        expanded_rx,
+        unique_rx,
+        cleanup_tasks,
         cleanup_receivers,
     ))
 }
+
+
 
 #[allow(dead_code)]
 async fn write_dummy_assembly_files(assembly_dir: &PathBuf) -> Result<(), anyhow::Error> {
@@ -10473,17 +10522,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 )?;
 
     // Generate the annotated FASTA stream
-    let (annotated_rx, unidentified_rx, unique_unidentified_rx, mut annot_tasks, mut annot_rxs) =
-        generate_annotated_fasta_stream(
-            config.clone(),
-            interleaved_stream,
-            duplicate_clusters.clone(),
-            nt_map,
-            nr_map,
-            annot_concurrency,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("Annotated FASTA from files failed: {}", e)))?;
+    let (
+        annotated_rx,
+        unidentified_rx,
+        unique_unidentified_rx,
+        mut annot_tasks,
+        mut annot_rxs,
+    ) = generate_annotated_fasta(
+        config.clone(),
+        interleaved_stream,
+        duplicate_clusters.clone(),
+        nt_map,
+        nr_map,
+        annot_concurrency,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "Annotated FASTA from files failed: {}",
+        e
+    ))
+        })?;
 
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
@@ -11148,7 +11207,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         unique_unidentified_rx,
         mut annot_tasks,
         mut annot_rxs,
-    ) = generate_annotated_fasta_stream(
+    ) = generate_annotated_fasta(
         config.clone(),
         nonhost_stream,
         duplicate_clusters.clone(),
@@ -11158,8 +11217,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await
         .map_err(|e| {
-            PipelineError::Other(anyhow!("Refined generate_annotated_fasta failed: {}", e))
+            PipelineError::Other(anyhow!(
+        "Refined generate_annotated_fasta failed: {}",
+        e
+    ))
         })?;
+
+    cleanup_tasks.append(&mut annot_tasks);
+    cleanup_receivers.append(&mut annot_rxs);
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
 

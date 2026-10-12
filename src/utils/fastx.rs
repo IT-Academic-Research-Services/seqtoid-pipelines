@@ -38,10 +38,13 @@ use crate::config::defs::{
 };
 use crate::utils::file::extension_remover;
 use crate::utils::sequence::{normal_phred_qual_string, DNA};
-use crate::utils::streams::{ParseOutput, ToBytes};
+use crate::utils::streams::{ParseOutput, ToBytes, batch_rayon_process};
 use crate::utils::system::compute_phase_concurrency;
 use crate::utils::taxonomy::get_taxid;
 use crate::utils::taxonomy::{combine_taxon_loc_json, get_valid_lineage};
+
+
+pub const UNMAPPED_HEADER_PREFIX: &str = "NR::NT::";
 
 
 // Metadata describing one completed paired-end FASTQ chunk.
@@ -2613,7 +2616,286 @@ pub async fn chunk_paired_fastq(
         .await
         .map_err(|e| anyhow!("Paired FASTQ chunking task failed: {}", e))?
 }
+/// Parse a FASTA batch, look up NT/NR accessions, annotate mapped records,
+/// and tag records for routing.
+///
+/// Tag meanings:
+///   0 = mapped/identified (has an NT and/or NR accession)
+///   1 = unidentified (has neither an NT nor NR accession)
+///
+/// Existing Rust behavior is preserved:
+///
+///   mapped:
+///       NR:<nr_accession>:NT:<nt_accession>:<read_id>
+///
+///   unidentified:
+///       <read_id>
+///
+/// Duplicate-cluster handling is intentionally not performed here. That is
+/// short-read-specific behavior and belongs in the short-read pipeline.
+fn parse_fasta_batch_to_annotated_streaming(
+    batch: Vec<u8>,
+    nt_map: &AHashMap<String, String>,
+    nr_map: &AHashMap<String, String>,
+) -> Vec<Vec<u8>> {
+    const MAPPED_TAG: u8 = 0;
+    const UNIDENTIFIED_TAG: u8 = 1;
 
+    let mut results = Vec::with_capacity(batch.len() / 512);
+
+    let mut reader = match needletail::parse_fastx_reader(std::io::Cursor::new(batch)) {
+        Ok(reader) => reader,
+        Err(e) => {
+            error!(
+                "parse_fasta_batch_to_annotated_streaming: failed to create reader: {}",
+                e
+            );
+            return results;
+        }
+    };
+
+    while let Some(record) = reader.next() {
+        let rec = match record {
+            Ok(rec) => rec,
+            Err(e) => {
+                warn!(
+                    "parse_fasta_batch_to_annotated_streaming: bad record: {}",
+                    e
+                );
+                continue;
+            }
+        };
+
+        let record: SequenceRecord = rec.into();
+        let read_id = record.id().to_string();
+
+        let nr_accession = nr_map
+            .get(&read_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let nt_accession = nt_map
+            .get(&read_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let is_unidentified =
+            nr_accession.is_empty() && nt_accession.is_empty();
+
+        // Preserve the existing Rust behavior exactly:
+        //
+        // mapped reads:
+        //     NR:<nr>:NT:<nt>:<read_id>
+        //
+        // unidentified reads:
+        //     <read_id>
+        let output_id = if is_unidentified {
+            read_id.clone()
+        } else {
+            format!(
+                "NR:{}:NT:{}:{}",
+                nr_accession,
+                nt_accession,
+                read_id
+            )
+        };
+
+        let output_record = SequenceRecord::Fasta {
+            id: output_id,
+            desc: None,
+            seq: record.seq(),
+        };
+
+        match output_record.to_bytes() {
+            Ok(bytes) => {
+                let tag = if is_unidentified {
+                    UNIDENTIFIED_TAG
+                } else {
+                    MAPPED_TAG
+                };
+
+                let mut tagged = Vec::with_capacity(bytes.len() + 1);
+                tagged.push(tag);
+                tagged.extend_from_slice(&bytes);
+
+                results.push(tagged);
+            }
+
+            Err(e) => {
+                warn!(
+                    "parse_fasta_batch_to_annotated_streaming: \
+                     failed to serialize record {}: {}",
+                    read_id,
+                    e
+                );
+            }
+        }
+    }
+
+    results
+}
+
+
+/// Generate mapped and unidentified FASTA streams.
+///
+/// This is the pipeline-independent portion of annotated FASTA generation.
+///
+/// Existing Rust behavior is preserved:
+///
+///   mapped records:
+///       NR:<nr_accession>:NT:<nt_accession>:<read_id>
+///
+///   unidentified records:
+///       <read_id>
+///
+/// This function intentionally knows nothing about:
+///
+///   - duplicate clusters
+///   - duplicate expansion
+///   - cluster member IDs
+///   - /1 or /2 cluster-key handling
+///   - missing-cluster policy
+///
+/// Those are short-read-specific concerns and belong in the short-read
+/// pipeline wrapper.
+pub async fn generate_annotated_fasta_stream(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    nt_map: AHashMap<String, String>,
+    nr_map: AHashMap<String, String>,
+) -> Result<(
+    mpsc::Receiver<ParseOutput>,
+    mpsc::Receiver<ParseOutput>,
+    Vec<JoinHandle<Result<()>>>,
+    Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>>,
+)> {
+    const MAPPED_TAG: u8 = 0;
+    const UNIDENTIFIED_TAG: u8 = 1;
+
+    let channel_cap = (config.base_buffer_size / 4).max(10_000);
+
+    let (mapped_tx, mapped_rx) =
+        mpsc::channel(channel_cap);
+
+    let (unidentified_tx, unidentified_rx) =
+        mpsc::channel(channel_cap);
+
+    let (done_tx, done_rx) =
+        tokio::sync::oneshot::channel::<Result<(), anyhow::Error>>();
+    let cleanup_receivers = vec![done_rx];
+
+    let nt_map = Arc::new(nt_map);
+    let nr_map = Arc::new(nr_map);
+
+    let batched_stream = batch_rayon_process(
+        config.clone(),
+        input_stream,
+        move |batch: Vec<u8>| {
+            parse_fasta_batch_to_annotated_streaming(
+                batch,
+                &nt_map,
+                &nr_map,
+            )
+        },
+        "generate_annotated_fasta_streaming",
+        16 * 1024 * 1024,
+    );
+
+    let demux_handle = tokio::spawn(async move {
+        let mut stream = batched_stream;
+
+        while let Some(item) = stream.next().await {
+            let ParseOutput::Bytes(tagged_bytes) = item else {
+                continue;
+            };
+
+            if tagged_bytes.is_empty() {
+                continue;
+            }
+
+            let tag = tagged_bytes[0];
+            let fasta_bytes = &tagged_bytes[1..];
+
+            let mut reader =
+                needletail::parse_fastx_reader(
+                    std::io::Cursor::new(fasta_bytes)
+                )
+                    .map_err(|e| {
+                        anyhow!(
+                        "generate_annotated_fasta_stream: \
+                         failed to parse routed FASTA record: {}",
+                        e
+                    )
+                    })?;
+
+            let record = reader
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "generate_annotated_fasta_stream: \
+                         routed FASTA payload contained no record"
+                    )
+                })?
+                .map_err(|e| {
+                    anyhow!(
+                        "generate_annotated_fasta_stream: \
+                         invalid routed FASTA record: {}",
+                        e
+                    )
+                })?;
+
+            let sequence_record: SequenceRecord = record.into();
+            let output = ParseOutput::Fasta(sequence_record);
+
+            match tag {
+                MAPPED_TAG => {
+                    mapped_tx
+                        .send(output)
+                        .await
+                        .map_err(|_| {
+                            anyhow!(
+                                "generate_annotated_fasta_stream: \
+                                 mapped receiver dropped"
+                            )
+                        })?;
+                }
+
+                UNIDENTIFIED_TAG => {
+                    unidentified_tx
+                        .send(output)
+                        .await
+                        .map_err(|_| {
+                            anyhow!(
+                                "generate_annotated_fasta_stream: \
+                                 unidentified receiver dropped"
+                            )
+                        })?;
+                }
+
+                _ => {
+                    return Err(anyhow!(
+                        "generate_annotated_fasta_stream: \
+                         unexpected internal routing tag {}",
+                        tag
+                    ));
+                }
+            }
+        }
+
+        let _ = done_tx.send(Ok(()));
+
+        info!("generate_annotated_fasta_stream completed");
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok((
+        mapped_rx,
+        unidentified_rx,
+        vec![demux_handle],
+        cleanup_receivers,
+    ))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
