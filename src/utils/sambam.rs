@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Receiver as StdReceiver;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use log::{self, debug, info, warn};
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -23,8 +23,11 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufWriter;
+use needletail::parse_fastx_file;
+use noodles::sam::alignment::record::Flags;
+use rayon::prelude::*;
 
-use crate::config::defs::ClusterInfo;
+use crate::config::defs::{ClusterInfo, RunConfig};
 use crate::utils::streams::ParseOutput;
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,10 @@ pub async fn stream_sam_alignment_counter(
     Ok(counter)
 }
 
+/// Bridges the pipeline's asynchronous BAM byte stream into a synchronous
+/// `std::io::Read` implementation for noodles + streampile.
+///
+/// This is used only inside `spawn_blocking`.
 struct BlockingChannelReader {
     rx: mpsc::Receiver<ParseOutput>,
     runtime: tokio::runtime::Handle,
@@ -124,11 +131,14 @@ impl io::Read for BlockingChannelReader {
                 Some(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "streampile POC received non-Bytes ParseOutput",
+                        "generate_assembly_coverage: expected \
+                         ParseOutput::Bytes in BAM stream",
                     ));
                 }
 
-                None => return Ok(0),
+                None => {
+                    return Ok(0);
+                }
             }
         }
     }
@@ -451,27 +461,125 @@ pub async fn compute_insert_size_stats_from_bam(
     })
 }
 
-/// Proof of concept for consuming the complete assembly BAM stream through
-/// a synchronous noodles BAM reader and streampile without writing an
-/// intermediate BAM file.
+/// Generate assembly contig coverage statistics from a streamed BAM.
 ///
-/// This intentionally follows the legacy Python coverage operation at the
-/// pileup-depth level:
+/// The BAM is consumed once through `streampile` using the existing streaming
+/// pipeline. No intermediate BAM file is written.
+///
+/// Coverage is represented over the actual FASTA contig length, so positions
+/// with no aligned reads remain explicit zeroes.
+///
+/// Pileup depth deliberately uses `unfiltered_depth()`, matching the legacy
+/// Python:
 ///
 ///     pileup_column.get_num_aligned()
 ///
-/// therefore the POC records `unfiltered_depth()`.
+/// The alignment filter is explicitly configured to match the legacy pysam
+/// pileup flag filter:
 ///
-/// It does not yet generate the final coverage JSON/CSV. Its purpose is to
-/// prove that the complete streamed BAM can be consumed successfully by
-/// noodles + streampile.
-pub async fn streampile_poc(
+///     UNMAPPED | SECONDARY | QC_FAIL | DUPLICATE
+///
+/// Supplementary alignments are therefore retained.
+///
+/// The final per-contig statistics remain parallelized using the existing
+/// Rayon thread pool.
+///
+/// JSON uses the legacy Python field names:
+///
+///     coverage, avg, p0, p100, p25, p50, p75,
+///     avg2xcnt, cnt0, cnt1, cnt2, contig_len
+///
+/// CSV uses the legacy Python column names:
+///
+///     contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2
+pub async fn generate_assembly_coverage(
+    config: Arc<RunConfig>,
     assembly_bam_rx: ReceiverStream<ParseOutput>,
+    contigs_fasta_path: &PathBuf,
+    coverage_json_path: &PathBuf,
+    coverage_csv_path: &PathBuf,
 ) -> Result<()> {
+    const MIN_CONTIG_FILE_SIZE: u64 = 50;
+
+    // ---------------------------------------------------------------------
+    // Early exit for failed/empty assemblies.
+    // ---------------------------------------------------------------------
+    let meta = tokio::fs::metadata(contigs_fasta_path)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to stat contigs FASTA {}",
+                contigs_fasta_path.display()
+            )
+        })?;
+
+    if meta.len() < MIN_CONTIG_FILE_SIZE {
+        tokio::fs::write(coverage_json_path, b"{}").await?;
+        tokio::fs::write(coverage_csv_path, b"No Contigs\n").await?;
+        return Ok(());
+    }
+
+    info!(
+        "Streaming assembly coverage: {} -> {}",
+        contigs_fasta_path.display(),
+        coverage_json_path.display()
+    );
+
+    // ---------------------------------------------------------------------
+    // Load contig order and actual FASTA lengths.
+    //
+    // These lengths are authoritative for the coverage vectors. A position
+    // with no pileup remains zero.
+    // ---------------------------------------------------------------------
+    let (contig_order, contig_lengths): (Vec<String>, HashMap<String, usize>) = {
+        let mut reader = parse_fastx_file(contigs_fasta_path)
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to open contigs FASTA {}: {}",
+                    contigs_fasta_path.display(),
+                    e
+                )
+            })?;
+
+        let mut order = Vec::with_capacity(100_000);
+        let mut lengths = HashMap::with_capacity(100_000);
+
+        while let Some(result) = reader.next() {
+            let record = result
+                .map_err(|e| anyhow!("Failed to parse contigs FASTA: {}", e))?;
+
+            let id = String::from_utf8_lossy(record.id()).into_owned();
+            let len = record.seq().len();
+
+            if len > 0 {
+                order.push(id.clone());
+                lengths.insert(id, len);
+            }
+        }
+
+        if order.is_empty() {
+            tokio::fs::write(coverage_json_path, b"{}").await?;
+            tokio::fs::write(coverage_csv_path, b"No Contigs\n").await?;
+            return Ok(());
+        }
+
+        (order, lengths)
+    };
+
+    // ---------------------------------------------------------------------
+    // The BAM stream is consumed by a synchronous noodles/streampile worker.
+    //
+    // Keep copies of the FASTA metadata for the statistics phase after the
+    // blocking pileup pass completes.
+    // ---------------------------------------------------------------------
+    let pileup_contig_lengths = contig_lengths.clone();
+
     let rx = assembly_bam_rx.into_inner();
     let runtime = tokio::runtime::Handle::current();
 
-    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+    let coverage_by_contig = tokio::task::spawn_blocking(move || -> Result<
+        HashMap<String, Vec<u32>>
+    > {
         let reader = BlockingChannelReader::new(rx, runtime);
 
         let mut bam_reader = bam::io::Reader::new(reader);
@@ -480,7 +588,7 @@ pub async fn streampile_poc(
             .read_header()
             .map_err(|e| {
                 anyhow!(
-                    "streampile POC: failed to read BAM header: {}",
+                    "Failed to read BAM header for assembly coverage: {}",
                     e
                 )
             })?;
@@ -488,43 +596,81 @@ pub async fn streampile_poc(
         let references = header.reference_sequences();
 
         info!(
-            "streampile POC: BAM header loaded successfully; {} references",
+            "Assembly coverage pileup: BAM header contains {} references",
             references.len()
         );
+
+        // Match pysam pileup's legacy default flag filtering, while retaining
+        // supplementary alignments.
+        let exclude_flags =
+            Flags::UNMAPPED
+                | Flags::SECONDARY
+                | Flags::QC_FAIL
+                | Flags::DUPLICATE;
 
         let mut builder =
             StreamingPileupBuilder::new(bam_reader, &header)
                 .map_err(|e| {
                     anyhow!(
-                        "streampile POC: failed to create pileup builder: {}",
+                        "Failed to create StreamingPileupBuilder: {}",
                         e
                     )
-                })?;
+                })?
+                .exclude_flags(exclude_flags);
+
+        let mut coverage_by_contig =
+            HashMap::with_capacity(pileup_contig_lengths.len());
 
         let mut total_columns: u64 = 0;
         let mut total_depth: u64 = 0;
-        let mut references_with_pileup = 0usize;
 
+        // `StreamingPileupBuilder` is forward-only. Iterate references in BAM
+        // header order rather than arbitrary HashMap/FASTA order.
         for (reference_index, (reference_name, reference_sequence)) in
             references.iter().enumerate()
         {
             let contig_name = reference_name.to_string();
-            let contig_length = reference_sequence.length().get() as usize;
+
+            let Some(&contig_len) =
+                pileup_contig_lengths.get(&contig_name)
+            else {
+                warn!(
+                    "Assembly coverage: BAM reference '{}' is not present \
+                     in contigs FASTA; skipping",
+                    contig_name
+                );
+                continue;
+            };
+
+            let bam_len =
+                reference_sequence.length().get() as usize;
+
+            if bam_len != contig_len {
+                warn!(
+                    "Assembly coverage: length mismatch for {}: \
+                     BAM={} FASTA={}",
+                    contig_name,
+                    bam_len,
+                    contig_len
+                );
+            }
 
             info!(
-                "streampile POC: processing reference {}/{}: {} ({} bp)",
+                "Assembly coverage: processing reference {}/{}: {} ({} bp)",
                 reference_index + 1,
                 references.len(),
                 contig_name,
-                contig_length
+                contig_len
             );
 
+            // One depth value for every actual FASTA reference position.
+            let mut coverage = vec![0u32; contig_len];
+
             let mut columns = builder
-                .columns(&contig_name, 0, contig_length)
+                .columns(&contig_name, 0, contig_len)
                 .map_err(|e| {
                     anyhow!(
-                        "streampile POC: failed to create pileup columns \
-                         for {}: {}",
+                        "Failed to create pileup columns for {}: {}",
                         contig_name,
                         e
                     )
@@ -533,72 +679,236 @@ pub async fn streampile_poc(
             let mut contig_columns: u64 = 0;
             let mut contig_depth: u64 = 0;
 
+            // columns() sweeps every requested reference position, including
+            // positions with zero coverage.
             while let Some(pileup) = columns.next_pileup() {
                 let pileup = pileup.map_err(|e| {
                     anyhow!(
-                        "streampile POC: pileup error on {} after {} columns: {}",
+                        "Pileup failed for {} after {} columns: {}",
                         contig_name,
                         contig_columns,
                         e
                     )
                 })?;
 
-                let depth = pileup.unfiltered_depth() as u64;
+                let position = pileup.position();
+
+                if position >= coverage.len() {
+                    return Err(anyhow!(
+                        "Pileup position {} is outside FASTA length {} \
+                         for contig '{}'",
+                        position,
+                        coverage.len(),
+                        contig_name
+                    ));
+                }
+
+                // Direct equivalent of the legacy:
+                //
+                //     pileup_column.get_num_aligned()
+                //
+                // Do NOT use filtered_depth() here.
+                let depth = pileup.unfiltered_depth() as u32;
+
+                coverage[position] = depth;
 
                 contig_columns += 1;
-                contig_depth += depth;
+                contig_depth += depth as u64;
                 total_columns += 1;
-                total_depth += depth;
-            }
-
-            if contig_columns > 0 {
-                references_with_pileup += 1;
+                total_depth += depth as u64;
             }
 
             info!(
-                "streampile POC: completed {} — {} pileup columns, \
+                "Assembly coverage: completed {} — {} columns, \
                  cumulative unfiltered depth {}",
                 contig_name,
                 contig_columns,
                 contig_depth
             );
+
+            coverage_by_contig.insert(contig_name, coverage);
         }
 
-        builder.close().map_err(|e| {
-            anyhow!(
-                "streampile POC: failed to close pileup builder: {}",
-                e
-            )
-        })?;
+        // Explicitly close so any remaining source-side error is surfaced.
+        builder
+            .close()
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to close assembly coverage pileup builder: {}",
+                    e
+                )
+            })?;
 
         info!(
-            "streampile POC: COMPLETE — processed {} references, \
-             {} with pileup columns, {} total pileup columns, \
+            "Assembly coverage pileup complete — {} columns, \
              cumulative unfiltered depth {}",
-            references.len(),
-            references_with_pileup,
             total_columns,
             total_depth
         );
 
-        Ok(())
+        Ok(coverage_by_contig)
     })
         .await
         .map_err(|e| {
             anyhow!(
-            "streampile POC blocking task failed: {}",
+            "Assembly coverage pileup blocking task failed: {}",
             e
         )
-        })?;
+        })??;
 
-    result?;
+    // ---------------------------------------------------------------------
+    // Parallel per-contig statistics.
+    // ---------------------------------------------------------------------
+    let coverage_by_contig = Arc::new(coverage_by_contig);
 
-    // Deliberately fail so the normal coverage stage does not continue and
-    // consume nonexistent coverage output files.
-    Err(anyhow!(
-        "streampile POC completed successfully, but coverage outputs \
-         were intentionally not generated"
-    ))
+    let stats: Vec<(String, Value)> = config.thread_pool.install(|| {
+        contig_order
+            .par_iter()
+            .filter_map(|name| {
+                let coverage = coverage_by_contig.get(name)?;
+                let len = *contig_lengths.get(name)?;
+
+                if len == 0 {
+                    return None;
+                }
+
+                let sum: u64 =
+                    coverage.iter().map(|&d| d as u64).sum();
+
+                let avg = sum as f64 / len as f64;
+
+                let mut sorted = coverage.clone();
+                sorted.sort_unstable();
+
+                let p25 =
+                    sorted[((len as f64 * 0.25) as usize).min(len - 1)];
+
+                let p50 =
+                    sorted[((len as f64 * 0.50) as usize).min(len - 1)];
+
+                let p75 =
+                    sorted[((len as f64 * 0.75) as usize).min(len - 1)];
+
+                let min = *sorted.first()?;
+                let max = *sorted.last()?;
+
+                let avg2xcnt = coverage
+                    .iter()
+                    .filter(|&&depth| depth as f64 > 2.0 * avg)
+                    .count() as f64
+                    / len as f64;
+
+                let cnt0 = coverage
+                    .iter()
+                    .filter(|&&depth| depth == 0)
+                    .count() as f64
+                    / len as f64;
+
+                let cnt1 = coverage
+                    .iter()
+                    .filter(|&&depth| depth == 1)
+                    .count() as f64
+                    / len as f64;
+
+                let cnt2 = coverage
+                    .iter()
+                    .filter(|&&depth| depth == 2)
+                    .count() as f64
+                    / len as f64;
+
+                let coverage_array: Vec<u64> =
+                    coverage.iter().map(|&d| d as u64).collect();
+
+                Some((
+                    name.clone(),
+                    json!({
+                        "coverage": coverage_array,
+                        "avg": avg,
+                        "p0": min as u64,
+                        "p100": max as u64,
+                        "p25": p25 as u64,
+                        "p50": p50 as u64,
+                        "p75": p75 as u64,
+                        "avg2xcnt": avg2xcnt,
+                        "cnt0": cnt0,
+                        "cnt1": cnt1,
+                        "cnt2": cnt2,
+                        "contig_len": len as u64,
+                    }),
+                ))
+            })
+            .collect()
+    });
+
+    // ---------------------------------------------------------------------
+    // Write JSON and CSV asynchronously.
+    // ---------------------------------------------------------------------
+    let mut json_file =
+        BufWriter::new(File::create(coverage_json_path).await?);
+
+    let mut csv_file =
+        BufWriter::new(File::create(coverage_csv_path).await?);
+
+    csv_file
+        .write_all(
+            b"contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2\n",
+        )
+        .await?;
+
+    json_file.write_all(b"{").await?;
+
+    for (i, (name, stat)) in stats.iter().enumerate() {
+        if i > 0 {
+            json_file.write_all(b",").await?;
+        }
+
+        let key = serde_json::to_string(name)?;
+        let value = serde_json::to_string(stat)?;
+
+        json_file.write_all(key.as_bytes()).await?;
+        json_file.write_all(b":").await?;
+        json_file.write_all(value.as_bytes()).await?;
+    }
+
+    json_file.write_all(b"}").await?;
+    json_file.flush().await?;
+
+    for (name, stat) in &stats {
+        let object = stat
+            .as_object()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Coverage statistics for '{}' are not an object",
+                    name
+                )
+            })?;
+
+        let line = format!(
+            "{},{:.6},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6}\n",
+            name,
+            object["avg"].as_f64().unwrap_or(0.0),
+            object["p0"].as_u64().unwrap_or(0),
+            object["p100"].as_u64().unwrap_or(0),
+            object["p25"].as_u64().unwrap_or(0),
+            object["p50"].as_u64().unwrap_or(0),
+            object["p75"].as_u64().unwrap_or(0),
+            object["avg2xcnt"].as_f64().unwrap_or(0.0),
+            object["cnt0"].as_f64().unwrap_or(0.0),
+            object["cnt1"].as_f64().unwrap_or(0.0),
+            object["cnt2"].as_f64().unwrap_or(0.0),
+        );
+
+        csv_file.write_all(line.as_bytes()).await?;
+    }
+
+    csv_file.flush().await?;
+
+    info!(
+        "Assembly coverage complete — {} contigs written",
+        stats.len()
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
