@@ -90,7 +90,7 @@ use crate::utils::file::{
 };
 use crate::utils::paf::paf_to_m8;
 use crate::utils::plotting::plot_insert_sizes;
-use crate::utils::sambam::{compute_insert_size_stats_from_bam, generate_info_from_bam_stream};
+use crate::utils::sambam::{compute_insert_size_stats_from_bam, generate_info_from_bam_stream, streampile_poc};
 use crate::utils::streams::deinterleave_fastq_stream_to_fifos;
 use crate::utils::streams::{
     batch_rayon_process, deinterleave_fastq_stream, fanout_to_channels, join_with_error_handling,
@@ -10661,15 +10661,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let coverage_json_path = assembly_out_dir.join("assembly_contig_coverage.json");
     let coverage_summary_csv_path = assembly_out_dir.join("assembly_contig_coverage_summary.csv");
 
-    let generate_assembly_coverage_result = generate_assembly_coverage(
-        config.clone(),
-        assembly_bam_out_stream,
-        &assembly_outputs.contigs_fasta,
-        &coverage_json_path,
-        &coverage_summary_csv_path,
-    )
-    .await
-    .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
+    // let generate_assembly_coverage_result = generate_assembly_coverage(
+    //     config.clone(),
+    //     assembly_bam_out_stream,
+    //     &assembly_outputs.contigs_fasta,
+    //     &coverage_json_path,
+    //     &coverage_summary_csv_path,
+    // )
+    // .await
+    // .map_err(|e| anyhow!("generate_assembly_coverage failed: {}", e))?;
+
+    let generate_assembly_coverage_result =
+        streampile_poc(assembly_bam_out_stream)
+            .await
+            .map_err(|e| anyhow!("streampile POC failed: {}", e))?;
 
     for rx in post_assembly_cleanup_receivers {
         rx.await??;

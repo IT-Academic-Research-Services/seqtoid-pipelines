@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Receiver as StdReceiver;
 
 use anyhow::{anyhow, Result};
+use log::{self, debug, info, warn};
 use dashmap::DashMap;
 use futures::StreamExt;
 use noodles::bam;
@@ -16,6 +18,8 @@ use tokio::fs::File;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
+use streampile::StreamingPileupBuilder;
+use bytes::Bytes;
 
 use crate::config::defs::ClusterInfo;
 use crate::utils::streams::ParseOutput;
@@ -59,6 +63,72 @@ pub async fn stream_sam_alignment_counter(
     }
 
     Ok(counter)
+}
+
+struct BlockingChannelReader {
+    rx: mpsc::Receiver<ParseOutput>,
+    runtime: tokio::runtime::Handle,
+    buffer: Bytes,
+    offset: usize,
+}
+
+impl BlockingChannelReader {
+    fn new(
+        rx: mpsc::Receiver<ParseOutput>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            rx,
+            runtime,
+            buffer: Bytes::new(),
+            offset: 0,
+        }
+    }
+}
+
+impl io::Read for BlockingChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if self.offset < self.buffer.len() {
+                let remaining = &self.buffer[self.offset..];
+                let n = remaining.len().min(buf.len());
+
+                buf[..n].copy_from_slice(&remaining[..n]);
+                self.offset += n;
+
+                if self.offset == self.buffer.len() {
+                    self.buffer = Bytes::new();
+                    self.offset = 0;
+                }
+
+                return Ok(n);
+            }
+
+            match self.runtime.block_on(self.rx.recv()) {
+                Some(ParseOutput::Bytes(bytes)) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+
+                    self.buffer = bytes;
+                    self.offset = 0;
+                }
+
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "streampile POC received non-Bytes ParseOutput",
+                    ));
+                }
+
+                None => return Ok(0),
+            }
+        }
+    }
 }
 
 fn anyhow_to_io(e: anyhow::Error) -> io::Error {
@@ -376,6 +446,128 @@ pub async fn compute_insert_size_stats_from_bam(
         stddev,
         mapped_proper_pairs: total_proper_pairs,
     })
+}
+
+pub async fn streampile_poc(
+    assembly_bam_rx: ReceiverStream<ParseOutput>,
+) -> Result<()> {
+    let rx = assembly_bam_rx.into_inner();
+    let runtime = tokio::runtime::Handle::current();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let reader = BlockingChannelReader::new(rx, runtime);
+
+        let mut bam_reader = bam::io::Reader::new(reader);
+
+        let header = bam_reader
+            .read_header()
+            .map_err(|e| anyhow!("streampile POC: failed to read BAM header: {}", e))?;
+
+        let references = header.reference_sequences();
+
+        info!(
+            "streampile POC: BAM header read successfully; {} references",
+            references.len()
+        );
+
+        let mut builder =
+            StreamingPileupBuilder::new(bam_reader, &header)
+                .map_err(|e| {
+                    anyhow!(
+                        "streampile POC: failed to create StreamingPileupBuilder: {}",
+                        e
+                    )
+                })?;
+
+        let mut total_columns = 0usize;
+        let mut total_depth = 0usize;
+
+        for (reference_index, (reference_name, reference_sequence)) in
+            references.iter().enumerate()
+        {
+            let contig_name = reference_name.to_string();
+            let contig_length = reference_sequence.length().get() as usize;
+
+            info!(
+                "streampile POC: processing reference {}/{}: {} ({} bp)",
+                reference_index + 1,
+                references.len(),
+                contig_name,
+                contig_length
+            );
+
+            let mut columns = builder
+                .columns(&contig_name, 0, contig_length)
+                .map_err(|e| {
+                    anyhow!(
+                        "streampile POC: failed to create columns for {}: {}",
+                        contig_name,
+                        e
+                    )
+                })?;
+
+            let mut contig_columns = 0usize;
+            let mut contig_depth = 0usize;
+
+            while let Some(pileup) = columns.next_pileup() {
+                let pileup = pileup.map_err(|e| {
+                    anyhow!(
+                        "streampile POC: pileup error on {} near column {}: {}",
+                        contig_name,
+                        contig_columns,
+                        e
+                    )
+                })?;
+
+                contig_columns += 1;
+
+                let depth = pileup.filtered_depth();
+                contig_depth += depth;
+
+                total_columns += 1;
+                total_depth += depth;
+
+                if contig_columns % 1_000_000 == 0 {
+                    info!(
+                        "streampile POC: {} — {} pileup columns processed",
+                        contig_name,
+                        contig_columns
+                    );
+                }
+            }
+
+            info!(
+                "streampile POC: completed {} — {} pileup columns, \
+                 cumulative filtered depth {}",
+                contig_name,
+                contig_columns,
+                contig_depth
+            );
+        }
+
+        builder.close().map_err(|e| {
+            anyhow!("streampile POC: failed to close pileup builder: {}", e)
+        })?;
+
+        info!(
+            "streampile POC: COMPLETE — {} pileup columns across {} references, \
+             cumulative filtered depth {}",
+            total_columns,
+            references.len(),
+            total_depth
+        );
+
+        Ok(())
+    })
+        .await
+        .map_err(|e| anyhow!("streampile POC blocking task failed: {}", e))?;
+
+    result?;
+
+    Err(anyhow!(
+        "streampile POC consumed the assembly BAM stream successfully, \
+         but did not generate coverage output"
+    ))
 }
 
 #[cfg(test)]
