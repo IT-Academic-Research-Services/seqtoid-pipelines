@@ -317,6 +317,7 @@ pub async fn generate_info_from_bam_stream(
     Ok((read2contig, contig_stats, contig_unique_counts))
 }
 
+
 /// Insert stats from an exisiting bam file
 ///
 ///

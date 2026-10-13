@@ -6335,101 +6335,19 @@ async fn process_assembly(
     };
 
     // =====================================================================
-    // samtools name-sort
-    // =====================================================================
-
-    let samtools_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                "-T".to_string(),
-                Some(temp_dir.path().to_string_lossy().to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
-
-    let samtools_sort_args = match generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&samtools_sort_config),
-    ) {
-        Ok(args) => args,
-        Err(e) => {
-            return_assembly_failure!(format!(
-                "failed generating samtools sort arguments: {}",
-                e
-            ));
-        }
-    };
-
-    info!(
-        "[assembly] samtools sort args generated: {:?}",
-        samtools_sort_args
-    );
-
-    let (
-        samtools_sort_child,
-        samtools_sort_task,
-        samtools_sort_err_task,
-    ) = match stream_to_cmd(
-        config.clone(),
-        bt2_out_stream,
-        SAMTOOLS_TAG,
-        samtools_sort_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-        None,
-    )
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            return_assembly_failure!(format!(
-                "failed starting samtools sort: {}",
-                e
-            ));
-        }
-    };
-
-    cleanup_tasks.push(samtools_sort_task);
-    cleanup_tasks.push(samtools_sort_err_task);
-
-    let samtools_sort_out_stream = {
-        let mut guard = samtools_sort_child.lock().await;
-
-        match parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            &config,
-        )
-            .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                return_assembly_failure!(format!(
-                    "failed reading samtools sort output: {}",
-                    e
-                ));
-            }
-        }
-    };
-
-    // =====================================================================
-    // Fan out BAM:
+    // Fan out Bowtie2 BAM stream into three independent branches:
     //
-    // 1. durable BAM
-    // 2. contig statistics
-    // 3. downstream assembly coverage
+    // 1. durable BAM output: ordering is irrelevant
+    // 2. name-sorted BAM: used for read-to-contig statistics
+    // 3. coordinate-sorted BAM: returned for downstream assembly coverage
+    //
+    // The two samtools sorts are started independently and therefore run
+    // concurrently. Neither sort waits for the other.
     // =====================================================================
 
-    let (non_host_streams, non_host_done_rx) =
+    let (assembly_bam_streams, assembly_bam_fanout_done) =
         match fanout_to_channels(
-            ReceiverStream::new(samtools_sort_out_stream),
+            ReceiverStream::new(bt2_out_stream),
             3,
             "process_assembly_bam",
             &config,
@@ -6446,11 +6364,18 @@ async fn process_assembly(
             }
         };
 
-    cleanup_receivers.push(non_host_done_rx);
+    cleanup_receivers.push(assembly_bam_fanout_done);
 
-    let mut non_host_streams_iter = non_host_streams.into_iter();
+    let mut assembly_bam_streams = assembly_bam_streams.into_iter();
 
-    let bam_for_file = match non_host_streams_iter.next() {
+    // ---------------------------------------------------------------------
+    // Branch 1: durable BAM output.
+    //
+    // This branch is deliberately unsorted. It is an artifact only; no
+    // downstream computation depends on its record ordering.
+    // ---------------------------------------------------------------------
+
+    let bam_for_file = match assembly_bam_streams.next() {
         Some(rx) => ReceiverStream::new(rx),
         None => {
             return_assembly_failure!(
@@ -6458,28 +6383,6 @@ async fn process_assembly(
             );
         }
     };
-
-    let bam_for_stats = match non_host_streams_iter.next() {
-        Some(rx) => ReceiverStream::new(rx),
-        None => {
-            return_assembly_failure!(
-                "assembly BAM statistics branch was not created".to_string()
-            );
-        }
-    };
-
-    let bam_for_output = match non_host_streams_iter.next() {
-        Some(rx) => ReceiverStream::new(rx),
-        None => {
-            return_assembly_failure!(
-                "assembly BAM output branch was not created".to_string()
-            );
-        }
-    };
-
-    // =====================================================================
-    // Durable BAM write
-    // =====================================================================
 
     let write_bam_task = match write_byte_stream_to_file(
         &final_bam_path,
@@ -6502,8 +6405,209 @@ async fn process_assembly(
 
     cleanup_tasks.push(write_bam_task);
 
+    // ---------------------------------------------------------------------
+    // Branch 2: query-name sort for read-to-contig statistics.
+    //
+    // This preserves the existing contract of generate_info_from_bam_stream
+    // and the legacy Python generate_info_from_sam() input ordering.
+    // ---------------------------------------------------------------------
+
+    let bam_for_name_sort = match assembly_bam_streams.next() {
+        Some(rx) => rx,
+        None => {
+            return_assembly_failure!(
+                "assembly BAM name-sort branch was not created".to_string()
+            );
+        }
+    };
+
+    let name_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-u".to_string(), None),
+            ("-O".to_string(), Some("bam".to_string())),
+            (
+                "-T".to_string(),
+                Some(temp_dir.path().to_string_lossy().to_string()),
+            ),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let name_sort_args = match generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&name_sort_config),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed generating samtools name-sort arguments: {}",
+                e
+            ));
+        }
+    };
+
+    info!(
+        "[assembly] starting query-name sort for read/contig statistics: {:?}",
+        name_sort_args
+    );
+
+    let (
+        name_sort_child,
+        name_sort_task,
+        name_sort_err_task,
+    ) = match stream_to_cmd(
+        config.clone(),
+        bam_for_name_sort,
+        SAMTOOLS_TAG,
+        name_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed starting assembly BAM name sort: {}",
+                e
+            ));
+        }
+    };
+
+    cleanup_tasks.push(name_sort_task);
+    cleanup_tasks.push(name_sort_err_task);
+
+    let name_sort_rx = {
+        let mut guard = name_sort_child.lock().await;
+
+        match parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed reading coordinate-independent name-sort output: {}",
+                    e
+                ));
+            }
+        }
+    };
+
+    // ---------------------------------------------------------------------
+    // Branch 3: coordinate sort for streampile coverage.
+    //
+    // This is intentionally launched independently of the name sort above.
+    // The two samtools processes now consume separate fanout branches in
+    // parallel.
+    // ---------------------------------------------------------------------
+
+    let bam_for_coordinate_sort = match assembly_bam_streams.next() {
+        Some(rx) => rx,
+        None => {
+            return_assembly_failure!(
+                "assembly BAM coordinate-sort branch was not created".to_string()
+            );
+        }
+    };
+
+    let coordinate_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-u".to_string(), None),
+            ("-O".to_string(), Some("bam".to_string())),
+            (
+                "-T".to_string(),
+                Some(temp_dir.path().to_string_lossy().to_string()),
+            ),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let coordinate_sort_args = match generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&coordinate_sort_config),
+    ) {
+        Ok(args) => args,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed generating samtools coordinate-sort arguments: {}",
+                e
+            ));
+        }
+    };
+
+    info!(
+        "[assembly] starting coordinate sort for assembly coverage: {:?}",
+        coordinate_sort_args
+    );
+
+    let (
+        coordinate_sort_child,
+        coordinate_sort_task,
+        coordinate_sort_err_task,
+    ) = match stream_to_cmd(
+        config.clone(),
+        bam_for_coordinate_sort,
+        SAMTOOLS_TAG,
+        coordinate_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return_assembly_failure!(format!(
+                "failed starting assembly BAM coordinate sort: {}",
+                e
+            ));
+        }
+    };
+
+    cleanup_tasks.push(coordinate_sort_task);
+    cleanup_tasks.push(coordinate_sort_err_task);
+
+    let coordinate_sort_rx = {
+        let mut guard = coordinate_sort_child.lock().await;
+
+        match parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                return_assembly_failure!(format!(
+                    "failed reading coordinate-sort output: {}",
+                    e
+                ));
+            }
+        }
+    };
+
+    // This is the stream that will ultimately be returned from
+    // process_assembly() and consumed by generate_assembly_coverage().
+    let bam_for_output = ReceiverStream::new(coordinate_sort_rx);
+
     // =====================================================================
     // Contig statistics
+    //
+    // name_sort_rx is already being drained by parse_child_output() while
+    // the coordinate sort above is running independently.
     // =====================================================================
 
     let bam_concurrency = compute_phase_concurrency(
@@ -6522,7 +6626,7 @@ async fn process_assembly(
 
     let (read2contig, contig_stats, _contig_uniques) =
         match generate_info_from_bam_stream(
-            bam_for_stats.into_inner(),
+            name_sort_rx,
             &duplicate_clusters,
             MIN_CONTIG_SIZE,
             bam_concurrency,
