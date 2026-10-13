@@ -148,14 +148,30 @@ fn anyhow_to_io(e: anyhow::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
+/// Generate read-to-contig mappings and unweighted contig read counts from
+/// a name-sorted BAM stream.
+///
+/// This is the generic equivalent of the legacy
+/// `generate_info_from_sam()` helper.
+///
+/// Legacy behavior:
+///   * process alignments in input order
+///   * skip SAM headers (handled by the BAM reader)
+///   * keep only the first alignment encountered for each read ID
+///   * count one unique read for its reported contig
+///   * populate read2contig for mapped reads
+///   * use "*" for reads with no reference sequence
+///   * filter contigs below `min_contig_size`
+///
+/// Short-read duplicate-cluster weighting is intentionally NOT done here.
+/// The caller that has duplicate-cluster information can transform the
+/// unweighted contig statistics afterward.
 pub async fn generate_info_from_bam_stream(
     rx: mpsc::Receiver<ParseOutput>,
-    duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
     min_contig_size: u64,
-    concurrency: usize,
 ) -> Result<(
     HashMap<String, String>, // read2contig
-    HashMap<String, u64>,    // contig_stats (cluster-adjusted)
+    HashMap<String, u64>,    // unweighted contig_stats
     HashMap<String, usize>,  // contig_unique_counts
 )> {
     let byte_stream = ReceiverStream::new(rx).map(|item| match item {
@@ -173,148 +189,81 @@ pub async fn generate_info_from_bam_stream(
         .await
         .map_err(|e| anyhow!("BAM header error: {}", e))?;
 
-    // Shared structures
-    let read2contig = Arc::new(DashMap::new());
-    let contig_stats = Arc::new(DashMap::new());
-    let contig_unique_counts = Arc::new(DashMap::new());
-    let seen_reads = Arc::new(DashMap::new());
+    let mut read2contig: HashMap<String, String> = HashMap::new();
+    let mut contig_stats: HashMap<String, u64> = HashMap::new();
+    let mut contig_unique_counts: HashMap<String, usize> = HashMap::new();
+    let mut seen_reads: HashSet<String> = HashSet::new();
 
-    let (job_tx, job_rx) = mpsc::channel::<Vec<BamRecord>>(concurrency);
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
-
-    let mut worker_handles = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let rx = shared_rx.clone();
-        let duplicate_clusters_clone = duplicate_clusters.clone();
-        let header_clone = header.clone();
-        let read2contig_clone = read2contig.clone();
-        let contig_stats_clone = contig_stats.clone();
-        let contig_unique_counts_clone = contig_unique_counts.clone();
-        let seen_reads_clone = seen_reads.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                let batch = {
-                    let mut guard = rx.lock().await;
-                    guard.recv().await
-                };
-
-                let chunk = match batch {
-                    Some(c) => c,
-                    None => break,
-                };
-
-                // Process locally for this batch
-                let mut local_read2contig = HashMap::new();
-                let mut local_contig_stats = HashMap::new();
-                let mut local_contig_unique_counts = HashMap::new();
-                let mut local_seen = HashSet::new();
-
-                for record in chunk.iter() {
-                    let flags = record.flags();
-                    if flags.is_unmapped() || flags.is_secondary() || flags.is_supplementary() {
-                        continue;
-                    }
-
-                    let read_name = record
-                        .name()
-                        .and_then(|b| std::str::from_utf8(b.as_ref()).ok())
-                        .unwrap_or("*")
-                        .to_string();
-
-                    if !local_seen.insert(read_name.clone()) {
-                        continue;
-                    }
-
-                    let rid = match record.reference_sequence_id() {
-                        Some(Ok(rid)) => rid,
-                        _ => continue,
-                    };
-
-                    let contig_name = match header_clone.reference_sequences().get_index(rid) {
-                        Some((name, _)) => name.to_string(),
-                        None => continue,
-                    };
-
-                    local_read2contig.insert(read_name.clone(), contig_name.clone());
-
-                    let cluster_size = duplicate_clusters_clone
-                        .get(&read_name)
-                        .map(|entry| entry.value().size)
-                        .unwrap_or(1u64);
-
-                    *local_contig_stats.entry(contig_name.clone()).or_insert(0) += cluster_size;
-                    *local_contig_unique_counts.entry(contig_name).or_insert(0) += 1;
-                }
-
-                // Merge local into global (DashMap is concurrent-safe)
-                for (k, v) in local_read2contig {
-                    read2contig_clone.insert(k, v);
-                }
-                for (k, v) in local_contig_stats {
-                    *contig_stats_clone.entry(k).or_insert(0) += v;
-                }
-                for (k, v) in local_contig_unique_counts {
-                    *contig_unique_counts_clone.entry(k).or_insert(0) += v;
-                }
-                for read in local_seen {
-                    seen_reads_clone.insert(read, ());
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        });
-        worker_handles.push(handle);
-    }
-
-    // Producer loop: read and batch BAM records
-    let mut batch = Vec::with_capacity(10_000);
     let mut record = BamRecord::default();
-    loop {
-        match bam_reader.read_record(&mut record).await {
-            Ok(0) => break,
-            Ok(_) => {
-                batch.push(record.clone());
-                if batch.len() >= 10_000 {
-                    if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(e) => return Err(anyhow!("BAM record read error: {}", e)),
+
+    while bam_reader.read_record(&mut record).await? > 0 {
+        // The legacy Python helper does not inspect SAM flags here.
+        //
+        // In particular, do NOT filter unmapped/secondary/supplementary
+        // records at this generic layer. The Python code simply takes the
+        // first alignment encountered for each read ID.
+        let read_name = record
+            .name()
+            .and_then(|name| std::str::from_utf8(name.as_ref()).ok())
+            .unwrap_or("*")
+            .to_string();
+
+        // Global, input-order deduplication.
+        //
+        // This must be one set for the entire BAM stream, not one per batch.
+        if !seen_reads.insert(read_name.clone()) {
+            continue;
+        }
+
+        let contig_name = match record.reference_sequence_id() {
+            Some(Ok(rid)) => match header.reference_sequences().get_index(rid) {
+                Some((name, _)) => name.to_string(),
+                None => "*".to_string(),
+            },
+            _ => "*".to_string(),
+        };
+
+        // Generic unweighted statistics: one unique read contributes one.
+        *contig_stats
+            .entry(contig_name.clone())
+            .or_insert(0) += 1;
+
+        *contig_unique_counts
+            .entry(contig_name.clone())
+            .or_insert(0) += 1;
+
+        // Match legacy generate_info_from_sam():
+        // only mapped reads are entered into read2contig.
+        if contig_name != "*" {
+            read2contig.insert(read_name, contig_name);
         }
     }
 
-    if !batch.is_empty() {
-        let _ = job_tx.send(batch).await;
-    }
-    drop(job_tx);
+    // Match the legacy post-pass filtering:
+    // remove contigs whose unique-read count is below the threshold.
+    contig_stats.retain(|contig, count| {
+        *count >= min_contig_size
+            && contig_unique_counts
+            .get(contig)
+            .copied()
+            .unwrap_or(0) as u64
+            >= min_contig_size
+    });
 
-    for handle in worker_handles {
-        handle
-            .await
-            .map_err(|e| anyhow!("Worker join error: {}", e))??;
-    }
+    contig_unique_counts.retain(|contig, _| contig_stats.contains_key(contig));
 
-    let read2contig: HashMap<String, String> = read2contig
-        .iter()
-        .map(|r| (r.key().clone(), r.value().clone()))
-        .collect();
+    info!(
+        "generate_info_from_bam_stream: {} unique reads, {} mapped read-to-contig entries, {} contigs retained",
+        seen_reads.len(),
+        read2contig.len(),
+        contig_stats.len()
+    );
 
-    let mut contig_stats: HashMap<String, u64> = contig_stats
-        .iter()
-        .map(|r| (r.key().clone(), *r.value()))
-        .collect();
-
-    let mut contig_unique_counts: HashMap<String, usize> = contig_unique_counts
-        .iter()
-        .map(|r| (r.key().clone(), *r.value()))
-        .collect();
-
-    contig_stats.retain(|_, count| *count >= min_contig_size);
-
-    contig_unique_counts.retain(|contig_name, _| contig_stats.contains_key(contig_name));
-
-    Ok((read2contig, contig_stats, contig_unique_counts))
+    Ok((
+        read2contig,
+        contig_stats,
+        contig_unique_counts,
+    ))
 }
 
 

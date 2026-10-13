@@ -6610,43 +6610,28 @@ async fn process_assembly(
     // the coordinate sort above is running independently.
     // =====================================================================
 
-    let bam_concurrency = compute_phase_concurrency(
-        &config,
-        "bam_info",
-        0.5,
-        1.0,
-        128,
-        4,
-    );
-
-    info!(
-        "BAM info concurrency {}",
-        bam_concurrency
-    );
-
     let (read2contig, contig_stats, _contig_uniques) =
-        match generate_info_from_bam_stream(
+        match generate_short_read_info_from_bam_stream(
             name_sort_rx,
             &duplicate_clusters,
             MIN_CONTIG_SIZE,
-            bam_concurrency,
         )
             .await
         {
             Ok(v) => v,
             Err(e) => {
                 return_assembly_failure!(format!(
-                    "failed generating read-to-contig mapping/statistics: {}",
-                    e
-                ));
+                "failed generating read-to-contig mapping/statistics: {}",
+                e
+            ));
             }
         };
 
     info!(
-        "[assembly] contig statistics generated: contigs={}, read2contig={}",
-        contig_stats.len(),
-        read2contig.len()
-    );
+    "[assembly] contig statistics generated: contigs={}, read2contig={}",
+    contig_stats.len(),
+    read2contig.len()
+);
 
     let stats_json = match serde_json::to_string_pretty(&contig_stats) {
         Ok(json) => json,
@@ -6704,6 +6689,112 @@ async fn process_assembly(
     ))
 }
 
+
+/// Short-read-specific wrapper around the generic BAM read-to-contig
+/// bookkeeping.
+///
+/// The generic function performs the common work:
+///   * global first-seen read-ID deduplication
+///   * read_id -> contig mapping
+///   * unique read counts per contig
+///   * unweighted contig statistics
+///   * minimum-contig-size filtering
+///
+/// Short reads additionally weight each representative read by the size of
+/// its duplicate cluster, reproducing the legacy
+/// `generate_info_from_sam(..., duplicate_cluster_sizes_path=...)` behavior.
+pub async fn generate_short_read_info_from_bam_stream(
+    rx: mpsc::Receiver<ParseOutput>,
+    duplicate_clusters: &Arc<DashMap<String, ClusterInfo>>,
+    min_contig_size: u64,
+) -> Result<(
+    HashMap<String, String>, // read2contig
+    HashMap<String, u64>,    // cluster-adjusted contig_stats
+    HashMap<String, usize>,  // contig_unique_counts
+)> {
+    let (
+        read2contig,
+        unweighted_contig_stats,
+        contig_unique_counts,
+    ) = generate_info_from_bam_stream(
+        rx,
+        min_contig_size,
+    )
+        .await?;
+
+    // Start from zero and reconstruct the cluster-weighted contig counts
+    // from the generic read-to-contig mapping.
+    //
+    // Only retained contigs are included. The generic function has already
+    // applied min_contig_size to the unique-read counts.
+    let retained_contigs: HashSet<String> =
+        unweighted_contig_stats.keys().cloned().collect();
+
+    let mut contig_stats: HashMap<String, u64> =
+        unweighted_contig_stats
+            .keys()
+            .map(|contig| (contig.clone(), 0u64))
+            .collect();
+
+    for (read_id, contig_name) in &read2contig {
+        if !retained_contigs.contains(contig_name) {
+            continue;
+        }
+
+        let cluster_size = match duplicate_clusters.get(read_id) {
+            Some(entry) => entry.value().size,
+
+            None => {
+                // Match legacy get_read_cluster_size():
+                // if the exact read ID is absent, strip the final two
+                // characters and try that key. The result must exist, and
+                // the stripped suffix must be /1 or /2.
+                if read_id.len() < 2 {
+                    return Err(anyhow!(
+                        "Read ID not found in duplicate cluster sizes dict: {}",
+                        read_id
+                    ));
+                }
+
+                let suffix = &read_id[read_id.len() - 2..];
+                let prefix = &read_id[..read_id.len() - 2];
+
+                if suffix != "/1" && suffix != "/2" {
+                    return Err(anyhow!(
+                        "Read ID not found in duplicate cluster sizes dict: {}",
+                        read_id
+                    ));
+                }
+
+                duplicate_clusters
+                    .get(prefix)
+                    .map(|entry| entry.value().size)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Read ID not found in duplicate cluster sizes dict: {}",
+                            read_id
+                        )
+                    })?
+            }
+        };
+
+        *contig_stats
+            .entry(contig_name.clone())
+            .or_insert(0) += cluster_size;
+    }
+
+    info!(
+        "generate_short_read_info_from_bam_stream: {} mapped reads, {} retained contigs",
+        read2contig.len(),
+        contig_stats.len()
+    );
+
+    Ok((
+        read2contig,
+        contig_stats,
+        contig_unique_counts,
+    ))
+}
 
 /// Fixes FASTA header by removing leading comma in description if present.
 /// apparently there are a few broken accessions out there
