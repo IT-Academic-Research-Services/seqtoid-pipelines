@@ -20,6 +20,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 use streampile::StreamingPileupBuilder;
 use bytes::Bytes;
+use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufWriter;
 
 use crate::config::defs::ClusterInfo;
 use crate::utils::streams::ParseOutput;
@@ -448,6 +451,20 @@ pub async fn compute_insert_size_stats_from_bam(
     })
 }
 
+/// Proof of concept for consuming the complete assembly BAM stream through
+/// a synchronous noodles BAM reader and streampile without writing an
+/// intermediate BAM file.
+///
+/// This intentionally follows the legacy Python coverage operation at the
+/// pileup-depth level:
+///
+///     pileup_column.get_num_aligned()
+///
+/// therefore the POC records `unfiltered_depth()`.
+///
+/// It does not yet generate the final coverage JSON/CSV. Its purpose is to
+/// prove that the complete streamed BAM can be consumed successfully by
+/// noodles + streampile.
 pub async fn streampile_poc(
     assembly_bam_rx: ReceiverStream<ParseOutput>,
 ) -> Result<()> {
@@ -461,12 +478,17 @@ pub async fn streampile_poc(
 
         let header = bam_reader
             .read_header()
-            .map_err(|e| anyhow!("streampile POC: failed to read BAM header: {}", e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "streampile POC: failed to read BAM header: {}",
+                    e
+                )
+            })?;
 
         let references = header.reference_sequences();
 
         info!(
-            "streampile POC: BAM header read successfully; {} references",
+            "streampile POC: BAM header loaded successfully; {} references",
             references.len()
         );
 
@@ -474,13 +496,14 @@ pub async fn streampile_poc(
             StreamingPileupBuilder::new(bam_reader, &header)
                 .map_err(|e| {
                     anyhow!(
-                        "streampile POC: failed to create StreamingPileupBuilder: {}",
+                        "streampile POC: failed to create pileup builder: {}",
                         e
                     )
                 })?;
 
-        let mut total_columns = 0usize;
-        let mut total_depth = 0usize;
+        let mut total_columns: u64 = 0;
+        let mut total_depth: u64 = 0;
+        let mut references_with_pileup = 0usize;
 
         for (reference_index, (reference_name, reference_sequence)) in
             references.iter().enumerate()
@@ -500,45 +523,41 @@ pub async fn streampile_poc(
                 .columns(&contig_name, 0, contig_length)
                 .map_err(|e| {
                     anyhow!(
-                        "streampile POC: failed to create columns for {}: {}",
+                        "streampile POC: failed to create pileup columns \
+                         for {}: {}",
                         contig_name,
                         e
                     )
                 })?;
 
-            let mut contig_columns = 0usize;
-            let mut contig_depth = 0usize;
+            let mut contig_columns: u64 = 0;
+            let mut contig_depth: u64 = 0;
 
             while let Some(pileup) = columns.next_pileup() {
                 let pileup = pileup.map_err(|e| {
                     anyhow!(
-                        "streampile POC: pileup error on {} near column {}: {}",
+                        "streampile POC: pileup error on {} after {} columns: {}",
                         contig_name,
                         contig_columns,
                         e
                     )
                 })?;
 
+                let depth = pileup.unfiltered_depth() as u64;
+
                 contig_columns += 1;
-
-                let depth = pileup.filtered_depth();
                 contig_depth += depth;
-
                 total_columns += 1;
                 total_depth += depth;
+            }
 
-                if contig_columns % 1_000_000 == 0 {
-                    info!(
-                        "streampile POC: {} — {} pileup columns processed",
-                        contig_name,
-                        contig_columns
-                    );
-                }
+            if contig_columns > 0 {
+                references_with_pileup += 1;
             }
 
             info!(
                 "streampile POC: completed {} — {} pileup columns, \
-                 cumulative filtered depth {}",
+                 cumulative unfiltered depth {}",
                 contig_name,
                 contig_columns,
                 contig_depth
@@ -546,27 +565,39 @@ pub async fn streampile_poc(
         }
 
         builder.close().map_err(|e| {
-            anyhow!("streampile POC: failed to close pileup builder: {}", e)
+            anyhow!(
+                "streampile POC: failed to close pileup builder: {}",
+                e
+            )
         })?;
 
         info!(
-            "streampile POC: COMPLETE — {} pileup columns across {} references, \
-             cumulative filtered depth {}",
-            total_columns,
+            "streampile POC: COMPLETE — processed {} references, \
+             {} with pileup columns, {} total pileup columns, \
+             cumulative unfiltered depth {}",
             references.len(),
+            references_with_pileup,
+            total_columns,
             total_depth
         );
 
         Ok(())
     })
         .await
-        .map_err(|e| anyhow!("streampile POC blocking task failed: {}", e))?;
+        .map_err(|e| {
+            anyhow!(
+            "streampile POC blocking task failed: {}",
+            e
+        )
+        })?;
 
     result?;
 
+    // Deliberately fail so the normal coverage stage does not continue and
+    // consume nonexistent coverage output files.
     Err(anyhow!(
-        "streampile POC consumed the assembly BAM stream successfully, \
-         but did not generate coverage output"
+        "streampile POC completed successfully, but coverage outputs \
+         were intentionally not generated"
     ))
 }
 
