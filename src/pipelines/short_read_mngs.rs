@@ -2932,43 +2932,65 @@ async fn nt_non_host_align(
     let est_gb_per_job = (largest_gb * 0.85).max(35.0).min(65.0);
 
     info!(
-        "Largest NT chunk: {:.1} GiB → estimating {:.0} GiB RAM per minimap2 job",
-        largest_gb, est_gb_per_job
-    );
+    "Largest NT chunk: {:.1} GiB -> estimating {:.0} GiB RAM per minimap2 job",
+    largest_gb, est_gb_per_job
+);
 
     let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
-    let ram_based = (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
 
-    let mut concurrency = ram_based.clamp(MIN_CONCURRENCY, HARD_MAX_CONCURRENCY);
+    // Use a lower concurrency floor on small-memory machines,
+    // while preserving the existing minimum on larger machines.
+    let effective_min_concurrency = if available_ram_gb < 64.0 {
+        1
+    } else {
+        MIN_CONCURRENCY
+    };
+
+    let ram_based =
+        (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
+
+    let mut concurrency =
+        ram_based.clamp(effective_min_concurrency, HARD_MAX_CONCURRENCY);
 
     // Extra safety valve
     let estimated_peak = concurrency as f64 * est_gb_per_job;
     if estimated_peak > available_ram_gb * 0.82 {
-        let new_conc = concurrency.saturating_sub(2).max(MIN_CONCURRENCY);
+        let new_conc = concurrency
+            .saturating_sub(1)
+            .max(effective_min_concurrency);
+
         warn!(
-            "Estimated peak {:.0} GiB exceeds 82% of available ({:.0} GiB) → reducing concurrency from {} to {}",
-            estimated_peak, available_ram_gb, concurrency, new_conc
-        );
+        "Estimated peak {:.0} GiB exceeds 82% of available ({:.0} GiB) -> reducing concurrency from {} to {}",
+        estimated_peak,
+        available_ram_gb,
+        concurrency,
+        new_conc
+    );
+
         concurrency = new_conc;
     }
 
-    let threads_per_job =
-        (config.max_cores / concurrency.max(1)).clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB);
+    let threads_per_job = if available_ram_gb < 64.0 {
+        config.max_cores.min(6).max(1)
+    } else {
+        (config.max_cores / concurrency.max(1))
+            .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB)
+    };
 
     info!(
-        concat!(
-            "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
-            "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-            "  single-job baseline: ~81 s real time (measured)\n",
-            "  largest chunk: {:.1} GiB → est/job: {:.0} GiB"
-        ),
-        concurrency,
-        threads_per_job,
-        estimated_peak,
-        (estimated_peak / available_ram_gb * 100.0).round(),
-        largest_gb,
-        est_gb_per_job
-    );
+    concat!(
+        "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
+        "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
+        "  single-job baseline: ~81 s real time (measured)\n",
+        "  largest chunk: {:.1} GiB -> est/job: {:.0} GiB"
+    ),
+    concurrency,
+    threads_per_job,
+    estimated_peak,
+    (estimated_peak / available_ram_gb * 100.0).round(),
+    largest_gb,
+    est_gb_per_job
+);
     // =========================================================
 
     // Global merged output stream.
@@ -5242,7 +5264,14 @@ async fn diamond_non_host_align(
 
     let optimal_block_size = compute_optimal_block_size(&config).await.unwrap_or(12.0);
 
-    let threads = config.thread_allocation(DIAMOND_TAG, None);
+    let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
+
+    let threads = if available_ram_gb < 64.0 {
+        config.thread_allocation(DIAMOND_TAG, None).min(6).max(1)
+    } else {
+        config.thread_allocation(DIAMOND_TAG, None)
+    };
+
     let mut index_chunks = if threads >= 192 {
         32
     } else if threads >= 128 {
@@ -5255,7 +5284,9 @@ async fn diamond_non_host_align(
         4
     };
 
-    index_chunks = index_chunks.min((config.available_ram / 12_000_000_000) as usize);
+    index_chunks = index_chunks
+        .min((config.available_ram / 12_000_000_000) as usize)
+        .max(1);
 
     info!(
         "Diamond non-host: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
@@ -9283,6 +9314,7 @@ async fn mmseqs_non_host_align(
 
     Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
 }
+
 async fn collect_m8_accession_map(
     mut stream: ReceiverStream<ReducedRead>,
 ) -> Result<AHashMap<String, String>> {

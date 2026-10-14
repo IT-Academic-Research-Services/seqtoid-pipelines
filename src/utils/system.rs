@@ -651,22 +651,31 @@ pub fn compute_phase_concurrency(
     min_threads: usize,
 ) -> usize {
     let total_threads = config.max_cores as f64;
-    let (total_bytes, avail_bytes) = detect_ram().unwrap_or((0, 0)); // fallback to 0 if fails
+    let (total_bytes, avail_bytes) = detect_ram().unwrap_or((0, 0));
 
     let total_gib = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     let avail_gib = avail_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
-    let target_ram_gib = avail_gib * 0.80; // 80% safe usage
+    let target_ram_gib = avail_gib * 0.80;
     let max_jobs_from_ram = (target_ram_gib / ram_per_thread_gb).floor() as usize;
 
     let max_jobs_from_cpu = (total_threads / cpu_divisor).max(1.0) as usize;
 
+    // Small machines must be allowed to run with a single job.
+    // Larger machines retain the existing phase-specific minimum.
+    let effective_min_threads = if total_gib < 64.0 {
+        1
+    } else {
+        min_threads
+    };
+
     let mut concurrency = max_jobs_from_ram
         .min(max_jobs_from_cpu)
         .min(max_cap)
-        .max(min_threads);
+        .max(effective_min_threads);
 
-    // Small machine overrides
+    // Small-machine caps remain, but no longer override the RAM-aware
+    // ability to run with a single worker.
     if total_gib < 128.0 {
         concurrency = concurrency.min(4);
     }
@@ -675,9 +684,14 @@ pub fn compute_phase_concurrency(
     }
 
     info!(
-        "{} concurrency: {} jobs (RAM limit: {}, CPU limit: {}, cap: {}, min: {})",
-        phase_name, concurrency, max_jobs_from_ram, max_jobs_from_cpu, max_cap, min_threads
-    );
+    "{} concurrency: {} jobs (RAM limit: {}, CPU limit: {}, cap: {}, min: {})",
+    phase_name,
+    concurrency,
+    max_jobs_from_ram,
+    max_jobs_from_cpu,
+    max_cap,
+    effective_min_threads
+);
 
     concurrency
 }
