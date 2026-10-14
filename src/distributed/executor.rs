@@ -22,6 +22,8 @@ use tokio::process::Child;
 
 use crate::config::defs::{DiamondSubcommand, DIAMOND_TAG, MMSEQS_TAG};
 use crate::utils::command::diamond::{
+    compute_diamond_index_chunks,
+    compute_optimal_diamond_block_size,
     generate_diamond_args,
     DiamondConfig,
     DiamondExecutionConfig,
@@ -1122,9 +1124,36 @@ impl WorkerExecutor {
             .clone()
             .ok_or_else(|| {
                 anyhow!(
-                    "Diamond backend selected but no worker-local Diamond DB configured"
-                )
+                "Diamond backend selected but no worker-local Diamond DB configured"
+            )
             })?;
+
+        // Use the worker's actual resources to calculate the same
+        // Diamond tuning parameters used by the non-distributed pipeline.
+        let (_, available_ram) =
+            crate::utils::system::detect_ram()?;
+
+        let block_size = compute_optimal_diamond_block_size(
+            &diamond_db,
+            &self.config.scratch_dir,
+            available_ram,
+        )
+            .await?;
+
+        let index_chunks =
+            compute_diamond_index_chunks(
+                self.config.threads,
+                available_ram,
+            );
+
+        info!(
+        "[worker:{}] Diamond tuning: threads={}, block-size={:.1}, index-chunks={}, scratch={}",
+        self.worker_id(),
+        self.config.threads,
+        block_size,
+        index_chunks,
+        self.config.scratch_dir.display()
+    );
 
         let execution = DiamondExecutionConfig {
             threads: self.config.threads,
@@ -1132,7 +1161,9 @@ impl WorkerExecutor {
 
         let mut output_parts = Vec::new();
 
+        // ------------------------------------------------------------
         // R1
+        // ------------------------------------------------------------
         let r1_out =
             attempt_dir.join("diamond_R1.m8");
 
@@ -1142,6 +1173,30 @@ impl WorkerExecutor {
             r1_path: Some(work_unit.r1_path.clone()),
             r2_path: None,
             subcommand_fields: HashMap::from([
+                (
+                    "--mid-sensitive".to_string(),
+                    None,
+                ),
+                (
+                    "--block-size".to_string(),
+                    Some(format!("{:.1}", block_size)),
+                ),
+                (
+                    "-c".to_string(),
+                    Some(index_chunks.to_string()),
+                ),
+                (
+                    "-f".to_string(),
+                    Some("6".to_string()),
+                ),
+                (
+                    "--tmpdir".to_string(),
+                    Some(attempt_dir.to_string_lossy().to_string()),
+                ),
+                (
+                    "--unal".to_string(),
+                    Some("0".to_string()),
+                ),
                 (
                     "--query".to_string(),
                     Some(
@@ -1158,10 +1213,6 @@ impl WorkerExecutor {
                             .to_string_lossy()
                             .to_string(),
                     ),
-                ),
-                (
-                    "-f".to_string(),
-                    Some("6".to_string()),
                 ),
             ]),
         };
@@ -1185,7 +1236,9 @@ impl WorkerExecutor {
 
         output_parts.push(r1_out);
 
+        // ------------------------------------------------------------
         // R2
+        // ------------------------------------------------------------
         if let Some(r2) = &work_unit.r2_path {
             let r2_out =
                 attempt_dir.join("diamond_R2.m8");
@@ -1197,10 +1250,33 @@ impl WorkerExecutor {
                 r2_path: None,
                 subcommand_fields: HashMap::from([
                     (
+                        "--mid-sensitive".to_string(),
+                        None,
+                    ),
+                    (
+                        "--block-size".to_string(),
+                        Some(format!("{:.1}", block_size)),
+                    ),
+                    (
+                        "-c".to_string(),
+                        Some(index_chunks.to_string()),
+                    ),
+                    (
+                        "-f".to_string(),
+                        Some("6".to_string()),
+                    ),
+                    (
+                        "--tmpdir".to_string(),
+                        Some(attempt_dir.to_string_lossy().to_string()),
+                    ),
+                    (
+                        "--unal".to_string(),
+                        Some("0".to_string()),
+                    ),
+                    (
                         "--query".to_string(),
                         Some(
-                            r2.to_string_lossy()
-                                .to_string(),
+                            r2.to_string_lossy().to_string(),
                         ),
                     ),
                     (
@@ -1210,10 +1286,6 @@ impl WorkerExecutor {
                                 .to_string_lossy()
                                 .to_string(),
                         ),
-                    ),
-                    (
-                        "-f".to_string(),
-                        Some("6".to_string()),
                     ),
                 ]),
             };
@@ -1241,7 +1313,9 @@ impl WorkerExecutor {
             output_parts.push(r2_out);
         }
 
+        // ------------------------------------------------------------
         // Merge R1/R2 result files.
+        // ------------------------------------------------------------
         let merged_m8 =
             attempt_dir.join("result.m8");
 
