@@ -2477,30 +2477,32 @@ pub mod diamond {
     /// This remains a pipeline-level resource-planning helper because it
     /// currently inspects system RAM, scratch space, and the configured
     /// pipeline database.
-    pub async fn compute_optimal_block_size(
-        run_config: &RunConfig,
+    pub async fn compute_optimal_diamond_block_size(
+        diamond_db: &PathBuf,
+        scratch_path: &PathBuf,
+        available_ram_bytes: u64,
     ) -> Result<f64> {
-        let (_, available_ram) = detect_ram()?;
         let available_ram_gb =
-            available_ram as f64 / 1_073_741_824.0;
+            available_ram_bytes as f64 / 1_073_741_824.0;
 
-        let db_path = run_config
-            .args
-            .diamond_db
-            .as_deref()
-            .ok_or_else(|| anyhow!("--diamond-db required"))?;
-
-        let db_path = if db_path.ends_with(".dmnd") {
-            db_path.to_string()
+        let db_path = if diamond_db.extension()
+            == Some(std::ffi::OsStr::new("dmnd"))
+        {
+            diamond_db.clone()
         } else {
-            format!("{}.dmnd", db_path)
+            diamond_db.with_extension("dmnd")
         };
 
-        let db_stats = get_diamond_db_stats(&db_path)
+        let db_path_str = db_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Diamond DB path is not valid UTF-8"))?;
+
+        let db_stats = get_diamond_db_stats(db_path_str)
             .await
             .unwrap_or((0, 300_000_000_000));
 
-        let total_letters_billions = db_stats.1 as f64 / 1e9;
+        let total_letters_billions =
+            db_stats.1 as f64 / 1e9;
 
         let ram_factor = if available_ram_gb >= 1400.0 {
             9.0
@@ -2519,16 +2521,8 @@ pub mod diamond {
         block_size = block_size.max(6.0);
         block_size = block_size.min(200.0);
 
-        let scratch_path = PathBuf::from(
-            run_config
-                .args
-                .nvme_scratch
-                .as_deref()
-                .unwrap_or("."),
-        );
-
         let scratch_avail =
-            available_space_for_path(&scratch_path)
+            available_space_for_path(scratch_path)
                 .await
                 .unwrap_or(0);
 
@@ -2540,32 +2534,63 @@ pub mod diamond {
 
         if scratch_avail_gib < estimated_scratch_gib * 1.2 {
             warn!(
-                "Low scratch space — need {:.1} GiB, have {:.1} GiB; \
-                 reducing block size by 50%",
-                estimated_scratch_gib,
-                scratch_avail_gib
-            );
+            "Low scratch space - need {:.1} GiB, have {:.1} GiB; \
+             reducing Diamond block size by 50%",
+            estimated_scratch_gib,
+            scratch_avail_gib
+        );
+
             block_size *= 0.5;
         } else if scratch_avail_gib < estimated_scratch_gib * 1.5 {
             warn!(
-                "Low scratch space — need {:.1} GiB, have {:.1} GiB; \
-                 reducing block size by 30%",
-                estimated_scratch_gib,
-                scratch_avail_gib
-            );
+            "Low scratch space - need {:.1} GiB, have {:.1} GiB; \
+             reducing Diamond block size by 30%",
+            estimated_scratch_gib,
+            scratch_avail_gib
+        );
+
             block_size *= 0.7;
         }
 
         info!(
-            "Diamond block size: {:.1} \
-             (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
-            block_size,
-            available_ram_gb,
-            total_letters_billions,
-            scratch_avail as f64 / 1e9 / 1_073_741_824.0
-        );
+        "Diamond block size: {:.1} \
+         (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
+        block_size,
+        available_ram_gb,
+        total_letters_billions,
+        scratch_avail_gib
+    );
 
         Ok(block_size)
+    }
+
+    pub async fn compute_optimal_block_size(
+        run_config: &RunConfig,
+    ) -> Result<f64> {
+        let diamond_db = run_config
+            .args
+            .diamond_db
+            .as_ref()
+            .ok_or_else(|| anyhow!("--diamond-db required"))?;
+
+        let diamond_db = PathBuf::from(diamond_db);
+
+        let scratch_path = PathBuf::from(
+            run_config
+                .args
+                .nvme_scratch
+                .as_deref()
+                .unwrap_or("."),
+        );
+
+        let (_, available_ram) = detect_ram()?;
+
+        compute_optimal_diamond_block_size(
+            &diamond_db,
+            &scratch_path,
+            available_ram,
+        )
+            .await
     }
 
     async fn get_diamond_db_stats(
