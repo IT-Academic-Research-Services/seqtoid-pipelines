@@ -2593,6 +2593,29 @@ pub mod diamond {
             .await
     }
 
+    pub fn compute_diamond_index_chunks(
+        threads: usize,
+        available_ram_bytes: u64,
+    ) -> usize {
+        let mut index_chunks = if threads >= 192 {
+            32
+        } else if threads >= 128 {
+            24
+        } else if threads >= 96 {
+            16
+        } else if threads >= 64 {
+            12
+        } else {
+            4
+        };
+
+        index_chunks = index_chunks
+            .min((available_ram_bytes / 12_000_000_000) as usize)
+            .max(1);
+
+        index_chunks
+    }
+
     async fn get_diamond_db_stats(
         db_path: &str,
     ) -> Result<(u64, u64)> {

@@ -65,7 +65,7 @@ use crate::utils::command::blastn::BlastnConfig;
 use crate::utils::command::blastx::BlastxConfig;
 use crate::utils::command::bowtie2::{bowtie2_index_prep, Bowtie2Config};
 use crate::utils::command::diamond::{
-    compute_optimal_block_size, diamond_index_prep, DiamondConfig,
+    compute_optimal_block_size, compute_diamond_index_chunks, diamond_index_prep, DiamondConfig,
 };
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::hisat2::{hisat2_index_prep, Hisat2Config};
@@ -5272,21 +5272,8 @@ async fn diamond_non_host_align(
         config.thread_allocation(DIAMOND_TAG, None)
     };
 
-    let mut index_chunks = if threads >= 192 {
-        32
-    } else if threads >= 128 {
-        24
-    } else if threads >= 96 {
-        16
-    } else if threads >= 64 {
-        12
-    } else {
-        4
-    };
-
-    index_chunks = index_chunks
-        .min((config.available_ram / 12_000_000_000) as usize)
-        .max(1);
+    let index_chunks =
+        compute_diamond_index_chunks(threads, config.available_ram);
 
     info!(
         "Diamond non-host: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
