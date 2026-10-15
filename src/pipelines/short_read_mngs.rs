@@ -3174,6 +3174,8 @@ async fn run_diamond_single_file(
         }
     })?;
 
+    info!("[single-node] spawning diamond: {:?}", diamond_args);
+
     let (mut diamond_child, _diamond_stderr_task) = spawn_cmd(
         config.clone(),
         DIAMOND_TAG,
