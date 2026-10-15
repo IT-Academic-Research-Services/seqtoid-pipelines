@@ -72,7 +72,7 @@ use crate::utils::command::hisat2::{hisat2_index_prep, Hisat2Config};
 use crate::utils::command::kallisto::KallistoConfig;
 use crate::utils::command::makeblastdb::MakeblastdbConfig;
 use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2Config};
-use crate::utils::command::mmseqs::{MmseqsBackend, MmseqsConfig, MmseqsSubcommand};
+use crate::utils::command::mmseqs::{MmseqsBackend, MmseqsConfig, MmseqsSubcommand, build_mmseqs_cpu_search_config, build_mmseqs_gpu_search_config};
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::{check_versions, generate_cli};
@@ -9113,38 +9113,22 @@ async fn mmseqs_fastq_to_m8_file(
     }
 
     // 3) search -> result DB
-    let search_cfg = MmseqsConfig {
-        subcommand: MmseqsSubcommand::Search,
-        backend,
-        input: Some(query_db.clone()),
-        target_db: Some(target_db.clone()),
-        result_db: Some(result_db.clone()),
-        output: None,
-        tmp_dir: Some(tmp_dir.clone()),
-        threads: Some(config.mmseqs_threads()),
+    let search_cfg = match backend {
+        MmseqsBackend::Cpu => build_mmseqs_cpu_search_config(
+            query_db.clone(),
+            target_db.clone(),
+            result_db.clone(),
+            tmp_dir.clone(),
+            config.mmseqs_threads(),
+        ),
 
-        sensitivity: match backend {
-            MmseqsBackend::Cpu => Some("5.7".to_string()),
-            MmseqsBackend::Gpu => None,
-        },
-
-        search_type: Some("3".to_string()),
-        max_seqs: Some(match backend {
-            MmseqsBackend::Cpu => "1000".to_string(),
-            MmseqsBackend::Gpu => "3000".to_string(),
-        }),
-        prefilter_mode: Some("0".to_string()),
-        db_load_mode: Some("2".to_string()),
-        alignment_mode: Some("3".to_string()),
-
-        index_subset: None,
-        format_output: None,
-        cuda_visible_devices: None,
-        option_fields: HashMap::from([
-            ("-e".to_string(), Some("0.001".to_string())),
-            ("--min-seq-id".to_string(), Some("0.25".to_string())),
-        ]),
-        gpu_server: backend == MmseqsBackend::Gpu,
+        MmseqsBackend::Gpu => build_mmseqs_gpu_search_config(
+            query_db.clone(),
+            target_db.clone(),
+            result_db.clone(),
+            tmp_dir.clone(),
+            config.mmseqs_threads(),
+        ),
     };
 
     // 3) search -> result DB

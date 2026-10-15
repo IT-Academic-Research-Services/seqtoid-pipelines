@@ -3234,6 +3234,106 @@ pub mod mmseqs {
         }
     }
 
+    pub fn build_mmseqs_cpu_search_config(
+        input: PathBuf,
+        target_db: PathBuf,
+        result_db: PathBuf,
+        tmp_dir: PathBuf,
+        threads: usize,
+    ) -> MmseqsConfig {
+        MmseqsConfig {
+            subcommand: MmseqsSubcommand::Search,
+            backend: MmseqsBackend::Cpu,
+
+            input: Some(input),
+            target_db: Some(target_db),
+            result_db: Some(result_db),
+            output: None,
+            tmp_dir: Some(tmp_dir),
+
+            threads: Some(threads),
+
+            // Established production CPU sensitivity.
+            sensitivity: Some("5.7".to_string()),
+
+            // Established production search parameters.
+            search_type: Some("3".to_string()),
+            max_seqs: Some("1000".to_string()),
+            prefilter_mode: Some("0".to_string()),
+            alignment_mode: Some("3".to_string()),
+
+            // Not used for CPU search.
+            db_load_mode: None,
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+            gpu_server: false,
+
+            // Established production filtering parameters.
+            option_fields: HashMap::from([
+                (
+                    "-e".to_string(),
+                    Some("0.001".to_string()),
+                ),
+                (
+                    "--min-seq-id".to_string(),
+                    Some("0.25".to_string()),
+                ),
+            ]),
+        }
+    }
+
+    pub fn build_mmseqs_gpu_search_config(
+        input: PathBuf,
+        target_db: PathBuf,
+        result_db: PathBuf,
+        tmp_dir: PathBuf,
+        threads: usize,
+    ) -> MmseqsConfig {
+        MmseqsConfig {
+            subcommand: MmseqsSubcommand::Search,
+            backend: MmseqsBackend::Gpu,
+
+            input: Some(input),
+            target_db: Some(target_db),
+            result_db: Some(result_db),
+            output: None,
+            tmp_dir: Some(tmp_dir),
+
+            threads: Some(threads),
+
+            // GPU search does not use the CPU sensitivity setting.
+            sensitivity: None,
+
+            search_type: Some("3".to_string()),
+            max_seqs: Some("3000".to_string()),
+
+            // Let command.rs apply the GPU-server default of 1.
+            prefilter_mode: None,
+
+            // Established GPU-server settings.
+            db_load_mode: Some("2".to_string()),
+            alignment_mode: Some("3".to_string()),
+
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+
+            option_fields: HashMap::from([
+                (
+                    "-e".to_string(),
+                    Some("0.001".to_string()),
+                ),
+                (
+                    "--min-seq-id".to_string(),
+                    Some("0.25".to_string()),
+                ),
+            ]),
+
+            gpu_server: true,
+        }
+    }
+
     /// Runtime information needed to construct an MMseqs command.
     ///
     /// This deliberately does NOT depend on the full pipeline RunConfig.
