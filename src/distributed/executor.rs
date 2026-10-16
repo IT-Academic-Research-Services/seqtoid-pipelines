@@ -1128,32 +1128,13 @@ impl WorkerExecutor {
             )
             })?;
 
-        // Use the worker's actual resources to calculate the same
-        // Diamond tuning parameters used by the non-distributed pipeline.
+        // self.config.threads was resolved at worker startup using the same
+        // shared thread-allocation policy as the single-node pipeline.
+        //
+        // The remaining Diamond tuning is calculated by the same shared
+        // Diamond configuration builder used by single-node execution.
         let (_, available_ram) =
             crate::utils::system::detect_ram()?;
-
-        let block_size = compute_optimal_diamond_block_size(
-            &diamond_db,
-            &self.config.scratch_dir,
-            available_ram,
-        )
-            .await?;
-
-        let index_chunks =
-            compute_diamond_index_chunks(
-                self.config.threads,
-                available_ram,
-            );
-
-        info!(
-        "[worker:{}] Diamond tuning: threads={}, block-size={:.1}, index-chunks={}, scratch={}",
-        self.worker_id(),
-        self.config.threads,
-        block_size,
-        index_chunks,
-        self.config.scratch_dir.display()
-    );
 
         let execution = DiamondExecutionConfig {
             threads: self.config.threads,
@@ -1164,65 +1145,36 @@ impl WorkerExecutor {
         // ------------------------------------------------------------
         // R1
         // ------------------------------------------------------------
+
         let r1_out =
             attempt_dir.join("diamond_R1.m8");
 
-        let r1_config = DiamondConfig {
-            subcommand: DiamondSubcommand::Blastx,
-            db: diamond_db.clone(),
-            r1_path: Some(work_unit.r1_path.clone()),
-            r2_path: None,
-            subcommand_fields: HashMap::from([
-                (
-                    "--mid-sensitive".to_string(),
-                    None,
-                ),
-                (
-                    "--block-size".to_string(),
-                    Some(format!("{:.1}", block_size)),
-                ),
-                (
-                    "-c".to_string(),
-                    Some(index_chunks.to_string()),
-                ),
-                (
-                    "-f".to_string(),
-                    Some("6".to_string()),
-                ),
-                (
-                    "--tmpdir".to_string(),
-                    Some(attempt_dir.to_string_lossy().to_string()),
-                ),
-                (
-                    "--unal".to_string(),
-                    Some("0".to_string()),
-                ),
-                (
-                    "--query".to_string(),
-                    Some(
-                        work_unit
-                            .r1_path
-                            .to_string_lossy()
-                            .to_string(),
-                    ),
-                ),
-                (
-                    "--out".to_string(),
-                    Some(
-                        r1_out
-                            .to_string_lossy()
-                            .to_string(),
-                    ),
-                ),
-            ]),
-        };
+        let r1_config =
+            crate::utils::command::diamond::build_diamond_config(
+                diamond_db.clone(),
+                work_unit.r1_path.clone(),
+                attempt_dir.to_path_buf(),
+                execution.threads,
+                available_ram,
+                Some(r1_out.clone()),
+            )
+                .await?;
 
-        let args =
-            generate_diamond_args(&execution, &r1_config)?;
+        let r1_args =
+            generate_diamond_args(
+                &execution,
+                &r1_config,
+            )?;
+
+        info!(
+        "[worker:{}] spawning diamond R1: {:?}",
+        self.worker_id(),
+        r1_args
+    );
 
         self.run_external(
             DIAMOND_TAG,
-            args,
+            r1_args,
             attempt_dir,
             "blastx_R1",
         )
@@ -1239,66 +1191,37 @@ impl WorkerExecutor {
         // ------------------------------------------------------------
         // R2
         // ------------------------------------------------------------
+
         if let Some(r2) = &work_unit.r2_path {
             let r2_out =
                 attempt_dir.join("diamond_R2.m8");
 
-            let r2_config = DiamondConfig {
-                subcommand: DiamondSubcommand::Blastx,
-                db: diamond_db,
-                r1_path: Some(r2.clone()),
-                r2_path: None,
-                subcommand_fields: HashMap::from([
-                    (
-                        "--mid-sensitive".to_string(),
-                        None,
-                    ),
-                    (
-                        "--block-size".to_string(),
-                        Some(format!("{:.1}", block_size)),
-                    ),
-                    (
-                        "-c".to_string(),
-                        Some(index_chunks.to_string()),
-                    ),
-                    (
-                        "-f".to_string(),
-                        Some("6".to_string()),
-                    ),
-                    (
-                        "--tmpdir".to_string(),
-                        Some(attempt_dir.to_string_lossy().to_string()),
-                    ),
-                    (
-                        "--unal".to_string(),
-                        Some("0".to_string()),
-                    ),
-                    (
-                        "--query".to_string(),
-                        Some(
-                            r2.to_string_lossy().to_string(),
-                        ),
-                    ),
-                    (
-                        "--out".to_string(),
-                        Some(
-                            r2_out
-                                .to_string_lossy()
-                                .to_string(),
-                        ),
-                    ),
-                ]),
-            };
+            let r2_config =
+                crate::utils::command::diamond::build_diamond_config(
+                    diamond_db,
+                    r2.clone(),
+                    attempt_dir.to_path_buf(),
+                    execution.threads,
+                    available_ram,
+                    Some(r2_out.clone()),
+                )
+                    .await?;
 
-            let args =
+            let r2_args =
                 generate_diamond_args(
                     &execution,
                     &r2_config,
                 )?;
 
+            info!(
+            "[worker:{}] spawning diamond R2: {:?}",
+            self.worker_id(),
+            r2_args
+        );
+
             self.run_external(
                 DIAMOND_TAG,
-                args,
+                r2_args,
                 attempt_dir,
                 "blastx_R2",
             )
@@ -1316,6 +1239,7 @@ impl WorkerExecutor {
         // ------------------------------------------------------------
         // Merge R1/R2 result files.
         // ------------------------------------------------------------
+
         let merged_m8 =
             attempt_dir.join("result.m8");
 
@@ -1328,7 +1252,8 @@ impl WorkerExecutor {
 
         for part in output_parts {
             let mut input =
-                fs::File::open(&part).await?;
+                fs::File::open(&part)
+                    .await?;
 
             tokio::io::copy(
                 &mut input,
@@ -1340,7 +1265,8 @@ impl WorkerExecutor {
         drop(merged);
 
         let m8_validation =
-            validate_m8(&merged_m8).await?;
+            validate_m8(&merged_m8)
+                .await?;
 
         self.publish_result(
             work_unit,

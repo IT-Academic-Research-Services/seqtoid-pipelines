@@ -3146,98 +3146,129 @@ async fn nt_non_host_align(
 /// Result containing the path to the output m8 file
 async fn run_diamond_single_file(
     config: Arc<RunConfig>,
-    query_path: PathBuf,
-    db_prefix: PathBuf,
-    mut options: HashMap<String, Option<String>>,
+    diamond_config: DiamondConfig,
     temp_dir: &TempDir,
     label: &str,
 ) -> Result<PathBuf, PipelineError> {
-    let m8_path = temp_dir.path().join(format!("diamond_{}.m8", label));
+    let m8_path = temp_dir
+        .path()
+        .join(format!("diamond_{}.m8", label));
 
-    options.insert(
-        "--query".to_string(),
-        Some(query_path.to_string_lossy().to_string()),
+    let diamond_args =
+        generate_cli(
+            DIAMOND_TAG,
+            &config,
+            Some(&diamond_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: DIAMOND_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    info!(
+        "[single-node] spawning diamond: {:?}",
+        diamond_args
     );
 
-    let diamond_config = DiamondConfig {
-        subcommand: DiamondSubcommand::Blastx,
-        db: db_prefix,
-        r1_path: Some(query_path),
-        r2_path: None,
-        subcommand_fields: options,
-    };
-
-    let diamond_args = generate_cli(DIAMOND_TAG, &config, Some(&diamond_config)).map_err(|e| {
-        PipelineError::ToolExecution {
-            tool: DIAMOND_TAG.to_string(),
-            error: e.to_string(),
-        }
-    })?;
-
-    info!("[single-node] spawning diamond: {:?}", diamond_args);
-
-    let (mut diamond_child, _diamond_stderr_task) = spawn_cmd(
-        config.clone(),
-        DIAMOND_TAG,
-        diamond_args,
-        config.args.verbose,
-        None,
-    )
-    .await?;
+    let (mut diamond_child, _diamond_stderr_task) =
+        spawn_cmd(
+            config.clone(),
+            DIAMOND_TAG,
+            diamond_args,
+            config.args.verbose,
+            None,
+        )
+            .await?;
 
     let diamond_stdout = diamond_child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("diamond stdout missing"))?;
 
-    let (m8_tx, m8_rx) = mpsc::channel(config.base_buffer_size * 8);
+    let (m8_tx, m8_rx) =
+        mpsc::channel(config.base_buffer_size * 8);
 
-    let parse_task: JoinHandle<Result<(), anyhow::Error>> = tokio::spawn(async move {
-        let mut reader = TokioBufReader::new(diamond_stdout);
-        let mut line = Vec::with_capacity(1024);
+    let parse_task: JoinHandle<Result<(), anyhow::Error>> =
+        tokio::spawn(async move {
+            let mut reader =
+                TokioBufReader::new(diamond_stdout);
 
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line).await? == 0 {
-                break;
-            }
-            if !line.is_empty() && line[0] != b'#' {
-                let bytes = Bytes::from(std::mem::take(&mut line));
-                if m8_tx.send(ParseOutput::Bytes(bytes)).await.is_err() {
+            let mut line =
+                Vec::with_capacity(1024);
+
+            loop {
+                line.clear();
+
+                if reader
+                    .read_until(b'\n', &mut line)
+                    .await?
+                    == 0
+                {
                     break;
                 }
+
+                if !line.is_empty()
+                    && line[0] != b'#'
+                {
+                    let bytes =
+                        Bytes::from(std::mem::take(&mut line));
+
+                    if m8_tx
+                        .send(ParseOutput::Bytes(bytes))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
-        }
-        Ok(())
-    });
 
-    let write_task = write_byte_stream_to_file(
-        &m8_path,
-        ReceiverStream::new(m8_rx),
-        config.clone(),
-        StreamDataType::JustBytes,
-        &format!("diamond_{}", label),
-        false
-    )
-    .await?;
+            Ok(())
+        });
 
-    // Wait for diamond process
-    let status = diamond_child.wait().await?;
+    let write_task =
+        write_byte_stream_to_file(
+            &m8_path,
+            ReceiverStream::new(m8_rx),
+            config.clone(),
+            StreamDataType::JustBytes,
+            &format!("diamond_{}", label),
+            false,
+        )
+            .await?;
+
+    // Wait for Diamond process.
+    let status =
+        diamond_child.wait().await?;
+
     if !status.success() {
         return Err(PipelineError::ToolExecution {
             tool: DIAMOND_TAG.to_string(),
-            error: format!("exited with code {:?}", status.code()),
+            error: format!(
+                "exited with code {:?}",
+                status.code()
+            ),
         });
     }
 
-    // Wait for both tasks to complete
+    // Wait for both tasks to complete.
     parse_task
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("parse_task panicked: {}", e)))??;
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "parse_task panicked: {}",
+                e
+            ))
+        })??;
 
     write_task
         .await
-        .map_err(|e| PipelineError::Other(anyhow!("write_task panicked: {}", e)))??;
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "write_task panicked: {}",
+                e
+            ))
+        })??;
 
     Ok(m8_path)
 }
@@ -5251,7 +5282,7 @@ async fn diamond_non_host_align(
         4,
         true,
     )
-    .await?;
+        .await?;
 
     let diamond_db = config
         .args
@@ -5261,76 +5292,94 @@ async fn diamond_non_host_align(
             "diamond_db required for NR alignment".into(),
         ))?;
 
-    let (db_prefix, prep_tasks) = diamond_index_prep(Some(diamond_db), "non_host").await?;
+    let (db_prefix, prep_tasks) =
+        diamond_index_prep(Some(diamond_db), "non_host").await?;
+
     cleanup_tasks.extend(prep_tasks);
 
-    let optimal_block_size = compute_optimal_block_size(&config).await.unwrap_or(12.0);
-
-    let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
+    // Preserve the existing single-node thread-allocation policy.
+    let available_ram_gb =
+        config.available_ram as f64 / 1_000_000_000.0;
 
     let threads = if available_ram_gb < 64.0 {
-        config.thread_allocation(DIAMOND_TAG, None).min(6).max(1)
+        config
+            .thread_allocation(DIAMOND_TAG, None)
+            .min(6)
+            .max(1)
     } else {
         config.thread_allocation(DIAMOND_TAG, None)
     };
 
-    let index_chunks =
-        compute_diamond_index_chunks(threads, config.available_ram);
-
     info!(
-        "Diamond non-host: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
+        "Diamond non-host: threads={}, tmpdir={}",
         threads,
-        index_chunks,
-        optimal_block_size,
         temp_dir.path().display()
     );
 
-    let diamond_options = HashMap::from([
-        ("--mid-sensitive".to_string(), None),
-        (
-            "--block-size".to_string(),
-            Some(format!("{:.1}", optimal_block_size)),
-        ),
-        ("-c".to_string(), Some(index_chunks.to_string())),
-        ("-f".to_string(), Some("6".to_string())),
-        (
-            "--tmpdir".to_string(),
-            Some(temp_dir.path().to_string_lossy().to_string()),
-        ),
-        ("--unal".to_string(), Some("0".to_string())),
-    ]);
+    // Build the complete Diamond configuration through the shared
+    // Diamond module. All Diamond-specific parameters are constructed
+    // there using this machine's resources.
+    let r1_config =
+        crate::utils::command::diamond::build_diamond_config(
+            db_prefix.clone(),
+            r1_path,
+            temp_dir.path().to_path_buf(),
+            threads,
+            config.available_ram,
+            None,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: DIAMOND_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
-    // Run R1
+    // Run R1.
     let r1_m8 = run_diamond_single_file(
         config.clone(),
-        r1_path,
-        db_prefix.clone(),
-        diamond_options.clone(),
+        r1_config,
         &temp_dir,
         "nr_r1",
     )
-    .await?;
+        .await?;
 
-    // Run R2 (if present)
+    // Run R2 (if present), using the same shared Diamond parameter
+    // construction and the same machine-local resource values.
     if let Some(r2_path) = r2_path_opt {
+        let r2_config =
+            crate::utils::command::diamond::build_diamond_config(
+                db_prefix,
+                r2_path,
+                temp_dir.path().to_path_buf(),
+                threads,
+                config.available_ram,
+                None,
+            )
+                .await
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: DIAMOND_TAG.to_string(),
+                    error: e.to_string(),
+                })?;
+
         let _r2_m8 = run_diamond_single_file(
             config.clone(),
-            r2_path,
-            db_prefix,
-            diamond_options,
+            r2_config,
             &temp_dir,
             "nr_r2",
         )
-        .await?;
+            .await?;
     }
 
-    // Merge results
-    let merged_m8 = temp_dir.path().join("diamond_merged_nr.m8");
+    // Merge results.
+    let merged_m8 =
+        temp_dir.path().join("diamond_merged_nr.m8");
+
     let mut merged = TokioFile::create(&merged_m8)
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     let mut f1 = TokioFile::open(&r1_m8).await?;
+
     tokio::io::copy(&mut f1, &mut merged).await?;
 
     merged.flush().await?;
@@ -5339,11 +5388,20 @@ async fn diamond_non_host_align(
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let m8_rx = parse_lines(m8_file, &config, StreamDataType::JustBytes)
+    let m8_rx = parse_lines(
+        m8_file,
+        &config,
+        StreamDataType::JustBytes,
+    )
         .await
         .map_err(|e| PipelineError::Other(e.into()))?;
 
-    Ok((m8_rx, cleanup_tasks, cleanup_receivers, vec![temp_dir]))
+    Ok((
+        m8_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+        vec![temp_dir],
+    ))
 }
 
 

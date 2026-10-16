@@ -2415,6 +2415,113 @@ pub mod diamond {
         Ok((path.with_extension(""), vec![]))
     }
 
+    /// Build the complete Diamond configuration for one invocation.
+    ///
+    /// This is the shared Diamond-parameter construction used by both the
+    /// single-node pipeline and distributed workers.
+    ///
+    /// The caller supplies the resources for the machine that will actually
+    /// execute Diamond:
+    ///   - `threads`
+    ///   - `available_ram_bytes`
+    ///   - `tmpdir`
+    ///
+    /// Diamond-specific tuning is then calculated here using the existing
+    /// shared algorithms:
+    ///   - block size from RAM + DB size + scratch availability
+    ///   - index chunk count from threads + RAM
+    ///
+    /// `output` controls only where Diamond writes its M8 output:
+    ///   - `None`  -> Diamond writes to stdout (existing single-node behavior)
+    ///   - `Some` -> Diamond receives `--out <path>` (distributed worker behavior)
+    pub async fn build_diamond_config(
+        db: PathBuf,
+        query: PathBuf,
+        tmpdir: PathBuf,
+        threads: usize,
+        available_ram_bytes: u64,
+        output: Option<PathBuf>,
+    ) -> Result<DiamondConfig> {
+        let block_size = compute_optimal_diamond_block_size(
+            &db,
+            &tmpdir,
+            available_ram_bytes,
+        )
+            .await
+            .unwrap_or(12.0);
+
+        let index_chunks = compute_diamond_index_chunks(
+            threads,
+            available_ram_bytes,
+        );
+
+        let mut subcommand_fields = HashMap::from([
+            (
+                "--mid-sensitive".to_string(),
+                None,
+            ),
+            (
+                "--block-size".to_string(),
+                Some(format!("{:.1}", block_size)),
+            ),
+            (
+                "-c".to_string(),
+                Some(index_chunks.to_string()),
+            ),
+            (
+                "-f".to_string(),
+                Some("6".to_string()),
+            ),
+            (
+                "--tmpdir".to_string(),
+                Some(
+                    tmpdir
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            ),
+            (
+                "--query".to_string(),
+                Some(
+                    query
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            ),
+            (
+                "--unal".to_string(),
+                Some("0".to_string()),
+            ),
+        ]);
+
+        if let Some(output_path) = output {
+            subcommand_fields.insert(
+                "--out".to_string(),
+                Some(
+                    output_path
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            );
+        }
+
+        info!(
+        "Diamond config: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
+        threads,
+        index_chunks,
+        block_size,
+        tmpdir.display(),
+    );
+
+        Ok(DiamondConfig {
+            subcommand: DiamondSubcommand::Blastx,
+            db,
+            r1_path: Some(query),
+            r2_path: None,
+            subcommand_fields,
+        })
+    }
+
     /// Generates Diamond command-line arguments without requiring RunConfig.
     ///
     /// Worker code should call this directly.

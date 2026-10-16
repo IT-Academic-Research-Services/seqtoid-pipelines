@@ -330,6 +330,75 @@ pub enum PairingMode {
 
 pub type DuplicateClusters = HashMap<String, ClusterInfo>;
 
+pub fn allocate_tool_threads(
+    core_allocation: CoreAllocation,
+    requested_threads: usize,
+    max_cores: usize,
+    physical_cores: usize,
+    use_smt: bool,
+    tag: &str,
+    subcommand: Option<&str>,
+) -> usize {
+    let max_cores =
+        min(max_cores, requested_threads.max(1));
+
+    let mut allocation = match core_allocation {
+        CoreAllocation::Maximal => max_cores,
+        CoreAllocation::High => {
+            ((max_cores as f32 * 0.75) as usize).max(1)
+        }
+        CoreAllocation::Low => {
+            (max_cores / 3).max(1)
+        }
+        CoreAllocation::Minimal => 1,
+    };
+
+    let prefer_physical = match tag {
+        DIAMOND_TAG
+        | MINIMAP2_TAG
+        | KRAKEN2_TAG
+        | KALLISTO_TAG
+        | MAFFT_TAG
+        | MMSEQS_TAG => false,
+
+        BOWTIE2_TAG
+        | HISAT2_TAG
+        | SPADES_TAG
+        | FASTP_TAG
+        | PIGZ_TAG => true,
+
+        _ => false,
+    };
+
+    if prefer_physical && use_smt {
+        allocation =
+            allocation.min(physical_cores);
+    } else if !prefer_physical && use_smt {
+        let modest_max =
+            (physical_cores as f32
+                * SMT_MODEST_MULTIPLIER)
+                .ceil() as usize;
+
+        allocation =
+            allocation.min(modest_max);
+    }
+
+    if let Some(cap) =
+        TOOL_THREAD_CAPS.get(tag)
+    {
+        allocation =
+            allocation.min(*cap);
+    }
+
+    match (tag, subcommand) {
+        (PIGZ_TAG, _) => allocation.min(16),
+        (FASTP_TAG, _) => allocation.min(32),
+        (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16),
+        (HISAT2_TAG, _) => allocation.min(64),
+        _ => allocation,
+    }
+}
+
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
@@ -361,44 +430,20 @@ impl RunConfig {
         threads.min(self.max_cores * 9 / 10)
     }
 
-    pub fn thread_allocation(&self, tag: &str, subcommand: Option<&str>) -> usize {
-        let max_cores = min(self.max_cores, self.args.threads.max(1));
-
-        let mut allocation = match self.get_core_allocation(tag, subcommand) {
-            CoreAllocation::Maximal => max_cores,
-            CoreAllocation::High => ((max_cores as f32 * 0.75) as usize).max(1),
-            CoreAllocation::Low => (max_cores / 3).max(1),
-            CoreAllocation::Minimal => 1,
-        };
-
-        let prefer_physical = match tag {
-            DIAMOND_TAG | MINIMAP2_TAG | KRAKEN2_TAG | KALLISTO_TAG | MAFFT_TAG | MMSEQS_TAG => false, // allow modest SMT
-            BOWTIE2_TAG | HISAT2_TAG | SPADES_TAG | FASTP_TAG | PIGZ_TAG => true,      // physical only
-            _ => false,  // default allow
-        };
-
-        if prefer_physical && self.args.use_smt { // If a program does poorly with SMT, don't allow it even if use_smt true
-            allocation = allocation.min(self.physical_cores);
-        } else if !prefer_physical && self.args.use_smt {
-            // Modest SMT: allow up to ~1.3× physical cores
-
-            let modest_max = (self.physical_cores as f32 * SMT_MODEST_MULTIPLIER).ceil() as usize;
-            allocation = allocation.min(modest_max);
-        }
-
-        // Apply tool-specific cap
-        if let Some(cap) = TOOL_THREAD_CAPS.get(tag) {
-            allocation = allocation.min(*cap);
-        }
-
-        // Per-tool overrides
-        match (tag, subcommand) {
-            (PIGZ_TAG, _) => allocation.min(16),
-            (FASTP_TAG, _) => allocation.min(32),
-            (BCFTOOLS_TAG, Some("mpileup")) => allocation.min(16),
-            (HISAT2_TAG, _) => allocation.min(64), //scales a bit worse than bt2
-            _ => allocation,
-        }
+    pub fn thread_allocation(
+        &self,
+        tag: &str,
+        subcommand: Option<&str>,
+    ) -> usize {
+        allocate_tool_threads(
+            self.get_core_allocation(tag, subcommand),
+            self.args.threads,
+            self.max_cores,
+            self.physical_cores,
+            self.args.use_smt,
+            tag,
+            subcommand,
+        )
     }
 }
 
