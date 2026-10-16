@@ -127,14 +127,27 @@ setup_thp() {
 install_packages() {
   log "Ensuring critical launch-node infrastructure packages"
 
-  if ! dnf_retry \
-      mdadm \
-      xfsprogs \
-      nfs-utils \
-      amazon-ssm-agent \
-      libatomic; then
+if ! dnf_retry \
+    mdadm \
+    xfsprogs \
+    nfs-utils \
+    amazon-ssm-agent \
+    libatomic \
+    numactl; then
 
     log "ERROR: critical package installation failed"
+    return 1
+  fi
+
+  if ! command -v numactl >/dev/null 2>&1; then
+    log "ERROR: numactl is not available after package installation"
+    return 1
+  fi
+
+  log "numactl: $(command -v numactl)"
+
+  if ! numactl --hardware; then
+    log "ERROR: numactl --hardware failed"
     return 1
   fi
 
