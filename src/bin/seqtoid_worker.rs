@@ -5,10 +5,12 @@ use clap::{Parser, ValueEnum};
 use tokio::fs;
 
 use seqtoid_pipelines::config::defs::{
+    allocate_mmseqs_threads,
     allocate_tool_threads,
     CoreAllocation,
     DIAMOND_TAG,
 };
+
 use seqtoid_pipelines::distributed::executor::{
     WorkUnitClaimed,
     WorkerBackend,
@@ -145,9 +147,21 @@ async fn main() -> Result<()> {
         diamond_threads
     );
 
+    let mmseqs_threads = allocate_mmseqs_threads(
+        args.threads,
+        args.max_cores,
+        physical_cores,
+        args.use_smt,
+    );
+
+    log::info!(
+    "Worker MMseqs thread allocation: {}",
+    mmseqs_threads
+    );
+
     let worker_threads = match args.backend {
         Backend::Diamond => diamond_threads,
-        Backend::MmseqsCpu | Backend::MmseqsGpu => args.threads,
+        Backend::MmseqsCpu | Backend::MmseqsGpu => mmseqs_threads,
     };
 
     let executor_config = WorkerExecutorConfig {

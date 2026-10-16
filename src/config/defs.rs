@@ -399,6 +399,34 @@ pub fn allocate_tool_threads(
     }
 }
 
+pub fn allocate_mmseqs_threads(
+    requested_threads: usize,
+    max_cores: usize,
+    physical_cores: usize,
+    use_smt: bool,
+) -> usize {
+    let base = allocate_tool_threads(
+        CoreAllocation::Maximal,
+        requested_threads,
+        max_cores,
+        physical_cores,
+        use_smt,
+        MMSEQS_TAG,
+        Some("search"),
+    );
+
+    // Scale based on physical scale of the machine.
+    let threads = match max_cores {
+        0..=64 => base.min(56),      // small machines / MacBook
+        65..=128 => base.min(112),   // r6id.32xlarge
+        129..=192 => base.min(160),  // r8id.48xlarge class
+        _ => base.min(224),          // 256+ core EPYC permanent nodes
+    };
+
+    // Final safety cap (never use 100% of cores).
+    threads.min(max_cores * 9 / 10)
+}
+
 impl RunConfig {
     pub fn get_core_allocation(&self, tag: &str, subcommand: Option<&str>) -> CoreAllocation {
         match (tag, subcommand) {
@@ -416,18 +444,12 @@ impl RunConfig {
     }
 
     pub fn mmseqs_threads(&self) -> usize {
-        let base = self.thread_allocation(MMSEQS_TAG, Some("search"));
-
-        // Scale based on physical scale of the machine
-        let threads = match self.max_cores {
-            0..=64   => base.min(56),                    // small machines / MacBook
-            65..=128 => base.min(112),                   // r6id.32xlarge
-            129..=192 => base.min(160),                  // r8id.48xlarge class
-            _        => base.min(224),                   // 256+ core EPYC permanent nodes
-        };
-
-        // Final safety cap (never use 100% of cores)
-        threads.min(self.max_cores * 9 / 10)
+        allocate_mmseqs_threads(
+            self.args.threads,
+            self.max_cores,
+            self.physical_cores,
+            self.args.use_smt,
+        )
     }
 
     pub fn thread_allocation(
