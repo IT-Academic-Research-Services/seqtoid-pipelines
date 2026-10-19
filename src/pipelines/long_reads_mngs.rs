@@ -15,7 +15,7 @@ use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, Stre
 use crate::cli::args::Technology;
 use crate::utils::command::check_versions;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
-use crate::utils::fastx::{raw_read_count, read_fastq};
+use crate::utils::fastx::{read_fastq};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput};
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
@@ -34,7 +34,6 @@ use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseO
 /// - interleaved FASTQ stream
 /// - vector of cleanup tasks
 /// - vector of cleanup receivers
-/// - handle for the raw read count task
 /// - handle for the validated read count task
 async fn validate_input(
     config: Arc<RunConfig>,
@@ -46,7 +45,6 @@ async fn validate_input(
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
-        JoinHandle<anyhow::Result<u64, anyhow::Error>>,
         JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>,
     ),
     PipelineError,
@@ -61,8 +59,6 @@ async fn validate_input(
         Some("sample_validated.fastq.gz"),
         "_",
     );
-
-    let raw_count_task = raw_read_count(input_fastq.clone(), None);
 
 
     let (validated_rx, val_count_task) = read_fastq(
@@ -119,7 +115,6 @@ async fn validate_input(
         val_out_stream,
         cleanup_tasks,
         cleanup_receivers,
-        raw_count_task,
         val_count_task,
     ))
 }
@@ -178,7 +173,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         val_out_stream,
         validate_cleanup_tasks,
         validate_cleanup_receivers,
-        raw_count_task,
         val_count_task,
     ) = validate_input(
         config.clone(),
@@ -198,19 +192,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     let validation_and_qc_fut = async move {
-        let raw_count = join_with_error_handling(raw_count_task).await?;
-        info!(
-            "Processed {} raw reads (additive from R1 and R2 if paired)",
-            raw_count
-        );
 
         let stats = join_with_error_handling(val_count_task).await?;
         info!(
-            "Processed {} validated, {} undersized, {} oversized reads",
-            stats.validated, stats.undersized, stats.oversized
+            "Processed {} raw reads, {} raw bases, {} validated reads, {} validated bases, {} undersized, {} oversized reads",
+            stats.raw_reads, stats.raw_bases, stats.validated, stats.validated_bases, stats.undersized, stats.oversized
         );
 
-        Ok::<_, PipelineError>((raw_count, stats))
+        Ok::<_, PipelineError>((stats))
     };
 
 
