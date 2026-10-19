@@ -409,7 +409,6 @@ async fn validate_input(
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
-        JoinHandle<anyhow::Result<u64, anyhow::Error>>,
         JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>,
     ),
     PipelineError,
@@ -425,7 +424,6 @@ async fn validate_input(
         "_",
     );
 
-    let raw_count_task = raw_read_count(file1_path.clone(), file2_path.clone());
 
     let (rx, val_count_task) = read_fastq(
         file1_path,
@@ -480,7 +478,6 @@ async fn validate_input(
         val_ercc_bowtie2_filter_out_stream,
         cleanup_tasks,
         cleanup_receivers,
-        raw_count_task,
         val_count_task,
     ))
 }
@@ -9478,7 +9475,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         val_out_stream,
         validate_cleanup_tasks,
         validate_cleanup_receivers,
-        raw_count_task,
         val_count_task,
     ) = validate_input(
         config.clone(),
@@ -11583,16 +11579,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir_kallisto = out_dir.clone();
 
     let validation_and_qc_fut = async move {
-        let raw_count = join_with_error_handling(raw_count_task).await?;
-        info!(
-            "Processed {} raw reads (additive from R1 and R2 if paired)",
-            raw_count
-        );
 
         let stats = join_with_error_handling(val_count_task).await?;
         info!(
-            "Processed {} validated, {} undersized, {} oversized reads",
-            stats.validated, stats.undersized, stats.oversized
+            "Processed {} raw reads, {} raw bases, {} validated reads, {} validated bases, {} undersized, {} oversized reads",
+            stats.raw_reads, stats.raw_bases, stats.validated, stats.validated_bases, stats.undersized, stats.oversized
         );
 
         let _qc_fastp_read_count = match qc_count_result_rx.await {
@@ -11614,7 +11605,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await
             .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
 
-        Ok::<_, PipelineError>((raw_count, stats, ercc_mapped_count))
+        Ok::<_, PipelineError>((stats, ercc_mapped_count))
     };
 
     let host_bam_and_counts_fut = async move {
