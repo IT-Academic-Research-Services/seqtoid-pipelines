@@ -2,13 +2,128 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
+
 use anyhow::anyhow;
 use futures::future::try_join_all;
 use log::{debug, info, warn};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
-use crate::config::defs::{PipelineError, RunConfig};
-use crate::utils::file::validate_file_inputs;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType, BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG, BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG};
+use crate::cli::args::Technology;
+use crate::utils::command::check_versions;
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
+use crate::utils::fastx::{raw_read_count, read_fastq};
+use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput};
+
+/// Validates the input FASTQ files and returns an interleaved stream of sequence records.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `file1_path`: path to the R1 (or single-end) FASTQ file
+/// * `file2_path`: optional path to the R2 FASTQ file
+/// * `sample_base_buf`: base path for the sample
+/// * `out_dir`: directory where output files should be saved
+///
+/// # Returns
+///
+/// Result containing:
+/// - interleaved FASTQ stream
+/// - vector of cleanup tasks
+/// - vector of cleanup receivers
+/// - handle for the raw read count task
+/// - handle for the validated read count task
+async fn validate_input(
+    config: Arc<RunConfig>,
+    input_fastq: PathBuf,
+    sample_base_buf: PathBuf,
+    out_dir: &PathBuf,
+) -> anyhow::Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+        JoinHandle<anyhow::Result<u64, anyhow::Error>>,
+        JoinHandle<anyhow::Result<ReadStats, anyhow::Error>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let validated_file_path = file_path_manipulator(
+        &PathBuf::from(&sample_base_buf),
+        Some(out_dir),
+        None,
+        Some("sample_validated.fastq.gz"),
+        "_",
+    );
+
+    let raw_count_task = raw_read_count(input_fastq.clone(), None);
+
+
+    let (validated_rx, val_count_task) = read_fastq(
+        input_fastq.clone(),
+        None,
+        PairingMode::Strict,
+        Some(Technology::ONT),
+        config.args.max_reads as u64,
+        config.args.min_read_len,
+        config.args.max_read_len,
+        "run_validate_input",
+        &config,
+    )
+        .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+
+    let val_rx_stream = ReceiverStream::new(validated_rx);
+
+    let (val_streams, val_router_done_rx) = fanout_to_channels(
+        val_rx_stream,
+        2,
+        "validate_input",
+        &config,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(val_router_done_rx);
+
+    let mut val_streams_iter = val_streams.into_iter();
+
+    let val_out_stream =
+        ReceiverStream::new(val_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
+
+    let val_file_stream =
+        ReceiverStream::new(val_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
+
+    let val_file_write_task = write_byte_stream_to_file(
+        &validated_file_path,
+        val_file_stream,
+        config.clone(),
+        StreamDataType::IlluminaFastq,
+        "validate_input",
+        false
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(val_file_write_task);
+
+
+
+    Ok((
+        val_out_stream,
+        cleanup_tasks,
+        cleanup_receivers,
+        raw_count_task,
+        val_count_task,
+    ))
+}
+
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
@@ -32,27 +147,77 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> =
         Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
-    let mut host_filter_temp_dirs: Vec<TempDir> = Vec::new();
     let mut final_temp_dirs: Vec<TempDir> = Vec::new();
     let temp_paths: Vec<PathBuf> = Vec::new();
 
     info!("Starting long read mNGS pipeline.");
+
+    // *******************
+    // Setup and Validation
+    // *******************
+
+    // External tools check
+
+    let mut versions_vec = vec![
+        FASTP_TAG,
+    ];
+
+    if !config.args.no_version_check {
+        check_versions(versions_vec, &out_dir.clone(), &config)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?;
+    }
 
 
     let (input_fastq, _file2, sample_base_buf, sample_base) =
         validate_file_inputs(&config, &cwd, true).await?;
 
 
+    // Input Validation
+    let (
+        val_out_stream,
+        validate_cleanup_tasks,
+        validate_cleanup_receivers,
+        raw_count_task,
+        val_count_task,
+    ) = validate_input(
+        config.clone(),
+        input_fastq.clone(),
+        sample_base_buf.clone(),
+        &out_dir,
+    )
+        .await?;
+    cleanup_tasks.extend(validate_cleanup_tasks);
+    cleanup_receivers.extend(validate_cleanup_receivers);
 
 
 
 
+    // *******************
+    // Results retrieval
+    // *******************
+
+    let validation_and_qc_fut = async move {
+        let raw_count = join_with_error_handling(raw_count_task).await?;
+        info!(
+            "Processed {} raw reads (additive from R1 and R2 if paired)",
+            raw_count
+        );
+
+        let stats = join_with_error_handling(val_count_task).await?;
+        info!(
+            "Processed {} validated, {} undersized, {} oversized reads",
+            stats.validated, stats.undersized, stats.oversized
+        );
+
+        Ok::<_, PipelineError>((raw_count, stats))
+    };
 
 
 
-
-
-
+    let (_validation_and_qc, ) = tokio::try_join!(
+        validation_and_qc_fut,
+    )?;
 
     // *******************
     // Cleanup
