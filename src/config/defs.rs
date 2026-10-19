@@ -180,9 +180,14 @@ pub const READ_COUNTING_MODE: ReadCountingMode = ReadCountingMode::CountUnique;
 // For specifying which read (or read pairs are validated fore size.
 #[derive(Debug)]
 pub struct ReadStats {
+    pub raw_reads: u64,
+    pub raw_bases: u64,
+
     pub undersized: u64,
     pub validated: u64,
+    pub validated_bases: u64,
     pub oversized: u64,
+
     pub unpaired_r1: u64,
     pub unpaired_r2: u64,
 }
