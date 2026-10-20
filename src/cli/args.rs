@@ -257,7 +257,7 @@ pub struct Arguments {
     #[arg(long, default_value_t = false)]
     pub no_version_check: bool,
 
-    #[arg(long = "library_type", default_value = "DNA", value_enum)]
+    #[arg(long = "library_type", default_value = "dna", value_enum)]
     pub library_type: LibraryType,
 
 }
