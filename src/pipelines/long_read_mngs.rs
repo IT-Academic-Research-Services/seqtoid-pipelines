@@ -273,7 +273,7 @@ async fn fastp_qc(
     ))
 }
 
-async fn minimap2_host_filter(
+async fn minimap2_filter(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
     host_index_path: PathBuf,
@@ -651,6 +651,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(qc_cleanup_tasks);
 
 
+    // *******************
+    // Host Filtering Stage
+    // *******************
 
     //Host filtering
 
@@ -665,7 +668,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         &config.ram_temp_dir,
         config.args.host_sequence.clone(),
-        config.args.host_index.clone(),
+        config.args.host_mm2_index.clone(),
         "host",
     )
         .await?;
@@ -677,7 +680,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         host_filter_stats,
         host_filter_cleanup_tasks,
         host_filter_cleanup_receivers,
-    ) = minimap2_host_filter(
+    ) = minimap2_filter(
         config.clone(),
         qc_fastp_out_stream,
         host_index_path,
@@ -689,8 +692,44 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(host_filter_cleanup_receivers);
     host_filter_temp_dirs.extend(host_temp_dir);
 
+    //Human filtering
 
-    
+    let (
+        _human_ref_fasta_path,
+        human_index_path,
+        _human_ref_temp,
+        _human_index_temp,
+        human_temp_dir,
+        _human_ref_tasks,
+    ) = minimap2_index_prep(
+        &config,
+        &config.ram_temp_dir,
+        config.args.human_sequence.clone(),
+        config.args.human_mm2_index.clone(),
+        "host",
+    )
+        .await?;
+
+    debug!("Human index : {}", human_index_path.display());
+
+    let (
+        human_filter_out_stream,
+        human_filter_stats,
+        human_filter_cleanup_tasks,
+        human_filter_cleanup_receivers,
+    ) = minimap2_filter(
+        config.clone(),
+        host_filter_out_stream,
+        human_index_path,
+        out_dir.join("sample.hostfiltered.bam"),
+    )
+        .await?;
+
+    cleanup_tasks.extend(human_filter_cleanup_tasks);
+    cleanup_receivers.extend(human_filter_cleanup_receivers);
+    host_filter_temp_dirs.extend(human_temp_dir);
+
+
     // Early cleanup upstream temp dirs (host filter, etc.)
     for td in &host_filter_temp_dirs {
         if let Err(e) = std::fs::remove_dir_all(td.path()) {
@@ -712,7 +751,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Temporary final stream drain for construction
     // *******************
 
-    let mut final_temp_drain_stream = host_filter_out_stream;
+    let mut final_temp_drain_stream = human_filter_out_stream;
 
     let final_temp_drain_task = tokio::spawn(async move {
         while final_temp_drain_stream.next().await.is_some() {}

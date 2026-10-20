@@ -1920,7 +1920,7 @@ async fn minimap2_filter(
         &config,
         &config.ram_temp_dir,
         config.args.host_sequence.clone(),
-        config.args.host_index.clone(),
+        config.args.host_mm2_index.clone(),
         "host",
     )
     .await?;

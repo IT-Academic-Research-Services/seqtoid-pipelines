@@ -85,8 +85,14 @@ pub struct Arguments {
     #[arg(short = 'a', long)]  // For host removal
     pub host_sequence : Option<String>,
 
+    #[arg(short = 'a', long)]  // For human removal
+    pub human_sequence : Option<String>,
+
     #[arg(long, help = "Optional path to pre-built minimap2 index for host reference (e.g., hg38.mmi)")]
-    pub host_index: Option<String>,
+    pub host_mm2_index: Option<String>,
+
+    #[arg(long, help = "Optional path to pre-built minimap2 index for human reference (e.g., hg38.mmi)")]
+    pub human_mm2_index: Option<String>,
 
     #[arg(short = 't', long)] // For target aligning
     pub target_sequence : Option<String>,

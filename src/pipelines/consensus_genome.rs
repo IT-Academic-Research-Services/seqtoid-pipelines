@@ -2166,7 +2166,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
         &config,
         &ram_temp_dir,
         config.args.host_sequence.clone(),
-        config.args.host_index.clone(),
+        config.args.host_mm2_index.clone(),
         "host",
     )
     .await?;
