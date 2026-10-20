@@ -194,7 +194,6 @@ pub mod fastp {
             let mut args_vec: Vec<String> = Vec::new();
             args_vec.push("--stdin".to_string());
             args_vec.push("--stdout".to_string());
-            args_vec.push("--interleaved_in".to_string());
             // args_vec.push("-q".to_string());
             // args_vec.push(args.quality.to_string());
 

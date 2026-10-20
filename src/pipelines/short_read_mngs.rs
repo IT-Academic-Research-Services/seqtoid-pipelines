@@ -1437,6 +1437,7 @@ async fn fastp_qc(
     let qc_fastp_config_view = FastpConfig {
         //These default QC thresholds are loosely based on the pre-2022 CZI pipeline using PriceSeq & LZW
         command_fields: HashMap::from([
+            ("--interleaved_in".to_string(), None),
             ("--dont_eval_duplication".to_string(), None),
             ("--length_required".to_string(), Some("35".to_string())),
             (
