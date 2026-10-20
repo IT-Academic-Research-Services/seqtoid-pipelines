@@ -14,6 +14,13 @@ pub enum TargetType {
     Bacterial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum,  Default)]
+pub enum LibraryType {
+    #[default]
+    DNA,
+    RNA,
+}
+
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
@@ -243,5 +250,8 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = false)]
     pub no_version_check: bool,
+
+    #[arg(long = "library_type", default_value = "DNA", value_enum)]
+    pub library_type: LibraryType,
 
 }

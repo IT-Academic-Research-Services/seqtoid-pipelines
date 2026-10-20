@@ -66,6 +66,7 @@ pub static SIMD_LEVEL: Lazy<SimdLevel> = Lazy::new(|| {
     crate::utils::system::detect_simd_level()
 });
 
+
 lazy_static! {
     pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
         let mut m = HashMap::new();

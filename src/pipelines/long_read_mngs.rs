@@ -12,10 +12,16 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType, BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG, BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG};
-use crate::cli::args::Technology;
+use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
+                           MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
+                          BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
+                          SamtoolsSubcommand};
+use crate::cli::args::{Technology, LibraryType};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::fastp::FastpConfig;
+use crate::utils::command::minimap2::{Minimap2Config};
+use crate::utils::command::samtools::{SamtoolsConfig};
+use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
@@ -267,6 +273,313 @@ async fn fastp_qc(
     ))
 }
 
+async fn minimap2_host_filter(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+    host_index_path: PathBuf,
+    output_bam_path: PathBuf,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        tokio::sync::oneshot::Receiver<StreamRecordStats>,
+        Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    // ------------------------------------------------------------------
+    // minimap2
+    //
+    // The WDL selects splice-aware alignment for RNA and map-ont for DNA.
+    // Input comes directly from the previous FASTQ stream.
+    // ------------------------------------------------------------------
+
+    let library_type = config.args.library_type;
+    let minimap_preset = match library_type {
+        LibraryType::DNA => "map-ont",
+        LibraryType::RNA => "splice",
+    };
+
+    let minimap2_config = Minimap2Config {
+        minimap2_index_path: host_index_path,
+        r1_path: None,
+        r2_path: None,
+        option_fields: HashMap::from([(
+            "-ax".to_string(),
+            Some(minimap_preset.to_string()),
+        )]),
+        num_threads: None,
+    };
+
+    let minimap2_args =
+        generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config)).map_err(|e| {
+            PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
+    let (minimap2_child, minimap2_task, minimap2_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        StreamDataType::OntFastq,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(minimap2_task);
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_out_stream = {
+        let mut guard = minimap2_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // ------------------------------------------------------------------
+    // The minimap2 SAM stream feeds two independent samtools processes:
+    //
+    //   1. fastq -n -f 4 -> downstream unmapped FASTQ stream
+    //   2. view -b        -> host-filter BAM file
+    // ------------------------------------------------------------------
+    let (sam_streams, sam_router_done_rx) = fanout_to_channels(
+        ReceiverStream::new(minimap2_out_stream),
+        2,
+        "host_filter",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(sam_router_done_rx);
+
+    let mut sam_streams_iter = sam_streams.into_iter();
+
+    // ------------------------------------------------------------------
+    // Branch 1: unmapped FASTQ
+    // ------------------------------------------------------------------
+    let unmapped_sam_stream = ReceiverStream::new(
+        sam_streams_iter
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let samtools_fastq_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-f".to_string(), Some("4".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let samtools_fastq_args =
+        generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config)).map_err(|e| {
+            PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
+    let (
+        samtools_fastq_child,
+        samtools_fastq_task,
+        samtools_fastq_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        unmapped_sam_stream.into_inner(),
+        SAMTOOLS_TAG,
+        samtools_fastq_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(samtools_fastq_task);
+    cleanup_tasks.push(samtools_fastq_err_task);
+
+    let unmapped_fastq_stream = {
+        let mut guard = samtools_fastq_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // ------------------------------------------------------------------
+    // Tee unmapped FASTQ:
+    //
+    //   branch 1 -> next pipeline stage
+    //   branch 2 -> read/base counter
+    // ------------------------------------------------------------------
+    let (count_streams, count_router_done_rx) = fanout_to_channels(
+        ReceiverStream::new(unmapped_fastq_stream),
+        2,
+        "host_filter_count",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(count_router_done_rx);
+
+    let mut count_streams_iter = count_streams.into_iter();
+
+    let host_filtered_stream = ReceiverStream::new(
+        count_streams_iter
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let host_filtered_count_stream = ReceiverStream::new(
+        count_streams_iter
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let (count_tx, count_rx) =
+        tokio::sync::oneshot::channel::<StreamRecordStats>();
+
+    let count_task = tokio::spawn(async move {
+        let stats = stream_record_counter(
+            host_filtered_count_stream.into_inner(),
+            false,
+        )
+            .await?;
+
+        debug!(
+            "Host filter output: {} reads, {} bases",
+            stats.reads,
+            stats.bases
+        );
+
+        let _ = count_tx.send(stats);
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(count_task);
+
+    // ------------------------------------------------------------------
+    // Branch 2: BAM
+    // ------------------------------------------------------------------
+    let mapped_sam_stream = ReceiverStream::new(
+        sam_streams_iter
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let samtools_view_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([
+            ("-S".to_string(), None),
+            ("-b".to_string(), None),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let samtools_view_args =
+        generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_view_config)).map_err(|e| {
+            PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
+    let (
+        samtools_view_child,
+        samtools_view_task,
+        samtools_view_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        mapped_sam_stream.into_inner(),
+        SAMTOOLS_TAG,
+        samtools_view_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(samtools_view_task);
+    cleanup_tasks.push(samtools_view_err_task);
+
+    let bam_stream = {
+        let mut guard = samtools_view_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    let bam_write_task = write_byte_stream_to_file(
+        &output_bam_path,
+        ReceiverStream::new(bam_stream),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "host_filter_bam",
+        false,
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(bam_write_task);
+
+    Ok((
+        host_filtered_stream,
+        count_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -289,6 +602,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mut cleanup_receivers: Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> =
         Vec::new();
     let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let mut host_filter_temp_dirs: Vec<TempDir> = Vec::new();
     let mut final_temp_dirs: Vec<TempDir> = Vec::new();
     let temp_paths: Vec<PathBuf> = Vec::new();
 
@@ -338,11 +652,67 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
 
+    //Host filtering
+
+    let (
+        _host_ref_fasta_path,
+        host_index_path,
+        _host_ref_temp,
+        _host_index_temp,
+        host_temp_dir,
+        _host_ref_tasks,
+    ) = minimap2_index_prep(
+        &config,
+        &config.ram_temp_dir,
+        config.args.host_sequence.clone(),
+        config.args.host_index.clone(),
+        "host",
+    )
+        .await?;
+
+    debug!("Host index : {}", host_index_path.display());
+
+    let (
+        host_filter_out_stream,
+        host_filter_stats,
+        host_filter_cleanup_tasks,
+        host_filter_cleanup_receivers,
+    ) = minimap2_host_filter(
+        config.clone(),
+        qc_fastp_out_stream,
+        host_index_path,
+        out_dir.join("sample.hostfiltered.bam"),
+    )
+        .await?;
+
+    cleanup_tasks.extend(host_filter_cleanup_tasks);
+    cleanup_receivers.extend(host_filter_cleanup_receivers);
+    host_filter_temp_dirs.extend(host_temp_dir);
+
+
+    
+    // Early cleanup upstream temp dirs (host filter, etc.)
+    for td in &host_filter_temp_dirs {
+        if let Err(e) = std::fs::remove_dir_all(td.path()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Early temp dir cleanup failed (non-fatal): {}", e);
+            } else {
+                debug!("Temp dir already gone: {}", td.path().display());
+            }
+        } else {
+            info!("Early cleanup: removed temp dir {}", td.path().display());
+        }
+    }
+    host_filter_temp_dirs.clear();
+
+
+
+
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
-    let mut final_temp_drain_stream = qc_fastp_out_stream;
+    let mut final_temp_drain_stream = host_filter_out_stream;
 
     let final_temp_drain_task = tokio::spawn(async move {
         while final_temp_drain_stream.next().await.is_some() {}
