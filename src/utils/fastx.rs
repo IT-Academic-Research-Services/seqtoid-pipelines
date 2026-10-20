@@ -83,10 +83,18 @@ pub struct PairedFastqChunkingSummary {
     pub total_r2_records: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamRecordStats {
     pub reads: u64,
     pub bases: u64,
+    pub mean: f64,
+    pub min: u64,
+    pub max: u64,
+    pub std_deviation: f64,
+    pub mean_absolute_deviation: f64,
+    pub mode: u64,
+    pub median: f64,
+    pub length_counts: HashMap<u64, u64>,
 }
 
 lazy_static! {
@@ -1391,19 +1399,81 @@ pub async fn stream_record_counter(
 
     let mut stats = StreamRecordStats::default();
 
-    // Bytes can split anywhere, so retain only the incomplete line
-    // between chunks.
+    // Bytes can split anywhere, so retain only the incomplete FASTX
+    // record between chunks.
     let mut pending = Vec::<u8>::new();
 
-    // Only needed for Bytes output.
-    // FASTQ: header -> sequence -> '+' -> quality
-    // FASTA: header -> sequence lines until next header
+    // FASTQ: four lines per record.
+    // FASTA: a record continues until the next '>' header.
     let mut byte_format: Option<u8> = None;
-    let mut fastq_line: u8 = 0;
-    let mut in_fasta_record = false;
+    let mut fastq_line_count: usize = 0;
+    let mut current_record = Vec::<u8>::new();
+
+    // Update all statistics for one completed record.
+    let mut add_record = |read_length: u64| {
+        stats.reads += 1;
+        stats.bases += read_length;
+
+        *stats.length_counts.entry(read_length).or_insert(0) += 1;
+
+        if stats.reads == 1 {
+            stats.min = read_length;
+            stats.max = read_length;
+        } else {
+            stats.min = stats.min.min(read_length);
+            stats.max = stats.max.max(read_length);
+        }
+    };
+
+    // Parse one complete FASTX record and return its sequence length.
+    let parse_record_length = |record_bytes: &[u8]| -> Result<u64, anyhow::Error> {
+        let mut reader = needletail::parse_fastx_reader(Cursor::new(record_bytes))
+            .map_err(|e| anyhow!("Failed to parse FASTX record: {}", e))?;
+
+        let record = reader
+            .next()
+            .ok_or_else(|| anyhow!("FASTX record contained no sequence"))?
+            .map_err(|e| anyhow!("Failed to parse FASTX record: {}", e))?;
+
+        Ok(record.seq().len() as u64)
+    };
 
     while let Some(item) = stream.next().await {
         match item {
+            ParseOutput::Fastq(record) => {
+                let read_length = record.seq().len() as u64;
+
+                add_record(read_length);
+
+                if early_exit {
+                    return Ok(StreamRecordStats {
+                        reads: 1,
+                        bases: read_length,
+                        min: read_length,
+                        max: read_length,
+                        length_counts: HashMap::from([(read_length, 1)]),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            ParseOutput::Fasta(record) => {
+                let read_length = record.seq().len() as u64;
+
+                add_record(read_length);
+
+                if early_exit {
+                    return Ok(StreamRecordStats {
+                        reads: 1,
+                        bases: read_length,
+                        min: read_length,
+                        max: read_length,
+                        length_counts: HashMap::from([(read_length, 1)]),
+                        ..Default::default()
+                    });
+                }
+            }
+
             ParseOutput::Bytes(chunk) => {
                 pending.extend_from_slice(&chunk);
 
@@ -1420,35 +1490,30 @@ pub async fn stream_record_counter(
                         continue;
                     }
 
-                    // Determine format from the first non-empty line.
+                    // Determine FASTA vs FASTQ from the first non-empty line.
                     if byte_format.is_none() {
                         match line[0] {
                             b'@' => {
                                 byte_format = Some(b'@');
-                                fastq_line = 1;
+                                fastq_line_count = 1;
 
-                                stats.reads += 1;
+                                current_record.extend_from_slice(&line);
+                                current_record.push(b'\n');
 
                                 if early_exit {
                                     return Ok(StreamRecordStats {
                                         reads: 1,
                                         bases: 0,
+                                        ..Default::default()
                                     });
                                 }
                             }
 
                             b'>' => {
                                 byte_format = Some(b'>');
-                                in_fasta_record = true;
 
-                                stats.reads += 1;
-
-                                if early_exit {
-                                    return Ok(StreamRecordStats {
-                                        reads: 1,
-                                        bases: 0,
-                                    });
-                                }
+                                current_record.extend_from_slice(&line);
+                                current_record.push(b'\n');
                             }
 
                             _ => {
@@ -1463,99 +1528,73 @@ pub async fn stream_record_counter(
 
                     match byte_format {
                         Some(b'@') => {
-                            match fastq_line {
-                                // Sequence line.
-                                1 => {
-                                    stats.bases += line.len() as u64;
-                                    fastq_line = 2;
-                                }
+                            current_record.extend_from_slice(&line);
+                            current_record.push(b'\n');
 
-                                // '+' separator.
-                                2 => {
-                                    if line[0] != b'+' {
-                                        return Err(anyhow!(
-                                            "Invalid FASTQ byte stream: expected '+' separator"
-                                        ));
-                                    }
+                            fastq_line_count += 1;
 
-                                    fastq_line = 3;
-                                }
+                            // Standard four-line FASTQ record is complete.
+                            if fastq_line_count == 4 {
+                                let read_length =
+                                    parse_record_length(&current_record)?;
 
-                                // Quality line.
-                                3 => {
-                                    fastq_line = 0;
-                                }
+                                add_record(read_length);
 
-                                // Next header.
-                                0 => {
-                                    if line[0] != b'@' {
-                                        return Err(anyhow!(
-                                            "Invalid FASTQ byte stream: expected '@' header"
-                                        ));
-                                    }
-
-                                    stats.reads += 1;
-
-                                    if early_exit {
-                                        return Ok(StreamRecordStats {
-                                            reads: 1,
-                                            bases: 0,
-                                        });
-                                    }
-
-                                    fastq_line = 1;
-                                }
-
-                                _ => unreachable!(),
-                            }
-                        }
-
-                        Some(b'>') => {
-                            if line[0] == b'>' {
-                                stats.reads += 1;
-                                in_fasta_record = true;
+                                current_record.clear();
+                                fastq_line_count = 0;
 
                                 if early_exit {
                                     return Ok(StreamRecordStats {
                                         reads: 1,
-                                        bases: 0,
+                                        bases: read_length,
+                                        min: read_length,
+                                        max: read_length,
+                                        length_counts: HashMap::from([
+                                            (read_length, 1),
+                                        ]),
+                                        ..Default::default()
                                     });
                                 }
-                            } else if in_fasta_record {
-                                stats.bases += line.len() as u64;
+                            }
+                        }
+
+                        Some(b'>') => {
+                            // A new '>' starts the next FASTA record.
+                            if line[0] == b'>' {
+                                // Finalize the previous record.
+                                if !current_record.is_empty() {
+                                    let read_length =
+                                        parse_record_length(&current_record)?;
+
+                                    add_record(read_length);
+
+                                    current_record.clear();
+
+                                    if early_exit {
+                                        return Ok(StreamRecordStats {
+                                            reads: 1,
+                                            bases: read_length,
+                                            min: read_length,
+                                            max: read_length,
+                                            length_counts: HashMap::from([
+                                                (read_length, 1),
+                                            ]),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+
+                                current_record.extend_from_slice(&line);
+                                current_record.push(b'\n');
+                            } else {
+                                // Sequence line belonging to current FASTA record.
+                                current_record.extend_from_slice(&line);
+                                current_record.push(b'\n');
                             }
                         }
 
                         _ => unreachable!(),
                     }
-                }
-            }
-
-            ParseOutput::Fastq(record) => {
-                let bases = record.seq().len() as u64;
-
-                stats.reads += 1;
-                stats.bases += bases;
-
-                if early_exit {
-                    return Ok(StreamRecordStats {
-                        reads: 1,
-                        bases,
-                    });
-                }
-            }
-
-            ParseOutput::Fasta(record) => {
-                let bases = record.seq().len() as u64;
-
-                stats.reads += 1;
-                stats.bases += bases;
-
-                if early_exit {
-                    return Ok(StreamRecordStats {
-                        reads: 1,
-                        bases,
-                    });
                 }
             }
         }
@@ -1569,24 +1608,25 @@ pub async fn stream_record_counter(
 
         if !pending.is_empty() {
             match byte_format {
-                Some(b'@') => match fastq_line {
-                    1 => {
-                        stats.bases += pending.len() as u64;
+                Some(b'@') => {
+                    current_record.extend_from_slice(&pending);
+                    current_record.push(b'\n');
+
+                    fastq_line_count += 1;
+
+                    if fastq_line_count == 4 {
+                        let read_length =
+                            parse_record_length(&current_record)?;
+
+                        add_record(read_length);
+                        current_record.clear();
+                        fastq_line_count = 0;
                     }
-                    0 => {
-                        if pending[0] == b'@' {
-                            stats.reads += 1;
-                        }
-                    }
-                    _ => {}
-                },
+                }
 
                 Some(b'>') => {
-                    if pending[0] == b'>' {
-                        stats.reads += 1;
-                    } else if in_fasta_record {
-                        stats.bases += pending.len() as u64;
-                    }
+                    current_record.extend_from_slice(&pending);
+                    current_record.push(b'\n');
                 }
 
                 None => {
@@ -1599,6 +1639,90 @@ pub async fn stream_record_counter(
             }
         }
     }
+
+    // Finalize the last FASTA record.
+    if matches!(byte_format, Some(b'>')) && !current_record.is_empty() {
+        let read_length = parse_record_length(&current_record)?;
+        add_record(read_length);
+    }
+
+    // A FASTQ stream must end at a record boundary.
+    if matches!(byte_format, Some(b'@')) && fastq_line_count != 0 {
+        return Err(anyhow!(
+            "Incomplete FASTQ record at end of byte stream"
+        ));
+    }
+
+    if stats.reads == 0 {
+        return Ok(stats);
+    }
+
+    // Mean.
+    stats.mean = stats.bases as f64 / stats.reads as f64;
+
+    // Derive standard deviation, mean absolute deviation, and mode
+    // directly from the retained read-length histogram.
+    let mut squared_deviation_sum = 0.0;
+    let mut absolute_deviation_sum = 0.0;
+
+    let mut sorted_lengths: Vec<(u64, u64)> = stats
+        .length_counts
+        .iter()
+        .map(|(&length, &count)| (length, count))
+        .collect();
+
+    sorted_lengths.sort_unstable_by_key(|&(length, _)| length);
+
+    let mut mode_length = sorted_lengths[0].0;
+    let mut mode_count = sorted_lengths[0].1;
+
+    for &(length, count) in &sorted_lengths {
+        let length_f64 = length as f64;
+        let count_f64 = count as f64;
+        let deviation = length_f64 - stats.mean;
+
+        squared_deviation_sum += deviation * deviation * count_f64;
+        absolute_deviation_sum += deviation.abs() * count_f64;
+
+        if count > mode_count {
+            mode_count = count;
+            mode_length = length;
+        }
+    }
+
+    stats.std_deviation =
+        (squared_deviation_sum / stats.reads as f64).sqrt();
+
+    stats.mean_absolute_deviation =
+        absolute_deviation_sum / stats.reads as f64;
+
+    stats.mode = mode_length;
+
+    // Exact median from the read-length histogram.
+    let lower_rank = (stats.reads - 1) / 2;
+    let upper_rank = stats.reads / 2;
+
+    let mut cumulative = 0u64;
+    let mut lower_value = stats.min;
+    let mut upper_value = stats.max;
+
+    for &(length, count) in &sorted_lengths {
+        let next = cumulative + count;
+
+        if lower_rank >= cumulative && lower_rank < next {
+            lower_value = length;
+        }
+
+        if upper_rank >= cumulative && upper_rank < next {
+            upper_value = length;
+            break;
+        }
+
+        cumulative = next;
+    }
+
+    stats.median =
+        (lower_value as f64 + upper_value as f64) / 2.0;
 
     Ok(stats)
 }
