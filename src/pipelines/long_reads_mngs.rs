@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-
+use std::collections::HashMap;
 
 use anyhow::anyhow;
 use futures::future::try_join_all;
@@ -13,10 +13,12 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType, BOWTIE2_TAG, MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG, BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG};
 use crate::cli::args::Technology;
-use crate::utils::command::check_versions;
+use crate::utils::command::{check_versions, generate_cli};
+use crate::utils::command::fastp::FastpConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
-use crate::utils::fastx::{read_fastq};
-use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput};
+use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter};
+use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
+                            stream_to_cmd, parse_child_output, ChildStream, ParseMode};
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
 ///
@@ -118,6 +120,151 @@ async fn validate_input(
     ))
 }
 
+
+async fn fastp_qc(
+    config: Arc<RunConfig>,
+    input_stream: ReceiverStream<ParseOutput>,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+        tokio::sync::oneshot::Receiver<anyhow::Result<StreamRecordStats, anyhow::Error>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let fastp_config = FastpConfig {
+        command_fields: HashMap::from([
+            ("--disable_adapter_trimming".to_string(), None),
+            (
+                "--qualified_quality_phred".to_string(),
+                Some("9".to_string()),
+            ),
+            (
+                "--length_required".to_string(),
+                Some("100".to_string()),
+            ),
+            ("--low_complexity_filter".to_string(), None),
+            (
+                "--complexity_threshold".to_string(),
+                Some("30".to_string()),
+            ),
+            ("--dont_eval_duplication".to_string(), None),
+        ]),
+        paired: false,
+    };
+
+    let fastp_args =
+        generate_cli(FASTP_TAG, &config, Some(&fastp_config)).map_err(|e| {
+            PipelineError::ToolExecution {
+                tool: FASTP_TAG.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
+    let (fastp_child, fastp_stream_task, fastp_err_task) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        FASTP_TAG,
+        fastp_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(fastp_stream_task);
+    cleanup_tasks.push(fastp_err_task);
+
+    let fastp_out_stream = {
+        let mut guard = fastp_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FASTP_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // Tee the fastp output:
+    //   branch 1 -> next pipeline stage
+    //   branch 2 -> streamed read/base counter
+    let tee_count_input = ReceiverStream::new(fastp_out_stream);
+
+    let (tee_streams, tee_router_done_rx) = fanout_to_channels(
+        tee_count_input,
+        2,
+        "fastp_count",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: "fanout_to_channels".to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_receivers.push(tee_router_done_rx);
+
+    let mut tee_streams_iter = tee_streams.into_iter();
+
+    let qc_out_stream = ReceiverStream::new(
+        tee_streams_iter
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let qc_count_stream = ReceiverStream::new(
+        tee_streams_iter
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let (count_tx, count_result_rx) =
+        tokio::sync::oneshot::channel::<Result<StreamRecordStats, anyhow::Error>>();
+
+    let count_task = tokio::spawn(async move {
+        match stream_record_counter(qc_count_stream.into_inner(), false).await {
+            Ok(stats) => {
+                debug!(
+                    "Fastp output reads: {}, bases: {}",
+                    stats.reads,
+                    stats.bases
+                );
+
+                let _ = count_tx.send(Ok(stats));
+                Ok(())
+            }
+
+            Err(e) => {
+                let _ = count_tx.send(Err(e));
+                Err(anyhow!("Failed to count fastp output reads and bases"))
+            }
+        }
+    });
+
+    cleanup_tasks.push(count_task);
+
+    Ok((
+        qc_out_stream,
+        cleanup_tasks,
+        cleanup_receivers,
+        count_result_rx,
+    ))
+}
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
