@@ -776,11 +776,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Ok::<_, PipelineError>((stats))
     };
 
+    let human_filter_stats_fut = async move {
+        let stats = human_filter_stats
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Human filter stats channel failed: {}", e)))?;
+
+        info!(
+        "Human filter: {} reads, {} bases",
+        stats.reads,
+        stats.bases
+    );
+
+        Ok::<_, PipelineError>(stats)
+    };
 
 
-    let (_validation_and_qc, ) = tokio::try_join!(
+    let (_validation_stats, human_filtered_stats) = tokio::try_join!(
         validation_and_qc_fut,
+        human_filter_stats_fut,
     )?;
+
+    info!("Human filtered stats: {:?}", human_filtered_stats);
 
     // *******************
     // Cleanup
