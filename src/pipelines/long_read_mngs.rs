@@ -690,7 +690,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(host_filter_cleanup_tasks);
     cleanup_receivers.extend(host_filter_cleanup_receivers);
-    host_filter_temp_dirs.extend(host_temp_dir);
+    final_temp_dirs.extend(host_temp_dir);
 
     //Human filtering
 
@@ -721,29 +721,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         host_filter_out_stream,
         human_index_path,
-        out_dir.join("sample.hostfiltered.bam"),
+        out_dir.join("sample.humanfiltered.bam"),
     )
         .await?;
 
     cleanup_tasks.extend(human_filter_cleanup_tasks);
     cleanup_receivers.extend(human_filter_cleanup_receivers);
-    host_filter_temp_dirs.extend(human_temp_dir);
-
-
-    // Early cleanup upstream temp dirs (host filter, etc.)
-    for td in &host_filter_temp_dirs {
-        if let Err(e) = std::fs::remove_dir_all(td.path()) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Early temp dir cleanup failed (non-fatal): {}", e);
-            } else {
-                debug!("Temp dir already gone: {}", td.path().display());
-            }
-        } else {
-            info!("Early cleanup: removed temp dir {}", td.path().display());
-        }
-    }
-    host_filter_temp_dirs.clear();
-
+    final_temp_dirs.extend(human_temp_dir);
 
 
 
