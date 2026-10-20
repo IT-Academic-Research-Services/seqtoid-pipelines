@@ -100,7 +100,7 @@ async fn validate_input(
         &validated_file_path,
         val_file_stream,
         config.clone(),
-        StreamDataType::IlluminaFastq,
+        StreamDataType::OntFastq,
         "validate_input",
         false
     )
@@ -108,7 +108,6 @@ async fn validate_input(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     cleanup_tasks.push(val_file_write_task);
-
 
 
     Ok((
