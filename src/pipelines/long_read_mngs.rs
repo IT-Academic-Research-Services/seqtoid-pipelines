@@ -1,5 +1,6 @@
 //! Long Read Metagenomics Pipeline
 
+use tokio_stream::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -330,7 +331,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
 
+    // QC with fastp
+    let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) =
+        fastp_qc(config.clone(), val_out_stream).await?;
+    cleanup_tasks.extend(qc_cleanup_tasks);
 
+
+
+    // *******************
+    // Temporary final stream drain for construction
+    // *******************
+
+    let mut final_temp_drain_stream = qc_fastp_out_stream;
+
+    let final_temp_drain_task = tokio::spawn(async move {
+        while final_temp_drain_stream.next().await.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************
