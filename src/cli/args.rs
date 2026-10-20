@@ -85,7 +85,7 @@ pub struct Arguments {
     #[arg(short = 'a', long)]  // For host removal
     pub host_sequence : Option<String>,
 
-    #[arg(short = 'a', long)]  // For human removal
+    #[arg(long)]  // For human removal
     pub human_sequence : Option<String>,
 
     #[arg(long, help = "Optional path to pre-built minimap2 index for host reference (e.g., hg38.mmi)")]
