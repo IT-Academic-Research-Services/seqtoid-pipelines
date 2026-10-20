@@ -1,4 +1,4 @@
 pub mod consensus_genome;
 pub mod short_read_mngs;
 pub mod db;
-pub mod long_reads_mngs;
+pub mod long_read_mngs;
