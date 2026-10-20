@@ -81,7 +81,7 @@ use crate::utils::fastx::{
     generate_taxid_fasta, generate_taxid_locator, parse_byte_stream_to_fastq, raw_read_count,
     read_fasta, read_fastq, stream_record_counter, write_combined_fastq,
     write_fasta_stream_to_file, SequenceRecord, chunk_paired_fastq, generate_annotated_fasta_stream,
-    UNMAPPED_HEADER_PREFIX
+    UNMAPPED_HEADER_PREFIX, StreamRecordStats
 };
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
@@ -1528,9 +1528,9 @@ async fn fastp_qc(
 
     let count_task = tokio::spawn(async move {
         match stream_record_counter(qc_count_stream.into_inner(), false).await {
-            Ok(count) => {
-                debug!("Fastp output reads: {}", count);
-                let _ = count_tx.send(Ok(count)); // Send the count result
+            Ok(stats) => {
+                debug!("Fastp output reads: {}", stats.reads);
+                let _ = count_tx.send(Ok(stats.reads));
                 Ok(())
             }
             Err(e) => {
@@ -1539,6 +1539,7 @@ async fn fastp_qc(
             }
         }
     });
+
     cleanup_tasks.push(count_task);
 
     Ok((
@@ -11460,12 +11461,19 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
     cleanup_tasks.push(initial_write_combined_handle);
 
-    let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false).await?;
-    let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false).await?;
+    let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false)
+        .await?
+        .reads;
+
+    let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false)
+        .await?
+        .reads;
+
     info!(
-        "Experimental: {} mapped, {} combined records",
-        initial_mapped_count, initial_combined_count
-    );
+    "Experimental: {} mapped, {} combined records",
+    initial_mapped_count,
+    initial_combined_count
+);
 
     info!("Starting generate_taxid_locator on second");
     let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) =

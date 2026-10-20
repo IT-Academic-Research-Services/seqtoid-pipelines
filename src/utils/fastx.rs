@@ -83,6 +83,11 @@ pub struct PairedFastqChunkingSummary {
     pub total_r2_records: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamRecordStats {
+    pub reads: u64,
+    pub bases: u64,
+}
 
 lazy_static! {
     static ref R1_R2_TAGS: HashMap<&'static str, &'static str> = {
@@ -1378,43 +1383,224 @@ pub fn write_fasta_to_fifo(fasta_path: &PathBuf, fifo_path: &PathBuf) -> Result<
     Ok(())
 }
 
-#[allow(dead_code)]
 pub async fn stream_record_counter(
-    rx: mpsc::Receiver<ParseOutput>,
+    rx: Receiver<ParseOutput>,
     early_exit: bool,
-) -> Result<u64, anyhow::Error> {
+) -> Result<StreamRecordStats, anyhow::Error> {
     let mut stream = ReceiverStream::new(rx);
-    let mut counter: u64 = 0;
+
+    let mut stats = StreamRecordStats::default();
+
+    // Bytes can split anywhere, so retain only the incomplete line
+    // between chunks.
+    let mut pending = Vec::<u8>::new();
+
+    // Only needed for Bytes output.
+    // FASTQ: header -> sequence -> '+' -> quality
+    // FASTA: header -> sequence lines until next header
+    let mut byte_format: Option<u8> = None;
+    let mut fastq_line: u8 = 0;
+    let mut in_fasta_record = false;
 
     while let Some(item) = stream.next().await {
         match item {
             ParseOutput::Bytes(chunk) => {
-                let chunk_str = String::from_utf8_lossy(&chunk);
-                for line in chunk_str.lines() {
-                    if line.starts_with('@') || line.starts_with('>') {
-                        counter += 1;
-                        if early_exit {
-                            return Ok(1); // Early exit: Not empty
+                pending.extend_from_slice(&chunk);
+
+                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                    let mut line: Vec<u8> = pending.drain(..=pos).collect();
+
+                    // Remove '\n' and optional '\r'.
+                    line.pop();
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    // Determine format from the first non-empty line.
+                    if byte_format.is_none() {
+                        match line[0] {
+                            b'@' => {
+                                byte_format = Some(b'@');
+                                fastq_line = 1;
+
+                                stats.reads += 1;
+
+                                if early_exit {
+                                    return Ok(StreamRecordStats {
+                                        reads: 1,
+                                        bases: 0,
+                                    });
+                                }
+                            }
+
+                            b'>' => {
+                                byte_format = Some(b'>');
+                                in_fasta_record = true;
+
+                                stats.reads += 1;
+
+                                if early_exit {
+                                    return Ok(StreamRecordStats {
+                                        reads: 1,
+                                        bases: 0,
+                                    });
+                                }
+                            }
+
+                            _ => {
+                                return Err(anyhow!(
+                                    "Invalid FASTX byte stream: expected '@' or '>' header"
+                                ));
+                            }
                         }
+
+                        continue;
+                    }
+
+                    match byte_format {
+                        Some(b'@') => {
+                            match fastq_line {
+                                // Sequence line.
+                                1 => {
+                                    stats.bases += line.len() as u64;
+                                    fastq_line = 2;
+                                }
+
+                                // '+' separator.
+                                2 => {
+                                    if line[0] != b'+' {
+                                        return Err(anyhow!(
+                                            "Invalid FASTQ byte stream: expected '+' separator"
+                                        ));
+                                    }
+
+                                    fastq_line = 3;
+                                }
+
+                                // Quality line.
+                                3 => {
+                                    fastq_line = 0;
+                                }
+
+                                // Next header.
+                                0 => {
+                                    if line[0] != b'@' {
+                                        return Err(anyhow!(
+                                            "Invalid FASTQ byte stream: expected '@' header"
+                                        ));
+                                    }
+
+                                    stats.reads += 1;
+
+                                    if early_exit {
+                                        return Ok(StreamRecordStats {
+                                            reads: 1,
+                                            bases: 0,
+                                        });
+                                    }
+
+                                    fastq_line = 1;
+                                }
+
+                                _ => unreachable!(),
+                            }
+                        }
+
+                        Some(b'>') => {
+                            if line[0] == b'>' {
+                                stats.reads += 1;
+                                in_fasta_record = true;
+
+                                if early_exit {
+                                    return Ok(StreamRecordStats {
+                                        reads: 1,
+                                        bases: 0,
+                                    });
+                                }
+                            } else if in_fasta_record {
+                                stats.bases += line.len() as u64;
+                            }
+                        }
+
+                        _ => unreachable!(),
                     }
                 }
             }
-            ParseOutput::Fastq(_) => {
-                counter += 1;
+
+            ParseOutput::Fastq(record) => {
+                let bases = record.seq().len() as u64;
+
+                stats.reads += 1;
+                stats.bases += bases;
+
                 if early_exit {
-                    return Ok(1);
+                    return Ok(StreamRecordStats {
+                        reads: 1,
+                        bases,
+                    });
                 }
             }
-            ParseOutput::Fasta(_) => {
-                counter += 1;
+
+            ParseOutput::Fasta(record) => {
+                let bases = record.seq().len() as u64;
+
+                stats.reads += 1;
+                stats.bases += bases;
+
                 if early_exit {
-                    return Ok(1);
+                    return Ok(StreamRecordStats {
+                        reads: 1,
+                        bases,
+                    });
                 }
             }
         }
     }
 
-    Ok(counter)
+    // Handle a final unterminated line.
+    if !pending.is_empty() {
+        if pending.last() == Some(&b'\r') {
+            pending.pop();
+        }
+
+        if !pending.is_empty() {
+            match byte_format {
+                Some(b'@') => match fastq_line {
+                    1 => {
+                        stats.bases += pending.len() as u64;
+                    }
+                    0 => {
+                        if pending[0] == b'@' {
+                            stats.reads += 1;
+                        }
+                    }
+                    _ => {}
+                },
+
+                Some(b'>') => {
+                    if pending[0] == b'>' {
+                        stats.reads += 1;
+                    } else if in_fasta_record {
+                        stats.bases += pending.len() as u64;
+                    }
+                }
+
+                None => {
+                    return Err(anyhow!(
+                        "FASTX byte stream contained no complete record"
+                    ));
+                }
+
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 /// Filters a stream of FASTQ records based on a predicate applied to the ID line.
@@ -3303,10 +3489,10 @@ mod tests {
         assert_eq!(count, 4);
         Ok(())
     }
-
     #[tokio::test]
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
+
         let fastq_data = vec![
             ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec().into()),
             ParseOutput::Fastq(SequenceRecord::Fastq {
@@ -3323,14 +3509,18 @@ mod tests {
             }
         });
 
-        let count = stream_record_counter(rx, false).await?;
-        assert_eq!(count, 2);
+        let stats = stream_record_counter(rx, false).await?;
+
+        assert_eq!(stats.reads, 2);
+        assert_eq!(stats.bases, 8);
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_stream_record_counter_fasta_early_exit() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
+
         let fasta_data = vec![
             ParseOutput::Bytes(b">seq1\nATCG\n".to_vec().into()),
             ParseOutput::Fasta(SequenceRecord::Fasta {
@@ -3346,8 +3536,11 @@ mod tests {
             }
         });
 
-        let count = stream_record_counter(rx, true).await?;
-        assert_eq!(count, 1);
+        let stats = stream_record_counter(rx, true).await?;
+
+        assert_eq!(stats.reads, 1);
+        assert_eq!(stats.bases, 0);
+
         Ok(())
     }
 
@@ -3355,11 +3548,14 @@ mod tests {
     async fn test_stream_record_counter_empty() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
         drop(tx);
-        let count = stream_record_counter(rx, false).await?;
-        assert_eq!(count, 0);
+
+        let stats = stream_record_counter(rx, false).await?;
+
+        assert_eq!(stats.reads, 0);
+        assert_eq!(stats.bases, 0);
+
         Ok(())
     }
-
     #[tokio::test]
     async fn test_parse_and_filter_fastq_id() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
