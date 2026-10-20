@@ -3523,12 +3523,20 @@ async fn nr_distributed_non_host_align(
     // ------------------------------------------------------------------
     // 2. Chunk FASTQs.
     //
-    // Paired-end keeps the existing chunk_paired_fastq() path.
-    // Single-end reads R1 records and writes complete FASTQ records
-    // into deterministic R1-only chunk files.
+    // Chunk count is determined by non-host FASTQ volume rather than
+    // worker count. Worker count determines execution capacity; chunk
+    // count determines the amount of Diamond work in each WorkUnit.
+    //
+    // Empirical target:
+    //   ~75 MiB of R1 + ~75 MiB of R2 per paired-end WorkUnit.
+    //
+    // This is deliberately aggressive because Diamond has a substantial
+    // per-invocation database-processing cost. We want enough query
+    // material in each invocation to amortize that cost while keeping
+    // individual Diamond runs in the approximate 1-1.5 hour target range.
     // ------------------------------------------------------------------
 
-    const CHUNKS_PER_WORKER: usize = 4;
+    const TARGET_CHUNK_BYTES_PER_END: u64 = 75 * 1024 * 1024;
 
     let total_records =
         raw_read_count(
@@ -3538,35 +3546,60 @@ async fn nr_distributed_non_host_align(
             .await
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Non-host FASTQ count task join failed: {e}"
-                ))
+            "Non-host FASTQ count task join failed: {e}"
+        ))
             })?
             .map_err(|e| {
                 PipelineError::Other(anyhow!(
-                    "Failed to count non-host FASTQ records: {e}"
-                ))
+            "Failed to count non-host FASTQ records: {e}"
+        ))
             })?;
 
     if total_records == 0 {
-        return Err(
-            PipelineError::EmptyStream
-        );
+        return Err(PipelineError::EmptyStream);
     }
 
-    let target_chunks =
-        requested_workers
-            .checked_mul(
-                CHUNKS_PER_WORKER,
-            )
-            .ok_or_else(|| {
-                PipelineError::InvalidConfig(
-                    "Distributed chunk count overflow"
-                        .to_string(),
-                )
-            })?;
+    let r1_bytes = tokio::fs::metadata(&non_host_r1_efs)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Failed to stat non-host R1 FASTQ {}: {e}",
+            non_host_r1_efs.display()
+        ))
+        })?
+        .len();
 
-    let chunks_dir =
-        efs_base.join("chunks");
+    let r2_bytes = match &non_host_r2_efs {
+        Some(path) => tokio::fs::metadata(path)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to stat non-host R2 FASTQ {}: {e}",
+                path.display()
+            ))
+            })?
+            .len(),
+        None => 0,
+    };
+
+    // Use the larger end for conservative paired-end chunk sizing.
+    let bytes_per_end = r1_bytes.max(r2_bytes);
+
+    let target_chunks = bytes_per_end
+        .div_ceil(TARGET_CHUNK_BYTES_PER_END)
+        .max(1);
+
+    info!(
+    "Distributed NR size-based chunking: R1={} bytes, R2={} bytes, \
+     {} requested workers, target {} chunks, target ~{} MiB/end/chunk",
+    r1_bytes,
+    r2_bytes,
+    requested_workers,
+    target_chunks,
+    TARGET_CHUNK_BYTES_PER_END / (1024 * 1024)
+);
+
+    let chunks_dir = efs_base.join("chunks");
 
     let chunk_work_units:
         Vec<(
@@ -3595,25 +3628,21 @@ async fn nr_distributed_non_host_align(
         let total_pairs =
             total_records / 2;
 
-        let target_chunks =
-            (target_chunks as u64)
-                .min(total_pairs)
-                .max(1);
+            let target_chunks =
+                target_chunks.min(total_pairs.max(1));
 
-        let pairs_per_chunk =
-            (total_pairs
-                + target_chunks
-                - 1)
-                / target_chunks;
+            let pairs_per_chunk =
+                (total_pairs + target_chunks - 1)
+                    / target_chunks;
 
-        info!(
-            "Distributed NR chunking: {} pairs, {} requested workers, \
-             target {} chunks, {} pairs/chunk",
-            total_pairs,
-            requested_workers,
-            target_chunks,
-            pairs_per_chunk
-        );
+            info!(
+        "Distributed NR chunking: {} pairs, {} requested workers, \
+         size-based target {} chunks, {} pairs/chunk",
+        total_pairs,
+        requested_workers,
+        target_chunks,
+        pairs_per_chunk
+    );
 
         let chunk_summary =
             chunk_paired_fastq(
