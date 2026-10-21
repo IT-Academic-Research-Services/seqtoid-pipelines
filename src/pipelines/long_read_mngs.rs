@@ -26,6 +26,7 @@ use crate::utils::command::flye::FlyeConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          choose_temp_dir};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream};
+use crate::utils::sambam::filter_clipped_alignments;
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
                             ChannelReader, parse_fastq};
@@ -859,7 +860,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(pre_assembly_fasta_write_task);
 
-    
+
     // Materialize the subsampled FASTQ into scratch.
     let subsampled_fastq_write_task = write_byte_stream_to_file(
         &subsampled_fastq_path,
@@ -887,6 +888,116 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         polishing_iterations: config.args.polishing_iterations,
     };
 
+    let flye_args =
+        generate_cli(
+            FLYE_TAG,
+            &config,
+            Some(&flye_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FLYE_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    info!("Starting Flye assembly: {:?}", flye_args);
+
+    let (mut flye_child, flye_err_task) =
+        crate::utils::streams::spawn_cmd(
+            config.clone(),
+            FLYE_TAG,
+            flye_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FLYE_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    // Drain Flye stderr while Flye runs.
+    cleanup_tasks.push(flye_err_task);
+
+    // Flye must finish before anything can consume its assembly.
+    let flye_status =
+        flye_child
+            .wait()
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: FLYE_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    if flye_status.success() {
+        info!("Flye assembly completed successfully");
+    } else {
+    // Flye failure itself is NOT fatal.
+        warn!(
+        "Flye exited with status {}; continuing because assembly failure is non-fatal",
+        flye_status
+    );
+    }
+
+
+    // ------------------------------------------------------------------
+    // Resolve Flye assembly output.
+    //
+    // Legacy WDL:
+    //
+    //     if [ -f temp_flye_out/assembly.fasta ]
+    //     then
+    //         cat temp_flye_out/assembly.fasta > sample.assembled_reads.fasta
+    //     else
+    //         touch sample.assembled_reads.fasta
+    //     fi
+    //
+    //     mv sample.assembled_reads.fasta contigs.fasta
+    //
+    // Therefore the durable pipeline artifact is always contigs.fasta,
+    // which is empty when Flye did not produce assembly.fasta.
+    // ------------------------------------------------------------------
+
+    let flye_assembly_path =
+        flye_out_dir.join("assembly.fasta");
+
+    let contigs_fasta_path =
+        out_dir.join("contigs.fasta");
+
+    if flye_assembly_path.exists() {
+        tokio::fs::copy(
+            &flye_assembly_path,
+            &contigs_fasta_path,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed to copy Flye assembly {} to {}: {}",
+                    flye_assembly_path.display(),
+                    contigs_fasta_path.display(),
+                    e
+                ))
+            })?;
+
+        info!(
+        "Flye assembly copied to {}",
+        contigs_fasta_path.display()
+    );
+    } else {
+        warn!(
+        "Flye did not produce {}; creating empty contigs.fasta",
+        flye_assembly_path.display()
+    );
+
+        tokio::fs::File::create(&contigs_fasta_path)
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed to create empty {}: {}",
+                    contigs_fasta_path.display(),
+                    e
+                ))
+            })?;
+    }
 
 
     // *******************
