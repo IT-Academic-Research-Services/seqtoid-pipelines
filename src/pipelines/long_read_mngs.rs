@@ -26,7 +26,7 @@ use crate::utils::command::flye::FlyeConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          choose_temp_dir};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream};
-use crate::utils::sambam::filter_clipped_alignments;
+use crate::utils::sambam::{filter_clipped_alignments, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
                             ChannelReader, parse_fastq, spawn_cmd};
@@ -1058,8 +1058,7 @@ async fn run_reads_to_contigs(
             })?
     };
 
-    // Do NOT put this task into cleanup_tasks yet.
-    //
+
     // samtools index requires the BAM to be completely written, so this
     // writer is explicitly awaited below.
     let bam_write_task = write_byte_stream_to_file(
@@ -1989,6 +1988,76 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &mapped_contigs_fasta_path,
     )
         .await?;
+
+
+    // *******************
+    // Generate Contig Stats
+    // *******************
+
+    // Name-sort the final reads-to-contigs BAM before passing it to the
+    // generic generate_info_from_bam_stream() implementation.
+    let name_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-O".to_string(), Some("bam".to_string())),
+            (
+                reads_to_contigs_outputs
+                    .reads_to_contigs_bam
+                    .to_string_lossy()
+                    .to_string(),
+                None,
+            ),
+        ]),
+    };
+
+    let name_sort_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&name_sort_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut name_sort_child, name_sort_err_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        name_sort_args,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(name_sort_err_task);
+
+    let name_sort_rx = parse_child_output(
+        &mut name_sort_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        &config,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        read2contig,
+        contig_stats,
+        contig_unique_counts,
+    ) = generate_info_from_bam_stream(
+        name_sort_rx,
+        0,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
 
     // *******************
     // Temporary final stream drain for construction
