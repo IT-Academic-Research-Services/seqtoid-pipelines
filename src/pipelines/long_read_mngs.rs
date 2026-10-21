@@ -15,14 +15,16 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
                            MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
                           BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
-                          SamtoolsSubcommand};
+                          SamtoolsSubcommand, FLYE_TAG};
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::minimap2::{Minimap2Config};
 use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
+use crate::utils::command::flye::FlyeConfig;
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
+                         choose_temp_dir};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
@@ -771,8 +773,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(subsample_task);
 
-    
-    // Split the byte stream for fastp and write
+    // Split the subsampled stream into:
+    //
+    //   1. pre-assembly FASTA
+    //   2. materialized FASTQ for downstream file-based consumers
+    //
     let (subsampled_streams, subsample_router_done_rx) = fanout_to_channels(
         subsampled_stream,
         2,
@@ -787,17 +792,47 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let mut subsampled_streams_iter = subsampled_streams.into_iter();
 
-    let subsampled_out_stream =
-        ReceiverStream::new(subsampled_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
-
     let subsampled_fasta_input_stream =
-        ReceiverStream::new(subsampled_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
+        ReceiverStream::new(
+            subsampled_streams_iter
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let subsampled_fastq_input_stream =
+        ReceiverStream::new(
+            subsampled_streams_iter
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
 
 
-    //and convert FASTQ to FASTA
+    // *******************
+    // Assembly Stage
+    // *******************
+
+    // Choose scratch for the materialized subsampled FASTQ and Flye work dir.
+    let assembly_temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        1,
+        true,
+    )
+        .await?;
 
     let pre_assembly_fasta_path =
         out_dir.join("pre_assembly.fa");
+
+    let flye_out_dir =
+        assembly_temp_dir.path().join("temp_flye_out");
+
+    let subsampled_fastq_path =
+        assembly_temp_dir.path().join("subsampled.fastq");
+
+    final_temp_dirs.push(assembly_temp_dir);
+
+    //convert FASTQ to FASTA
 
     let (
         pre_assembly_fasta_stream,
@@ -811,32 +846,61 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(fastq_to_fasta_task);
 
 
-    let subsampled_file_write_task = write_byte_stream_to_file(
+    let pre_assembly_fasta_write_task = write_byte_stream_to_file(
         &pre_assembly_fasta_path,
         pre_assembly_fasta_stream,
         config.clone(),
         StreamDataType::OntFastq,
         "pre_assembly_fasta",
-        false
+        false,
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    cleanup_tasks.push(subsampled_file_write_task);
+    cleanup_tasks.push(pre_assembly_fasta_write_task);
+
+    
+    // Materialize the subsampled FASTQ into scratch.
+    let subsampled_fastq_write_task = write_byte_stream_to_file(
+        &subsampled_fastq_path,
+        subsampled_fastq_input_stream,
+        config.clone(),
+        StreamDataType::OntFastq,
+        "pre_assembly_fastq",
+        false,
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+
+    // Flye needs the complete input file, so this is the synchronization point.
+    subsampled_fastq_write_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
+
+
+
+    let flye_config = FlyeConfig {
+        input_fastq: subsampled_fastq_path.clone(),
+        outdir_path: flye_out_dir.clone(),
+        guppy_basecaller_setting: config.args.guppy_basecaller_setting.clone(),
+        polishing_iterations: config.args.polishing_iterations,
+    };
+
 
 
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
-    let mut final_temp_drain_stream = subsampled_out_stream;
-
-    let final_temp_drain_task = tokio::spawn(async move {
-        while final_temp_drain_stream.next().await.is_some() {}
-        Ok::<(), anyhow::Error>(())
-    });
-
-    cleanup_tasks.push(final_temp_drain_task);
+    // let mut final_temp_drain_stream = subsampled_out_stream;
+    //
+    // let final_temp_drain_task = tokio::spawn(async move {
+    //     while final_temp_drain_stream.next().await.is_some() {}
+    //     Ok::<(), anyhow::Error>(())
+    // });
+    //
+    // cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************

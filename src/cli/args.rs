@@ -260,4 +260,18 @@ pub struct Arguments {
     #[arg(long = "library_type", default_value = "dna", value_enum)]
     pub library_type: LibraryType,
 
+    #[arg(
+        long = "guppy-basecaller-setting",
+        default_value = "hac",
+        help = "Guppy basecaller setting. 'super' uses Flye --nano-hq; all other values use --nano-raw."
+    )]
+    pub guppy_basecaller_setting: String,
+
+    #[arg(
+        long = "polishing-iterations",
+        default_value_t = 1,
+        help = "Number of Flye polishing iterations."
+    )]
+    pub polishing_iterations: usize,
+
 }
