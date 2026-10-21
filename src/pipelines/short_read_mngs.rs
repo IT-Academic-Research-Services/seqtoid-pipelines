@@ -9547,29 +9547,21 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut dedup_cleanup_receivers);
 
 
-    let uniques_count = dedup_count_rx.await?;
-    let unique_reads = uniques_count * if paired { 2 } else { 1 };
-    info!(
-        "Uniques count after dedup (pairs counted separately): {}",
-        unique_reads
-    );
-
-    // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
-    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform_reservoir(
+    // Uniform subsampling without replacement.
+    // In paired mode, max_subsample and the returned count are logical pairs.
+    let (
+        subsampled_stream,
+        subsample_count_rx,
+        subsample_send_task,
+    ) = subsample_uniform_reservoir(
         config.clone(),
         dedup_stream.into_inner(),
         config.args.max_subsample as u64,
         paired,
     )
-    .await?;
-    cleanup_tasks.push(subsample_send_task);
+        .await?;
 
-    let subsample_count = subsample_count_rx.await?;
-    let subsample_reads = subsample_count * if paired { 2 } else { 1 };
-    info!(
-        "Subsampled reads (pairs counted separately): {}",
-        subsample_reads
-    );
+    cleanup_tasks.push(subsample_send_task);
 
     // *******************
     // Non host Alignment
@@ -11545,11 +11537,58 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Ok::<_, PipelineError>((kallisto_ercc_counts, ()))
     };
 
-    let (_validation_and_qc, _host_bam_and_counts, _kallisto_and_taxon) = tokio::try_join!(
-        validation_and_qc_fut,
-        host_bam_and_counts_fut,
-        kallisto_and_taxon_fut
-    )?;
+    let dedup_and_subsample_counts_fut = async move {
+        let uniques_count = dedup_count_rx
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Dedup count receiver failed: {}",
+                e
+            ))
+            })?;
+
+        let unique_reads =
+            uniques_count * if paired { 2 } else { 1 };
+
+        info!(
+        "Uniques count after dedup (pairs counted separately): {}",
+        unique_reads
+    );
+
+        let subsample_count = subsample_count_rx
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Subsample count receiver failed: {}",
+                e
+            ))
+            })?;
+
+        let subsample_reads =
+            subsample_count * if paired { 2 } else { 1 };
+
+        info!(
+        "Subsampled reads (pairs counted separately): {}",
+        subsample_reads
+    );
+
+        Ok::<_, PipelineError>((
+            unique_reads,
+            subsample_reads,
+        ))
+    };
+
+    let (
+        _validation_and_qc,
+        _host_bam_and_counts,
+        _kallisto_and_taxon,
+        _dedup_and_subsample_counts,
+    ) = tokio::try_join!(
+    validation_and_qc_fut,
+    host_bam_and_counts_fut,
+    kallisto_and_taxon_fut,
+    dedup_and_subsample_counts_fut,
+)?;
 
     // *******************
     // Cleanup
