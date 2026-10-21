@@ -29,8 +29,18 @@ use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, 
 use crate::utils::sambam::filter_clipped_alignments;
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
-                            ChannelReader, parse_fastq};
+                            ChannelReader, parse_fastq, spawn_cmd};
 use crate::utils::subsample::subsample_uniform_reservoir;
+
+
+struct ReadsToContigsOutputs {
+    reads_to_contigs_sam: PathBuf,
+    reads_to_contigs_bam: PathBuf,
+    reads_to_contigs_bai: PathBuf,
+    reads_to_contigs_tsv: PathBuf,
+    non_contigs_fastq: PathBuf,
+    non_contigs_fasta: PathBuf,
+}
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
 ///
@@ -585,6 +595,708 @@ async fn minimap2_filter(
     ))
 }
 
+
+async fn run_reads_to_contigs(
+    config: Arc<RunConfig>,
+    input_fastq: PathBuf,
+    assembled_reads: PathBuf,
+    out_dir: &PathBuf,
+) -> Result<
+    (
+        ReadsToContigsOutputs,
+        Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    // ================================================================
+    // Durable outputs
+    // ================================================================
+
+    let reads_to_contigs_sam =
+        out_dir.join("sample.reads_to_contigs.sam");
+
+    let reads_to_contigs_bam =
+        out_dir.join("sample.reads_to_contigs.bam");
+
+    let reads_to_contigs_bai =
+        out_dir.join("sample.reads_to_contigs.bam.bai");
+
+    let reads_to_contigs_tsv =
+        out_dir.join("reads_to_contigs.tsv");
+
+    let non_contigs_fastq =
+        out_dir.join("sample.non_contigs.fastq");
+
+    let non_contigs_fasta =
+        out_dir.join("sample.non_contigs.fasta");
+
+
+    // ================================================================
+    // minimap2
+    //
+    // Legacy:
+    //
+    // minimap2 -ax map-ont assembled_reads input_fastq
+    //          -t 15 --secondary=no
+    //
+    // We preserve the map-ont preset and secondary=no.
+    // ================================================================
+
+    let minimap2_config = Minimap2Config {
+        minimap2_index_path: assembled_reads.clone(),
+        r1_path: Some(input_fastq),
+        r2_path: None,
+        option_fields: HashMap::from([
+            (
+                "-ax".to_string(),
+                Some("map-ont".to_string()),
+            ),
+            (
+                "--secondary=no".to_string(),
+                None,
+            ),
+        ]),
+        num_threads: Some(15),
+    };
+
+    let minimap2_args = generate_cli(
+        MINIMAP2_TAG,
+        &config,
+        Some(&minimap2_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    info!(
+        "RunReadsToContigs minimap2 args: {:?}",
+        minimap2_args
+    );
+
+    let (mut minimap2_child, minimap2_err_task) =
+        spawn_cmd(
+            config.clone(),
+            MINIMAP2_TAG,
+            minimap2_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_sam_rx = parse_child_output(
+        &mut minimap2_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        &config,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+
+    // ================================================================
+    // samtools view -h -F 0x900
+    //
+    // Keep headers and discard secondary + supplementary alignments.
+    // ================================================================
+
+    let primary_view_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([
+            ("-h".to_string(), None),
+            ("-F".to_string(), Some("0x900".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let primary_view_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&primary_view_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        primary_child,
+        primary_stream_task,
+        primary_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        minimap2_sam_rx,
+        SAMTOOLS_TAG,
+        primary_view_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(primary_stream_task);
+    cleanup_tasks.push(primary_err_task);
+
+    let primary_sam_rx = {
+        let mut guard = primary_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    // ================================================================
+    // filter_clipped_alignments.py equivalent
+    //
+    // Legacy invocation:
+    //
+    //     -m 20
+    // ================================================================
+
+    let (
+        filtered_sam_stream,
+        clipped_filter_task,
+    ) = filter_clipped_alignments(
+        ReceiverStream::new(primary_sam_rx),
+        20.0,
+        config.base_buffer_size,
+    )
+        .await?;
+
+    cleanup_tasks.push(clipped_filter_task);
+
+
+    // ================================================================
+    // Fan out FINAL filtered SAM.
+    //
+    // Consumers:
+    //
+    //  1. durable SAM
+    //  2. reads_to_contigs.tsv
+    //  3. BAM pipeline
+    //  4. non-contig FASTQ extraction
+    // ================================================================
+
+    let (filtered_sam_streams, filtered_sam_done_rx) =
+        fanout_to_channels(
+            filtered_sam_stream,
+            4,
+            "reads_to_contigs_filtered_sam",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(filtered_sam_done_rx);
+
+    let mut filtered_sam_streams =
+        filtered_sam_streams.into_iter();
+
+
+    // ================================================================
+    // Branch 1: durable filtered SAM
+    // ================================================================
+
+    let sam_file_stream = ReceiverStream::new(
+        filtered_sam_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let sam_write_task = write_byte_stream_to_file(
+        &reads_to_contigs_sam,
+        sam_file_stream,
+        config.clone(),
+        StreamDataType::JustBytes,
+        "reads_to_contigs_sam",
+        false,
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(sam_write_task);
+
+
+    // ================================================================
+    // Branch 2: reads_to_contigs.tsv
+    //
+    // Legacy:
+    //
+    // grep -v "^@" sample.reads_to_contigs.sam |
+    // awk '{ print $1 "\t" $3 "\t" length($10)}'
+    // ================================================================
+
+    let mut tsv_input = ReceiverStream::new(
+        filtered_sam_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let tsv_path = reads_to_contigs_tsv.clone();
+
+    let tsv_task = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+
+        let file = tokio::fs::File::create(&tsv_path).await?;
+        let mut writer = tokio::io::BufWriter::new(file);
+
+        while let Some(item) = tsv_input.next().await {
+            let ParseOutput::Bytes(bytes) = item else {
+                continue;
+            };
+
+            if bytes.first() == Some(&b'@') {
+                continue;
+            }
+
+            let line = std::str::from_utf8(&bytes)?
+                .trim_end_matches(&['\r', '\n'][..]);
+
+            let fields: Vec<&str> =
+                line.split('\t').collect();
+
+            if fields.len() < 10 {
+                return Err(anyhow!(
+                    "Malformed SAM record while generating reads_to_contigs.tsv"
+                ));
+            }
+
+            let output = format!(
+                "{}\t{}\t{}\n",
+                fields[0],
+                fields[2],
+                fields[9].len(),
+            );
+
+            writer.write_all(output.as_bytes()).await?;
+        }
+
+        writer.flush().await?;
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(tsv_task);
+
+
+    // ================================================================
+    // Branch 3:
+    //
+    // samtools view -b -
+    //      |
+    // samtools sort -
+    //
+    // ================================================================
+
+    let bam_input = filtered_sam_streams
+        .next()
+        .ok_or(PipelineError::EmptyStream)?;
+
+    let bam_view_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([
+            ("-b".to_string(), None),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let bam_view_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&bam_view_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        bam_view_child,
+        bam_view_stream_task,
+        bam_view_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        bam_input,
+        SAMTOOLS_TAG,
+        bam_view_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(bam_view_stream_task);
+    cleanup_tasks.push(bam_view_err_task);
+
+    let bam_view_rx = {
+        let mut guard = bam_view_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    // samtools sort
+
+    let sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-O".to_string(), Some("bam".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let sort_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&sort_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        sort_child,
+        sort_stream_task,
+        sort_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        bam_view_rx,
+        SAMTOOLS_TAG,
+        sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(sort_stream_task);
+    cleanup_tasks.push(sort_err_task);
+
+    let sorted_bam_rx = {
+        let mut guard = sort_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    let bam_write_task = write_byte_stream_to_file(
+        &reads_to_contigs_bam,
+        ReceiverStream::new(sorted_bam_rx),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "reads_to_contigs_bam",
+        false,
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+
+    // ================================================================
+    // Branch 4: non-contig reads
+    //
+    // samtools fastq -n -f 4 -
+    // ================================================================
+
+    let non_contig_sam_input =
+        filtered_sam_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let non_contig_fastq_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Fastq,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-f".to_string(), Some("4".to_string())),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let non_contig_fastq_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&non_contig_fastq_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        non_contig_child,
+        non_contig_stream_task,
+        non_contig_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        non_contig_sam_input,
+        SAMTOOLS_TAG,
+        non_contig_fastq_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(non_contig_stream_task);
+    cleanup_tasks.push(non_contig_err_task);
+
+    let non_contig_fastq_rx = {
+        let mut guard = non_contig_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    // ================================================================
+    // Fan out non-contig FASTQ:
+    //
+    //   1. durable FASTQ
+    //   2. FASTQ -> FASTA
+    // ================================================================
+
+    let (non_contig_streams, non_contig_done_rx) =
+        fanout_to_channels(
+            ReceiverStream::new(non_contig_fastq_rx),
+            2,
+            "non_contig_fastq",
+            &config,
+            StreamDataType::OntFastq,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(non_contig_done_rx);
+
+    let mut non_contig_streams =
+        non_contig_streams.into_iter();
+
+    let non_contig_file_stream =
+        ReceiverStream::new(
+            non_contig_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let non_contig_fasta_input =
+        ReceiverStream::new(
+            non_contig_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // Durable FASTQ
+
+    let non_contig_fastq_write_task =
+        write_byte_stream_to_file(
+            &non_contigs_fastq,
+            non_contig_file_stream,
+            config.clone(),
+            StreamDataType::OntFastq,
+            "non_contigs_fastq",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(non_contig_fastq_write_task);
+
+
+    // FASTQ -> FASTA
+
+    let (
+        non_contig_fasta_stream,
+        non_contig_fasta_convert_task,
+    ) = fastq_to_fasta_stream(
+        non_contig_fasta_input,
+        config.base_buffer_size,
+    )
+        .await?;
+
+    cleanup_tasks.push(non_contig_fasta_convert_task);
+
+    let non_contig_fasta_write_task =
+        write_byte_stream_to_file(
+            &non_contigs_fasta,
+            non_contig_fasta_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "non_contigs_fasta",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(non_contig_fasta_write_task);
+
+
+    // ================================================================
+    // BAM must be completely materialized before samtools index starts.
+    // ================================================================
+
+    bam_write_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
+
+
+    // ================================================================
+    // samtools index
+    // ================================================================
+
+    let index_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Index,
+        subcommand_fields: HashMap::from([
+            (
+                reads_to_contigs_bam
+                    .to_string_lossy()
+                    .to_string(),
+                None,
+            ),
+            (
+                reads_to_contigs_bai
+                    .to_string_lossy()
+                    .to_string(),
+                None,
+            ),
+        ]),
+    };
+
+    let index_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&index_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (mut index_child, index_err_task) =
+        spawn_cmd(
+            config.clone(),
+            SAMTOOLS_TAG,
+            index_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    let index_status =
+        index_child
+            .wait()
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    index_err_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
+
+    if !index_status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: format!(
+                "samtools index exited with status {}",
+                index_status
+            ),
+        });
+    }
+
+
+    Ok((
+        ReadsToContigsOutputs {
+            reads_to_contigs_sam,
+            reads_to_contigs_bam,
+            reads_to_contigs_bai,
+            reads_to_contigs_tsv,
+            non_contigs_fastq,
+            non_contigs_fasta,
+        },
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
+
+
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -915,9 +1627,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 error: e.to_string(),
             })?;
 
-    // Drain Flye stderr while Flye runs.
-    cleanup_tasks.push(flye_err_task);
-
     // Flye must finish before anything can consume its assembly.
     let flye_status =
         flye_child
@@ -937,6 +1646,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         flye_status
     );
     }
+
+    flye_err_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
 
 
     // ------------------------------------------------------------------
@@ -998,6 +1711,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 ))
             })?;
     }
+
+    // *******************
+    // Write checkpoint
+    // *******************
 
 
     // *******************

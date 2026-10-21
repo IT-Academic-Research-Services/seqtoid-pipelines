@@ -1,5 +1,7 @@
 //! SAM/BAM alignment counter and insert size statistics.
 
+use crate::config::defs::PipelineError;
+use tokio::task::JoinHandle;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
@@ -859,6 +861,347 @@ pub async fn generate_assembly_coverage(
     );
 
     Ok(())
+}
+
+/// Filter minimap2 SAM alignments with excessive terminal clipping.
+///
+/// This is the streaming Rust equivalent of filter_clipped_alignments.py.
+///
+/// Behavior intentionally matches the legacy implementation:
+///
+/// - SAM headers are passed through unchanged.
+/// - Already-unmapped records (CIGAR == "*") are passed through unchanged.
+/// - Only clipping at the beginning and end of the CIGAR is considered.
+/// - Both soft clipping (`S`) and hard clipping (`H`) count toward clipping.
+/// - Hard-clipped bases are added to SEQ length when calculating the
+///   effective read length because they are absent from SEQ.
+/// - Alignments with percent_clipped < max_percent are retained.
+/// - Alignments with percent_clipped >= max_percent are rewritten as
+///   unmapped SAM records while preserving QNAME, SEQ, and QUAL.
+///
+/// The output remains a SAM byte stream.
+pub async fn filter_clipped_alignments(
+    mut input_stream: ReceiverStream<ParseOutput>,
+    max_percent: f64,
+    buffer_size: usize,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        JoinHandle<anyhow::Result<(), anyhow::Error>>,
+    ),
+    PipelineError,
+> {
+    let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
+
+    let task = tokio::spawn(async move {
+        while let Some(item) = input_stream.next().await {
+            let bytes = match item {
+                ParseOutput::Bytes(bytes) => bytes,
+                other => {
+                    return Err(anyhow!(
+                        "filter_clipped_alignments expected SAM bytes, got {:?}",
+                        other
+                    ));
+                }
+            };
+
+            // ----------------------------------------------------------
+            // SAM headers are preserved exactly.
+            // ----------------------------------------------------------
+            if bytes.first() == Some(&b'@') {
+                tx.send(ParseOutput::Bytes(bytes))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "filter_clipped_alignments output receiver dropped"
+                        )
+                    })?;
+
+                continue;
+            }
+
+            // ----------------------------------------------------------
+            // Parse the mandatory SAM fields.
+            //
+            // We only need:
+            //   0  QNAME
+            //   5  CIGAR
+            //   9  SEQ
+            //   10 QUAL
+            // ----------------------------------------------------------
+            let line = std::str::from_utf8(&bytes)
+                .map_err(|e| {
+                    anyhow!(
+                        "filter_clipped_alignments received invalid UTF-8 SAM record: {}",
+                        e
+                    )
+                })?;
+
+            let line = line.trim_end_matches(&['\r', '\n'][..]);
+
+            let fields: Vec<&str> = line.split('\t').collect();
+
+            if fields.len() < 11 {
+                return Err(anyhow!(
+                    "Malformed SAM record in filter_clipped_alignments: \
+                     expected at least 11 fields, found {}: {}",
+                    fields.len(),
+                    line
+                ));
+            }
+
+            let qname = fields[0];
+            let cigar = fields[5];
+            let seq = fields[9];
+            let qual = fields[10];
+
+            // ----------------------------------------------------------
+            // Legacy Python:
+            //
+            //     elif row[5] != "*":
+            //         ...
+            //     else:
+            //         output.writerow(row)
+            //
+            // So already-unmapped records pass through unchanged.
+            // ----------------------------------------------------------
+            if cigar == "*" {
+                tx.send(ParseOutput::Bytes(bytes))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "filter_clipped_alignments output receiver dropped"
+                        )
+                    })?;
+
+                continue;
+            }
+
+            // ----------------------------------------------------------
+            // Calculate terminal clipping.
+            //
+            // Python patterns:
+            //
+            //     ^\d+[SH]
+            //     \d+[SH]$
+            //
+            // Therefore ONLY the first and last CIGAR operations count.
+            // Internal S/H operations, if present, do not.
+            // ----------------------------------------------------------
+            let (front_clipping, front_hard_clipping) =
+                terminal_cigar_clipping(cigar, true)?;
+
+            let (end_clipping, end_hard_clipping) =
+                terminal_cigar_clipping(cigar, false)?;
+
+            // Python starts with:
+            //
+            //     alength = len(row[9])
+            //
+            // and adds hard-clipped bases because they are not represented
+            // in SEQ.
+            let alignment_length = seq.len()
+                + front_hard_clipping
+                + end_hard_clipping;
+
+            if alignment_length == 0 {
+                return Err(anyhow!(
+                    "SAM record {} has zero effective alignment length",
+                    qname
+                ));
+            }
+
+            let total_clipping =
+                front_clipping + end_clipping;
+
+            let percent_clipped =
+                (total_clipping as f64 / alignment_length as f64) * 100.0;
+
+            // ----------------------------------------------------------
+            // Python uses:
+            //
+            //     if percent_clipped < max_percent:
+            //
+            // Therefore equality is filtered.
+            // ----------------------------------------------------------
+            if percent_clipped < max_percent {
+                tx.send(ParseOutput::Bytes(bytes))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "filter_clipped_alignments output receiver dropped"
+                        )
+                    })?;
+
+                continue;
+            }
+
+            // ----------------------------------------------------------
+            // Excessively clipped alignment:
+            //
+            // Match the legacy UNMAPPED_READ template exactly:
+            //
+            // QNAME  FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL
+            // id     4    *     0   0    *     *     0     0    seq qual
+            //
+            // The original QNAME, SEQ, and QUAL are retained.
+            // Everything else is replaced.
+            // ----------------------------------------------------------
+            let unmapped = format!(
+                "{}\t4\t*\t0\t0\t*\t*\t0\t0\t{}\t{}\n",
+                qname,
+                seq,
+                qual,
+            );
+
+            tx.send(ParseOutput::Bytes(bytes::Bytes::from(unmapped)))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "filter_clipped_alignments output receiver dropped"
+                    )
+                })?;
+        }
+
+        Ok(())
+    });
+
+    Ok((
+        ReceiverStream::new(rx),
+        task,
+    ))
+}
+
+
+/// Return terminal clipping information for one end of a CIGAR string.
+///
+/// Returns:
+///
+///     (clipping_length, hard_clipping_length)
+///
+/// Examples:
+///
+///     100M          -> (0, 0)
+///     20S100M       -> front: (20, 0)
+///     20H100M       -> front: (20, 20)
+///     100M30S       -> end:   (30, 0)
+///     100M30H       -> end:   (30, 30)
+///
+/// This deliberately matches the legacy regular expressions:
+///
+///     ^\d+[SH]
+///     \d+[SH]$
+///
+/// It does NOT combine adjacent clipping operations. For example,
+/// `10H20S100M` matches only `10H` at the front, just as the Python
+/// regular expression does.
+fn terminal_cigar_clipping(
+    cigar: &str,
+    front: bool,
+) -> anyhow::Result<(usize, usize)> {
+    let cigar_bytes = cigar.as_bytes();
+
+    if cigar_bytes.is_empty() {
+        return Ok((0, 0));
+    }
+
+    if front {
+        // --------------------------------------------------------------
+        // Equivalent to:
+        //
+        //     re.compile(r"^\d+[SH]")
+        // --------------------------------------------------------------
+        let mut end = 0;
+
+        while end < cigar_bytes.len()
+            && cigar_bytes[end].is_ascii_digit()
+        {
+            end += 1;
+        }
+
+        // No leading number or no operation following it.
+        if end == 0 || end >= cigar_bytes.len() {
+            return Ok((0, 0));
+        }
+
+        let op = cigar_bytes[end];
+
+        if op != b'S' && op != b'H' {
+            return Ok((0, 0));
+        }
+
+        let clipping_length: usize = cigar[..end]
+            .parse()
+            .map_err(|e| {
+                anyhow!(
+                    "Invalid leading clipping length in CIGAR '{}': {}",
+                    cigar,
+                    e
+                )
+            })?;
+
+        let hard_clipping_length = if op == b'H' {
+            clipping_length
+        } else {
+            0
+        };
+
+        Ok((
+            clipping_length,
+            hard_clipping_length,
+        ))
+    } else {
+        // --------------------------------------------------------------
+        // Equivalent to:
+        //
+        //     re.compile(r"\d+[SH]$")
+        // --------------------------------------------------------------
+        let op = *cigar_bytes
+            .last()
+            .ok_or_else(|| anyhow!("Empty CIGAR"))?;
+
+        if op != b'S' && op != b'H' {
+            return Ok((0, 0));
+        }
+
+        // Start immediately before the final S/H and walk backwards
+        // through its numeric length.
+        let mut start = cigar_bytes.len() - 1;
+
+        while start > 0
+            && cigar_bytes[start - 1].is_ascii_digit()
+        {
+            start -= 1;
+        }
+
+        // A terminal S/H with no numeric length isn't a valid clipping
+        // operation for purposes of the legacy regex.
+        if start == cigar_bytes.len() - 1 {
+            return Ok((0, 0));
+        }
+
+        let clipping_length: usize =
+            cigar[start..cigar_bytes.len() - 1]
+                .parse()
+                .map_err(|e| {
+                    anyhow!(
+                        "Invalid trailing clipping length in CIGAR '{}': {}",
+                        cigar,
+                        e
+                    )
+                })?;
+
+        let hard_clipping_length = if op == b'H' {
+            clipping_length
+        } else {
+            0
+        };
+
+        Ok((
+            clipping_length,
+            hard_clipping_length,
+        ))
+    }
 }
 
 #[cfg(test)]
