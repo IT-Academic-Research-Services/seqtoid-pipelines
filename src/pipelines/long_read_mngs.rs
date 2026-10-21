@@ -596,6 +596,7 @@ async fn minimap2_filter(
 }
 
 
+
 async fn run_reads_to_contigs(
     config: Arc<RunConfig>,
     input_fastq: PathBuf,
@@ -643,11 +644,15 @@ async fn run_reads_to_contigs(
     // minimap2 -ax map-ont assembled_reads input_fastq
     //          -t 15 --secondary=no
     //
-    // We preserve the map-ont preset and secondary=no.
+    // The Rust pipeline preserves the alignment parameters but lets
+    // RunConfig choose the available minimap2 threads.
+    //
+    // assembled_reads is the Flye contigs FASTA. Minimap2 accepts the
+    // FASTA directly and builds the transient index internally.
     // ================================================================
 
     let minimap2_config = Minimap2Config {
-        minimap2_index_path: assembled_reads.clone(),
+        minimap2_index_path: assembled_reads,
         r1_path: Some(input_fastq),
         r2_path: None,
         option_fields: HashMap::from([
@@ -660,7 +665,7 @@ async fn run_reads_to_contigs(
                 None,
             ),
         ]),
-        num_threads: Some(15),
+        num_threads: None,
     };
 
     let minimap2_args = generate_cli(
@@ -678,19 +683,18 @@ async fn run_reads_to_contigs(
         minimap2_args
     );
 
-    let (mut minimap2_child, minimap2_err_task) =
-        spawn_cmd(
-            config.clone(),
-            MINIMAP2_TAG,
-            minimap2_args,
-            config.args.verbose,
-            None,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: MINIMAP2_TAG.to_string(),
-                error: e.to_string(),
-            })?;
+    let (mut minimap2_child, minimap2_err_task) = spawn_cmd(
+        config.clone(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     cleanup_tasks.push(minimap2_err_task);
 
@@ -710,7 +714,8 @@ async fn run_reads_to_contigs(
     // ================================================================
     // samtools view -h -F 0x900
     //
-    // Keep headers and discard secondary + supplementary alignments.
+    // Preserve the SAM header and remove secondary/supplementary
+    // alignments before applying the clipping filter.
     // ================================================================
 
     let primary_view_config = SamtoolsConfig {
@@ -774,9 +779,13 @@ async fn run_reads_to_contigs(
     // ================================================================
     // filter_clipped_alignments.py equivalent
     //
-    // Legacy invocation:
+    // Legacy:
     //
-    //     -m 20
+    // filter_clipped_alignments.py ... -m 20
+    //
+    // Excessively clipped mapped reads are rewritten as unmapped SAM
+    // records rather than removed, allowing samtools fastq -f 4 below
+    // to recover them as non-contig reads.
     // ================================================================
 
     let (
@@ -793,26 +802,26 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Fan out FINAL filtered SAM.
+    // Fan out the FINAL filtered SAM.
     //
-    // Consumers:
-    //
-    //  1. durable SAM
-    //  2. reads_to_contigs.tsv
-    //  3. BAM pipeline
-    //  4. non-contig FASTQ extraction
+    // 1. durable sample.reads_to_contigs.sam
+    // 2. reads_to_contigs.tsv
+    // 3. BAM conversion + coordinate sort
+    // 4. unmapped/non-contig FASTQ extraction
     // ================================================================
 
-    let (filtered_sam_streams, filtered_sam_done_rx) =
-        fanout_to_channels(
-            filtered_sam_stream,
-            4,
-            "reads_to_contigs_filtered_sam",
-            &config,
-            StreamDataType::JustBytes,
-        )
-            .await
-            .map_err(|_| PipelineError::StreamDataDropped)?;
+    let (
+        filtered_sam_streams,
+        filtered_sam_done_rx,
+    ) = fanout_to_channels(
+        filtered_sam_stream,
+        4,
+        "reads_to_contigs_filtered_sam",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     cleanup_receivers.push(filtered_sam_done_rx);
 
@@ -864,14 +873,20 @@ async fn run_reads_to_contigs(
     let tsv_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
 
-        let file = tokio::fs::File::create(&tsv_path).await?;
-        let mut writer = tokio::io::BufWriter::new(file);
+        let file =
+            tokio::fs::File::create(&tsv_path).await?;
+
+        let mut writer =
+            tokio::io::BufWriter::new(file);
 
         while let Some(item) = tsv_input.next().await {
             let ParseOutput::Bytes(bytes) = item else {
-                continue;
+                return Err(anyhow!(
+                    "reads_to_contigs TSV branch expected SAM bytes"
+                ));
             };
 
+            // grep -v "^@"
             if bytes.first() == Some(&b'@') {
                 continue;
             }
@@ -882,9 +897,12 @@ async fn run_reads_to_contigs(
             let fields: Vec<&str> =
                 line.split('\t').collect();
 
+            // We access QNAME, RNAME and SEQ (fields 0, 2, 9).
             if fields.len() < 10 {
                 return Err(anyhow!(
-                    "Malformed SAM record while generating reads_to_contigs.tsv"
+                    "Malformed SAM record while generating reads_to_contigs.tsv: \
+                     expected >=10 fields, got {}",
+                    fields.len()
                 ));
             }
 
@@ -895,7 +913,9 @@ async fn run_reads_to_contigs(
                 fields[9].len(),
             );
 
-            writer.write_all(output.as_bytes()).await?;
+            writer
+                .write_all(output.as_bytes())
+                .await?;
         }
 
         writer.flush().await?;
@@ -911,8 +931,9 @@ async fn run_reads_to_contigs(
     //
     // samtools view -b -
     //      |
-    // samtools sort -
-    //
+    // samtools sort -O bam -
+    //      |
+    // sample.reads_to_contigs.bam
     // ================================================================
 
     let bam_input = filtered_sam_streams
@@ -981,7 +1002,10 @@ async fn run_reads_to_contigs(
     let sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
         subcommand_fields: HashMap::from([
-            ("-O".to_string(), Some("bam".to_string())),
+            (
+                "-O".to_string(),
+                Some("bam".to_string()),
+            ),
             ("-".to_string(), None),
         ]),
     };
@@ -1034,6 +1058,10 @@ async fn run_reads_to_contigs(
             })?
     };
 
+    // Do NOT put this task into cleanup_tasks yet.
+    //
+    // samtools index requires the BAM to be completely written, so this
+    // writer is explicitly awaited below.
     let bam_write_task = write_byte_stream_to_file(
         &reads_to_contigs_bam,
         ReceiverStream::new(sorted_bam_rx),
@@ -1049,7 +1077,9 @@ async fn run_reads_to_contigs(
     // ================================================================
     // Branch 4: non-contig reads
     //
-    // samtools fastq -n -f 4 -
+    // Legacy:
+    //
+    // samtools fastq -n -f 4 sample.reads_to_contigs.sam
     // ================================================================
 
     let non_contig_sam_input =
@@ -1118,20 +1148,22 @@ async fn run_reads_to_contigs(
     // ================================================================
     // Fan out non-contig FASTQ:
     //
-    //   1. durable FASTQ
-    //   2. FASTQ -> FASTA
+    // 1. durable sample.non_contigs.fastq
+    // 2. FASTQ -> FASTA -> sample.non_contigs.fasta
     // ================================================================
 
-    let (non_contig_streams, non_contig_done_rx) =
-        fanout_to_channels(
-            ReceiverStream::new(non_contig_fastq_rx),
-            2,
-            "non_contig_fastq",
-            &config,
-            StreamDataType::OntFastq,
-        )
-            .await
-            .map_err(|_| PipelineError::StreamDataDropped)?;
+    let (
+        non_contig_streams,
+        non_contig_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(non_contig_fastq_rx),
+        2,
+        "non_contig_fastq",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     cleanup_receivers.push(non_contig_done_rx);
 
@@ -1153,7 +1185,7 @@ async fn run_reads_to_contigs(
         );
 
 
-    // Durable FASTQ
+    // Durable non-contig FASTQ.
 
     let non_contig_fastq_write_task =
         write_byte_stream_to_file(
@@ -1172,7 +1204,7 @@ async fn run_reads_to_contigs(
     cleanup_tasks.push(non_contig_fastq_write_task);
 
 
-    // FASTQ -> FASTA
+    // Convert the second branch directly to FASTA.
 
     let (
         non_contig_fasta_stream,
@@ -1203,7 +1235,10 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // BAM must be completely materialized before samtools index starts.
+    // BAM synchronization point.
+    //
+    // The other fanout branches continue concurrently while we wait.
+    // samtools index cannot begin until the sorted BAM is complete.
     // ================================================================
 
     bam_write_task
@@ -1213,6 +1248,12 @@ async fn run_reads_to_contigs(
 
     // ================================================================
     // samtools index
+    //
+    // Legacy:
+    //
+    // samtools index \
+    //     sample.reads_to_contigs.bam \
+    //     sample.reads_to_contigs.bam.bai
     // ================================================================
 
     let index_config = SamtoolsConfig {
@@ -1243,28 +1284,26 @@ async fn run_reads_to_contigs(
             error: e.to_string(),
         })?;
 
-    let (mut index_child, index_err_task) =
-        spawn_cmd(
-            config.clone(),
-            SAMTOOLS_TAG,
-            index_args,
-            config.args.verbose,
-            None,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
+    let (mut index_child, index_err_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        index_args,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-    let index_status =
-        index_child
-            .wait()
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?;
+    let index_status = index_child
+        .wait()
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     index_err_task
         .await
@@ -1711,6 +1750,54 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 ))
             })?;
     }
+
+    // *******************
+    // Reads-to-Contigs Stage
+    // *******************
+    //
+    // Legacy RunReadsToContigs:
+    //
+    //   input_fastq    = RunSubsampling.subsampled_fastq
+    //   assembled_reads = RunAssembly.assembled_fasta
+    //
+    // The subsampled FASTQ has already been materialized in assembly scratch
+    // for Flye, so reuse that same file here.
+    //
+    let (
+        reads_to_contigs_outputs,
+        reads_to_contigs_cleanup_tasks,
+        reads_to_contigs_cleanup_receivers,
+    ) = run_reads_to_contigs(
+        config.clone(),
+        subsampled_fastq_path.clone(),
+        contigs_fasta_path.clone(),
+        &out_dir,
+    )
+        .await?;
+
+    cleanup_tasks.extend(reads_to_contigs_cleanup_tasks);
+    cleanup_receivers.extend(reads_to_contigs_cleanup_receivers);
+
+
+    // Paths corresponding to the legacy RunReadsToContigs outputs.
+    let reads_to_contigs_sam_path =
+        reads_to_contigs_outputs.reads_to_contigs_sam.clone();
+
+    let reads_to_contigs_bam_path =
+        reads_to_contigs_outputs.reads_to_contigs_bam.clone();
+
+    let reads_to_contigs_bai_path =
+        reads_to_contigs_outputs.reads_to_contigs_bai.clone();
+
+    let reads_to_contigs_tsv_path =
+        reads_to_contigs_outputs.reads_to_contigs_tsv.clone();
+
+    let non_contigs_fastq_path =
+        reads_to_contigs_outputs.non_contigs_fastq.clone();
+
+    let non_contigs_fasta_path =
+        reads_to_contigs_outputs.non_contigs_fasta.clone();
+
 
     // *******************
     // Write checkpoint
