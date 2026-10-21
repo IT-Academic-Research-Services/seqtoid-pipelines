@@ -3324,6 +3324,67 @@ pub async fn generate_annotated_fasta_stream(
         cleanup_receivers,
     ))
 }
+
+pub async fn fastq_to_fasta_stream(
+    mut input_stream: ReceiverStream<ParseOutput>,
+    buffer_size: usize,
+) -> anyhow::Result<(
+    ReceiverStream<ParseOutput>,
+    JoinHandle<anyhow::Result<()>>,
+)> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let task = tokio::spawn(async move {
+        while let Some(item) = input_stream.next().await {
+            let fasta_record = match item {
+                ParseOutput::Fastq(SequenceRecord::Fastq {
+                                       id,
+                                       desc,
+                                       seq,
+                                       ..
+                                   }) => {
+                    SequenceRecord::Fasta {
+                        id,
+                        desc,
+                        seq,
+                    }
+                }
+
+                ParseOutput::Fastq(other) => {
+                    return Err(anyhow!(
+                        "fastq_to_fasta_stream: ParseOutput::Fastq contained \
+                         non-FASTQ SequenceRecord: {:?}",
+                        other
+                    ));
+                }
+
+                other => {
+                    return Err(anyhow!(
+                        "fastq_to_fasta_stream: expected FASTQ input, got {:?}",
+                        other
+                    ));
+                }
+            };
+
+            tx.send(ParseOutput::Fasta(fasta_record))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "fastq_to_fasta_stream: output receiver dropped"
+                    )
+                })?;
+        }
+
+        Ok(())
+    });
+
+    Ok((
+        ReceiverStream::new(rx),
+        task,
+    ))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
