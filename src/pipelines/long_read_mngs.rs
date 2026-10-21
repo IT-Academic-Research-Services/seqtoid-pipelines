@@ -923,7 +923,7 @@ async fn run_reads_to_contigs(
         Ok::<(), anyhow::Error>(())
     });
 
-    cleanup_tasks.push(tsv_task);
+
 
 
     // ================================================================
@@ -1319,6 +1319,9 @@ async fn run_reads_to_contigs(
         });
     }
 
+    tsv_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
 
     Ok((
         ReadsToContigsOutputs {
@@ -1939,6 +1942,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
 
     // *******************
+    // Write checkpoint
+    // *******************
+
+    // *******************
     // Reads-to-Contigs Stage
     // *******************
     //
@@ -1950,27 +1957,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // The subsampled FASTQ has already been materialized in assembly scratch
     // for Flye, so reuse that same file here.
     //
-    let (
-        reads_to_contigs_outputs,
-        reads_to_contigs_cleanup_tasks,
-        reads_to_contigs_cleanup_receivers,
-    ) = run_reads_to_contigs(
-        config.clone(),
-        subsampled_fastq_path.clone(),
-        contigs_fasta_path.clone(),
-        &out_dir,
-    )
-        .await?;
 
-    cleanup_tasks.extend(reads_to_contigs_cleanup_tasks);
-    cleanup_receivers.extend(reads_to_contigs_cleanup_receivers);
-
-
-
-
-    // *******************
-    // Write checkpoint
-    // *******************
 
 
     let (
