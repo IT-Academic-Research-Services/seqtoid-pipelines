@@ -26,6 +26,7 @@ use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode};
+use crate::utils::subsample::subsample_uniform_reservoir;
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
 ///
@@ -730,12 +731,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     final_temp_dirs.extend(human_temp_dir);
 
 
+    // *******************
+    // Subsampling Stage
+    // *******************
+    //
+    // Legacy RunSubsampling operates on the output of RunHumanFilter.
+    // Long reads are single-end, so each FASTQ record is one sampling unit.
+    let (
+        subsampled_stream,
+        subsample_count_rx,
+        subsample_task,
+    ) = subsample_uniform_reservoir(
+        config.clone(),
+        human_filter_out_stream.into_inner(),
+        config.args.max_subsample as u64,
+        false,
+    )
+        .await?;
+
+    cleanup_tasks.push(subsample_task);
+
+
 
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
-    let mut final_temp_drain_stream = human_filter_out_stream;
+    let mut final_temp_drain_stream = subsampled_stream;
 
     let final_temp_drain_task = tokio::spawn(async move {
         while final_temp_drain_stream.next().await.is_some() {}
@@ -774,10 +796,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Ok::<_, PipelineError>(stats)
     };
 
+    let subsample_counts_fut = async move {
 
-    let (_validation_stats, human_filtered_stats) = tokio::try_join!(
+        let subsample_count = subsample_count_rx
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Subsample count receiver failed: {}",
+                e
+            ))
+            })?;
+
+
+        info!(
+        "Subsampled reads (pairs counted separately): {}",
+        subsample_count
+    );
+
+        Ok::<_, PipelineError>((
+            subsample_count,
+        ))
+    };
+
+
+    let (_validation_stats, human_filtered_stats, _subsample_stats) = tokio::try_join!(
         validation_and_qc_fut,
         human_filter_stats_fut,
+        subsample_counts_fut
     )?;
 
     info!("Human filtered stats: {:?}", human_filtered_stats);
