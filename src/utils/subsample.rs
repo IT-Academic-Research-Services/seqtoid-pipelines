@@ -180,17 +180,37 @@ pub async fn subsample_uniform(
             }
         }
 
-        // Safety check: paired streams must be even-length
+        // Safety check: paired streams must be even-length.
         if paired && total % 2 != 0 {
-            return Err(anyhow!("Odd number of FASTQ records in paired mode"));
+            return Err(anyhow!(
+                "Odd number of FASTQ records in paired mode"
+            ));
         }
 
+        // Sampling units are:
+        //   SE: individual reads
+        //   PE: read pairs
         let num_units = if paired { total / 2 } else { total };
-        let subsample_units = (max_subsample).min(num_units);
-        let subsample_size = subsample_units * if paired { 2 } else { 1 };
 
-        if count_tx.send(total).is_err() {
-            warn!("Subsample count send failed (receiver might have dropped)");
+        let subsample_units = max_subsample.min(num_units);
+
+        // Number of physical FASTQ records that will be emitted.
+        let subsample_size =
+            subsample_units * if paired { 2 } else { 1 };
+
+        // Report the number of sampled LOGICAL units.
+        //
+        // SE: sampled reads
+        // PE: sampled pairs
+        //
+        // The caller can convert this to physical FASTQ records with:
+        //
+        //   count * if paired { 2 } else { 1 }
+        if count_tx.send(subsample_units).is_err() {
+            warn!(
+                "Subsample count send failed \
+                 (receiver might have dropped)"
+            );
         }
 
         let mut rng = config.rng.clone();
@@ -201,66 +221,108 @@ pub async fn subsample_uniform(
                 .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
                 .collect();
 
-            let mut indices: Vec<usize> = (0..pairs.len()).collect();
+            let mut indices: Vec<usize> =
+                (0..pairs.len()).collect();
+
             indices.shuffle(&mut rng);
 
-            let sampled_indices: HashSet<usize> =
-                indices.into_iter().take(subsample_units as usize).collect();
+            let sampled_indices: HashSet<usize> = indices
+                .into_iter()
+                .take(subsample_units as usize)
+                .collect();
 
             for (i, (r1, r2)) in pairs.into_iter().enumerate() {
                 if sampled_indices.contains(&i) {
-                    tx.send(r1).await.map_err(|_| anyhow!("Send R1 failed"))?;
-                    tx.send(r2).await.map_err(|_| anyhow!("Send R2 failed"))?;
+                    tx.send(r1)
+                        .await
+                        .map_err(|_| anyhow!("Send R1 failed"))?;
+
+                    tx.send(r2)
+                        .await
+                        .map_err(|_| anyhow!("Send R2 failed"))?;
                 }
             }
         } else {
-            let mut indices: Vec<usize> = (0..records.len()).collect();
+            let mut indices: Vec<usize> =
+                (0..records.len()).collect();
+
             indices.shuffle(&mut rng);
 
-            let sampled_indices: HashSet<usize> =
-                indices.into_iter().take(subsample_units as usize).collect();
+            let sampled_indices: HashSet<usize> = indices
+                .into_iter()
+                .take(subsample_units as usize)
+                .collect();
 
             for (i, item) in records.into_iter().enumerate() {
                 if sampled_indices.contains(&i) {
-                    tx.send(item).await.map_err(|_| anyhow!("Send failed"))?;
+                    tx.send(item)
+                        .await
+                        .map_err(|_| anyhow!("Send failed"))?;
                 }
             }
         }
 
         info!(
-            "Subsample distributor processed {} uniques, sampled {}",
-            total, subsample_size
+            "Subsample distributor processed {} FASTQ records \
+             ({} logical units), sampled {} FASTQ records \
+             ({} logical units)",
+            total,
+            num_units,
+            subsample_size,
+            subsample_units
         );
 
         Ok(())
     });
 
-    Ok((ReceiverStream::new(rx), count_rx, task))
+    Ok((
+        ReceiverStream::new(rx),
+        count_rx,
+        task,
+    ))
 }
 
-/// Uniformly subsample single-end FASTQ records using reservoir sampling.
+/// Uniformly subsample FASTQ records using reservoir sampling.
 ///
-/// Given X input FASTQ records and a requested maximum sample size Y:
+/// Sampling units:
+///   - single-end: one FASTQ record
+///   - paired-end: two consecutive FASTQ records (R1, R2)
 ///
-///   - if X <= Y, every input record is emitted
-///   - if X > Y, exactly Y records are selected
-///   - every input record has probability Y / X of being selected
+/// Given X logical input units and requested maximum Y:
+///
+///   - if X <= Y, every unit is emitted
+///   - if X > Y, exactly Y units are selected
+///   - every input unit has probability Y / X of being selected
 ///   - sampling is without replacement
+///   - paired reads are always sampled and emitted together
 ///
 /// Memory usage is O(Y), rather than O(X).
 ///
-/// The final reservoir is sorted by original stream position before emission,
-/// so selected reads are emitted in the same relative order they appeared in
-/// the input stream.
-async fn subsample_uniform_reservoir(
+/// Selected units are sorted by their original stream position before
+/// emission, preserving their relative input order.
+pub async fn subsample_uniform_reservoir(
     config: Arc<RunConfig>,
     input_rx: mpsc::Receiver<ParseOutput>,
     max_subsample: u64,
+    paired: bool,
 ) -> anyhow::Result<(
     ReceiverStream<ParseOutput>,
     tokio::sync::oneshot::Receiver<u64>,
     JoinHandle<anyhow::Result<()>>,
 )> {
+    struct SampleUnit {
+        input_index: u64,
+        records: Vec<ParseOutput>,
+    }
+
+    let reservoir_capacity = usize::try_from(max_subsample)
+        .map_err(|_| {
+            anyhow!(
+                "subsample_uniform_reservoir: max_subsample {} exceeds usize capacity",
+                max_subsample
+            )
+        })?;
+
     let (tx, rx) = mpsc::channel(config.base_buffer_size);
     let (count_tx, count_rx) = tokio::sync::oneshot::channel();
 
@@ -268,73 +330,152 @@ async fn subsample_uniform_reservoir(
         let mut stream = ReceiverStream::new(input_rx);
         let mut rng = config.rng.clone();
 
-        // Each reservoir entry retains its original input position so that
-        // the final selected records can be restored to input order.
-        let mut reservoir: Vec<(u64, ParseOutput)> =
-            Vec::with_capacity(max_subsample as usize);
+        let mut reservoir: Vec<SampleUnit> =
+            Vec::with_capacity(reservoir_capacity);
 
-        let mut total = 0u64;
+        let mut total_records = 0u64;
+        let mut total_units = 0u64;
 
-        while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Fastq(_) => {}
+        loop {
+            // ---------------------------------------------------------
+            // Construct one logical sampling unit.
+            //
+            // SE: one record
+            // PE: two consecutive records
+            // ---------------------------------------------------------
+
+            let first = match stream.next().await {
+                Some(item) => item,
+                None => break,
+            };
+
+            let first_record = match first {
+                ParseOutput::Fastq(record) => ParseOutput::Fastq(record),
+
                 other => {
                     return Err(anyhow!(
-                        "subsample_uniform_reservoir: unexpected non-FASTQ item: {:?}",
+                        "subsample_uniform_reservoir: \
+                         unexpected non-FASTQ item: {:?}",
                         other
                     ));
                 }
-            }
+            };
 
-            let input_index = total;
-            total += 1;
+            total_records += 1;
 
-            if reservoir.len() < max_subsample as usize {
-                // The first Y records initially fill the reservoir.
-                reservoir.push((input_index, item));
-            } else if max_subsample > 0 {
-                // We have now seen `total` records.
-                //
-                // Choose uniformly from [0, total).
-                let j = rng.random_range(0..total);
+            let records = if paired {
+                let second = stream.next().await.ok_or_else(|| {
+                    anyhow!(
+                        "subsample_uniform_reservoir: \
+                         odd number of FASTQ records in paired mode"
+                    )
+                })?;
 
-                // If j falls inside the reservoir, replace that entry.
-                //
-                // Probability of accepting this record:
-                //
-                //     Y / total
-                //
-                // which is exactly what is required for uniform reservoir
-                // sampling.
+                let second_record = match second {
+                    ParseOutput::Fastq(record) => {
+                        ParseOutput::Fastq(record)
+                    }
+
+                    other => {
+                        return Err(anyhow!(
+                            "subsample_uniform_reservoir: \
+                             unexpected non-FASTQ R2 item: {:?}",
+                            other
+                        ));
+                    }
+                };
+
+                total_records += 1;
+
+                vec![first_record, second_record]
+            } else {
+                vec![first_record]
+            };
+
+            // `input_index` is the logical-unit position, not the physical
+            // FASTQ-record position.
+            let input_index = total_units;
+
+            total_units += 1;
+
+            let unit = SampleUnit {
+                input_index,
+                records,
+            };
+
+            // ---------------------------------------------------------
+            // Algorithm R reservoir sampling.
+            //
+            // First Y units fill the reservoir.
+            //
+            // For every subsequent unit i, choose uniformly from all
+            // units seen so far. If the chosen position lies within the
+            // Y reservoir slots, replace that slot.
+            // ---------------------------------------------------------
+
+            if reservoir.len() < reservoir_capacity {
+                reservoir.push(unit);
+            } else if reservoir_capacity > 0 {
+                let j = rng.random_range(0..total_units);
+
                 if j < max_subsample {
-                    reservoir[j as usize] = (input_index, item);
+                    reservoir[j as usize] = unit;
                 }
             }
         }
 
-        // Reservoir replacement destroys input ordering. Restore it.
-        reservoir.sort_unstable_by_key(|(input_index, _)| *input_index);
+        // -------------------------------------------------------------
+        // Reservoir replacement does not preserve stream ordering.
+        // Restore the selected units to their original relative order.
+        // -------------------------------------------------------------
 
-        let sampled = reservoir.len() as u64;
+        reservoir.sort_unstable_by_key(|unit| unit.input_index);
 
-        if count_tx.send(sampled).is_err() {
+        let sampled_units = reservoir.len() as u64;
+
+        // Preserve the same logical-unit counting convention as the
+        // existing subsample_uniform:
+        //
+        //   SE -> number of sampled reads
+        //   PE -> number of sampled pairs
+        if count_tx.send(sampled_units).is_err() {
             warn!(
-                "subsample_uniform_reservoir: sample count receiver dropped"
+                "subsample_uniform_reservoir: \
+                 sample count receiver dropped"
             );
         }
 
-        for (_, item) in reservoir {
-            tx.send(item)
-                .await
-                .map_err(|_| anyhow!(
-                    "subsample_uniform_reservoir: output receiver dropped"
-                ))?;
+        // -------------------------------------------------------------
+        // Emit selected units.
+        //
+        // In PE mode both records are emitted consecutively, so a pair
+        // can never be split by the sampler.
+        // -------------------------------------------------------------
+
+        for unit in reservoir {
+            for record in unit.records {
+                tx.send(record)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "subsample_uniform_reservoir: \
+                             output receiver dropped"
+                        )
+                    })?;
+            }
         }
 
+        let sampled_records =
+            sampled_units * if paired { 2 } else { 1 };
+
         info!(
-            "Uniform reservoir subsampling processed {} reads, sampled {}",
-            total,
-            sampled
+            "Uniform reservoir subsampling processed {} records \
+             ({} logical units), sampled {} records \
+             ({} logical units)",
+            total_records,
+            total_units,
+            sampled_records,
+            sampled_units
         );
 
         Ok(())

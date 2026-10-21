@@ -98,7 +98,7 @@ use crate::utils::streams::{
     read_child_output_to_vec, spawn_cmd, stream_to_cmd, stream_to_file, ChannelReader, ChildStream,
     ParseMode, ParseOutput, ToBytes,
 };
-use crate::utils::subsample::subsample_uniform;
+use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::{compute_batch_size, compute_phase_concurrency};
 use crate::utils::taxonomy::{
     build_should_keep_filter, get_top_m8_nr, get_top_m8_nt, load_lineage_and_acc2tax_maps,
@@ -9555,7 +9555,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
 
     // Separate subsample (weighted by cluster sizes; correctness: full stream propagation, no silent drops via explicit send/await)
-    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform(
+    let (subsampled_stream, subsample_count_rx, subsample_send_task) = subsample_uniform_reservoir(
         config.clone(),
         dedup_stream.into_inner(),
         config.args.max_subsample as u64,
