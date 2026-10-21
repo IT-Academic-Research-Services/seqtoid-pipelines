@@ -25,7 +25,8 @@ use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
-                            stream_to_cmd, parse_child_output, ChildStream, ParseMode};
+                            stream_to_cmd, parse_child_output, ChildStream, ParseMode,
+                            ChannelReader, parse_fastq};
 use crate::utils::subsample::subsample_uniform_reservoir;
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
@@ -730,6 +731,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(human_filter_cleanup_receivers);
     final_temp_dirs.extend(human_temp_dir);
 
+    // Human filter output remains raw FASTQ bytes through both minimap2 stages.
+    // Parse only once here because reservoir sampling operates on FASTQ records.
+    let human_filtered_byte_reader =
+        ChannelReader::new(human_filter_out_stream.into_inner());
+
+    let human_filtered_fastq_rx = parse_fastq(
+        human_filtered_byte_reader,
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!(
+    "Failed to parse human-filtered FASTQ stream: {}",
+    e
+)))?;
+
+    let human_filtered_fastq_stream =
+        ReceiverStream::new(human_filtered_fastq_rx);
 
     // *******************
     // Subsampling Stage
@@ -737,20 +756,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //
     // Legacy RunSubsampling operates on the output of RunHumanFilter.
     // Long reads are single-end, so each FASTQ record is one sampling unit.
+
     let (
         subsampled_stream,
         subsample_count_rx,
         subsample_task,
     ) = subsample_uniform_reservoir(
         config.clone(),
-        human_filter_out_stream.into_inner(),
+        human_filtered_fastq_stream.into_inner(),
         config.args.max_subsample as u64,
         false,
     )
         .await?;
 
     cleanup_tasks.push(subsample_task);
-
 
 
     // *******************
