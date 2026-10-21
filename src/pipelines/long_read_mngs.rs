@@ -23,7 +23,7 @@ use crate::utils::command::minimap2::{Minimap2Config};
 use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file};
-use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter};
+use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
                             ChannelReader, parse_fastq};
@@ -771,12 +771,65 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(subsample_task);
 
+    
+    // Split the byte stream for fastp and write
+    let (subsampled_streams, subsample_router_done_rx) = fanout_to_channels(
+        subsampled_stream,
+        2,
+        "post_subsample",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(subsample_router_done_rx);
+
+    let mut subsampled_streams_iter = subsampled_streams.into_iter();
+
+    let subsampled_out_stream =
+        ReceiverStream::new(subsampled_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
+
+    let subsampled_fasta_input_stream =
+        ReceiverStream::new(subsampled_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
+
+
+    //and convert FASTQ to FASTA
+
+    let pre_assembly_fasta_path =
+        out_dir.join("pre_assembly.fa");
+
+    let (
+        pre_assembly_fasta_stream,
+        fastq_to_fasta_task,
+    ) = fastq_to_fasta_stream(
+        subsampled_fasta_input_stream,
+        config.base_buffer_size,
+    )
+        .await?;
+
+    cleanup_tasks.push(fastq_to_fasta_task);
+
+
+    let subsampled_file_write_task = write_byte_stream_to_file(
+        &pre_assembly_fasta_path,
+        pre_assembly_fasta_stream,
+        config.clone(),
+        StreamDataType::OntFastq,
+        "pre_assembly_fasta",
+        false
+    )
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(subsampled_file_write_task);
+
 
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
-    let mut final_temp_drain_stream = subsampled_stream;
+    let mut final_temp_drain_stream = subsampled_out_stream;
 
     let final_temp_drain_task = tokio::spawn(async move {
         while final_temp_drain_stream.next().await.is_some() {}
