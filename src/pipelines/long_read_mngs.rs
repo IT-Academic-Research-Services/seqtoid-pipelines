@@ -1335,6 +1335,193 @@ async fn run_reads_to_contigs(
 }
 
 
+async fn remove_unmapped_contigs(
+    assembled_reads: &PathBuf,
+    reads_to_contig_tsv: &PathBuf,
+    mapped_contigs_fasta: &PathBuf,
+) -> Result<(), PipelineError> {
+    use std::collections::HashSet;
+    use tokio::io::{
+        AsyncBufReadExt,
+        AsyncWriteExt,
+        BufReader,
+        BufWriter,
+    };
+
+    // ================================================================
+    // Collect contig IDs with mapped reads.
+    //
+    // Legacy:
+    //
+    // contigs_with_reads = set(
+    //     row[1]
+    //     for row in csv.reader(f, delimiter="\t")
+    // )
+    // ================================================================
+
+    let tsv_file = tokio::fs::File::open(reads_to_contig_tsv)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to open reads-to-contigs TSV {}: {}",
+                reads_to_contig_tsv.display(),
+                e
+            ))
+        })?;
+
+    let mut tsv_lines =
+        BufReader::new(tsv_file).lines();
+
+    let mut contigs_with_reads: HashSet<String> =
+        HashSet::new();
+
+    while let Some(line) = tsv_lines
+        .next_line()
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?
+    {
+        let mut fields = line.split('\t');
+
+        // QNAME
+        let _read_id = fields.next();
+
+        // RNAME / contig ID
+        let contig_id = fields.next().ok_or_else(|| {
+            PipelineError::Other(anyhow!(
+                "Malformed reads-to-contigs TSV row: {}",
+                line
+            ))
+        })?;
+
+        contigs_with_reads.insert(contig_id.to_string());
+    }
+
+    debug!(
+        "RemoveUnmappedContigs: {} referenced contig IDs",
+        contigs_with_reads.len()
+    );
+
+
+    // ================================================================
+    // Filter assembled FASTA.
+    //
+    // We stream the FASTA rather than loading all Flye contigs into RAM.
+    //
+    // Biopython SeqRecord.id is the first whitespace-delimited token
+    // following '>', so use the same definition here.
+    // ================================================================
+
+    let fasta_file = tokio::fs::File::open(assembled_reads)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to open assembled FASTA {}: {}",
+                assembled_reads.display(),
+                e
+            ))
+        })?;
+
+    let output_file = tokio::fs::File::create(
+        mapped_contigs_fasta,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to create mapped contigs FASTA {}: {}",
+                mapped_contigs_fasta.display(),
+                e
+            ))
+        })?;
+
+    let mut fasta_lines =
+        BufReader::new(fasta_file).lines();
+
+    let mut writer =
+        BufWriter::new(output_file);
+
+    let mut keep_current = false;
+    let mut total_contigs: u64 = 0;
+    let mut mapped_contigs: u64 = 0;
+
+    while let Some(line) = fasta_lines
+        .next_line()
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?
+    {
+        if let Some(header) = line.strip_prefix('>') {
+            total_contigs += 1;
+
+            let contig_id = header
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+
+            keep_current =
+                contigs_with_reads.contains(contig_id);
+
+            if keep_current {
+                mapped_contigs += 1;
+
+                writer
+                    .write_all(line.as_bytes())
+                    .await
+                    .map_err(|e| {
+                        PipelineError::IOError(
+                            e.to_string()
+                        )
+                    })?;
+
+                writer
+                    .write_all(b"\n")
+                    .await
+                    .map_err(|e| {
+                        PipelineError::IOError(
+                            e.to_string()
+                        )
+                    })?;
+            }
+
+            continue;
+        }
+
+        if keep_current {
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(
+                        e.to_string()
+                    )
+                })?;
+
+            writer
+                .write_all(b"\n")
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(
+                        e.to_string()
+                    )
+                })?;
+        }
+    }
+
+    writer
+        .flush()
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(e.to_string())
+        })?;
+
+    info!(
+        "RemoveUnmappedContigs: retained {} of {} assembled contigs -> {}",
+        mapped_contigs,
+        total_contigs,
+        mapped_contigs_fasta.display()
+    );
+
+    Ok(())
+}
+
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
@@ -1779,30 +1966,42 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(reads_to_contigs_cleanup_receivers);
 
 
-    // Paths corresponding to the legacy RunReadsToContigs outputs.
-    let reads_to_contigs_sam_path =
-        reads_to_contigs_outputs.reads_to_contigs_sam.clone();
-
-    let reads_to_contigs_bam_path =
-        reads_to_contigs_outputs.reads_to_contigs_bam.clone();
-
-    let reads_to_contigs_bai_path =
-        reads_to_contigs_outputs.reads_to_contigs_bai.clone();
-
-    let reads_to_contigs_tsv_path =
-        reads_to_contigs_outputs.reads_to_contigs_tsv.clone();
-
-    let non_contigs_fastq_path =
-        reads_to_contigs_outputs.non_contigs_fastq.clone();
-
-    let non_contigs_fasta_path =
-        reads_to_contigs_outputs.non_contigs_fasta.clone();
 
 
     // *******************
     // Write checkpoint
     // *******************
 
+
+    let (
+        reads_to_contigs_outputs,
+        reads_to_contigs_cleanup_tasks,
+        reads_to_contigs_cleanup_receivers,
+    ) = run_reads_to_contigs(
+        config.clone(),
+        subsampled_fastq_path.clone(),
+        contigs_fasta_path.clone(),
+        &out_dir,
+    )
+        .await?;
+
+    cleanup_tasks.extend(reads_to_contigs_cleanup_tasks);
+    cleanup_receivers.extend(reads_to_contigs_cleanup_receivers);
+
+
+    // *******************
+    // Remove Unmapped Contigs
+    // *******************
+
+    let mapped_contigs_fasta_path =
+        out_dir.join("mapped_contigs.fasta");
+
+    remove_unmapped_contigs(
+        &contigs_fasta_path,
+        &reads_to_contigs_outputs.reads_to_contigs_tsv,
+        &mapped_contigs_fasta_path,
+    )
+        .await?;
 
     // *******************
     // Temporary final stream drain for construction
