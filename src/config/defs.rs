@@ -46,6 +46,7 @@ pub const BLASTX_TAG: &str = "blastx";
 pub const MAKEBLASTDB_TAG: &str = "makeblastdb";
 pub const SORT_TAG: &str = "sort";
 pub const MMSEQS_TAG: &str = "mmseqs";
+pub const FLYE_TAG: &str = "flye";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";

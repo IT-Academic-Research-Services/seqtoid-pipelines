@@ -12,7 +12,7 @@ use crate::config::defs::{
     RunConfig, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG,
     FASTP_TAG, H5DUMP_TAG, HISAT2_TAG, IVAR_TAG, KALLISTO_TAG, KRAKEN2_TAG, MAFFT_TAG,
     MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, MUSCLE_TAG, NUCMER_TAG, PIGZ_TAG, QUAST_TAG,
-    SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, TOOL_VERSIONS,
+    SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, FLYE_TAG, TOOL_VERSIONS,
 };
 use crate::utils::streams::spawn_cmd;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
@@ -4199,6 +4199,96 @@ pub mod mmseqs {
     }
 }
 
+
+pub mod flye {
+    use crate::config::defs::{RunConfig, FLYE_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    use anyhow::{anyhow, Result};
+    use std::path::PathBuf;
+
+    #[derive(Debug)]
+    pub struct FlyeConfig {
+        pub input_fastq: PathBuf,
+        pub outdir_path: PathBuf,
+        pub guppy_basecaller_setting: String,
+        pub polishing_iterations: usize,
+    }
+
+    pub struct FlyeArgGenerator;
+
+    /// Checks if `flye` is present and returns its version.
+    pub async fn flye_presence_check(
+        config: &RunConfig,
+        version_file: Option<PathBuf>,
+    ) -> Result<f32> {
+        let version = version_check(
+            FLYE_TAG,
+            vec!["--version"],
+            0,
+            0,
+            ChildStream::Stdout,
+            version_file,
+            config,
+        )
+            .await?;
+
+        Ok(version)
+    }
+
+    impl ArgGenerator for FlyeArgGenerator {
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<FlyeConfig>())
+                .ok_or_else(|| anyhow!("Flye requires a FlyeConfig as extra argument"))?;
+
+            if !config.input_fastq.exists() {
+                return Err(anyhow!(
+                    "Flye input FASTQ does not exist: {}",
+                    config.input_fastq.display()
+                ));
+            }
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            // Legacy RunAssembly:
+            //     flye --threads $(nproc) --meta ...
+            args_vec.push("--threads".to_string());
+            args_vec.push(
+                RunConfig::thread_allocation(run_config, FLYE_TAG, None).to_string(),
+            );
+
+            // Legacy pipeline always runs metaFlye.
+            args_vec.push("--meta".to_string());
+
+            // Legacy WDL:
+            //     default -> --nano-raw
+            //     "super" -> --nano-hq
+            if config.guppy_basecaller_setting == "super" {
+                args_vec.push("--nano-hq".to_string());
+            } else {
+                args_vec.push("--nano-raw".to_string());
+            }
+
+            // Flye nanopore input is positional after the read-type option.
+            args_vec.push(config.input_fastq.to_string_lossy().to_string());
+
+            args_vec.push("--out-dir".to_string());
+            args_vec.push(config.outdir_path.to_string_lossy().to_string());
+
+            args_vec.push("--iterations".to_string());
+            args_vec.push(config.polishing_iterations.to_string());
+
+            Ok(args_vec)
+        }
+    }
+}
+
 /// Generates the command-line arguments for a given tool.
 ///
 /// # Arguments
@@ -4275,6 +4365,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 SPADES_TAG => Some(assembly_dir.join("assembly_version.txt")),
                 MINIMAP2_TAG => Some(out_dir.join("minimap2_version.txt")),
                 DIAMOND_TAG => Some(out_dir.join("diamond_version.txt")),
+                FLYE_TAG => Some(assembly_dir.join("assembly_version.txt")),
                 _ => None,
             };
 
@@ -4303,6 +4394,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check(&config).await,
                 SORT_TAG => sort::sort_presence_check(&config).await,
                 MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
+                FLYE_TAG => flye::flye_presence_check(&config, version_file).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))
