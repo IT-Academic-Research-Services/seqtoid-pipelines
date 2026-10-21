@@ -317,12 +317,17 @@ mod h5dump {
 }
 
 pub mod minimap2 {
-    use crate::config::defs::{PipelineError, RunConfig, FASTA_EXTS, MINIMAP2_TAG};
-    use crate::utils::command::{spawn_cmd, version_check, ArgGenerator};
+    use crate::config::defs::{
+        PipelineError, RunConfig, FASTA_EXTS, MINIMAP2_TAG,
+    };
+    use crate::utils::command::{
+        spawn_cmd, version_check, ArgGenerator,
+    };
     use crate::utils::file::available_space_for_path;
     use crate::utils::streams::ChildStream;
+
     use anyhow::{anyhow, Result};
-    use log::{self, debug, info};
+    use log::{debug, info};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -331,25 +336,38 @@ pub mod minimap2 {
     use tokio::task::JoinHandle;
 
     pub struct Minimap2Config {
+        /// Minimap2 reference.
+        ///
+        /// May be either:
+        ///   - a pre-built `.mmi` index
+        ///   - a FASTA reference, which minimap2 will index internally
+        ///
+        /// The field name is retained for compatibility with existing
+        /// pipeline call sites.
         pub minimap2_index_path: PathBuf,
-        pub r1_path: Option<PathBuf>, // ← NEW: optional query file (None = stdin)
-        pub r2_path: Option<PathBuf>, // ← NEW: optional query file (None = stdin)
+
+        /// Query input.
+        ///
+        /// Some(path) = read query from file.
+        /// None       = read query from stdin.
+        pub r1_path: Option<PathBuf>,
+
+        /// Optional second query file.
+        pub r2_path: Option<PathBuf>,
+
+        /// Additional minimap2 command-line options.
         pub option_fields: HashMap<String, Option<String>>,
+
+        /// Optional explicit thread override.
+        ///
+        /// If None, use RunConfig thread allocation.
         pub num_threads: Option<usize>,
     }
 
     pub struct Minimap2ArgGenerator;
 
+
     /// Checks if `minimap2` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    /// * `version_file`: optional path to a file containing the version
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the minimap2 version
     pub async fn minimap2_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
@@ -361,25 +379,25 @@ pub mod minimap2 {
             0,
             ChildStream::Stdout,
             version_file,
-            &config,
+            config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
-    /// Prepares the minimap2 index for a reference sequence.
+
+    /// Prepares a minimap2 index for a reference sequence.
     ///
-    /// # Arguments
+    /// This helper retains the existing host/human-reference behavior:
     ///
-    /// * `config`: the run configuration
-    /// * `ram_temp_dir`: temporary directory in RAM
-    /// * `sequence`: optional path to the reference sequence FASTA
-    /// * `index_path`: optional path to an existing index
-    /// * `ref_type`: type of reference (e.g., "host")
+    ///   - if an existing `.mmi` is supplied, use/copy it;
+    ///   - if a FASTA is supplied, copy it into RAM scratch and build
+    ///     a temporary `.mmi`.
     ///
-    /// # Returns
-    ///
-    /// Result containing paths to FASTA and index, temporary files, and a vector of preparation tasks
+    /// This helper is NOT required when a caller intentionally wants
+    /// minimap2 to consume a FASTA reference directly. Such callers can
+    /// put the FASTA directly in `Minimap2Config::minimap2_index_path`.
     pub async fn minimap2_index_prep(
         config: &RunConfig,
         ram_temp_dir: &PathBuf,
@@ -392,61 +410,102 @@ pub mod minimap2 {
             PathBuf,               // index path (.mmi)
             Option<NamedTempFile>, // FASTA temp
             Option<NamedTempFile>, // Index temp
-            Option<TempDir>,       // temp dir for splits
+            Option<TempDir>,       // temp dir for split indexes
             Vec<JoinHandle<Result<(), anyhow::Error>>>,
         ),
         PipelineError,
     > {
         let mut tasks = Vec::new();
+
         let mut ref_fasta_path: Option<PathBuf> = None;
         let mut ref_temp: Option<NamedTempFile> = None;
-        let mut final_index_path: PathBuf = PathBuf::new();
+
+        let final_index_path: PathBuf;
+
         let mut index_temp_file: Option<NamedTempFile> = None;
         let mut index_temp_dir: Option<TempDir> = None;
 
         match index_path {
-            // pre-existing .mmi index, maybe w split parts
+            // ----------------------------------------------------------
+            // Existing .mmi index, possibly with split index parts.
+            // ----------------------------------------------------------
             Some(index) => {
                 let orig_index_path = PathBuf::from(&index);
+
                 if !orig_index_path.exists() {
-                    return Err(PipelineError::FileNotFound(orig_index_path));
-                }
-                if orig_index_path.extension().map_or(true, |ext| ext != "mmi") {
-                    return Err(PipelineError::InvalidConfig(format!(
-                        "{} index must have .mmi extension: {}",
-                        ref_type,
-                        orig_index_path.display()
-                    )));
+                    return Err(PipelineError::FileNotFound(
+                        orig_index_path,
+                    ));
                 }
 
-                let orig_dir = orig_index_path.parent().ok_or_else(|| {
-                    PipelineError::InvalidConfig("Invalid index path".to_string())
-                })?;
+                if orig_index_path
+                    .extension()
+                    .map_or(true, |ext| ext != "mmi")
+                {
+                    return Err(PipelineError::InvalidConfig(
+                        format!(
+                            "{} index must have .mmi extension: {}",
+                            ref_type,
+                            orig_index_path.display()
+                        ),
+                    ));
+                }
+
+                let orig_dir =
+                    orig_index_path.parent().ok_or_else(|| {
+                        PipelineError::InvalidConfig(
+                            "Invalid index path".to_string(),
+                        )
+                    })?;
+
                 let basename = orig_index_path
                     .file_stem()
                     .ok_or_else(|| {
-                        PipelineError::InvalidConfig("Invalid index filename".to_string())
+                        PipelineError::InvalidConfig(
+                            "Invalid index filename".to_string(),
+                        )
                     })?
                     .to_str()
                     .ok_or_else(|| {
-                        PipelineError::InvalidConfig("Invalid UTF-8 in filename".to_string())
+                        PipelineError::InvalidConfig(
+                            "Invalid UTF-8 in filename".to_string(),
+                        )
                     })?;
 
-                // find split parts: {basename}.part_001.mmi, etc.
+                // Find split index files:
+                //
+                //     basename.part_001.mmi
+                //     basename.part_002.mmi
+                //     ...
                 let mut split_files: Vec<PathBuf> = Vec::new();
-                let split_prefix = format!("{}.part_", basename);
-                let mut dir_entries = fs::read_dir(orig_dir)
-                    .await
-                    .map_err(|e| PipelineError::Other(e.into()))?;
+
+                let split_prefix =
+                    format!("{}.part_", basename);
+
+                let mut dir_entries =
+                    fs::read_dir(orig_dir)
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?;
+
                 while let Some(entry) = dir_entries
                     .next_entry()
                     .await
-                    .map_err(|e| PipelineError::Other(e.into()))?
+                    .map_err(|e| {
+                        PipelineError::Other(e.into())
+                    })?
                 {
                     let path = entry.path();
+
                     if path.is_file() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with(&split_prefix) && name.ends_with(".mmi") {
+                        if let Some(name) =
+                            path.file_name()
+                                .and_then(|n| n.to_str())
+                        {
+                            if name.starts_with(&split_prefix)
+                                && name.ends_with(".mmi")
+                            {
                                 split_files.push(path);
                             }
                         }
@@ -455,167 +514,336 @@ pub mod minimap2 {
 
                 let is_split = !split_files.is_empty();
 
-                let mut files_to_copy: Vec<(PathBuf, String)> = Vec::new();
+                let mut files_to_copy:
+                    Vec<(PathBuf, String)> = Vec::new();
+
                 let mmi_name = orig_index_path
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
                     .to_string();
-                files_to_copy.push((orig_index_path.clone(), mmi_name.clone()));
+
+                files_to_copy.push((
+                    orig_index_path.clone(),
+                    mmi_name.clone(),
+                ));
+
                 for split in &split_files {
-                    let name = split.file_name().unwrap().to_string_lossy().to_string();
-                    files_to_copy.push((split.clone(), name));
+                    let name = split
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+
+                    files_to_copy.push((
+                        split.clone(),
+                        name,
+                    ));
                 }
 
-                // calc size of all index files
+                // Calculate total index size.
                 let mut total_size: u64 = 0;
-                for (p, _) in &files_to_copy {
-                    let meta = fs::metadata(p)
-                        .await
-                        .map_err(|e| PipelineError::Other(e.into()))?;
-                    total_size += meta.len();
+
+                for (path, _) in &files_to_copy {
+                    let metadata =
+                        fs::metadata(path)
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(
+                                    e.into(),
+                                )
+                            })?;
+
+                    total_size += metadata.len();
                 }
 
-                let buffer = 10 * 1024 * 1024; // 10 megs buffer
-                let avail = available_space_for_path(ram_temp_dir)
-                    .await
-                    .map_err(|e| PipelineError::Other(e))?;
-                let enough_space = avail >= total_size + buffer;
+                // Keep a little breathing room in RAM scratch.
+                let buffer = 10 * 1024 * 1024;
+
+                let available =
+                    available_space_for_path(ram_temp_dir)
+                        .await
+                        .map_err(PipelineError::Other)?;
+
+                let enough_space =
+                    available >= total_size + buffer;
 
                 if enough_space {
                     if is_split {
-                        let temp_dir = TempDir::new_in(ram_temp_dir)
-                            .map_err(|e| PipelineError::Other(e.into()))?;
-                        let temp_index_path = temp_dir.path().join(&mmi_name);
-
-                        for (src, name) in files_to_copy {
-                            let dest = temp_dir.path().join(&name);
-                            let src_cl = src.clone();
-                            let dest_cl = dest.clone();
-                            let ref_type_cl = ref_type.to_string();
-                            let task = tokio::spawn(async move {
-                                fs::copy(&src_cl, &dest_cl).await.map_err(|e| {
-                                    anyhow!(
-                                        "Failed to copy {} index file {}: {}",
-                                        ref_type_cl,
-                                        name,
-                                        e
+                        let temp_dir =
+                            TempDir::new_in(ram_temp_dir)
+                                .map_err(|e| {
+                                    PipelineError::Other(
+                                        e.into(),
                                     )
                                 })?;
-                                Ok(())
-                            });
+
+                        let temp_index_path =
+                            temp_dir.path().join(&mmi_name);
+
+                        for (src, name) in files_to_copy {
+                            let dest =
+                                temp_dir.path().join(&name);
+
+                            let src_cl = src.clone();
+                            let dest_cl = dest.clone();
+                            let ref_type_cl =
+                                ref_type.to_string();
+
+                            let task =
+                                tokio::spawn(async move {
+                                    fs::copy(
+                                        &src_cl,
+                                        &dest_cl,
+                                    )
+                                        .await
+                                        .map_err(|e| {
+                                            anyhow!(
+                                            "Failed to copy {} index file {}: {}",
+                                            ref_type_cl,
+                                            name,
+                                            e
+                                        )
+                                        })?;
+
+                                    Ok(())
+                                });
+
                             tasks.push(task);
                         }
 
-                        final_index_path = temp_index_path;
-                        index_temp_dir = Some(temp_dir);
+                        final_index_path =
+                            temp_index_path;
+
+                        index_temp_dir =
+                            Some(temp_dir);
                     } else {
-                        let temp_file = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                            .map_err(|e| PipelineError::Other(e.into()))?;
-                        let temp_index_path = temp_file.path().to_path_buf();
-                        let temp_index_path_cl = temp_index_path.clone();
-                        let ref_type_cl = ref_type.to_string();
-                        let task = tokio::spawn(async move {
-                            fs::copy(&orig_index_path, &temp_index_path_cl)
-                                .await
+                        let temp_file =
+                            NamedTempFile::with_suffix_in(
+                                ".mmi",
+                                ram_temp_dir,
+                            )
                                 .map_err(|e| {
-                                    anyhow!("Failed to copy {} index: {}", ref_type_cl, e)
+                                    PipelineError::Other(
+                                        e.into(),
+                                    )
                                 })?;
-                            Ok(())
-                        });
+
+                        let temp_index_path =
+                            temp_file.path().to_path_buf();
+
+                        let temp_index_path_cl =
+                            temp_index_path.clone();
+
+                        let ref_type_cl =
+                            ref_type.to_string();
+
+                        let task =
+                            tokio::spawn(async move {
+                                fs::copy(
+                                    &orig_index_path,
+                                    &temp_index_path_cl,
+                                )
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow!(
+                                        "Failed to copy {} index: {}",
+                                        ref_type_cl,
+                                        e
+                                    )
+                                    })?;
+
+                                Ok(())
+                            });
+
                         tasks.push(task);
-                        final_index_path = temp_index_path;
-                        index_temp_file = Some(temp_file);
+
+                        final_index_path =
+                            temp_index_path;
+
+                        index_temp_file =
+                            Some(temp_file);
                     }
                 } else {
                     info!(
-                        "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
-                        ref_type, total_size, avail
+                        "Not enough space in RAM temp dir for {} index \
+                         (need: {} bytes, have: {} bytes). \
+                         Using original path.",
+                        ref_type,
+                        total_size,
+                        available
                     );
-                    final_index_path = orig_index_path;
+
+                    final_index_path =
+                        orig_index_path;
                 }
             }
 
-            // or build index from FASTA
+
+            // ----------------------------------------------------------
+            // Build .mmi from FASTA.
+            //
+            // This remains the existing behavior for callers using
+            // minimap2_index_prep(), such as host filtering.
+            // ----------------------------------------------------------
             None => {
-                let sequence_path = sequence.ok_or_else(|| {
-                    PipelineError::InvalidConfig(
-                        "No FASTA or index provided for minimap2".to_string(),
-                    )
-                })?;
-                let sequence_path = PathBuf::from(&sequence_path);
+                let sequence_path =
+                    sequence.ok_or_else(|| {
+                        PipelineError::InvalidConfig(
+                            "No FASTA or index provided for minimap2"
+                                .to_string(),
+                        )
+                    })?;
+
+                let sequence_path =
+                    PathBuf::from(sequence_path);
+
                 if !sequence_path.exists() {
-                    return Err(PipelineError::FileNotFound(sequence_path));
+                    return Err(
+                        PipelineError::FileNotFound(
+                            sequence_path,
+                        ),
+                    );
                 }
+
                 let is_fasta = sequence_path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map(|ext| FASTA_EXTS.iter().any(|&f| ext.eq_ignore_ascii_case(f)))
+                    .map(|ext| {
+                        FASTA_EXTS.iter().any(|&f| {
+                            ext.eq_ignore_ascii_case(f)
+                        })
+                    })
                     .unwrap_or(false);
+
                 if !is_fasta {
-                    return Err(PipelineError::InvalidConfig(format!(
-                        "Sequence file must have a FASTA extension ({}): {}",
-                        FASTA_EXTS.join(", "),
-                        sequence_path.display()
-                    )));
+                    return Err(
+                        PipelineError::InvalidConfig(
+                            format!(
+                                "Sequence file must have a FASTA extension ({}): {}",
+                                FASTA_EXTS.join(", "),
+                                sequence_path.display()
+                            ),
+                        ),
+                    );
                 }
 
-                let temp_fasta = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                let temp_fasta_path = temp_fasta.path().to_path_buf();
-                let temp_fasta_path_cl = temp_fasta_path.clone();
-                let ref_type_cl = ref_type.to_string();
-                let copy_task = tokio::spawn(async move {
-                    fs::copy(&sequence_path, &temp_fasta_path_cl)
-                        .await
-                        .map_err(|e| anyhow!("Failed to copy {} FASTA: {}", ref_type_cl, e))?;
-                    Ok(())
-                });
-                tasks.push(copy_task);
-                ref_fasta_path = Some(temp_fasta_path.clone());
-                ref_temp = Some(temp_fasta);
+                let temp_fasta =
+                    NamedTempFile::with_suffix_in(
+                        ".fasta",
+                        ram_temp_dir,
+                    )
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?;
 
-                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                let index_temp_path = index_temp.path().to_path_buf();
+                let temp_fasta_path =
+                    temp_fasta.path().to_path_buf();
+
+                let temp_fasta_path_cl =
+                    temp_fasta_path.clone();
+
+                let ref_type_cl =
+                    ref_type.to_string();
+
+                let copy_task =
+                    tokio::spawn(async move {
+                        fs::copy(
+                            &sequence_path,
+                            &temp_fasta_path_cl,
+                        )
+                            .await
+                            .map_err(|e| {
+                                anyhow!(
+                                "Failed to copy {} FASTA: {}",
+                                ref_type_cl,
+                                e
+                            )
+                            })?;
+
+                        Ok(())
+                    });
+
+                tasks.push(copy_task);
+
+                ref_fasta_path =
+                    Some(temp_fasta_path.clone());
+
+                ref_temp =
+                    Some(temp_fasta);
+
+                let index_temp =
+                    NamedTempFile::with_suffix_in(
+                        ".mmi",
+                        ram_temp_dir,
+                    )
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?;
+
+                let index_temp_path =
+                    index_temp.path().to_path_buf();
 
                 let minimap2_args = vec![
                     "-d".to_string(),
-                    index_temp_path.to_string_lossy().to_string(),
-                    temp_fasta_path.to_string_lossy().to_string(),
+                    index_temp_path
+                        .to_string_lossy()
+                        .to_string(),
+                    temp_fasta_path
+                        .to_string_lossy()
+                        .to_string(),
                 ];
 
-                let (mut child, err_task) = spawn_cmd(
-                    Arc::new(config.clone()),
-                    MINIMAP2_TAG,
-                    minimap2_args,
-                    config.args.verbose,
-                    None,
-                )
-                .await
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: MINIMAP2_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+                let (mut child, err_task) =
+                    spawn_cmd(
+                        Arc::new(config.clone()),
+                        MINIMAP2_TAG,
+                        minimap2_args,
+                        config.args.verbose,
+                        None,
+                    )
+                        .await
+                        .map_err(|e| {
+                            PipelineError::ToolExecution {
+                                tool:
+                                MINIMAP2_TAG.to_string(),
+                                error: e.to_string(),
+                            }
+                        })?;
 
-                let index_task = tokio::spawn(async move {
-                    let status = child.wait().await?;
-                    if !status.success() {
-                        return Err(anyhow!(
-                            "minimap2 index creation failed with exit code: {:?}",
-                            status.code()
-                        ));
-                    }
-                    Ok(())
-                });
+                let index_task =
+                    tokio::spawn(async move {
+                        let status =
+                            child.wait().await?;
+
+                        if !status.success() {
+                            return Err(anyhow!(
+                                "minimap2 index creation failed with exit code: {:?}",
+                                status.code()
+                            ));
+                        }
+
+                        Ok(())
+                    });
+
                 index_task
                     .await
-                    .map_err(|e| PipelineError::Other(e.into()))??;
-                debug!("{} mmi created in RAM", ref_type);
+                    .map_err(|e| {
+                        PipelineError::Other(e.into())
+                    })??;
+
+                debug!(
+                    "{} mmi created in RAM",
+                    ref_type
+                );
+
                 tasks.push(err_task);
 
-                final_index_path = index_temp_path;
-                index_temp_file = Some(index_temp);
+                final_index_path =
+                    index_temp_path;
+
+                index_temp_file =
+                    Some(index_temp);
             }
         }
 
@@ -629,6 +857,7 @@ pub mod minimap2 {
         ))
     }
 
+
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(
             &self,
@@ -636,54 +865,185 @@ pub mod minimap2 {
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| e.downcast_ref::<Minimap2Config>())
-                .ok_or_else(|| anyhow!("Minimap2 requires a Minimap2Config as extra argument"))?;
+                .and_then(|e| {
+                    e.downcast_ref::<Minimap2Config>()
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Minimap2 requires a Minimap2Config as extra argument"
+                    )
+                })?;
 
-            let index_path = config.minimap2_index_path.clone();
-            if !index_path.exists() {
+            // ----------------------------------------------------------
+            // Reference validation.
+            //
+            // Minimap2 accepts either:
+            //
+            //     reference.mmi
+            //
+            // or:
+            //
+            //     reference.fa / reference.fasta / etc.
+            //
+            // This is important for the long-read RunReadsToContigs
+            // stage, where Flye's contigs.fasta is intentionally passed
+            // directly to minimap2, matching the legacy WDL.
+            // ----------------------------------------------------------
+
+            let reference_path =
+                config.minimap2_index_path.clone();
+
+            if !reference_path.exists() {
                 return Err(anyhow!(
-                    "Minimap2 index file does not exist: {}",
-                    index_path.display()
+                    "Minimap2 reference/index file does not exist: {}",
+                    reference_path.display()
                 ));
             }
-            if index_path.extension().map_or(true, |ext| ext != "mmi") {
+
+            let extension = reference_path
+                .extension()
+                .and_then(|ext| ext.to_str());
+
+            let is_mmi = extension
+                .map(|ext| {
+                    ext.eq_ignore_ascii_case("mmi")
+                })
+                .unwrap_or(false);
+
+            let is_fasta = extension
+                .map(|ext| {
+                    FASTA_EXTS.iter().any(|&f| {
+                        ext.eq_ignore_ascii_case(f)
+                    })
+                })
+                .unwrap_or(false);
+
+            if !is_mmi && !is_fasta {
                 return Err(anyhow!(
-                    "Minimap2 index must have .mmi extension, got: {}",
-                    index_path.display()
+                    "Minimap2 reference must be an .mmi index or FASTA \
+                     file ({}), got: {}",
+                    FASTA_EXTS.join(", "),
+                    reference_path.display()
                 ));
             }
 
-            let mut args_vec: Vec<String> = Vec::new();
 
-            let threads = if let Some(override_threads) = config.num_threads {
-                override_threads
-            } else {
-                run_config.thread_allocation(MINIMAP2_TAG, None)
-            };
+            // ----------------------------------------------------------
+            // Query validation.
+            // ----------------------------------------------------------
 
-            // let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
+            if let Some(r1_path) = &config.r1_path {
+                if !r1_path.exists() {
+                    return Err(anyhow!(
+                        "Minimap2 query file does not exist: {}",
+                        r1_path.display()
+                    ));
+                }
+            }
+
+            if let Some(r2_path) = &config.r2_path {
+                if !r2_path.exists() {
+                    return Err(anyhow!(
+                        "Minimap2 second query file does not exist: {}",
+                        r2_path.display()
+                    ));
+                }
+            }
+
+
+            let mut args_vec: Vec<String> =
+                Vec::new();
+
+
+            // ----------------------------------------------------------
+            // Threads
+            // ----------------------------------------------------------
+
+            let threads =
+                if let Some(override_threads) =
+                    config.num_threads
+                {
+                    override_threads
+                } else {
+                    run_config.thread_allocation(
+                        MINIMAP2_TAG,
+                        None,
+                    )
+                };
+
             args_vec.push("-t".to_string());
             args_vec.push(threads.to_string());
 
-            for (key, value) in config.option_fields.iter() {
+
+            // ----------------------------------------------------------
+            // Caller-supplied minimap2 options.
+            //
+            // Examples:
+            //
+            //     -ax map-ont
+            //     --secondary=no
+            // ----------------------------------------------------------
+
+            for (key, value) in
+                config.option_fields.iter()
+            {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            // Index path
-            args_vec.push(index_path.to_string_lossy().to_string());
 
-            // Input: file if provided, otherwise stdin
+            // ----------------------------------------------------------
+            // Reference
+            //
+            // This can now be either an .mmi or FASTA.
+            // ----------------------------------------------------------
+
+            args_vec.push(
+                reference_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+
+            // ----------------------------------------------------------
+            // Query input.
+            //
+            // File input:
+            //
+            //     minimap2 reference reads.fastq
+            //
+            // Stdin:
+            //
+            //     ... | minimap2 reference -
+            // ----------------------------------------------------------
+
             if let Some(r1_path) = &config.r1_path {
-                args_vec.push(r1_path.to_string_lossy().to_string());
-                if let Some(r2_path) = &config.r2_path {
-                    args_vec.push(r2_path.to_string_lossy().to_string());
+                args_vec.push(
+                    r1_path
+                        .to_string_lossy()
+                        .to_string(),
+                );
+
+                if let Some(r2_path) =
+                    &config.r2_path
+                {
+                    args_vec.push(
+                        r2_path
+                            .to_string_lossy()
+                            .to_string(),
+                    );
                 }
             } else {
-                args_vec.push("-".to_string()); // stdin
+                args_vec.push("-".to_string());
             }
+
+            debug!(
+                "Minimap2 final args: {}",
+                args_vec.join(" ")
+            );
 
             Ok(args_vec)
         }
