@@ -1778,6 +1778,32 @@ pub fn parse_and_filter_fastq_id(
     (filtered_rx, task)
 }
 
+#[inline]
+fn trim_line_ending(buf: &mut Vec<u8>) {
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+}
+
+/// Parses a byte stream containing serialized FASTQ data into structured FASTQ records.
+///
+/// The input must contain FASTQ-formatted bytes, typically carried as
+/// `ParseOutput::Bytes`. Input byte chunks do not need to correspond to FASTQ
+/// record boundaries; records are reconstructed incrementally across chunks.
+///
+/// # Arguments
+/// * `input_rx` - Receiver of `ParseOutput::Bytes` containing serialized FASTQ data.
+/// * `buffer_size` - Size of the output channel buffer.
+/// * `stall_threshold_secs` - Seconds without reported progress before logging a stall warning.
+///
+/// # Returns
+/// Tuple of:
+/// * `mpsc::Receiver<ParseOutput>` emitting `ParseOutput::Fastq(SequenceRecord::Fastq)` records.
+/// * `JoinHandle<Result<(), anyhow::Error>>` for the asynchronous parsing task.
 pub async fn parse_byte_stream_to_fastq(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
@@ -1789,60 +1815,170 @@ pub async fn parse_byte_stream_to_fastq(
     let (tx, rx) = mpsc::channel(buffer_size);
 
     let task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(input_rx);
-        let mut full_buffer: Vec<u8> = Vec::new(); // Accumulate all bytes (RAM-efficient for filtered streams)
-        let mut record_count = 0;
+        let reader = ChannelReader::new(input_rx);
+
+        let mut reader =
+            tokio::io::BufReader::with_capacity(
+                1024 * 1024,
+                reader,
+            );
+
+        let mut header = Vec::new();
+        let mut seq = Vec::new();
+        let mut plus = Vec::new();
+        let mut qual = Vec::new();
+
+        let mut record_count: u64 = 0;
         let mut last_progress = tokio::time::Instant::now();
 
-        while let Some(item) = stream.next().await {
-            if last_progress.elapsed() > Duration::from_secs(stall_threshold_secs) {
+        loop {
+            // ---------------------------------------------------------
+            // FASTQ header
+            // ---------------------------------------------------------
+
+            header.clear();
+
+            let n = reader
+                .read_until(b'\n', &mut header)
+                .await?;
+
+            if n == 0 {
+                break;
+            }
+
+            trim_line_ending(&mut header);
+
+            if header.is_empty() {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: empty FASTQ header at record {}",
+                    record_count + 1
+                ));
+            }
+
+            if header[0] != b'@' {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: expected '@' FASTQ header at record {}, got {:?}",
+                    record_count + 1,
+                    String::from_utf8_lossy(&header)
+                ));
+            }
+
+            // ---------------------------------------------------------
+            // Sequence
+            // ---------------------------------------------------------
+
+            seq.clear();
+
+            if reader
+                .read_until(b'\n', &mut seq)
+                .await?
+                == 0
+            {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: unexpected EOF after header at record {}",
+                    record_count + 1
+                ));
+            }
+
+            trim_line_ending(&mut seq);
+
+            // ---------------------------------------------------------
+            // Plus line
+            // ---------------------------------------------------------
+
+            plus.clear();
+
+            if reader
+                .read_until(b'\n', &mut plus)
+                .await?
+                == 0
+            {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: unexpected EOF before '+' at record {}",
+                    record_count + 1
+                ));
+            }
+
+            trim_line_ending(&mut plus);
+
+            if plus.first() != Some(&b'+') {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: expected '+' line at record {}, got {:?}",
+                    record_count + 1,
+                    String::from_utf8_lossy(&plus)
+                ));
+            }
+
+            // ---------------------------------------------------------
+            // Quality
+            // ---------------------------------------------------------
+
+            qual.clear();
+
+            if reader
+                .read_until(b'\n', &mut qual)
+                .await?
+                == 0
+            {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: unexpected EOF before quality at record {}",
+                    record_count + 1
+                ));
+            }
+
+            trim_line_ending(&mut qual);
+
+            if seq.len() != qual.len() {
+                return Err(anyhow!(
+                    "parse_byte_stream_to_fastq: sequence/quality length mismatch \
+                     at record {}: seq={}, qual={}",
+                    record_count + 1,
+                    seq.len(),
+                    qual.len()
+                ));
+            }
+
+            // ---------------------------------------------------------
+            // Parse header and construct the same structured FASTQ
+            // representation expected by dedup().
+            // ---------------------------------------------------------
+
+            let (id, desc) =
+                parse_header(&header, '@');
+
+            let record = SequenceRecord::Fastq {
+                id,
+                desc,
+                seq: Bytes::copy_from_slice(&seq),
+                qual: Bytes::copy_from_slice(&qual),
+            };
+
+            tx.send(ParseOutput::Fastq(record))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "parse_byte_stream_to_fastq: output receiver dropped \
+                         at record {}",
+                        record_count + 1
+                    )
+                })?;
+
+            record_count += 1;
+
+            // ---------------------------------------------------------
+            // Stall reporting
+            // ---------------------------------------------------------
+
+            if last_progress.elapsed()
+                > Duration::from_secs(stall_threshold_secs)
+            {
                 warn!(
                     "parse_byte_stream_to_fastq: Stall detected at {} records",
                     record_count
                 );
-                last_progress = tokio::time::Instant::now();
-            }
 
-            match item {
-                ParseOutput::Bytes(bytes) => {
-                    full_buffer.extend_from_slice(&*bytes);
-                }
-                _ => {
-                    warn!(
-                        "parse_byte_stream_to_fastq: Unexpected non-Bytes ParseOutput at record {}",
-                        record_count + 1
-                    );
-                    continue;
-                }
-            }
-        }
-
-        if full_buffer.is_empty() {
-            return Err(anyhow!("Empty byte buffer for FASTQ parsing"));
-        }
-
-        // Parse accumulated bytes into FASTQ records
-        let cursor = Cursor::new(full_buffer);
-        let mut reader = FastqReader::new(cursor);
-        while let Some(result) = reader.next() {
-            match result {
-                Ok(record) => {
-                    let owned_record: SequenceRecord = record.to_owned().into();
-                    if tx.send(ParseOutput::Fastq(owned_record)).await.is_err() {
-                        return Err(anyhow!(
-                            "Failed to send FASTQ record at count {}",
-                            record_count + 1
-                        ));
-                    }
-                    record_count += 1;
-                }
-                Err(e) => {
-                    return Err(anyhow!(
-                        "FASTQ parsing error at count {}: {}",
-                        record_count + 1,
-                        e
-                    ));
-                }
+                last_progress =
+                    tokio::time::Instant::now();
             }
         }
 
@@ -1850,6 +1986,7 @@ pub async fn parse_byte_stream_to_fastq(
             "parse_byte_stream_to_fastq: Parsed {} FASTQ records",
             record_count
         );
+
         Ok(())
     });
 
@@ -3326,6 +3463,20 @@ pub async fn generate_annotated_fasta_stream(
     ))
 }
 
+/// Converts a stream of structured FASTQ records into structured FASTA records.
+///
+/// The input must already be parsed FASTQ records represented as
+/// `ParseOutput::Fastq(SequenceRecord::Fastq)`. Each record's ID, description,
+/// and sequence are preserved, while the FASTQ quality scores are discarded.
+///
+/// # Arguments
+/// * `input_stream` - Stream of structured `ParseOutput::Fastq(SequenceRecord::Fastq)` records.
+/// * `buffer_size` - Size of the output channel buffer.
+///
+/// # Returns
+/// Tuple of:
+/// * `ReceiverStream<ParseOutput>` emitting `ParseOutput::Fasta(SequenceRecord::Fasta)` records.
+/// * `JoinHandle<anyhow::Result<()>>` for the asynchronous conversion task.
 pub async fn fastq_to_fasta_stream(
     mut input_stream: ReceiverStream<ParseOutput>,
     buffer_size: usize,
@@ -3385,6 +3536,24 @@ pub async fn fastq_to_fasta_stream(
     ))
 }
 
+/// Parses a byte stream containing serialized FASTQ data directly into structured FASTA records.
+///
+/// The input must contain FASTQ-formatted bytes carried as `ParseOutput::Bytes`.
+/// Input byte chunks do not need to correspond to FASTQ record boundaries.
+/// FASTQ records are reconstructed incrementally, with each record's ID,
+/// description, and sequence preserved while its quality scores are discarded.
+///
+/// This performs the direct conversion:
+/// `FASTQ bytes -> structured FASTA`, without first emitting structured FASTQ records.
+///
+/// # Arguments
+/// * `input_rx` - Receiver of `ParseOutput::Bytes` containing serialized FASTQ data.
+/// * `buffer_size` - Size of the output channel buffer.
+///
+/// # Returns
+/// Tuple of:
+/// * `ReceiverStream<ParseOutput>` emitting `ParseOutput::Fasta(SequenceRecord::Fasta)` records.
+/// * `JoinHandle<anyhow::Result<()>>` for the asynchronous parsing/conversion task.
 pub async fn fastq_bytes_to_fasta_stream(
     input_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
