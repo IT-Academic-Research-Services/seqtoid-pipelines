@@ -1883,19 +1883,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // ------------------------------------------------------------------
     // Resolve Flye assembly output.
     //
-    // Legacy WDL:
+    // The Flye assembly in assembly scratch is the canonical working file
+    // used by downstream pipeline stages.
     //
-    //     if [ -f temp_flye_out/assembly.fasta ]
-    //     then
-    //         cat temp_flye_out/assembly.fasta > sample.assembled_reads.fasta
-    //     else
-    //         touch sample.assembled_reads.fasta
-    //     fi
+    // Legacy WDL guarantees that contigs.fasta exists even when Flye does
+    // not produce an assembly. Preserve that behavior by first ensuring
+    // that flye_assembly_path exists, creating an empty file when needed.
     //
-    //     mv sample.assembled_reads.fasta contigs.fasta
-    //
-    // Therefore the durable pipeline artifact is always contigs.fasta,
-    // which is empty when Flye did not produce assembly.fasta.
+    // contigs.fasta is a durable output artifact. Copy the canonical
+    // scratch assembly to it asynchronously while downstream processing
+    // continues from flye_assembly_path.
     // ------------------------------------------------------------------
 
     let flye_assembly_path =
@@ -1904,45 +1901,57 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let contigs_fasta_path =
         out_dir.join("contigs.fasta");
 
-    if flye_assembly_path.exists() {
-        tokio::fs::copy(
-            &flye_assembly_path,
-            &contigs_fasta_path,
-        )
-            .await
-            .map_err(|e| {
-                PipelineError::IOError(format!(
-                    "Failed to copy Flye assembly {} to {}: {}",
-                    flye_assembly_path.display(),
-                    contigs_fasta_path.display(),
-                    e
-                ))
-            })?;
-
-        info!(
-        "Flye assembly copied to {}",
-        contigs_fasta_path.display()
-    );
-    } else {
+    // Downstream stages must always have a valid assembly file to consume.
+    if !flye_assembly_path.exists() {
         warn!(
-        "Flye did not produce {}; creating empty contigs.fasta",
+        "Flye did not produce {}; creating empty assembly",
         flye_assembly_path.display()
     );
 
-        tokio::fs::File::create(&contigs_fasta_path)
+        tokio::fs::File::create(&flye_assembly_path)
             .await
             .map_err(|e| {
                 PipelineError::IOError(format!(
-                    "Failed to create empty {}: {}",
-                    contigs_fasta_path.display(),
+                    "Failed to create empty Flye assembly {}: {}",
+                    flye_assembly_path.display(),
                     e
                 ))
             })?;
     }
 
-    // *******************
-    // Write checkpoint
-    // *******************
+    // Persist contigs.fasta independently of downstream processing.
+    //
+    // flye_assembly_path lives under assembly_temp_dir, which is retained
+    // in final_temp_dirs until final pipeline cleanup.
+    let contigs_source = flye_assembly_path.clone();
+    let contigs_destination = contigs_fasta_path.clone();
+
+    let contigs_copy_task = tokio::spawn(async move {
+        tokio::fs::copy(
+            &contigs_source,
+            &contigs_destination,
+        )
+            .await
+            .map_err(|e| {
+                anyhow!(
+            "Failed to copy Flye assembly {} to {}: {}",
+            contigs_source.display(),
+            contigs_destination.display(),
+            e
+        )
+            })?;
+
+        info!(
+        "Flye assembly copied to {}",
+        contigs_destination.display()
+    );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(contigs_copy_task);
+
+    
 
     // *******************
     // Reads-to-Contigs Stage
@@ -1950,14 +1959,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     //
     // Legacy RunReadsToContigs:
     //
-    //   input_fastq    = RunSubsampling.subsampled_fastq
+    //   input_fastq     = RunSubsampling.subsampled_fastq
     //   assembled_reads = RunAssembly.assembled_fasta
     //
-    // The subsampled FASTQ has already been materialized in assembly scratch
-    // for Flye, so reuse that same file here.
+    // The subsampled FASTQ has already been materialized in assembly
+    // scratch for Flye, so reuse that same file.
     //
-
-
+    // Likewise, use Flye's assembly.fasta directly from retained assembly
+    // scratch rather than waiting for the durable contigs.fasta copy.
+    //
 
     let (
         reads_to_contigs_outputs,
@@ -1966,7 +1976,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ) = run_reads_to_contigs(
         config.clone(),
         subsampled_fastq_path.clone(),
-        contigs_fasta_path.clone(),
+        flye_assembly_path.clone(),
         &out_dir,
     )
         .await?;
