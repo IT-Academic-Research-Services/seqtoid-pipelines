@@ -617,8 +617,20 @@ async fn run_reads_to_contigs(
         ReceiverStream<ParseOutput>,
 
         // Completes when reads_to_contigs.tsv has been written and
-        // returns the in-memory metadata needed downstream.
+        // returns the in-memory metadata needed downstream:
+        //   * mapped contig IDs
+        //   * read ID -> read length
         JoinHandle<anyhow::Result<ReadsToContigsMetadata>>,
+
+        // Computational read-to-contig statistics branch.
+        //
+        // This is deliberately independent of the durable coordinate-sorted
+        // BAM/BAI artifact branch.
+        JoinHandle<anyhow::Result<(
+            HashMap<String, String>, // read2contig
+            HashMap<String, u64>,    // unweighted contig_stats
+            HashMap<String, usize>,  // contig_unique_counts
+        )>>,
 
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
@@ -813,9 +825,18 @@ async fn run_reads_to_contigs(
     // Fan out the FINAL filtered SAM.
     //
     // 1. durable sample.reads_to_contigs.sam
-    // 2. reads_to_contigs.tsv + mapped-contig HashSet
-    // 3. asynchronous BAM + BAI artifact generation
-    // 4. unmapped/non-contig FASTQ extraction
+    //
+    // 2. durable reads_to_contigs.tsv +
+    //    in-memory mapped-contig IDs/read lengths
+    //
+    // 3. coordinate-sorted BAM + BAI durable artifact side-chain
+    //
+    // 4. unmapped/non-contig FASTQ/FASTA
+    //
+    // 5. query-name-sorted BAM -> in-memory contig statistics
+    //
+    // Branches 3 and 5 are deliberately independent. Nothing in the
+    // computational statistics path depends on the durable BAM file.
     // ================================================================
 
     let (
@@ -823,7 +844,7 @@ async fn run_reads_to_contigs(
         filtered_sam_done_rx,
     ) = fanout_to_channels(
         filtered_sam_stream,
-        4,
+        5,
         "reads_to_contigs_filtered_sam",
         &config,
         StreamDataType::JustBytes,
@@ -862,11 +883,24 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Branch 2: reads_to_contigs.tsv + mapped contig collection
+    // Branch 2: reads_to_contigs.tsv + in-memory metadata
     //
-    // The TSV remains a durable artifact, but downstream computation
-    // receives the unique mapped-contig IDs directly rather than
-    // reopening and reparsing the TSV.
+    // Legacy:
+    //
+    // grep -v "^@" sample.reads_to_contigs.sam |
+    // awk '{ print $1 "\t" $3 "\t" length($10)}'
+    //
+    // Preserve that TSV as a durable artifact, but retain the useful
+    // information in memory:
+    //
+    //   mapped_contig_ids:
+    //       unique non-"*" RNAMEs
+    //
+    //   read_base_counts:
+    //       QNAME -> length(SEQ)
+    //
+    // The latter is the in-memory equivalent of the legacy
+    // read2base_count dictionary.
     // ================================================================
 
     let mut tsv_input = ReceiverStream::new(
@@ -895,8 +929,8 @@ async fn run_reads_to_contigs(
         while let Some(item) = tsv_input.next().await {
             let ParseOutput::Bytes(bytes) = item else {
                 return Err(anyhow!(
-                "reads_to_contigs TSV branch expected SAM bytes"
-            ));
+                    "reads_to_contigs TSV branch expected SAM bytes"
+                ));
             };
 
             if bytes.first() == Some(&b'@') {
@@ -911,17 +945,16 @@ async fn run_reads_to_contigs(
 
             if fields.len() < 10 {
                 return Err(anyhow!(
-                "Malformed SAM record while generating \
-                 reads_to_contigs.tsv: expected >=10 fields, got {}",
-                fields.len()
-            ));
+                    "Malformed SAM record while generating \
+                     reads_to_contigs.tsv: expected >=10 fields, got {}",
+                    fields.len()
+                ));
             }
 
             let qname = fields[0];
             let rname = fields[2];
             let read_length = fields[9].len() as u64;
 
-            // Preserve the legacy durable TSV.
             let output = format!(
                 "{}\t{}\t{}\n",
                 qname,
@@ -931,15 +964,10 @@ async fn run_reads_to_contigs(
 
             writer.write_all(output.as_bytes()).await?;
 
-            // Useful downstream state: which contigs received reads?
             if rname != "*" {
                 mapped_contig_ids.insert(rname.to_owned());
             }
 
-            // Useful downstream state: legacy read2base_count.
-            //
-            // This intentionally includes every TSV row, just as the
-            // WDL's dictionary comprehension does.
             read_base_counts.insert(
                 qname.to_owned(),
                 read_length,
@@ -949,11 +977,11 @@ async fn run_reads_to_contigs(
         writer.flush().await?;
 
         info!(
-        "reads_to_contigs.tsv complete; {} contigs have mapped reads, \
-         {} read lengths collected",
-        mapped_contig_ids.len(),
-        read_base_counts.len(),
-    );
+            "reads_to_contigs.tsv complete; {} contigs have mapped reads, \
+             {} read lengths collected",
+            mapped_contig_ids.len(),
+            read_base_counts.len(),
+        );
 
         Ok::<ReadsToContigsMetadata, anyhow::Error>(
             ReadsToContigsMetadata {
@@ -965,15 +993,15 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Branch 3: asynchronous BAM + BAI artifact generation.
+    // Branch 3: asynchronous coordinate-sorted BAM + BAI artifacts.
     //
-    // Neither artifact is consumed by a downstream computational stage.
+    // Neither artifact is consumed by downstream computation.
     //
-    // The BAM must still be fully written before samtools index begins,
-    // but that dependency belongs entirely inside this side-chain.
+    // The BAM must be completely written before samtools index begins,
+    // but that dependency lives entirely inside this side-chain.
     //
-    // run_reads_to_contigs() does NOT wait for this work to complete.
-    // The final pipeline cleanup waits for bam_index_artifact_task.
+    // run_reads_to_contigs() does NOT wait for this branch to finish.
+    // Final pipeline cleanup waits for bam_index_artifact_task.
     // ================================================================
 
     let bam_input = filtered_sam_streams
@@ -1037,7 +1065,7 @@ async fn run_reads_to_contigs(
     };
 
 
-    // samtools sort
+    // Coordinate sort for the durable BAM artifact.
 
     let sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -1099,8 +1127,8 @@ async fn run_reads_to_contigs(
     };
 
 
-    // Start the BAM writer immediately so the sorted BAM stream has a
-    // consumer. Do not await it here.
+    // Start writing the BAM immediately so the coordinate-sort stream
+    // always has a consumer. Do not synchronize on it here.
 
     let bam_write_task = write_byte_stream_to_file(
         &reads_to_contigs_bam,
@@ -1114,13 +1142,13 @@ async fn run_reads_to_contigs(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
 
-    // The combined side-chain task owns the only required synchronization:
+    // The combined artifact task owns the only required synchronization:
     //
     //     finish BAM write
-    //           ↓
+    //            ↓
     //     samtools index
     //
-    // Nothing in the main computational pipeline waits on this.
+    // Neither operation blocks the computational pipeline.
 
     let bam_path_for_index =
         reads_to_contigs_bam.clone();
@@ -1132,10 +1160,6 @@ async fn run_reads_to_contigs(
         config.clone();
 
     let bam_index_artifact_task = tokio::spawn(async move {
-        // ------------------------------------------------------------
-        // First finish materializing the coordinate-sorted BAM.
-        // ------------------------------------------------------------
-
         bam_write_task
             .await
             .map_err(|e| {
@@ -1144,10 +1168,6 @@ async fn run_reads_to_contigs(
                     e
                 )
             })??;
-
-        // ------------------------------------------------------------
-        // Then build the BAI.
-        // ------------------------------------------------------------
 
         let index_config = SamtoolsConfig {
             subcommand: SamtoolsSubcommand::Index,
@@ -1242,9 +1262,10 @@ async fn run_reads_to_contigs(
     //
     // samtools fastq -n -f 4 sample.reads_to_contigs.sam
     //
-    // The FASTQ is retained as an output artifact. The FASTA is also
-    // retained, but its structured stream continues downstream into
-    // PrepareNTAlignmentInputs.
+    // The FASTQ is retained as an output artifact.
+    //
+    // The FASTA is retained as an output artifact AND continues as a
+    // structured stream for PrepareNTAlignmentInputs.
     // ================================================================
 
     let non_contig_sam_input =
@@ -1310,12 +1331,12 @@ async fn run_reads_to_contigs(
     };
 
 
-    // ================================================================
+    // ------------------------------------------------
     // Fan out non-contig FASTQ:
     //
     // 1. durable sample.non_contigs.fastq
     // 2. FASTQ -> FASTA
-    // ================================================================
+    // ------------------------------------------------
 
     let (
         non_contig_streams,
@@ -1350,7 +1371,7 @@ async fn run_reads_to_contigs(
         );
 
 
-    // Durable non-contig FASTQ side-chain.
+    // Durable FASTQ artifact.
 
     let non_contig_fastq_write_task =
         write_byte_stream_to_file(
@@ -1369,9 +1390,7 @@ async fn run_reads_to_contigs(
     cleanup_tasks.push(non_contig_fastq_write_task);
 
 
-    // ================================================================
-    // Convert non-contig FASTQ to structured FASTA.
-    // ================================================================
+    // FASTQ -> structured FASTA.
 
     let (
         non_contig_fasta_stream,
@@ -1385,12 +1404,12 @@ async fn run_reads_to_contigs(
     cleanup_tasks.push(non_contig_fasta_convert_task);
 
 
-    // ================================================================
+    // ------------------------------------------------
     // Fan out structured FASTA:
     //
     // 1. downstream computational stream
     // 2. durable sample.non_contigs.fasta
-    // ================================================================
+    // ------------------------------------------------
 
     let (
         non_contig_fasta_streams,
@@ -1442,10 +1461,181 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Return immediately after all live branches have consumers.
+    // Branch 5: query-name-sorted BAM for contig statistics.
     //
-    // In particular, BAM/BAI generation continues independently in
-    // cleanup_tasks and does not block downstream pipeline construction.
+    // This is a COMPUTATIONAL branch.
+    //
+    // It consumes the final filtered SAM directly and is completely
+    // independent of Branch 3's durable coordinate-sorted BAM/BAI.
+    //
+    // Legacy GenerateContigStats ultimately needs first-seen read ->
+    // contig assignments. generate_info_from_bam_stream() provides that
+    // generic bookkeeping and requires query-name-sorted BAM input.
+    //
+    // Start the statistics consumer inside this function so the entire
+    // branch remains live while the other filtered-SAM branches run.
+    // ================================================================
+
+    let stats_sam_input =
+        filtered_sam_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+
+    // ------------------------------------------------
+    // Final filtered SAM -> BAM
+    // ------------------------------------------------
+
+    let stats_view_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::View,
+        subcommand_fields: HashMap::from([
+            ("-b".to_string(), None),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let stats_view_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&stats_view_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        stats_view_child,
+        stats_view_stream_task,
+        stats_view_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        stats_sam_input,
+        SAMTOOLS_TAG,
+        stats_view_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(stats_view_stream_task);
+    cleanup_tasks.push(stats_view_err_task);
+
+    let stats_bam_rx = {
+        let mut guard = stats_view_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    // ------------------------------------------------
+    // Query-name sort the computational BAM stream.
+    //
+    // No filesystem BAM is involved.
+    // ------------------------------------------------
+
+    let name_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-u".to_string(), None),
+            (
+                "-O".to_string(),
+                Some("bam".to_string()),
+            ),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let name_sort_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&name_sort_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        name_sort_child,
+        name_sort_stream_task,
+        name_sort_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        stats_bam_rx,
+        SAMTOOLS_TAG,
+        name_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(name_sort_stream_task);
+    cleanup_tasks.push(name_sort_err_task);
+
+    let name_sort_rx = {
+        let mut guard = name_sort_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    // ------------------------------------------------
+    // Consume the name-sorted BAM immediately.
+    //
+    // Do NOT put this task in cleanup_tasks: its return value is needed
+    // downstream to construct the long-read contig/base statistics.
+    // ------------------------------------------------
+
+    let contig_info_task = tokio::spawn(async move {
+        generate_info_from_bam_stream(
+            name_sort_rx,
+            0,
+        )
+            .await
+    });
+
+
+    // ================================================================
+    // Return.
+    //
+    // Branch 3's BAM/BAI artifact work continues asynchronously until
+    // cleanup.
+    //
+    // Branch 5's computational contig-info work also continues
+    // asynchronously, but its JoinHandle is returned because run()
+    // requires the resulting in-memory objects.
     // ================================================================
 
     Ok((
@@ -1459,6 +1649,7 @@ async fn run_reads_to_contigs(
         },
         non_contig_fasta_out_stream,
         reads_to_contigs_metadata_task,
+        contig_info_task,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -1622,70 +1813,6 @@ async fn remove_unmapped_contigs(
 }
 
 
-
-pub async fn generate_long_read_info_from_bam_stream(
-    rx: mpsc::Receiver<ParseOutput>,
-    read_base_counts: &HashMap<String, u64>,
-    min_contig_size: u64,
-) -> Result<(
-    HashMap<String, String>, // read2contig
-    HashMap<String, u64>,    // contig_stats: reads per contig
-    HashMap<String, u64>,    // contig_base_counts: bases per contig
-)> {
-    let (
-        read2contig,
-        contig_stats,
-        _contig_unique_counts,
-    ) = generate_info_from_bam_stream(
-        rx,
-        min_contig_size,
-    )
-        .await?;
-
-    // Only contigs retained by the generic function should appear
-    // in the final base-count map.
-    let retained_contigs: HashSet<&String> =
-        contig_stats.keys().collect();
-
-    let mut contig_base_counts: HashMap<String, u64> =
-        contig_stats
-            .keys()
-            .map(|contig| (contig.clone(), 0u64))
-            .collect();
-
-    for (read_id, contig_name) in &read2contig {
-        if !retained_contigs.contains(contig_name) {
-            continue;
-        }
-
-        let read_length = read_base_counts
-            .get(read_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Missing read base count for mapped read: {}",
-                    read_id
-                )
-            })?;
-
-        *contig_base_counts
-            .entry(contig_name.clone())
-            .or_insert(0) += *read_length;
-    }
-
-    info!(
-        "generate_long_read_info_from_bam_stream: \
-         {} mapped reads, {} retained contigs, {} contig base counts",
-        read2contig.len(),
-        contig_stats.len(),
-        contig_base_counts.len(),
-    );
-
-    Ok((
-        read2contig,
-        contig_stats,
-        contig_base_counts,
-    ))
-}
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
@@ -2135,6 +2262,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         reads_to_contigs_outputs,
         non_contig_fasta_stream,
         reads_to_contigs_metadata_task,
+        contig_info_task,
         reads_to_contigs_cleanup_tasks,
         reads_to_contigs_cleanup_receivers,
     ) = run_reads_to_contigs(
@@ -2188,71 +2316,43 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Generate Contig Stats
     // *******************
 
-    // Name-sort the final reads-to-contigs BAM before passing it to the
-    // generic generate_info_from_bam_stream() implementation.
-    let name_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                reads_to_contigs_outputs
-                    .reads_to_contigs_bam
-                    .to_string_lossy()
-                    .to_string(),
-                None,
-            ),
-        ]),
-    };
-
-    let name_sort_args = generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&name_sort_config),
-    )
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut name_sort_child, name_sort_err_task) = spawn_cmd(
-        config.clone(),
-        SAMTOOLS_TAG,
-        name_sort_args,
-        config.args.verbose,
-        None,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    cleanup_tasks.push(name_sort_err_task);
-
-    let name_sort_rx = parse_child_output(
-        &mut name_sort_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        &config,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
 
     let (
         read2contig,
         contig_stats,
-        contig_base_counts,
-    ) = generate_long_read_info_from_bam_stream(
-        name_sort_rx,
-        &reads_to_contigs_metadata.read_base_counts,
-        0,
-    )
+        _contig_unique_counts,
+    ) = contig_info_task
         .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Contig info task panicked: {}",
+            e
+        ))
+        })?
         .map_err(PipelineError::Other)?;
+
+
+    let mut contig_base_counts: HashMap<String, u64> =
+        contig_stats
+            .keys()
+            .map(|contig| (contig.clone(), 0u64))
+            .collect();
+
+    for (read_id, contig_name) in &read2contig {
+        let read_length = reads_to_contigs_metadata
+            .read_base_counts
+            .get(read_id)
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+                "Missing read base count for mapped read: {}",
+                read_id
+            ))
+            })?;
+
+        *contig_base_counts
+            .entry(contig_name.clone())
+            .or_insert(0) += *read_length;
+    }
 
     // *******************
     // Temporary final stream drain for construction
