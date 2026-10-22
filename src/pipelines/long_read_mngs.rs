@@ -606,6 +606,9 @@ async fn run_reads_to_contigs(
     (
         ReadsToContigsOutputs,
 
+        // Structured FASTA stream of reads that did not map to contigs.
+        ReceiverStream<ParseOutput>,
+
         // Completes when reads_to_contigs.tsv has been written and
         // returns the unique set of contigs with mapped reads.
         JoinHandle<anyhow::Result<HashSet<String>>>,
@@ -1231,7 +1234,16 @@ async fn run_reads_to_contigs(
     cleanup_tasks.push(non_contig_fastq_write_task);
 
 
-    // Convert the second branch directly to FASTA.
+    // ================================================================
+    // Convert non-contig FASTQ to structured FASTA.
+    //
+    // This FASTA is real downstream pipeline data: it becomes the
+    // non-contig-read input to PrepareNTAlignmentInputs.
+    //
+    // Fan it out so:
+    //   1. one branch continues downstream as structured FASTA
+    //   2. one branch asynchronously writes sample.non_contigs.fasta
+    // ================================================================
 
     let (
         non_contig_fasta_stream,
@@ -1244,10 +1256,53 @@ async fn run_reads_to_contigs(
 
     cleanup_tasks.push(non_contig_fasta_convert_task);
 
+
+    // Split the structured FASTA stream into the computational path and
+    // the durable-output path.
+
+    let (
+        non_contig_fasta_streams,
+        non_contig_fasta_done_rx,
+    ) = fanout_to_channels(
+        non_contig_fasta_stream,
+        2,
+        "non_contig_fasta",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(non_contig_fasta_done_rx);
+
+    let mut non_contig_fasta_streams =
+        non_contig_fasta_streams.into_iter();
+
+
+    // Branch 1: continue through the pipeline.
+    //
+    // This contains:
+    //     ParseOutput::Fasta(SequenceRecord::Fasta { ... })
+
+    let non_contig_fasta_out_stream = ReceiverStream::new(
+        non_contig_fasta_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+
+    // Branch 2: durable sample.non_contigs.fasta artifact.
+
+    let non_contig_fasta_file_stream = ReceiverStream::new(
+        non_contig_fasta_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
     let non_contig_fasta_write_task =
         write_byte_stream_to_file(
             &non_contigs_fasta,
-            non_contig_fasta_stream,
+            non_contig_fasta_file_stream,
             config.clone(),
             StreamDataType::JustBytes,
             "non_contigs_fasta",
@@ -1356,6 +1411,7 @@ async fn run_reads_to_contigs(
             non_contigs_fastq,
             non_contigs_fasta,
         },
+        non_contig_fasta_out_stream,
         mapped_contigs_task,
         cleanup_tasks,
         cleanup_receivers,
@@ -1966,6 +2022,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (
         reads_to_contigs_outputs,
+        non_contig_fasta_stream,
         mapped_contigs_task,
         reads_to_contigs_cleanup_tasks,
         reads_to_contigs_cleanup_receivers,
