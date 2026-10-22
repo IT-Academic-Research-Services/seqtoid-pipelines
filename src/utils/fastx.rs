@@ -3395,8 +3395,10 @@ pub async fn fastq_bytes_to_fasta_stream(
     let (tx, rx) = mpsc::channel(buffer_size);
 
     let task = tokio::spawn(async move {
+        // ChannelReader adapts Receiver<ParseOutput> into Tokio AsyncRead.
         let reader = ChannelReader::new(input_rx);
 
+        // IMPORTANT: this must be tokio::io::BufReader, not std::io::BufReader.
         let mut reader =
             tokio::io::BufReader::with_capacity(
                 1024 * 1024,
@@ -3406,15 +3408,19 @@ pub async fn fastq_bytes_to_fasta_stream(
         let mut line = String::new();
 
         loop {
+            // ---------------------------------------------------------
             // FASTQ header
+            // ---------------------------------------------------------
             line.clear();
+
             let n = reader.read_line(&mut line).await?;
 
             if n == 0 {
                 break;
             }
 
-            let header = line.trim_end_matches(&['\r', '\n'][..]);
+            let header =
+                line.trim_end_matches(&['\r', '\n'][..]);
 
             if !header.starts_with('@') {
                 return Err(anyhow!(
@@ -3426,8 +3432,11 @@ pub async fn fastq_bytes_to_fasta_stream(
             let (id, desc) =
                 parse_header(header.as_bytes(), '@');
 
+            // ---------------------------------------------------------
             // Sequence
+            // ---------------------------------------------------------
             line.clear();
+
             if reader.read_line(&mut line).await? == 0 {
                 return Err(anyhow!(
                     "fastq_bytes_to_fasta_stream: unexpected EOF after header {}",
@@ -3436,11 +3445,15 @@ pub async fn fastq_bytes_to_fasta_stream(
             }
 
             let seq = Bytes::copy_from_slice(
-                line.trim_end_matches(&['\r', '\n'][..]).as_bytes()
+                line.trim_end_matches(&['\r', '\n'][..])
+                    .as_bytes(),
             );
 
+            // ---------------------------------------------------------
             // Plus line
+            // ---------------------------------------------------------
             line.clear();
+
             if reader.read_line(&mut line).await? == 0 {
                 return Err(anyhow!(
                     "fastq_bytes_to_fasta_stream: unexpected EOF before '+' for {}",
@@ -3455,8 +3468,11 @@ pub async fn fastq_bytes_to_fasta_stream(
                 ));
             }
 
-            // Quality — consume and discard
+            // ---------------------------------------------------------
+            // Quality -- consume and discard
+            // ---------------------------------------------------------
             line.clear();
+
             if reader.read_line(&mut line).await? == 0 {
                 return Err(anyhow!(
                     "fastq_bytes_to_fasta_stream: unexpected EOF before quality for {}",
@@ -3465,7 +3481,9 @@ pub async fn fastq_bytes_to_fasta_stream(
             }
 
             let qual_len =
-                line.trim_end_matches(&['\r', '\n'][..]).len();
+                line.trim_end_matches(&['\r', '\n'][..])
+                    .as_bytes()
+                    .len();
 
             if qual_len != seq.len() {
                 return Err(anyhow!(
@@ -3477,6 +3495,9 @@ pub async fn fastq_bytes_to_fasta_stream(
                 ));
             }
 
+            // ---------------------------------------------------------
+            // FASTA output
+            // ---------------------------------------------------------
             tx.send(ParseOutput::Fasta(
                 SequenceRecord::Fasta {
                     id,

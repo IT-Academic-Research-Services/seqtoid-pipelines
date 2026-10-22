@@ -86,7 +86,13 @@ pub enum ParseMode {
     Lines,
 }
 
-// streams.rs
+/// Physical representation carried through pipeline channels.
+///
+/// ParseOutput::Fastq / Fasta are structured FASTX records.
+/// ParseOutput::Bytes is opaque serialized data; its semantic format
+/// (FASTQ, FASTA, SAM, BAM, etc.) is determined by pipeline context.
+///
+/// Do not infer serialized byte format from ParseOutput::Bytes alone.
 #[derive(Clone, Debug)]
 pub enum ParseOutput {
     Fastq(SequenceRecord),
