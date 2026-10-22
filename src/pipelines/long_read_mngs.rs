@@ -603,7 +603,6 @@ async fn minimap2_filter(
 }
 
 
-
 async fn run_reads_to_contigs(
     config: Arc<RunConfig>,
     input_fastq: PathBuf,
@@ -624,8 +623,9 @@ async fn run_reads_to_contigs(
 
         // Computational read-to-contig statistics branch.
         //
-        // This is deliberately independent of the durable coordinate-sorted
-        // BAM/BAI artifact branch.
+        // Runs from the same BAM stream used to generate the durable
+        // coordinate-sorted BAM/BAI artifacts, but never depends on
+        // those files being written.
         JoinHandle<anyhow::Result<(
             HashMap<String, String>, // read2contig
             HashMap<String, u64>,    // unweighted contig_stats
@@ -829,14 +829,12 @@ async fn run_reads_to_contigs(
     // 2. durable reads_to_contigs.tsv +
     //    in-memory mapped-contig IDs/read lengths
     //
-    // 3. coordinate-sorted BAM + BAI durable artifact side-chain
+    // 3. SAM -> BAM ONCE, then BAM fanout:
+    //
+    //        a. coordinate sort -> durable BAM -> BAI
+    //        b. query-name sort -> in-memory contig statistics
     //
     // 4. unmapped/non-contig FASTQ/FASTA
-    //
-    // 5. query-name-sorted BAM -> in-memory contig statistics
-    //
-    // Branches 3 and 5 are deliberately independent. Nothing in the
-    // computational statistics path depends on the durable BAM file.
     // ================================================================
 
     let (
@@ -844,7 +842,7 @@ async fn run_reads_to_contigs(
         filtered_sam_done_rx,
     ) = fanout_to_channels(
         filtered_sam_stream,
-        5,
+        4,
         "reads_to_contigs_filtered_sam",
         &config,
         StreamDataType::JustBytes,
@@ -993,15 +991,17 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Branch 3: asynchronous coordinate-sorted BAM + BAI artifacts.
+    // Branch 3: shared BAM stream.
     //
-    // Neither artifact is consumed by downstream computation.
+    // Convert the final filtered SAM to BAM exactly once.
     //
-    // The BAM must be completely written before samtools index begins,
-    // but that dependency lives entirely inside this side-chain.
+    // The resulting BAM stream is then fanned out to:
     //
-    // run_reads_to_contigs() does NOT wait for this branch to finish.
-    // Final pipeline cleanup waits for bam_index_artifact_task.
+    //   1. coordinate sort -> durable BAM -> BAI
+    //   2. query-name sort -> computational contig statistics
+    //
+    // Neither computational statistics nor any downstream stage needs
+    // to reopen the durable BAM artifact.
     // ================================================================
 
     let bam_input = filtered_sam_streams
@@ -1065,7 +1065,51 @@ async fn run_reads_to_contigs(
     };
 
 
-    // Coordinate sort for the durable BAM artifact.
+    // ------------------------------------------------
+    // Fan out the BAM stream.
+    //
+    // Both downstream consumers are installed immediately, so this
+    // remains a bounded streaming pipeline rather than materializing
+    // the BAM in memory.
+    // ------------------------------------------------
+
+    let (
+        bam_streams,
+        bam_router_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(bam_view_rx),
+        2,
+        "reads_to_contigs_bam",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(bam_router_done_rx);
+
+    let mut bam_streams =
+        bam_streams.into_iter();
+
+    let bam_for_coordinate_sort =
+        bam_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let bam_for_name_sort =
+        bam_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+
+    // ================================================================
+    // Branch 3A: coordinate-sorted BAM + BAI durable artifacts.
+    //
+    // Neither artifact is consumed by downstream computation.
+    //
+    // The BAM must be completely written before samtools index begins,
+    // but that dependency lives entirely inside this side-chain.
+    // ================================================================
 
     let sort_config = SamtoolsConfig {
         subcommand: SamtoolsSubcommand::Sort,
@@ -1094,7 +1138,7 @@ async fn run_reads_to_contigs(
         sort_err_task,
     ) = stream_to_cmd(
         config.clone(),
-        bam_view_rx,
+        bam_for_coordinate_sort,
         SAMTOOLS_TAG,
         sort_args,
         StreamDataType::JustBytes,
@@ -1127,8 +1171,8 @@ async fn run_reads_to_contigs(
     };
 
 
-    // Start writing the BAM immediately so the coordinate-sort stream
-    // always has a consumer. Do not synchronize on it here.
+    // Start writing the coordinate-sorted BAM immediately.
+    // Do not synchronize on it here.
 
     let bam_write_task = write_byte_stream_to_file(
         &reads_to_contigs_bam,
@@ -1253,6 +1297,90 @@ async fn run_reads_to_contigs(
     });
 
     cleanup_tasks.push(bam_index_artifact_task);
+
+
+    // ================================================================
+    // Branch 3B: query-name-sorted BAM for contig statistics.
+    //
+    // This is a computational branch from the SAME BAM stream used by
+    // Branch 3A. No second SAM -> BAM conversion and no filesystem BAM
+    // dependency are required.
+    // ================================================================
+
+    let name_sort_config = SamtoolsConfig {
+        subcommand: SamtoolsSubcommand::Sort,
+        subcommand_fields: HashMap::from([
+            ("-n".to_string(), None),
+            ("-u".to_string(), None),
+            (
+                "-O".to_string(),
+                Some("bam".to_string()),
+            ),
+            ("-".to_string(), None),
+        ]),
+    };
+
+    let name_sort_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&name_sort_config),
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        name_sort_child,
+        name_sort_stream_task,
+        name_sort_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        bam_for_name_sort,
+        SAMTOOLS_TAG,
+        name_sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(name_sort_stream_task);
+    cleanup_tasks.push(name_sort_err_task);
+
+    let name_sort_rx = {
+        let mut guard = name_sort_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+
+    // Consume the name-sorted BAM immediately.
+    //
+    // Do NOT put this task in cleanup_tasks. Its return value is
+    // computational pipeline state required downstream.
+
+    let contig_info_task = tokio::spawn(async move {
+        generate_info_from_bam_stream(
+            name_sort_rx,
+            0,
+        )
+            .await
+    });
 
 
     // ================================================================
@@ -1461,181 +1589,14 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Branch 5: query-name-sorted BAM for contig statistics.
-    //
-    // This is a COMPUTATIONAL branch.
-    //
-    // It consumes the final filtered SAM directly and is completely
-    // independent of Branch 3's durable coordinate-sorted BAM/BAI.
-    //
-    // Legacy GenerateContigStats ultimately needs first-seen read ->
-    // contig assignments. generate_info_from_bam_stream() provides that
-    // generic bookkeeping and requires query-name-sorted BAM input.
-    //
-    // Start the statistics consumer inside this function so the entire
-    // branch remains live while the other filtered-SAM branches run.
-    // ================================================================
-
-    let stats_sam_input =
-        filtered_sam_streams
-            .next()
-            .ok_or(PipelineError::EmptyStream)?;
-
-
-    // ------------------------------------------------
-    // Final filtered SAM -> BAM
-    // ------------------------------------------------
-
-    let stats_view_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-b".to_string(), None),
-            ("-".to_string(), None),
-        ]),
-    };
-
-    let stats_view_args = generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&stats_view_config),
-    )
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (
-        stats_view_child,
-        stats_view_stream_task,
-        stats_view_err_task,
-    ) = stream_to_cmd(
-        config.clone(),
-        stats_sam_input,
-        SAMTOOLS_TAG,
-        stats_view_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-        None,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    cleanup_tasks.push(stats_view_stream_task);
-    cleanup_tasks.push(stats_view_err_task);
-
-    let stats_bam_rx = {
-        let mut guard = stats_view_child.lock().await;
-
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            &config,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
-
-
-    // ------------------------------------------------
-    // Query-name sort the computational BAM stream.
-    //
-    // No filesystem BAM is involved.
-    // ------------------------------------------------
-
-    let name_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-u".to_string(), None),
-            (
-                "-O".to_string(),
-                Some("bam".to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
-
-    let name_sort_args = generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&name_sort_config),
-    )
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (
-        name_sort_child,
-        name_sort_stream_task,
-        name_sort_err_task,
-    ) = stream_to_cmd(
-        config.clone(),
-        stats_bam_rx,
-        SAMTOOLS_TAG,
-        name_sort_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-        None,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    cleanup_tasks.push(name_sort_stream_task);
-    cleanup_tasks.push(name_sort_err_task);
-
-    let name_sort_rx = {
-        let mut guard = name_sort_child.lock().await;
-
-        parse_child_output(
-            &mut guard,
-            ChildStream::Stdout,
-            ParseMode::Bytes,
-            &config,
-        )
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: SAMTOOLS_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
-
-
-    // ------------------------------------------------
-    // Consume the name-sorted BAM immediately.
-    //
-    // Do NOT put this task in cleanup_tasks: its return value is needed
-    // downstream to construct the long-read contig/base statistics.
-    // ------------------------------------------------
-
-    let contig_info_task = tokio::spawn(async move {
-        generate_info_from_bam_stream(
-            name_sort_rx,
-            0,
-        )
-            .await
-    });
-
-
-    // ================================================================
     // Return.
     //
-    // Branch 3's BAM/BAI artifact work continues asynchronously until
+    // BAM/BAI artifact generation continues asynchronously until
     // cleanup.
     //
-    // Branch 5's computational contig-info work also continues
-    // asynchronously, but its JoinHandle is returned because run()
-    // requires the resulting in-memory objects.
+    // Query-name sorting and contig-info generation also continue
+    // asynchronously, but contig_info_task is returned because its
+    // in-memory result is required by downstream computation.
     // ================================================================
 
     Ok((
@@ -1883,6 +1844,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (qc_fastp_out_stream, qc_cleanup_tasks, qc_cleanup_receivers, qc_count_result_rx) =
         fastp_qc(config.clone(), val_out_stream).await?;
     cleanup_tasks.extend(qc_cleanup_tasks);
+    cleanup_receivers.extend(qc_cleanup_receivers);
 
 
     // *******************
