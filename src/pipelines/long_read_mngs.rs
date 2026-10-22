@@ -652,9 +652,6 @@ async fn run_reads_to_contigs(
     // minimap2 -ax map-ont assembled_reads input_fastq
     //          -t 15 --secondary=no
     //
-    // The Rust pipeline preserves the alignment parameters but lets
-    // RunConfig choose the available minimap2 threads.
-    //
     // assembled_reads is the Flye contigs FASTA. Minimap2 accepts the
     // FASTA directly and builds the transient index internally.
     // ================================================================
@@ -787,10 +784,6 @@ async fn run_reads_to_contigs(
     // ================================================================
     // filter_clipped_alignments.py equivalent
     //
-    // Legacy:
-    //
-    // filter_clipped_alignments.py ... -m 20
-    //
     // Excessively clipped mapped reads are rewritten as unmapped SAM
     // records rather than removed, allowing samtools fastq -f 4 below
     // to recover them as non-contig reads.
@@ -813,8 +806,8 @@ async fn run_reads_to_contigs(
     // Fan out the FINAL filtered SAM.
     //
     // 1. durable sample.reads_to_contigs.sam
-    // 2. reads_to_contigs.tsv
-    // 3. BAM conversion + coordinate sort
+    // 2. reads_to_contigs.tsv + mapped-contig HashSet
+    // 3. asynchronous BAM + BAI artifact generation
     // 4. unmapped/non-contig FASTQ extraction
     // ================================================================
 
@@ -864,16 +857,9 @@ async fn run_reads_to_contigs(
     // ================================================================
     // Branch 2: reads_to_contigs.tsv + mapped contig collection
     //
-    // Legacy TSV:
-    //
-    // grep -v "^@" sample.reads_to_contigs.sam |
-    // awk '{ print $1 "\t" $3 "\t" length($10)}'
-    //
-    // While writing the durable TSV, retain only the unique RNAMEs for
-    // mapped reads. This avoids rereading the TSV in RemoveUnmappedContigs.
-    //
-    // RNAME == "*" means the read is unmapped and is therefore not added
-    // to mapped_contig_ids.
+    // The TSV remains a durable artifact, but downstream computation
+    // receives the unique mapped-contig IDs directly rather than
+    // reopening and reparsing the TSV.
     // ================================================================
 
     let mut tsv_input = ReceiverStream::new(
@@ -887,8 +873,11 @@ async fn run_reads_to_contigs(
     let mapped_contigs_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
 
-        let file = tokio::fs::File::create(&tsv_path).await?;
-        let mut writer = tokio::io::BufWriter::new(file);
+        let file =
+            tokio::fs::File::create(&tsv_path).await?;
+
+        let mut writer =
+            tokio::io::BufWriter::new(file);
 
         let mut mapped_contig_ids: HashSet<String> =
             HashSet::new();
@@ -896,11 +885,10 @@ async fn run_reads_to_contigs(
         while let Some(item) = tsv_input.next().await {
             let ParseOutput::Bytes(bytes) = item else {
                 return Err(anyhow!(
-                "reads_to_contigs TSV branch expected SAM bytes"
-            ));
+                    "reads_to_contigs TSV branch expected SAM bytes"
+                ));
             };
 
-            // Skip SAM headers.
             if bytes.first() == Some(&b'@') {
                 continue;
             }
@@ -908,25 +896,21 @@ async fn run_reads_to_contigs(
             let line = std::str::from_utf8(&bytes)?
                 .trim_end_matches(&['\r', '\n'][..]);
 
-            let fields: Vec<&str> = line.split('\t').collect();
+            let fields: Vec<&str> =
+                line.split('\t').collect();
 
-            // QNAME = 0
-            // RNAME = 2
-            // SEQ   = 9
             if fields.len() < 10 {
                 return Err(anyhow!(
-                "Malformed SAM record while generating \
-                 reads_to_contigs.tsv: expected >=10 fields, got {}",
-                fields.len()
-            ));
+                    "Malformed SAM record while generating \
+                     reads_to_contigs.tsv: expected >=10 fields, got {}",
+                    fields.len()
+                ));
             }
 
             let qname = fields[0];
             let rname = fields[2];
             let read_length = fields[9].len();
 
-            // Preserve the legacy TSV exactly, including unmapped records
-            // whose RNAME is "*".
             let output = format!(
                 "{}\t{}\t{}\n",
                 qname,
@@ -936,8 +920,6 @@ async fn run_reads_to_contigs(
 
             writer.write_all(output.as_bytes()).await?;
 
-            // But the in-memory set contains only contigs that actually
-            // received at least one mapped read.
             if rname != "*" {
                 mapped_contig_ids.insert(rname.to_owned());
             }
@@ -946,9 +928,9 @@ async fn run_reads_to_contigs(
         writer.flush().await?;
 
         info!(
-        "reads_to_contigs.tsv complete; {} contigs have mapped reads",
-        mapped_contig_ids.len()
-    );
+            "reads_to_contigs.tsv complete; {} contigs have mapped reads",
+            mapped_contig_ids.len()
+        );
 
         Ok::<HashSet<String>, anyhow::Error>(
             mapped_contig_ids
@@ -956,15 +938,16 @@ async fn run_reads_to_contigs(
     });
 
 
-
     // ================================================================
-    // Branch 3:
+    // Branch 3: asynchronous BAM + BAI artifact generation.
     //
-    // samtools view -b -
-    //      |
-    // samtools sort -O bam -
-    //      |
-    // sample.reads_to_contigs.bam
+    // Neither artifact is consumed by a downstream computational stage.
+    //
+    // The BAM must still be fully written before samtools index begins,
+    // but that dependency belongs entirely inside this side-chain.
+    //
+    // run_reads_to_contigs() does NOT wait for this work to complete.
+    // The final pipeline cleanup waits for bam_index_artifact_task.
     // ================================================================
 
     let bam_input = filtered_sam_streams
@@ -1090,8 +1073,9 @@ async fn run_reads_to_contigs(
     };
 
 
-    // samtools index requires the BAM to be completely written, so this
-    // writer is explicitly awaited below.
+    // Start the BAM writer immediately so the sorted BAM stream has a
+    // consumer. Do not await it here.
+
     let bam_write_task = write_byte_stream_to_file(
         &reads_to_contigs_bam,
         ReceiverStream::new(sorted_bam_rx),
@@ -1104,12 +1088,137 @@ async fn run_reads_to_contigs(
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
 
+    // The combined side-chain task owns the only required synchronization:
+    //
+    //     finish BAM write
+    //           ↓
+    //     samtools index
+    //
+    // Nothing in the main computational pipeline waits on this.
+
+    let bam_path_for_index =
+        reads_to_contigs_bam.clone();
+
+    let bai_path_for_index =
+        reads_to_contigs_bai.clone();
+
+    let index_config_for_task =
+        config.clone();
+
+    let bam_index_artifact_task = tokio::spawn(async move {
+        // ------------------------------------------------------------
+        // First finish materializing the coordinate-sorted BAM.
+        // ------------------------------------------------------------
+
+        bam_write_task
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "reads-to-contigs BAM writer task panicked: {}",
+                    e
+                )
+            })??;
+
+        // ------------------------------------------------------------
+        // Then build the BAI.
+        // ------------------------------------------------------------
+
+        let index_config = SamtoolsConfig {
+            subcommand: SamtoolsSubcommand::Index,
+            subcommand_fields: HashMap::from([
+                (
+                    bam_path_for_index
+                        .to_string_lossy()
+                        .to_string(),
+                    None,
+                ),
+                (
+                    bai_path_for_index
+                        .to_string_lossy()
+                        .to_string(),
+                    None,
+                ),
+            ]),
+        };
+
+        let index_args = generate_cli(
+            SAMTOOLS_TAG,
+            &index_config_for_task,
+            Some(&index_config),
+        )
+            .map_err(|e| {
+                anyhow!(
+                "Failed to generate samtools index arguments: {}",
+                e
+            )
+            })?;
+
+        let (
+            mut index_child,
+            index_err_task,
+        ) = spawn_cmd(
+            index_config_for_task.clone(),
+            SAMTOOLS_TAG,
+            index_args,
+            index_config_for_task.args.verbose,
+            None,
+        )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                "Failed to start samtools index: {}",
+                e
+            )
+            })?;
+
+        let index_status = index_child
+            .wait()
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed waiting for samtools index: {}",
+                    e
+                )
+            })?;
+
+        index_err_task
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "samtools index stderr task panicked: {}",
+                    e
+                )
+            })??;
+
+        if !index_status.success() {
+            return Err(anyhow!(
+                "samtools index exited with status {}",
+                index_status
+            ));
+        }
+
+        info!(
+            "Reads-to-contigs BAM and index complete: {} / {}",
+            bam_path_for_index.display(),
+            bai_path_for_index.display()
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(bam_index_artifact_task);
+
+
     // ================================================================
     // Branch 4: non-contig reads
     //
     // Legacy:
     //
     // samtools fastq -n -f 4 sample.reads_to_contigs.sam
+    //
+    // The FASTQ is retained as an output artifact. The FASTA is also
+    // retained, but its structured stream continues downstream into
+    // PrepareNTAlignmentInputs.
     // ================================================================
 
     let non_contig_sam_input =
@@ -1179,7 +1288,7 @@ async fn run_reads_to_contigs(
     // Fan out non-contig FASTQ:
     //
     // 1. durable sample.non_contigs.fastq
-    // 2. FASTQ -> FASTA -> sample.non_contigs.fasta
+    // 2. FASTQ -> FASTA
     // ================================================================
 
     let (
@@ -1215,7 +1324,7 @@ async fn run_reads_to_contigs(
         );
 
 
-    // Durable non-contig FASTQ.
+    // Durable non-contig FASTQ side-chain.
 
     let non_contig_fastq_write_task =
         write_byte_stream_to_file(
@@ -1236,13 +1345,6 @@ async fn run_reads_to_contigs(
 
     // ================================================================
     // Convert non-contig FASTQ to structured FASTA.
-    //
-    // This FASTA is real downstream pipeline data: it becomes the
-    // non-contig-read input to PrepareNTAlignmentInputs.
-    //
-    // Fan it out so:
-    //   1. one branch continues downstream as structured FASTA
-    //   2. one branch asynchronously writes sample.non_contigs.fasta
     // ================================================================
 
     let (
@@ -1257,8 +1359,12 @@ async fn run_reads_to_contigs(
     cleanup_tasks.push(non_contig_fasta_convert_task);
 
 
-    // Split the structured FASTA stream into the computational path and
-    // the durable-output path.
+    // ================================================================
+    // Fan out structured FASTA:
+    //
+    // 1. downstream computational stream
+    // 2. durable sample.non_contigs.fasta
+    // ================================================================
 
     let (
         non_contig_fasta_streams,
@@ -1278,26 +1384,19 @@ async fn run_reads_to_contigs(
     let mut non_contig_fasta_streams =
         non_contig_fasta_streams.into_iter();
 
+    let non_contig_fasta_out_stream =
+        ReceiverStream::new(
+            non_contig_fasta_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
 
-    // Branch 1: continue through the pipeline.
-    //
-    // This contains:
-    //     ParseOutput::Fasta(SequenceRecord::Fasta { ... })
-
-    let non_contig_fasta_out_stream = ReceiverStream::new(
-        non_contig_fasta_streams
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
-
-
-    // Branch 2: durable sample.non_contigs.fasta artifact.
-
-    let non_contig_fasta_file_stream = ReceiverStream::new(
-        non_contig_fasta_streams
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let non_contig_fasta_file_stream =
+        ReceiverStream::new(
+            non_contig_fasta_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
 
     let non_contig_fasta_write_task =
         write_byte_stream_to_file(
@@ -1317,90 +1416,11 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // BAM synchronization point.
+    // Return immediately after all live branches have consumers.
     //
-    // The other fanout branches continue concurrently while we wait.
-    // samtools index cannot begin until the sorted BAM is complete.
+    // In particular, BAM/BAI generation continues independently in
+    // cleanup_tasks and does not block downstream pipeline construction.
     // ================================================================
-
-    bam_write_task
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))??;
-
-
-    // ================================================================
-    // samtools index
-    //
-    // Legacy:
-    //
-    // samtools index \
-    //     sample.reads_to_contigs.bam \
-    //     sample.reads_to_contigs.bam.bai
-    // ================================================================
-
-    let index_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Index,
-        subcommand_fields: HashMap::from([
-            (
-                reads_to_contigs_bam
-                    .to_string_lossy()
-                    .to_string(),
-                None,
-            ),
-            (
-                reads_to_contigs_bai
-                    .to_string_lossy()
-                    .to_string(),
-                None,
-            ),
-        ]),
-    };
-
-    let index_args = generate_cli(
-        SAMTOOLS_TAG,
-        &config,
-        Some(&index_config),
-    )
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (mut index_child, index_err_task) = spawn_cmd(
-        config.clone(),
-        SAMTOOLS_TAG,
-        index_args,
-        config.args.verbose,
-        None,
-    )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let index_status = index_child
-        .wait()
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    index_err_task
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))??;
-
-    if !index_status.success() {
-        return Err(PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: format!(
-                "samtools index exited with status {}",
-                index_status
-            ),
-        });
-    }
-
 
     Ok((
         ReadsToContigsOutputs {
