@@ -3,7 +3,7 @@
 use tokio_stream::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::anyhow;
 use futures::future::try_join_all;
@@ -605,6 +605,11 @@ async fn run_reads_to_contigs(
 ) -> Result<
     (
         ReadsToContigsOutputs,
+
+        // Completes when reads_to_contigs.tsv has been written and
+        // returns the unique set of contigs with mapped reads.
+        JoinHandle<anyhow::Result<HashSet<String>>>,
+
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
     ),
@@ -854,12 +859,18 @@ async fn run_reads_to_contigs(
 
 
     // ================================================================
-    // Branch 2: reads_to_contigs.tsv
+    // Branch 2: reads_to_contigs.tsv + mapped contig collection
     //
-    // Legacy:
+    // Legacy TSV:
     //
     // grep -v "^@" sample.reads_to_contigs.sam |
     // awk '{ print $1 "\t" $3 "\t" length($10)}'
+    //
+    // While writing the durable TSV, retain only the unique RNAMEs for
+    // mapped reads. This avoids rereading the TSV in RemoveUnmappedContigs.
+    //
+    // RNAME == "*" means the read is unmapped and is therefore not added
+    // to mapped_contig_ids.
     // ================================================================
 
     let mut tsv_input = ReceiverStream::new(
@@ -870,23 +881,23 @@ async fn run_reads_to_contigs(
 
     let tsv_path = reads_to_contigs_tsv.clone();
 
-    let tsv_task = tokio::spawn(async move {
+    let mapped_contigs_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
 
-        let file =
-            tokio::fs::File::create(&tsv_path).await?;
+        let file = tokio::fs::File::create(&tsv_path).await?;
+        let mut writer = tokio::io::BufWriter::new(file);
 
-        let mut writer =
-            tokio::io::BufWriter::new(file);
+        let mut mapped_contig_ids: HashSet<String> =
+            HashSet::new();
 
         while let Some(item) = tsv_input.next().await {
             let ParseOutput::Bytes(bytes) = item else {
                 return Err(anyhow!(
-                    "reads_to_contigs TSV branch expected SAM bytes"
-                ));
+                "reads_to_contigs TSV branch expected SAM bytes"
+            ));
             };
 
-            // grep -v "^@"
+            // Skip SAM headers.
             if bytes.first() == Some(&b'@') {
                 continue;
             }
@@ -894,35 +905,52 @@ async fn run_reads_to_contigs(
             let line = std::str::from_utf8(&bytes)?
                 .trim_end_matches(&['\r', '\n'][..]);
 
-            let fields: Vec<&str> =
-                line.split('\t').collect();
+            let fields: Vec<&str> = line.split('\t').collect();
 
-            // We access QNAME, RNAME and SEQ (fields 0, 2, 9).
+            // QNAME = 0
+            // RNAME = 2
+            // SEQ   = 9
             if fields.len() < 10 {
                 return Err(anyhow!(
-                    "Malformed SAM record while generating reads_to_contigs.tsv: \
-                     expected >=10 fields, got {}",
-                    fields.len()
-                ));
+                "Malformed SAM record while generating \
+                 reads_to_contigs.tsv: expected >=10 fields, got {}",
+                fields.len()
+            ));
             }
 
+            let qname = fields[0];
+            let rname = fields[2];
+            let read_length = fields[9].len();
+
+            // Preserve the legacy TSV exactly, including unmapped records
+            // whose RNAME is "*".
             let output = format!(
                 "{}\t{}\t{}\n",
-                fields[0],
-                fields[2],
-                fields[9].len(),
+                qname,
+                rname,
+                read_length,
             );
 
-            writer
-                .write_all(output.as_bytes())
-                .await?;
+            writer.write_all(output.as_bytes()).await?;
+
+            // But the in-memory set contains only contigs that actually
+            // received at least one mapped read.
+            if rname != "*" {
+                mapped_contig_ids.insert(rname.to_owned());
+            }
         }
 
         writer.flush().await?;
 
-        Ok::<(), anyhow::Error>(())
-    });
+        info!(
+        "reads_to_contigs.tsv complete; {} contigs have mapped reads",
+        mapped_contig_ids.len()
+    );
 
+        Ok::<HashSet<String>, anyhow::Error>(
+            mapped_contig_ids
+        )
+    });
 
 
 
@@ -1318,9 +1346,6 @@ async fn run_reads_to_contigs(
         });
     }
 
-    tsv_task
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))??;
 
     Ok((
         ReadsToContigsOutputs {
@@ -1331,6 +1356,7 @@ async fn run_reads_to_contigs(
             non_contigs_fastq,
             non_contigs_fasta,
         },
+        mapped_contigs_task,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -1339,10 +1365,9 @@ async fn run_reads_to_contigs(
 
 async fn remove_unmapped_contigs(
     assembled_reads: &PathBuf,
-    reads_to_contig_tsv: &PathBuf,
+    contigs_with_reads: &HashSet<String>,
     mapped_contigs_fasta: &PathBuf,
 ) -> Result<(), PipelineError> {
-    use std::collections::HashSet;
     use tokio::io::{
         AsyncBufReadExt,
         AsyncWriteExt,
@@ -1350,67 +1375,24 @@ async fn remove_unmapped_contigs(
         BufWriter,
     };
 
-    // ================================================================
-    // Collect contig IDs with mapped reads.
-    //
-    // Legacy:
-    //
-    // contigs_with_reads = set(
-    //     row[1]
-    //     for row in csv.reader(f, delimiter="\t")
-    // )
-    // ================================================================
-
-    let tsv_file = tokio::fs::File::open(reads_to_contig_tsv)
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "Failed to open reads-to-contigs TSV {}: {}",
-                reads_to_contig_tsv.display(),
-                e
-            ))
-        })?;
-
-    let mut tsv_lines =
-        BufReader::new(tsv_file).lines();
-
-    let mut contigs_with_reads: HashSet<String> =
-        HashSet::new();
-
-    while let Some(line) = tsv_lines
-        .next_line()
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?
-    {
-        let mut fields = line.split('\t');
-
-        // QNAME
-        let _read_id = fields.next();
-
-        // RNAME / contig ID
-        let contig_id = fields.next().ok_or_else(|| {
-            PipelineError::Other(anyhow!(
-                "Malformed reads-to-contigs TSV row: {}",
-                line
-            ))
-        })?;
-
-        contigs_with_reads.insert(contig_id.to_string());
-    }
-
     debug!(
-        "RemoveUnmappedContigs: {} referenced contig IDs",
+        "RemoveUnmappedContigs: {} contig IDs have mapped reads",
         contigs_with_reads.len()
     );
-
 
     // ================================================================
     // Filter assembled FASTA.
     //
-    // We stream the FASTA rather than loading all Flye contigs into RAM.
+    // `contigs_with_reads` was collected directly from the final
+    // reads-to-contigs SAM stream while reads_to_contigs.tsv was being
+    // written asynchronously. There is therefore no need to reopen and
+    // parse the TSV here.
+    //
+    // Stream the Flye assembly rather than loading all contig sequences
+    // into memory.
     //
     // Biopython SeqRecord.id is the first whitespace-delimited token
-    // following '>', so use the same definition here.
+    // following '>', so preserve that definition here.
     // ================================================================
 
     let fasta_file = tokio::fs::File::open(assembled_reads)
@@ -1448,11 +1430,21 @@ async fn remove_unmapped_contigs(
     while let Some(line) = fasta_lines
         .next_line()
         .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?
+        .map_err(|e| {
+            PipelineError::IOError(e.to_string())
+        })?
     {
+        // A new FASTA record begins.
         if let Some(header) = line.strip_prefix('>') {
             total_contigs += 1;
 
+            // Match Biopython SeqRecord.id behavior:
+            //
+            // >contig_123 description...
+            //
+            // becomes:
+            //
+            // contig_123
             let contig_id = header
                 .split_whitespace()
                 .next()
@@ -1486,6 +1478,7 @@ async fn remove_unmapped_contigs(
             continue;
         }
 
+        // Sequence belonging to the current FASTA record.
         if keep_current {
             writer
                 .write_all(line.as_bytes())
@@ -1515,9 +1508,11 @@ async fn remove_unmapped_contigs(
         })?;
 
     info!(
-        "RemoveUnmappedContigs: retained {} of {} assembled contigs -> {}",
+        "RemoveUnmappedContigs: retained {} of {} assembled contigs \
+         ({} referenced contig IDs) -> {}",
         mapped_contigs,
         total_contigs,
+        contigs_with_reads.len(),
         mapped_contigs_fasta.display()
     );
 
@@ -1951,7 +1946,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.push(contigs_copy_task);
 
-    
+
 
     // *******************
     // Reads-to-Contigs Stage
@@ -1971,6 +1966,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (
         reads_to_contigs_outputs,
+        mapped_contigs_task,
         reads_to_contigs_cleanup_tasks,
         reads_to_contigs_cleanup_receivers,
     ) = run_reads_to_contigs(
@@ -1985,6 +1981,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(reads_to_contigs_cleanup_receivers);
 
 
+    // ================================================================
+    // Synchronize on mapped-contig collection.
+    //
+    // The reads-to-contigs TSV is written by the same asynchronous task,
+    // but downstream computation consumes the HashSet directly rather
+    // than reopening and reparsing that file.
+    // ================================================================
+
+    let mapped_contig_ids = mapped_contigs_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Mapped contig collection task panicked: {}",
+            e
+        ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+
     // *******************
     // Remove Unmapped Contigs
     // *******************
@@ -1993,8 +2008,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("mapped_contigs.fasta");
 
     remove_unmapped_contigs(
-        &contigs_fasta_path,
-        &reads_to_contigs_outputs.reads_to_contigs_tsv,
+        &flye_assembly_path,
+        &mapped_contig_ids,
         &mapped_contigs_fasta_path,
     )
         .await?;
