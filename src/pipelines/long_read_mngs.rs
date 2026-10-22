@@ -26,7 +26,7 @@ use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::command::flye::FlyeConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          choose_temp_dir};
-use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream};
+use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream, fastq_bytes_to_fasta_stream};
 use crate::utils::sambam::{filter_clipped_alignments, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
@@ -1573,13 +1573,13 @@ async fn run_reads_to_contigs(
     cleanup_tasks.push(non_contig_fastq_write_task);
 
 
-    // FASTQ -> structured FASTA.
+    // FASTQ bytes -> structured FASTA.
 
     let (
         non_contig_fasta_stream,
         non_contig_fasta_convert_task,
-    ) = fastq_to_fasta_stream(
-        non_contig_fasta_input,
+    ) = fastq_bytes_to_fasta_stream(
+        non_contig_fasta_input.into_inner(),
         config.base_buffer_size,
     )
         .await?;
@@ -2375,14 +2375,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Temporary final stream drain for construction
     // *******************
 
-    // let mut final_temp_drain_stream = subsampled_out_stream;
-    //
-    // let final_temp_drain_task = tokio::spawn(async move {
-    //     while final_temp_drain_stream.next().await.is_some() {}
-    //     Ok::<(), anyhow::Error>(())
-    // });
-    //
-    // cleanup_tasks.push(final_temp_drain_task);
+
+    let mut final_temp_drain_stream = non_contig_fasta_stream;
+
+    let final_temp_drain_task = tokio::spawn(async move {
+        while final_temp_drain_stream.next().await.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************

@@ -29,6 +29,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{self as stream};
+use tokio::io::AsyncBufReadExt;
 
 use crate::cli::Technology;
 use crate::config::defs::{
@@ -38,7 +39,7 @@ use crate::config::defs::{
 };
 use crate::utils::file::extension_remover;
 use crate::utils::sequence::{normal_phred_qual_string, DNA};
-use crate::utils::streams::{ParseOutput, ToBytes, batch_rayon_process};
+use crate::utils::streams::{ParseOutput, ToBytes, batch_rayon_process, ChannelReader};
 use crate::utils::system::compute_phase_concurrency;
 use crate::utils::taxonomy::get_taxid;
 use crate::utils::taxonomy::{combine_taxon_loc_json, get_valid_lineage};
@@ -3372,6 +3373,122 @@ pub async fn fastq_to_fasta_stream(
                     anyhow!(
                         "fastq_to_fasta_stream: output receiver dropped"
                     )
+                })?;
+        }
+
+        Ok(())
+    });
+
+    Ok((
+        ReceiverStream::new(rx),
+        task,
+    ))
+}
+
+pub async fn fastq_bytes_to_fasta_stream(
+    input_rx: mpsc::Receiver<ParseOutput>,
+    buffer_size: usize,
+) -> anyhow::Result<(
+    ReceiverStream<ParseOutput>,
+    JoinHandle<anyhow::Result<()>>,
+)> {
+    let (tx, rx) = mpsc::channel(buffer_size);
+
+    let task = tokio::spawn(async move {
+        let reader = ChannelReader::new(input_rx);
+
+        let mut reader =
+            tokio::io::BufReader::with_capacity(
+                1024 * 1024,
+                reader,
+            );
+
+        let mut line = String::new();
+
+        loop {
+            // FASTQ header
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+
+            if n == 0 {
+                break;
+            }
+
+            let header = line.trim_end_matches(&['\r', '\n'][..]);
+
+            if !header.starts_with('@') {
+                return Err(anyhow!(
+                    "fastq_bytes_to_fasta_stream: expected '@' FASTQ header, got {:?}",
+                    header
+                ));
+            }
+
+            let (id, desc) =
+                parse_header(header.as_bytes(), '@');
+
+            // Sequence
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(anyhow!(
+                    "fastq_bytes_to_fasta_stream: unexpected EOF after header {}",
+                    id
+                ));
+            }
+
+            let seq = Bytes::copy_from_slice(
+                line.trim_end_matches(&['\r', '\n'][..]).as_bytes()
+            );
+
+            // Plus line
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(anyhow!(
+                    "fastq_bytes_to_fasta_stream: unexpected EOF before '+' for {}",
+                    id
+                ));
+            }
+
+            if !line.starts_with('+') {
+                return Err(anyhow!(
+                    "fastq_bytes_to_fasta_stream: expected '+' line for {}",
+                    id
+                ));
+            }
+
+            // Quality — consume and discard
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err(anyhow!(
+                    "fastq_bytes_to_fasta_stream: unexpected EOF before quality for {}",
+                    id
+                ));
+            }
+
+            let qual_len =
+                line.trim_end_matches(&['\r', '\n'][..]).len();
+
+            if qual_len != seq.len() {
+                return Err(anyhow!(
+                    "fastq_bytes_to_fasta_stream: sequence/quality length mismatch \
+                     for {}: seq={}, qual={}",
+                    id,
+                    seq.len(),
+                    qual_len
+                ));
+            }
+
+            tx.send(ParseOutput::Fasta(
+                SequenceRecord::Fasta {
+                    id,
+                    desc,
+                    seq,
+                },
+            ))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                    "fastq_bytes_to_fasta_stream: output receiver dropped"
+                )
                 })?;
         }
 

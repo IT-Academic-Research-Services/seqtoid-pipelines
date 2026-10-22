@@ -4690,6 +4690,7 @@ pub fn generate_cli(
         MAKEBLASTDB_TAG => Box::new(makeblastdb::MakeblastdbArgGenerator),
         SORT_TAG => Box::new(sort::SortArgGenerator),
         MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
+        FLYE_TAG => Box::new(flye::FlyeArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
