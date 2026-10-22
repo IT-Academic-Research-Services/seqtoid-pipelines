@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context, Result};
 use futures::future::try_join_all;
 use log::{debug, info, warn};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
@@ -40,6 +41,12 @@ struct ReadsToContigsOutputs {
     reads_to_contigs_tsv: PathBuf,
     non_contigs_fastq: PathBuf,
     non_contigs_fasta: PathBuf,
+}
+
+#[derive(Debug)]
+struct ReadsToContigsMetadata {
+    mapped_contig_ids: HashSet<String>,
+    read_base_counts: HashMap<String, u64>,
 }
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
@@ -610,8 +617,8 @@ async fn run_reads_to_contigs(
         ReceiverStream<ParseOutput>,
 
         // Completes when reads_to_contigs.tsv has been written and
-        // returns the unique set of contigs with mapped reads.
-        JoinHandle<anyhow::Result<HashSet<String>>>,
+        // returns the in-memory metadata needed downstream.
+        JoinHandle<anyhow::Result<ReadsToContigsMetadata>>,
 
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
@@ -870,7 +877,7 @@ async fn run_reads_to_contigs(
 
     let tsv_path = reads_to_contigs_tsv.clone();
 
-    let mapped_contigs_task = tokio::spawn(async move {
+    let reads_to_contigs_metadata_task = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
 
         let file =
@@ -882,11 +889,14 @@ async fn run_reads_to_contigs(
         let mut mapped_contig_ids: HashSet<String> =
             HashSet::new();
 
+        let mut read_base_counts: HashMap<String, u64> =
+            HashMap::new();
+
         while let Some(item) = tsv_input.next().await {
             let ParseOutput::Bytes(bytes) = item else {
                 return Err(anyhow!(
-                    "reads_to_contigs TSV branch expected SAM bytes"
-                ));
+                "reads_to_contigs TSV branch expected SAM bytes"
+            ));
             };
 
             if bytes.first() == Some(&b'@') {
@@ -901,16 +911,17 @@ async fn run_reads_to_contigs(
 
             if fields.len() < 10 {
                 return Err(anyhow!(
-                    "Malformed SAM record while generating \
-                     reads_to_contigs.tsv: expected >=10 fields, got {}",
-                    fields.len()
-                ));
+                "Malformed SAM record while generating \
+                 reads_to_contigs.tsv: expected >=10 fields, got {}",
+                fields.len()
+            ));
             }
 
             let qname = fields[0];
             let rname = fields[2];
-            let read_length = fields[9].len();
+            let read_length = fields[9].len() as u64;
 
+            // Preserve the legacy durable TSV.
             let output = format!(
                 "{}\t{}\t{}\n",
                 qname,
@@ -920,20 +931,35 @@ async fn run_reads_to_contigs(
 
             writer.write_all(output.as_bytes()).await?;
 
+            // Useful downstream state: which contigs received reads?
             if rname != "*" {
                 mapped_contig_ids.insert(rname.to_owned());
             }
+
+            // Useful downstream state: legacy read2base_count.
+            //
+            // This intentionally includes every TSV row, just as the
+            // WDL's dictionary comprehension does.
+            read_base_counts.insert(
+                qname.to_owned(),
+                read_length,
+            );
         }
 
         writer.flush().await?;
 
         info!(
-            "reads_to_contigs.tsv complete; {} contigs have mapped reads",
-            mapped_contig_ids.len()
-        );
+        "reads_to_contigs.tsv complete; {} contigs have mapped reads, \
+         {} read lengths collected",
+        mapped_contig_ids.len(),
+        read_base_counts.len(),
+    );
 
-        Ok::<HashSet<String>, anyhow::Error>(
-            mapped_contig_ids
+        Ok::<ReadsToContigsMetadata, anyhow::Error>(
+            ReadsToContigsMetadata {
+                mapped_contig_ids,
+                read_base_counts,
+            }
         )
     });
 
@@ -1432,7 +1458,7 @@ async fn run_reads_to_contigs(
             non_contigs_fasta,
         },
         non_contig_fasta_out_stream,
-        mapped_contigs_task,
+        reads_to_contigs_metadata_task,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -1595,6 +1621,71 @@ async fn remove_unmapped_contigs(
     Ok(())
 }
 
+
+
+pub async fn generate_long_read_info_from_bam_stream(
+    rx: mpsc::Receiver<ParseOutput>,
+    read_base_counts: &HashMap<String, u64>,
+    min_contig_size: u64,
+) -> Result<(
+    HashMap<String, String>, // read2contig
+    HashMap<String, u64>,    // contig_stats: reads per contig
+    HashMap<String, u64>,    // contig_base_counts: bases per contig
+)> {
+    let (
+        read2contig,
+        contig_stats,
+        _contig_unique_counts,
+    ) = generate_info_from_bam_stream(
+        rx,
+        min_contig_size,
+    )
+        .await?;
+
+    // Only contigs retained by the generic function should appear
+    // in the final base-count map.
+    let retained_contigs: HashSet<&String> =
+        contig_stats.keys().collect();
+
+    let mut contig_base_counts: HashMap<String, u64> =
+        contig_stats
+            .keys()
+            .map(|contig| (contig.clone(), 0u64))
+            .collect();
+
+    for (read_id, contig_name) in &read2contig {
+        if !retained_contigs.contains(contig_name) {
+            continue;
+        }
+
+        let read_length = read_base_counts
+            .get(read_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Missing read base count for mapped read: {}",
+                    read_id
+                )
+            })?;
+
+        *contig_base_counts
+            .entry(contig_name.clone())
+            .or_insert(0) += *read_length;
+    }
+
+    info!(
+        "generate_long_read_info_from_bam_stream: \
+         {} mapped reads, {} retained contigs, {} contig base counts",
+        read2contig.len(),
+        contig_stats.len(),
+        contig_base_counts.len(),
+    );
+
+    Ok((
+        read2contig,
+        contig_stats,
+        contig_base_counts,
+    ))
+}
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
@@ -2043,7 +2134,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         reads_to_contigs_outputs,
         non_contig_fasta_stream,
-        mapped_contigs_task,
+        reads_to_contigs_metadata_task,
         reads_to_contigs_cleanup_tasks,
         reads_to_contigs_cleanup_receivers,
     ) = run_reads_to_contigs(
@@ -2066,15 +2157,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // than reopening and reparsing that file.
     // ================================================================
 
-    let mapped_contig_ids = mapped_contigs_task
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Mapped contig collection task panicked: {}",
-            e
-        ))
-        })?
-        .map_err(PipelineError::Other)?;
+    let reads_to_contigs_metadata =
+        reads_to_contigs_metadata_task
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Reads-to-contigs metadata task panicked: {}",
+                e
+            ))
+            })?
+            .map_err(PipelineError::Other)?;
 
 
     // *******************
@@ -2086,7 +2178,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     remove_unmapped_contigs(
         &flye_assembly_path,
-        &mapped_contig_ids,
+        &reads_to_contigs_metadata.mapped_contig_ids,
         &mapped_contigs_fasta_path,
     )
         .await?;
@@ -2153,9 +2245,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         read2contig,
         contig_stats,
-        contig_unique_counts,
-    ) = generate_info_from_bam_stream(
+        contig_base_counts,
+    ) = generate_long_read_info_from_bam_stream(
         name_sort_rx,
+        &reads_to_contigs_metadata.read_base_counts,
         0,
     )
         .await
