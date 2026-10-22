@@ -943,7 +943,12 @@ async fn run_reads_to_contigs(
     // grep -v "^@" sample.reads_to_contigs.sam |
     // awk '{ print $1 "\t" $3 "\t" length($10)}'
     //
-    // Preserve that TSV as a durable artifact, but retain the useful
+    // The upstream stream contains arbitrary ParseOutput::Bytes chunks.
+    // Those chunks are NOT SAM-record boundaries. Adapt the byte channel
+    // to AsyncRead with ChannelReader and reconstruct complete SAM lines
+    // before parsing fields.
+    //
+    // Preserve the TSV as a durable artifact, but retain the useful
     // information in memory:
     //
     //   mapped_contig_ids:
@@ -956,16 +961,27 @@ async fn run_reads_to_contigs(
     // read2base_count dictionary.
     // ================================================================
 
-    let mut tsv_input = ReceiverStream::new(
-        filtered_sam_streams
-            .next()
-            .ok_or(PipelineError::EmptyStream)?,
-    );
+    let tsv_input = filtered_sam_streams
+        .next()
+        .ok_or(PipelineError::EmptyStream)?;
 
     let tsv_path = reads_to_contigs_tsv.clone();
 
     let reads_to_contigs_metadata_task = tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{
+            AsyncBufReadExt,
+            AsyncWriteExt,
+        };
+
+        // Convert the arbitrary SAM byte chunks into a continuous AsyncRead.
+        let channel_reader =
+            ChannelReader::new(tsv_input);
+
+        let mut sam_reader =
+            tokio::io::BufReader::with_capacity(
+                1024 * 1024,
+                channel_reader,
+            );
 
         let file =
             tokio::fs::File::create(&tsv_path).await?;
@@ -979,46 +995,190 @@ async fn run_reads_to_contigs(
         let mut read_base_counts: HashMap<String, u64> =
             HashMap::new();
 
-        while let Some(item) = tsv_input.next().await {
-            let ParseOutput::Bytes(bytes) = item else {
-                return Err(anyhow!(
-                    "reads_to_contigs TSV branch expected SAM bytes"
-                ));
-            };
+        let mut line = Vec::<u8>::new();
+        let mut sam_record_count: u64 = 0;
 
-            if bytes.first() == Some(&b'@') {
+        loop {
+            line.clear();
+
+            let bytes_read = sam_reader
+                .read_until(b'\n', &mut line)
+                .await?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            // Remove LF and optional CR without otherwise modifying the
+            // SAM record.
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+
+            if line.is_empty() {
                 continue;
             }
 
-            let line = std::str::from_utf8(&bytes)?
-                .trim_end_matches(&['\r', '\n'][..]);
-
-            let fields: Vec<&str> =
-                line.split('\t').collect();
-
-            if fields.len() < 10 {
-                return Err(anyhow!(
-                    "Malformed SAM record while generating \
-                     reads_to_contigs.tsv: expected >=10 fields, got {}",
-                    fields.len()
-                ));
+            // Match grep -v "^@" from the legacy implementation.
+            if line.first() == Some(&b'@') {
+                continue;
             }
 
-            let qname = fields[0];
-            let rname = fields[2];
-            let read_length = fields[9].len() as u64;
+            sam_record_count += 1;
 
-            let output = format!(
-                "{}\t{}\t{}\n",
-                qname,
-                rname,
-                read_length,
-            );
+            let line_str = std::str::from_utf8(&line)
+                .map_err(|e| {
+                    anyhow!(
+                    "Invalid UTF-8 in reads-to-contigs SAM record {}: {}",
+                    sam_record_count,
+                    e
+                )
+                })?;
 
-            writer.write_all(output.as_bytes()).await?;
+            // We only need fields:
+            //
+            //   1  QNAME
+            //   3  RNAME
+            //   10 SEQ
+            //
+            // Avoid allocating a Vec for every SAM record.
+            let mut fields = line_str.split('\t');
+
+            let qname = fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing QNAME",
+                    sam_record_count
+                )
+                })?;
+
+            // FLAG
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing FLAG",
+                    sam_record_count
+                )
+                })?;
+
+            let rname = fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing RNAME",
+                    sam_record_count
+                )
+                })?;
+
+            // POS
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing POS",
+                    sam_record_count
+                )
+                })?;
+
+            // MAPQ
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing MAPQ",
+                    sam_record_count
+                )
+                })?;
+
+            // CIGAR
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing CIGAR",
+                    sam_record_count
+                )
+                })?;
+
+            // RNEXT
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing RNEXT",
+                    sam_record_count
+                )
+                })?;
+
+            // PNEXT
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing PNEXT",
+                    sam_record_count
+                )
+                })?;
+
+            // TLEN
+            fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing TLEN",
+                    sam_record_count
+                )
+                })?;
+
+            // SEQ -- SAM field 10, matching legacy length($10).
+            let seq = fields
+                .next()
+                .ok_or_else(|| {
+                    anyhow!(
+                    "Malformed reads-to-contigs SAM record {}: missing SEQ",
+                    sam_record_count
+                )
+                })?;
+
+            let read_length = seq.len() as u64;
+
+            // Match the legacy TSV exactly:
+            //
+            // QNAME <tab> RNAME <tab> length(SEQ)
+            writer
+                .write_all(qname.as_bytes())
+                .await?;
+
+            writer
+                .write_all(b"\t")
+                .await?;
+
+            writer
+                .write_all(rname.as_bytes())
+                .await?;
+
+            writer
+                .write_all(b"\t")
+                .await?;
+
+            writer
+                .write_all(read_length.to_string().as_bytes())
+                .await?;
+
+            writer
+                .write_all(b"\n")
+                .await?;
 
             if rname != "*" {
-                mapped_contig_ids.insert(rname.to_owned());
+                mapped_contig_ids.insert(
+                    rname.to_owned(),
+                );
             }
 
             read_base_counts.insert(
@@ -1030,11 +1190,12 @@ async fn run_reads_to_contigs(
         writer.flush().await?;
 
         info!(
-            "reads_to_contigs.tsv complete; {} contigs have mapped reads, \
-             {} read lengths collected",
-            mapped_contig_ids.len(),
-            read_base_counts.len(),
-        );
+        "reads_to_contigs.tsv complete; processed {} SAM records, \
+         {} contigs have mapped reads, {} read lengths collected",
+        sam_record_count,
+        mapped_contig_ids.len(),
+        read_base_counts.len(),
+    );
 
         Ok::<ReadsToContigsMetadata, anyhow::Error>(
             ReadsToContigsMetadata {
