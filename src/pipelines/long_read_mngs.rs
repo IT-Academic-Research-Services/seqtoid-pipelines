@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
                            MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
                           BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
-                          SamtoolsSubcommand, FLYE_TAG};
+                          SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG};
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::fastp::FastpConfig;
@@ -112,7 +112,7 @@ async fn validate_input(
         2,
         "validate_input",
         &config,
-        StreamDataType::IlluminaFastq,
+        StreamDataType::OntFastq,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -127,18 +127,73 @@ async fn validate_input(
     let val_file_stream =
         ReceiverStream::new(val_streams_iter.next().ok_or(PipelineError::EmptyStream)?);
 
-    let val_file_write_task = write_byte_stream_to_file(
-        &validated_file_path,
-        val_file_stream,
+    // Compress the validated FASTQ artifact with pigz.
+    //
+    // The computational branch remains structured ONT FASTQ.
+    // This side branch serializes those records to FASTQ bytes through
+    // stream_to_cmd(), compresses them with pigz, and writes the compressed
+    // stdout to sample_validated.fastq.gz.
+
+    let pigz_args = generate_cli(
+        PIGZ_TAG,
+        &config,
+        None,
+    )
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    let (
+        pigz_child,
+        pigz_stream_task,
+        pigz_err_task,
+    ) = stream_to_cmd(
         config.clone(),
+        val_file_stream.into_inner(),
+        PIGZ_TAG,
+        pigz_args,
         StreamDataType::OntFastq,
-        "validate_input",
-        false
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(pigz_stream_task);
+    cleanup_tasks.push(pigz_err_task);
+
+    let pigz_out_stream = {
+        let mut guard = pigz_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    let pigz_write_task = write_byte_stream_to_file(
+        &validated_file_path,
+        ReceiverStream::new(pigz_out_stream),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "validated_fastq_gz",
+        false,
     )
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    cleanup_tasks.push(val_file_write_task);
+    cleanup_tasks.push(pigz_write_task);
 
 
     Ok((
@@ -1547,7 +1602,7 @@ async fn run_reads_to_contigs(
         2,
         "non_contig_fasta",
         &config,
-        StreamDataType::JustBytes,
+        StreamDataType::OntFastq,
     )
         .await
         .map_err(|_| PipelineError::StreamDataDropped)?;
@@ -1576,7 +1631,7 @@ async fn run_reads_to_contigs(
             &non_contigs_fasta,
             non_contig_fasta_file_stream,
             config.clone(),
-            StreamDataType::JustBytes,
+            StreamDataType::OntFastq,
             "non_contigs_fasta",
             false,
         )
@@ -1810,7 +1865,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // External tools check
 
     let mut versions_vec = vec![
-        FASTP_TAG,
+        FASTP_TAG, MINIMAP2_TAG, FLYE_TAG, SAMTOOLS_TAG, PIGZ_TAG
     ];
 
     if !config.args.no_version_check {
@@ -2335,14 +2390,55 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // *******************
 
     let validation_and_qc_fut = async move {
-
         let stats = join_with_error_handling(val_count_task).await?;
-        info!(
-            "Processed {} raw reads, {} raw bases, {} validated reads, {} validated bases, {} undersized, {} oversized reads",
-            stats.raw_reads, stats.raw_bases, stats.validated, stats.validated_bases, stats.undersized, stats.oversized
-        );
 
-        Ok::<_, PipelineError>((stats))
+        info!(
+        "Processed {} raw reads, {} raw bases, {} validated reads, {} validated bases, {} undersized, {} oversized reads",
+        stats.raw_reads,
+        stats.raw_bases,
+        stats.validated,
+        stats.validated_bases,
+        stats.undersized,
+        stats.oversized
+    );
+
+        let qc_stats = qc_count_result_rx
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Fastp QC count receiver failed: {}",
+                e
+            ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Fastp QC read/base counting failed: {}",
+                e
+            ))
+            })?;
+
+        info!(
+        "Fastp QC output: {} reads, {} bases",
+        qc_stats.reads,
+        qc_stats.bases
+    );
+
+        Ok::<_, PipelineError>((stats, qc_stats))
+    };
+
+
+    let host_filter_stats_fut = async move {
+        let stats = host_filter_stats
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Host filter stats channel failed: {}", e)))?;
+
+        info!(
+        "Host filter: {} reads, {} bases",
+        stats.reads,
+        stats.bases
+    );
+
+        Ok::<_, PipelineError>(stats)
     };
 
     let human_filter_stats_fut = async move {
@@ -2382,11 +2478,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
-    let (_validation_stats, human_filtered_stats, _subsample_stats) = tokio::try_join!(
-        validation_and_qc_fut,
-        human_filter_stats_fut,
-        subsample_counts_fut
-    )?;
+    let (
+        (_validation_stats, _qc_stats), _host_filter_stats,
+        human_filtered_stats,
+        _subsample_stats,
+    ) = tokio::try_join!(
+    validation_and_qc_fut, host_filter_stats_fut,
+    human_filter_stats_fut,
+    subsample_counts_fut
+)?;
 
     info!("Human filtered stats: {:?}", human_filtered_stats);
 
