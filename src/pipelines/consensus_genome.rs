@@ -2236,12 +2236,17 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
     cleanup_receivers.extend(no_host_cleanup_receivers);
 
     // Counting stats for the host-removed reads
-    let stats_seqkit_config_stats = SeqkitConfig {
-        subcommand: SeqkitSubcommand::Stats,
-        subcommand_fields: HashMap::from([]),
-    };
+    let stats_seqkit_config_stats =
+        SeqkitConfig::new(SeqkitSubcommand::Stats)
+            .positional("-");
+
     let stats_seqkit_args_stats =
-        generate_cli(SEQKIT_TAG, &config, Some(&stats_seqkit_config_stats))?;
+        generate_cli(
+            SEQKIT_TAG,
+            &config,
+            Some(&stats_seqkit_config_stats),
+        )?;
+
     let no_host_seqkit_out_stream_stats = no_host_seqkit_out_stream_stats.into_inner();
     let (no_host_seqkit_child_stats, no_host_seqkit_task_stats, no_host_seqkit_err_task_stats) =
         stream_to_cmd(

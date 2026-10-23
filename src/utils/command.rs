@@ -1599,12 +1599,55 @@ pub mod seqkit {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
 
     #[derive(Debug)]
     pub struct SeqkitConfig {
         pub subcommand: SeqkitSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
+
+        /// Ordered command-line options and flags.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        pub positional_args: Vec<String>,
+    }
+
+    impl SeqkitConfig {
+        pub fn new(subcommand: SeqkitSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        /// Add an option with a value.
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        /// Add a flag without a value.
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        /// Add an ordered positional operand.
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct SeqkitArgGenerator;
@@ -1618,7 +1661,9 @@ pub mod seqkit {
     /// # Returns
     ///
     /// Result<f32>: the seqkit version
-    pub async fn seqkit_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn seqkit_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             SEQKIT_TAG,
             vec!["--help"],
@@ -1628,7 +1673,8 @@ pub mod seqkit {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
@@ -1640,29 +1686,33 @@ pub mod seqkit {
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<SeqkitConfig>())
-                .ok_or_else(|| anyhow!("Seqkit requires a SeqkitConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Seqkit requires a SeqkitConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                SeqkitSubcommand::Stats => {
-                    args_vec.push("stats".to_string());
+            args_vec.push(
+                match config.subcommand {
+                    SeqkitSubcommand::Stats => "stats",
+                    SeqkitSubcommand::Rmdup => "rmdup",
                 }
+                    .to_string(),
+            );
 
-                SeqkitSubcommand::Rmdup => {
-                    args_vec.push("rmdup".to_string());
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            for (key, value) in config.subcommand_fields.iter() {
-                args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => {}
-                }
-            }
-
-            args_vec.push("-".to_string());
+            // Serialize positional operands exactly and in order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }

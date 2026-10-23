@@ -739,7 +739,7 @@ async fn run_reads_to_contigs(
     let minimap2_config = Minimap2Config::new()
         .option(
             "-t",
-            config0
+            config
                 .thread_allocation(MINIMAP2_TAG, None)
                 .to_string(),
         )
