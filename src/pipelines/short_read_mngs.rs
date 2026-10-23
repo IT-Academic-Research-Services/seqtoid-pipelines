@@ -1461,36 +1461,81 @@ async fn fastp_qc(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let qc_fastp_config_view = FastpConfig {
-        //These default QC thresholds are loosely based on the pre-2022 CZI pipeline using PriceSeq & LZW
-        command_fields: HashMap::from([
-            ("--interleaved_in".to_string(), None),
-            ("--dont_eval_duplication".to_string(), None),
-            ("--length_required".to_string(), Some("35".to_string())),
-            (
-                "--qualified_quality_phred".to_string(),
-                Some("17".to_string()),
-            ),
-            (
-                "--unqualified_percent_limit".to_string(),
-                Some("15".to_string()),
-            ),
-            ("--n_base_limit".to_string(), Some("15".to_string())),
-            ("--complexity_threshold".to_string(), Some("60".to_string())),
-            // ("--sdust_complexity_filter".to_string(), None),
-        ]),
+    let mut qc_fastp_config_view = FastpConfig::new()
+        .flag("--stdin")
+        .flag("--stdout")
+        .option(
+            "-j",
+            config
+                .out_dir
+                .join("fastp.json")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .option(
+            "-h",
+            config
+                .out_dir
+                .join("fastp.html")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .option(
+            "-w",
+            config
+                .thread_allocation(FASTP_TAG, None)
+                .to_string(),
+        )
+        // These default QC thresholds are loosely based on the
+        // pre-2022 CZI pipeline using PriceSeq & LZW.
+        .flag("--interleaved_in")
+        .flag("--dont_eval_duplication")
+        .option("--length_required", "35")
+        .option("--qualified_quality_phred", "17")
+        .option("--unqualified_percent_limit", "15")
+        .option("--n_base_limit", "15")
+        .option("--complexity_threshold", "60");
+    // .flag("--sdust_complexity_filter");
 
-        paired: paired,
-    };
+    if let Some(adapter_fasta) = &config.args.adapter_fasta {
+        let cwd = std::env::current_dir()?;
+
+        let adapter_path = file_path_manipulator(
+            &PathBuf::from(adapter_fasta),
+            Some(&cwd),
+            None,
+            None,
+            "",
+        );
+
+        if !adapter_path.exists() {
+            return Err(PipelineError::InvalidConfig(format!(
+                "Adapter FASTA file does not exist: {}",
+                adapter_path.display()
+            )));
+        }
+
+        qc_fastp_config_view = qc_fastp_config_view.option(
+            "--adapter_fasta",
+            adapter_path.to_string_lossy().into_owned(),
+        );
+
+        if paired {
+            qc_fastp_config_view =
+                qc_fastp_config_view.flag("--detect_adapter_for_pe");
+        }
+    }
 
     let qc_fastp_args =
-        generate_cli(FASTP_TAG, &config, Some(&qc_fastp_config_view)).map_err(|e| {
-            PipelineError::ToolExecution {
+        generate_cli(
+            FASTP_TAG,
+            &config,
+            Some(&qc_fastp_config_view),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
                 tool: FASTP_TAG.to_string(),
                 error: e.to_string(),
-            }
-        })?;
-
+            })?;
     let (qc_fastp_child, qc_fastp_stream_task, qc_fastp_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(),

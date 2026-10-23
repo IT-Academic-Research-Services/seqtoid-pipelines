@@ -138,18 +138,41 @@ pub async fn version_check(
 pub mod fastp {
     use crate::config::defs::{RunConfig, FASTP_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::file::file_path_manipulator;
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use log::{self, debug};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct FastpConfig {
-        pub command_fields: HashMap<String, Option<String>>,
-        pub paired: bool,
+        /// Ordered command-line options and flags.
+        pub command_fields: Vec<(String, Option<String>)>,
     }
+
+    impl FastpConfig {
+        pub fn new() -> Self {
+            Self {
+                command_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.command_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.command_fields.push((flag.into(), None));
+            self
+        }
+    }
+
     pub struct FastpArgGenerator;
 
     /// Checks if `fastp` is present and returns its version.
@@ -161,7 +184,9 @@ pub mod fastp {
     /// # Returns
     ///
     /// Result<f32>: the fastp version
-    pub async fn fastp_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn fastp_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             FASTP_TAG,
             vec!["-v"],
@@ -171,68 +196,33 @@ pub mod fastp {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for FastpArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            debug!(
-                "Allocating {} threads for fastp",
-                RunConfig::thread_allocation(run_config, FASTP_TAG, None)
-            );
-
             let config = extra
                 .and_then(|e| e.downcast_ref::<FastpConfig>())
-                .ok_or_else(|| anyhow!("FASTP requires a FaspConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "FASTP requires a FastpConfig as extra argument"
+                    )
+                })?;
 
-            let args = &run_config.args;
-            let mut args_vec: Vec<String> = Vec::new();
-            args_vec.push("--stdin".to_string());
-            args_vec.push("--stdout".to_string());
-            // args_vec.push("-q".to_string());
-            // args_vec.push(args.quality.to_string());
+            let mut args_vec = Vec::new();
 
-            let json_out = run_config.out_dir.join("fastp.json");
-            args_vec.push("-j".to_string());
-            args_vec.push(json_out.as_os_str().to_str().unwrap().to_string());
-            let html_out = run_config.out_dir.join("fastp.html");
-            args_vec.push("-h".to_string());
-            args_vec.push(html_out.as_os_str().to_str().unwrap().to_string());
-            args_vec.push("-w".to_string());
-            args_vec.push(RunConfig::thread_allocation(run_config, FASTP_TAG, None).to_string());
-
-            if let Some(adapter_fasta) = &args.adapter_fasta {
-                let cwd = std::env::current_dir()?;
-                let adapter_path = file_path_manipulator(
-                    &PathBuf::from(adapter_fasta),
-                    Some(&cwd.clone()),
-                    None,
-                    None,
-                    "",
-                );
-                if !adapter_path.exists() {
-                    return Err(anyhow!(
-                        "Adapter FASTA file does not exist: {}",
-                        adapter_path.display()
-                    ));
-                }
-                args_vec.push("--adapter_fasta".to_string());
-                args_vec.push(adapter_path.to_string_lossy().into_owned());
-            }
-
-            if args.adapter_fasta.is_some() && config.paired {
-                args_vec.push("--detect_adapter_for_pe".to_string());
-            }
-
-            for (key, value) in config.command_fields.iter() {
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.command_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 

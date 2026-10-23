@@ -219,27 +219,61 @@ async fn fastp_qc(
 > {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
+    let mut fastp_config = FastpConfig::new()
+        .flag("--stdin")
+        .flag("--stdout")
+        .option(
+            "-j",
+            config
+                .out_dir
+                .join("fastp.json")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .option(
+            "-h",
+            config
+                .out_dir
+                .join("fastp.html")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .option(
+            "-w",
+            config
+                .thread_allocation(FASTP_TAG, None)
+                .to_string(),
+        )
+        .flag("--disable_adapter_trimming")
+        .option("--qualified_quality_phred", "9")
+        .option("--length_required", "100")
+        .flag("--low_complexity_filter")
+        .option("--complexity_threshold", "30")
+        .flag("--dont_eval_duplication");
 
-    let fastp_config = FastpConfig {
-        command_fields: HashMap::from([
-            ("--disable_adapter_trimming".to_string(), None),
-            (
-                "--qualified_quality_phred".to_string(),
-                Some("9".to_string()),
-            ),
-            (
-                "--length_required".to_string(),
-                Some("100".to_string()),
-            ),
-            ("--low_complexity_filter".to_string(), None),
-            (
-                "--complexity_threshold".to_string(),
-                Some("30".to_string()),
-            ),
-            ("--dont_eval_duplication".to_string(), None),
-        ]),
-        paired: false,
-    };
+    if let Some(adapter_fasta) = &config.args.adapter_fasta {
+        let cwd = std::env::current_dir()?;
+
+        let adapter_path = file_path_manipulator(
+            &PathBuf::from(adapter_fasta),
+            Some(&cwd),
+            None,
+            None,
+            "",
+        );
+
+        if !adapter_path.exists() {
+            return Err(PipelineError::InvalidConfig(format!(
+                "Adapter FASTA file does not exist: {}",
+                adapter_path.display()
+            )));
+        }
+
+        fastp_config = fastp_config.option(
+            "--adapter_fasta",
+            adapter_path.to_string_lossy().into_owned(),
+        );
+    }
 
     let fastp_args =
         generate_cli(FASTP_TAG, &config, Some(&fastp_config)).map_err(|e| {
