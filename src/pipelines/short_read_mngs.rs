@@ -1657,6 +1657,19 @@ async fn kallisto_quant(
     if let Some(r2_handle) = r2_write_handle_opt {
         cleanup_tasks.push(r2_handle);
     }
+    let kallisto_index = config
+        .args
+        .kallisto_index
+        .clone()
+        .ok_or_else(|| {
+            PipelineError::MissingArgument(
+                "Must provide kallisto index with --kallisto-index arg.".to_string(),
+            )
+        })?;
+
+    let kallisto_threads = config
+        .thread_allocation(KALLISTO_TAG, None)
+        .to_string();
 
     let kallisto_config = if paired {
         let r2_fifo = r2_fifo_opt.as_ref().ok_or_else(|| {
@@ -1664,36 +1677,30 @@ async fn kallisto_quant(
                 "Paired mode requested but R2 FIFO not created".to_string(),
             )
         })?;
-        KallistoConfig {
-            subcommand: KallistoSubcommand::Quant,
-            subcommand_fields: HashMap::from([
-                (
-                    "R1".to_string(),
-                    Some(r1_fifo.to_string_lossy().to_string()),
-                ),
-                (
-                    "R2".to_string(),
-                    Some(r2_fifo.to_string_lossy().to_string()),
-                ),
-            ]),
-            output_dir: kallisto_out_dir.clone(),
-            reproducible: false,
-        }
+
+        KallistoConfig::new(KallistoSubcommand::Quant)
+            .option("-i", kallisto_index.clone())
+            .option(
+                "-o",
+                kallisto_out_dir.to_string_lossy().to_string(),
+            )
+            .flag("--plaintext")
+            .option("--threads", kallisto_threads.clone())
+            .positional(r1_fifo.to_string_lossy().to_string())
+            .positional(r2_fifo.to_string_lossy().to_string())
     } else {
-        KallistoConfig {
-            subcommand: KallistoSubcommand::Quant,
-            subcommand_fields: HashMap::from([
-                ("--single".to_string(), None),
-                ("-l".to_string(), Some("200".to_string())),
-                ("-s".to_string(), Some("20".to_string())),
-                (
-                    "R1".to_string(),
-                    Some(r1_fifo.to_string_lossy().to_string()),
-                ),
-            ]),
-            output_dir: kallisto_out_dir.clone(),
-            reproducible: false,
-        }
+        KallistoConfig::new(KallistoSubcommand::Quant)
+            .option("-i", kallisto_index)
+            .option(
+                "-o",
+                kallisto_out_dir.to_string_lossy().to_string(),
+            )
+            .flag("--plaintext")
+            .option("--threads", kallisto_threads)
+            .flag("--single")
+            .option("-l", "200")
+            .option("-s", "20")
+            .positional(r1_fifo.to_string_lossy().to_string())
     };
 
     let kallisto_args =
@@ -1703,6 +1710,7 @@ async fn kallisto_quant(
                 error: e.to_string(),
             }
         })?;
+
     debug!("Spawning Kallisto with args: {:?}", kallisto_args);
 
     let (mut kallisto_child, kallisto_err_task) = spawn_cmd(
@@ -8294,7 +8302,7 @@ async fn blast_contigs(
     assembled_contig_fasta.display(),
     blastdb_path.display()
 );
-    
+
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
         blast_command,

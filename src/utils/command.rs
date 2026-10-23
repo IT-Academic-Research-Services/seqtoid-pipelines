@@ -2240,19 +2240,62 @@ pub mod kallisto {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
+    #[derive(Debug)]
     pub struct KallistoConfig {
         pub subcommand: KallistoSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
-        pub output_dir: PathBuf,
-        pub reproducible: bool,
+
+        /// Ordered command-line options and flags.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        ///
+        /// For `kallisto quant`, these are the input read files in
+        /// their required order.
+        pub positional_args: Vec<String>,
+    }
+
+    impl KallistoConfig {
+        pub fn new(subcommand: KallistoSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct KallistoArgGenerator;
 
-    pub async fn kallisto_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn kallisto_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             KALLISTO_TAG,
             vec!["version"],
@@ -2262,74 +2305,46 @@ pub mod kallisto {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for KallistoArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<KallistoConfig>())
-                .ok_or_else(|| anyhow!("Kallisto requires a KallistoConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Kallisto requires a KallistoConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                KallistoSubcommand::Index => {
-                    args_vec.push("index".to_string());
+            args_vec.push(
+                match config.subcommand {
+                    KallistoSubcommand::Index => "index",
+                    KallistoSubcommand::Quant => "quant",
                 }
-                KallistoSubcommand::Quant => {
-                    args_vec.push("quant".to_string());
-                    args_vec.push("-i".to_string());
-                    args_vec.push(
-                        args.kallisto_index
-                            .clone()
-                            .expect("Must provide kallisto index with --kallisto-index arg.")
-                            .to_string(),
-                    );
-                    args_vec.push("-o".to_string());
-                    args_vec.push(config.output_dir.to_string_lossy().to_string());
-                    args_vec.push("--plaintext".to_string());
-                    if config.reproducible {
-                        args_vec.push("--threads".to_string());
-                        args_vec.push("1".to_string());
-                        args_vec.push("--seed".to_string());
-                        args_vec.push("42".to_string());
-                    } else {
-                        args_vec.push("--threads".to_string());
-                        let num_cores: usize =
-                            RunConfig::thread_allocation(run_config, KALLISTO_TAG, None);
-                        args_vec.push(num_cores.to_string());
-                    }
+                    .to_string(),
+            );
 
-                    // Add non-file options from subcommand_fields (e.g., --single, -l, -s)
-                    for (key, value) in config.subcommand_fields.iter() {
-                        if key != "R1" && key != "R2" {
-                            args_vec.push(key.clone());
-                            if let Some(v) = value {
-                                args_vec.push(v.clone());
-                            }
-                        }
-                    }
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
 
-                    // Add R1 and R2 paths in order as positional arguments
-                    if let Some(r1_path) =
-                        config.subcommand_fields.get("R1").and_then(|v| v.as_ref())
-                    {
-                        args_vec.push(r1_path.clone());
-                    }
-                    if let Some(r2_path) =
-                        config.subcommand_fields.get("R2").and_then(|v| v.as_ref())
-                    {
-                        args_vec.push(r2_path.clone());
-                    }
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
+
+            // Serialize positional operands exactly and in order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
