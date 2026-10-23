@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
-                           MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
+                          MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
                           BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
                           SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG};
 use crate::cli::args::{Technology, LibraryType};
@@ -462,14 +462,17 @@ async fn minimap2_filter(
             .ok_or(PipelineError::EmptyStream)?,
     );
 
-    let samtools_fastq_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-f".to_string(), Some("4".to_string())),
-            ("-".to_string(), None),
-        ]),
-    };
+    let samtools_fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                .to_string(),
+        )
+        .option("-c", "6")
+        .flag("-n")
+        .option("-f", "4")
+        .positional("-");
 
     let samtools_fastq_args =
         generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config)).map_err(|e| {
@@ -581,14 +584,17 @@ async fn minimap2_filter(
             .ok_or(PipelineError::EmptyStream)?,
     );
 
-    let samtools_view_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-S".to_string(), None),
-            ("-b".to_string(), None),
-            ("-".to_string(), None),
-        ]),
-    };
+    let samtools_view_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                .to_string(),
+        )
+        .flag("--no-PG")
+        .flag("-S")
+        .flag("-b")
+        .positional("-");
 
     let samtools_view_args =
         generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_view_config)).map_err(|e| {
@@ -797,14 +803,17 @@ async fn run_reads_to_contigs(
     // alignments before applying the clipping filter.
     // ================================================================
 
-    let primary_view_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-h".to_string(), None),
-            ("-F".to_string(), Some("0x900".to_string())),
-            ("-".to_string(), None),
-        ]),
-    };
+    let primary_view_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                .to_string(),
+        )
+        .flag("--no-PG")
+        .flag("-h")
+        .option("-F", "0x900")
+        .positional("-");
 
     let primary_view_args = generate_cli(
         SAMTOOLS_TAG,
@@ -1224,13 +1233,16 @@ async fn run_reads_to_contigs(
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
-    let bam_view_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-b".to_string(), None),
-            ("-".to_string(), None),
-        ]),
-    };
+    let bam_view_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                .to_string(),
+        )
+        .flag("--no-PG")
+        .flag("-b")
+        .positional("-");
 
     let bam_view_args = generate_cli(
         SAMTOOLS_TAG,
@@ -1327,16 +1339,16 @@ async fn run_reads_to_contigs(
     // but that dependency lives entirely inside this side-chain.
     // ================================================================
 
-    let sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            (
-                "-O".to_string(),
-                Some("bam".to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
+    let sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .option("-O", "bam")
+        .positional("-");
 
     let sort_args = generate_cli(
         SAMTOOLS_TAG,
@@ -1429,23 +1441,23 @@ async fn run_reads_to_contigs(
                 )
             })??;
 
-        let index_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Index,
-            subcommand_fields: HashMap::from([
-                (
-                    bam_path_for_index
-                        .to_string_lossy()
-                        .to_string(),
-                    None,
-                ),
-                (
-                    bai_path_for_index
-                        .to_string_lossy()
-                        .to_string(),
-                    None,
-                ),
-            ]),
-        };
+        let index_config = SamtoolsConfig::new(SamtoolsSubcommand::Index)
+            .option(
+                "-@",
+                index_config_for_task
+                    .thread_allocation(SAMTOOLS_TAG, Some("index"))
+                    .to_string(),
+            )
+            .positional(
+                bam_path_for_index
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .positional(
+                bai_path_for_index
+                    .to_string_lossy()
+                    .to_string(),
+            );
 
         let index_args = generate_cli(
             SAMTOOLS_TAG,
@@ -1523,18 +1535,18 @@ async fn run_reads_to_contigs(
     // dependency are required.
     // ================================================================
 
-    let name_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-u".to_string(), None),
-            (
-                "-O".to_string(),
-                Some("bam".to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
+    let name_sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .flag("-n")
+        .flag("-u")
+        .option("-O", "bam")
+        .positional("-");
 
     let name_sort_args = generate_cli(
         SAMTOOLS_TAG,
@@ -1617,14 +1629,17 @@ async fn run_reads_to_contigs(
             .next()
             .ok_or(PipelineError::EmptyStream)?;
 
-    let non_contig_fastq_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-f".to_string(), Some("4".to_string())),
-            ("-".to_string(), None),
-        ]),
-    };
+    let non_contig_fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                .to_string(),
+        )
+        .option("-c", "6")
+        .flag("-n")
+        .option("-f", "4")
+        .positional("-");
 
     let non_contig_fastq_args = generate_cli(
         SAMTOOLS_TAG,
@@ -2335,7 +2350,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     if flye_status.success() {
         info!("Flye assembly completed successfully");
     } else {
-    // Flye failure itself is NOT fatal.
+        // Flye failure itself is NOT fatal.
         warn!(
         "Flye exited with status {}; continuing because assembly failure is non-fatal",
         flye_status

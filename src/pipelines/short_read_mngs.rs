@@ -426,7 +426,7 @@ async fn validate_input(
         "validate_input",
         &config,
     )
-    .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
+        .map_err(|e| PipelineError::InvalidFastqFormat(e.to_string()))?;
 
     let val_rx_stream = ReceiverStream::new(rx);
 
@@ -438,8 +438,8 @@ async fn validate_input(
         &config,
         StreamDataType::IlluminaFastq,
     )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     cleanup_receivers.push(val_router_done_rx);
 
@@ -459,8 +459,8 @@ async fn validate_input(
         "validate_input",
         false
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
     cleanup_tasks.push(val_file_write_task);
 
@@ -520,7 +520,7 @@ async fn bowtie2_align_and_sort_stream(
         4,
         false,
     )
-    .await?;
+        .await?;
 
     // ─────────────────────────────
     // Bowtie2
@@ -545,7 +545,7 @@ async fn bowtie2_align_and_sort_stream(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.push(bt2_stream_task);
     cleanup_tasks.push(bt2_err_task);
@@ -559,19 +559,19 @@ async fn bowtie2_align_and_sort_stream(
     // samtools sort -n, needs name sorting before conversion
     // ─────────────────────────────
 
-    let sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None), // name-sorted
-            ("-u".to_string(), None), // uncompressed
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                "-T".to_string(),
-                Some(temp_dir.path().to_string_lossy().to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
+    let sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .flag("-n") // name-sorted
+        .flag("-u") // uncompressed
+        .option("-O", "bam")
+        .option("-T", temp_dir.path().to_string_lossy().to_string())
+        .positional("-");
 
     let sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&sort_config))?;
 
@@ -584,7 +584,7 @@ async fn bowtie2_align_and_sort_stream(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.push(sort_task);
     cleanup_tasks.push(sort_err_task);
@@ -605,8 +605,8 @@ async fn bowtie2_align_and_sort_stream(
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     // track the task instead of a oneshot receiver
     cleanup_receivers.push(router_done_rx);
@@ -632,7 +632,7 @@ async fn bowtie2_align_and_sort_stream(
                 "bt2_bam_write",
                 false
             )
-            .await?;
+                .await?;
             Ok(())
         }
     });
@@ -723,19 +723,22 @@ async fn bowtie2_filter_stream(
         bowtie2_options,
         output_bam_path.clone(),
     )
-    .await?;
+        .await?;
 
     // samtools fastq → stdout
     let fastq_flag = if paired { "-f13" } else { "-f4" };
 
-    let config_fastq = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            (fastq_flag.to_string(), None),
-            ("-N".to_string(), None),
-            ("-".to_string(), None),
-        ]),
-    };
+    let config_fastq = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                .to_string(),
+        )
+        .option("-c", "6")
+        .flag(fastq_flag)
+        .flag("-N")
+        .positional("-");
 
     let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
 
@@ -748,7 +751,7 @@ async fn bowtie2_filter_stream(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.push(stdin_task);
     cleanup_tasks.push(err_task);
@@ -826,7 +829,7 @@ async fn bowtie2_filter_files(
         bowtie2_options,
         output_bam_path.clone(),
     )
-    .await?;
+        .await?;
 
     let fastq_temp_dir = choose_temp_dir(
         config.input_size,
@@ -835,7 +838,7 @@ async fn bowtie2_filter_files(
         2,
         false,
     )
-    .await?;
+        .await?;
 
     let fq1 = fastq_temp_dir.path().join("bt2_R1.fastq");
     let fq2 = if paired {
@@ -845,21 +848,24 @@ async fn bowtie2_filter_files(
     };
 
     if paired {
-        let mut fields = HashMap::new();
-        fields.insert("-f".to_string(), Some("13".to_string()));
-        fields.insert("-1".to_string(), Some(fq1.to_string_lossy().to_string()));
-        fields.insert(
-            "-2".to_string(),
-            Some(fq2.as_ref().unwrap().to_string_lossy().to_string()),
-        );
-        fields.insert("-N".to_string(), None);
-        fields.insert("-0".to_string(), Some("/dev/null".to_string()));
-        fields.insert("-s".to_string(), Some("/dev/null".to_string()));
-
-        let config_fastq = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Fastq,
-            subcommand_fields: fields,
-        };
+        let config_fastq = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+            .option(
+                "-@",
+                config
+                    .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                    .to_string(),
+            )
+            .option("-c", "6")
+            .option("-f", "13")
+            .option("-1", fq1.to_string_lossy().to_string())
+            .option(
+                "-2",
+                fq2.as_ref().unwrap().to_string_lossy().to_string(),
+            )
+            .flag("-N")
+            .option("-0", "/dev/null")
+            .option("-s", "/dev/null")
+            .positional("-");
 
         let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
 
@@ -872,7 +878,7 @@ async fn bowtie2_filter_files(
             config.args.verbose,
             None,
         )
-        .await?;
+            .await?;
 
         cleanup_tasks.push(stdin_task);
         cleanup_tasks.push(err_task);
@@ -883,14 +889,17 @@ async fn bowtie2_filter_files(
         }
     } else {
         // streaming fastq (no -o flag)
-        let fastq_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Fastq,
-            subcommand_fields: HashMap::from([
-                ("-f4".to_string(), None),
-                ("-".to_string(), None),
-                ("-N".to_string(), None),
-            ]),
-        };
+        let fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+            .option(
+                "-@",
+                config
+                    .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                    .to_string(),
+            )
+            .option("-c", "6")
+            .flag("-f4")
+            .flag("-N")
+            .positional("-");
 
         let fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&fastq_config))?;
 
@@ -903,7 +912,7 @@ async fn bowtie2_filter_files(
             config.args.verbose,
             None,
         )
-        .await?;
+            .await?;
 
         cleanup_tasks.extend([fastq_task, fastq_err_task]);
 
@@ -920,7 +929,7 @@ async fn bowtie2_filter_files(
             "bt2_fastq_se",
             false
         )
-        .await?;
+            .await?;
         cleanup_tasks.push(write_task);
     }
 
@@ -988,7 +997,7 @@ async fn hisat2_filter(
             4,
             false,
         )
-        .await?;
+            .await?;
 
         // 1. HISAT2 → SAM
         let sam_path = temp_dir.path().join("hisat2.sam");
@@ -1019,11 +1028,11 @@ async fn hisat2_filter(
             config.args.verbose,
             None,
         )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: HISAT2_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: HISAT2_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
         cleanup_tasks.push(hisat2_err_task);
 
@@ -1042,30 +1051,21 @@ async fn hisat2_filter(
         let bam_path = temp_dir.path().join("hisat2_sorted.bam");
         let sort_threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
 
-        let sort_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Sort,
-            subcommand_fields: HashMap::from([
-                ("-n".to_string(), None),
-                (
-                    "-o".to_string(),
-                    Some(bam_path.to_string_lossy().to_string()),
-                ),
-                ("-@".to_string(), Some(sort_threads.to_string())),
-                (
-                    "-T".to_string(),
-                    Some(temp_dir.path().to_string_lossy().to_string()),
-                ),
-            ]),
-        };
+        let sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+            .option("-@", sort_threads.to_string())
+            .option("-m", "2G")
+            .flag("-n")
+            .option("-o", bam_path.to_string_lossy().to_string())
+            .option("-T", temp_dir.path().to_string_lossy().to_string())
+            .positional(sam_path.to_string_lossy().to_string());
 
-        let mut sort_args =
+        let sort_args =
             generate_cli(SAMTOOLS_TAG, &config, Some(&sort_config)).map_err(|e| {
                 PipelineError::ToolExecution {
                     tool: SAMTOOLS_TAG.to_string(),
                     error: e.to_string(),
                 }
             })?;
-        sort_args.push(sam_path.to_string_lossy().to_string());
 
         let (mut sort_child, sort_err_task) = spawn_cmd(
             config.clone(),
@@ -1074,11 +1074,11 @@ async fn hisat2_filter(
             config.args.verbose,
             None,
         )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
         cleanup_tasks.push(sort_err_task);
         sort_child
@@ -1096,32 +1096,28 @@ async fn hisat2_filter(
         let fq1_path = temp_dir.path().join("hisat2_filtered_R1.fastq");
         let fq2_path = temp_dir.path().join("hisat2_filtered_R2.fastq");
 
-        let mut fastq_fields = HashMap::new();
-        fastq_fields.insert("-f".to_string(), Some("13".to_string()));
-        fastq_fields.insert(
-            "-1".to_string(),
-            Some(fq1_path.to_string_lossy().to_string()),
-        );
-        fastq_fields.insert(
-            "-2".to_string(),
-            Some(fq2_path.to_string_lossy().to_string()),
-        );
-        fastq_fields.insert("-0".to_string(), Some("/dev/null".to_string()));
-        fastq_fields.insert("-s".to_string(), Some("/dev/null".to_string()));
+        let fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+            .option(
+                "-@",
+                config
+                    .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                    .to_string(),
+            )
+            .option("-c", "6")
+            .option("-f", "13")
+            .option("-1", fq1_path.to_string_lossy().to_string())
+            .option("-2", fq2_path.to_string_lossy().to_string())
+            .option("-0", "/dev/null")
+            .option("-s", "/dev/null")
+            .positional(bam_path.to_string_lossy().to_string());
 
-        let fastq_config = SamtoolsConfig {
-            subcommand: SamtoolsSubcommand::Fastq,
-            subcommand_fields: fastq_fields,
-        };
-
-        let mut fastq_args =
+        let fastq_args =
             generate_cli(SAMTOOLS_TAG, &config, Some(&fastq_config)).map_err(|e| {
                 PipelineError::ToolExecution {
                     tool: SAMTOOLS_TAG.to_string(),
                     error: e.to_string(),
                 }
             })?;
-        fastq_args.push(bam_path.to_string_lossy().to_string());
 
         let (mut fastq_child, fastq_err_task) = spawn_cmd(
             config.clone(),
@@ -1130,11 +1126,11 @@ async fn hisat2_filter(
             config.args.verbose,
             None,
         )
-        .await
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
         cleanup_tasks.push(fastq_err_task);
         fastq_child
@@ -1154,7 +1150,7 @@ async fn hisat2_filter(
             "hisat2_filter",
             &config,
         )
-        .map_err(|e| PipelineError::Other(e))?;
+            .map_err(|e| PipelineError::Other(e))?;
 
         cleanup_tasks.push(tokio::spawn(async move {
             read_task.await??;
@@ -1198,7 +1194,7 @@ async fn hisat2_filter(
         4,
         false,
     )
-    .await?;
+        .await?;
 
     // 1. HISAT2 → SAM (streaming)
     let hisat2_config = Hisat2Config {
@@ -1225,11 +1221,11 @@ async fn hisat2_filter(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: HISAT2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: HISAT2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     cleanup_tasks.push(hisat2_err_task);
 
@@ -1241,20 +1237,14 @@ async fn hisat2_filter(
     // 2. samtools sort -n
     let sort_threads = config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
 
-    let sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                "-T".to_string(),
-                Some(temp_dir.path().to_string_lossy().to_string()),
-            ),
-            ("-@".to_string(), Some(sort_threads.to_string())),
-            ("-".to_string(), None),
-        ]),
-    };
+    let sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option("-@", sort_threads.to_string())
+        .option("-m", "2G")
+        .flag("-n")
+        .flag("-u")
+        .option("-O", "bam")
+        .option("-T", temp_dir.path().to_string_lossy().to_string())
+        .positional("-");
 
     let sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&sort_config))?;
 
@@ -1267,7 +1257,7 @@ async fn hisat2_filter(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.extend([sort_task, sort_err_task]);
 
@@ -1286,8 +1276,8 @@ async fn hisat2_filter(
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     let mut splits = streams.into_iter();
     let count_stream = splits.next().ok_or(PipelineError::EmptyStream)?;
@@ -1303,7 +1293,7 @@ async fn hisat2_filter(
             "hisat2_bam_write",
             false
         )
-        .await?;
+            .await?;
         cleanup_tasks.push(write_task);
     }
     cleanup_receivers.push(hisat2_bam_split_done_rx);
@@ -1313,15 +1303,12 @@ async fn hisat2_filter(
     // 4. samtools fastq -f 4 → stdout (streaming)
     let fastq_threads = config.thread_allocation(SAMTOOLS_TAG, Some("fastq"));
 
-    let fastq_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([
-            ("-f4".to_string(), None),
-            ("-".to_string(), None),
-            ("-@".to_string(), Some(fastq_threads.to_string())),
-            ("-N".to_string(), None),
-        ]),
-    };
+    let fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+        .option("-@", fastq_threads.to_string())
+        .option("-c", "6")
+        .flag("-f4")
+        .flag("-N")
+        .positional("-");
 
     let fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&fastq_config))?;
 
@@ -1334,7 +1321,7 @@ async fn hisat2_filter(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.extend([fastq_task, fastq_err_task]);
 
@@ -1347,14 +1334,17 @@ async fn hisat2_filter(
 
     // 5. mapped count via streaming view -c -F4 on its tee (correct SE count, no data drop)
     let (count_tx, count_rx) = oneshot::channel();
-    let samtools_count_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-c".to_string(), None),
-            ("-F4".to_string(), None),
-            ("-".to_string(), None),
-        ]),
-    };
+    let samtools_count_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                .to_string(),
+        )
+        .flag("--no-PG")
+        .flag("-c")
+        .flag("-F4")
+        .positional("-");
     let count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))?;
 
     let (count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
@@ -1366,7 +1356,7 @@ async fn hisat2_filter(
         config.args.verbose,
         None,
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.push(count_stream_task);
     cleanup_tasks.push(count_err_task);
@@ -1463,11 +1453,11 @@ async fn fastp_qc(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: FASTP_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: FASTP_TAG.to_string(),
+            error: e.to_string(),
+        })?;
     cleanup_tasks.push(qc_fastp_stream_task);
     cleanup_tasks.push(qc_fastp_err_task);
 
@@ -1491,11 +1481,11 @@ async fn fastp_qc(
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: "fanout_to_channels".to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: "fanout_to_channels".to_string(),
+            error: e.to_string(),
+        })?;
 
     // track the task instead of oneshot receiver
     cleanup_receivers.push(tee_count_router_done_rx);
@@ -1675,11 +1665,11 @@ async fn kallisto_quant(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: KALLISTO_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: KALLISTO_TAG.to_string(),
+            error: e.to_string(),
+        })?;
     cleanup_tasks.push(kallisto_err_task);
 
     // Create Kallisto exit task with safe FIFO cleanup
@@ -1897,7 +1887,7 @@ async fn minimap2_filter(
         4,
         false,
     )
-    .await?;
+        .await?;
 
     let (
         _host_ref_fasta_path,
@@ -1913,7 +1903,7 @@ async fn minimap2_filter(
         config.args.host_mm2_index.clone(),
         "host",
     )
-    .await?;
+        .await?;
     try_join_all(host_ref_tasks).await?; // Have to wait on this to make sure index is in place ahead of running minimap2
     debug!("Host index : {}", host_index_path.display());
 
@@ -1960,11 +1950,11 @@ async fn minimap2_filter(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: MINIMAP2_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
     cleanup_tasks.push(minimap2_task);
     cleanup_tasks.push(minimap2_err_task);
 
@@ -1978,19 +1968,19 @@ async fn minimap2_filter(
             })?
     };
 
-    let samtools_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                "-T".to_string(),
-                Some(temp_dir.path().to_string_lossy().to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
+    let samtools_sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .flag("-n")
+        .flag("-u")
+        .option("-O", "bam")
+        .option("-T", temp_dir.path().to_string_lossy().to_string())
+        .positional("-");
 
     let samtools_sort_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_sort_config))
         .map_err(|e| PipelineError::ToolExecution {
@@ -2007,11 +1997,11 @@ async fn minimap2_filter(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
     cleanup_tasks.push(samtools_sort_task);
     cleanup_tasks.push(samtools_sort_err_task);
 
@@ -2038,8 +2028,8 @@ async fn minimap2_filter(
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     // track task instead of oneshot receiver
     cleanup_receivers.push(bam_router_done_rx);
@@ -2059,8 +2049,8 @@ async fn minimap2_filter(
             "mm2_filter_bam",
             false
         )
-        .await
-        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
         cleanup_tasks.push(bam_write_task);
     }
@@ -2073,14 +2063,17 @@ async fn minimap2_filter(
     } else {
         "-F4".to_string()
     };
-    let samtools_count_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::View,
-        subcommand_fields: HashMap::from([
-            ("-c".to_string(), None),
-            (mapped_flag, None),
-            ("-".to_string(), None),
-        ]),
-    };
+    let samtools_count_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                .to_string(),
+        )
+        .flag("--no-PG")
+        .flag("-c")
+        .flag(mapped_flag)
+        .positional("-");
     let samtools_count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -2096,11 +2089,11 @@ async fn minimap2_filter(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
     cleanup_tasks.push(count_stream_task);
     cleanup_tasks.push(count_err_task);
 
@@ -2125,10 +2118,16 @@ async fn minimap2_filter(
     } else {
         "-f4".to_string()
     };
-    let samtools_fastq_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Fastq,
-        subcommand_fields: HashMap::from([(unmapped_flag, None), ("-".to_string(), None)]),
-    };
+    let samtools_fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                .to_string(),
+        )
+        .option("-c", "6")
+        .flag(unmapped_flag)
+        .positional("-");
     let samtools_fastq_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_fastq_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: SAMTOOLS_TAG.to_string(),
@@ -2144,11 +2143,11 @@ async fn minimap2_filter(
         config.args.verbose,
         None,
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: SAMTOOLS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
     cleanup_tasks.push(fastq_stream_task);
     cleanup_tasks.push(fastq_err_task);
 
@@ -2820,8 +2819,8 @@ async fn nt_non_host_align(
                     config.args.verbose,
                     None,
                 )
-                .await
-                .context("Failed to spawn minimap2")?;
+                    .await
+                    .context("Failed to spawn minimap2")?;
 
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = tokio::io::BufReader::new(stdout);
@@ -3410,14 +3409,14 @@ async fn nr_distributed_non_host_align(
         let total_pairs =
             total_records / 2;
 
-            let target_chunks =
-                target_chunks.min(total_pairs.max(1));
+        let target_chunks =
+            target_chunks.min(total_pairs.max(1));
 
-            let pairs_per_chunk =
-                (total_pairs + target_chunks - 1)
-                    / target_chunks;
+        let pairs_per_chunk =
+            (total_pairs + target_chunks - 1)
+                / target_chunks;
 
-            info!(
+        info!(
         "Distributed NR chunking: {} pairs, {} requested workers, \
          size-based target {} chunks, {} pairs/chunk",
         total_pairs,
@@ -6307,19 +6306,19 @@ async fn process_assembly(
         }
     };
 
-    let name_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-n".to_string(), None),
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                "-T".to_string(),
-                Some(temp_dir.path().to_string_lossy().to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
+    let name_sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .flag("-n")
+        .flag("-u")
+        .option("-O", "bam")
+        .option("-T", temp_dir.path().to_string_lossy().to_string())
+        .positional("-");
 
     let name_sort_args = match generate_cli(
         SAMTOOLS_TAG,
@@ -6405,18 +6404,18 @@ async fn process_assembly(
         }
     };
 
-    let coordinate_sort_config = SamtoolsConfig {
-        subcommand: SamtoolsSubcommand::Sort,
-        subcommand_fields: HashMap::from([
-            ("-u".to_string(), None),
-            ("-O".to_string(), Some("bam".to_string())),
-            (
-                "-T".to_string(),
-                Some(temp_dir.path().to_string_lossy().to_string()),
-            ),
-            ("-".to_string(), None),
-        ]),
-    };
+    let coordinate_sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .flag("-u")
+        .option("-O", "bam")
+        .option("-T", temp_dir.path().to_string_lossy().to_string())
+        .positional("-");
 
     let coordinate_sort_args = match generate_cli(
         SAMTOOLS_TAG,
@@ -6700,9 +6699,9 @@ fn fix_header(header_line: &str) -> String {
         .split(|c: char| {
             c == ','
                 && header_line
-                    .as_bytes()
-                    .get(header_line.find(',').unwrap_or(0) + 1)
-                    .map_or(false, |&b| b != b' ')
+                .as_bytes()
+                .get(header_line.find(',').unwrap_or(0) + 1)
+                .map_or(false, |&b| b != b' ')
         })
         .collect();
 
@@ -6743,7 +6742,7 @@ async fn build_reference_fasta_from_selected_genera(
         4,
         false,
     )
-    .await?; // ← Create early
+        .await?; // ← Create early
 
     if accessions.is_empty() {
         warn!("selected_genera is empty — writing empty reference FASTA");
@@ -8776,11 +8775,11 @@ async fn run_mmseqs_step(
         config.args.verbose,
         Some(mmseqs_stderr_log),
     )
-    .await
-    .map_err(|e| PipelineError::ToolExecution {
-        tool: MMSEQS_TAG.to_string(),
-        error: e.to_string(),
-    })?;
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MMSEQS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
     let wait_task = tokio::spawn(async move {
         let status = child.wait().await?;
@@ -9294,7 +9293,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         sample_base_buf.clone(),
         &out_dir,
     )
-    .await?;
+        .await?;
     cleanup_tasks.extend(validate_cleanup_tasks);
     cleanup_receivers.extend(validate_cleanup_receivers);
 
@@ -9321,7 +9320,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ercc_bt2_options,
         out_dir.join("ercc_bt2_aligned_sorted.bam"),
     )
-    .await?;
+        .await?;
     cleanup_tasks.extend(ercc_bt2_cleanup_tasks);
     final_temp_dirs.extend(ercc_bt2_temp_dirs);
 
@@ -9338,8 +9337,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         StreamDataType::JustBytes,
     )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
     let mut kallisto_streams_iter = kallisto_streams.into_iter();
 
@@ -9368,7 +9367,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         paired,
         sample_base_buf.clone(),
     )
-    .await?;
+        .await?;
     cleanup_tasks.extend(kallisto_cleanup_tasks);
     cleanup_receivers.extend(kallisto_cleanup_receivers);
 
@@ -9392,7 +9391,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         host_bt2_options,
         out_dir.join("host_bt2_aligned_sorted.bam"),
     )
-    .await?;
+        .await?;
     cleanup_tasks.extend(host_bt2_cleanup_tasks);
     host_filter_temp_dirs.extend(host_bt2_temp_dirs);
 
@@ -9433,7 +9432,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         None,
         4,
     )
-    .await?;
+        .await?;
     cleanup_tasks.append(&mut host_hisat2_cleanup_tasks);
     host_filter_temp_dirs.extend(hisat_temp_dirs);
 
@@ -9469,7 +9468,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             human_bt2_options,
             out_dir.join("human_bt2_aligned_sorted.bam"),
         )
-        .await?;
+            .await?;
 
         cleanup_tasks.extend(human_bt2_cleanup_tasks);
         host_filter_temp_dirs.extend(human_bt2_temp_dirs);
@@ -9501,7 +9500,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             None,
             4,
         )
-        .await?;
+            .await?;
 
         cleanup_tasks.append(&mut human_hisat2_cleanup_tasks);
         hisat2_cleanup_receivers.extend(human_hisat2_cleanup_receivers);
@@ -9578,8 +9577,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             taxon_whitelist_path,
             taxon_blacklist_path,
         )
-        .await
-        .map_err(|e| PipelineError::Other(e))?,
+            .await
+            .map_err(|e| PipelineError::Other(e))?,
     );
 
     //write de-interleaved non-host file. easier for the scatter-gather
@@ -9595,8 +9594,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         4,
         true,
     )
-    .await
-    .map_err(|e| PipelineError::Other(e.into()))?;
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
 
     // Compute paths after temp_dir but before moving rx (only borrows with as_ref())
     let non_host_r1_path = non_host_temp_dir.path().join("nonhost_R1.fastq");
@@ -10336,7 +10335,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "run - Read non-host R1/R2 as proper parsed Fastq records",
         &config,
     )
-    .map_err(|e| PipelineError::Other(e))?;
+        .map_err(|e| PipelineError::Other(e))?;
 
     // Wrap the stats task so it matches cleanup_tasks type
     let stats_wrapper = tokio::spawn(async move {
@@ -10397,7 +10396,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         StreamDataType::JustBytes,
     )
-    .await?;
+        .await?;
 
     let mut annotated_rxs_iter = annotated_rxs.into_iter();
     let initial_annotated_file_stream = annotated_rxs_iter
@@ -10414,7 +10413,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         StreamDataType::JustBytes,
     )
-    .await?;
+        .await?;
 
     let mut unidentified_rxs_iter = unidentified_rxs.into_iter();
     let initial_unidentified_file_stream = unidentified_rxs_iter
@@ -10486,7 +10485,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         paired,
         4, // this can become as CLI arg if needed
     )
-    .await?;
+        .await?;
 
     cleanup_tasks.extend(post_assembly_cleanup_tasks);
     // cleanup_receivers.extend(post_assembly_cleanup_receivers);
@@ -10574,8 +10573,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                     &PathBuf::from(nt_file),
                     &PathBuf::from(nt_offset_db_file),
                 )
-                .await
-                .map_err(|e| PipelineError::Other(e.into()))?;
+                    .await
+                    .map_err(|e| PipelineError::Other(e.into()))?;
             Ok::<
                 (
                     AHashMap<String, Arc<ReadHit>>,
@@ -10616,8 +10615,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                     &PathBuf::from(nr_file),
                     &PathBuf::from(nr_offset_db_file),
                 )
-                .await
-                .map_err(|e| PipelineError::Other(e.into()))?;
+                    .await
+                    .map_err(|e| PipelineError::Other(e.into()))?;
             Ok::<
                 (
                     AHashMap<String, Arc<ReadHit>>,
@@ -11103,7 +11102,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         StreamDataType::JustBytes,
     )
-    .await?;
+        .await?;
     cleanup_receivers.push(taxid_mapped_done_rx);
 
     let mut taxid_mapped_iter = taxid_mapped_rxs.into_iter();
@@ -11138,8 +11137,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         taxid_mapped_locator, // directly pass the receiver
         assembly_dir,
     )
-    .await
-    .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
     info!("generate_taxid_locator finished");
     cleanup_tasks.append(&mut locator_tasks);
     info!("Taxid locator files generated: {:?}", locator_outputs);
@@ -11183,7 +11182,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         StreamDataType::JustBytes,
     )
-    .await?;
+        .await?;
     cleanup_receivers.push(initial_mapped_done_rx);
 
     let mut initial_mapped_iter = initial_mapped_rxs.into_iter();
@@ -11204,7 +11203,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &config,
         StreamDataType::JustBytes,
     )
-    .await?;
+        .await?;
     cleanup_receivers.push(initial_combined_done_rx);
 
     let mut initial_combined_iter = initial_combined_rxs.into_iter();
@@ -11254,10 +11253,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             initial_taxid_mapped_locator,
             out_dir.clone(),
         )
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e))
-        })?;
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e))
+            })?;
     info!("second generate_taxid_locator odone ");
 
     // Now safe to await the annotated and unidentified fanout tasks

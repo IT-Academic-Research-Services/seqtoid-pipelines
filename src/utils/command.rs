@@ -1055,26 +1055,82 @@ pub mod samtools {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
 
     #[derive(Debug)]
     pub struct SamtoolsConfig {
         pub subcommand: SamtoolsSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
+
+        /// Ordered command-line options and flags.
+        ///
+        /// Examples:
+        ///     ("-@", Some("16"))
+        ///     ("--no-PG", None)
+        ///     ("-F", Some("0x900"))
+        ///
+        /// Vec is intentional:
+        ///   - preserves command-line order;
+        ///   - permits repeated options;
+        ///   - does not conflate options with positional operands.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        ///
+        /// Examples:
+        ///     "-"
+        ///     "input.sam"
+        ///     "input.bam"
+        ///     "output.bai"
+        ///
+        /// Order is part of the command's semantics and must therefore
+        /// be represented explicitly.
+        pub positional_args: Vec<String>,
+    }
+
+    impl SamtoolsConfig {
+        pub fn new(subcommand: SamtoolsSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        /// Add an option with a value.
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        /// Add a flag without a value.
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        /// Add an ordered positional operand.
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct SamtoolsArgGenerator;
 
     /// Checks if `samtools` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the samtools version
-    pub async fn samtools_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn samtools_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             SAMTOOLS_TAG,
             vec!["--version"],
@@ -1082,115 +1138,59 @@ pub mod samtools {
             1,
             ChildStream::Stdout,
             None,
-            &config,
+            config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for SamtoolsArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<SamtoolsConfig>())
-                .ok_or_else(|| anyhow!("Samtools requires a SamtoolsConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Samtools requires a SamtoolsConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                SamtoolsSubcommand::View => {
-                    args_vec.push("view".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("view"))
-                            .to_string(),
-                    );
-                    args_vec.push("--no-PG".to_string());
+            // The generator owns only translation of the typed
+            // subcommand into its CLI spelling.
+            args_vec.push(
+                match config.subcommand {
+                    SamtoolsSubcommand::View => "view",
+                    SamtoolsSubcommand::Fastq => "fastq",
+                    SamtoolsSubcommand::Stats => "stats",
+                    SamtoolsSubcommand::Sort => "sort",
+                    SamtoolsSubcommand::Index => "index",
+                    SamtoolsSubcommand::Mpileup => "mpileup",
+                    SamtoolsSubcommand::Consensus => "consensus",
+                    SamtoolsSubcommand::Depth => "depth",
+                    SamtoolsSubcommand::Ampliconclip => "ampliconclip",
+                    SamtoolsSubcommand::Fixmate => "fixmate",
                 }
-                SamtoolsSubcommand::Fastq => {
-                    args_vec.push("fastq".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fastq"))
-                            .to_string(),
-                    );
-                    args_vec.push("-c".to_string());
-                    args_vec.push("6".to_string());
-                }
-                SamtoolsSubcommand::Stats => {
-                    args_vec.push("stats".to_string());
-                }
-                SamtoolsSubcommand::Sort => {
-                    args_vec.push("sort".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("sort"))
-                            .to_string(),
-                    );
-                    args_vec.push("-m".to_string());
-                    args_vec.push("2G".to_string());
-                }
-                SamtoolsSubcommand::Index => {
-                    args_vec.push("index".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("index"))
-                            .to_string(),
-                    );
-                }
-                SamtoolsSubcommand::Mpileup => {
-                    args_vec.push("mpileup".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("mpileup"))
-                            .to_string(),
-                    );
-                }
-                SamtoolsSubcommand::Consensus => {
-                    args_vec.push("consensus".to_string());
-                    args_vec.push("-f".to_string());
-                    args_vec.push("fasta".to_string());
-                    args_vec.push("-m".to_string());
-                    args_vec.push("simple".to_string());
-                    args_vec.push("--min-BQ".to_string());
-                    args_vec.push(args.quality.to_string());
-                    args_vec.push("-d".to_string());
-                    args_vec.push(args.min_depth.to_string());
-                }
-                SamtoolsSubcommand::Depth => {
-                    args_vec.push("depth".to_string());
-                }
-                SamtoolsSubcommand::Ampliconclip => {
-                    args_vec.push("ampliconclip".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(
-                            run_config,
-                            SAMTOOLS_TAG,
-                            Some("ampliconclip"),
-                        )
-                        .to_string(),
-                    );
-                }
-                SamtoolsSubcommand::Fixmate => {
-                    args_vec.push("fixmate".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fixmate"))
-                            .to_string(),
-                    );
-                }
-            }
-            for (key, value) in config.subcommand_fields.iter() {
+                    .to_string(),
+            );
+
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
+
+            // Positional operands always follow the options and retain
+            // their caller-specified order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
