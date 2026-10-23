@@ -497,7 +497,6 @@ async fn bowtie2_align_and_sort_stream(
     input_stream: ReceiverStream<ParseOutput>,
     bt2_index_path: PathBuf,
     paired: bool,
-    bowtie2_options: HashMap<String, Option<String>>,
     output_bam_path: PathBuf,
 ) -> Result<
     (
@@ -526,13 +525,29 @@ async fn bowtie2_align_and_sort_stream(
     // Bowtie2
     // ─────────────────────────────
 
-    let bt2_config = Bowtie2Config {
-        bt2_index_path,
-        paired,
-        r1_path: None,
-        r2_path: None,
-        option_fields: bowtie2_options,
+    let mut bt2_config = Bowtie2Config::new()
+        .flag("--very-sensitive-local")
+        .option(
+            "-x",
+            bt2_index_path.to_string_lossy().to_string(),
+        )
+        .option(
+            "-p",
+            config
+                .thread_allocation(BOWTIE2_TAG, None)
+                .to_string(),
+        );
+
+    bt2_config = if paired {
+        bt2_config
+            .flag("--interleaved")
+            .positional("-")
+    } else {
+        bt2_config.option("-U", "-")
     };
+
+    let bt2_args =
+        generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config))?;
 
     let bt2_args = generate_cli(BOWTIE2_TAG, &config, Some(&bt2_config))?;
 
@@ -694,7 +709,6 @@ async fn bowtie2_filter_stream(
     input_stream: ReceiverStream<ParseOutput>,
     bt2_index_path: PathBuf,
     paired: bool,
-    bowtie2_options: HashMap<String, Option<String>>,
     output_bam_path: PathBuf,
 ) -> Result<
     (
@@ -720,7 +734,6 @@ async fn bowtie2_filter_stream(
         input_stream,
         bt2_index_path,
         paired,
-        bowtie2_options,
         output_bam_path.clone(),
     )
         .await?;
@@ -740,7 +753,8 @@ async fn bowtie2_filter_stream(
         .flag("-N")
         .positional("-");
 
-    let args = generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
+    let args =
+        generate_cli(SAMTOOLS_TAG, &config, Some(&config_fastq))?;
 
     let (child, stdin_task, err_task) = stream_to_cmd(
         config.clone(),
@@ -758,7 +772,14 @@ async fn bowtie2_filter_stream(
 
     let out_stream = {
         let mut guard = child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Fastq, &config).await?
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Fastq,
+            &config,
+        )
+            .await?
     };
 
     Ok((
@@ -799,7 +820,6 @@ async fn bowtie2_filter_files(
     input_stream: ReceiverStream<ParseOutput>,
     bt2_index_path: PathBuf,
     paired: bool,
-    bowtie2_options: HashMap<String, Option<String>>,
     output_bam_path: PathBuf,
 ) -> Result<
     (
@@ -826,7 +846,6 @@ async fn bowtie2_filter_files(
         input_stream,
         bt2_index_path,
         paired,
-        bowtie2_options,
         output_bam_path.clone(),
     )
         .await?;
@@ -6257,15 +6276,44 @@ async fn process_assembly(
     // Bowtie2 read-to-contig alignment
     // =====================================================================
 
-    let bt2_options =
-        HashMap::from([("--very-sensitive".to_string(), None)]);
+    let mut bt2_config_view = Bowtie2Config::new()
+        .flag("--very-sensitive")
+        .option(
+            "-x",
+            index_prefix.to_string_lossy().to_string(),
+        )
+        .option(
+            "-p",
+            config
+                .thread_allocation(BOWTIE2_TAG, None)
+                .to_string(),
+        );
 
-    let bt2_config_view = Bowtie2Config {
-        bt2_index_path: index_prefix,
-        r1_path: Some(r1_path.clone()),
-        r2_path: r2_path_opt.clone(),
-        paired,
-        option_fields: bt2_options,
+    bt2_config_view = if paired {
+        let r2_path = match r2_path_opt.as_ref() {
+            Some(path) => path,
+            None => {
+                return_assembly_failure!(
+                "Paired Bowtie2 alignment requested but R2 path is missing"
+                    .to_string()
+            );
+            }
+        };
+
+        bt2_config_view
+            .option(
+                "-1",
+                r1_path.to_string_lossy().to_string(),
+            )
+            .option(
+                "-2",
+                r2_path.to_string_lossy().to_string(),
+            )
+    } else {
+        bt2_config_view.option(
+            "-U",
+            r1_path.to_string_lossy().to_string(),
+        )
     };
 
     let bt2_args = match generate_cli(
@@ -6276,12 +6324,11 @@ async fn process_assembly(
         Ok(args) => args,
         Err(e) => {
             return_assembly_failure!(format!(
-                "failed generating Bowtie2 arguments: {}",
-                e
-            ));
+            "failed generating Bowtie2 arguments: {}",
+            e
+        ));
         }
     };
-
     info!(
         "[assembly] bowtie2 args generated: {:?}",
         bt2_args
@@ -9456,7 +9503,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // ERCC bt2 filtering and count
     let ercc_bt2_index_path = bowtie2_index_prep(&config.args.ercc_bowtie2_index, &cwd)?;
-    let ercc_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
     let (
         ercc_bt2_out_stream,
         ercc_count_rx,
@@ -9470,7 +9516,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         val_out_stream,
         ercc_bt2_index_path,
         paired,
-        ercc_bt2_options,
         out_dir.join("ercc_bt2_aligned_sorted.bam"),
     )
         .await?;
@@ -9526,7 +9571,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Host filtering: bt2
     let host_bt2_index_path = bowtie2_index_prep(host_bowtie2_index, &cwd)?;
-    let host_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
     let (
         host_bt2_r1,
         host_bt2_r2,
@@ -9541,7 +9585,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         kallisto_bypass_stream,
         host_bt2_index_path,
         paired,
-        host_bt2_options,
         out_dir.join("host_bt2_aligned_sorted.bam"),
     )
         .await?;
@@ -9601,8 +9644,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         let human_bowtie2_index: String = config.args.human_bowtie2_index.clone();
         let human_hisat2_index: String = config.args.human_hisat2_index.clone();
 
-        let human_bt2_index_path = bowtie2_index_prep(human_bowtie2_index, &cwd)?;
-        let human_bt2_options = HashMap::from([("--very-sensitive-local".to_string(), None)]);
+        let human_bt2_index_path =
+            bowtie2_index_prep(human_bowtie2_index, &cwd)?;
 
         let (
             human_bt2_r1,
@@ -9618,7 +9661,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             host_hisat2_out_stream,
             human_bt2_index_path,
             paired,
-            human_bt2_options,
             out_dir.join("human_bt2_aligned_sorted.bam"),
         )
             .await?;

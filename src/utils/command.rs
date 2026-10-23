@@ -1715,17 +1715,52 @@ pub mod bowtie2 {
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
     use log::{self, debug};
-    use std::collections::HashMap;
     use std::fs::{self, DirEntry};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    #[derive(Debug)]
     pub struct Bowtie2Config {
-        pub bt2_index_path: PathBuf,
-        pub paired: bool,
-        pub r1_path: Option<PathBuf>,
-        pub r2_path: Option<PathBuf>,
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands, if any.
+        pub positional_args: Vec<String>,
+    }
+
+    impl Bowtie2Config {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct Bowtie2ArgGenerator;
@@ -1739,7 +1774,9 @@ pub mod bowtie2 {
     /// # Returns
     ///
     /// Result<f32>: the bowtie2 version
-    pub async fn bowtie2_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn bowtie2_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             BOWTIE2_TAG,
             vec!["-h"],
@@ -1749,23 +1786,18 @@ pub mod bowtie2 {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     /// Prepares the Bowtie2 index by handling directory, tar, or tar.gz inputs.
-    /// Returns the PathBuf to the basename (e.g., /path/to/ercc for files ercc.1.bt2, etc.).
-    /// Prepares a Bowtie2 index for the given input sequence.
-    ///
-    /// # Arguments
-    ///
-    /// * `input_path`: path to the reference sequence FASTA
-    /// * `cwd`: current working directory for temporary files
-    ///
-    /// # Returns
-    ///
-    /// Result<PathBuf>: path to the generated Bowtie2 index
-    pub fn bowtie2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+    /// Returns the PathBuf to the basename
+    /// (e.g., /path/to/ercc for files ercc.1.bt2, etc.).
+    pub fn bowtie2_index_prep(
+        input_path: impl AsRef<Path>,
+        cwd: &PathBuf,
+    ) -> Result<PathBuf> {
         let input = input_path.as_ref();
 
         // Generate unique unpack directory
@@ -1782,12 +1814,16 @@ pub mod bowtie2 {
                 .to_string_lossy()
                 .to_string()
         };
-        let unpack_dir = cwd.join(format!("unpacked_index_bt2_{}", unique_id));
+
+        let unpack_dir =
+            cwd.join(format!("unpacked_index_bt2_{}", unique_id));
 
         if unpack_dir.exists() {
             fs::remove_dir_all(&unpack_dir)?;
         }
+
         fs::create_dir_all(&unpack_dir)?;
+
         debug!(
             "Bowtie2: Created unpack directory: {}",
             unpack_dir.display()
@@ -1802,6 +1838,7 @@ pub mod bowtie2 {
                 .extension()
                 .map(|s| s.to_str().unwrap_or(""))
                 .unwrap_or("");
+
             let stem_ext = input
                 .file_stem()
                 .and_then(|s| Path::new(s).extension())
@@ -1809,7 +1846,11 @@ pub mod bowtie2 {
                 .unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                debug!("Bowtie2: Unpacking GZIP TAR: {}", input.display());
+                debug!(
+                    "Bowtie2: Unpacking GZIP TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -1817,7 +1858,11 @@ pub mod bowtie2 {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                debug!("Bowtie2: Unpacking TAR: {}", input.display());
+                debug!(
+                    "Bowtie2: Unpacking TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -1845,40 +1890,66 @@ pub mod bowtie2 {
         }
 
         // Strip single top-level subdir (e.g., "ercc/")
-        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let entries: Vec<DirEntry> =
+            fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+
         let dirs: Vec<DirEntry> = entries
             .into_iter()
-            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .filter(|e| {
+                e.file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false)
+            })
             .collect();
 
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
+
             if fs::read_dir(&subdir)?.next().is_some() {
                 index_dir = subdir;
             }
         }
-        debug!("Bowtie2 index directory: {}", index_dir.display());
+
+        debug!(
+            "Bowtie2 index directory: {}",
+            index_dir.display()
+        );
 
         // Validate
-        let extensions = vec!["bt2".to_string(), "bt2l".to_string()];
-        let required_suffixes = vec!["1", "2", "3", "4", "rev.1", "rev.2"];
+        let extensions =
+            vec!["bt2".to_string(), "bt2l".to_string()];
+
+        let required_suffixes =
+            vec!["1", "2", "3", "4", "rev.1", "rev.2"];
 
         for suffix in &required_suffixes {
             let mut found = false;
+
             for ext in &extensions {
-                let pattern = format!("{}.{}", suffix, ext);
+                let pattern =
+                    format!("{}.{}", suffix, ext);
+
                 let mut candidates = Vec::new();
+
                 for entry in fs::read_dir(&index_dir)? {
                     let path = entry?.path();
-                    if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+
+                    if path.is_file()
+                        && path
+                        .to_str()
+                        .unwrap_or("")
+                        .ends_with(&pattern)
+                    {
                         candidates.push(path);
                     }
                 }
+
                 if !candidates.is_empty() {
                     found = true;
                     break;
                 }
             }
+
             if !found {
                 return Err(anyhow!(
                     "Missing Bowtie2 index file for suffix '{}' in: {}",
@@ -1891,104 +1962,101 @@ pub mod bowtie2 {
         // Derive basename using suffix "1", avoiding "rev"
         let pattern_suffix = "1";
         let mut basename = None;
+
         for ext in &extensions {
-            let pattern = format!("{}.{}", pattern_suffix, ext);
+            let pattern =
+                format!("{}.{}", pattern_suffix, ext);
+
             let mut candidates = Vec::new();
+
             for entry in fs::read_dir(&index_dir)? {
                 let path = entry?.path();
+
                 if path.is_file()
-                    && path.to_str().unwrap_or("").ends_with(&pattern)
-                    && !path.to_str().unwrap_or("").contains("rev")
+                    && path
+                    .to_str()
+                    .unwrap_or("")
+                    .ends_with(&pattern)
+                    && !path
+                    .to_str()
+                    .unwrap_or("")
+                    .contains("rev")
                 {
                     candidates.push(path);
                 }
             }
+
             if let Some(file) = candidates.first() {
                 let file_name = file
                     .file_name()
                     .ok_or(anyhow!("Invalid file path"))?
                     .to_str()
                     .ok_or(anyhow!("Invalid UTF-8"))?;
+
                 let stripped = file_name
                     .strip_suffix(&pattern)
-                    .ok_or(anyhow!("Suffix mismatch in Bowtie2 file: {}", file_name))?;
-                basename = Some(stripped.trim_end_matches('.').to_string());
+                    .ok_or(anyhow!(
+                        "Suffix mismatch in Bowtie2 file: {}",
+                        file_name
+                    ))?;
+
+                basename =
+                    Some(stripped.trim_end_matches('.').to_string());
+
                 break;
             }
         }
+
         let basename = basename.ok_or(anyhow!(
             "No Bowtie2 index file with suffix '1' avoiding 'rev' found in: {}",
             index_dir.display()
         ))?;
 
-        let final_path = index_dir.join(&basename);
-        debug!("Final Bowtie2 index path: {}", final_path.display());
+        let final_path =
+            index_dir.join(&basename);
+
+        debug!(
+            "Final Bowtie2 index path: {}",
+            final_path.display()
+        );
+
         Ok(final_path)
     }
 
     impl ArgGenerator for Bowtie2ArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| e.downcast_ref::<Bowtie2Config>())
-                .ok_or_else(|| anyhow!("Bowtie2 requires a Bowtie2Config as extra argument"))?;
+                .and_then(|e| {
+                    e.downcast_ref::<Bowtie2Config>()
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Bowtie2 requires a Bowtie2Config as extra argument"
+                    )
+                })?;
 
-            let mut args: Vec<String> = Vec::new();
+            let mut args = Vec::new();
 
+            // Serialize caller-specified options exactly and in order.
             for (key, value) in &config.option_fields {
                 args.push(key.clone());
-                if let Some(v) = value {
-                    args.push(v.clone());
+
+                if let Some(value) = value {
+                    args.push(value.clone());
                 }
             }
 
-            // Index
-            args.push("-x".to_string());
-            args.push(config.bt2_index_path.to_string_lossy().to_string());
+            // Serialize positional operands exactly and in order.
+            args.extend(config.positional_args.iter().cloned());
 
-            // Threads
-            args.push("-p".to_string());
-            let num_cores = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
-            args.push(num_cores.to_string());
-
-            // Input handling
-            match (config.r1_path.as_ref(), config.r2_path.as_ref()) {
-                (Some(r1), Some(r2)) => {
-                    // Paired files
-                    args.push("-1".to_string());
-                    args.push(r1.to_string_lossy().to_string());
-                    args.push("-2".to_string());
-                    args.push(r2.to_string_lossy().to_string());
-                }
-                (Some(r1), None) => {
-                    // Single-end file
-                    args.push("-U".to_string());
-                    args.push(r1.to_string_lossy().to_string());
-                }
-                (None, _) => {
-                    // Stdin mode
-                    if config.paired {
-                        args.push("--interleaved".to_string());
-                    } else {
-                        args.push("-U".to_string());
-                    }
-                    args.push("-".to_string()); // stdin
-                }
-            }
-
-            // Safety check: paired flag should match input
-            if config.paired && config.r1_path.is_none() && config.r2_path.is_none() {
-                debug!("Bowtie2: using --interleaved for paired stdin input");
-            } else if config.paired && (config.r1_path.is_none() || config.r2_path.is_none()) {
-                return Err(anyhow!(
-                    "Bowtie2 paired mode requires both R1 and R2 paths (or stdin)"
-                ));
-            }
-
-            debug!("Bowtie2 final args: {}", args.join(" "));
+            debug!(
+                "Bowtie2 final args: {}",
+                args.join(" ")
+            );
 
             Ok(args)
         }
