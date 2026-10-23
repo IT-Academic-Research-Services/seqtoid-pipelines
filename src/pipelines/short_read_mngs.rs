@@ -1161,21 +1161,68 @@ async fn hisat2_filter(
 
         // 5. mapped count
         let (count_tx, count_rx) = oneshot::channel();
-        let count_task = tokio::spawn({
-            let bam_path = bam_path.clone();
-            async move {
-                let output = Command::new("samtools")
-                    .args(["view", "-c", "-F13", bam_path.to_str().unwrap()])
-                    .output()
-                    .await?;
-                let count = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .unwrap_or(0);
-                let _ = count_tx.send(count);
-                Ok::<(), anyhow::Error>(())
+
+        let count_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+            .option(
+                "-@",
+                config
+                    .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                    .to_string(),
+            )
+            .flag("--no-PG")
+            .flag("-c")
+            .flag("-F13")
+            .positional(bam_path.to_string_lossy().to_string());
+
+        let count_args =
+            generate_cli(SAMTOOLS_TAG, &config, Some(&count_config))
+                .map_err(|e| PipelineError::ToolExecution {
+                    tool: SAMTOOLS_TAG.to_string(),
+                    error: e.to_string(),
+                })?;
+
+        let count_config_clone = config.clone();
+
+        let count_task = tokio::spawn(async move {
+            let (mut child, err_task) = spawn_cmd(
+                count_config_clone.clone(),
+                SAMTOOLS_TAG,
+                count_args,
+                count_config_clone.args.verbose,
+                None,
+            )
+                .await?;
+
+            let lines = read_child_output_to_vec(
+                &mut child,
+                ChildStream::Stdout,
+                &count_config_clone,
+            )
+                .await?;
+
+            let status = child.wait().await?;
+
+            err_task.await??;
+
+            if !status.success() {
+                return Err(anyhow!(
+            "samtools view count exited with status {}",
+            status
+        ));
             }
+
+            let count = lines
+                .first()
+                .map(|line| line.trim())
+                .unwrap_or("0")
+                .parse::<u64>()
+                .unwrap_or(0);
+
+            let _ = count_tx.send(count);
+
+            Ok::<(), anyhow::Error>(())
         });
+
         cleanup_tasks.push(count_task);
 
         return Ok((
