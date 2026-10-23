@@ -8145,7 +8145,6 @@ async fn blast_contigs(
             Ok::<(), anyhow::Error>(())
         }
     });
-
     let temp_dir = choose_temp_dir(
         ref_size + contig_size,
         &config.ram_temp_dir,
@@ -8157,23 +8156,33 @@ async fn blast_contigs(
 
     let blastdb_path = temp_dir.path().join(format!("{}_blastindex", db_type));
 
-    let makeblastdb_config = MakeblastdbConfig {
-        input: reference_fasta.clone(),
-        dbtype: if db_type == NT_TAG {
-            "nucl".to_string()
-        } else {
-            "prot".to_string()
-        },
-        output: blastdb_path.clone(),
-        option_fields: HashMap::new(),
-    };
-    let makeblastdb_args = generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: MAKEBLASTDB_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let makeblastdb_config = MakeblastdbConfig::new()
+        .option(
+            "-in",
+            reference_fasta.to_string_lossy().to_string(),
+        )
+        .option(
+            "-dbtype",
+            if db_type == NT_TAG {
+                "nucl"
+            } else {
+                "prot"
+            },
+        )
+        .option(
+            "-out",
+            blastdb_path.to_string_lossy().to_string(),
+        );
+
+    let makeblastdb_args =
+        generate_cli(MAKEBLASTDB_TAG, &config, Some(&makeblastdb_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MAKEBLASTDB_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
     info!("[blast_contigs:{}] launching makeblastdb", db_type);
+
     let (mut makeblastdb_child, makeblastdb_err_task) = spawn_cmd(
         config.clone(),
         MAKEBLASTDB_TAG,
@@ -8182,6 +8191,7 @@ async fn blast_contigs(
         None,
     )
         .await?;
+
     let makeblastdb_status = makeblastdb_child
         .wait()
         .await
@@ -8189,64 +8199,102 @@ async fn blast_contigs(
             tool: MAKEBLASTDB_TAG.to_string(),
             error: format!("makeblastdb wait failed: {}", e),
         })?;
+
     makeblastdb_err_task.await??;
+
     if !makeblastdb_status.success() {
         return Err(anyhow!(
-            "makeblastdb exited with {:?} (db_type={}, prefix={})",
-            makeblastdb_status.code(),
-            db_type,
-            blastdb_path.display()
-        )
-            .into());
-    }
-    if !blastdb_ready(&blastdb_path, db_type) {
-        return Err(anyhow!(
-            "makeblastdb succeeded but index not ready at prefix={}",
-            blastdb_path.display()
-        )
-            .into());
-    }
-    info!(
-        "[blast_contigs:{}] blastdb ready at prefix={}",
+        "makeblastdb exited with {:?} (db_type={}, prefix={})",
+        makeblastdb_status.code(),
         db_type,
         blastdb_path.display()
-    );
+    )
+            .into());
+    }
+
+    if !blastdb_ready(&blastdb_path, db_type) {
+        return Err(anyhow!(
+        "makeblastdb succeeded but index not ready at prefix={}",
+        blastdb_path.display()
+    )
+            .into());
+    }
+
+    info!(
+    "[blast_contigs:{}] blastdb ready at prefix={}",
+    db_type,
+    blastdb_path.display()
+);
 
     let blast_command = if db_type == NT_TAG {
         BLASTN_TAG
     } else {
         BLASTX_TAG
     };
+
     let blast_args = if db_type == NT_TAG {
-        let blastn_config = BlastnConfig {
-            query: assembled_contig_fasta.clone(),
-            db: blastdb_path.clone(),
-            outfmt: "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
-                .to_string(),
-            evalue: 1e-10,
-            max_target_seqs: 5000,
-            option_fields: HashMap::new(),
-        };
-        generate_cli(BLASTN_TAG, &config, Some(&blastn_config))?
+        let blastn_config = BlastnConfig::new()
+            .option(
+                "-query",
+                assembled_contig_fasta.to_string_lossy().to_string(),
+            )
+            .option(
+                "-db",
+                blastdb_path.to_string_lossy().to_string(),
+            )
+            .option(
+                "-outfmt",
+                "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen",
+            )
+            .option("-evalue", 1e-10.to_string())
+            .option("-max_target_seqs", "5000")
+            .option(
+                "-num_threads",
+                config
+                    .thread_allocation(BLASTN_TAG, None)
+                    .to_string(),
+            );
+
+        generate_cli(
+            BLASTN_TAG,
+            &config,
+            Some(&blastn_config),
+        )?
     } else {
-        let blastx_config = BlastxConfig {
-            query: assembled_contig_fasta.clone(),
-            db: blastdb_path.clone(),
-            outfmt: 6,
-            evalue: 1e-10,
-            num_alignments: 5,
-            option_fields: HashMap::new(),
-        };
-        generate_cli(BLASTX_TAG, &config, Some(&blastx_config))?
+        let blastx_config = BlastxConfig::new()
+            .option(
+                "-query",
+                assembled_contig_fasta.to_string_lossy().to_string(),
+            )
+            .option(
+                "-db",
+                blastdb_path.to_string_lossy().to_string(),
+            )
+            .option("-outfmt", "6")
+            .option("-evalue", 1e-10.to_string())
+            .option("-num_alignments", "5")
+            .option(
+                "-num_threads",
+                config
+                    .thread_allocation(BLASTX_TAG, None)
+                    .to_string(),
+            );
+
+        generate_cli(
+            BLASTX_TAG,
+            &config,
+            Some(&blastx_config),
+        )?
     };
 
     info!(
-        "[blast_contigs:{}] launching {} query={} db={}",
-        db_type,
-        blast_command,
-        assembled_contig_fasta.display(),
-        blastdb_path.display()
-    );
+    "[blast_contigs:{}] launching {} query={} db={}",
+    db_type,
+    blast_command,
+    assembled_contig_fasta.display(),
+    blastdb_path.display()
+);
+    
     let (mut blast_child, err_task) = spawn_cmd(
         config.clone(),
         blast_command,

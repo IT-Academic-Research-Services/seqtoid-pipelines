@@ -3217,29 +3217,45 @@ pub mod makeblastdb {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct MakeblastdbConfig {
-        pub input: PathBuf,  // reference_fasta
-        pub dbtype: String,  // "nucl" or "prot"
-        pub output: PathBuf, // blast_index_path (without extension)
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl MakeblastdbConfig {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
     }
 
     pub struct MakeblastdbArgGenerator;
 
     /// Checks if `makeblastdb` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the makeblastdb version
-    pub async fn makeblastdb_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn makeblastdb_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             MAKEBLASTDB_TAG,
             vec!["-version"],
@@ -3249,7 +3265,8 @@ pub mod makeblastdb {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
@@ -3262,24 +3279,18 @@ pub mod makeblastdb {
             let config = extra
                 .and_then(|e| e.downcast_ref::<MakeblastdbConfig>())
                 .ok_or_else(|| {
-                    anyhow!("makeblastdb requires MakeblastdbConfig as extra argument")
+                    anyhow!(
+                        "makeblastdb requires MakeblastdbConfig as extra argument"
+                    )
                 })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            args_vec.push("-in".to_string());
-            args_vec.push(config.input.to_string_lossy().to_string());
-
-            args_vec.push("-dbtype".to_string());
-            args_vec.push(config.dbtype.clone());
-
-            args_vec.push("-out".to_string());
-            args_vec.push(config.output.to_string_lossy().to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
@@ -3288,36 +3299,51 @@ pub mod makeblastdb {
     }
 }
 
+
 pub mod blastn {
     use crate::config::defs::{RunConfig, BLASTN_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct BlastnConfig {
-        pub query: PathBuf,       // assembled_contig
-        pub db: PathBuf,          // blast_index_path (without extension)
-        pub outfmt: String, // e.g., "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
-        pub evalue: f64,    // e.g. 1e-10
-        pub max_target_seqs: u32, // e.g. 5000
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl BlastnConfig {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
     }
 
     pub struct BlastnArgGenerator;
 
     /// Checks if `blastn` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the blastn version
-    pub async fn blastn_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn blastn_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             BLASTN_TAG,
             vec!["-version"],
@@ -3327,45 +3353,32 @@ pub mod blastn {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for BlastnArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<BlastnConfig>())
-                .ok_or_else(|| anyhow!("blastn requires BlastnConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "blastn requires BlastnConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            args_vec.push("-query".to_string());
-            args_vec.push(config.query.to_string_lossy().to_string());
-
-            args_vec.push("-db".to_string());
-            args_vec.push(config.db.to_string_lossy().to_string());
-
-            args_vec.push("-outfmt".to_string());
-            args_vec.push(config.outfmt.clone());
-
-            args_vec.push("-evalue".to_string());
-            args_vec.push(config.evalue.to_string());
-
-            args_vec.push("-max_target_seqs".to_string());
-            args_vec.push(config.max_target_seqs.to_string());
-
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BLASTN_TAG, None);
-            args_vec.push("-num_threads".to_string());
-            args_vec.push(num_cores.to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
@@ -3374,36 +3387,51 @@ pub mod blastn {
     }
 }
 
+
 pub mod blastx {
     use crate::config::defs::{RunConfig, BLASTX_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct BlastxConfig {
-        pub query: PathBuf,      // assembled_contig
-        pub db: PathBuf,         // blast_index_path (without extension)
-        pub outfmt: u32,         // 6 (standard tabular)
-        pub evalue: f64,         // e.g. 1e-10
-        pub num_alignments: u32, // e.g. 5
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl BlastxConfig {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
     }
 
     pub struct BlastxArgGenerator;
 
     /// Checks if `blastx` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the blastx version
-    pub async fn blastx_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn blastx_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             BLASTX_TAG,
             vec!["-version"],
@@ -3413,45 +3441,32 @@ pub mod blastx {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for BlastxArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<BlastxConfig>())
-                .ok_or_else(|| anyhow!("blastx requires BlastxConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "blastx requires BlastxConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            args_vec.push("-query".to_string());
-            args_vec.push(config.query.to_string_lossy().to_string());
-
-            args_vec.push("-db".to_string());
-            args_vec.push(config.db.to_string_lossy().to_string());
-
-            args_vec.push("-outfmt".to_string());
-            args_vec.push(config.outfmt.to_string());
-
-            args_vec.push("-evalue".to_string());
-            args_vec.push(config.evalue.to_string());
-
-            args_vec.push("-num_alignments".to_string());
-            args_vec.push(config.num_alignments.to_string());
-
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BLASTX_TAG, None);
-            args_vec.push("-num_threads".to_string());
-            args_vec.push(num_cores.to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
