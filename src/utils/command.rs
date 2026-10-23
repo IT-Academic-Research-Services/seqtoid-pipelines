@@ -1202,12 +1202,73 @@ pub mod bcftools {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
 
     #[derive(Debug)]
     pub struct BcftoolsConfig {
         pub subcommand: BcftoolsSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
+
+        /// Ordered command-line options and flags.
+        ///
+        /// Examples:
+        ///     ("-a", Some("AD"))
+        ///     ("-Ou", None)
+        ///     ("--ploidy", Some("1"))
+        ///
+        /// Vec is intentional:
+        ///   - preserves command-line order;
+        ///   - permits repeated options;
+        ///   - does not conflate options with positional operands.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        ///
+        /// Examples:
+        ///     "-"
+        ///     "input.bcf"
+        ///     "reference.fa"
+        ///
+        /// Order is part of the command's semantics and must therefore
+        /// be represented explicitly.
+        pub positional_args: Vec<String>,
+    }
+
+    impl BcftoolsConfig {
+        pub fn new(subcommand: BcftoolsSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        /// Add an option with a value.
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        /// Add a flag without a value.
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        /// Add an ordered positional operand.
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct BcftoolsArgGenerator;
@@ -1221,7 +1282,9 @@ pub mod bcftools {
     /// # Returns
     ///
     /// Result<f32>: the bcftools version
-    pub async fn bcftools_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn bcftools_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             BCFTOOLS_TAG,
             vec!["-v"],
@@ -1231,58 +1294,50 @@ pub mod bcftools {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for BcftoolsArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<BcftoolsConfig>())
-                .ok_or_else(|| anyhow!("Bcftools requires a BcftoolsConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Bcftools requires a BcftoolsConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                BcftoolsSubcommand::Consensus => {
-                    args_vec.push("consensus".to_string());
+            // The generator owns only translation of the typed
+            // subcommand into its CLI spelling.
+            args_vec.push(
+                match config.subcommand {
+                    BcftoolsSubcommand::Consensus => "consensus",
+                    BcftoolsSubcommand::Call => "call",
+                    BcftoolsSubcommand::Mpileup => "mpileup",
+                    BcftoolsSubcommand::View => "view",
                 }
-                BcftoolsSubcommand::Call => {
-                    args_vec.push("call".to_string());
-                }
-                BcftoolsSubcommand::Mpileup => {
-                    args_vec.push("mpileup".to_string());
-                    args_vec.push("-a".to_string());
-                    args_vec.push("AD".to_string()); // include allele depth (AD) for all positions, including those with zero coverage, mimicking -aa.
-                    args_vec.push("-d".to_string());
-                    args_vec.push("10000".to_string()); // max depth essentially without limit
-                    args_vec.push("-L".to_string());
-                    args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
-                    args_vec.push("-Q".to_string());
-                    args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push("--threads".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, BCFTOOLS_TAG, Some("mpileup"))
-                            .to_string(),
-                    );
-                }
-                BcftoolsSubcommand::View => {
-                    args_vec.push("view".to_string());
+                    .to_string(),
+            );
+
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            for (key, value) in config.subcommand_fields.iter() {
-                args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => {}
-                }
-            }
+            // Positional operands always retain their caller-specified order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }

@@ -1522,17 +1522,27 @@ async fn call_variants(
     let mut cleanup_tasks = vec![];
     let mut cleanup_receivers = vec![];
 
-    let bcftools_mpileup_config = BcftoolsConfig {
-        subcommand: BcftoolsSubcommand::Mpileup,
-        subcommand_fields: HashMap::from([
-            (
-                "-f".to_string(),
-                Some(target_ref_path.to_string_lossy().into_owned()),
-            ),
-            ("-Ou".to_string(), None), // Uncompressed BCF
-            ("-".to_string(), None),
-        ]),
-    };
+    let bcftools_mpileup_config =
+        BcftoolsConfig::new(BcftoolsSubcommand::Mpileup)
+            .option("-a", "AD")
+            .option("-d", "10000")
+            .option("-L", "100000000")
+            .option("-Q", config.args.quality.to_string())
+            .option(
+                "--threads",
+                RunConfig::thread_allocation(
+                    &config,
+                    BCFTOOLS_TAG,
+                    Some("mpileup"),
+                )
+                    .to_string(),
+            )
+            .option(
+                "-f",
+                target_ref_path.to_string_lossy().into_owned(),
+            )
+            .flag("-Ou")
+            .positional("-");
     let bcftools_mpileup_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_mpileup_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: BCFTOOLS_TAG.to_string(),
@@ -1566,20 +1576,18 @@ async fn call_variants(
             })?
     };
 
-    let bcftools_call_config = BcftoolsConfig {
-        subcommand: BcftoolsSubcommand::Call,
-        subcommand_fields: HashMap::from([
-            ("--ploidy".to_string(), Some("1".to_string())),
-            ("-m".to_string(), None),
-            ("-v".to_string(), None),
-            (
-                "-P".to_string(),
-                Some(config.args.bcftools_call_theta.to_string()),
-            ),
-            ("-Ou".to_string(), None), // Uncompressed BCF
-            ("-".to_string(), None),
-        ]),
-    };
+    let bcftools_call_config =
+        BcftoolsConfig::new(BcftoolsSubcommand::Call)
+            .option("--ploidy", "1")
+            .flag("-m")
+            .flag("-v")
+            .option(
+                "-P",
+                config.args.bcftools_call_theta.to_string(),
+            )
+            .flag("-Ou")
+            .positional("-");
+    
     let bcftools_call_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_call_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: BCFTOOLS_TAG.to_string(),
