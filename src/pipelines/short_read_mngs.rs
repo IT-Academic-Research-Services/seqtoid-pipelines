@@ -1964,22 +1964,24 @@ async fn minimap2_filter(
         temp_dirs.push(temp_dir);
     }
 
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: host_index_path,
-        r1_path: None,
-        r2_path: None,
-        option_fields: HashMap::from([
-            ("-ax".to_string(), Some("sr".to_string())), // Short-read preset
-            ("-k".to_string(), Some("15".to_string())),  // Default k-mer
-            ("-w".to_string(), Some("10".to_string())),  // Default window
-            ("-s".to_string(), Some("30".to_string())),  // Match HISAT2's score threshold
-            ("-A".to_string(), Some("2".to_string())),   // Match score
-            ("-B".to_string(), Some("4".to_string())),   // Mismatch penalty
-            ("-O".to_string(), Some("4,24".to_string())), // Gap open
-            ("-E".to_string(), Some("2,1".to_string())), // Gap extension
-        ]),
-        num_threads: None,
-    };
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", "sr") // Short-read preset
+        .option("-k", "15") // Default k-mer
+        .option("-w", "10") // Default window
+        .option("-s", "30") // Match HISAT2's score threshold
+        .option("-A", "2") // Match score
+        .option("-B", "4") // Mismatch penalty
+        .option("-O", "4,24") // Gap open
+        .option("-E", "2,1") // Gap extension
+        .positional(host_index_path.to_string_lossy().to_string())
+        .positional("-");
+
     let minimap2_args =
         generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config)).map_err(|e| {
             PipelineError::ToolExecution {
@@ -2841,21 +2843,24 @@ async fn nt_non_host_align(
 
         let handle = tokio::spawn(async move {
             while let Some((chunk_mmi, chunk_name)) = job_rx.recv().await {
-                let mut options = HashMap::new();
-                options.insert("-c".to_string(), None);
-                options.insert("-x".to_string(), Some("sr".to_string()));
-                options.insert("--secondary".to_string(), Some("yes".to_string()));
 
-                let mm_config = Minimap2Config {
-                    minimap2_index_path: chunk_mmi,
-                    r1_path: Some(r1.clone()),
-                    r2_path: r2.clone(),
-                    option_fields: options,
-                    num_threads: Some(threads_per_job),
+                let mm_config = Minimap2Config::new()
+                    .option("-t", threads_per_job.to_string())
+                    .flag("-c")
+                    .option("-x", "sr")
+                    .option("--secondary", "yes")
+                    .positional(chunk_mmi.to_string_lossy().to_string())
+                    .positional(r1.to_string_lossy().to_string());
+
+                let mm_config = if let Some(r2_path) = &r2 {
+                    mm_config.positional(r2_path.to_string_lossy().to_string())
+                } else {
+                    mm_config
                 };
 
-                let args = generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
-                    .context("Failed to generate minimap2 args")?;
+                let args =
+                    generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
+                        .context("Failed to generate minimap2 args")?;
 
                 debug!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
 

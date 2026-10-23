@@ -380,16 +380,16 @@ async fn minimap2_filter(
         LibraryType::RNA => "splice",
     };
 
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: host_index_path,
-        r1_path: None,
-        r2_path: None,
-        option_fields: HashMap::from([(
-            "-ax".to_string(),
-            Some(minimap_preset.to_string()),
-        )]),
-        num_threads: None,
-    };
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", minimap_preset)
+        .positional(host_index_path.to_string_lossy().to_string())
+        .positional("-");
 
     let minimap2_args =
         generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config)).map_err(|e| {
@@ -736,22 +736,17 @@ async fn run_reads_to_contigs(
     // FASTA directly and builds the transient index internally.
     // ================================================================
 
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: assembled_reads,
-        r1_path: Some(input_fastq),
-        r2_path: None,
-        option_fields: HashMap::from([
-            (
-                "-ax".to_string(),
-                Some("map-ont".to_string()),
-            ),
-            (
-                "--secondary=no".to_string(),
-                None,
-            ),
-        ]),
-        num_threads: None,
-    };
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config0
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", "map-ont")
+        .flag("--secondary=no")
+        .positional(assembled_reads.to_string_lossy().to_string())
+        .positional(input_fastq.to_string_lossy().to_string());
 
     let minimap2_args = generate_cli(
         MINIMAP2_TAG,

@@ -328,40 +328,53 @@ pub mod minimap2 {
 
     use anyhow::{anyhow, Result};
     use log::{debug, info};
-    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
     use tokio::task::JoinHandle;
 
+    #[derive(Debug)]
     pub struct Minimap2Config {
-        /// Minimap2 reference.
-        ///
-        /// May be either:
-        ///   - a pre-built `.mmi` index
-        ///   - a FASTA reference, which minimap2 will index internally
-        ///
-        /// The field name is retained for compatibility with existing
-        /// pipeline call sites.
-        pub minimap2_index_path: PathBuf,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
 
-        /// Query input.
-        ///
-        /// Some(path) = read query from file.
-        /// None       = read query from stdin.
-        pub r1_path: Option<PathBuf>,
+        /// Ordered positional operands.
+        pub positional_args: Vec<String>,
+    }
 
-        /// Optional second query file.
-        pub r2_path: Option<PathBuf>,
+    impl Minimap2Config {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
 
-        /// Additional minimap2 command-line options.
-        pub option_fields: HashMap<String, Option<String>>,
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((option.into(), Some(value.into())));
+            self
+        }
 
-        /// Optional explicit thread override.
-        ///
-        /// If None, use RunConfig thread allocation.
-        pub num_threads: Option<usize>,
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct Minimap2ArgGenerator;
@@ -861,132 +874,20 @@ pub mod minimap2 {
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| {
-                    e.downcast_ref::<Minimap2Config>()
-                })
+                .and_then(|e| e.downcast_ref::<Minimap2Config>())
                 .ok_or_else(|| {
                     anyhow!(
                         "Minimap2 requires a Minimap2Config as extra argument"
                     )
                 })?;
 
-            // ----------------------------------------------------------
-            // Reference validation.
-            //
-            // Minimap2 accepts either:
-            //
-            //     reference.mmi
-            //
-            // or:
-            //
-            //     reference.fa / reference.fasta / etc.
-            //
-            // This is important for the long-read RunReadsToContigs
-            // stage, where Flye's contigs.fasta is intentionally passed
-            // directly to minimap2, matching the legacy WDL.
-            // ----------------------------------------------------------
+            let mut args_vec = Vec::new();
 
-            let reference_path =
-                config.minimap2_index_path.clone();
-
-            if !reference_path.exists() {
-                return Err(anyhow!(
-                    "Minimap2 reference/index file does not exist: {}",
-                    reference_path.display()
-                ));
-            }
-
-            let extension = reference_path
-                .extension()
-                .and_then(|ext| ext.to_str());
-
-            let is_mmi = extension
-                .map(|ext| {
-                    ext.eq_ignore_ascii_case("mmi")
-                })
-                .unwrap_or(false);
-
-            let is_fasta = extension
-                .map(|ext| {
-                    FASTA_EXTS.iter().any(|&f| {
-                        ext.eq_ignore_ascii_case(f)
-                    })
-                })
-                .unwrap_or(false);
-
-            if !is_mmi && !is_fasta {
-                return Err(anyhow!(
-                    "Minimap2 reference must be an .mmi index or FASTA \
-                     file ({}), got: {}",
-                    FASTA_EXTS.join(", "),
-                    reference_path.display()
-                ));
-            }
-
-
-            // ----------------------------------------------------------
-            // Query validation.
-            // ----------------------------------------------------------
-
-            if let Some(r1_path) = &config.r1_path {
-                if !r1_path.exists() {
-                    return Err(anyhow!(
-                        "Minimap2 query file does not exist: {}",
-                        r1_path.display()
-                    ));
-                }
-            }
-
-            if let Some(r2_path) = &config.r2_path {
-                if !r2_path.exists() {
-                    return Err(anyhow!(
-                        "Minimap2 second query file does not exist: {}",
-                        r2_path.display()
-                    ));
-                }
-            }
-
-
-            let mut args_vec: Vec<String> =
-                Vec::new();
-
-
-            // ----------------------------------------------------------
-            // Threads
-            // ----------------------------------------------------------
-
-            let threads =
-                if let Some(override_threads) =
-                    config.num_threads
-                {
-                    override_threads
-                } else {
-                    run_config.thread_allocation(
-                        MINIMAP2_TAG,
-                        None,
-                    )
-                };
-
-            args_vec.push("-t".to_string());
-            args_vec.push(threads.to_string());
-
-
-            // ----------------------------------------------------------
-            // Caller-supplied minimap2 options.
-            //
-            // Examples:
-            //
-            //     -ax map-ont
-            //     --secondary=no
-            // ----------------------------------------------------------
-
-            for (key, value) in
-                config.option_fields.iter()
-            {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
 
                 if let Some(value) = value {
@@ -994,61 +895,13 @@ pub mod minimap2 {
                 }
             }
 
-
-            // ----------------------------------------------------------
-            // Reference
-            //
-            // This can now be either an .mmi or FASTA.
-            // ----------------------------------------------------------
-
-            args_vec.push(
-                reference_path
-                    .to_string_lossy()
-                    .to_string(),
-            );
-
-
-            // ----------------------------------------------------------
-            // Query input.
-            //
-            // File input:
-            //
-            //     minimap2 reference reads.fastq
-            //
-            // Stdin:
-            //
-            //     ... | minimap2 reference -
-            // ----------------------------------------------------------
-
-            if let Some(r1_path) = &config.r1_path {
-                args_vec.push(
-                    r1_path
-                        .to_string_lossy()
-                        .to_string(),
-                );
-
-                if let Some(r2_path) =
-                    &config.r2_path
-                {
-                    args_vec.push(
-                        r2_path
-                            .to_string_lossy()
-                            .to_string(),
-                    );
-                }
-            } else {
-                args_vec.push("-".to_string());
-            }
-
-            debug!(
-                "Minimap2 final args: {}",
-                args_vec.join(" ")
-            );
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
     }
 }
+
 
 pub mod samtools {
     use crate::config::defs::{RunConfig, SamtoolsSubcommand, SAMTOOLS_TAG};

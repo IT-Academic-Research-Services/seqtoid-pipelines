@@ -247,23 +247,21 @@ async fn align_to_host(
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
-    let mut minimap2_options = HashMap::new();
-    match config.args.technology {
-        Technology::Illumina => {
-            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
-        }
-        Technology::ONT => {
-            minimap2_options.insert("-ax".to_string(), Some("map-ont".to_string()));
-        }
-    }
-
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: host_index_path,
-        r1_path: None,
-        r2_path: None,
-        option_fields: minimap2_options.clone(),
-        num_threads: None,
+    let minimap_preset = match config.args.technology {
+        Technology::Illumina => "sr",
+        Technology::ONT => "map-ont",
     };
+
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", minimap_preset)
+        .positional(host_index_path.to_string_lossy().to_string())
+        .positional("-");
 
     let minimap2_args =
         generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config)).map_err(|e| {
@@ -549,23 +547,21 @@ async fn process_ercc(
     let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     cleanup_receivers.push(ercc_router_handle);
 
-    let mut minimap2_options = HashMap::new();
-    match config.args.technology {
-        Technology::Illumina => {
-            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
-        }
-        Technology::ONT => {
-            minimap2_options.insert("-ax".to_string(), Some("map-ont".to_string()));
-        }
-    }
-
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: ercc_index_path,
-        r1_path: None, // ← NEW: optional query file (None = stdin)
-        r2_path: None,
-        option_fields: minimap2_options.clone(),
-        num_threads: None,
+    let minimap_preset = match config.args.technology {
+        Technology::Illumina => "sr",
+        Technology::ONT => "map-ont",
     };
+
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", minimap_preset)
+        .positional(ercc_index_path.to_string_lossy().to_string())
+        .positional("-");
 
     let minimap2_args =
         generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config)).map_err(|e| {
@@ -1101,23 +1097,21 @@ async fn align_to_target(
     )
         .await?;
 
-    let mut minimap2_options = HashMap::new();
-    match config.args.technology {
-        Technology::Illumina => {
-            minimap2_options.insert("-ax".to_string(), Some("sr".to_string()));
-        }
-        Technology::ONT => {
-            minimap2_options.insert("-ax".to_string(), Some("map-ont".to_string()));
-        }
-    }
-
-    let minimap2_config = Minimap2Config {
-        minimap2_index_path: target_index_path,
-        r1_path: None,
-        r2_path: None,
-        option_fields: minimap2_options.clone(),
-        num_threads: None,
+    let minimap_preset = match config.args.technology {
+        Technology::Illumina => "sr",
+        Technology::ONT => "map-ont",
     };
+
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", minimap_preset)
+        .positional(target_index_path.to_string_lossy().to_string())
+        .positional("-");
 
     let minimap2_args =
         generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config)).map_err(|e| {
@@ -1587,7 +1581,7 @@ async fn call_variants(
             )
             .flag("-Ou")
             .positional("-");
-    
+
     let bcftools_call_args = generate_cli(BCFTOOLS_TAG, &config, Some(&bcftools_call_config))
         .map_err(|e| PipelineError::ToolExecution {
             tool: BCFTOOLS_TAG.to_string(),
