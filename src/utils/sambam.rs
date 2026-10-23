@@ -30,7 +30,7 @@ use noodles::sam::alignment::record::Flags;
 use rayon::prelude::*;
 
 use crate::config::defs::{ClusterInfo, RunConfig};
-use crate::utils::streams::ParseOutput;
+use crate::utils::streams::{ParseOutput, ChannelReader};
 
 #[derive(Debug, Clone)]
 pub struct InsertSizeStats {
@@ -863,6 +863,7 @@ pub async fn generate_assembly_coverage(
     Ok(())
 }
 
+
 /// Filter minimap2 SAM alignments with excessive terminal clipping.
 ///
 /// This is the streaming Rust equivalent of filter_clipped_alignments.py.
@@ -879,9 +880,15 @@ pub async fn generate_assembly_coverage(
 /// - Alignments with percent_clipped >= max_percent are rewritten as
 ///   unmapped SAM records while preserving QNAME, SEQ, and QUAL.
 ///
+/// IMPORTANT:
+///
+/// The input ParseOutput::Bytes stream contains arbitrary byte chunks.
+/// Those chunks are NOT guaranteed to correspond to SAM records.
+/// Reconstruct complete newline-delimited SAM records before parsing.
+///
 /// The output remains a SAM byte stream.
 pub async fn filter_clipped_alignments(
-    mut input_stream: ReceiverStream<ParseOutput>,
+    input_stream: ReceiverStream<ParseOutput>,
     max_percent: f64,
     buffer_size: usize,
 ) -> Result<
@@ -891,62 +898,118 @@ pub async fn filter_clipped_alignments(
     ),
     PipelineError,
 > {
+    use tokio::io::AsyncBufReadExt;
+
     let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
 
+    // Convert the arbitrary ParseOutput::Bytes chunks into a continuous
+    // AsyncRead. ChannelReader preserves byte order while hiding the
+    // upstream chunk boundaries.
+    let channel_reader =
+        ChannelReader::new(input_stream.into_inner());
+
     let task = tokio::spawn(async move {
-        while let Some(item) = input_stream.next().await {
-            let bytes = match item {
-                ParseOutput::Bytes(bytes) => bytes,
-                other => {
-                    return Err(anyhow!(
-                        "filter_clipped_alignments expected SAM bytes, got {:?}",
-                        other
-                    ));
-                }
-            };
+        let mut reader =
+            tokio::io::BufReader::with_capacity(
+                1024 * 1024,
+                channel_reader,
+            );
+
+        let mut line = Vec::<u8>::new();
+        let mut sam_record_count: u64 = 0;
+
+        loop {
+            line.clear();
+
+            let bytes_read = reader
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "filter_clipped_alignments failed reading SAM stream \
+                         after {} records: {}",
+                        sam_record_count,
+                        e,
+                    )
+                })?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            // Preserve a complete copy including the original newline.
+            //
+            // For records that pass through unchanged, this is emitted
+            // directly so the SAM serialization remains unchanged.
+            let original_bytes =
+                bytes::Bytes::copy_from_slice(&line);
+
+            // Remove LF and optional CR only for parsing.
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+
+            // Ignore a completely empty line if one somehow appears.
+            if line.is_empty() {
+                continue;
+            }
 
             // ----------------------------------------------------------
             // SAM headers are preserved exactly.
             // ----------------------------------------------------------
-            if bytes.first() == Some(&b'@') {
-                tx.send(ParseOutput::Bytes(bytes))
+
+            if line.first() == Some(&b'@') {
+                tx.send(ParseOutput::Bytes(original_bytes))
                     .await
                     .map_err(|_| {
                         anyhow!(
-                            "filter_clipped_alignments output receiver dropped"
+                            "filter_clipped_alignments output receiver dropped \
+                             while sending SAM header after {} records",
+                            sam_record_count,
                         )
                     })?;
 
                 continue;
             }
 
+            sam_record_count += 1;
+
             // ----------------------------------------------------------
-            // Parse the mandatory SAM fields.
+            // Parse one COMPLETE SAM record.
             //
             // We only need:
+            //
             //   0  QNAME
             //   5  CIGAR
             //   9  SEQ
             //   10 QUAL
             // ----------------------------------------------------------
-            let line = std::str::from_utf8(&bytes)
-                .map_err(|e| {
-                    anyhow!(
-                        "filter_clipped_alignments received invalid UTF-8 SAM record: {}",
-                        e
-                    )
-                })?;
 
-            let line = line.trim_end_matches(&['\r', '\n'][..]);
+            let line_str =
+                std::str::from_utf8(&line)
+                    .map_err(|e| {
+                        anyhow!(
+                            "filter_clipped_alignments received invalid UTF-8 \
+                             in SAM record {}: {}",
+                            sam_record_count,
+                            e,
+                        )
+                    })?;
 
-            let fields: Vec<&str> = line.split('\t').collect();
+            let fields: Vec<&str> =
+                line_str.split('\t').collect();
 
             if fields.len() < 11 {
                 return Err(anyhow!(
-                    "Malformed SAM record in filter_clipped_alignments: \
+                    "Malformed SAM record {} in filter_clipped_alignments: \
                      expected at least 11 fields, found {}: {}",
+                    sam_record_count,
                     fields.len(),
-                    line
+                    line_str,
                 ));
             }
 
@@ -965,12 +1028,16 @@ pub async fn filter_clipped_alignments(
             //
             // So already-unmapped records pass through unchanged.
             // ----------------------------------------------------------
+
             if cigar == "*" {
-                tx.send(ParseOutput::Bytes(bytes))
+                tx.send(ParseOutput::Bytes(original_bytes))
                     .await
                     .map_err(|_| {
                         anyhow!(
-                            "filter_clipped_alignments output receiver dropped"
+                            "filter_clipped_alignments output receiver dropped \
+                             while sending unmapped SAM record {} ({})",
+                            sam_record_count,
+                            qname,
                         )
                     })?;
 
@@ -988,11 +1055,32 @@ pub async fn filter_clipped_alignments(
             // Therefore ONLY the first and last CIGAR operations count.
             // Internal S/H operations, if present, do not.
             // ----------------------------------------------------------
+
             let (front_clipping, front_hard_clipping) =
-                terminal_cigar_clipping(cigar, true)?;
+                terminal_cigar_clipping(cigar, true)
+                    .map_err(|e| {
+                        anyhow!(
+                            "filter_clipped_alignments failed parsing leading \
+                             clipping in SAM record {} ({}, CIGAR={}): {}",
+                            sam_record_count,
+                            qname,
+                            cigar,
+                            e,
+                        )
+                    })?;
 
             let (end_clipping, end_hard_clipping) =
-                terminal_cigar_clipping(cigar, false)?;
+                terminal_cigar_clipping(cigar, false)
+                    .map_err(|e| {
+                        anyhow!(
+                            "filter_clipped_alignments failed parsing trailing \
+                             clipping in SAM record {} ({}, CIGAR={}): {}",
+                            sam_record_count,
+                            qname,
+                            cigar,
+                            e,
+                        )
+                    })?;
 
             // Python starts with:
             //
@@ -1000,14 +1088,17 @@ pub async fn filter_clipped_alignments(
             //
             // and adds hard-clipped bases because they are not represented
             // in SEQ.
-            let alignment_length = seq.len()
-                + front_hard_clipping
-                + end_hard_clipping;
+
+            let alignment_length =
+                seq.len()
+                    + front_hard_clipping
+                    + end_hard_clipping;
 
             if alignment_length == 0 {
                 return Err(anyhow!(
-                    "SAM record {} has zero effective alignment length",
-                    qname
+                    "SAM record {} ({}) has zero effective alignment length",
+                    sam_record_count,
+                    qname,
                 ));
             }
 
@@ -1015,7 +1106,9 @@ pub async fn filter_clipped_alignments(
                 front_clipping + end_clipping;
 
             let percent_clipped =
-                (total_clipping as f64 / alignment_length as f64) * 100.0;
+                (total_clipping as f64
+                    / alignment_length as f64)
+                    * 100.0;
 
             // ----------------------------------------------------------
             // Python uses:
@@ -1024,12 +1117,16 @@ pub async fn filter_clipped_alignments(
             //
             // Therefore equality is filtered.
             // ----------------------------------------------------------
+
             if percent_clipped < max_percent {
-                tx.send(ParseOutput::Bytes(bytes))
+                tx.send(ParseOutput::Bytes(original_bytes))
                     .await
                     .map_err(|_| {
                         anyhow!(
-                            "filter_clipped_alignments output receiver dropped"
+                            "filter_clipped_alignments output receiver dropped \
+                             while sending retained SAM record {} ({})",
+                            sam_record_count,
+                            qname,
                         )
                     })?;
 
@@ -1041,12 +1138,13 @@ pub async fn filter_clipped_alignments(
             //
             // Match the legacy UNMAPPED_READ template exactly:
             //
-            // QNAME  FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL
-            // id     4    *     0   0    *     *     0     0    seq qual
+            // QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL
+            // id    4    *     0   0    *     *     0     0    seq qual
             //
             // The original QNAME, SEQ, and QUAL are retained.
             // Everything else is replaced.
             // ----------------------------------------------------------
+
             let unmapped = format!(
                 "{}\t4\t*\t0\t0\t*\t*\t0\t0\t{}\t{}\n",
                 qname,
@@ -1054,11 +1152,18 @@ pub async fn filter_clipped_alignments(
                 qual,
             );
 
-            tx.send(ParseOutput::Bytes(bytes::Bytes::from(unmapped)))
+            tx.send(
+                ParseOutput::Bytes(
+                    bytes::Bytes::from(unmapped)
+                )
+            )
                 .await
                 .map_err(|_| {
                     anyhow!(
-                        "filter_clipped_alignments output receiver dropped"
+                        "filter_clipped_alignments output receiver dropped \
+                         while sending rewritten SAM record {} ({})",
+                        sam_record_count,
+                        qname,
                     )
                 })?;
         }
