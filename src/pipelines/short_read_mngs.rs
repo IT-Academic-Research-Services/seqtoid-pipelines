@@ -991,7 +991,7 @@ async fn hisat2_filter(
     r2_path_opt: Option<PathBuf>,
     hisat2_index_path: PathBuf,
     paired: bool,
-    hisat2_options: HashMap<String, Option<String>>,
+    hisat2_options: Vec<(String, Option<String>)>,
     output_bam_path: Option<PathBuf>,
     headroom: u64,
 ) -> Result<
@@ -1020,25 +1020,40 @@ async fn hisat2_filter(
 
         // 1. HISAT2 → SAM
         let sam_path = temp_dir.path().join("hisat2.sam");
-        let hisat2_config = Hisat2Config {
-            hisat2_index_path: hisat2_index_path.clone(),
-            option_fields: hisat2_options,
-            r1_path: r1_path.to_string_lossy().to_string(),
-            r2_path: r2_path_opt
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string()),
-        };
+        let r2_path = r2_path_opt.as_ref().ok_or_else(|| {
+            PipelineError::InvalidConfig(
+                "Paired HISAT2 alignment requested but R2 path is missing".to_string(),
+            )
+        })?;
 
-        let mut hisat2_args =
+        let mut hisat2_config = Hisat2Config::new()
+            .option("-x", hisat2_index_path.to_string_lossy().to_string())
+            .option(
+                "-p",
+                config
+                    .thread_allocation(HISAT2_TAG, None)
+                    .to_string(),
+            );
+
+        for (key, value) in &hisat2_options {
+            hisat2_config = match value {
+                Some(value) => hisat2_config.option(key.clone(), value.clone()),
+                None => hisat2_config.flag(key.clone()),
+            };
+        }
+
+        hisat2_config = hisat2_config
+            .option("-1", r1_path.to_string_lossy().to_string())
+            .option("-2", r2_path.to_string_lossy().to_string())
+            .option("-S", sam_path.to_string_lossy().to_string());
+
+        let hisat2_args =
             generate_cli(HISAT2_TAG, &config, Some(&hisat2_config)).map_err(|e| {
                 PipelineError::ToolExecution {
                     tool: HISAT2_TAG.to_string(),
                     error: e.to_string(),
                 }
             })?;
-
-        hisat2_args.push("-S".to_string());
-        hisat2_args.push(sam_path.to_string_lossy().to_string());
 
         let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
             config.clone(),
@@ -1263,22 +1278,33 @@ async fn hisat2_filter(
         .await?;
 
     // 1. HISAT2 → SAM (streaming)
-    let hisat2_config = Hisat2Config {
-        hisat2_index_path: hisat2_index_path.clone(),
-        option_fields: hisat2_options,
-        r1_path: r1_path.to_string_lossy().to_string(),
-        r2_path: None,
-    };
+    let mut hisat2_config = Hisat2Config::new()
+        .option("-x", hisat2_index_path.to_string_lossy().to_string())
+        .option(
+            "-p",
+            config
+                .thread_allocation(HISAT2_TAG, None)
+                .to_string(),
+        );
 
-    let mut hisat2_args = generate_cli(HISAT2_TAG, &config, Some(&hisat2_config)).map_err(|e| {
-        PipelineError::ToolExecution {
-            tool: HISAT2_TAG.to_string(),
-            error: e.to_string(),
-        }
-    })?;
+    for (key, value) in &hisat2_options {
+        hisat2_config = match value {
+            Some(value) => hisat2_config.option(key.clone(), value.clone()),
+            None => hisat2_config.flag(key.clone()),
+        };
+    }
 
-    hisat2_args.push("-S".to_string());
-    hisat2_args.push("/dev/stdout".to_string());
+    hisat2_config = hisat2_config
+        .option("-U", r1_path.to_string_lossy().to_string())
+        .option("-S", "/dev/stdout");
+
+    let hisat2_args =
+        generate_cli(HISAT2_TAG, &config, Some(&hisat2_config)).map_err(|e| {
+            PipelineError::ToolExecution {
+                tool: HISAT2_TAG.to_string(),
+                error: e.to_string(),
+            }
+        })?;
 
     let (mut hisat2_child, hisat2_err_task) = spawn_cmd(
         config.clone(),
@@ -1448,6 +1474,7 @@ async fn hisat2_filter(
         vec![temp_dir],
     ))
 }
+
 
 /// Performs quality control on the input FASTQ stream using fastp.
 ///
@@ -9610,8 +9637,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     }
 
     //host filtering hisat2
-    let host_hisat2_index_path = hisat2_index_prep(host_hisat2_index, &cwd)?;
-    let hisat2_options = HashMap::from([]);
+    // Host filtering HISAT2
+    let host_hisat2_index_path =
+        hisat2_index_prep(host_hisat2_index, &cwd)?;
+
     let (
         host_hisat2_out_stream,
         host_hisat2_count_rx,
@@ -9624,7 +9653,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         host_bt2_r2,
         host_hisat2_index_path,
         paired,
-        hisat2_options,
+        Vec::new(),
         None,
         4,
     )
@@ -9677,7 +9706,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         optional_human_bam_path = Some(human_bt2_bam_path);
 
         let human_hisat2_index_path = hisat2_index_prep(human_hisat2_index, &cwd)?;
-        let hisat2_options = HashMap::new();
 
         let (
             human_hisat2_out_stream,
@@ -9691,7 +9719,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             human_bt2_r2,
             human_hisat2_index_path,
             paired,
-            hisat2_options,
+            Vec::new(),
             None,
             4,
         )

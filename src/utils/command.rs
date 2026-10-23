@@ -2069,22 +2069,59 @@ pub mod hisat2 {
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
     use log::{self, debug};
-    use std::collections::HashMap;
     use std::fs::{self, DirEntry};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[derive(Debug)]
     pub struct Hisat2Config {
-        pub hisat2_index_path: PathBuf,
-        pub option_fields: HashMap<String, Option<String>>,
-        pub r1_path: String,
-        pub r2_path: Option<String>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands, if any.
+        pub positional_args: Vec<String>,
+    }
+
+    impl Hisat2Config {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct Hisat2ArgGenerator;
 
-    pub async fn hisat2_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn hisat2_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             HISAT2_TAG,
             vec!["--version"],
@@ -2094,13 +2131,18 @@ pub mod hisat2 {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     /// Prepares the HISAT2 index by handling directory, tar, or tar.gz inputs.
-    /// Returns the PathBuf to the basename (e.g., /path/to/human for files human.1.ht2, etc.).
-    pub fn hisat2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+    /// Returns the PathBuf to the basename
+    /// (e.g., /path/to/human for files human.1.ht2, etc.).
+    pub fn hisat2_index_prep(
+        input_path: impl AsRef<Path>,
+        cwd: &PathBuf,
+    ) -> Result<PathBuf> {
         let input = input_path.as_ref();
 
         // Generate unique unpack directory
@@ -2117,14 +2159,21 @@ pub mod hisat2 {
                 .to_string_lossy()
                 .to_string()
         };
-        let unpack_dir = cwd.join(format!("unpacked_index_ht2_{}", unique_id));
+
+        let unpack_dir =
+            cwd.join(format!("unpacked_index_ht2_{}", unique_id));
 
         // Clean unpack_dir
         if unpack_dir.exists() {
             fs::remove_dir_all(&unpack_dir)?;
         }
+
         fs::create_dir_all(&unpack_dir)?;
-        debug!("HISAT2: Created unpack directory: {}", unpack_dir.display());
+
+        debug!(
+            "HISAT2: Created unpack directory: {}",
+            unpack_dir.display()
+        );
 
         let mut index_dir = unpack_dir.clone();
 
@@ -2136,6 +2185,7 @@ pub mod hisat2 {
                 .extension()
                 .map(|s| s.to_str().unwrap_or(""))
                 .unwrap_or("");
+
             let stem_ext = input
                 .file_stem()
                 .and_then(|s| Path::new(s).extension())
@@ -2143,7 +2193,11 @@ pub mod hisat2 {
                 .unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                debug!("HISAT2: Unpacking GZIP TAR: {}", input.display());
+                debug!(
+                    "HISAT2: Unpacking GZIP TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -2151,7 +2205,11 @@ pub mod hisat2 {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                debug!("HISAT2: Unpacking TAR: {}", input.display());
+                debug!(
+                    "HISAT2: Unpacking TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -2172,43 +2230,68 @@ pub mod hisat2 {
                 ));
             }
         } else {
-            return Err(anyhow!("HISAT2 index input not found: {}", input.display()));
+            return Err(anyhow!(
+                "HISAT2 index input not found: {}",
+                input.display()
+            ));
         }
 
         // Strip single top-level subdir (e.g., "human/")
-        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let entries: Vec<DirEntry> =
+            fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+
         let dirs: Vec<DirEntry> = entries
             .into_iter()
-            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .filter(|e| {
+                e.file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false)
+            })
             .collect();
 
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
+
             if fs::read_dir(&subdir)?.next().is_some() {
                 index_dir = subdir;
             }
         }
 
         // Validate required files
-        let extensions = vec!["ht2".to_string(), "ht2l".to_string()];
-        let required_suffixes = vec!["1", "2", "3", "4", "5", "6", "7", "8"];
+        let extensions =
+            vec!["ht2".to_string(), "ht2l".to_string()];
+
+        let required_suffixes =
+            vec!["1", "2", "3", "4", "5", "6", "7", "8"];
 
         for suffix in &required_suffixes {
             let mut found = false;
+
             for ext in &extensions {
-                let pattern = format!("{}.{}", suffix, ext);
+                let pattern =
+                    format!("{}.{}", suffix, ext);
+
                 let mut candidates = Vec::new();
+
                 for entry in fs::read_dir(&index_dir)? {
                     let path = entry?.path();
-                    if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+
+                    if path.is_file()
+                        && path
+                        .to_str()
+                        .unwrap_or("")
+                        .ends_with(&pattern)
+                    {
                         candidates.push(path);
                     }
                 }
+
                 if !candidates.is_empty() {
                     found = true;
                     break;
                 }
             }
+
             if !found {
                 return Err(anyhow!(
                     "Missing HISAT2 index file for suffix '{}' in: {}",
@@ -2218,75 +2301,100 @@ pub mod hisat2 {
             }
         }
 
-        // Derive basename using suffix "1", avoiding any unexpected patterns
+        // Derive basename using suffix "1"
         let pattern_suffix = "1";
         let mut basename = None;
+
         for ext in &extensions {
-            let pattern = format!("{}.{}", pattern_suffix, ext);
+            let pattern =
+                format!("{}.{}", pattern_suffix, ext);
+
             let mut candidates = Vec::new();
+
             for entry in fs::read_dir(&index_dir)? {
                 let path = entry?.path();
-                if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+
+                if path.is_file()
+                    && path
+                    .to_str()
+                    .unwrap_or("")
+                    .ends_with(&pattern)
+                {
                     candidates.push(path);
                 }
             }
+
             if let Some(file) = candidates.first() {
                 let file_name = file
                     .file_name()
                     .ok_or(anyhow!("Invalid file path"))?
                     .to_str()
                     .ok_or(anyhow!("Invalid UTF-8"))?;
+
                 let stripped = file_name
                     .strip_suffix(&pattern)
-                    .ok_or(anyhow!("Suffix mismatch in HISAT2 file: {}", file_name))?;
-                basename = Some(stripped.trim_end_matches('.').to_string());
+                    .ok_or(anyhow!(
+                        "Suffix mismatch in HISAT2 file: {}",
+                        file_name
+                    ))?;
+
+                basename =
+                    Some(stripped.trim_end_matches('.').to_string());
+
                 break;
             }
         }
+
         let basename = basename.ok_or(anyhow!(
             "No HISAT2 index file with suffix '1' found in: {}",
             index_dir.display()
         ))?;
 
-        let final_path = index_dir.join(&basename);
-        debug!("Final HISAT2 index path: {}", final_path.display());
+        let final_path =
+            index_dir.join(&basename);
+
+        debug!(
+            "Final HISAT2 index path: {}",
+            final_path.display()
+        );
+
         Ok(final_path)
     }
 
     impl ArgGenerator for Hisat2ArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| e.downcast_ref::<Hisat2Config>())
-                .ok_or_else(|| anyhow!("HISAT2 requires a Hisat2Config as extra argument"))?;
+                .and_then(|e| {
+                    e.downcast_ref::<Hisat2Config>()
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "HISAT2 requires a Hisat2Config as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            for (key, value) in config.option_fields.iter() {
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            args_vec.push("-x".to_string());
-            args_vec.push(config.hisat2_index_path.to_string_lossy().to_string());
-            args_vec.push("-p".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, HISAT2_TAG, None);
-            args_vec.push(num_cores.to_string());
+            // Serialize positional operands exactly and in order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
-            if config.r2_path.is_some() {
-                args_vec.push("-1".to_string());
-                args_vec.push(config.r1_path.clone());
-                args_vec.push("-2".to_string());
-                args_vec.push(config.r2_path.clone().unwrap());
-            } else {
-                args_vec.push("-U".to_string());
-                args_vec.push(config.r1_path.clone());
-            }
+            debug!(
+                "HISAT2 final args: {}",
+                args_vec.join(" ")
+            );
 
             Ok(args_vec)
         }
