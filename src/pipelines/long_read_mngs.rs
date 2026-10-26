@@ -2553,6 +2553,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(PipelineError::Other)?;
 
 
+    // ------------------------------------------------------------------
+    // GenerateContigStats
+    //
+    // contig_stats has already been generated from the name-sorted
+    // reads-to-contigs BAM.
+    //
+    // contig_base_counts is the sum of read lengths for reads assigned
+    // to each contig.
+    //
+    // The resulting JSON files are durable output artifacts only.
+    // Downstream computation continues using the in-memory maps and does
+    // not depend on these files being written.
+    // ------------------------------------------------------------------
+
     let mut contig_base_counts: HashMap<String, u64> =
         contig_stats
             .keys()
@@ -2574,6 +2588,110 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .entry(contig_name.clone())
             .or_insert(0) += *read_length;
     }
+
+
+    // ------------------------------------------------------------------
+    // Serialize GenerateContigStats outputs.
+    //
+    // Serialization happens here because the in-memory maps remain
+    // available to the main pipeline. Only the actual filesystem writes
+    // are moved into background tasks.
+    // ------------------------------------------------------------------
+
+    let contig_stats_json =
+        serde_json::to_vec(&contig_stats)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to serialize contig_stats.json: {}",
+                e
+            ))
+            })?;
+
+    let contig_base_counts_json =
+        serde_json::to_vec(&contig_base_counts)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to serialize contig_base_counts.json: {}",
+                e
+            ))
+            })?;
+
+    let contig_stats_path =
+        out_dir.join("contig_stats.json");
+
+    let contig_base_counts_path =
+        out_dir.join("contig_base_counts.json");
+
+
+    // ------------------------------------------------------------------
+    // Durable artifact writes.
+    //
+    // ------------------------------------------------------------------
+
+    let contig_stats_write_task = {
+        let path = contig_stats_path.clone();
+
+        tokio::spawn(async move {
+            tokio::fs::write(
+                &path,
+                contig_stats_json,
+            )
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                "Failed to write {}: {}",
+                path.display(),
+                e
+            )
+                })?;
+
+            info!(
+            "Wrote contig statistics to {}",
+            path.display()
+        );
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    cleanup_tasks.push(contig_stats_write_task);
+
+
+    let contig_base_counts_write_task = {
+        let path = contig_base_counts_path.clone();
+
+        tokio::spawn(async move {
+            tokio::fs::write(
+                &path,
+                contig_base_counts_json,
+            )
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                "Failed to write {}: {}",
+                path.display(),
+                e
+            )
+                })?;
+
+            info!(
+            "Wrote contig base counts to {}",
+            path.display()
+        );
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    cleanup_tasks.push(contig_base_counts_write_task);
+
+
+    info!(
+    "GenerateContigStats complete: {} contigs, {} mapped reads; \
+     JSON artifact writes running asynchronously",
+    contig_stats.len(),
+    read2contig.len(),
+);
 
     // *******************
     // Temporary final stream drain for construction
