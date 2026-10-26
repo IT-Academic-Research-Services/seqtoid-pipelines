@@ -2331,7 +2331,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| PipelineError::Other(e.into()))??;
 
 
-
     let flye_config = FlyeConfig {
         input_fastq: subsampled_fastq_path.clone(),
         outdir_path: flye_out_dir.clone(),
@@ -2366,6 +2365,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 error: e.to_string(),
             })?;
 
+    // Stderr draining is independent of downstream pipeline construction.
+    cleanup_tasks.push(flye_err_task);
+
     // Flye must finish before anything can consume its assembly.
     let flye_status =
         flye_child
@@ -2376,6 +2378,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 error: e.to_string(),
             })?;
 
+
     if flye_status.success() {
         info!("Flye assembly completed successfully");
     } else {
@@ -2385,10 +2388,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         flye_status
     );
     }
-
-    flye_err_task
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))??;
 
 
     // ------------------------------------------------------------------
@@ -2445,11 +2444,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await
             .map_err(|e| {
                 anyhow!(
-            "Failed to copy Flye assembly {} to {}: {}",
-            contigs_source.display(),
-            contigs_destination.display(),
-            e
-        )
+                "Failed to copy Flye assembly {} to {}: {}",
+                contigs_source.display(),
+                contigs_destination.display(),
+                e
+            )
             })?;
 
         info!(
